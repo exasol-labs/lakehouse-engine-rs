@@ -1,4 +1,4 @@
-//! End-to-end integration tests for the lakehouse-vs Virtual Schema.
+//! End-to-end integration tests for the lakehouse-engine Virtual Schema.
 //!
 //! These tests run against a live Exasol + MinIO + Iceberg REST catalog stack.
 //! They FAIL (never skip) when the stack is unavailable — per project rules.
@@ -8,8 +8,8 @@
 //!
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
-//! 2. Install SLC 0.14.0 (LHRUST alias) and upload liblakehouse_vs.so to BucketFS.
-//! 3. Create the LAKEHOUSE_VS_ADAPTER script and LAKEHOUSE_SCAN script.
+//! 2. Install SLC 0.14.0 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
+//! 3. Create the LAKEHOUSE_ADAPTER script and LAKEHOUSE_SCAN script.
 //! 4. Create the LHVS Virtual Schema over the seeded table.
 //!
 //! The VS properties carry UDF-internal URLs (docker-network names) for the
@@ -21,7 +21,7 @@ use common::exasol_ws::ExaConn;
 use common::seed::{E2E_QUALIFIED_TABLE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, seed_events};
 use common::stack::{
     bucketfs_port, bucketfs_write_password, exasol_host, exasol_sql_port, iceberg_catalog_url,
-    iceberg_catalog_url_internal, lakehouse_vs_so_path, minio_url_internal, upload_to_bucketfs,
+    iceberg_catalog_url_internal, lakehouse_engine_so_path, minio_url_internal, upload_to_bucketfs,
     wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
 };
 
@@ -35,17 +35,17 @@ use std::time::Duration;
 const SYS_PASSWORD: &str = "exasol";
 const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
-const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_VS_ADAPTER";
+const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 /// BucketFS path for the .so (as PUT target).
-const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_vs.so";
+const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the .so as referenced in %udf_object (without leading /).
-const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_vs.so";
+const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the SLC tarball.
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
 /// SLC version we link against.
 const SLC_VERSION: &str = "0.14.0";
-/// Language alias for our SLC 0.14.0. This Exasol is dedicated to lakehouse-vs
+/// Language alias for our SLC 0.14.0. This Exasol is dedicated to lakehouse-engine
 /// (the sibling strata-rs stack is stopped), so we register the canonical RUST
 /// alias cleanly rather than coexisting with a foreign RUST= entry.
 const LANG_ALIAS: &str = "RUST";
@@ -79,7 +79,7 @@ fn setup_e2e() {
         install_slc_0_14();
 
         // 4. Upload the .so to BucketFS.
-        let so_path = lakehouse_vs_so_path();
+        let so_path = lakehouse_engine_so_path();
         upload_to_bucketfs(&so_path, SO_BUCKETFS_PUT_PATH);
 
         // 5. Create Exasol schema + scripts + VS.
@@ -131,7 +131,7 @@ fn install_slc_0_14() {
 
     // Register the RUST language alias, replacing any existing RUST= entry so
     // the alias points at our freshly-uploaded 0.14.0 SLC. This Exasol is
-    // dedicated to lakehouse-vs, so a clean replacement is correct.
+    // dedicated to lakehouse-engine, so a clean replacement is correct.
     let mut conn = exa_conn();
     let rust_def = format!(
         "{LANG_ALIAS}=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"
@@ -172,7 +172,7 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
 
     // Adapter script — RUST ADAPTER SCRIPT.
     // The SLC dispatches to the entry point whose name matches the SQL script
-    // name (__exa_udf_entry_LAKEHOUSE_VS_ADAPTER); there is no %main directive
+    // name (__exa_udf_entry_LAKEHOUSE_ADAPTER); there is no %main directive
     // for RUST scripts. %udf_object references the uploaded .so.
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} AS
@@ -393,11 +393,11 @@ fn both_scripts_resolve_one_artifact() {
 
     // Both script bodies must reference the same .so artifact path.
     assert!(
-        adapter_body.contains("liblakehouse_vs.so") || adapter_body.contains("udf"),
+        adapter_body.contains("liblakehouse_engine.so") || adapter_body.contains("udf"),
         "adapter script body does not reference the .so: {adapter_body}"
     );
     assert!(
-        scan_body.contains("liblakehouse_vs.so") || scan_body.contains("udf"),
+        scan_body.contains("liblakehouse_engine.so") || scan_body.contains("udf"),
         "scan script body does not reference the .so: {scan_body}"
     );
 }

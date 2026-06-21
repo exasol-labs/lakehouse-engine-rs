@@ -1,5 +1,5 @@
 [package]
-name = "lakehouse-vs"
+name = "lakehouse-engine"
 version = "0.2.0"
 edition = "2024"
 

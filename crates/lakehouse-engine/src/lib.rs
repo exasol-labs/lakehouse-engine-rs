@@ -1,6 +1,6 @@
 //! Lakehouse Virtual Schema — single `.so`, two entry points.
 //!
-//! Entry point #1: VS adapter (`__exa_udf_entry_LAKEHOUSE_VS_ADAPTER`)
+//! Entry point #1: VS adapter (`__exa_udf_entry_LAKEHOUSE_ADAPTER`)
 //!   Handles the Exasol Virtual Schema JSON protocol: getCapabilities,
 //!   createVirtualSchema, refreshVirtualSchema, dropVirtualSchema, pushdown.
 //!   Resolves the Iceberg file list ONCE in `pushdown` and returns SQL that
@@ -35,9 +35,9 @@ pub mod types;
 ///
 /// The `#[exasol_udf(vs_adapter(adapter::adapter_call))]` annotation wires
 /// `adapter::adapter_call` into the `virtual_schema_adapter_call` vtable slot.
-/// The exported symbol is `__exa_udf_entry_LAKEHOUSE_VS_ADAPTER`.
+/// The exported symbol is `__exa_udf_entry_LAKEHOUSE_ADAPTER`.
 #[exasol_udf(vs_adapter(adapter::adapter_call))]
-fn lakehouse_vs_adapter(_ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
+fn lakehouse_adapter(_ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // The run hook is never called for an ADAPTER SCRIPT — the adapter call
     // goes through `virtual_schema_adapter_call`. This body is unreachable.
     Ok(())

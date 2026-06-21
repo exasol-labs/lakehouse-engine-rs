@@ -10,7 +10,7 @@
 //! a pure test: it reads no files at runtime and needs no live services.
 
 /// Workspace build-convention documentation, embedded at compile time.
-/// Path is relative to this source file: crates/lakehouse-vs/tests -> workspace root.
+/// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
 const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
 
 #[test]

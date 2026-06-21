@@ -1,4 +1,4 @@
-//! Iceberg table seeder for lakehouse-vs E2E tests.
+//! Iceberg table seeder for lakehouse-engine E2E tests.
 //!
 //! Seeds a deterministic mixed-column table into the Iceberg REST catalog over MinIO.
 //! Uses iceberg-rust 0.9.1 + iceberg-catalog-rest 0.9.1 (same as the main crate).

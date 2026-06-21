@@ -58,8 +58,8 @@ impl ExaConn {
             "username": user,
             "password": enc_password,
             "useCompression": false,
-            "clientName": "lakehouse-vs-test",
-            "driverName": "lakehouse-vs-test",
+            "clientName": "lakehouse-engine-test",
+            "driverName": "lakehouse-engine-test",
             "clientOs": "Linux",
             "clientOsUsername": "ci",
             "clientRuntime": "Rust"

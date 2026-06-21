@@ -1,6 +1,6 @@
-# Mission: Exasol DataFusion Virtual Schema PoC
+# Mission: lakehouse-engine — Exasol In-Place Lakehouse Query Engine
 
-> A stateless Exasol Virtual Schema that queries Apache Iceberg and Databricks-managed datasets by running DataFusion inside Rust UDFs, using the Exasol cluster as a distributed execution substrate.
+> An **in-place query engine**: technically an Exasol Virtual Schema, but rather than only translating and planning it runs the DataFusion engine on the node, in place — querying Apache Iceberg and Databricks-managed datasets inside Rust UDFs, using the Exasol cluster as a distributed execution substrate. (Repo: `lakehouse-engine-rs`; the `-rs` is an external "built in Rust" hint — internally the project is `lakehouse-engine`.)
 
 ## Problem Statement
 
@@ -97,7 +97,7 @@ cargo clippy --all-targets && cargo fmt
 ## Project Structure
 
 ```
-lakehouse-vs/
+lakehouse-engine/
 ├── specs/          # mission.md and spec library (speq)
 ├── crates/         # VS adapter + DataFusion-in-UDF crate(s)
 ├── Cargo.toml      # workspace manifest

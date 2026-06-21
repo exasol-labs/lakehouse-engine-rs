@@ -1,8 +1,8 @@
 # Tasks: add-datafusion-iceberg-scan-pushdown
 
 ## Phase 2: Implementation (Group A — Scaffolding)
-- [x] 2.A1 Workspace Cargo.toml (edition 2024) + `lakehouse-vs` cdylib crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, SDK/macros 0.14.0 (crates.io — published, no path fallback)
-- [x] 2.A2 Makefile: `cross-musl-udf-build` (docker rust:1.92-bookworm, `-p lakehouse-vs`, out `target/release/liblakehouse_vs.so`, persistent cargo vol) + gated `test-e2e`, mirror strata-rs
+- [x] 2.A1 Workspace Cargo.toml (edition 2024) + `lakehouse-engine` cdylib crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, SDK/macros 0.14.0 (crates.io — published, no path fallback)
+- [x] 2.A2 Makefile: `cross-musl-udf-build` (docker rust:1.92-bookworm, `-p lakehouse-engine`, out `target/release/liblakehouse_engine.so`, persistent cargo vol) + gated `test-e2e`, mirror strata-rs
 - [x] 2.A3 Docker compose: MinIO + Iceberg REST catalog + Exasol, shared network, BucketFS 2581 / MinIO 9000, mirror strata-rs
 
 ## Phase 2: Implementation (Group B+C — crate core) [expert]
@@ -33,7 +33,7 @@
 
 ## Phase 5: Verification (live Docker on this machine — CLEAN stack, no manual patches)
 - [x] 5.1 Build: `make cross-musl-udf-build` → exit 0, `.so` produced (164 MB)
-- [x] 5.2 `nm -D ... | grep __exa_udf_entry_` → both symbols (LAKEHOUSE_SCAN, LAKEHOUSE_VS_ADAPTER)
+- [x] 5.2 `nm -D ... | grep __exa_udf_entry_` → both symbols (LAKEHOUSE_SCAN, LAKEHOUSE_ADAPTER)
 - [x] 5.3 `cargo test` → 39 passed, 0 failed (incl. +redaction, +build_convention)
 - [x] 5.4 `cargo clippy --all-targets --features exasol-e2e` → 0 errors (only pre-existing tests/common nits); `cargo fmt --check` clean
 - [x] 5.5 `make test-e2e` against clean-from-scratch stack → 9 passed, 0 failed, NO manual /etc/hosts patch

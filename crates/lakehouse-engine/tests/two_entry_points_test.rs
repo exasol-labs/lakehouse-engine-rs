@@ -15,14 +15,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Host-side path of the built lakehouse-vs `.so`.
+/// Host-side path of the built lakehouse-engine `.so`.
 fn so_path() -> PathBuf {
-    // CARGO_MANIFEST_DIR = crates/lakehouse-vs; the workspace target/ is ../../target.
+    // CARGO_MANIFEST_DIR = crates/lakehouse-engine; the workspace target/ is ../../target.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
         .expect("navigate to workspace root from CARGO_MANIFEST_DIR")
-        .join("target/release/liblakehouse_vs.so")
+        .join("target/release/liblakehouse_engine.so")
 }
 
 #[test]
@@ -48,8 +48,8 @@ fn so_exports_both_entry_symbols() {
     let symbols = String::from_utf8_lossy(&output.stdout);
 
     assert!(
-        symbols.contains("__exa_udf_entry_LAKEHOUSE_VS_ADAPTER"),
-        "the .so must export the adapter entry symbol __exa_udf_entry_LAKEHOUSE_VS_ADAPTER"
+        symbols.contains("__exa_udf_entry_LAKEHOUSE_ADAPTER"),
+        "the .so must export the adapter entry symbol __exa_udf_entry_LAKEHOUSE_ADAPTER"
     );
     assert!(
         symbols.contains("__exa_udf_entry_LAKEHOUSE_SCAN"),

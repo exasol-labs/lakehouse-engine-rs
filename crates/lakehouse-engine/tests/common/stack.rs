@@ -1,4 +1,4 @@
-//! Stack readiness helpers and environment accessors for lakehouse-vs E2E tests.
+//! Stack readiness helpers and environment accessors for lakehouse-engine E2E tests.
 #![cfg(feature = "exasol-e2e")]
 
 use std::time::{Duration, Instant};
@@ -8,7 +8,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Read a `u16` port from `env_var`, falling back to `default`.
 ///
-/// Port discipline: the suite targets the lakehouse-vs compose stack's
+/// Port discipline: the suite targets the lakehouse-engine compose stack's
 /// dedicated host ports, all overridable so a fresh stack can always pick
 /// free ports. Defaults match `docker-compose.yml`.
 fn port_from_env(env_var: &str, default: u16) -> u16 {
@@ -71,7 +71,7 @@ pub fn minio_url_internal() -> String {
 
 /// The Exasol container name (for `docker exec` credential extraction).
 pub fn exasol_container() -> String {
-    std::env::var("EXASOL_CONTAINER").unwrap_or_else(|_| "lakehouse-vs-exasol-1".to_string())
+    std::env::var("EXASOL_CONTAINER").unwrap_or_else(|_| "lakehouse-engine-rs-exasol-1".to_string())
 }
 
 /// Extract the BucketFS write password.
@@ -194,14 +194,14 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     );
 }
 
-/// Path (host-side) of the compiled lakehouse-vs .so.
-pub fn lakehouse_vs_so_path() -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR = lakehouse-vs/crates/lakehouse-vs; go up two levels to workspace root.
+/// Path (host-side) of the compiled lakehouse-engine .so.
+pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/lakehouse-vs -> workspace root is ../../
+    // crates/lakehouse-engine -> workspace root is ../../
     manifest
         .parent()
         .and_then(|p| p.parent())
         .expect("could not navigate to workspace root from CARGO_MANIFEST_DIR")
-        .join("target/release/liblakehouse_vs.so")
+        .join("target/release/liblakehouse_engine.so")
 }

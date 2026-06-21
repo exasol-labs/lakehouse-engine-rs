@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-vs"]
+members = ["crates/lakehouse-engine"]
 # The UDF crate is a cdylib that MUST be compiled inside rust:1.92-bookworm
 # (glibc 2.36) via `make cross-musl-udf-build`. A bare host `cargo build
 # --release` must never emit the .so — it would write a host-glibc binary that

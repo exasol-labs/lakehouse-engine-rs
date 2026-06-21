@@ -32,7 +32,7 @@ in DataFusion. language-container-rs 0.14.0 newly allows multiple UDF entry poin
 
 ### Decision
 
-A single `cdylib` crate, `lakehouse-vs`, exports two `#[exasol_udf]` entry points. The
+A single `cdylib` crate, `lakehouse-engine`, exports two `#[exasol_udf]` entry points. The
 adapter entry point handles the VS JSON protocol and resolves the Iceberg file list
 once; the scan entry point is a SET UDF that consumes a scan spec, runs DataFusion, and
 emits rows. The adapter's `pushdown` response is SQL that invokes the scan SET UDF with
@@ -69,7 +69,7 @@ Iceberg/Parquet files in MinIO  →  rows back to Exasol
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| Two entry points in one `.so` (0.14.0) | `lakehouse-vs` crate | One artifact, one BucketFS upload; adapter + scan share build/deploy |
+| Two entry points in one `.so` (0.14.0) | `lakehouse-engine` crate | One artifact, one BucketFS upload; adapter + scan share build/deploy |
 | Resolve-once seam | adapter `pushdown` → explicit file-list arg to UDF | Avoids N-node duplicate metadata fetches; the seam multi-node sharding later exploits |
 | File-level work assignment | scan UDF receives a file list, never discovers files | Keeps the UDF stateless and shardable later |
 | Batch-and-emit streaming | scan UDF Arrow→`Value` loop | Never materialize full result; rely on 4,000,000-byte auto-flush |
@@ -114,8 +114,8 @@ Iceberg/Parquet files in MinIO  →  rows back to Exasol
 
 ### Group A — Scaffolding (no dependencies)
 
-- [ ] A.1 Create workspace `Cargo.toml` (edition 2024) and the `lakehouse-vs` `cdylib` crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, and the SDK/macros deps (0.14.0 with documented path fallback).
-- [ ] A.2 Add the Makefile with `cross-musl-udf-build` (docker run in `rust:1.92-bookworm`, `-p lakehouse-vs`, output `target/release/liblakehouse_vs.so`, persistent cargo registry volume) and `test-e2e` (gated `--features exasol-e2e`), mirroring `strata-rs`.
+- [ ] A.1 Create workspace `Cargo.toml` (edition 2024) and the `lakehouse-engine` `cdylib` crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, and the SDK/macros deps (0.14.0 with documented path fallback).
+- [ ] A.2 Add the Makefile with `cross-musl-udf-build` (docker run in `rust:1.92-bookworm`, `-p lakehouse-engine`, output `target/release/liblakehouse_engine.so`, persistent cargo registry volume) and `test-e2e` (gated `--features exasol-e2e`), mirroring `strata-rs`.
 - [ ] A.3 Add Docker compose overlays for MinIO + Iceberg REST catalog + Exasol on a shared network (BucketFS port 2581, MinIO 9000), mirroring `strata-rs/docker-compose.exasol.yml`.
 
 ### Group B — Two entry points + scan core
@@ -174,28 +174,28 @@ Sequential dependencies:
 
 | Scenario | Test Type | Test Location | Test Name |
 |----------|-----------|---------------|-----------|
-| create-virtual-schema / Adapter reports its pushdown capabilities | Unit | `crates/lakehouse-vs/src/adapter/capabilities.rs` | `reports_projection_filter_limit_only` |
+| create-virtual-schema / Adapter reports its pushdown capabilities | Unit | `crates/lakehouse-engine/src/adapter/capabilities.rs` | `reports_projection_filter_limit_only` |
 | create-virtual-schema / Create virtual schema maps the Iceberg table schema | Integration | `tests/e2e_scan_test.rs` | `create_vs_maps_iceberg_schema` |
 | create-virtual-schema / Create virtual schema fails clearly when the catalog is unreachable | Integration | `tests/e2e_scan_test.rs` | `create_vs_unreachable_catalog_errors_no_secret` |
-| pushdown-planning / Pushdown resolves the file list once and builds a scan-driving query | Unit | `crates/lakehouse-vs/src/adapter/pushdown.rs` | `pushdown_resolves_files_once_builds_scan_sql` |
-| pushdown-planning / Projection is pushed into the scan-driving query | Unit | `crates/lakehouse-vs/src/adapter/pushdown.rs` | `pushdown_carries_projection` |
-| pushdown-planning / Filter predicate is pushed into the scan spec | Unit | `crates/lakehouse-vs/src/adapter/pushdown.rs` | `pushdown_translates_or_omits_predicate` |
-| pushdown-planning / LIMIT is pushed into the scan spec | Unit | `crates/lakehouse-vs/src/adapter/pushdown.rs` | `pushdown_carries_limit` |
+| pushdown-planning / Pushdown resolves the file list once and builds a scan-driving query | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `pushdown_resolves_files_once_builds_scan_sql` |
+| pushdown-planning / Projection is pushed into the scan-driving query | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `pushdown_carries_projection` |
+| pushdown-planning / Filter predicate is pushed into the scan spec | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `pushdown_translates_or_omits_predicate` |
+| pushdown-planning / LIMIT is pushed into the scan spec | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `pushdown_carries_limit` |
 | scan-execution / Scan registers only its assigned files and returns matching rows | Integration | `tests/e2e_scan_test.rs` | `scan_registers_only_assigned_files` |
 | scan-execution / Filter predicate restricts the emitted rows | Integration | `tests/e2e_scan_test.rs` | `scan_filter_restricts_rows` |
 | scan-execution / LIMIT caps the emitted rows | Integration | `tests/e2e_scan_test.rs` | `scan_limit_caps_rows` |
-| scan-execution / Arrow batches are converted to Value rows and emitted incrementally | Unit | `crates/lakehouse-vs/src/scan/emit.rs` | `emits_batch_by_batch_without_materializing` |
-| scan-execution / Arrow types map to the correct SDK Value variants | Unit | `crates/lakehouse-vs/src/scan/convert.rs` | `arrow_columns_map_to_value_variants` |
-| scan-execution / Incompatible Arrow columns are emitted as JSON strings | Unit | `crates/lakehouse-vs/src/scan/convert.rs` | `incompatible_columns_emit_json_strings` |
-| type-mapping / Compatible Arrow types map to their Exasol type | Unit | `crates/lakehouse-vs/src/types/mapping.rs` | `compatible_types_map_to_exasol_type` |
-| type-mapping / In-range Decimal128 maps to a precise Exasol DECIMAL | Unit | `crates/lakehouse-vs/src/types/mapping.rs` | `decimal128_in_range_maps_to_decimal` |
-| type-mapping / Out-of-range Decimal128 falls back to VARCHAR via JSON | Unit | `crates/lakehouse-vs/src/types/mapping.rs` | `decimal128_out_of_range_maps_to_varchar_json` |
-| type-mapping / Incompatible Arrow types are serialized to JSON VARCHAR | Unit | `crates/lakehouse-vs/src/types/mapping.rs` | `incompatible_types_map_to_varchar_json` |
+| scan-execution / Arrow batches are converted to Value rows and emitted incrementally | Unit | `crates/lakehouse-engine/src/scan/emit.rs` | `emits_batch_by_batch_without_materializing` |
+| scan-execution / Arrow types map to the correct SDK Value variants | Unit | `crates/lakehouse-engine/src/scan/convert.rs` | `arrow_columns_map_to_value_variants` |
+| scan-execution / Incompatible Arrow columns are emitted as JSON strings | Unit | `crates/lakehouse-engine/src/scan/convert.rs` | `incompatible_columns_emit_json_strings` |
+| type-mapping / Compatible Arrow types map to their Exasol type | Unit | `crates/lakehouse-engine/src/types/mapping.rs` | `compatible_types_map_to_exasol_type` |
+| type-mapping / In-range Decimal128 maps to a precise Exasol DECIMAL | Unit | `crates/lakehouse-engine/src/types/mapping.rs` | `decimal128_in_range_maps_to_decimal` |
+| type-mapping / Out-of-range Decimal128 falls back to VARCHAR via JSON | Unit | `crates/lakehouse-engine/src/types/mapping.rs` | `decimal128_out_of_range_maps_to_varchar_json` |
+| type-mapping / Incompatible Arrow types are serialized to JSON VARCHAR | Unit | `crates/lakehouse-engine/src/types/mapping.rs` | `incompatible_types_map_to_varchar_json` |
 | type-mapping / A mixed-column Parquet file round-trips through schema mapping and scan | Integration | `tests/e2e_scan_test.rs` | `mixed_column_parquet_round_trips` |
 | scan-execution / Scan reports a clear error when an assigned file is unreadable | Integration | `tests/e2e_scan_test.rs` | `scan_unreadable_file_errors_no_secret` |
 | single-so-two-entry-points / One crate exports both the adapter and the scan entry points | Integration | `tests/two_entry_points_test.rs` | `so_exports_both_entry_symbols` |
 | single-so-two-entry-points / Both scripts resolve from the same uploaded artifact | Integration | `tests/e2e_scan_test.rs` | `both_scripts_resolve_one_artifact` |
-| single-so-two-entry-points / Host release build of the .so is rejected by convention | Unit | `crates/lakehouse-vs/tests/build_convention.rs` | `host_release_build_documented_unloadable` |
+| single-so-two-entry-points / Host release build of the .so is rejected by convention | Unit | `crates/lakehouse-engine/tests/build_convention.rs` | `host_release_build_documented_unloadable` |
 | e2e-harness / End-to-end projection + filter + LIMIT query returns correct rows | Integration | `tests/e2e_scan_test.rs` | `e2e_projection_filter_limit_returns_correct_rows` |
 | e2e-harness / E2E suite fails when the stack is unavailable | Integration | `tests/e2e_scan_test.rs` | `e2e_fails_when_stack_unavailable` |
 
@@ -206,7 +206,7 @@ Sequential dependencies:
 
 | Feature | Command | Expected Output |
 |---------|---------|-----------------|
-| packaging/single-so-two-entry-points | `make cross-musl-udf-build && nm -D target/release/liblakehouse_vs.so \| grep __exa_udf_entry_` | Two entry-point symbols (adapter + scan) listed |
+| packaging/single-so-two-entry-points | `make cross-musl-udf-build && nm -D target/release/liblakehouse_engine.so \| grep __exa_udf_entry_` | Two entry-point symbols (adapter + scan) listed |
 | packaging/e2e-harness | `docker compose up -d` then `make test-e2e` | Stack starts; E2E suite passes |
 | vs-adapter/create-virtual-schema | In Exasol: `CREATE VIRTUAL SCHEMA my_vs USING ... ;` then `OPEN SCHEMA my_vs; DESCRIBE <table>;` | Table columns appear with mapped SQL types |
 | vs-adapter/pushdown-planning + datafusion-scan | In Exasol: `SELECT a, b FROM my_vs.t WHERE a > 10 LIMIT 5;` | Up to 5 rows, only columns a,b, all with a>10, matching seeded data |
@@ -216,7 +216,7 @@ Sequential dependencies:
 
 | Step | Command | Expected |
 |------|---------|----------|
-| Build | `make cross-musl-udf-build` | Exit 0; `target/release/liblakehouse_vs.so` produced |
+| Build | `make cross-musl-udf-build` | Exit 0; `target/release/liblakehouse_engine.so` produced |
 | Test | `cargo test` | 0 failures (host unit tests) |
 | Test (E2E) | `make test-e2e` | 0 failures against the running stack |
 | Lint | `cargo clippy --all-targets` | 0 errors/warnings |

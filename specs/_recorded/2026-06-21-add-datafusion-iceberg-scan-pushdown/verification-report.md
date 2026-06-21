@@ -10,7 +10,7 @@
 
 | Check | Status |
 |-------|--------|
-| Build (`make cross-musl-udf-build`) | ✓ exit 0, `liblakehouse_vs.so` (164 MB) in `rust:1.92-bookworm` |
+| Build (`make cross-musl-udf-build`) | ✓ exit 0, `liblakehouse_engine.so` (164 MB) in `rust:1.92-bookworm` |
 | Tests (host unit) | ✓ 39 passed / 0 failed |
 | Tests (E2E live Docker) | ✓ 9 passed / 0 failed |
 | Lint (`cargo clippy --all-targets --features exasol-e2e`) | ✓ 0 errors (5 pre-existing `tests/common/` style nits only) |
@@ -21,9 +21,9 @@
 ## Two-entry-point packaging (single `.so`)
 
 ```
-$ nm -D target/release/liblakehouse_vs.so | grep __exa_udf_entry_
+$ nm -D target/release/liblakehouse_engine.so | grep __exa_udf_entry_
 0000000001f25e00 T __exa_udf_entry_LAKEHOUSE_SCAN
-0000000001f25e10 T __exa_udf_entry_LAKEHOUSE_VS_ADAPTER
+0000000001f25e10 T __exa_udf_entry_LAKEHOUSE_ADAPTER
 ```
 One crate → one `.so` → both the VS adapter and the DataFusion scan SET UDF (language-container-rs 0.14.0 multi-entry capability), uploaded once to BucketFS and referenced by both `CREATE SCRIPT` statements.
 
@@ -40,7 +40,7 @@ E2E suite wall time: 142.8 s.
 
 | Feature | Command | Result |
 |---------|---------|--------|
-| single-so-two-entry-points | `make cross-musl-udf-build && nm -D …liblakehouse_vs.so \| grep __exa_udf_entry_` | ✓ two symbols |
+| single-so-two-entry-points | `make cross-musl-udf-build && nm -D …liblakehouse_engine.so \| grep __exa_udf_entry_` | ✓ two symbols |
 | e2e-harness | `docker compose down -v && up` → `make install-slc` → `make test-e2e` | ✓ stack starts clean; SLC 0.14.0 registers; 9/9 pass |
 | create-virtual-schema | `CREATE VIRTUAL SCHEMA` over the seeded Iceberg table | ✓ columns mapped to Exasol types |
 | pushdown-planning + datafusion-scan | `SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5` | ✓ (see gate evidence) |
