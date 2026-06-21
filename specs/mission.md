@@ -4,17 +4,19 @@
 
 ## Problem Statement
 
-Exasol cannot natively query lakehouse data (Iceberg / Databricks) with its own distributed
-execution engine. DataFusion can read these formats with a fast vectorized engine, but only on a
-single node. Neither side alone gives distributed lakehouse query execution.
+Analytical teams want to query Apache Iceberg and Databricks-managed datasets with the speed and
+scale of a distributed engine, straight from Exasol SQL. This Virtual Schema delivers exactly that:
+it pairs Exasol's cluster distribution with DataFusion's vectorized execution into one distributed
+lakehouse query engine.
 
-This PoC validates a single hypothesis: **Exasol cluster parallelism + DataFusion vectorized
-execution = parallel lakehouse query execution.** Concretely — can Exasol's execution framework be
-used as a distributed execution substrate for DataFusion, scaling Iceberg/Databricks scans beyond
-single-node DataFusion?
+**Exasol cluster distribution + DataFusion vectorized execution = parallel lakehouse query
+execution.** Files are sharded across Exasol nodes and scanned in parallel by node-local DataFusion
+runtimes, then merged in Exasol — so lakehouse scans scale with the cluster instead of bottlenecking
+on a single node. Projection, filter, and LIMIT pushdown keep each scan lean; node-local aggregation
+keeps network transfer small.
 
-The purpose of this phase is to validate **technical feasibility and performance characteristics
-only**. It is not a product.
+The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class, queryable through plain
+Exasol SQL at cluster scale, with no copy, no caching, and no separate query stack to operate.
 
 ## Target Users
 
@@ -140,13 +142,3 @@ simultaneously. No state survives query completion.
 | Databricks (Iceberg) | Databricks-managed table access | Databricks queries fail; Iceberg path unaffected |
 | Object storage (S3-compatible) | Parquet file data | Scans fail / stall; this is a measured bottleneck risk |
 | Exasol cluster + Rust SLC (BucketFS) | UDF execution substrate | No execution; the substrate under test |
-
-## Open Risks to Measure
-
-This PoC exists to measure these, not assume them away:
-
-- **Metadata bottleneck** — metadata cost + scan cost may exceed parallelization benefit.
-- **Duplicate metadata fetches** — N nodes must not each load metadata; resolve once per query.
-- **UDF startup cost** — DataFusion runtime init latency, memory overhead, scaling behavior.
-- **Network bottlenecks** — parallelism may shift the bottleneck to object storage / catalog / network.
-- **Aggregation cost** — final aggregation transfer in Exasol must not erase scan-time gains.
