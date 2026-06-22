@@ -6,7 +6,7 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 
 Exasol sends pushdown requests with expression trees expressed as serde_json `Value` objects. Node types include column references, literals, comparison predicates, logical operators, scalar functions, arithmetic operators, and CAST. The crate must translate these trees to DataFusion SQL strings usable in WHERE clauses and GROUP BY clauses without adding a SQL-parser dependency — only serde_json is used as the IR.
 
-The crate is a standalone workspace member with no knowledge of lakehouse-engine internals. It exposes two public functions per use-case: a raising variant (for tests and explicit handling) and a `_safe` None-returning variant (for adapter fallback paths).
+The crate is a standalone workspace member with no knowledge of lakehouse-engine internals. It exposes three public entry points: `render_expression` (raising, returns `Err` for unsupported nodes), `render_expression_safe` (returns `None` for unsupported nodes), and `render_df_filter_safe` (same as safe but also suppresses trivially-true results so the adapter can omit no-op filters).
 
 ## Scenarios
 
@@ -19,7 +19,7 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
 
 ### Scenario: Literal nodes translate to SQL literal forms
 
-* *GIVEN* a VS expression node of type `literal_string`, `literal_exactnumeric`, `literal_double`, `literal_bool`, `literal_null`, `literal_date`, or `literal_timestamp`
+* *GIVEN* a VS expression node of type `literal_string`, `literal_exactnumeric`, `literal_double`, `literal_bool`, `literal_null`, `literal_date`, `literal_timestamp`, or `literal_timestamp_utc`
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the corresponding SQL literal:
   `literal_string` → single-quoted string with internal single-quotes escaped by doubling;
@@ -27,7 +27,8 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
   `literal_bool` → `TRUE` or `FALSE`;
   `literal_null` → `NULL`;
   `literal_date` → `DATE 'YYYY-MM-DD'`;
-  `literal_timestamp` → `TIMESTAMP 'YYYY-MM-DD HH:MI:SS'`
+  `literal_timestamp` → `TIMESTAMP 'YYYY-MM-DD HH:MI:SS'`;
+  `literal_timestamp_utc` → a timestamp-with-timezone literal whose value DataFusion parses as UTC (`TIMESTAMP 'YYYY-MM-DD HH:MI:SS+00:00'` or the equivalent `arrow_cast` to `Timestamp(_, "UTC")`)
 * *AND* the translator MUST NOT produce any SQL injection vector from string literal values
 
 ### Scenario: Comparison predicates translate to binary operator expressions
@@ -75,3 +76,11 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
 * *AND* an `escape_char` field is absent or empty
 * *THEN* the translator SHALL return `(<expr> LIKE <pattern>)`
 * *AND* when `escape_char` is present and non-empty the translator SHALL return `(<expr> LIKE <pattern> ESCAPE '<ch>')`
+
+### Scenario: REGEXP_LIKE predicate translates to a DataFusion regexp_like call
+
+* *GIVEN* a VS expression node of type `predicate_like_regexp` (the Exasol node type for the infix `<str> REGEXP_LIKE <pat>` predicate) with an `expression` operand and a `pattern` operand
+* *WHEN* `render_expression` processes the node
+* *THEN* the translator SHALL return `regexp_like(<expression_sql>, <pattern_sql>)`
+* *AND* the translator SHALL recursively render both operands
+* *AND* a missing operand SHALL cause `render_expression` to return an error in raising mode and `None` in the safe variants

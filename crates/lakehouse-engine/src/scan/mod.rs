@@ -305,6 +305,7 @@ fn value_to_gk_string(v: Value) -> Value {
 /// Build the fallback null partial row for an empty aggregate result.
 ///
 /// COUNT/CountCol -> 0 (not NULL); SUM/Min/Max/Avg parts -> NULL.
+/// Stat family: cnt -> 0, sum -> NULL, sumsq -> NULL.
 fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::value::Value> {
     use exasol_udf_sdk::value::Value;
     let mut row = Vec::new();
@@ -315,6 +316,11 @@ fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::va
             AggKind::Avg => {
                 row.push(Value::Null); // partial_avg_sum
                 row.push(Value::Int64(0)); // partial_avg_cnt
+            }
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+                row.push(Value::Int64(0)); // partial_stat_cnt
+                row.push(Value::Null); // partial_stat_sum
+                row.push(Value::Null); // partial_stat_sumsq
             }
         }
     }
@@ -407,6 +413,17 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
             vec![
                 format!(r#"SUM({}) AS "PARTIAL_avg_sum_{i}""#, quote_ident(col)),
                 format!(r#"COUNT({}) AS "PARTIAL_avg_cnt_{i}""#, quote_ident(col)),
+            ]
+        }
+        // STDDEV/VARIANCE family: emit (cnt, sum, sum_sq) sufficient statistics.
+        // COUNT(col) excludes NULLs, matching single-node semantics.
+        AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+            let col = plan.column.as_deref().unwrap_or("");
+            let qcol = quote_ident(col);
+            vec![
+                format!(r#"COUNT({qcol}) AS "PARTIAL_stat_cnt_{i}""#),
+                format!(r#"SUM({qcol}) AS "PARTIAL_stat_sum_{i}""#),
+                format!(r#"SUM({qcol} * {qcol}) AS "PARTIAL_stat_sumsq_{i}""#),
             ]
         }
     }
@@ -662,7 +679,7 @@ mod tests {
     use crate::scan::spec::{AggKind, AggregatePlan};
 
     // ---------------------------------------------------------------------------
-    // Task 5.4 host-runnable unit tests for build_partial_agg_sql
+    // build_partial_agg_sql — host-runnable unit tests
     // ---------------------------------------------------------------------------
 
     fn sample_plans_count_sum_min_max() -> Vec<AggregatePlan> {
@@ -838,7 +855,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 3.8 unit tests for build_grouped_partial_agg_sql
+    // build_grouped_partial_agg_sql — GROUP BY key emission and partial columns
     // ---------------------------------------------------------------------------
 
     /// Single group key with COUNT(*): SELECT includes the key and COUNT(*).
@@ -940,6 +957,99 @@ mod tests {
         assert!(
             second_pos.is_some(),
             "expression key must appear in both SELECT and GROUP BY: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Stat aggregate partial SQL — COUNT(col), SUM(col), SUM(col*col) triple
+    // ---------------------------------------------------------------------------
+
+    /// Stat aggregate partial emits COUNT(col), SUM(col), SUM(col*col) at index 0.
+    #[test]
+    fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
+        for kind in &[
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            let plans = vec![AggregatePlan {
+                kind: kind.clone(),
+                column: Some("SCORE".into()),
+            }];
+            let sql = build_partial_agg_sql(&plans, "aliased");
+            assert!(
+                sql.contains(r#"COUNT("SCORE") AS "PARTIAL_stat_cnt_0""#),
+                "{kind:?} must emit COUNT(col) as PARTIAL_stat_cnt_0: {sql}"
+            );
+            assert!(
+                sql.contains(r#"SUM("SCORE") AS "PARTIAL_stat_sum_0""#),
+                "{kind:?} must emit SUM(col) as PARTIAL_stat_sum_0: {sql}"
+            );
+            assert!(
+                sql.contains(r#"SUM("SCORE" * "SCORE") AS "PARTIAL_stat_sumsq_0""#),
+                "{kind:?} must emit SUM(col*col) as PARTIAL_stat_sumsq_0: {sql}"
+            );
+            // Must NOT use AVG or STDDEV directly — only sufficient statistics
+            assert!(
+                !sql.contains("STDDEV"),
+                "{kind:?} must not emit STDDEV: {sql}"
+            );
+            assert!(
+                !sql.contains("VARIANCE"),
+                "{kind:?} must not emit VARIANCE: {sql}"
+            );
+        }
+    }
+
+    /// Stat aggregate null fallback row has 3 values: cnt=0, sum=NULL, sumsq=NULL.
+    #[test]
+    fn stat_aggregate_null_fallback_row_has_three_values() {
+        use exasol_udf_sdk::value::Value;
+        for kind in &[
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            let plans = vec![AggregatePlan {
+                kind: kind.clone(),
+                column: Some("X".into()),
+            }];
+            let row = emit_null_partial_row(&plans);
+            assert_eq!(row.len(), 3, "{kind:?} fallback row must have 3 values");
+            assert_eq!(row[0], Value::Int64(0), "{kind:?} cnt must be 0");
+            assert_eq!(row[1], Value::Null, "{kind:?} sum must be NULL");
+            assert_eq!(row[2], Value::Null, "{kind:?} sumsq must be NULL");
+        }
+    }
+
+    /// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.
+    #[test]
+    fn stat_aggregate_index_follows_plan_order() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            },
+            AggregatePlan {
+                kind: AggKind::VarPop,
+                column: Some("X".into()),
+            },
+        ];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+        assert!(sql.contains("PARTIAL_count_0"), "count at index 0: {sql}");
+        assert!(
+            sql.contains("PARTIAL_stat_cnt_1"),
+            "stat at index 1 must use suffix _1: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_stat_sum_1"),
+            "stat sum at index 1: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_stat_sumsq_1"),
+            "stat sumsq at index 1: {sql}"
         );
     }
 }

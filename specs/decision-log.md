@@ -365,3 +365,112 @@ Consume `UdfContext::memory_limit()` from the published `exasol-udf-sdk` release
 ### Consequences
 
 The live `ctx.memory_limit()` path is gated on a sibling-repo SDK release. Until that release, the pool-sizing code operates against the 1024 MB default. The dependency is explicit and recorded; the one-line version bump unblocks the live path without touching any scan logic.
+
+---
+
+## ADR-014: Capability Invariant — Advertise Only What the Engine Can Back Correctly
+
+**Date:** 2026-06-22
+**Plan:** `add-capability-alignment`
+**Status:** Accepted
+
+### Context
+
+The adapter's `CAPABILITIES` list and the `crates/vs-expression` translator had drifted in both directions: some advertised names did not exist in Exasol's vocabulary (`FN_PRED_GREATER`/`FN_PRED_GREATEREQUAL`), while many DataFusion-supported functions were not advertised at all. Over-advertising a function that is translated wrongly produces silent correctness bugs; under-advertising only costs performance.
+
+### Decision
+
+Establish the invariant that every name in `CAPABILITIES` must round-trip — either the `vs-expression` translator emits a correct DataFusion fragment for it, or the aggregate planner emits a correct shard-associative partial/merge plan. Any audit of the capability set starts from this rule: additions require a working translator path, and removals are required when no such path exists.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Capability invariant: advertise only what the engine backs correctly | ✓ Chosen — over-advertising is a silent correctness bug; under-advertising is only a performance loss |
+| Maximise advertised set and rely on Exasol ignoring wrongly-handled names | ✗ Rejected — any wrongly-translated capability produces incorrect query results silently |
+
+### Consequences
+
+The capability list is now a contract: adding a new `FN_*` entry requires a translator arm or aggregate decomposition path to be implemented first. Removing capability names requires confirming the translator arm produces incorrect or no output. Future reviewers have an explicit rule to apply rather than guessing.
+
+---
+
+## ADR-015: Remove FN_PRED_GREATER and FN_PRED_GREATEREQUAL from CAPABILITIES
+
+**Date:** 2026-06-22
+**Plan:** `add-capability-alignment`
+**Status:** Accepted
+
+### Context
+
+`FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` were present in the adapter's `CAPABILITIES` list. Verification against `virtual-schema-common-java/doc/development/api/capabilities_list.md` confirmed that neither name exists in Exasol's capability vocabulary. Exasol normalises `a > b` to `b < a` and `a >= b` to `b <= a` before the pushdown request reaches the adapter, so the adapter never receives nodes with these names in practice. Advertising non-existent capability names is misleading dead capability that future reviewers would re-litigate.
+
+### Decision
+
+Delete `FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` from `CAPABILITIES`. The `predicate_greater` and `predicate_greaterequal` translator arms in `vs-expression` are retained as defensive no-ops (they are never reached in practice but do no harm).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Remove both names from CAPABILITIES; keep translator arms as defensive no-ops | ✓ Chosen — the names are not in Exasol's vocabulary; advertising them is misleading |
+| Leave them (Exasol ignores unknown names) | ✗ Rejected — future reviewer would re-litigate; inconsistent with the capability invariant (ADR-014) |
+
+### Consequences
+
+The capability list no longer contains names outside Exasol's vocabulary. The translator arms for `predicate_greater(equal)` stay as a safety net for any future Exasol version that might emit them, but are otherwise unreachable.
+
+---
+
+## ADR-016: STDDEV/VARIANCE Pushdown via (count, sum, sum_sq) Sufficient Statistics
+
+**Date:** 2026-06-22
+**Plan:** `add-capability-alignment`
+**Status:** Accepted
+
+### Context
+
+The STDDEV and VARIANCE family of aggregates are not directly shard-associative: averaging per-shard standard deviations is mathematically incorrect for unequal shard sizes. However, the three sufficient statistics `COUNT(col)`, `SUM(col)`, and `SUM(col*col)` are individually shard-associative (each merges via SUM) and together allow exact reconstruction of variance and standard deviation in the outer wrapper.
+
+### Decision
+
+Advertise the STDDEV/VARIANCE family (`FN_AGG_STDDEV`, `FN_AGG_STDDEV_POP`, `FN_AGG_STDDEV_SAMP`, `FN_AGG_VARIANCE`, `FN_AGG_VAR_POP`, `FN_AGG_VAR_SAMP`) by decomposing each into a `(COUNT(col), SUM(col), SUM(col*col))` sufficient-statistics triple emitted per shard. The outer wrapper reconstructs variance as `(SUM(sum_sq) - SUM(sum)^2/SUM(cnt)) / d` (where `d` is `SUM(cnt)` for population forms and `SUM(cnt)-1` for sample forms) and standard deviation as its square root, with NULL guards for zero count and single-sample cases.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Sufficient-statistics decomposition: (count, sum, sum_sq) per shard | ✓ Chosen — exactly shard-associative; reconstructs exact result within float tolerance |
+| Per-shard stddev then average the per-shard values | ✗ Rejected — mathematically incorrect for unequal shard sizes |
+| Skip statistical aggregates entirely | ✗ Rejected — leaves easily supportable DataFusion capabilities off the table |
+
+### Consequences
+
+Statistical aggregates push down correctly across shards. The wrapper SQL is more complex (three partial columns per statistical aggregate plus the reconstruction formula). NULL/zero-count guards are required to avoid division-by-zero and negative-radicand edge cases. The approach is consistent with the partial/merge pattern already used for AVG (ADR-008).
+
+---
+
+## ADR-017: HAVING Applied in the Outer Merge Wrapper Only
+
+**Date:** 2026-06-22
+**Plan:** `add-capability-alignment`
+**Status:** Accepted
+
+### Context
+
+With sharded partial aggregation, each shard emits one partial-aggregate row per group. The final HAVING predicate must be evaluated after the per-shard partials are merged into the true group aggregate. Applying HAVING inside the per-shard scan would silently discard groups whose aggregate value only clears the HAVING threshold after cross-shard merge, producing wrong results.
+
+### Decision
+
+Render the HAVING predicate via the shared `vs-expression` translator and apply it only in the OUTER wrapper SQL that merges the per-shard partial-aggregate rows. Never include a HAVING clause in the per-shard partial scan query. A HAVING predicate the adapter cannot translate is omitted from the wrapper SQL; Exasol retains it as a correctness backstop.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| HAVING in the outer merge wrapper only | ✓ Chosen — HAVING is logically evaluated after grouping is complete; "complete" with sharded partials means post-merge |
+| HAVING applied per shard | ✗ Rejected — discards groups that only clear the threshold after cross-shard merge; produces wrong results |
+
+### Consequences
+
+The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never does. This is the same structural pattern as the outer-wrapper aggregate merge in ADR-008 and ADR-016: logic that requires the full group picture goes in the wrapper, not the shard.
