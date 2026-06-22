@@ -5,8 +5,9 @@ pub mod convert;
 pub mod emit;
 pub mod spec;
 
+use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{emit_stream, redact_storage_error};
-use crate::scan::spec::ScanSpec;
+use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
@@ -50,15 +51,192 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 }
 
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
-    let secrets = spec.storage.secret_values();
     let session_ctx = build_session_context(spec)?;
-    let df = build_dataframe(&session_ctx, spec).await?;
-    let stream = df
-        .execute_stream()
+    if spec.aggregates.is_some() {
+        run_partial_aggregate(ctx, &session_ctx, spec).await
+    } else {
+        let secrets = spec.storage.secret_values();
+        let df = build_dataframe(&session_ctx, spec).await?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        emit_stream(ctx, stream, &secrets).await?;
+        Ok(())
+    }
+}
+
+/// Run a node-local partial aggregate and emit exactly one row per shard.
+///
+/// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`).
+async fn run_partial_aggregate(
+    ctx: &mut dyn UdfContext,
+    session_ctx: &SessionContext,
+    spec: &ScanSpec,
+) -> Result<(), UdfError> {
+    let secrets = spec.storage.secret_values();
+    let aggregates = spec
+        .aggregates
+        .as_deref()
+        .expect("run_partial_aggregate called without aggregates");
+
+    // Register the assigned files so we can query them.
+    let table_name = "scan_target";
+    register_files(session_ctx, table_name, spec).await?;
+
+    // Build the alias inner SELECT (uppercase column names).
+    let table = session_ctx
+        .table(table_name)
+        .await
+        .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
+    let schema = table.schema();
+    let alias_items: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let arrow_name = f.name();
+            format!(
+                "{} AS {}",
+                quote_ident(arrow_name),
+                quote_ident(&arrow_name.to_uppercase())
+            )
+        })
+        .collect();
+    let aliased_table = format!("SELECT {} FROM {table_name}", alias_items.join(", "));
+
+    let sql = build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.filter.as_deref());
+
+    let df = session_ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| UdfError::User(format!("partial aggregate SQL error: {e}")))?;
+
+    // Execute and collect the single partial-aggregate row.
+    let batches = df
+        .collect()
         .await
         .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
-    emit_stream(ctx, stream, &secrets).await?;
+
+    // The aggregate always produces exactly one row (even over an empty table).
+    // Emit that row; if the query produced no batches at all (should not happen
+    // for a well-formed aggregate), emit a row of NULLs.
+    let row = if let Some(batch) = batches.first() {
+        if batch.num_rows() > 0 {
+            // Convert the single row from the batch.
+            (0..batch.num_columns())
+                .map(|col_idx| arrow_value_at(batch.column(col_idx), 0))
+                .collect::<Vec<_>>()
+        } else {
+            emit_null_partial_row(aggregates)
+        }
+    } else {
+        emit_null_partial_row(aggregates)
+    };
+
+    ctx.emit(&row)?;
     Ok(())
+}
+
+/// Build the fallback null partial row for an empty aggregate result.
+///
+/// COUNT/CountCol -> 0 (not NULL); SUM/Min/Max/Avg parts -> NULL.
+fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::value::Value> {
+    use exasol_udf_sdk::value::Value;
+    let mut row = Vec::new();
+    for plan in aggregates {
+        match plan.kind {
+            AggKind::Count | AggKind::CountCol => row.push(Value::Int64(0)),
+            AggKind::Sum | AggKind::Min | AggKind::Max => row.push(Value::Null),
+            AggKind::Avg => {
+                row.push(Value::Null); // partial_avg_sum
+                row.push(Value::Int64(0)); // partial_avg_cnt
+            }
+        }
+    }
+    row
+}
+
+/// COLUMN CONTRACT:
+///
+/// Iterating `aggregates` in order, each plan item at index `i` contributes:
+/// - `Count`    -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
+/// - `CountCol` -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
+/// - `Sum`      -> 1 column: `"PARTIAL_sum_{i}"`     (DOUBLE PRECISION, summable)
+/// - `Min`      -> 1 column: `"PARTIAL_min_{i}"`     (DOUBLE PRECISION, re-minnable)
+/// - `Max`      -> 1 column: `"PARTIAL_max_{i}"`     (DOUBLE PRECISION, re-maxable)
+/// - `Avg`      -> 2 columns: `"PARTIAL_avg_sum_{i}"` (DOUBLE PRECISION) then
+///   `"PARTIAL_avg_cnt_{i}"` (DECIMAL(20,0))
+///
+/// The scan UDF aggregate SELECT list, the EMITS clause in the fan-out SQL, and
+/// the outer merge SELECT MUST all agree on this order and column count.
+///
+/// `aliased_table` is a subquery string: `SELECT ... FROM scan_target` with
+/// uppercase aliases already applied. No filter applied.
+pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
+    build_partial_agg_sql_filtered(aggregates, aliased_table, None)
+}
+
+/// Build the partial-aggregate SQL, optionally with a WHERE clause.
+pub fn build_partial_agg_sql_filtered(
+    aggregates: &[AggregatePlan],
+    aliased_table: &str,
+    filter: Option<&str>,
+) -> String {
+    let select_items: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .flat_map(|(i, plan)| partial_select_items(plan, i))
+        .collect();
+
+    let mut sql = format!(
+        "SELECT {} FROM ({})",
+        select_items.join(", "),
+        aliased_table
+    );
+
+    if let Some(f) = filter
+        && !f.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        sql.push_str(f);
+    }
+
+    sql
+}
+
+/// Produce the SELECT list items for one aggregate plan entry at index `i`.
+fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
+    match plan.kind {
+        AggKind::Count => {
+            vec![format!(r#"COUNT(*) AS "PARTIAL_count_{i}""#)]
+        }
+        AggKind::CountCol => {
+            let col = plan.column.as_deref().unwrap_or("");
+            vec![format!(
+                r#"COUNT({}) AS "PARTIAL_count_{i}""#,
+                quote_ident(col)
+            )]
+        }
+        AggKind::Sum => {
+            let col = plan.column.as_deref().unwrap_or("");
+            vec![format!(r#"SUM({}) AS "PARTIAL_sum_{i}""#, quote_ident(col))]
+        }
+        AggKind::Min => {
+            let col = plan.column.as_deref().unwrap_or("");
+            vec![format!(r#"MIN({}) AS "PARTIAL_min_{i}""#, quote_ident(col))]
+        }
+        AggKind::Max => {
+            let col = plan.column.as_deref().unwrap_or("");
+            vec![format!(r#"MAX({}) AS "PARTIAL_max_{i}""#, quote_ident(col))]
+        }
+        AggKind::Avg => {
+            let col = plan.column.as_deref().unwrap_or("");
+            vec![
+                format!(r#"SUM({}) AS "PARTIAL_avg_sum_{i}""#, quote_ident(col)),
+                format!(r#"COUNT({}) AS "PARTIAL_avg_cnt_{i}""#, quote_ident(col)),
+            ]
+        }
+    }
 }
 
 /// Build a DataFusion SessionContext with the MinIO object store registered.
@@ -268,4 +446,186 @@ async fn build_scan_sql(
 /// Double-quote an identifier (SQL-safe column name).
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::spec::{AggKind, AggregatePlan};
+
+    // ---------------------------------------------------------------------------
+    // Task 5.4 host-runnable unit tests for build_partial_agg_sql
+    // ---------------------------------------------------------------------------
+
+    fn sample_plans_count_sum_min_max() -> Vec<AggregatePlan> {
+        vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("TS".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("TS".into()),
+            },
+        ]
+    }
+
+    /// Column order: COUNT(*) first, then SUM, MIN, MAX — each one column.
+    #[test]
+    fn partial_agg_sql_count_star_uses_count_star() {
+        let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
+        assert!(
+            sql.contains("COUNT(*) AS"),
+            "COUNT(*) plan must use COUNT(*): {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_count_0"),
+            "COUNT(*) partial column must be PARTIAL_count_0: {sql}"
+        );
+    }
+
+    /// COUNT(col) plan uses COUNT("COL"), not COUNT(*).
+    #[test]
+    fn partial_agg_sql_count_col_uses_count_col() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::CountCol,
+            column: Some("ID".into()),
+        }];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+        assert!(
+            sql.contains(r#"COUNT("ID")"#),
+            "COUNT(col) must use COUNT(\"ID\"): {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_count_0"),
+            "COUNT(col) partial must be PARTIAL_count_0: {sql}"
+        );
+        assert!(
+            !sql.contains("COUNT(*)"),
+            "COUNT(col) must not use COUNT(*): {sql}"
+        );
+    }
+
+    /// SUM plan uses SUM("COL") at index 1.
+    #[test]
+    fn partial_agg_sql_sum_uses_sum_col() {
+        let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
+        assert!(
+            sql.contains(r#"SUM("AMOUNT") AS "PARTIAL_sum_1""#),
+            "SUM plan must use SUM(\"AMOUNT\") as PARTIAL_sum_1: {sql}"
+        );
+    }
+
+    /// MIN/MAX plans use MIN/MAX("COL").
+    #[test]
+    fn partial_agg_sql_min_max_use_min_max_col() {
+        let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
+        assert!(
+            sql.contains(r#"MIN("TS") AS "PARTIAL_min_2""#),
+            "MIN plan must use MIN at index 2: {sql}"
+        );
+        assert!(
+            sql.contains(r#"MAX("TS") AS "PARTIAL_max_3""#),
+            "MAX plan must use MAX at index 3: {sql}"
+        );
+    }
+
+    /// AVG plan emits TWO columns: sum first, count second.
+    #[test]
+    fn partial_agg_sql_avg_emits_sum_count_pair() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Avg,
+            column: Some("SCORE".into()),
+        }];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+        // Must NOT emit an AVG() function.
+        assert!(
+            !sql.contains("AVG("),
+            "must not use AVG() for partial avg: {sql}"
+        );
+        // Must emit SUM for the sum part.
+        assert!(
+            sql.contains(r#"SUM("SCORE") AS "PARTIAL_avg_sum_0""#),
+            "AVG plan must emit SUM as PARTIAL_avg_sum_0: {sql}"
+        );
+        // Must emit COUNT(col) for the count part (not COUNT(*)).
+        assert!(
+            sql.contains(r#"COUNT("SCORE") AS "PARTIAL_avg_cnt_0""#),
+            "AVG plan must emit COUNT(col) as PARTIAL_avg_cnt_0: {sql}"
+        );
+    }
+
+    /// Mixed: COUNT/SUM/AVG — AVG contributes two columns at indices 2 (sum) and 2 (cnt),
+    /// i.e., each plan item is indexed by its position in the aggregates vec.
+    #[test]
+    fn partial_agg_sql_mixed_column_order_and_indices() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Avg,
+                column: Some("SCORE".into()),
+            },
+        ];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+        // COUNT at index 0.
+        assert!(sql.contains("PARTIAL_count_0"), "count at index 0: {sql}");
+        // SUM at index 1.
+        assert!(sql.contains("PARTIAL_sum_1"), "sum at index 1: {sql}");
+        // AVG at index 2 -> both sum and cnt use index 2.
+        assert!(
+            sql.contains("PARTIAL_avg_sum_2"),
+            "avg sum at index 2: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_avg_cnt_2"),
+            "avg cnt at index 2: {sql}"
+        );
+    }
+
+    /// Filter is applied when present.
+    #[test]
+    fn partial_agg_sql_applies_filter() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+        }];
+        let sql = build_partial_agg_sql_filtered(&plans, "aliased", Some("\"ID\" > 5"));
+        assert!(
+            sql.contains("WHERE"),
+            "filter must produce WHERE clause: {sql}"
+        );
+        assert!(
+            sql.contains("\"ID\" > 5"),
+            "filter expression must appear: {sql}"
+        );
+    }
+
+    /// No filter: no WHERE clause.
+    #[test]
+    fn partial_agg_sql_no_filter_no_where() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+        }];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+        assert!(
+            !sql.contains("WHERE"),
+            "no filter must produce no WHERE: {sql}"
+        );
+    }
 }

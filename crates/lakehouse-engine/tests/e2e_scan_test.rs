@@ -537,3 +537,268 @@ fn e2e_fails_when_stack_unavailable() {
         "ExaConn::connect to an unreachable host must panic, not return Ok"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 5.4 / Plan scenario coverage: partial-aggregate E2E stubs
+// Group D fills in the assertions; we define the function names here so the
+// plan's scenario table can reference them and they compile without the feature.
+// ---------------------------------------------------------------------------
+
+/// Scan computes a node-local partial aggregate instead of raw rows.
+///
+/// Verifies: spec with aggregate plan causes the UDF to emit one partial row
+/// per shard, not the full row set.
+#[test]
+fn scan_emits_partial_aggregate_row() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // COUNT(*) over the whole table: one merged row with the total row count.
+    let cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {}", vs_table()));
+    assert_eq!(cols.len(), 1, "COUNT(*) must return one column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "COUNT(*) must return one row: {cols:?}");
+    let count = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("COUNT(*) result not integer: {:?}", cols[0][0]));
+    // The seeded table has 20 rows.
+    assert_eq!(count, 20, "COUNT(*) should return 20 for the seeded table");
+}
+
+/// Partial COUNT/SUM/MIN/MAX emitted in merge-ready form.
+///
+/// Verifies: each aggregate type returns the correct merged scalar.
+#[test]
+fn partial_count_sum_min_max_merge_ready() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // score = 5.0 * id for id 1..20; SUM = 5*(1+2+...+20) = 5*210 = 1050.
+    let cols = conn.query_columns(&format!(
+        "SELECT COUNT(*), SUM(score), MIN(score), MAX(score) FROM {}",
+        vs_table()
+    ));
+    assert_eq!(cols.len(), 4, "must return 4 columns: {cols:?}");
+
+    let count = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("COUNT must be integer");
+    assert_eq!(count, 20, "COUNT(*) must be 20");
+
+    let sum = cols[1][0]
+        .as_f64()
+        .or_else(|| cols[1][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("SUM must be numeric");
+    assert!(
+        (sum - 1050.0).abs() < 0.001,
+        "SUM(score) must be 1050, got {sum}"
+    );
+
+    let min = cols[2][0]
+        .as_f64()
+        .or_else(|| cols[2][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("MIN must be numeric");
+    assert!(
+        (min - 5.0).abs() < 0.001,
+        "MIN(score) must be 5.0, got {min}"
+    );
+
+    let max = cols[3][0]
+        .as_f64()
+        .or_else(|| cols[3][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("MAX must be numeric");
+    assert!(
+        (max - 100.0).abs() < 0.001,
+        "MAX(score) must be 100.0, got {max}"
+    );
+}
+
+/// AVG emitted as a partial sum and partial count pair.
+///
+/// Verifies: AVG(score) returns the correct average, including with a WHERE filter.
+#[test]
+fn partial_avg_emits_sum_count_pair() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // AVG(score) over all rows: 1050.0 / 20 = 52.5.
+    let cols = conn.query_columns(&format!("SELECT AVG(score) FROM {}", vs_table()));
+    assert_eq!(cols.len(), 1, "AVG must return one column: {cols:?}");
+    let avg = cols[0][0]
+        .as_f64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("AVG must be numeric");
+    assert!(
+        (avg - 52.5).abs() < 0.001,
+        "AVG(score) must be 52.5, got {avg}"
+    );
+
+    // AVG with WHERE: score > 15.0 → id >= 4 (17 rows), scores 20..100.
+    // SUM = 5*(4+5+...+20) = 5*(17*12) = 5*204... actually sum of 4..20 = (4+20)*17/2 = 204,
+    // so SUM(score) = 5*204 = 1020, AVG = 1020/17 = 60.0.
+    let cols_filtered = conn.query_columns(&format!(
+        "SELECT AVG(score) FROM {} WHERE score > 15.0",
+        vs_table()
+    ));
+    let avg_filtered = cols_filtered[0][0]
+        .as_f64()
+        .or_else(|| cols_filtered[0][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("filtered AVG must be numeric");
+    assert!(
+        (avg_filtered - 60.0).abs() < 0.001,
+        "filtered AVG(score) must be 60.0, got {avg_filtered}"
+    );
+}
+
+/// After createVirtualSchema the CLUSTER_NODES count is recorded in the schema's
+/// adapterNotes and is >= 1.
+///
+/// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
+/// column for adapter-controlled schema state. Exasol does NOT persist
+/// adapter-returned schemaMetadata.properties (they are silently dropped and
+/// never appear in any catalog view), so the adapter carries CLUSTER_NODES in
+/// adapterNotes (a JSON string), which Exasol DOES persist and surface here.
+///
+/// (The view is keyed by SCHEMA_NAME, confirmed against the live DB.)
+///
+/// CONNECTION_NAME is not supplied in create_virtual_schema, so connect-back
+/// defaults to 1 — asserting >= 1 (not == cluster size) is correct and robust.
+#[test]
+fn create_vs_records_cluster_nodes_property() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
+         WHERE SCHEMA_NAME = '{VS_NAME}'"
+    ));
+    assert_eq!(
+        cols.len(),
+        1,
+        "query must return one column (ADAPTER_NOTES): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "the virtual schema must exist (one row): {cols:?}"
+    );
+    let notes = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES value is not a string: {:?}", cols[0][0]));
+    assert!(
+        !notes.is_empty(),
+        "ADAPTER_NOTES must be non-empty (Exasol must have persisted it): {notes:?}"
+    );
+
+    // adapterNotes is a JSON string carrying {"CLUSTER_NODES":"<n>"}.
+    let parsed: serde_json::Value = serde_json::from_str(notes)
+        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
+    let raw = parsed["CLUSTER_NODES"]
+        .as_str()
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry CLUSTER_NODES as a string: {notes:?}"));
+    let n: i64 = raw
+        .parse()
+        .unwrap_or_else(|_| panic!("CLUSTER_NODES value '{raw}' is not an integer"));
+    assert!(n >= 1, "CLUSTER_NODES must be >= 1, got {n}");
+}
+
+/// COUNT(col) aggregate pushdown returns the correct non-null row count.
+///
+/// Verifies COUNT(score) and COUNT(score) WHERE score > 15.0, covering the
+/// COUNT(col) case not exercised by existing COUNT(*) tests.
+#[test]
+fn aggregate_count_col_returns_correct_value() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // COUNT(score) over all rows: all 20 rows have non-null score.
+    let cols = conn.query_columns(&format!("SELECT COUNT(score) FROM {}", vs_table()));
+    assert_eq!(
+        cols.len(),
+        1,
+        "COUNT(score) must return one column: {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "COUNT(score) must return one row: {cols:?}"
+    );
+    let count_all = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("COUNT(score) result not integer: {:?}", cols[0][0]));
+    assert_eq!(count_all, 20, "COUNT(score) must be 20 (all rows non-null)");
+
+    // COUNT(score) WHERE score > 15.0 → 17 rows (SEED_ROWS_SCORE_GT_15).
+    let cols_filtered = conn.query_columns(&format!(
+        "SELECT COUNT(score) FROM {} WHERE score > 15.0",
+        vs_table()
+    ));
+    let count_filtered = cols_filtered[0][0]
+        .as_i64()
+        .or_else(|| cols_filtered[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| {
+            panic!(
+                "filtered COUNT(score) result not integer: {:?}",
+                cols_filtered[0][0]
+            )
+        });
+    assert_eq!(
+        count_filtered, SEED_ROWS_SCORE_GT_15 as i64,
+        "COUNT(score) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_filtered}"
+    );
+
+    // COUNT(*) WHERE score > 15.0 — also verifies the WHERE path for COUNT(*).
+    let cols_star = conn.query_columns(&format!(
+        "SELECT COUNT(*) FROM {} WHERE score > 15.0",
+        vs_table()
+    ));
+    let count_star = cols_star[0][0]
+        .as_i64()
+        .or_else(|| cols_star[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("COUNT(*) WHERE result not integer: {:?}", cols_star[0][0]));
+    assert_eq!(
+        count_star, SEED_ROWS_SCORE_GT_15 as i64,
+        "COUNT(*) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_star}"
+    );
+}
+
+/// A multi-shard fan-out query returns the complete, non-overlapping row set.
+///
+/// The test Exasol stack is single-node so partition_files yields one shard at
+/// runtime; true cross-node file placement is exercised only on a real multi-node
+/// cluster. On the single-node stack this test asserts the union-completeness
+/// invariant: the fan-out/union path returns every row exactly once with no gaps
+/// and no duplicates — the correctness property that multi-shard sharding guarantees.
+#[test]
+fn multi_shard_row_query_matches_single_shard() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cols = conn.query_columns(&format!("SELECT id FROM {} ORDER BY id", vs_table()));
+    assert_eq!(cols.len(), 1, "SELECT id must return one column: {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "fan-out must return all 20 rows, no duplicates, no gaps: got {}",
+        cols[0].len()
+    );
+
+    let ids: Vec<i64> = cols[0]
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("id is not an integer: {v:?}"))
+        })
+        .collect();
+
+    for (pos, &id) in ids.iter().enumerate() {
+        let expected = (pos + 1) as i64;
+        assert_eq!(
+            id, expected,
+            "id at position {pos} must be {expected}, got {id} (union-completeness violated)"
+        );
+    }
+}

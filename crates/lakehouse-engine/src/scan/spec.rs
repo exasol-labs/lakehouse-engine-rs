@@ -10,6 +10,33 @@
 /// Credentials (`access_key`, `secret_key`) MUST NEVER appear in any error message.
 use serde::{Deserialize, Serialize};
 
+/// The kind of aggregate function to compute node-locally as a partial result.
+///
+/// COUNT(*) maps to `Count` (no column), COUNT(col) maps to `CountCol`.
+/// AVG is decomposed into a (partial_sum, partial_count) pair in the scan UDF;
+/// the adapter wrapper SQL performs the final division.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AggKind {
+    Count,
+    CountCol,
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// One aggregate function in a pushed-down aggregate plan.
+///
+/// `column` is `None` for `COUNT(*)` and `Some(col_name)` for all other
+/// variants.  The column name matches the projected column name (uppercase).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AggregatePlan {
+    pub kind: AggKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+}
+
 /// Storage connection properties (S3-compatible / MinIO).
 /// Fields are plain Strings so serde handles them uniformly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +108,12 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 
+    /// Ordered list of aggregate functions to compute as node-local partial
+    /// results. `None` (the default) means row scanning; absent from JSON when
+    /// serialized so pre-existing scan specs are backward-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregates: Option<Vec<AggregatePlan>>,
+
     pub storage: StorageProps,
     pub catalog: CatalogProps,
 }
@@ -114,6 +147,7 @@ mod tests {
             projection: vec!["id".into(), "name".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
+            aggregates: None,
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -166,10 +200,74 @@ mod tests {
         spec.filter = None;
         spec.limit = None;
         spec.storage.session_token = None;
+        spec.aggregates = None;
         let json = spec.to_json();
         assert!(!json.contains("filter"));
         assert!(!json.contains("limit"));
         assert!(!json.contains("session_token"));
+        assert!(
+            !json.contains("aggregates"),
+            "aggregates field must be absent when None: {json}"
+        );
+    }
+
+    /// Task 4.1: Aggregate plan round-trips through JSON and does not appear in row-scan specs.
+    #[test]
+    fn aggregate_plan_round_trips_and_absent_from_row_scan() {
+        // Row scan: aggregates must be absent.
+        let row_spec = sample_spec();
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("aggregates"),
+            "row-scan spec must not carry aggregates field: {row_json}"
+        );
+
+        // Aggregate scan: round-trip with all supported kinds.
+        let mut agg_spec = sample_spec();
+        agg_spec.aggregates = Some(vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            },
+            AggregatePlan {
+                kind: AggKind::CountCol,
+                column: Some("ID".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("TS".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("TS".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Avg,
+                column: Some("AMOUNT".into()),
+            },
+        ]);
+        let agg_json = agg_spec.to_json();
+        assert!(
+            agg_json.contains("aggregates"),
+            "aggregate spec must carry the aggregates field: {agg_json}"
+        );
+
+        let back = ScanSpec::from_json(&agg_json).unwrap();
+        let plans = back.aggregates.expect("aggregates must survive round-trip");
+        assert_eq!(plans.len(), 6);
+        assert_eq!(plans[0].kind, AggKind::Count);
+        assert_eq!(plans[0].column, None);
+        assert_eq!(plans[1].kind, AggKind::CountCol);
+        assert_eq!(plans[1].column.as_deref(), Some("ID"));
+        assert_eq!(plans[2].kind, AggKind::Sum);
+        assert_eq!(plans[3].kind, AggKind::Min);
+        assert_eq!(plans[4].kind, AggKind::Max);
+        assert_eq!(plans[5].kind, AggKind::Avg);
+        assert_eq!(plans[5].column.as_deref(), Some("AMOUNT"));
     }
 
     #[test]

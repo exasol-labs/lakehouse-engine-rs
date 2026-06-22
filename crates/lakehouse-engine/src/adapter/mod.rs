@@ -5,6 +5,7 @@
 pub mod capabilities;
 pub mod predicate;
 pub mod pushdown;
+pub mod sharding;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
@@ -29,6 +30,23 @@ const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 // reference the scan UDF schema-qualified, because it executes outside the
 // adapter script's schema context. Optional: unqualified when unset.
 const PROP_SCAN_SCHEMA: &str = "SCAN_SCHEMA";
+// Optional: name of an Exasol CONNECTION object whose credentials are used to
+// open a connect-back session for `SELECT NPROC()`. When absent, CLUSTER_NODES
+// defaults to 1 without error.
+const PROP_CONNECTION_NAME: &str = "CONNECTION_NAME";
+// Key written into the createVirtualSchema response under
+// schemaMetadata.adapterNotes (a stringified JSON object) so that subsequent
+// requests (pushdown, refresh) can read the resolved node count back from
+// `schemaMetadataInfo.adapterNotes`.
+//
+// adapterNotes is used rather than schemaMetadata.properties because Exasol
+// (2025.2.1) does NOT persist adapter-returned schemaMetadata.properties — they
+// are silently dropped and never appear in any catalog view. adapterNotes, by
+// contrast, is persisted at the schema level, passed back in
+// schemaMetadataInfo.adapterNotes, and is queryable via
+// SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES. Exasol requires adapterNotes to be
+// a JSON *string* (a raw JSON object fails with "No valid json string").
+const NOTE_CLUSTER_NODES: &str = "CLUSTER_NODES";
 
 /// Main adapter dispatch function.
 ///
@@ -41,13 +59,13 @@ pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, 
     Ok(response.to_string())
 }
 
-fn dispatch(_ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> {
+fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> {
     match request.get("type").and_then(|t| t.as_str()) {
         Some("getCapabilities") => Ok(get_capabilities_response()),
-        Some("createVirtualSchema") => handle_create_virtual_schema(request),
+        Some("createVirtualSchema") => handle_create_virtual_schema(ctx, request),
         Some("refreshVirtualSchema") => {
             // Stateless: refresh = re-resolve schema, same as create.
-            handle_create_virtual_schema(request)
+            handle_create_virtual_schema(ctx, request)
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
@@ -64,9 +82,14 @@ fn dispatch(_ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError>
     }
 }
 
-fn handle_create_virtual_schema(request: &Json) -> Result<Json, UdfError> {
+fn handle_create_virtual_schema(
+    ctx: &mut dyn UdfContext,
+    request: &Json,
+) -> Result<Json, UdfError> {
     let props = get_properties(request);
     let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
+
+    let cluster_nodes = resolve_cluster_nodes(ctx, &props);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -94,11 +117,17 @@ fn handle_create_virtual_schema(request: &Json) -> Result<Json, UdfError> {
         .next_back()
         .unwrap_or(&catalog.table)
         .to_uppercase();
+    // Exasol persists `adapterNotes` (a JSON *string*) at the schema level and
+    // passes it back in `schemaMetadataInfo.adapterNotes` on later requests.
+    // Carry the resolved node count there; merge into any pre-existing notes so
+    // we never clobber state another channel may have written.
+    let adapter_notes = build_adapter_notes(request, cluster_nodes);
     let schema_metadata = json!({
         "tables": [{
             "name": table_name,
             "columns": columns,
-        }]
+        }],
+        "adapterNotes": adapter_notes,
     });
 
     let response_type =
@@ -118,12 +147,20 @@ async fn handle_pushdown_request(request: &Json) -> Result<Json, UdfError> {
     let props = get_properties(request);
     let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
     let scan_schema = str_prop(&props, PROP_SCAN_SCHEMA).map(|s| s.to_string());
+    // CLUSTER_NODES is carried in adapterNotes (persisted by Exasol), NOT in
+    // properties (dropped by Exasol). Read it from schemaMetadataInfo.adapterNotes;
+    // default to 1 when absent or unparseable.
+    let cluster_nodes = adapter_note(request, NOTE_CLUSTER_NODES)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
     handle_pushdown(
         request,
         &catalog_uri,
         &storage,
         &catalog,
         scan_schema.as_deref(),
+        cluster_nodes,
     )
     .await
     .map_err(|e| redact_error(&storage, e))
@@ -155,6 +192,44 @@ fn str_prop<'a>(props: &'a Json, key: &str) -> Option<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse `request.schemaMetadataInfo.adapterNotes` (a JSON *string*) into a JSON
+/// object. Returns an empty object when adapterNotes is absent, empty, or not a
+/// parseable JSON object — callers fall back to their own defaults.
+fn parse_adapter_notes(request: &Json) -> serde_json::Map<String, Json> {
+    request
+        .get("schemaMetadataInfo")
+        .and_then(|smi| smi.get("adapterNotes"))
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<Json>(s).ok())
+        .and_then(|v| match v {
+            Json::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Read a single string value from the persisted adapterNotes.
+fn adapter_note(request: &Json, key: &str) -> Option<String> {
+    parse_adapter_notes(request)
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Build the adapterNotes value for the createVirtualSchema response: a JSON
+/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES. Any
+/// pre-existing notes on the request are preserved (merge, not clobber).
+fn build_adapter_notes(request: &Json, cluster_nodes: u32) -> Json {
+    let mut notes = parse_adapter_notes(request);
+    notes.insert(
+        NOTE_CLUSTER_NODES.to_string(),
+        Json::String(cluster_nodes.to_string()),
+    );
+    Json::String(Json::Object(notes).to_string())
 }
 
 /// Extract catalog URI, StorageProps, and CatalogProps from the VS properties.
@@ -202,6 +277,39 @@ fn extract_connection_props(
     };
 
     Ok((catalog_uri, storage, catalog))
+}
+
+/// Open a connect-back session and run `SELECT NPROC()` to obtain the active
+/// cluster node count. Returns 1 on any failure so `createVirtualSchema` never
+/// fails due to an unreachable or misconfigured connect-back path.
+fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> u32 {
+    let Some(conn_name) = str_prop(props, PROP_CONNECTION_NAME) else {
+        return 1;
+    };
+    let result = (|| -> Result<u32, UdfError> {
+        let conn_obj = ctx.connection(conn_name)?;
+        let mut session = ctx.connect_back(&conn_obj)?;
+        let rows = session.query("SELECT NPROC()")?;
+        let value = rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next());
+        Ok(nproc_value_to_count(value))
+    })();
+    result.unwrap_or(1)
+}
+
+/// Convert the first cell of a `SELECT NPROC()` result to a positive node count.
+/// Returns 1 for NULL, zero, negative, or unrecognised value variants.
+fn nproc_value_to_count(value: Option<exasol_udf_sdk::value::Value>) -> u32 {
+    use exasol_udf_sdk::value::Value;
+    let n: i64 = match value {
+        Some(Value::Int32(v)) => v as i64,
+        Some(Value::Int64(v)) => v,
+        Some(Value::Numeric(d)) if d.scale == 0 => i64::try_from(d.unscaled).unwrap_or(0),
+        _ => 0,
+    };
+    if n >= 1 { n as u32 } else { 1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,5 +443,136 @@ mod tests {
         fn next(&mut self) -> Result<bool, UdfError> {
             Ok(false)
         }
+    }
+
+    #[test]
+    fn cluster_nodes_defaults_to_one_on_connect_back_failure() {
+        // NoopCtx returns UdfError::Unimplemented for all connect-back methods,
+        // exercising the default-to-1 path without any network I/O.
+        let props = serde_json::json!({
+            PROP_CONNECTION_NAME: "SOME_CONNECTION"
+        });
+        let count = resolve_cluster_nodes(&mut NoopCtx, &props);
+        assert_eq!(count, 1u32);
+    }
+
+    #[test]
+    fn cluster_nodes_defaults_to_one_when_no_connection_name() {
+        let props = serde_json::json!({});
+        let count = resolve_cluster_nodes(&mut NoopCtx, &props);
+        assert_eq!(count, 1u32);
+    }
+
+    /// Verifies that the createVirtualSchema response JSON carries CLUSTER_NODES
+    /// in schemaMetadata.adapterNotes (a JSON *string*, the only channel Exasol
+    /// persists) under the default-1 path (no CONNECTION_NAME).
+    ///
+    /// Exercises the JSON-assembly seam without catalog or network I/O.
+    #[test]
+    fn create_response_carries_cluster_nodes_property() {
+        let props = serde_json::json!({});
+        let cluster_nodes = resolve_cluster_nodes(&mut NoopCtx, &props);
+        assert_eq!(cluster_nodes, 1u32, "default cluster_nodes must be 1");
+
+        // Replicate the schema_metadata construction from handle_create_virtual_schema.
+        // The request has no pre-existing adapterNotes (clean set path).
+        let request = serde_json::json!({"type": "createVirtualSchema"});
+        let adapter_notes = build_adapter_notes(&request, cluster_nodes);
+        let schema_metadata = serde_json::json!({
+            "tables": [],
+            "adapterNotes": adapter_notes,
+        });
+        let response = serde_json::json!({
+            "type": "createVirtualSchema",
+            "schemaMetadata": schema_metadata,
+        });
+
+        // adapterNotes MUST be a JSON string (Exasol rejects a raw object).
+        let notes_str = response["schemaMetadata"]["adapterNotes"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("schemaMetadata.adapterNotes must be a JSON string: {response}")
+            });
+        // The string parses to an object carrying CLUSTER_NODES = "1".
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+        let val = parsed[NOTE_CLUSTER_NODES]
+            .as_str()
+            .unwrap_or_else(|| panic!("adapterNotes.CLUSTER_NODES must be a string: {parsed}"));
+        assert_eq!(
+            val, "1",
+            "CLUSTER_NODES must be \"1\" on the default path, got \"{val}\""
+        );
+    }
+
+    /// Verifies the round-trip: a CLUSTER_NODES written into adapterNotes by
+    /// createVirtualSchema is read back by the pushdown path from
+    /// schemaMetadataInfo.adapterNotes (the channel Exasol actually persists).
+    #[test]
+    fn adapter_notes_cluster_nodes_round_trips() {
+        // createVirtualSchema produces the adapterNotes string for, say, 4 nodes.
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(&create_req, 4);
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+
+        // Exasol persists that string and hands it back under
+        // schemaMetadataInfo.adapterNotes on the next pushdown request.
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+        });
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_CLUSTER_NODES).as_deref(),
+            Some("4"),
+            "CLUSTER_NODES must round-trip through adapterNotes"
+        );
+    }
+
+    /// Verifies the default-to-1 fallback when adapterNotes is absent or
+    /// unparseable on a pushdown request.
+    #[test]
+    fn adapter_note_absent_or_unparseable_yields_none() {
+        // No schemaMetadataInfo at all.
+        let bare = serde_json::json!({"type": "pushdown"});
+        assert!(adapter_note(&bare, NOTE_CLUSTER_NODES).is_none());
+
+        // adapterNotes present but not valid JSON.
+        let garbage = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": "not json" },
+        });
+        assert!(adapter_note(&garbage, NOTE_CLUSTER_NODES).is_none());
+
+        // adapterNotes empty string.
+        let empty = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": "" },
+        });
+        assert!(adapter_note(&empty, NOTE_CLUSTER_NODES).is_none());
+    }
+
+    /// Verifies merge-not-clobber: a pre-existing adapterNotes key survives when
+    /// createVirtualSchema rewrites the notes with the resolved node count.
+    #[test]
+    fn build_adapter_notes_merges_existing() {
+        let req = serde_json::json!({
+            "type": "refreshVirtualSchema",
+            "schemaMetadataInfo": {
+                "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
+            },
+        });
+        let notes = build_adapter_notes(&req, 3);
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(
+            parsed["OTHER_KEY"].as_str(),
+            Some("keep-me"),
+            "pre-existing adapterNotes keys must be preserved"
+        );
+        assert_eq!(
+            parsed[NOTE_CLUSTER_NODES].as_str(),
+            Some("3"),
+            "CLUSTER_NODES must be updated to the freshly resolved value"
+        );
     }
 }
