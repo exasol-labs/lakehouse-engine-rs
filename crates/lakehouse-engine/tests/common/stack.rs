@@ -98,12 +98,11 @@ pub fn exasol_container() -> String {
             "{{.Names}}",
         ])
         .output()
+        && let Some(name) = String::from_utf8_lossy(&out.stdout).lines().next()
     {
-        if let Some(name) = String::from_utf8_lossy(&out.stdout).lines().next() {
-            let name = name.trim();
-            if !name.is_empty() {
-                return name.to_string();
-            }
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
         }
     }
     "lakehouse-engine-rs-exasol-1".to_string()
@@ -116,15 +115,15 @@ pub fn exasol_container() -> String {
 /// 2. `BUCKETFS_WRITE_PASS` env var
 /// 3. docker exec into the Exasol container to read `/exa/etc/EXAConf`
 pub fn bucketfs_write_password() -> String {
-    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD") {
-        if !p.is_empty() {
-            return p;
-        }
+    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD")
+        && !p.is_empty()
+    {
+        return p;
     }
-    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASS") {
-        if !p.is_empty() {
-            return p;
-        }
+    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASS")
+        && !p.is_empty()
+    {
+        return p;
     }
     let container = exasol_container();
     let script = "awk '/\\[\\[Bucket : default\\]\\]/{flag=1} flag && /WritePasswd/{print $3; exit}' /exa/etc/EXAConf | base64 -d";
