@@ -139,3 +139,88 @@ A single authoritative Arrow-to-Exasol mapping table governs both `createVirtual
 ### Consequences
 
 Every Iceberg column is surfaced in the virtual schema, even complex types. Incompatible columns arrive as queryable JSON strings typed as `VARCHAR(2000000)`. The single shared mapping table is the source of truth for both the adapter and the scan; any future type additions must update both code sites. Out-of-range Decimal128 values incur a JSON serialization round-trip.
+
+---
+
+## ADR-006: Cluster Node Count Captured Once at createVirtualSchema via adapterNotes
+
+**Date:** 2026-06-21
+**Plan:** `add-multinode-sharding-and-agg-pushdown`
+**Status:** Accepted
+
+### Context
+
+The adapter needs the active Exasol cluster node count at pushdown time to decide how many file shards to create. The count must be obtainable without a per-query connect-back (which would add latency on the hot pushdown path). Exasol 2025.2.1 silently drops adapter-returned `schemaMetadata.properties` — they never appear in any catalog view and are not round-tripped to the adapter. The `adapterNotes` field, by contrast, is persisted by Exasol and returned to the adapter via `schemaMetadataInfo.adapterNotes` on every subsequent pushdown request.
+
+### Decision
+
+Run `SELECT NPROC()` over connect-back once during `createVirtualSchema`, store the result as the `CLUSTER_NODES` entry in the response's `adapterNotes` (stringified JSON). Default to 1 on any connect-back failure. Read `CLUSTER_NODES` from `schemaMetadataInfo.adapterNotes` at pushdown time to choose the shard count.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Fetch NPROC() once at createVirtualSchema; store in adapterNotes | ✓ Chosen — node count is stable for the VS lifetime; adapterNotes is persisted and round-tripped; one connect-back keeps the hot pushdown path free of extra latency |
+| Store node count in schemaMetadata.properties | ✗ Rejected — Exasol 2025.2.1 silently drops adapter-returned properties; they are never persisted or round-tripped |
+| Fetch NPROC() on every pushdown via connect-back | ✗ Rejected — per-query connect-back latency for a value stable across the VS lifetime |
+| Require user to set a static node-count property | ✗ Rejected — error-prone; drifts from reality as the cluster scales |
+
+### Consequences
+
+One connect-back at schema creation time; zero connect-back overhead at pushdown time. The node count is queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`. Default of 1 leaves the single-node execution path unchanged when the cluster is single-node or the connect-back fails.
+
+---
+
+## ADR-007: IPROC Fan-Out via Derived VALUES + GROUP BY IPROC(), shard_key
+
+**Date:** 2026-06-21
+**Plan:** `add-multinode-sharding-and-agg-pushdown`
+**Status:** Accepted
+
+### Context
+
+The adapter must distribute N file shards across N Exasol cluster nodes so each node's DataFusion UDF invocation scans only its own shard. Exasol's IPROC() function identifies the current execution node; GROUP BY over IPROC() causes Exasol to route each group to a distinct node when driving a SET UDF. No existing pattern in the sibling project strata-rs covers IPROC-based fan-out (strata-rs uses a single-invocation cache UDF with no IPROC/NPROC use), so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
+
+### Decision
+
+Express the cross-node fan-out as a single scan-driving query: a derived `VALUES` table of `(shard_key, per-shard ScanSpec)` rows, with the scan SET UDF invoked per group under `GROUP BY IPROC(), shard_key`. Exasol places each group on a distinct node, routing each shard's rows to the correct DataFusion UDF invocation.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Derived VALUES + GROUP BY IPROC(), shard_key | ✓ Chosen — idiomatic Exasol mechanism for distributing SET-UDF work across nodes; one query the optimizer can place |
+| UNION ALL of N separate UDF SELECTs | ✗ Rejected — does not guarantee node placement; bloats SQL linearly with shard count |
+| One UDF row per file | ✗ Rejected — no node-level batching; loses the shard-level data locality |
+
+### Consequences
+
+Node placement is guaranteed by Exasol's GROUP BY IPROC() routing. The fan-out is expressed in one query, keeping the planning layer simple. Adding more shards increases the VALUES rows, not the query structure.
+
+---
+
+## ADR-008: Partial/Merge Aggregate Decomposition; AVG as (sum, count) Pair
+
+**Date:** 2026-06-21
+**Plan:** `add-multinode-sharding-and-agg-pushdown`
+**Status:** Accepted
+
+### Context
+
+Aggregate pushdown must produce correct results across multiple shards. A naively per-shard average and then averaged-again across shards gives wrong results for unequal shard sizes. COUNT/SUM/MIN/MAX each have a well-defined partially-mergeable decomposition; AVG does not but can be decomposed into a (sum, count) pair that merges correctly.
+
+### Decision
+
+Split each supported aggregate into a node-local partial (computed in the scan UDF) and an Exasol-side merge (wrapper SQL): COUNT → SUM(partial_count), SUM → SUM(partial_sum), MIN → MIN(partial_min), MAX → MAX(partial_max). AVG is emitted as a (partial_sum, partial_count) pair and divided in the wrapper as `SUM(sum)/SUM(count)` with a zero-count NULL guard.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Partial+merge decomposition; AVG as (sum, count) pair | ✓ Chosen — exactly mergeable for COUNT/SUM/MIN/MAX; AVG sum/count pair is the only correct cross-shard decomposition; cuts transfer to one row per node |
+| Full aggregate in one UDF on one node | ✗ Rejected — does not scale; defeats the sharding purpose |
+| Emit per-shard average and average the averages | ✗ Rejected — mathematically incorrect for unequal shard sizes |
+
+### Consequences
+
+Network transfer is bounded to one partial-result row per shard, regardless of how many rows each shard scans. AVG requires two output columns per aggregated column, adding wrapper SQL complexity. The zero-count NULL guard preserves single-node AVG semantics for empty tables.

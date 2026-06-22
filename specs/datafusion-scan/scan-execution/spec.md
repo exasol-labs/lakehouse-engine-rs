@@ -1,18 +1,19 @@
 # Feature: DataFusion Scan Execution
 
 A disposable Rust SET UDF that, for one query, builds a DataFusion session, registers
-exactly the Iceberg/Parquet data files assigned to it, applies the pushed-down
-projection, filter, and LIMIT to the scan, then streams the result back to Exasol by
-converting each Arrow batch to SDK `Value` rows and emitting them. It holds no state
-and discovers no files of its own.
+exactly the Iceberg/Parquet data files assigned to its shard, applies the pushed-down
+projection, filter, and LIMIT, and either streams the matching rows back or — when the
+spec carries aggregate instructions — emits one node-local partial-aggregate row. It
+holds no state and discovers no files of its own.
 
 ## Background
 
-* The UDF is the SET-script entry point of the same `.so` as the VS adapter; it reads
-  its assigned scan spec (file list, projection, filter, limit, catalog/storage
-  connection properties) from its input row(s) via `ctx.next()` / typed getters.
+* The UDF reads its scan spec (files, projection, filter, limit, optional aggregate
+  plan, catalog/storage connection properties) from its input row(s); it registers only
+  its assigned files and never resolves catalog metadata.
 * Only SDK `Value` types cross the `.so` boundary — Arrow types MUST NOT cross it.
-  Each Arrow `RecordBatch` is converted to rows of `Value` inside the UDF.
+* For an aggregate spec the UDF emits a single partial row per shard; the adapter's
+  wrapper SQL merges the per-shard partials into the final result.
 * The emit buffer auto-flushes at 4,000,000 bytes; the UDF relies on that rather than
   collecting the full result set.
 * Arrow→`Value` conversion (B.4) MUST implement the full mapping defined in the
@@ -75,3 +76,29 @@ and discovers no files of its own.
 * *WHEN* the scan UDF runs
 * *THEN* the UDF SHALL return an error identifying that the assigned data could not be read
 * *AND* the error message MUST NOT contain storage access keys or secret keys
+
+### Scenario: Scan computes a node-local partial aggregate instead of raw rows
+
+* *GIVEN* a scan spec carrying partial-aggregate instructions and the files assigned to this shard
+* *WHEN* the scan UDF runs for that spec
+* *THEN* the UDF SHALL register only its assigned files and apply any pushed-down filter
+* *AND* the UDF SHALL compute the requested aggregates over its assigned files locally in DataFusion
+* *AND* the UDF SHALL emit a single partial-result row carrying the per-shard partial aggregate values rather than the scanned rows
+* *AND* no Arrow type SHALL cross the `.so` boundary
+
+### Scenario: Partial COUNT, SUM, MIN, and MAX are emitted in their merge-ready form
+
+* *GIVEN* a scan spec requesting any of partial `COUNT`, `SUM`, `MIN`, or `MAX`
+* *WHEN* the scan UDF computes its shard's partial aggregate
+* *THEN* a partial `COUNT` SHALL be the count of matching rows in this shard, emitted as a value the wrapper can sum
+* *AND* a partial `SUM` SHALL be the sum over this shard's matching rows, emitted as a value the wrapper can sum
+* *AND* partial `MIN` and `MAX` SHALL be this shard's minimum and maximum, emitted as values the wrapper can re-`MIN`/`MAX`
+* *AND* an empty shard SHALL emit a partial `COUNT` of zero and a NULL partial `SUM`/`MIN`/`MAX` that the wrapper's merge ignores
+
+### Scenario: AVG is emitted as a partial sum and partial count pair
+
+* *GIVEN* a scan spec requesting partial `AVG(col)`
+* *WHEN* the scan UDF computes its shard's partial aggregate
+* *THEN* the UDF SHALL emit a `(partial_sum, partial_count)` pair for that column
+* *AND* the UDF MUST NOT emit a per-shard average
+* *AND* the partial count SHALL exclude rows where the target column is NULL so the merged average matches single-node `AVG` semantics
