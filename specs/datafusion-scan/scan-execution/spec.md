@@ -1,25 +1,32 @@
 # Feature: DataFusion Scan Execution
 
 A disposable Rust SET UDF that, for one query, builds a DataFusion session, registers
-exactly the Iceberg/Parquet data files assigned to its shard, applies the pushed-down
-projection, filter, and LIMIT, and either streams the matching rows back or — when the
-spec carries aggregate instructions — emits one node-local partial-aggregate row. It
-holds no state and discovers no files of its own.
+exactly the Iceberg/Parquet data files assigned to its shard, sizes its DataFusion
+`RuntimeEnv` memory pool from the per-instance memory limit reported in UDF metadata,
+applies the pushed-down projection, filter, and LIMIT, and either streams the matching
+rows back or — when the spec carries aggregate instructions — emits one node-local
+partial-aggregate row per distinct group (or a single row for ungrouped aggregates).
+It holds no state and discovers no files of its own.
 
 ## Background
 
-* The UDF reads its scan spec (files, projection, filter, limit, optional aggregate
-  plan, catalog/storage connection properties) from its input row(s); it registers only
-  its assigned files and never resolves catalog metadata.
-* Only SDK `Value` types cross the `.so` boundary — Arrow types MUST NOT cross it.
-* For an aggregate spec the UDF emits a single partial row per shard; the adapter's
-  wrapper SQL merges the per-shard partials into the final result.
+* The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
+* The UDF MUST register only its assigned files and MUST NOT discover additional files.
+* Only SDK Value types cross the .so boundary; no Arrow types.
+* Credentials MUST NOT appear in any error message.
+* The per-instance memory limit is read from `ctx.memory_limit()` (bytes; `0` =
+  unbounded/unknown sentinel), provided by the `language-container-rs:add-memory-limit-metadata`
+  SDK accessor. Exasol enforces the same per-process heap limit via `setrlimit(RLIMIT_RSS)` and
+  stalls additional concurrent VMs once usage reaches 80% of it, so a pool sized under the limit
+  lets the engine self-manage concurrency.
+* The spill backstop directory is `/tmp`; the UDF probes at runtime whether `/tmp` is real disk
+  with free space (tmpfs detection via `/proc/mounts` plus `statvfs` free-space check). Any `/tmp`
+  spill is transient per-invocation scratch — NOT persistent state.
 * The emit buffer auto-flushes at 4,000,000 bytes; the UDF relies on that rather than
   collecting the full result set.
-* Arrow→`Value` conversion (B.4) MUST implement the full mapping defined in the
+* Arrow→`Value` conversion MUST implement the full mapping defined in the
   `datafusion-scan/type-mapping` feature — every compatible Arrow type plus the JSON
-  fallback for out-of-range Decimal128 and all incompatible types — not only the
-  int/float/string/bool/date/timestamp subset.
+  fallback for out-of-range Decimal128 and all incompatible types.
 * The S3-compatible object store is MinIO; DataFusion's object store is configured with
   the supplied endpoint, region, and credentials and `validateservercertificate=0`
   semantics where applicable.

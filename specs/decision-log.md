@@ -224,3 +224,144 @@ Split each supported aggregate into a node-local partial (computed in the scan U
 ### Consequences
 
 Network transfer is bounded to one partial-result row per shard, regardless of how many rows each shard scans. AVG requires two output columns per aggregated column, adding wrapper SQL complexity. The zero-count NULL guard preserves single-node AVG semantics for empty tables.
+
+---
+
+## ADR-009: Standalone `crates/vs-expression` Crate for Expression Translation
+
+**Date:** 2026-06-22
+**Plan:** `add-group-by-and-sql-comprehension`
+**Status:** Accepted
+
+### Context
+
+The VS adapter needed to translate Exasol pushdown expression-JSON nodes (column references, literals, comparison predicates, logical connectives, arithmetic, CAST, IN, BETWEEN, LIKE, IS NULL) into DataFusion SQL fragments for both filter pushdown and GROUP BY key rendering. The existing walker lived in `adapter/predicate.rs` inside `lakehouse-engine`, tightly coupled to engine internals and unreusable by the sibling `strata-rs` project.
+
+### Decision
+
+Create a standalone workspace crate (`crates/vs-expression`) containing the full serde_json expression-node walker. The crate has no lakehouse-engine internals in its API; its only dependencies are `serde_json` and `exasol-udf-sdk` (for `UdfError`). It exposes three public entry points: `render_expression` (raising), `render_expression_safe` (None on failure), and `render_df_filter_safe` (None on failure or trivially-true result). Delete `adapter/predicate.rs` and replace all its callers with `vs_expression::render_df_filter_safe`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Standalone `crates/vs-expression` crate with no engine-internal deps | ✓ Chosen — clean, testable, reusable by strata-rs; supports future monorepo convergence |
+| Extend `adapter/predicate.rs` inline | ✗ Rejected — blocks strata-rs reuse; keeps expression logic coupled to engine internals |
+| Add a SQL-parser dependency (sqlparser-rs) as the IR | ✗ Rejected — user declined; overweight for a narrow translation job; serde_json walker is proven |
+
+### Consequences
+
+Expression translation is a separate, testable, reusable unit. The three-function public API (raising, safe, filter-safe) is stable and minimal. Long-term monorepo convergence with strata-rs is straightforward. `adapter/predicate.rs` is deleted; any future predicate coverage goes in `vs-expression`.
+
+---
+
+## ADR-010: GROUP BY Group-Key Values Emitted as Plain Columns; Wrapper Groups on Column Refs
+
+**Date:** 2026-06-22
+**Plan:** `add-group-by-and-sql-comprehension`
+**Status:** Accepted
+
+### Context
+
+A grouped aggregate pushdown requires the scan UDF to emit partial rows that the outer wrapper SQL can re-group and merge. The group-key values must survive the partial-to-merge handoff with correct identity. Two approaches were considered: re-render the same GROUP BY expression in the wrapper SQL, or emit the computed group-key values as plain output columns and have the wrapper group on those column positions.
+
+### Decision
+
+The scan UDF emits computed group-key values as plain output columns named `GK_0`, `GK_1`, ... in spec order. The outer wrapper SQL groups on the same `GK_n` column names, avoiding any re-rendering of the original expression. The EMITS declaration in the scan-driving SQL names the group-key columns first, followed by the `PARTIAL_*` aggregate columns.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Emit group-key computed values as plain GK_n columns; wrapper groups on column refs | ✓ Chosen — eliminates expression-rendering consistency risk between partial scan and merge; wrapper only needs positional column refs |
+| Re-render GROUP BY expression in the outer wrapper SQL | ✗ Rejected — any mismatch between UDF-side and wrapper-side rendering produces wrong grouping; brittle across expression types |
+| Emit group keys by column name only | ✗ Rejected — breaks expression group keys that produce a computed value without a stable source column name |
+
+### Consequences
+
+The column-value contract between the scan UDF and the outer wrapper is purely positional. Adding a new group-key expression type requires no wrapper SQL changes. The GK_n naming convention is a stable protocol between adapter and scan UDF.
+
+---
+
+## ADR-011: Memory Safety via Metadata-Sized DataFusion Pool and Spill-or-Hardcap Backstop
+
+**Date:** 2026-06-22
+**Plan:** `add-group-by-and-sql-comprehension`
+**Status:** Accepted
+
+### Context
+
+High-cardinality GROUP BY queries inside a scan UDF risk OOM-crashing the UDF process when DataFusion's intermediate state exceeds the per-instance memory budget. Exasol enforces a per-process heap limit via `setrlimit(RLIMIT_RSS)` (default 4096 MB) and stalls additional concurrent VMs once usage hits 80% of it (`swigengine.cc:1574-1595`). The per-instance limit is exposed in UDF metadata via `ctx.memory_limit()` (bytes; `0` = unbounded/unknown sentinel), provided by `language-container-rs:add-memory-limit-metadata`.
+
+### Decision
+
+The scan UDF reads `ctx.memory_limit()` and sizes the DataFusion `RuntimeEnv` `MemoryPool` to approximately 0.6 of it, leaving headroom below the engine's 80% stall threshold; falls back to a conservative 1024 MB default when the limit is `0`/unknown. A `/tmp` probe (tmpfs detection via `/proc/mounts` + `statvfs` free space) selects the pool variant: real disk with free space → `FairSpillPool` + `DiskManager` rooted at `/tmp` (completes at any cardinality); tmpfs or insufficient space → `GreedyMemoryPool` returning a clean `ResourcesExhausted` error. Any `/tmp` spill is transient per-invocation scratch, never persistent state.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Metadata-sized pool (~0.6 of limit) + spill-or-hardcap | ✓ Chosen — bounds to real per-instance limit; spill gives correctness at any cardinality; hardcap path fails cleanly; engine self-throttles at 80% |
+| File-count cardinality guard (`GROUP_BY_CARDINALITY_LIMIT`) | ✗ Rejected — heuristic with no statistical basis; removed entirely |
+| Per-shard emitted-group cap with UDF abort | ✗ Rejected — produces partial results; adds abort logic |
+| Unbounded pool | ✗ Rejected — OOM-crashes the UDF process at high cardinality |
+
+### Consequences
+
+Memory use is bounded without a heuristic. Spill lets high-cardinality grouped queries complete on nodes with real-disk `/tmp`. Nodes with tmpfs (e.g., certain Docker setups) get a clean error instead of a crash. The 0.6 fraction leaves the engine's per-process concurrency stall mechanism free to throttle concurrent instances before they individually OOM.
+
+---
+
+## ADR-012: Oversubscribed `GROUP BY shard_key` Work-Unit Sharding (Supersedes ADR-007)
+
+**Date:** 2026-06-22
+**Plan:** `add-group-by-and-sql-comprehension`
+**Status:** Accepted
+
+### Context
+
+ADR-007 shipped `GROUP BY IPROC(), shard_key` to distribute scan shards across nodes. A corrected reading of the Exasol engine internals (verified in `exasol-db`/`script-languages`) shows that groups drive UDF *invocations*, not OS processes; parallel instances on a node are a fixed VM pool sized to `NR_OF_CORES` (`primitives.cpp:267`, `swigengine.cc:1147-1184`), and groups are multiplexed onto it (`set_function.cpp:240-260`). `GROUP BY IPROC()` yields exactly one group per node (`misc_primitives.cpp:98-132`), capping parallelism at node count and leaving a node's other cores idle.
+
+### Decision
+
+Replace `GROUP BY IPROC(), shard_key` with `GROUP BY shard_key` over G oversubscribed work-unit shards, where `G = node_count × parallelism_factor` (`parallelism_factor` is a VS property, default 8), capped at 300 and clamped to `[1, file_count]`. The 300 cap keeps the group set in Exasol's round-robin distribution regime; above `max_dynamic_group_count` (default 300) Exasol hash-partitions groups instead (`globalgroupbyset5.cpp:295-341`). The `parallelism/iproc-sharding` feature is renamed to `parallelism/work-unit-sharding`. The balanced `partition_files` split is reused, passing G instead of node_count. The NPROC node-count capture (ADR-006) is retained to feed G.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `GROUP BY shard_key` with G = node_count × parallelism_factor capped 300 | ✓ Chosen — uses each node's full VM pool; stays in round-robin distribution regime (G ≤ 300) |
+| `GROUP BY IPROC()` (ADR-007) | ✗ Rejected — caps parallelism at node count; leaves per-node cores idle |
+| `GROUP BY IPROC(), shard_key` | ✗ Rejected — `shard_key` alone is sufficient; IPROC() adds no benefit once shard groups oversubscribe the node count |
+| Uncapped G | ✗ Rejected — above 300, Exasol hash-partitions groups (unbalanced) |
+
+### Consequences
+
+Shard groups spread round-robin across nodes AND multiplex onto each node's core pool. The two-level grouping composes cleanly: inner `shard_key` parallelizes the scan, DataFusion performs the user GROUP BY inside each shard invocation, the outer wrapper merges partials by user group keys. The `parallelism_factor` VS property (default 8) gives operators a tuning knob without code changes.
+
+---
+
+## ADR-013: Cross-Repo Dependency on `language-container-rs:add-memory-limit-metadata`
+
+**Date:** 2026-06-22
+**Plan:** `add-group-by-and-sql-comprehension`
+**Status:** Accepted
+
+### Context
+
+ADR-011's memory-pool sizing requires `ctx.memory_limit() -> u64` (bytes; `0` = unbounded/unknown sentinel), an accessor that belongs in the `exasol-udf-sdk` rather than being reimplemented in `lakehouse-engine-rs`. The accessor is added by the sibling-repo plan `language-container-rs:add-memory-limit-metadata`. Until the corresponding `exasol-udf-sdk` release is published, the pool-sizing code falls back to the `0`-sentinel path (1024 MB default budget). The SDK is currently pinned at 0.14.0; the accessor lands in the next release.
+
+### Decision
+
+Consume `UdfContext::memory_limit()` from the published `exasol-udf-sdk` release when it lands; do not reimplement the metadata proto deserialization locally. Until the SDK version carrying the accessor is published, the call site passes the `0` sentinel and the pool-sizing code uses the 1024 MB default. The version bump is a one-line `Cargo.toml` change.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Depend on `language-container-rs:add-memory-limit-metadata` SDK release | ✓ Chosen — single source of truth; avoids divergent wire-protocol decodings across repos |
+| Reimplement the proto deserialization locally | ✗ Rejected — duplicates SDK responsibility; risks drift in the wire-protocol decoding |
+
+### Consequences
+
+The live `ctx.memory_limit()` path is gated on a sibling-repo SDK release. Until that release, the pool-sizing code operates against the 1024 MB default. The dependency is explicit and recorded; the one-line version bump unblocks the live path without touching any scan logic.
