@@ -44,6 +44,10 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_AGG_MIN",
     "FN_AGG_MAX",
     "FN_AGG_AVG",
+    // GROUP BY aggregate pushdown: column references and scalar expressions.
+    // HAVING, COUNT(DISTINCT), and join pushdown are NOT advertised.
+    "AGGREGATE_GROUP_BY_COLUMN",
+    "AGGREGATE_GROUP_BY_EXPRESSION",
 ];
 
 /// Build the `getCapabilities` JSON response.
@@ -57,6 +61,41 @@ pub fn get_capabilities_response() -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 2.6: Adapter advertises GROUP BY column and expression capabilities.
+    #[test]
+    fn reports_group_by_capabilities() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        assert!(
+            cap_strs.contains(&"AGGREGATE_GROUP_BY_COLUMN"),
+            "AGGREGATE_GROUP_BY_COLUMN must be advertised: {cap_strs:?}"
+        );
+        assert!(
+            cap_strs.contains(&"AGGREGATE_GROUP_BY_EXPRESSION"),
+            "AGGREGATE_GROUP_BY_EXPRESSION must be advertised: {cap_strs:?}"
+        );
+
+        // Excluded capabilities must NOT appear.
+        assert!(
+            !cap_strs.contains(&"AGGREGATE_GROUP_BY_TUPLE"),
+            "AGGREGATE_GROUP_BY_TUPLE must not be advertised (not supported)"
+        );
+        assert!(
+            !cap_strs.contains(&"AGGREGATE_HAVING"),
+            "AGGREGATE_HAVING must not be advertised"
+        );
+        assert!(
+            !cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
+            "FN_AGG_COUNT_DISTINCT must not be advertised"
+        );
+        let has_join = cap_strs
+            .iter()
+            .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
+        assert!(!has_join, "join capabilities must not be advertised");
+    }
 
     /// Scenario: Adapter advertises projection, filter, and LIMIT capabilities.
     #[test]

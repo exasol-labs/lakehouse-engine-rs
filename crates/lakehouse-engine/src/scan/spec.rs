@@ -114,6 +114,12 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregates: Option<Vec<AggregatePlan>>,
 
+    /// Rendered DataFusion SQL fragments for each GROUP BY key, in order.
+    /// `None` means no GROUP BY pushdown (single-group or row scan).
+    /// Present only for grouped aggregate scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+
     pub storage: StorageProps,
     pub catalog: CatalogProps,
 }
@@ -148,6 +154,7 @@ mod tests {
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
             aggregates: None,
+            group_keys: None,
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -201,6 +208,7 @@ mod tests {
         spec.limit = None;
         spec.storage.session_token = None;
         spec.aggregates = None;
+        spec.group_keys = None;
         let json = spec.to_json();
         assert!(!json.contains("filter"));
         assert!(!json.contains("limit"));
@@ -208,6 +216,10 @@ mod tests {
         assert!(
             !json.contains("aggregates"),
             "aggregates field must be absent when None: {json}"
+        );
+        assert!(
+            !json.contains("group_keys"),
+            "group_keys field must be absent when None: {json}"
         );
     }
 
@@ -268,6 +280,36 @@ mod tests {
         assert_eq!(plans[4].kind, AggKind::Max);
         assert_eq!(plans[5].kind, AggKind::Avg);
         assert_eq!(plans[5].column.as_deref(), Some("AMOUNT"));
+    }
+
+    /// Task 2.1: group_keys round-trips through JSON and is absent from row-scan specs.
+    #[test]
+    fn group_keys_round_trips_and_absent_from_row_scan() {
+        // Row scan: group_keys must be absent from serialized JSON.
+        let row_spec = sample_spec();
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("group_keys"),
+            "row-scan spec must not carry group_keys field: {row_json}"
+        );
+
+        // Grouped scan: round-trip with Some group keys.
+        let mut grouped_spec = sample_spec();
+        grouped_spec.group_keys = Some(vec![
+            "\"REGION\"".to_string(),
+            "YEAR(\"EVENT_DATE\")".to_string(),
+        ]);
+        let grouped_json = grouped_spec.to_json();
+        assert!(
+            grouped_json.contains("group_keys"),
+            "grouped spec must carry group_keys field: {grouped_json}"
+        );
+
+        let back = ScanSpec::from_json(&grouped_json).unwrap();
+        let keys = back.group_keys.expect("group_keys must survive round-trip");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "\"REGION\"");
+        assert_eq!(keys[1], "YEAR(\"EVENT_DATE\")");
     }
 
     #[test]

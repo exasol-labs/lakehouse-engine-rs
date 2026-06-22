@@ -3,7 +3,6 @@
 ///
 /// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
 pub mod capabilities;
-pub mod predicate;
 pub mod pushdown;
 pub mod sharding;
 
@@ -47,6 +46,12 @@ const PROP_CONNECTION_NAME: &str = "CONNECTION_NAME";
 // SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES. Exasol requires adapterNotes to be
 // a JSON *string* (a raw JSON object fails with "No valid json string").
 const NOTE_CLUSTER_NODES: &str = "CLUSTER_NODES";
+// VS property name for the parallelism factor (oversubscription multiplier).
+// Default: 8. Stored in adapterNotes so the pushdown path can read it back.
+const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
+const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
+/// Default parallelism factor when not supplied or invalid.
+const DEFAULT_PARALLELISM_FACTOR: usize = 8;
 
 /// Main adapter dispatch function.
 ///
@@ -90,6 +95,7 @@ fn handle_create_virtual_schema(
     let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
 
     let cluster_nodes = resolve_cluster_nodes(ctx, &props);
+    let parallelism_factor = resolve_parallelism_factor(&props);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -119,9 +125,9 @@ fn handle_create_virtual_schema(
         .to_uppercase();
     // Exasol persists `adapterNotes` (a JSON *string*) at the schema level and
     // passes it back in `schemaMetadataInfo.adapterNotes` on later requests.
-    // Carry the resolved node count there; merge into any pre-existing notes so
-    // we never clobber state another channel may have written.
-    let adapter_notes = build_adapter_notes(request, cluster_nodes);
+    // Carry the resolved node count and parallelism factor there; merge into any
+    // pre-existing notes so we never clobber state another channel may have written.
+    let adapter_notes = build_adapter_notes(request, cluster_nodes, parallelism_factor);
     let schema_metadata = json!({
         "tables": [{
             "name": table_name,
@@ -147,13 +153,17 @@ async fn handle_pushdown_request(request: &Json) -> Result<Json, UdfError> {
     let props = get_properties(request);
     let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
     let scan_schema = str_prop(&props, PROP_SCAN_SCHEMA).map(|s| s.to_string());
-    // CLUSTER_NODES is carried in adapterNotes (persisted by Exasol), NOT in
-    // properties (dropped by Exasol). Read it from schemaMetadataInfo.adapterNotes;
-    // default to 1 when absent or unparseable.
+    // CLUSTER_NODES and PARALLELISM_FACTOR are carried in adapterNotes (persisted
+    // by Exasol), NOT in properties (dropped by Exasol). Read them from
+    // schemaMetadataInfo.adapterNotes; default to safe values when absent.
     let cluster_nodes = adapter_note(request, NOTE_CLUSTER_NODES)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(1);
+    let parallelism_factor = adapter_note(request, NOTE_PARALLELISM_FACTOR)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_PARALLELISM_FACTOR);
     handle_pushdown(
         request,
         &catalog_uri,
@@ -161,6 +171,7 @@ async fn handle_pushdown_request(request: &Json) -> Result<Json, UdfError> {
         &catalog,
         scan_schema.as_deref(),
         cluster_nodes,
+        parallelism_factor,
     )
     .await
     .map_err(|e| redact_error(&storage, e))
@@ -221,15 +232,29 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 }
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
-/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES. Any
-/// pre-existing notes on the request are preserved (merge, not clobber).
-fn build_adapter_notes(request: &Json, cluster_nodes: u32) -> Json {
+/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES and
+/// PARALLELISM_FACTOR. Any pre-existing notes on the request are preserved
+/// (merge, not clobber).
+fn build_adapter_notes(request: &Json, cluster_nodes: u32, parallelism_factor: usize) -> Json {
     let mut notes = parse_adapter_notes(request);
     notes.insert(
         NOTE_CLUSTER_NODES.to_string(),
         Json::String(cluster_nodes.to_string()),
     );
+    notes.insert(
+        NOTE_PARALLELISM_FACTOR.to_string(),
+        Json::String(parallelism_factor.to_string()),
+    );
     Json::String(Json::Object(notes).to_string())
+}
+
+/// Read and validate the PARALLELISM_FACTOR VS property.
+/// Returns DEFAULT_PARALLELISM_FACTOR when absent, empty, zero, or not a valid integer.
+fn resolve_parallelism_factor(props: &Json) -> usize {
+    str_prop(props, PROP_PARALLELISM_FACTOR)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_PARALLELISM_FACTOR)
 }
 
 /// Extract catalog URI, StorageProps, and CatalogProps from the VS properties.
@@ -477,7 +502,8 @@ mod tests {
         // Replicate the schema_metadata construction from handle_create_virtual_schema.
         // The request has no pre-existing adapterNotes (clean set path).
         let request = serde_json::json!({"type": "createVirtualSchema"});
-        let adapter_notes = build_adapter_notes(&request, cluster_nodes);
+        let adapter_notes =
+            build_adapter_notes(&request, cluster_nodes, DEFAULT_PARALLELISM_FACTOR);
         let schema_metadata = serde_json::json!({
             "tables": [],
             "adapterNotes": adapter_notes,
@@ -512,7 +538,7 @@ mod tests {
     fn adapter_notes_cluster_nodes_round_trips() {
         // createVirtualSchema produces the adapterNotes string for, say, 4 nodes.
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
-        let notes = build_adapter_notes(&create_req, 4);
+        let notes = build_adapter_notes(&create_req, 4, DEFAULT_PARALLELISM_FACTOR);
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
         // Exasol persists that string and hands it back under
@@ -561,7 +587,7 @@ mod tests {
                 "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
             },
         });
-        let notes = build_adapter_notes(&req, 3);
+        let notes = build_adapter_notes(&req, 3, DEFAULT_PARALLELISM_FACTOR);
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
         assert_eq!(
@@ -573,6 +599,70 @@ mod tests {
             parsed[NOTE_CLUSTER_NODES].as_str(),
             Some("3"),
             "CLUSTER_NODES must be updated to the freshly resolved value"
+        );
+    }
+
+    /// Task 2.2 — Adapter records the parallelism factor in the virtual-schema adapterNotes.
+    /// Covers scenario `create_vs_records_parallelism_factor`.
+    #[test]
+    fn create_vs_records_parallelism_factor() {
+        // Request with an explicit PARALLELISM_FACTOR property.
+        let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
+        let factor = resolve_parallelism_factor(&props);
+        assert_eq!(factor, 4, "factor must be read from the property");
+
+        // Build adapterNotes and verify PARALLELISM_FACTOR is present.
+        let request = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(&request, 2, factor);
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+        assert_eq!(
+            parsed[NOTE_PARALLELISM_FACTOR].as_str(),
+            Some("4"),
+            "PARALLELISM_FACTOR must be recorded in adapterNotes"
+        );
+
+        // Default when property absent.
+        let empty_props = serde_json::json!({});
+        let default_factor = resolve_parallelism_factor(&empty_props);
+        assert_eq!(
+            default_factor, DEFAULT_PARALLELISM_FACTOR,
+            "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent"
+        );
+
+        // Zero or invalid value also defaults.
+        let zero_props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "0" });
+        let zero_factor = resolve_parallelism_factor(&zero_props);
+        assert_eq!(
+            zero_factor, DEFAULT_PARALLELISM_FACTOR,
+            "zero must fall back to default"
+        );
+    }
+
+    /// Task 2.2 — Both CLUSTER_NODES and PARALLELISM_FACTOR round-trip through adapterNotes.
+    /// Covers scenario `adapter_notes_carry_cluster_nodes_and_parallelism_factor`.
+    #[test]
+    fn adapter_notes_carry_cluster_nodes_and_parallelism_factor() {
+        // createVirtualSchema records both values.
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(&create_req, 6, 12);
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+
+        // Exasol persists that string and hands it back on the next pushdown request.
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+        });
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_CLUSTER_NODES).as_deref(),
+            Some("6"),
+            "CLUSTER_NODES must round-trip through adapterNotes"
+        );
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
+            Some("12"),
+            "PARALLELISM_FACTOR must round-trip through adapterNotes"
         );
     }
 }

@@ -172,16 +172,26 @@ fn events_iceberg_schema() -> Result<IcebergSchema> {
         .context("build events Iceberg schema")
 }
 
-fn make_events_batch() -> RecordBatch {
-    let count = SEED_TOTAL_ROWS;
-    let ids: Vec<i64> = (1..=count as i64).collect();
-    let names: Vec<String> = (1..=count).map(|i| format!("event-{i:02}")).collect();
-    // score = 5.0 * i; scores > 15.0 → i >= 4 (1-indexed) → 17 rows have score > 15.0
-    let scores: Vec<f64> = (1..=count).map(|i| 5.0 * i as f64).collect();
-    let dates: Vec<i32> = (0..count as i32).map(|i| BASE_DATE + i).collect();
+/// Build a RecordBatch for the inclusive 1-indexed id range `first_id..=last_id`.
+///
+/// The per-row value formulas are identical regardless of how the rows are split
+/// across batches: score = 5.0 * id, name = "event-NN", event_date = BASE_DATE +
+/// (id-1), event_ts = BASE_TS_MICROS + (id-1) hours. Splitting the seed into two
+/// id-ranges (1..=10 and 11..=20) therefore produces the SAME 20 rows, just
+/// written across two parquet data files so the shard fan-out is observable.
+fn make_events_batch(first_id: usize, last_id: usize) -> RecordBatch {
+    let ids: Vec<i64> = (first_id as i64..=last_id as i64).collect();
+    let names: Vec<String> = (first_id..=last_id)
+        .map(|i| format!("event-{i:02}"))
+        .collect();
+    // score = 5.0 * id; scores > 15.0 → id >= 4 (1-indexed) → 17 rows have score > 15.0
+    let scores: Vec<f64> = (first_id..=last_id).map(|i| 5.0 * i as f64).collect();
+    let dates: Vec<i32> = (first_id..=last_id)
+        .map(|i| BASE_DATE + (i as i32 - 1))
+        .collect();
     // 1-hour spacing.
-    let timestamps: Vec<i64> = (0..count as i64)
-        .map(|i| BASE_TS_MICROS + i * 3_600_000_000)
+    let timestamps: Vec<i64> = (first_id..=last_id)
+        .map(|i| BASE_TS_MICROS + (i as i64 - 1) * 3_600_000_000)
         .collect();
 
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -256,7 +266,32 @@ impl iceberg::writer::file_writer::location_generator::LocationGenerator for Fla
     }
 }
 
+/// Write the 20 seed rows across TWO parquet data files (id 1..=10 and 11..=20),
+/// each committed as its own Iceberg fast-append. Two data files make the shard
+/// fan-out observable: with file_count == 2 the adapter emits `GROUP BY shard_key`
+/// (G = min(parallelism_factor, file_count, 300) = 2 > 1) instead of a single
+/// invocation. The rows and all column values are identical to a single-file seed.
 async fn write_events_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<Vec<String>> {
+    let mid = SEED_TOTAL_ROWS / 2;
+    let first_path = write_one_data_file(catalog, &table, 1, mid).await?;
+    // Reload the table so the second append builds on the first snapshot.
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .context("reload table between seed appends")?;
+    let second_path = write_one_data_file(catalog, &table, mid + 1, SEED_TOTAL_ROWS).await?;
+
+    Ok(vec![first_path, second_path])
+}
+
+/// Write rows for the inclusive id range as one parquet file and fast-append it.
+/// Returns the committed data file path.
+async fn write_one_data_file<C: Catalog>(
+    catalog: &C,
+    table: &Table,
+    first_id: usize,
+    last_id: usize,
+) -> Result<String> {
     let iceberg_schema = table.metadata().current_schema().clone();
     let file_io = table.file_io().clone();
     let table_location = table.metadata().location().to_string();
@@ -289,7 +324,7 @@ async fn write_events_and_commit<C: Catalog>(catalog: &C, table: Table) -> Resul
         .await
         .context("build data file writer")?;
 
-    let batch = make_events_batch();
+    let batch = make_events_batch(first_id, last_id);
     let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
     writer.write(batch).await.context("write Arrow batch")?;
     let data_files = writer.close().await.context("close data file writer")?;
@@ -298,14 +333,17 @@ async fn write_events_and_commit<C: Catalog>(catalog: &C, table: Table) -> Resul
         .map(|df| df.file_path().to_string())
         .collect();
 
-    let tx = Transaction::new(&table);
+    let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("apply fast-append action")?;
     tx.commit(catalog)
         .await
         .context("commit Iceberg snapshot")?;
 
-    Ok(paths)
+    paths
+        .into_iter()
+        .next()
+        .context("data file writer produced no file for the id range")
 }
 
 async fn existing_data_file_paths<C: Catalog>(
