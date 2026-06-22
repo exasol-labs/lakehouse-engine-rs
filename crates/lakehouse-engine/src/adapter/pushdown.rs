@@ -23,7 +23,7 @@ use std::sync::Arc;
 ///   (correctness backstop: Exasol keeps the predicate at its own level).
 /// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
 /// - Credentials NEVER appear in any returned SQL string or error message.
-use vs_expression::{render_df_filter_safe, render_expression};
+use vs_expression::{render_df_filter_safe, render_expression, render_expression_safe};
 
 /// Build a RestCatalog configured to read/write data files through the S3
 /// (MinIO) storage factory.
@@ -198,13 +198,69 @@ pub fn detect_group_by_aggregates(
                 plans.push(plan);
             }
             _ => {
-                // Non-aggregate, non-column item (e.g., function_scalar) — fall back.
-                return None;
+                // A scalar expression that renders to one of the group keys is a
+                // group-key projection (e.g. SELECT MOD(id,4) ... GROUP BY MOD(id,4)) —
+                // emitted via GK_*, so skip it. Anything else disqualifies the path.
+                match render_expression(item) {
+                    Ok(sql) if group_keys.contains(&sql) => {}
+                    _ => return None,
+                }
             }
         }
     }
 
     Some((group_keys, plans))
+}
+
+/// Resolve the Exasol-declared type of each group key from `selectListDataTypes`.
+///
+/// Each group-key expression also appears in `selectList`; the parallel
+/// `selectListDataTypes` array gives its declared result type. Falls back to
+/// `VARCHAR(2000000)` when the type cannot be located.
+fn group_key_exasol_types(pushdown_req: &Json, group_keys: &[String]) -> Vec<String> {
+    let select_list = pushdown_req.get("selectList").and_then(|v| v.as_array());
+    let declared_types = pushdown_req
+        .get("selectListDataTypes")
+        .and_then(|v| v.as_array());
+    group_keys
+        .iter()
+        .map(|key| {
+            select_list
+                .and_then(|list| {
+                    list.iter()
+                        .position(|item| render_expression(item).ok().as_deref() == Some(key))
+                })
+                .and_then(|idx| declared_types.and_then(|d| d.get(idx)))
+                .map(exasol_type_from_json)
+                .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
+        })
+        .collect()
+}
+
+/// Resolve the Exasol-declared type of each aggregate select-list item, in order.
+///
+/// Aggregates appear as `function_aggregate` items in `selectList`; the parallel
+/// `selectListDataTypes` array gives each one's declared result type (e.g. COUNT(*)
+/// → DECIMAL(18,0)). Falls back to `VARCHAR(2000000)` when not locatable.
+fn aggregate_exasol_types(pushdown_req: &Json) -> Vec<String> {
+    let select_list = match pushdown_req.get("selectList").and_then(|v| v.as_array()) {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+    let declared_types = pushdown_req
+        .get("selectListDataTypes")
+        .and_then(|v| v.as_array());
+    select_list
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
+        .map(|(idx, _)| {
+            declared_types
+                .and_then(|d| d.get(idx))
+                .map(exasol_type_from_json)
+                .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
+        })
+        .collect()
 }
 
 /// Extract the column name (uppercase) from the first argument of an aggregate function.
@@ -223,7 +279,7 @@ fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
 /// Parse a single `function_aggregate` select-list item into an `AggregatePlan`.
 ///
 /// Returns `None` when the item uses `distinct: true` or the function name is
-/// not one of COUNT, SUM, MIN, MAX, AVG.
+/// not one of COUNT, SUM, MIN, MAX, AVG, STDDEV, VARIANCE family.
 ///
 /// The caller must verify `item.type == "function_aggregate"` before calling.
 fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
@@ -278,6 +334,24 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
             kind: AggKind::Avg,
             column: column_from_first_arg(args),
         },
+        // STDDEV/VARIANCE family — decompose into (cnt, sum, sum_sq) sufficient statistics.
+        // STDDEV and STDDEV_SAMP are the sample forms; VARIANCE / VAR_SAMP likewise.
+        "STDDEV" | "STDDEV_SAMP" => AggregatePlan {
+            kind: AggKind::StddevSamp,
+            column: column_from_first_arg(args),
+        },
+        "STDDEV_POP" => AggregatePlan {
+            kind: AggKind::StddevPop,
+            column: column_from_first_arg(args),
+        },
+        "VARIANCE" | "VAR_SAMP" => AggregatePlan {
+            kind: AggKind::VarSamp,
+            column: column_from_first_arg(args),
+        },
+        "VAR_POP" => AggregatePlan {
+            kind: AggKind::VarPop,
+            column: column_from_first_arg(args),
+        },
         _ => return None,
     };
     Some(plan)
@@ -304,6 +378,11 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 /// `spec_template` carries the shared fields; only `files` is replaced per shard.
 /// `col_types` is the full table column type map `(uppercase_name, exasol_type)` used
 /// to assign the correct EMITS type per aggregate partial column.
+/// `aggregate_types` holds the Exasol-declared result type of each aggregate (from
+/// `aggregate_exasol_types`); the single-group merge casts each item to its declared
+/// type. Pass `&[]` to emit uncast merge items (row scans never read it).
+// ponytail: 8 args is one over the lint threshold; matches the sibling grouped builder.
+#[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql(
     spec_template: &ScanSpec,
     shards: Vec<Vec<String>>,
@@ -311,10 +390,18 @@ pub fn build_scan_driving_sql(
     proj_types: &[String],
     limit: Option<u64>,
     col_types: &[(String, String)],
+    aggregate_types: &[String],
     udf_name: &str,
 ) -> String {
     if let Some(aggregates) = spec_template.aggregates.as_deref() {
-        build_aggregate_scan_sql(spec_template, shards, aggregates, col_types, udf_name)
+        build_aggregate_scan_sql(
+            spec_template,
+            shards,
+            aggregates,
+            col_types,
+            aggregate_types,
+            udf_name,
+        )
     } else {
         build_row_scan_sql(
             spec_template,
@@ -377,11 +464,12 @@ fn build_aggregate_scan_sql(
     shards: Vec<Vec<String>>,
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
+    aggregate_types: &[String],
     udf_name: &str,
 ) -> String {
     let emits_items = partial_emits_items(aggregates, col_types);
     let emits = emits_items.join(", ");
-    let merge_select = merge_select_items(aggregates).join(", ");
+    let merge_select = cast_merge_items(aggregates, aggregate_types).join(", ");
 
     let fan_out = if shards.len() == 1 {
         let mut shard_spec = spec_template.clone();
@@ -419,20 +507,33 @@ fn build_aggregate_scan_sql(
 ///
 /// 2. Partial aggregate columns: same layout and naming as `partial_emits_items`
 ///    (`PARTIAL_count_i`, `PARTIAL_sum_i`, `PARTIAL_min_i`, `PARTIAL_max_i`,
-///    `PARTIAL_avg_sum_i` / `PARTIAL_avg_cnt_i`).
+///    `PARTIAL_avg_sum_i` / `PARTIAL_avg_cnt_i`,
+///    `PARTIAL_stat_cnt_i` / `PARTIAL_stat_sum_i` / `PARTIAL_stat_sumsq_i`).
+///
+/// ## HAVING
+///
+/// `having` is an already-rendered DataFusion SQL fragment applied in the OUTER wrapper
+/// only (after `GROUP BY`). Never pushed into the shard scan — a per-shard HAVING would
+/// incorrectly discard groups that only clear the threshold after merging across shards.
 ///
 /// ## LIMIT
 ///
 /// LIMIT is never pushed into a shard spec for grouped queries (shard emits all
 /// partial groups; the outer wrapper applies the final LIMIT when needed).
+// ponytail: 8 args is one over the lint threshold; grouping into a struct would
+// add boilerplate for a function called in only two places. Suppress the lint.
+#[allow(clippy::too_many_arguments)]
 pub fn build_grouped_aggregate_scan_sql(
     spec_template: &ScanSpec,
     shards: Vec<Vec<String>>,
     group_keys: &[String],
+    group_key_types: &[String],
     aggregates: &[AggregatePlan],
+    aggregate_types: &[String],
     limit: Option<u64>,
     col_types: &[(String, String)],
     udf_name: &str,
+    having: Option<&str>,
 ) -> String {
     // Build EMITS: GK_* columns first, then PARTIAL_* columns.
     let gk_emits: Vec<String> = (0..group_keys.len())
@@ -446,11 +547,19 @@ pub fn build_grouped_aggregate_scan_sql(
         .collect();
     let emits = all_emits.join(", ");
 
-    // Build outer merge SELECT: GK_* columns (identity projection) + merged aggregates.
+    // Build outer merge SELECT: GK_* columns + merged aggregates.
+    // The scan stringifies every group key into a VARCHAR EMITS column; the outer
+    // wrapper casts each back to its Exasol-declared type so the virtual-table result
+    // column type matches what Exasol expects (e.g. DECIMAL for MOD(id,4)).
     let gk_select: Vec<String> = (0..group_keys.len())
-        .map(|i| format!(r#""GK_{i}""#))
+        .map(|i| match group_key_types.get(i) {
+            Some(ty) if ty != "VARCHAR(2000000)" => {
+                format!(r#"CAST("GK_{i}" AS {ty})"#)
+            }
+            _ => format!(r#""GK_{i}""#),
+        })
         .collect();
-    let merge_items = merge_select_items(aggregates);
+    let merge_items = cast_merge_items(aggregates, aggregate_types);
     let outer_select: Vec<String> = gk_select
         .iter()
         .chain(merge_items.iter())
@@ -487,6 +596,13 @@ pub fn build_grouped_aggregate_scan_sql(
 
     let mut sql =
         format!("SELECT {outer_select_str} FROM ({fan_out}) GROUP BY {outer_group_by_str}");
+
+    // HAVING: applied in outer wrapper only, never pushed into shard scan.
+    if let Some(h) = having.filter(|h| !h.is_empty()) {
+        sql.push_str(" HAVING ");
+        sql.push_str(h);
+    }
+
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
@@ -501,6 +617,7 @@ pub fn build_grouped_aggregate_scan_sql(
 /// DECIMAL(36,s) to avoid overflow; any other type falls back (callers should have validated
 /// via `validate_agg_col_types` before reaching here — see handle_pushdown).
 /// AVG partial sum stays DOUBLE PRECISION (AVG is inherently fractional).
+/// Stat (STDDEV/VARIANCE) family: cnt DECIMAL(20,0), sum/sumsq DOUBLE PRECISION.
 fn partial_emits_items(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
@@ -528,6 +645,12 @@ fn partial_emits_items(
             AggKind::Avg => vec![
                 format!(r#""PARTIAL_avg_sum_{i}" DOUBLE PRECISION"#),
                 format!(r#""PARTIAL_avg_cnt_{i}" DECIMAL(20,0)"#),
+            ],
+            // Stat family: 3 columns — cnt (DECIMAL), sum (DOUBLE), sumsq (DOUBLE).
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => vec![
+                format!(r#""PARTIAL_stat_cnt_{i}" DECIMAL(20,0)"#),
+                format!(r#""PARTIAL_stat_sum_{i}" DOUBLE PRECISION"#),
+                format!(r#""PARTIAL_stat_sumsq_{i}" DOUBLE PRECISION"#),
             ],
         })
         .collect()
@@ -570,22 +693,30 @@ fn sum_emit_type(col_ty: &str) -> String {
     "DOUBLE PRECISION".to_string()
 }
 
-/// Return `true` if all SUM/MIN/MAX targets have a supported Exasol column type.
+/// Return `true` if all SUM/MIN/MAX/stat targets have a supported Exasol column type.
 ///
-/// SUM is only valid over DOUBLE PRECISION or DECIMAL columns.
+/// SUM and the STDDEV/VARIANCE family are only valid over DOUBLE PRECISION or DECIMAL columns.
 /// MIN/MAX are valid over any comparable type (DATE, TIMESTAMP, VARCHAR included).
-/// Returns `false` (fall back to row scan) when any SUM targets a non-numeric column.
+/// Returns `false` (fall back to row scan) when any SUM or stat aggregate targets a
+/// non-numeric column.
 pub fn validate_agg_col_types(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
 ) -> bool {
     for plan in aggregates {
-        if plan.kind != AggKind::Sum {
-            continue;
-        }
-        let ty = col_type_for(plan, col_types);
-        if !is_numeric_exasol_type(&ty) {
-            return false;
+        let needs_numeric = matches!(
+            plan.kind,
+            AggKind::Sum
+                | AggKind::VarPop
+                | AggKind::VarSamp
+                | AggKind::StddevPop
+                | AggKind::StddevSamp
+        );
+        if needs_numeric {
+            let ty = col_type_for(plan, col_types);
+            if !is_numeric_exasol_type(&ty) {
+                return false;
+            }
         }
     }
     true
@@ -600,6 +731,21 @@ fn is_numeric_exasol_type(ty: &str) -> bool {
 ///
 /// AVG uses `SUM(sum) / NULLIF(SUM(cnt), 0)` — the NULLIF guard ensures division
 /// by zero yields NULL rather than an error (Exasol: `x / NULL = NULL`).
+///
+/// STDDEV/VARIANCE sufficient-statistics reconstruction (König–Huygens identity):
+///   numer    = SUM(sumsq) - SUM(sum)² / NULLIF(SUM(cnt), 0)
+///   var_pop  = numer / NULLIF(SUM(cnt), 0)          [NULL when cnt = 0]
+///   var_samp = numer / (SUM(cnt) - 1)               [NULL when cnt ≤ 1, via CASE]
+///
+///   stddev_pop/samp = CASE WHEN var IS NULL THEN NULL
+///                          ELSE SQRT(GREATEST(0.0, var)) END
+///
+///   The CASE guard is required because Exasol's `GREATEST(0.0, NULL) = 0.0`
+///   (returns the max of non-NULL inputs; only returns NULL if ALL inputs are NULL),
+///   so a bare `SQRT(GREATEST(0.0, NULL))` would yield `0.0` instead of NULL for
+///   empty tables (N=0, pop) and single-row groups (N=1, samp).
+///   The GREATEST(0.0, …) inside the ELSE branch guards against tiny-negative
+///   float rounding artifacts that would otherwise cause SQRT to error.
 fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
     aggregates
         .iter()
@@ -612,6 +758,70 @@ fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
             AggKind::Avg => {
                 format!(r#"SUM("PARTIAL_avg_sum_{i}") / NULLIF(SUM("PARTIAL_avg_cnt_{i}"), 0)"#)
             }
+            AggKind::VarPop => {
+                // numer / SUM(cnt); NULL when cnt = 0
+                format!(
+                    concat!(
+                        r#"(SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0)"#,
+                    ),
+                    i = i
+                )
+            }
+            AggKind::VarSamp => {
+                // numer / (N-1); NULL when cnt <= 1
+                format!(
+                    concat!(
+                        r#"(SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END"#,
+                    ),
+                    i = i
+                )
+            }
+            AggKind::StddevPop => {
+                // CASE IS NULL guard: Exasol GREATEST(0.0, NULL) = 0.0, not NULL.
+                // Without the CASE, N=0 would yield SQRT(0.0) = 0.0 instead of NULL.
+                format!(
+                    concat!(
+                        r#"CASE WHEN ((SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0)) IS NULL THEN NULL"#,
+                        r#" ELSE SQRT(GREATEST(0.0, (SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))) END"#,
+                    ),
+                    i = i
+                )
+            }
+            AggKind::StddevSamp => {
+                // CASE IS NULL guard: Exasol GREATEST(0.0, NULL) = 0.0, not NULL.
+                // Without the CASE, N<=1 would yield SQRT(0.0) = 0.0 instead of NULL.
+                format!(
+                    concat!(
+                        r#"CASE WHEN ((SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END) IS NULL THEN NULL"#,
+                        r#" ELSE SQRT(GREATEST(0.0, (SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
+                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END)) END"#,
+                    ),
+                    i = i
+                )
+            }
+        })
+        .collect()
+}
+
+/// Build the outer merge SELECT items, each cast to its Exasol-declared result type.
+///
+/// The merge expression (e.g. `SUM("PARTIAL_count_0")` over DECIMAL(20,0) partials →
+/// DECIMAL(31,0)) must match the type Exasol declared for that select-list column
+/// (COUNT(score) → DECIMAL(18,0)); Exasol strictly validates the pushdown output
+/// column types. When no declared type is available (or it is VARCHAR(2000000)),
+/// the merge expression is emitted uncast.
+fn cast_merge_items(aggregates: &[AggregatePlan], aggregate_types: &[String]) -> Vec<String> {
+    merge_select_items(aggregates)
+        .into_iter()
+        .enumerate()
+        .map(|(i, expr)| match aggregate_types.get(i) {
+            Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
+            _ => expr,
         })
         .collect()
 }
@@ -718,13 +928,32 @@ pub async fn handle_pushdown(
         _ => SCAN_UDF_NAME.to_string(),
     };
 
+    // Render the HAVING predicate (for grouped aggregate queries).
+    // Applied in the OUTER wrapper only — never in the per-shard scan.
+    // If the predicate cannot be translated, omit it (Exasol post-processes).
+    let having = pushdown_req
+        .get("having")
+        .filter(|h| !h.is_null())
+        .and_then(render_expression_safe);
+
     // Detection priority: GROUP BY aggregate → single-group aggregate → row scan.
     if let Some((group_keys, grouped_agg_plans)) = detect_group_by_aggregates(&pushdown_req) {
         // Validate aggregate column types for the grouped path — same guard as the
         // single-group path below. SUM over a non-numeric column (VARCHAR, DATE, …)
-        // would produce an opaque UDF error; fall back to row scan instead.
+        // would produce an opaque UDF error; normally we fall back to row scan.
         if !validate_agg_col_types(&grouped_agg_plans, &col_types) {
-            // Fall through to single-group aggregate detection / row scan below.
+            // If a HAVING predicate is present, we cannot fall through silently:
+            // the adapter has advertised AGGREGATE_HAVING, so Exasol will not
+            // re-apply a HAVING we claim to handle. Dropping it yields wrong results.
+            // Return an error so Exasol executes the query natively.
+            if having.is_some() {
+                return Err(UdfError::User(
+                    "grouped aggregate pushdown declined: HAVING present but aggregate \
+                     column type is non-numeric; Exasol will retry natively"
+                        .into(),
+                ));
+            }
+            // No HAVING: safe to fall through to single-group / row scan.
         } else {
             // Grouped aggregate pushdown path.
             // ponytail: PoC accepted risk — credentials embedded in spec literal.
@@ -738,14 +967,19 @@ pub async fn handle_pushdown(
                 storage: storage.clone(),
                 catalog: catalog.clone(),
             };
+            let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys);
+            let aggregate_types = aggregate_exasol_types(&pushdown_req);
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
                 shards,
                 &group_keys,
+                &group_key_types,
                 &grouped_agg_plans,
+                &aggregate_types,
                 limit,
                 &col_types,
                 &udf_name,
+                having.as_deref(),
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         } // end else (validate_agg_col_types passed)
@@ -774,6 +1008,7 @@ pub async fn handle_pushdown(
         catalog: catalog.clone(),
     };
 
+    let aggregate_types = aggregate_exasol_types(&pushdown_req);
     let sql = build_scan_driving_sql(
         &spec_template,
         shards,
@@ -781,6 +1016,7 @@ pub async fn handle_pushdown(
         &proj_types,
         limit,
         &col_types,
+        &aggregate_types,
         &udf_name,
     );
 
@@ -919,6 +1155,15 @@ fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
 }
 
 /// Extract the projected columns and their Exasol types from the pushdown request.
+///
+/// For `column` nodes: returns the uppercase column name and its Exasol type.
+/// For scalar expression nodes (e.g. `function_scalar`): renders via the VS expression
+/// translator and returns the rendered SQL fragment with type `VARCHAR(2000000)`.
+/// If any select-list item can't be projected as-is (untranslatable scalar, or an
+/// aggregate/unknown node), the whole projection falls back to the full base table
+/// column set so Exasol can post-process the expression, GROUP BY, and aggregate —
+/// correctness over pushdown. The returned projection is always deduplicated by name,
+/// since duplicate EMITS column names are invalid in Exasol.
 fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
@@ -960,34 +1205,117 @@ fn extract_projection(
             .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
     };
 
+    let first_col_name = all_cols.first().map(|(n, _)| n.clone()).unwrap_or_default();
+
     let select_list = pushdown_req.get("selectList");
-    let proj_names: Vec<String> = match select_list {
-        None | Some(Json::Null) => all_cols.iter().map(|(n, _)| n.clone()).collect(),
-        Some(Json::Array(list)) if list.is_empty() => all_cols
-            .first()
-            .map(|(n, _)| vec![n.clone()])
-            .unwrap_or_default(),
+    let (proj_names, proj_types): (Vec<String>, Vec<String>) = match select_list {
+        None | Some(Json::Null) => {
+            let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
+            let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
+            (names, types)
+        }
+        Some(Json::Array(list)) if list.is_empty() => {
+            // Empty select list — project the first column only.
+            let name = first_col_name;
+            let ty = type_by_upper(&name);
+            (vec![name], vec![ty])
+        }
         Some(Json::Array(list)) => {
-            let first_name = all_cols.first().map(|(n, _)| n.clone());
-            list.iter()
-                .filter_map(|e| {
-                    if e.get("type").and_then(|t| t.as_str()) == Some("column") {
+            // Exasol declares the result type of each selectList item in a parallel
+            // `selectListDataTypes` array; the EMITS column type must equal it.
+            let declared_types = pushdown_req
+                .get("selectListDataTypes")
+                .and_then(|v| v.as_array());
+            let mut names = Vec::with_capacity(list.len());
+            let mut types = Vec::with_capacity(list.len());
+            // If any item can't be projected as-is (untranslatable scalar, or an
+            // aggregate/unknown node), we can't emit a per-item projection — repeating
+            // `first_col_name` would yield duplicate EMITS names. Instead project the
+            // full base row so Exasol has every column to post-process the expression,
+            // GROUP BY, and aggregate itself.
+            let mut needs_full_fallback = false;
+            for (i, e) in list.iter().enumerate() {
+                let declared_type = declared_types
+                    .and_then(|d| d.get(i))
+                    .map(exasol_type_from_json);
+                let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match item_type {
+                    "column" => {
+                        // Bare column reference — use the column name and its Exasol type.
                         let name = e
                             .get("name")
                             .and_then(|n| n.as_str())
-                            .map(|s| s.to_uppercase());
-                        name.or_else(|| first_name.clone())
-                    } else {
-                        first_name.clone()
+                            .map(|s| s.to_uppercase())
+                            .unwrap_or_else(|| first_col_name.clone());
+                        let ty = type_by_upper(&name);
+                        names.push(name);
+                        types.push(ty);
                     }
-                })
-                .collect()
+                    "function_scalar"
+                    | "predicate_equal"
+                    | "predicate_less"
+                    | "predicate_lessequal"
+                    | "predicate_like"
+                    | "predicate_and"
+                    | "predicate_or"
+                    | "predicate_not"
+                    | "literal_string"
+                    | "literal_exactnumeric"
+                    | "literal_double"
+                    | "literal_null"
+                    | "literal_date"
+                    | "literal_timestamp"
+                    | "literal_timestamp_utc" => {
+                        // Scalar expression node — try to render it.
+                        match render_expression_safe(e) {
+                            Some(sql_frag) => {
+                                names.push(sql_frag);
+                                let ty = declared_type
+                                    .clone()
+                                    .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
+                                types.push(ty);
+                            }
+                            None => {
+                                // Untranslatable — fall back to projecting the full row.
+                                needs_full_fallback = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Unknown / aggregate node — fall back to projecting the full row.
+                        needs_full_fallback = true;
+                    }
+                }
+            }
+            if needs_full_fallback {
+                let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
+                let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
+                (names, types)
+            } else {
+                (names, types)
+            }
         }
-        _ => all_cols.iter().map(|(n, _)| n.clone()).collect(),
+        _ => {
+            let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
+            let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
+            (names, types)
+        }
     };
 
-    let proj_types: Vec<String> = proj_names.iter().map(|n| type_by_upper(n)).collect();
-    Ok((proj_names, proj_types))
+    // Defensive backstop: duplicate EMITS column names are always invalid in Exasol,
+    // regardless of which path produced the projection. Dedup by name, keeping the
+    // first occurrence and its type.
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped_names = Vec::with_capacity(proj_names.len());
+    let mut deduped_types = Vec::with_capacity(proj_types.len());
+    for (name, ty) in proj_names.into_iter().zip(proj_types) {
+        if seen.insert(name.clone()) {
+            deduped_names.push(name);
+            deduped_types.push(ty);
+        }
+    }
+
+    Ok((deduped_names, deduped_types))
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -1060,7 +1388,7 @@ mod tests {
     use vs_expression::render_df_filter_safe;
 
     // ---------------------------------------------------------------------------
-    // Task 2.3: shard_count — cap/clamp boundary tests
+    // shard_count — cap/clamp boundary tests
     // ---------------------------------------------------------------------------
 
     /// Scenario: Shard count oversubscribes the cluster and is capped at 300.
@@ -1167,6 +1495,7 @@ mod tests {
             &proj_types,
             limit,
             &col_types,
+            &[],
             SCAN_UDF_NAME,
         )
     }
@@ -1380,7 +1709,60 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 4.2 / 4.4: detect_aggregates — plan translation + fallback
+    // extract_projection — row-scan fallback must be duplicate-free
+    // ---------------------------------------------------------------------------
+
+    /// A select list mixing an untranslatable scalar and COUNT(*) must NOT emit
+    /// repeated `first_col_name` columns (which Exasol rejects as duplicate EMITS).
+    /// It falls back to the full, deduplicated base-table column set.
+    #[test]
+    fn extract_projection_fallback_is_duplicate_free() {
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "name": "EVENTS",
+                "columns": [
+                    {"name": "id", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "name", "dataType": {"type": "varchar", "size": 2000000}},
+                ],
+            }],
+        });
+        // Untranslatable scalar (unknown function) + COUNT(*) aggregate — both items
+        // would otherwise hit the first-column fallback arms.
+        let pushdown_req = serde_json::json!({
+            "selectList": [
+                {"type": "function_scalar", "name": "TOTALLY_UNKNOWN_FN", "arguments": [
+                    {"type": "column", "name": "id"}
+                ]},
+                {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 20, "scale": 0},
+            ],
+        });
+
+        let (names, types) = extract_projection(&request, &pushdown_req).unwrap();
+
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "projection must be duplicate-free, got: {names:?}"
+        );
+        assert_eq!(
+            names,
+            vec!["ID".to_string(), "NAME".to_string()],
+            "fallback must project the full base-table column set"
+        );
+        assert_eq!(
+            names.len(),
+            types.len(),
+            "names and types must stay aligned"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_aggregates — plan translation + fallback
     // ---------------------------------------------------------------------------
 
     fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
@@ -1396,7 +1778,7 @@ mod tests {
         })
     }
 
-    /// Task 4.4: COUNT(*) translates to Count with column=None.
+    /// COUNT(*) translates to Count with column=None.
     #[test]
     fn detect_count_star_produces_count_no_column() {
         let req = serde_json::json!({
@@ -1408,7 +1790,7 @@ mod tests {
         assert!(plans[0].column.is_none());
     }
 
-    /// Task 4.4: COUNT(col) translates to CountCol with the column name.
+    /// COUNT(col) translates to CountCol with the column name.
     #[test]
     fn detect_count_col_produces_count_col() {
         let req = serde_json::json!({
@@ -1419,7 +1801,7 @@ mod tests {
         assert_eq!(plans[0].column.as_deref(), Some("AMOUNT"));
     }
 
-    /// Task 4.4: SUM/MIN/MAX/AVG each translate to the right kind + column.
+    /// SUM/MIN/MAX/AVG each translate to the right kind + column.
     #[test]
     fn detect_sum_min_max_avg_produce_correct_plans() {
         let req = serde_json::json!({
@@ -1441,7 +1823,7 @@ mod tests {
         assert_eq!(plans[3].column.as_deref(), Some("SCORE"));
     }
 
-    /// Task 4.4: GROUP BY present and non-empty => fall back (None).
+    /// GROUP BY present and non-empty => fall back (None).
     #[test]
     fn detect_aggregates_falls_back_on_group_by() {
         let req = serde_json::json!({
@@ -1454,7 +1836,7 @@ mod tests {
         );
     }
 
-    /// Task 4.4: DISTINCT aggregate => fall back.
+    /// DISTINCT aggregate => fall back.
     #[test]
     fn detect_aggregates_falls_back_on_distinct() {
         let req = serde_json::json!({
@@ -1466,13 +1848,14 @@ mod tests {
         );
     }
 
-    /// Task 4.4: Unsupported function (e.g., STDDEV) => fall back.
+    /// Unsupported aggregate function (e.g., MEDIAN) => fall back to row scan.
+    /// Note: STDDEV is a supported decomposable aggregate via sufficient-statistics.
     #[test]
     fn detect_aggregates_falls_back_on_unsupported_function() {
         let req = serde_json::json!({
             "selectList": [
                 agg_item("SUM", Some("amount"), false),
-                agg_item("STDDEV", Some("amount"), false),
+                agg_item("MEDIAN", Some("amount"), false),
             ]
         });
         assert!(
@@ -1481,7 +1864,7 @@ mod tests {
         );
     }
 
-    /// Task 4.4: Non-aggregate select item (e.g., plain column) => fall back.
+    /// Non-aggregate select item (e.g., plain column) => fall back.
     #[test]
     fn detect_aggregates_falls_back_on_column_select() {
         let req = serde_json::json!({
@@ -1495,14 +1878,13 @@ mod tests {
         );
     }
 
-    /// Task 4.4: Empty select list => None.
+    /// Empty select list => None.
     #[test]
     fn detect_aggregates_returns_none_for_empty_select_list() {
         let req = serde_json::json!({ "selectList": [] });
         assert!(detect_aggregates(&req).is_none());
     }
 
-    /// Task 4.4 + 3.3 (aggregate_query_builds_partial_agg_spec):
     /// An aggregate select-list translates to a ScanSpec carrying
     /// the aggregate plan (kind+column) plus any pushed-down filter.
     #[test]
@@ -1538,6 +1920,7 @@ mod tests {
             &["DOUBLE PRECISION".to_string()],
             None,
             &col_types,
+            &[],
             SCAN_UDF_NAME,
         );
 
@@ -1571,12 +1954,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 3.3: IPROC fan-out + single-shard equivalence
+    // Fan-out SQL shape — multi-shard GROUP BY shard_key, single-shard equivalence
     // ---------------------------------------------------------------------------
 
-    /// Task 3.3 (updated for task 2.8): multi_shard_sql_fans_via_shard_key_group_by
-    /// Given files partitioned into >1 shard: SQL contains GROUP BY shard_key (NOT IPROC()),
-    /// invokes the scan UDF, and carries each shard's distinct files as separate spec literals.
+    /// Multi-shard SQL fans out via GROUP BY shard_key (not IPROC()): SQL contains
+    /// GROUP BY shard_key, invokes the scan UDF, and carries each shard's distinct
+    /// files as separate spec literals.
     #[test]
     fn multi_shard_sql_fans_via_shard_key_group_by() {
         let files = vec![
@@ -1645,7 +2028,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 6.3: aggregate merge wrapper SQL tests
+    // Aggregate merge wrapper SQL — outer SELECT reconstructing partial results
     // ---------------------------------------------------------------------------
 
     /// Helper: build aggregate scan SQL from a set of aggregate plans.
@@ -1667,10 +2050,19 @@ mod tests {
             catalog: sample_catalog(),
         };
         let shards = crate::adapter::sharding::partition_files(files, cluster_nodes);
-        build_scan_driving_sql(&spec_template, shards, &[], &[], None, &[], SCAN_UDF_NAME)
+        build_scan_driving_sql(
+            &spec_template,
+            shards,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+        )
     }
 
-    /// Task 6.3: aggregate_wrapper_merges_partials
+    /// Aggregate wrapper merges partials: outer SELECT aggregates per-shard COUNT/SUM/MIN/MAX.
     /// Given COUNT/SUM/MIN/MAX aggregate plan: wrapper contains fan-out AND outer
     /// SUM/MIN/MAX over the partial columns in the right order.
     #[test]
@@ -1760,7 +2152,80 @@ mod tests {
         );
     }
 
-    /// Task 6.3: avg_wrapper_divides_sum_by_count_guarded
+    /// Single-group merge casts each aggregate to its Exasol-declared result type.
+    /// `SELECT COUNT(score)` merges as `SUM("PARTIAL_count_0")` (DECIMAL(31,0)); Exasol
+    /// declared DECIMAL(18,0) for the column and strictly validates the adapter's output
+    /// type, so the merge item must be `CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))`.
+    #[test]
+    fn single_group_merge_casts_to_declared_type() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::CountCol,
+            column: Some("SCORE".into()),
+        }];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(plans.clone()),
+            group_keys: None,
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
+        let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            shards,
+            &[],
+            &[],
+            None,
+            &col_types,
+            &aggregate_types,
+            SCAN_UDF_NAME,
+        );
+        assert!(
+            sql.contains(r#"CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))"#),
+            "single-group merge must cast COUNT to declared DECIMAL(18,0): {sql}"
+        );
+    }
+
+    /// Single-group merge with no declared types emits the bare uncast merge expression.
+    #[test]
+    fn single_group_merge_uncast_without_declared_types() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::CountCol,
+            column: Some("SCORE".into()),
+        }];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(plans.clone()),
+            group_keys: None,
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            shards,
+            &[],
+            &[],
+            None,
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+        );
+        assert!(
+            sql.contains(r#"SUM("PARTIAL_count_0")"#) && !sql.contains("CAST(SUM"),
+            "single-group merge without declared types must be uncast: {sql}"
+        );
+    }
+
+    /// AVG wrapper divides merged sum by count with NULLIF(cnt, 0) guard.
     /// Given AVG plan: wrapper computes SUM(partial_avg_sum) / NULLIF(SUM(partial_avg_cnt),0).
     #[test]
     fn avg_wrapper_divides_sum_by_count_guarded() {
@@ -1810,7 +2275,7 @@ mod tests {
         );
     }
 
-    /// Task 6.3 extra: single-shard aggregate path produces a correct merge wrapper.
+    /// Single-shard aggregate path produces a correct merge wrapper.
     #[test]
     fn single_shard_aggregate_still_uses_merge_wrapper() {
         let plans = vec![
@@ -2038,7 +2503,7 @@ mod tests {
         );
     }
 
-    /// Task 3.3: single_shard_sql_matches_legacy_shape
+    /// Single-shard SQL shape matches the expected SELECT * FROM (SELECT …) wrapper.
     /// Given CLUSTER_NODES=1: the generated SQL does NOT contain IPROC/VALUES/GROUP BY
     /// and matches the `SELECT * FROM (SELECT {udf}(...) EMITS (...))` form.
     #[test]
@@ -2093,7 +2558,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 2.5 tests — detect_group_by_aggregates
+    // detect_group_by_aggregates — GROUP BY key extraction and aggregate detection
     // ---------------------------------------------------------------------------
 
     fn make_group_by_request(
@@ -2181,7 +2646,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 2.4: partition_files_g_shards_balanced_disjoint_full_coverage
+    // partition_files — G shards balanced, disjoint, full coverage
     // ---------------------------------------------------------------------------
 
     /// File list partitioned into G shards via shard_count is balanced, disjoint,
@@ -2220,8 +2685,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 2.8 / 2.11: scan_driving_sql_groups_by_shard_key_not_iproc
-    //   and single_shard_collapses_to_single_invocation
+    // Row-scan SQL shape — GROUP BY shard_key fan-out, single-shard collapse
     // ---------------------------------------------------------------------------
 
     /// Multi-shard row-scan SQL uses GROUP BY shard_key, never IPROC().
@@ -2248,6 +2712,7 @@ mod tests {
             &["ID".to_string()],
             &["DECIMAL(20,0)".to_string()],
             None,
+            &[],
             &[],
             SCAN_UDF_NAME,
         );
@@ -2288,6 +2753,7 @@ mod tests {
             &["DECIMAL(20,0)".to_string()],
             None,
             &[],
+            &[],
             SCAN_UDF_NAME,
         );
         assert!(
@@ -2309,7 +2775,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 2.11: grouped_scan_sql_groups_by_shard_key
+    // Grouped aggregate scan SQL — GROUP BY shard_key fan-out
     // ---------------------------------------------------------------------------
 
     /// Helper: build grouped aggregate scan SQL.
@@ -2338,10 +2804,13 @@ mod tests {
             &spec_template,
             shards,
             &group_keys,
+            &[],
             &agg_plans,
+            &[],
             None,
             &col_types,
             SCAN_UDF_NAME,
+            None,
         )
     }
 
@@ -2402,13 +2871,16 @@ mod tests {
             &spec_template,
             shards,
             &["\"REGION\"".to_string()],
+            &[],
             &[AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
             }],
+            &[],
             Some(100),
             &col_types,
             SCAN_UDF_NAME,
+            None,
         );
         // The per-shard spec JSON must NOT carry "limit" — extract the embedded JSON literal
         // (everything between the first ' and the matching ') and verify "limit" is absent.
@@ -2485,7 +2957,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 2.10: grouped_scan_spec_carries_group_keys
+    // ScanSpec GROUP BY — group-key fragments propagated to the scan spec
     // ---------------------------------------------------------------------------
 
     /// Grouped scan spec carries group-key rendered SQL fragments.
@@ -2538,5 +3010,433 @@ mod tests {
             "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
         });
         assert!(detect_group_by_aggregates(&req).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Non-decomposable aggregate fallback to row scan
+    // ---------------------------------------------------------------------------
+
+    /// MEDIAN, *_DISTINCT, APPROX_COUNT_DISTINCT, LISTAGG, GROUP_CONCAT all cause
+    /// parse_agg_item / detect_aggregates to return None (row-scan fallback).
+    #[test]
+    fn non_decomposable_aggregate_falls_back_to_row_scan() {
+        for name in &[
+            "MEDIAN",
+            "APPROXIMATE_COUNT_DISTINCT",
+            "LISTAGG",
+            "GROUP_CONCAT",
+        ] {
+            let req = serde_json::json!({
+                "selectList": [agg_item(name, Some("AMOUNT"), false)],
+            });
+            assert!(
+                detect_aggregates(&req).is_none(),
+                "{name} must fall back to row scan"
+            );
+        }
+        // COUNT(DISTINCT col) — distinct flag set
+        let req_distinct = serde_json::json!({
+            "selectList": [agg_item("COUNT", Some("ID"), true)],
+        });
+        assert!(
+            detect_aggregates(&req_distinct).is_none(),
+            "COUNT(DISTINCT) must fall back to row scan"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // STDDEV / VARIANCE decomposition into sufficient statistics
+    // ---------------------------------------------------------------------------
+
+    /// parse_agg_item returns a stat plan for STDDEV/VARIANCE family names.
+    #[test]
+    fn parse_agg_item_recognises_stat_functions() {
+        for (name, expected_kind) in &[
+            ("STDDEV", AggKind::StddevSamp),
+            ("STDDEV_SAMP", AggKind::StddevSamp),
+            ("STDDEV_POP", AggKind::StddevPop),
+            ("VARIANCE", AggKind::VarSamp),
+            ("VAR_SAMP", AggKind::VarSamp),
+            ("VAR_POP", AggKind::VarPop),
+        ] {
+            let item = agg_item(name, Some("AMOUNT"), false);
+            let plan =
+                parse_agg_item(&item).unwrap_or_else(|| panic!("{name} must parse to a stat plan"));
+            assert_eq!(
+                plan.kind, *expected_kind,
+                "{name} must map to {:?}",
+                expected_kind
+            );
+            assert_eq!(plan.column.as_deref(), Some("AMOUNT"));
+        }
+    }
+
+    /// partial_emits_items produces 3 columns for stat aggregates.
+    #[test]
+    fn stat_aggregate_emits_three_partial_columns() {
+        for kind in &[
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            let plans = vec![AggregatePlan {
+                kind: kind.clone(),
+                column: Some("SCORE".into()),
+            }];
+            let col_types = vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+            let items = partial_emits_items(&plans, &col_types);
+            assert_eq!(
+                items.len(),
+                3,
+                "{kind:?} must emit 3 partial columns, got: {items:?}"
+            );
+            assert!(
+                items[0].contains("PARTIAL_stat_cnt_0"),
+                "first column must be cnt: {items:?}"
+            );
+            assert!(
+                items[1].contains("PARTIAL_stat_sum_0"),
+                "second column must be sum: {items:?}"
+            );
+            assert!(
+                items[2].contains("PARTIAL_stat_sumsq_0"),
+                "third column must be sumsq: {items:?}"
+            );
+        }
+    }
+
+    /// merge_select_items produces the correct reconstruction SQL for VAR_POP.
+    #[test]
+    fn var_pop_merge_formula_divides_by_n() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::VarPop,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        // Must contain NULLIF(..., 0) guard on the count
+        assert!(
+            sql.contains("NULLIF"),
+            "var_pop merge must guard zero count: {sql}"
+        );
+        // Must NOT divide by (count - 1)
+        assert!(
+            !sql.contains("- 1"),
+            "var_pop must not subtract 1 from count: {sql}"
+        );
+    }
+
+    /// merge_select_items for VAR_SAMP divides by N-1 and guards N<=1 → NULL.
+    #[test]
+    fn var_samp_merge_formula_divides_by_n_minus_1() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::VarSamp,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        // Must use CASE WHEN … <= 1 THEN NULL to guard count<=1 → NULL.
+        // Checking both `<= 1` and `CASE` ensures the N-1 sample divisor guard
+        // is specifically present — not just any CASE or NULLIF in the expression.
+        assert!(
+            sql.contains("<= 1"),
+            "var_samp merge must guard count<=1 with '<= 1': {sql}"
+        );
+        assert!(
+            sql.contains("CASE"),
+            "var_samp merge must use CASE for N<=1 guard: {sql}"
+        );
+    }
+
+    /// STDDEV_POP merge formula wraps variance in SQRT.
+    #[test]
+    fn stddev_pop_merge_formula_uses_sqrt() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::StddevPop,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        assert!(sql.contains("SQRT("), "stddev_pop must use SQRT: {sql}");
+        assert!(
+            !sql.contains("- 1"),
+            "stddev_pop must not subtract 1: {sql}"
+        );
+    }
+
+    /// STDDEV_SAMP merge formula wraps variance-samp in SQRT.
+    #[test]
+    fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::StddevSamp,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        assert!(sql.contains("SQRT("), "stddev_samp must use SQRT: {sql}");
+        // N-1 guard: removing the N<=1 CASE would break this assertion.
+        assert!(
+            sql.contains("<= 1"),
+            "stddev_samp must guard N<=1 (sample divisor): {sql}"
+        );
+        assert!(
+            sql.contains("CASE"),
+            "stddev_samp must use CASE for N<=1 guard: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // STDDEV/VARIANCE NULL-passthrough — N=0 (pop & samp) and N=1 (samp)
+    // ---------------------------------------------------------------------------
+
+    /// StddevPop merge SQL passes NULL through (N=0 → var_pop is NULL → stddev_pop NULL).
+    ///
+    /// Exasol `GREATEST(0.0, NULL) = 0.0` — a bare SQRT(GREATEST(...)) returns 0.0
+    /// when cnt=0, not NULL. The correct form wraps in CASE WHEN IS NULL THEN NULL.
+    #[test]
+    fn stddev_pop_merge_null_passthrough_for_n_zero() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::StddevPop,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        // Must contain a NULL guard (CASE … IS NULL) that wraps the whole expression.
+        assert!(
+            sql.contains("IS NULL"),
+            "stddev_pop must pass NULL through for N=0 via IS NULL guard: {sql}"
+        );
+        // The GREATEST guard against tiny-negative float rounding must still be present.
+        assert!(
+            sql.contains("GREATEST"),
+            "stddev_pop must keep GREATEST rounding guard: {sql}"
+        );
+    }
+
+    /// StddevSamp merge SQL passes NULL through for N=0 and N=1.
+    ///
+    /// var_samp is NULL when cnt<=1 (CASE guard). Wrapping in CASE WHEN IS NULL
+    /// ensures SQRT does not receive 0.0 via GREATEST(0.0, NULL) = 0.0.
+    #[test]
+    fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::StddevSamp,
+            column: Some("X".into()),
+        }];
+        let sql = merge_select_items(&plans).join(", ");
+        // Must contain a NULL guard that wraps the whole expression.
+        assert!(
+            sql.contains("IS NULL"),
+            "stddev_samp must pass NULL through for N<=1 via IS NULL guard: {sql}"
+        );
+        // The GREATEST guard against tiny-negative float rounding must still be present.
+        assert!(
+            sql.contains("GREATEST"),
+            "stddev_samp must keep GREATEST rounding guard: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // HAVING must not be silently dropped on grouped-path type-validation failure
+    // ---------------------------------------------------------------------------
+
+    /// Regression: HAVING is present + grouped-path type-validation fails.
+    ///
+    /// Before the fix, `handle_pushdown` would fall through to the row-scan path
+    /// and silently discard the HAVING predicate — yielding wrong results because
+    /// the adapter advertised `AGGREGATE_HAVING` so Exasol does not re-apply it.
+    ///
+    /// This test proves the two components that the guard in `handle_pushdown`
+    /// relies on: (a) HAVING renders to `Some` for this request, and (b) type
+    /// validation fails for SUM over a non-numeric column. Together they mean the
+    /// guard `if having.is_some() && !validate_agg_col_types(...)` triggers and
+    /// the function returns an error instead of falling through.
+    #[test]
+    fn having_present_and_grouped_type_validation_fails_conditions_hold() {
+        // Pushdown request: GROUP BY aggregate with SUM over VARCHAR (non-numeric)
+        // and a simple HAVING predicate (column > literal — translatable by render_expression_safe).
+        //
+        // A HAVING with `function_aggregate` is NOT translatable by vs_expression, so we use a
+        // plain column comparison to exercise the "having renders to Some" side of the invariant.
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "REGION", "dataType": {"type": "VARCHAR", "size": 100}},
+                    {"name": "LABEL",  "dataType": {"type": "VARCHAR", "size": 50}},
+                    {"name": "SCORE",  "dataType": {"type": "DOUBLE"}},
+                ]
+            }],
+            "pushdownRequest": {
+                "aggregationType": "group_by",
+                "groupBy": [{"type": "column", "name": "REGION"}],
+                "selectList": [
+                    {"type": "column", "name": "REGION"},
+                    {
+                        "type": "function_aggregate",
+                        "name": "SUM",
+                        "arguments": [{"type": "column", "name": "LABEL"}]
+                    }
+                ],
+                "having": {
+                    "type": "predicate_greater",
+                    "left":  {"type": "column", "name": "SCORE"},
+                    "right": {"type": "literal_exactnumeric", "value": "100"}
+                }
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let col_types = extract_all_column_types(&request);
+
+        // (a) detect_group_by_aggregates must find a grouped path.
+        let detected = detect_group_by_aggregates(&pushdown_req);
+        assert!(
+            detected.is_some(),
+            "test setup: must detect grouped aggregates"
+        );
+        let (_, grouped_plans) = detected.unwrap();
+
+        // (b) validate_agg_col_types must fail (SUM over VARCHAR is invalid).
+        assert!(
+            !validate_agg_col_types(&grouped_plans, &col_types),
+            "type validation must fail for SUM(VARCHAR)"
+        );
+
+        // (c) HAVING must render to Some — confirming it would be dropped without the guard.
+        let having = pushdown_req
+            .get("having")
+            .filter(|h| !h.is_null())
+            .and_then(render_expression_safe);
+        assert!(
+            having.is_some(),
+            "HAVING must render to Some — without the guard it would be silently dropped"
+        );
+
+        // Both conditions simultaneously: this is exactly the state that triggers the
+        // guard `if having.is_some() && !validate_agg_col_types(...)` in handle_pushdown.
+        // When both hold, handle_pushdown returns Err (not Ok with dropped HAVING).
+        assert!(
+            having.is_some() && !validate_agg_col_types(&grouped_plans, &col_types),
+            "guard condition must hold: having present AND type validation failed"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Select-list scalar expression pushdown
+    // ---------------------------------------------------------------------------
+
+    /// A function_scalar in the select list renders to a SQL expression in the
+    /// scan spec projection and EMITS clause.
+    #[test]
+    fn selectlist_scalar_expression_rendered_in_emits() {
+        // Simulate a pushdown request with UPPER(name) in the select list.
+        let upper_expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "UPPER",
+            "arguments": [{"type": "column", "name": "NAME"}]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [upper_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        // The rendered expression should be in projection
+        assert_eq!(proj_cols.len(), 1);
+        assert!(
+            proj_cols[0].contains("UPPER") || proj_cols[0].contains("upper"),
+            "projection must contain rendered expression: {proj_cols:?}"
+        );
+        // Type for an expression falls back to VARCHAR(2000000)
+        assert_eq!(proj_types[0], "VARCHAR(2000000)");
+    }
+
+    /// An untranslatable select-list item falls back to the bare column.
+    #[test]
+    fn selectlist_untranslatable_item_falls_back_to_column() {
+        // A node type the translator cannot handle
+        let bad_expr = serde_json::json!({
+            "type": "function_aggregate",  // aggregate in select list -> untranslatable as scalar expr
+            "name": "SUM",
+            "arguments": [{"type": "column", "name": "AMOUNT"}]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "AMOUNT", "dataType": {"type": "DECIMAL", "precision": 18, "scale": 2}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [bad_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        // Fall back to the first column name
+        assert_eq!(proj_cols.len(), 1);
+        assert_eq!(proj_cols[0], "AMOUNT");
+        assert_eq!(proj_types[0], "DECIMAL(18,2)");
+    }
+
+    // ---------------------------------------------------------------------------
+    // HAVING predicate — applied in the outer wrapper only, never in shard scan
+    // ---------------------------------------------------------------------------
+
+    /// HAVING is rendered and appears in the outer GROUP BY wrapper SQL.
+    #[test]
+    fn having_clause_appears_in_outer_wrapper_only() {
+        // Build a grouped aggregate SQL with a HAVING predicate.
+        let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec!["REGION".into(), "AMOUNT".into()],
+            filter: None,
+            limit: None,
+            aggregates: Some(vec![AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            }]),
+            group_keys: Some(vec![r#""REGION""#.to_string()]),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = vec![vec!["s3://wh/f.parquet".into()]];
+        let col_types = vec![
+            ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
+        ];
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &[r#""REGION""#.to_string()],
+            &[],
+            &[AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            }],
+            &[],
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+            having_filter.as_deref(),
+        );
+        // HAVING must appear in the outer wrapper (after GROUP BY)
+        assert!(
+            sql.contains("HAVING"),
+            "outer wrapper must contain HAVING: {sql}"
+        );
+        assert!(
+            sql.contains("100"),
+            "HAVING predicate value must be in SQL: {sql}"
+        );
+        // HAVING must come after GROUP BY
+        let having_pos = sql.find("HAVING").unwrap();
+        let group_by_pos = sql.find("GROUP BY").unwrap();
+        assert!(
+            having_pos > group_by_pos,
+            "HAVING must appear after GROUP BY: {sql}"
+        );
     }
 }

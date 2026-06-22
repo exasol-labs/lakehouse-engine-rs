@@ -55,10 +55,8 @@ shards via `GROUP BY shard_key` — over exactly those files.
 
 * *GIVEN* an Exasol session that has installed the VS adapter script
 * *WHEN* Exasol sends a `getCapabilities` request to the adapter
-* *THEN* the capabilities list SHALL include single-group aggregate pushdown for `COUNT`, `COUNT(*)`, `SUM`, `MIN`, `MAX`, and `AVG`
-* *AND* the capabilities list SHALL include `AGGREGATE_GROUP_BY_COLUMN` and `AGGREGATE_GROUP_BY_EXPRESSION` for GROUP BY pushdown
-* *AND* the capabilities list MUST NOT include `AGGREGATE_GROUP_BY_TUPLE`, `AGGREGATE_HAVING`, `FN_AGG_COUNT_DISTINCT`, or join pushdown
-* *AND* the capabilities list SHALL continue to include column projection, filter predicates, and LIMIT
+* *THEN* the capabilities list SHALL include single-group aggregate pushdown for `COUNT`/`COUNT(*)`/`SUM`/`MIN`/`MAX`/`AVG`, `AGGREGATE_GROUP_BY_COLUMN`/`AGGREGATE_GROUP_BY_EXPRESSION`/`AGGREGATE_HAVING`, the decomposable statistical aggregates `FN_AGG_STDDEV`/`FN_AGG_STDDEV_POP`/`FN_AGG_STDDEV_SAMP`/`FN_AGG_VARIANCE`/`FN_AGG_VAR_POP`/`FN_AGG_VAR_SAMP`, and (still) column projection, scalar select-list expressions, filter predicates, and LIMIT
+* *AND* the capabilities list MUST NOT include `AGGREGATE_GROUP_BY_TUPLE`, `FN_AGG_COUNT_DISTINCT` (or any other `*_DISTINCT` aggregate), `FN_AGG_MEDIAN`, `FN_AGG_APPROXIMATE_COUNT_DISTINCT`, `FN_AGG_GROUP_CONCAT*`/`FN_AGG_LISTAGG`, or join pushdown
 
 ### Scenario: Aggregate query is translated into a partial-aggregate scan spec
 

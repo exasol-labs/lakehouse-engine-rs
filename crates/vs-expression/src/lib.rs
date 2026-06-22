@@ -57,6 +57,17 @@ fn json_scalar_to_string(value: &Json) -> String {
     }
 }
 
+/// Render a slice of argument nodes, returning an error if any fails.
+fn render_args(args: &[Json]) -> Result<Vec<String>, UdfError> {
+    args.iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            render_expression_inner(arg)?
+                .ok_or_else(|| UdfError::User(format!("argument[{i}] rendered to null")))
+        })
+        .collect()
+}
+
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
 fn render_cast_target(data_type: &Json) -> Result<String, UdfError> {
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -130,6 +141,14 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
         "literal_date" => return Ok(Some(format!("DATE {}", quote_literal(value("value"))))),
         "literal_timestamp" => {
             return Ok(Some(format!("TIMESTAMP {}", quote_literal(value("value")))));
+        }
+        "literal_timestamp_utc" => {
+            // Append +00:00 so DataFusion parses it as a UTC timestamp-with-timezone.
+            let raw = match value("value") {
+                None | Some(Json::Null) => return Ok(Some("NULL".into())),
+                Some(v) => json_scalar_to_string(v),
+            };
+            return Ok(Some(format!("TIMESTAMP '{raw}+00:00'")));
         }
         "column" => {
             let name = value("name")
@@ -226,6 +245,90 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 )),
             }
         }
+        // Exasol sends REGEXP_LIKE as node type `predicate_like_regexp`.
+        "predicate_like_regexp" => {
+            let subject = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+                .ok_or_else(|| {
+                    UdfError::User("predicate_like_regexp missing 'expression'".into())
+                })?;
+            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null))?
+                .ok_or_else(|| UdfError::User("predicate_like_regexp missing 'pattern'".into()))?;
+            Ok(Some(format!("regexp_like({subject}, {pattern})")))
+        }
+        // Exasol sends EXTRACT as its own node type with the field in `toExtract`:
+        // {"type":"function_scalar_extract","name":"EXTRACT","toExtract":"DAY","arguments":[<src>]}
+        "function_scalar_extract" => {
+            let field = value("toExtract")
+                .and_then(|f| f.as_str())
+                .ok_or_else(|| {
+                    UdfError::User("function_scalar_extract missing 'toExtract'".into())
+                })?
+                .to_uppercase();
+            let args = value("arguments")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| {
+                    UdfError::User("function_scalar_extract missing 'arguments'".into())
+                })?;
+            if args.is_empty() {
+                return Err(UdfError::User(
+                    "function_scalar_extract requires 1 argument".into(),
+                ));
+            }
+            let src = render_expression_inner(&args[0])?
+                .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
+            // DataFusion 54 (default features) has no EXTRACT(field FROM expr) ExprPlanner;
+            // render the portable function form date_part('FIELD', expr) instead.
+            Ok(Some(format!("date_part('{field}', {src})")))
+        }
+        // Exasol encodes CASE (and CASE-expanded functions like NULLIF/ZEROIFNULL) as
+        // its own node type:
+        //   {"type":"function_scalar_case","name":"CASE",
+        //    "basis": <operand>?,            // present → "simple" CASE basis WHEN arg
+        //    "arguments": [<when>, ...],     // WHEN comparison values / predicates
+        //    "results":   [<then>, ..., <else>?]} // one THEN per WHEN; trailing = ELSE
+        // Rendered to SQL CASE; with `basis` it is `CASE basis WHEN arg THEN res ...`,
+        // without it the WHEN arguments are boolean predicates (`CASE WHEN pred ...`).
+        "function_scalar_case" => {
+            let whens = value("arguments")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| UdfError::User("function_scalar_case missing 'arguments'".into()))?;
+            let results = value("results")
+                .and_then(|r| r.as_array())
+                .ok_or_else(|| UdfError::User("function_scalar_case missing 'results'".into()))?;
+            if results.len() != whens.len() && results.len() != whens.len() + 1 {
+                return Err(UdfError::User(format!(
+                    "function_scalar_case results ({}) must equal WHEN count ({}) or +1 for ELSE",
+                    results.len(),
+                    whens.len()
+                )));
+            }
+            let basis = match value("basis") {
+                Some(b) if !b.is_null() => Some(
+                    render_expression_inner(b)?
+                        .ok_or_else(|| UdfError::User("CASE basis is null".into()))?,
+                ),
+                _ => None,
+            };
+            let mut sql = String::from("CASE");
+            if let Some(b) = &basis {
+                sql.push(' ');
+                sql.push_str(b);
+            }
+            for (i, when) in whens.iter().enumerate() {
+                let when_sql = render_expression_inner(when)?
+                    .ok_or_else(|| UdfError::User("CASE WHEN value is null".into()))?;
+                let then_sql = render_expression_inner(&results[i])?
+                    .ok_or_else(|| UdfError::User("CASE THEN result is null".into()))?;
+                sql.push_str(&format!(" WHEN {when_sql} THEN {then_sql}"));
+            }
+            if results.len() == whens.len() + 1 {
+                let else_sql = render_expression_inner(&results[whens.len()])?
+                    .ok_or_else(|| UdfError::User("CASE ELSE result is null".into()))?;
+                sql.push_str(&format!(" ELSE {else_sql}"));
+            }
+            sql.push_str(" END");
+            Ok(Some(format!("({sql})")))
+        }
         "function_scalar" => {
             let fn_name = value("name")
                 .and_then(|n| n.as_str())
@@ -234,7 +337,11 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             let args = value("arguments").and_then(|a| a.as_array());
 
             match fn_name.as_str() {
-                // Arithmetic binary operators
+                // Arithmetic operators and CAST are translated but not yet advertised as
+                // capabilities — Exasol pushes them implicitly as part of expression trees
+                // for advertised scalar functions.
+                // ponytail: arithmetic/cast capability advertisement is future scope; keep
+                // these arms so expression trees that contain them translate correctly.
                 "ADD" | "SUB" | "MUL" | "FLOAT_DIV" => {
                     let op = match fn_name.as_str() {
                         "ADD" => "+",
@@ -290,6 +397,312 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                     })?;
                     let target_type = render_cast_target(data_type)?;
                     Ok(Some(format!("CAST({inner} AS {target_type})")))
+                }
+                // REGEXP_LIKE as a function_scalar (alternate encoding)
+                "REGEXP_LIKE" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar REGEXP_LIKE missing 'arguments'".into())
+                    })?;
+                    if args.len() < 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar REGEXP_LIKE requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let subject = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("REGEXP_LIKE subject is null".into()))?;
+                    let pattern = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("REGEXP_LIKE pattern is null".into()))?;
+                    Ok(Some(format!("regexp_like({subject}, {pattern})")))
+                }
+                // Math functions: name-mapping table
+                // Arity: 1-arg: ABS FLOOR CEIL SQRT EXP LN SIGN DEGREES RADIANS SIN COS TAN ASIN
+                //               ACOS ATAN SINH COSH TANH COT
+                // 1-or-2-arg: ROUND TRUNC LOG
+                // 2-arg: POWER ATAN2
+                "ABS" | "FLOOR" | "CEIL" | "SQRT" | "EXP" | "LN" | "SIGN" | "DEGREES"
+                | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "SINH"
+                | "COSH" | "TANH" | "COT" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 1 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let lower;
+                    let df_name = match fn_name.as_str() {
+                        // SIGN → signum: DataFusion uses "signum" not "sign".
+                        "SIGN" => "signum",
+                        other => {
+                            lower = other.to_lowercase();
+                            &lower
+                        }
+                    };
+                    let arg = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
+                    Ok(Some(format!("{df_name}({arg})")))
+                }
+                "ROUND" | "TRUNC" | "LOG" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.is_empty() || args.len() > 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 1 or 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let df_name = fn_name.to_lowercase();
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                }
+                "POWER" | "ATAN2" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let df_name = fn_name.to_lowercase();
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                }
+                // MOD → (<l> % <r>) — DataFusion 54 exposes modulo only as the % operator
+                "MOD" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar MOD missing 'arguments'".into())
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar MOD requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let left = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("MOD left operand is null".into()))?;
+                    let right = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
+                    Ok(Some(format!("({left} % {right})")))
+                }
+                // String functions: name-mapping table
+                "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
+                | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
+                | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
+                | "UNICODE" | "UNICODECHR" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    let lower;
+                    let df_name = match fn_name.as_str() {
+                        "LENGTH" => "character_length",
+                        "OCTET_LENGTH" => "octet_length",
+                        "UNICODE" => "ascii",
+                        "UNICODECHR" => "chr",
+                        "SUBSTR" => "substr",
+                        other => {
+                            lower = other.to_lowercase();
+                            &lower
+                        }
+                    };
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                }
+                // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring)
+                // INSTR: arg[0]=string, arg[1]=substring → strpos(arg[0], arg[1])
+                // LOCATE: arg[0]=substring, arg[1]=string → strpos(arg[1], arg[0])
+                "INSTR" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar INSTR missing 'arguments'".into())
+                    })?;
+                    if args.len() < 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar INSTR requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let string = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("INSTR string arg is null".into()))?;
+                    let substr = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("INSTR substring arg is null".into()))?;
+                    Ok(Some(format!("strpos({string}, {substr})")))
+                }
+                "LOCATE" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar LOCATE missing 'arguments'".into())
+                    })?;
+                    if args.len() < 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar LOCATE requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    // Exasol LOCATE(substring, string) — reorder to strpos(string, substring)
+                    let substr = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("LOCATE substring arg is null".into()))?;
+                    let string = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("LOCATE string arg is null".into()))?;
+                    Ok(Some(format!("strpos({string}, {substr})")))
+                }
+                // CASE WHEN ... THEN ... [ELSE ...] END
+                // Exasol encodes CASE as function_scalar "CASE" with arguments interleaved:
+                //   [cond1, result1, cond2, result2, ..., else_result (if odd count)]
+                "CASE" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar CASE missing 'arguments'".into())
+                    })?;
+                    if args.len() < 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar CASE requires at least one WHEN branch (2 arguments), got {}",
+                            args.len()
+                        )));
+                    }
+                    let mut sql = "CASE".to_string();
+                    let has_else = args.len() % 2 == 1;
+                    let branch_end = if has_else { args.len() - 1 } else { args.len() };
+                    let mut i = 0;
+                    while i < branch_end {
+                        let cond = render_expression_inner(&args[i])?.ok_or_else(|| {
+                            UdfError::User(format!("CASE WHEN cond[{i}] is null"))
+                        })?;
+                        let result = render_expression_inner(&args[i + 1])?.ok_or_else(|| {
+                            UdfError::User(format!("CASE THEN result[{}] is null", i + 1))
+                        })?;
+                        sql.push_str(&format!(" WHEN {cond} THEN {result}"));
+                        i += 2;
+                    }
+                    if has_else {
+                        let else_val = render_expression_inner(&args[args.len() - 1])?
+                            .ok_or_else(|| UdfError::User("CASE ELSE value is null".into()))?;
+                        sql.push_str(&format!(" ELSE {else_val}"));
+                    }
+                    sql.push_str(" END");
+                    Ok(Some(sql))
+                }
+                // GREATEST / LEAST
+                "GREATEST" | "LEAST" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.is_empty() {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires at least 1 argument"
+                        )));
+                    }
+                    let df_name = fn_name.to_lowercase();
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                }
+                // NULLIFZERO / ZEROIFNULL
+                "NULLIFZERO" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar NULLIFZERO missing 'arguments'".into())
+                    })?;
+                    if args.len() != 1 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar NULLIFZERO requires 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let arg = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("NULLIFZERO argument is null".into()))?;
+                    Ok(Some(format!("nullif({arg}, 0)")))
+                }
+                "ZEROIFNULL" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar ZEROIFNULL missing 'arguments'".into())
+                    })?;
+                    if args.len() != 1 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar ZEROIFNULL requires 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let arg = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("ZEROIFNULL argument is null".into()))?;
+                    Ok(Some(format!("coalesce({arg}, 0)")))
+                }
+                // NULLIF(a, b) → nullif(a, b): returns NULL when a = b, else a.
+                "NULLIF" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar NULLIF missing 'arguments'".into())
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar NULLIF requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let left = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("NULLIF first argument is null".into()))?;
+                    let right = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("NULLIF second argument is null".into()))?;
+                    Ok(Some(format!("nullif({left}, {right})")))
+                }
+                // Field-shortcut date functions: YEAR(col) → date_part('YEAR', col)
+                "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 1 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let src = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
+                    Ok(Some(format!("date_part('{fn_name}', {src})")))
+                }
+                // DATE_TRUNC(unit, source) — note: Exasol arg order matches DataFusion
+                "DATE_TRUNC" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar DATE_TRUNC missing 'arguments'".into())
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar DATE_TRUNC requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let unit = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("DATE_TRUNC unit is null".into()))?;
+                    let src = render_expression_inner(&args[1])?
+                        .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
+                    Ok(Some(format!("date_trunc({unit}, {src})")))
+                }
+                // Now-family: zero-argument date/time functions
+                "CURRENT_DATE" | "SYSDATE" => Ok(Some("current_date()".into())),
+                "CURRENT_TIMESTAMP" | "SYSTIMESTAMP" => Ok(Some("now()".into())),
+                // TO_DATE / TO_TIMESTAMP — forward all args (source + optional format)
+                "TO_DATE" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar TO_DATE missing 'arguments'".into())
+                    })?;
+                    if args.is_empty() {
+                        return Err(UdfError::User(
+                            "function_scalar TO_DATE requires at least 1 argument".into(),
+                        ));
+                    }
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("to_date({})", rendered.join(", "))))
+                }
+                "TO_TIMESTAMP" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar TO_TIMESTAMP missing 'arguments'".into())
+                    })?;
+                    if args.is_empty() {
+                        return Err(UdfError::User(
+                            "function_scalar TO_TIMESTAMP requires at least 1 argument".into(),
+                        ));
+                    }
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!("to_timestamp({})", rendered.join(", "))))
                 }
                 other => Err(UdfError::User(format!(
                     "unsupported scalar function: {other}"
@@ -729,5 +1142,600 @@ mod tests {
     fn null_filter_returns_none_in_safe_mode() {
         let expr = json!({"type": "literal_null"});
         assert!(render_df_filter_safe(&expr).is_none());
+    }
+
+    // --- UTC timestamp literal ---
+
+    #[test]
+    fn renders_timestamp_utc_literal() {
+        let expr = json!({"type": "literal_timestamp_utc", "value": "2024-03-01 10:00:00"});
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, "TIMESTAMP '2024-03-01 10:00:00+00:00'");
+    }
+
+    // --- REGEXP_LIKE predicate and function_scalar ---
+
+    #[test]
+    fn renders_regexp_like() {
+        // Test as predicate node (Exasol's infix REGEXP_LIKE encoding)
+        let expr = json!({
+            "type": "predicate_like_regexp",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "^A.*"}
+        });
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, r#"regexp_like("NAME", '^A.*')"#);
+
+        // Test as function_scalar REGEXP_LIKE
+        let expr2 = json!({
+            "type": "function_scalar",
+            "name": "REGEXP_LIKE",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "literal_string", "value": "^B.*"}
+            ]
+        });
+        let sql2 = render_expression(&expr2).unwrap();
+        assert_eq!(sql2, r#"regexp_like("NAME", '^B.*')"#);
+    }
+
+    // --- Math scalar functions (ABS/ROUND/SIGN→signum/trig/...) ---
+
+    #[test]
+    fn renders_math_scalar_functions() {
+        // 1-arg functions
+        let cases_1arg = [
+            ("ABS", "abs"),
+            ("FLOOR", "floor"),
+            ("CEIL", "ceil"),
+            ("SQRT", "sqrt"),
+            ("EXP", "exp"),
+            ("LN", "ln"),
+            ("SIGN", "signum"),
+            ("DEGREES", "degrees"),
+            ("RADIANS", "radians"),
+            ("SIN", "sin"),
+            ("COS", "cos"),
+            ("TAN", "tan"),
+            ("ASIN", "asin"),
+            ("ACOS", "acos"),
+            ("ATAN", "atan"),
+            ("SINH", "sinh"),
+            ("COSH", "cosh"),
+            ("TANH", "tanh"),
+            ("COT", "cot"),
+        ];
+        for (exasol, df) in cases_1arg {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": exasol,
+                "arguments": [{"type": "column", "name": "x"}]
+            });
+            let sql = render_expression(&expr).unwrap();
+            assert_eq!(sql, format!(r#"{df}("X")"#), "failed for {exasol}");
+        }
+
+        // 2-arg: POWER, ATAN2
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "POWER",
+            "arguments": [
+                {"type": "column", "name": "x"},
+                {"type": "literal_exactnumeric", "value": 2}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"power("X", 2)"#);
+
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "ATAN2",
+            "arguments": [
+                {"type": "column", "name": "y"},
+                {"type": "column", "name": "x"}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"atan2("Y", "X")"#);
+
+        // 1-or-2-arg: ROUND, TRUNC, LOG
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [{"type": "column", "name": "v"}, {"type": "literal_exactnumeric", "value": 2}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"round("V", 2)"#);
+
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "TRUNC",
+            "arguments": [{"type": "column", "name": "v"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"trunc("V")"#);
+
+        // Arity error: ABS with 2 args
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "ABS",
+            "arguments": [
+                {"type": "column", "name": "x"},
+                {"type": "column", "name": "y"}
+            ]
+        });
+        assert!(render_expression_safe(&expr).is_none());
+    }
+
+    // --- MOD → % operator ---
+
+    #[test]
+    fn renders_mod_as_operator() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "MOD",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
+    }
+
+    // --- String scalar functions (CONCAT/LENGTH→character_length/INSTR+LOCATE→strpos/...) ---
+
+    #[test]
+    fn renders_string_scalar_functions() {
+        // Pass-through lowercased
+        let cases_lower = [
+            "CONCAT",
+            "LOWER",
+            "UPPER",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "REPLACE",
+            "REPEAT",
+            "REVERSE",
+            "LPAD",
+            "RPAD",
+            "ASCII",
+            "CHR",
+            "INITCAP",
+            "LEFT",
+            "RIGHT",
+            "TRANSLATE",
+        ];
+        for name in cases_lower {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [{"type": "column", "name": "s"}]
+            });
+            let sql = render_expression(&expr).unwrap();
+            assert_eq!(
+                sql,
+                format!(r#"{}("S")"#, name.to_lowercase()),
+                "failed for {name}"
+            );
+        }
+
+        // LENGTH → character_length
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [{"type": "column", "name": "s"}]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"character_length("S")"#
+        );
+
+        // OCTET_LENGTH → octet_length
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "OCTET_LENGTH",
+            "arguments": [{"type": "column", "name": "s"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"octet_length("S")"#);
+
+        // UNICODE → ascii
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "UNICODE",
+            "arguments": [{"type": "column", "name": "s"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"ascii("S")"#);
+
+        // UNICODECHR → chr
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "UNICODECHR",
+            "arguments": [{"type": "column", "name": "n"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"chr("N")"#);
+
+        // SUBSTR → substr (same name, but explicit mapping)
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "SUBSTR",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"substr("S", 1, 3)"#);
+
+        // INSTR: INSTR(string, substring) → strpos(string, substring)
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "INSTR",
+            "arguments": [
+                {"type": "literal_string", "value": "hello"},
+                {"type": "literal_string", "value": "ll"}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+
+        // LOCATE: LOCATE(substring, string) → strpos(string, substring) — operands reordered
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "LOCATE",
+            "arguments": [
+                {"type": "literal_string", "value": "ll"},
+                {"type": "literal_string", "value": "hello"}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+    }
+
+    // --- CASE WHEN ... THEN ... ELSE ... END ---
+
+    #[test]
+    fn renders_case_when() {
+        // CASE WHEN cond THEN result END (no else)
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CASE",
+            "arguments": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "status"},
+                 "right": {"type": "literal_string", "value": "A"}},
+                {"type": "literal_exactnumeric", "value": 1}
+            ]
+        });
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, r#"CASE WHEN ("STATUS" = 'A') THEN 1 END"#);
+
+        // CASE WHEN c1 THEN r1 WHEN c2 THEN r2 ELSE else END
+        let expr2 = json!({
+            "type": "function_scalar",
+            "name": "CASE",
+            "arguments": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "x"},
+                 "right": {"type": "literal_exactnumeric", "value": 1}},
+                {"type": "literal_string", "value": "one"},
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "x"},
+                 "right": {"type": "literal_exactnumeric", "value": 2}},
+                {"type": "literal_string", "value": "two"},
+                {"type": "literal_string", "value": "other"}
+            ]
+        });
+        let sql2 = render_expression(&expr2).unwrap();
+        assert_eq!(
+            sql2,
+            r#"CASE WHEN ("X" = 1) THEN 'one' WHEN ("X" = 2) THEN 'two' ELSE 'other' END"#
+        );
+
+        // Empty CASE (< 2 args) → error
+        let expr3 = json!({
+            "type": "function_scalar",
+            "name": "CASE",
+            "arguments": []
+        });
+        assert!(render_expression_safe(&expr3).is_none());
+    }
+
+    // --- GREATEST / LEAST ---
+
+    #[test]
+    fn renders_greatest_least() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "GREATEST",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"},
+                {"type": "column", "name": "c"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"greatest("A", "B", "C")"#
+        );
+
+        let expr2 = json!({
+            "type": "function_scalar",
+            "name": "LEAST",
+            "arguments": [
+                {"type": "column", "name": "x"},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        assert_eq!(render_expression(&expr2).unwrap(), r#"least("X", 0)"#);
+    }
+
+    // --- NULLIFZERO / ZEROIFNULL ---
+
+    #[test]
+    fn renders_nullifzero_zeroifnull() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "NULLIFZERO",
+            "arguments": [{"type": "column", "name": "v"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"nullif("V", 0)"#);
+
+        let expr2 = json!({
+            "type": "function_scalar",
+            "name": "ZEROIFNULL",
+            "arguments": [{"type": "column", "name": "v"}]
+        });
+        assert_eq!(render_expression(&expr2).unwrap(), r#"coalesce("V", 0)"#);
+    }
+
+    // --- NULLIF (two-arg) ---
+
+    /// NULLIF(MOD(id,5),0) — the group key from test_group_by_null_key_grouping —
+    /// must render so the grouped-aggregate path (not the row-scan fallback) handles it.
+    #[test]
+    fn renders_nullif_of_mod() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "NULLIF",
+            "arguments": [
+                {
+                    "type": "function_scalar",
+                    "name": "MOD",
+                    "arguments": [
+                        {"type": "column", "name": "id"},
+                        {"type": "literal_exactnumeric", "value": "5"}
+                    ]
+                },
+                {"type": "literal_exactnumeric", "value": "0"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"nullif(("ID" % 5), 0)"#
+        );
+    }
+
+    // --- CASE (function_scalar_case) ---
+
+    /// Exasol expands NULLIF(MOD(id,5),0) into a simple CASE before pushdown:
+    ///   CASE MOD(id,5) WHEN 0 THEN NULL ELSE MOD(id,5) END
+    /// This is the actual group key Exasol pushes in test_group_by_null_key_grouping
+    /// (FN_CASE is advertised), so the grouped-aggregate path — not the row-scan
+    /// fallback — must render it.
+    #[test]
+    fn renders_simple_case_from_nullif_expansion() {
+        let mod_node = json!({
+            "type": "function_scalar",
+            "name": "MOD",
+            "arguments": [
+                {"type": "column", "name": "ID"},
+                {"type": "literal_exactnumeric", "value": "5"}
+            ]
+        });
+        let expr = json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "basis": mod_node,
+            "arguments": [{"type": "literal_exactnumeric", "value": "0"}],
+            "results": [
+                {"type": "literal_null"},
+                mod_node
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE ("ID" % 5) WHEN 0 THEN NULL ELSE ("ID" % 5) END)"#
+        );
+    }
+
+    /// Searched CASE (no `basis`): WHEN arguments are boolean predicates.
+    #[test]
+    fn renders_searched_case_without_basis() {
+        let expr = json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {"type": "predicate_less",
+                 "left": {"type": "column", "name": "SCORE"},
+                 "right": {"type": "literal_exactnumeric", "value": "50"}}
+            ],
+            "results": [
+                {"type": "literal_string", "value": "low"},
+                {"type": "literal_string", "value": "high"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE WHEN ("SCORE" < 50) THEN 'low' ELSE 'high' END)"#
+        );
+    }
+
+    /// CASE with no ELSE branch: results.len() == arguments.len().
+    #[test]
+    fn renders_case_without_else() {
+        let expr = json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "basis": {"type": "column", "name": "ID"},
+            "arguments": [{"type": "literal_exactnumeric", "value": "1"}],
+            "results": [{"type": "literal_string", "value": "one"}]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE "ID" WHEN 1 THEN 'one' END)"#
+        );
+    }
+
+    // --- EXTRACT and field-shortcut date functions ---
+
+    #[test]
+    fn renders_extract() {
+        // Exasol sends EXTRACT as its own node type with the field in `toExtract`.
+        let expr = json!({
+            "type": "function_scalar_extract",
+            "name": "EXTRACT",
+            "toExtract": "YEAR",
+            "arguments": [{"type": "column", "name": "ts"}]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_part('YEAR', "TS")"#
+        );
+
+        let expr2 = json!({
+            "type": "function_scalar_extract",
+            "name": "EXTRACT",
+            "toExtract": "MONTH",
+            "arguments": [{"type": "column", "name": "ts"}]
+        });
+        assert_eq!(
+            render_expression(&expr2).unwrap(),
+            r#"date_part('MONTH', "TS")"#
+        );
+    }
+
+    #[test]
+    fn renders_year_month_day_extract() {
+        let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
+        for field in shortcuts {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": field,
+                "arguments": [{"type": "column", "name": "ts"}]
+            });
+            let sql = render_expression(&expr).unwrap();
+            assert_eq!(
+                sql,
+                format!(r#"date_part('{field}', "TS")"#),
+                "failed for {field}"
+            );
+        }
+    }
+
+    // --- DATE_TRUNC ---
+
+    #[test]
+    fn renders_date_trunc() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "DATE_TRUNC",
+            "arguments": [
+                {"type": "literal_string", "value": "month"},
+                {"type": "column", "name": "ts"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_trunc('month', "TS")"#
+        );
+    }
+
+    // --- CURRENT_DATE / SYSDATE / CURRENT_TIMESTAMP / SYSTIMESTAMP ---
+
+    #[test]
+    fn renders_now_family() {
+        for name in ["CURRENT_DATE", "SYSDATE"] {
+            let expr = json!({"type": "function_scalar", "name": name, "arguments": []});
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                "current_date()",
+                "failed for {name}"
+            );
+        }
+        for name in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
+            let expr = json!({"type": "function_scalar", "name": name, "arguments": []});
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                "now()",
+                "failed for {name}"
+            );
+        }
+    }
+
+    // --- TO_DATE / TO_TIMESTAMP with optional format arg ---
+
+    #[test]
+    fn renders_to_date_to_timestamp() {
+        // TO_DATE with 1 arg
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "TO_DATE",
+            "arguments": [{"type": "column", "name": "s"}]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"to_date("S")"#);
+
+        // TO_DATE with format
+        let expr2 = json!({
+            "type": "function_scalar",
+            "name": "TO_DATE",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_string", "value": "%Y-%m-%d"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr2).unwrap(),
+            r#"to_date("S", '%Y-%m-%d')"#
+        );
+
+        // TO_TIMESTAMP with 1 arg
+        let expr3 = json!({
+            "type": "function_scalar",
+            "name": "TO_TIMESTAMP",
+            "arguments": [{"type": "column", "name": "s"}]
+        });
+        assert_eq!(render_expression(&expr3).unwrap(), r#"to_timestamp("S")"#);
+
+        // TO_TIMESTAMP with format
+        let expr4 = json!({
+            "type": "function_scalar",
+            "name": "TO_TIMESTAMP",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_string", "value": "%Y-%m-%d %H:%M:%S"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr4).unwrap(),
+            r#"to_timestamp("S", '%Y-%m-%d %H:%M:%S')"#
+        );
+    }
+
+    // --- Unsupported date functions return an error ---
+
+    #[test]
+    fn unsupported_date_fn_falls_through() {
+        let unsupported = ["ADD_DAYS", "DAYS_BETWEEN", "CONVERT_TZ", "POSIX_TIME"];
+        for name in unsupported {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [{"type": "column", "name": "x"}]
+            });
+            let err = render_expression(&expr).unwrap_err();
+            assert!(
+                err.to_string().contains(name),
+                "error must name the unsupported function '{name}': {err}"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "safe mode must return None for '{name}'"
+            );
+        }
     }
 }

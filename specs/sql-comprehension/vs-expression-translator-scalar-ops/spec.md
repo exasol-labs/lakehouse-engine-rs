@@ -1,6 +1,6 @@
 # Feature: VS Expression Translator — Scalar Operations
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with arithmetic operators, CAST, and the safe/fallback entry points. These are the scenarios specific to scalar function translation and the None-returning safe variants used by the adapter fallback paths.
+Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with arithmetic operators, CAST, and the safe/fallback entry points. Named math/string/conditional scalar functions are covered in `sql-comprehension/vs-expression-translator-scalar-fns`; date/time functions in `sql-comprehension/vs-expression-translator-date-fns`.
 
 ## Background
 
