@@ -10,7 +10,7 @@
 
 | Phase | Status | Notes |
 |-------|--------|-------|
-| 0 — SDK dep bump | **BLOCKED** | `exasol-udf-sdk 0.16.0` (carrying `UdfContext::memory_limit()`) is committed in `language-container-rs` but NOT yet published to crates.io (latest published: 0.15.1). SDK stays pinned at 0.14.0; `build_runtime_env` call site passes the `0` sentinel → 1024 MB default budget. One-line upgrade once published. |
+| 0 — SDK dep bump | **DEFERRED → next plan** | `exasol-udf-sdk`/`exasol-udf-macros` `0.16.0` (carrying `UdfContext::memory_limit()`) **published to crates.io on 2026-06-22** (after this plan's implementation). This crate still pins `0.14.0`; `build_runtime_env` runs the `0`-sentinel default-budget path (1024 MB). The bump (and wiring the live `ctx.memory_limit()`) crosses `0.15.0`'s breaking "remove dead public API" change, so it is moved to the follow-up pushdown-capabilities plan rather than retrofitted here. |
 | 1 — vs-expression crate | DONE | New `crates/vs-expression`; moved + extended predicate walker (arithmetic, CAST); `predicate.rs` deleted. 35 tests. |
 | 2 — adapter (GROUP BY detect, shard_count, scan SQL) | DONE | `GROUP BY shard_key` fan-out replaces `GROUP BY IPROC()`. |
 | 3 — scan UDF (bounded runtime + grouped partial) | DONE | `runtime.rs` (spill probe + memory pool), grouped partial-agg streaming exec. |
@@ -31,3 +31,21 @@
 ## Code Review
 
 One correctness gap fixed: grouped aggregate path now runs `validate_agg_col_types` (SUM over VARCHAR/DATE falls back cleanly instead of an opaque UDF error). Flaky null-group position assertion loosened. Guardrail comment cleanups applied. Deliberately deferred (out of scope, recorded): `GroupedScanConfig` parameter-object refactor; `u32→usize` consistency.
+
+## Learnings & Shortcomings (feed the follow-up pushdown-capabilities plan)
+
+This plan shipped GROUP BY pushdown that is **correct** and **unit-proven**, but live E2E investigation surfaced gaps that belong to a dedicated next plan rather than this one.
+
+### Learnings
+
+1. **Exasol aggregation pushdown is cost-based, not capability-gated.** With the GROUP BY capabilities advertised, Exasol still sends a plain `{"type":"select"}` request (no `aggregationType`/`groupBy`) for the 20-row test table and aggregates natively — verified via `EXPLAIN VIRTUAL` (`exapump`). Filters *are* pushed on the same table, so this is aggregation-specific cost optimization, not a missing capability. Consequence: the partial/merge node-local aggregation path (the feature's performance value) is only exercised on **production-scale** tables; small-table E2E can only assert correctness. Any future "aggregate pushdown actually fires" E2E needs a large, multi-file seed.
+2. **The shard fan-out is independent of aggregate pushdown.** `GROUP BY shard_key` is emitted by the row-scan path whenever `G = shard_count(nodes, factor, files) > 1`. With a single data file `G = 1` (single invocation, no fan-out by design). Observing the fan-out E2E only needs ≥2 data files — it does not require Exasol to push the aggregation.
+3. **`exasol-udf-sdk 0.16.0` is now on crates.io** — the `ctx.memory_limit()` accessor is available; the memory pool can be sized from the real per-instance limit instead of the 1024 MB sentinel.
+4. **E2E harness container discovery** must use the Compose **service label** (`com.docker.compose.service=exasol`), not a hardcoded project-prefixed name — the stack may run under any Compose project name.
+
+### Shortcomings / open scope (→ next plan: pushdown capabilities)
+
+- **JOIN pushdown is NOT implemented** (still listed Out-of-Scope in `mission.md`). Product direction: **joins should be pushed down.** This requires verifying the Exasol VS join request shape against the capability list (`capabilities_list.md`: `JOIN`, `JOIN_TYPE_*`, `JOIN_CONDITION_EQUI`) and extending the single-table scan-spec model to a multi-table one so the DataFusion UDF can register both Iceberg tables and execute the join (file-sharding strategy across a join is an open design question).
+- **Capability coverage audit pending.** Verify our advertised capabilities against the authoritative `capabilities_list.md` and the VS API doc; advertise everything the DataFusion UDF can execute (candidates: `ORDER_BY_COLUMN`/`ORDER_BY_EXPRESSION`, `LIMIT_WITH_OFFSET`, additional `FN_*` scalar functions in `vs-expression`, any missing `FN_PRED_*`). Guiding principle confirmed: **advertise only what the UDF can execute; anything not advertised, Exasol post-processes natively** — so unsupported shapes stay correct, just not pushed.
+- **Live `ctx.memory_limit()` wiring deferred** — bump `exasol-udf-sdk`/`exasol-udf-macros` `0.14.0 → 0.16.0` (crosses `0.15.0`'s breaking API removal; verify compilation), then replace the `0`-sentinel at the `build_runtime_env` call site.
+- **Aggregate-pushdown E2E coverage** — add a large/multi-file seed so the partial/merge path is exercised E2E (not just unit-tested), if the next plan wants to prove the optimizer pushes it.
