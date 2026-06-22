@@ -3,10 +3,12 @@
 /// applies projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
 pub mod emit;
+pub mod runtime;
 pub mod spec;
 
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{emit_stream, redact_storage_error};
+use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -17,6 +19,8 @@ use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::value::Value;
+use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
@@ -68,12 +72,24 @@ async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(),
 
 /// Run a node-local partial aggregate and emit exactly one row per shard.
 ///
-/// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`).
+/// Dispatches to `run_grouped_partial_aggregate` when the spec carries non-empty
+/// `group_keys`; otherwise executes the single-group (ungrouped) path which
+/// always emits exactly one partial-aggregate row.
+///
+/// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`
+/// and `build_grouped_partial_agg_sql`).
 async fn run_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
+    // Dispatch: grouped path when group_keys is Some and non-empty.
+    if let Some(group_keys) = &spec.group_keys
+        && !group_keys.is_empty()
+    {
+        return run_grouped_partial_aggregate(ctx, session_ctx, spec).await;
+    }
+
     let secrets = spec.storage.secret_values();
     let aggregates = spec
         .aggregates
@@ -89,19 +105,7 @@ async fn run_partial_aggregate(
         .table(table_name)
         .await
         .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
-    let schema = table.schema();
-    let alias_items: Vec<String> = schema
-        .fields()
-        .iter()
-        .map(|f| {
-            let arrow_name = f.name();
-            format!(
-                "{} AS {}",
-                quote_ident(arrow_name),
-                quote_ident(&arrow_name.to_uppercase())
-            )
-        })
-        .collect();
+    let alias_items = build_alias_items(table.schema());
     let aliased_table = format!("SELECT {} FROM {table_name}", alias_items.join(", "));
 
     let sql = build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.filter.as_deref());
@@ -137,6 +141,167 @@ async fn run_partial_aggregate(
     Ok(())
 }
 
+/// Execute a grouped partial aggregate for the assigned shard files.
+///
+/// DataFusion runs the GROUP BY query and streams one row per distinct group.
+/// Each emitted row carries:
+///   - one `Value::String` per group key (GK_0 … GK_{n-1}), stringified via
+///     `arrow_value_at` then `to_string()` — the adapter declares all GK columns
+///     as `VARCHAR(2000000)` in the EMITS clause.
+///   - the PARTIAL_* values in the same order produced by the single-group path.
+///
+/// An empty result (no matching rows in this shard) emits zero rows, NOT a null
+/// fallback row.  This matches the COLUMN CONTRACT: the outer wrapper re-groups
+/// partial rows from all shards, so zero rows from one shard is correct.
+///
+/// Streaming rule: fetch one `RecordBatch` at a time, convert → emit → drop
+/// before fetching the next.  Never collect all batches in memory at once.
+async fn run_grouped_partial_aggregate(
+    ctx: &mut dyn UdfContext,
+    session_ctx: &SessionContext,
+    spec: &ScanSpec,
+) -> Result<(), UdfError> {
+    let secrets = spec.storage.secret_values();
+    let group_keys = spec
+        .group_keys
+        .as_deref()
+        .expect("run_grouped_partial_aggregate called without group_keys");
+    let aggregates = spec
+        .aggregates
+        .as_deref()
+        .expect("run_grouped_partial_aggregate called without aggregates");
+
+    // Register the assigned files so we can query them.
+    let table_name = "scan_target";
+    register_files(session_ctx, table_name, spec).await?;
+
+    // Build the alias inner SELECT (uppercase column names) — same pattern as
+    // the single-group path so group-key expressions reference uppercase names.
+    let table = session_ctx
+        .table(table_name)
+        .await
+        .map_err(|e| UdfError::User(format!("cannot resolve registered table: {e}")))?;
+    let alias_items = build_alias_items(table.schema());
+    let aliased_table = format!("SELECT {} FROM {table_name}", alias_items.join(", "));
+
+    let sql = build_grouped_partial_agg_sql(
+        group_keys,
+        aggregates,
+        &aliased_table,
+        spec.filter.as_deref(),
+    );
+
+    let df = session_ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| UdfError::User(format!("grouped partial aggregate SQL error: {e}")))?;
+
+    // Stream result batches — fetch one RecordBatch at a time, convert → emit → drop.
+    let mut stream = df
+        .execute_stream()
+        .await
+        .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+
+    let n_group_keys = group_keys.len();
+
+    while let Some(result) = stream.next().await {
+        let batch = result.map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+
+        for row_idx in 0..batch.num_rows() {
+            // Group-key columns come first (columns 0 .. n_group_keys - 1).
+            // They are emitted as VARCHAR strings regardless of the DataFusion type.
+            let mut row_values: Vec<Value> = Vec::with_capacity(batch.num_columns());
+
+            for col_idx in 0..n_group_keys {
+                let raw = arrow_value_at(batch.column(col_idx), row_idx);
+                // Stringify for GK_i VARCHAR(2000000) column.
+                // Value has no Display; format each variant explicitly.
+                let gk_str = value_to_gk_string(raw);
+                row_values.push(gk_str);
+            }
+
+            // Partial aggregate columns follow.
+            for col_idx in n_group_keys..batch.num_columns() {
+                row_values.push(arrow_value_at(batch.column(col_idx), row_idx));
+            }
+
+            ctx.emit(&row_values)?;
+        }
+        // Drop the batch before fetching the next — never hold two batches at once.
+        drop(batch);
+    }
+
+    Ok(())
+}
+
+/// Build the DataFusion SQL for a grouped partial aggregate.
+///
+/// Produces:
+/// ```sql
+/// SELECT <gk_0>, ..., <gk_{n-1}>, <partial_agg_0>, ...
+/// FROM (<aliased_table>)
+/// [WHERE <filter>]
+/// GROUP BY <gk_0>, ..., <gk_{n-1}>
+/// ```
+///
+/// Group-key expressions are inserted verbatim — they are already-rendered
+/// DataFusion SQL fragments from the adapter (e.g. `"REGION"` or `YEAR("DATE")`).
+/// No LIMIT is applied (the adapter never pushes LIMIT into grouped shard specs;
+/// the outer wrapper applies LIMIT after re-grouping the partials).
+pub fn build_grouped_partial_agg_sql(
+    group_keys: &[String],
+    aggregates: &[AggregatePlan],
+    aliased_table: &str,
+    filter: Option<&str>,
+) -> String {
+    // SELECT list: group keys first (verbatim), then partial aggregate items.
+    let mut select_items: Vec<String> = group_keys.to_vec();
+    let partial_items: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .flat_map(|(i, plan)| partial_select_items(plan, i))
+        .collect();
+    select_items.extend(partial_items);
+
+    let mut sql = format!(
+        "SELECT {} FROM ({})",
+        select_items.join(", "),
+        aliased_table
+    );
+
+    if let Some(f) = filter
+        && !f.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        sql.push_str(f);
+    }
+
+    // GROUP BY the group-key expressions (same verbatim fragments as in SELECT).
+    sql.push_str(" GROUP BY ");
+    sql.push_str(&group_keys.join(", "));
+
+    sql
+}
+
+/// Stringify a group-key `Value` for the `GK_i VARCHAR(2000000)` EMITS column.
+///
+/// NULL group keys stay NULL (the outer wrapper groups them together consistently).
+/// String values pass through unchanged. All other types are converted to their
+/// canonical string representation so the adapter's VARCHAR column accepts them.
+fn value_to_gk_string(v: Value) -> Value {
+    match v {
+        Value::Null => Value::Null,
+        Value::String(s) => Value::String(s),
+        Value::Bool(b) => Value::String(if b { "true" } else { "false" }.to_string()),
+        Value::Int32(n) => Value::String(n.to_string()),
+        Value::Int64(n) => Value::String(n.to_string()),
+        Value::Double(f) => Value::String(f.to_string()),
+        Value::Numeric(d) => Value::String(d.to_string()),
+        Value::Date(nd) => Value::String(nd.to_string()),
+        Value::Timestamp(ndt) => Value::String(ndt.to_string()),
+    }
+}
+
 /// Build the fallback null partial row for an empty aggregate result.
 ///
 /// COUNT/CountCol -> 0 (not NULL); SUM/Min/Max/Avg parts -> NULL.
@@ -161,17 +326,25 @@ fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::va
 /// Iterating `aggregates` in order, each plan item at index `i` contributes:
 /// - `Count`    -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
 /// - `CountCol` -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
-/// - `Sum`      -> 1 column: `"PARTIAL_sum_{i}"`     (DOUBLE PRECISION, summable)
-/// - `Min`      -> 1 column: `"PARTIAL_min_{i}"`     (DOUBLE PRECISION, re-minnable)
-/// - `Max`      -> 1 column: `"PARTIAL_max_{i}"`     (DOUBLE PRECISION, re-maxable)
+/// - `Sum`      -> 1 column: `"PARTIAL_sum_{i}"`     (type from `partial_emits_items`: DOUBLE
+///   PRECISION for float columns, DECIMAL(36,s) for DECIMAL(p,s) columns)
+/// - `Min`      -> 1 column: `"PARTIAL_min_{i}"`     (type from `partial_emits_items`: the
+///   column's real Exasol type, e.g. DATE, TIMESTAMP, or DECIMAL)
+/// - `Max`      -> 1 column: `"PARTIAL_max_{i}"`     (type from `partial_emits_items`: same
+///   as Min — the column's real Exasol type)
 /// - `Avg`      -> 2 columns: `"PARTIAL_avg_sum_{i}"` (DOUBLE PRECISION) then
 ///   `"PARTIAL_avg_cnt_{i}"` (DECIMAL(20,0))
+///
+/// For the exact EMITS types, defer to `partial_emits_items` in `adapter::pushdown` as the
+/// single source of truth — this DataFusion SELECT list produces the values; the EMITS clause
+/// declares the Exasol types that receive them.
 ///
 /// The scan UDF aggregate SELECT list, the EMITS clause in the fan-out SQL, and
 /// the outer merge SELECT MUST all agree on this order and column count.
 ///
 /// `aliased_table` is a subquery string: `SELECT ... FROM scan_target` with
 /// uppercase aliases already applied. No filter applied.
+#[cfg(test)]
 pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
     build_partial_agg_sql_filtered(aggregates, aliased_table, None)
 }
@@ -240,9 +413,24 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
 }
 
 /// Build a DataFusion SessionContext with the MinIO object store registered.
+///
+/// Sizes the DataFusion memory pool from `memory_limit_bytes` (UDF per-instance
+/// limit in bytes; `0` = unknown sentinel → conservative 1024 MB default) and
+/// probes `/tmp` for disk-spill eligibility.
+///
+/// # ponytail: pass ctx.memory_limit() once exasol-udf-sdk publishes the accessor
+/// Until that bump the call site passes `0` (→ 1024 MB default budget).
+/// Do NOT hand-roll the accessor.
 fn build_session_context(spec: &ScanSpec) -> Result<SessionContext, UdfError> {
     let config = SessionConfig::new().with_information_schema(false);
-    let ctx = SessionContext::new_with_config(config);
+
+    // Memory pool + spill config.
+    let memory_limit_bytes: u64 = 0; // 0-sentinel → default 1024 MB budget
+    let spill = probe_tmp_spill();
+    let runtime_env = build_runtime_env(memory_limit_bytes, spill)
+        .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
+
+    let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
     // Register the MinIO object store for the S3 URL scheme.
     let bucket = extract_bucket(spec)?;
@@ -443,6 +631,26 @@ async fn build_scan_sql(
     Ok(sql)
 }
 
+/// Build `"col" AS "COL"` alias items for all fields in `schema`.
+///
+/// Used to wrap a listing table in an inner SELECT that exposes uppercase column
+/// names, so projection/filter expressions resolved against uppercase identifiers
+/// find a match regardless of the Parquet field casing.
+fn build_alias_items(schema: &datafusion::common::DFSchema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let arrow_name = f.name();
+            format!(
+                "{} AS {}",
+                quote_ident(arrow_name),
+                quote_ident(&arrow_name.to_uppercase())
+            )
+        })
+        .collect()
+}
+
 /// Double-quote an identifier (SQL-safe column name).
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -626,6 +834,112 @@ mod tests {
         assert!(
             !sql.contains("WHERE"),
             "no filter must produce no WHERE: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 3.8 unit tests for build_grouped_partial_agg_sql
+    // ---------------------------------------------------------------------------
+
+    /// Single group key with COUNT(*): SELECT includes the key and COUNT(*).
+    #[test]
+    fn grouped_partial_agg_sql_single_key_count() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+        }];
+        let sql =
+            build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
+        assert!(
+            sql.contains(r#""REGION""#),
+            "group key must appear in SQL: {sql}"
+        );
+        assert!(sql.contains("COUNT(*) AS"), "COUNT(*) must appear: {sql}");
+        assert!(
+            sql.contains("PARTIAL_count_0"),
+            "partial count column at index 0: {sql}"
+        );
+        assert!(sql.contains("GROUP BY"), "must have GROUP BY clause: {sql}");
+    }
+
+    /// The emitted SELECT layout matches the GK_* then PARTIAL_* adapter contract:
+    /// group keys appear before partial aggregate columns in the SELECT list.
+    #[test]
+    fn grouped_partial_agg_sql_layout_matches_emits() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+            },
+        ];
+        let sql = build_grouped_partial_agg_sql(
+            &[r#""REGION""#.to_string(), r#""CATEGORY""#.to_string()],
+            &plans,
+            "aliased",
+            None,
+        );
+        // Verify ordering: group key positions come before partial aggregate positions.
+        let region_pos = sql.find(r#""REGION""#).expect("REGION must appear");
+        let partial_count_pos = sql
+            .find("PARTIAL_count_0")
+            .expect("PARTIAL_count_0 must appear");
+        assert!(
+            region_pos < partial_count_pos,
+            "group key must precede partial columns: {sql}"
+        );
+        let category_pos = sql.find(r#""CATEGORY""#).expect("CATEGORY must appear");
+        assert!(
+            category_pos < partial_count_pos,
+            "second group key must precede partial columns: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_sum_1"),
+            "SUM at index 1 must appear: {sql}"
+        );
+    }
+
+    /// No LIMIT is ever added to a grouped partial aggregate SQL.
+    #[test]
+    fn grouped_partial_agg_sql_no_limit() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+        }];
+        let sql =
+            build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
+        assert!(
+            !sql.contains("LIMIT"),
+            "grouped partial SQL must not contain LIMIT: {sql}"
+        );
+    }
+
+    /// Expression group keys (e.g. YEAR("DATE")) are inserted verbatim into the
+    /// DataFusion GROUP BY clause without any quoting or transformation.
+    #[test]
+    fn grouped_partial_agg_sql_expression_key_verbatim() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+        }];
+        let expr_key = r#"YEAR("ORDER_DATE")"#.to_string();
+        let sql =
+            build_grouped_partial_agg_sql(std::slice::from_ref(&expr_key), &plans, "aliased", None);
+        assert!(
+            sql.contains(&expr_key),
+            "expression key must appear verbatim in SQL: {sql}"
+        );
+        // Must appear in both SELECT and GROUP BY.
+        let first_pos = sql.find(&expr_key).unwrap();
+        let second_pos = sql[first_pos + 1..]
+            .find(&expr_key)
+            .map(|p| p + first_pos + 1);
+        assert!(
+            second_pos.is_some(),
+            "expression key must appear in both SELECT and GROUP BY: {sql}"
         );
     }
 }

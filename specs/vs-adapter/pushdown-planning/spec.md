@@ -2,25 +2,21 @@
 
 Translates an Exasol query against the virtual schema into a pushdown plan: it
 resolves the Iceberg data-file list once, captures the requested projection, filter,
-LIMIT, and any supported single-group aggregate, and emits the SQL that drives the
-DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files.
+LIMIT, and any supported single-group or grouped aggregate, and emits the SQL that
+drives the DataFusion scan SET UDF — fanned out across G oversubscribed work-unit
+shards via `GROUP BY shard_key` — over exactly those files.
 
 ## Background
 
 * The adapter receives a `pushdown` request carrying the projection, filter, and
-  LIMIT that Exasol was able to delegate.
-* Iceberg snapshot and data-file resolution happens exactly once here, in the planning
-  layer — never inside the scan UDF.
-* The shard count comes from the `CLUSTER_NODES` entry in the virtual schema's
-  `adapterNotes`, round-tripped to the adapter via `schemaMetadataInfo.adapterNotes`
-  at pushdown time (default 1).
-* The scan UDF is the second entry point of the same `.so`; the adapter references it
-  by its registered SET-script name.
-* A predicate or aggregate the adapter cannot translate is omitted/falls back rather
-  than producing an incorrect result.
-* Credentials MUST NOT appear in any returned SQL string or error message.
-* Connection properties (catalog endpoint, S3 endpoint/region, credentials) are passed
-  to the scan UDF so it can register the files without re-resolving them.
+  aggregate specification from Exasol.
+* The adapter resolves the Iceberg snapshot and file list exactly once per query.
+* The shard count G is `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped
+  to the file count, per the `parallelism/work-unit-sharding` feature; the scan-driving
+  SQL groups on `shard_key`, never on `IPROC()`.
+* Credentials MUST NOT appear in any returned SQL or error message.
+* A predicate or group-key expression the adapter cannot translate is omitted from the
+  scan spec; Exasol keeps it as a correctness backstop.
 
 ## Scenarios
 
@@ -59,8 +55,9 @@ DataFusion scan SET UDF — sharded across cluster nodes — over exactly those 
 
 * *GIVEN* an Exasol session that has installed the VS adapter script
 * *WHEN* Exasol sends a `getCapabilities` request to the adapter
-* *THEN* the capabilities list SHALL include single-group aggregate pushdown for `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `MIN(col)`, `MAX(col)`, and `AVG(col)`
-* *AND* the capabilities list MUST NOT include `GROUP BY`, `HAVING`, `COUNT(DISTINCT ...)`, or join pushdown
+* *THEN* the capabilities list SHALL include single-group aggregate pushdown for `COUNT`, `COUNT(*)`, `SUM`, `MIN`, `MAX`, and `AVG`
+* *AND* the capabilities list SHALL include `AGGREGATE_GROUP_BY_COLUMN` and `AGGREGATE_GROUP_BY_EXPRESSION` for GROUP BY pushdown
+* *AND* the capabilities list MUST NOT include `AGGREGATE_GROUP_BY_TUPLE`, `AGGREGATE_HAVING`, `FN_AGG_COUNT_DISTINCT`, or join pushdown
 * *AND* the capabilities list SHALL continue to include column projection, filter predicates, and LIMIT
 
 ### Scenario: Aggregate query is translated into a partial-aggregate scan spec

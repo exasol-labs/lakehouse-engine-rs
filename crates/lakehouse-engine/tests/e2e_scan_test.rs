@@ -802,3 +802,381 @@ fn multi_shard_row_query_matches_single_shard() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 — GROUP BY E2E tests
+//
+// Seed recap (20 rows, id=1..20):
+//   score  = 5.0 * id   (5.0, 10.0, ..., 100.0)
+//   name   = "event-NN"
+//   event_date = 2024-01-01 + (id-1) days
+//   event_ts   = 2024-01-01T00:00:00Z + (id-1) hours
+//
+// Group-key derivations used below:
+//   MOD(id, 4) → groups {0,1,2,3}, 5 rows each
+//   MOD(id, 2) × MOD(id, 4) × WHERE score > 50 → 4 groups across 10 rows
+//   CAST(score / 25.0 AS DECIMAL(4,0)) → groups {0,1,2,3,4} with sizes 2,5,5,5,3
+//     (Exasol CAST-to-DECIMAL rounds half away from zero)
+//   id → 20 groups, 1 row each (high cardinality / spill path)
+//   NULLIF(MOD(id, 5), 0) → groups {1,2,3,4,NULL}, sizes 4,4,4,4,4
+// ---------------------------------------------------------------------------
+
+fn parse_numeric(v: &serde_json::Value) -> f64 {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("expected numeric value, got: {v:?}"))
+}
+
+fn parse_int(v: &serde_json::Value) -> i64 {
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
+}
+
+/// GROUP BY returns correct per-group COUNT(*) and SUM(score).
+///
+/// Key: MOD(id, 4) — four equal-sized groups (5 rows each).
+///
+/// Expected:
+///   group 0 (id=4,8,12,16,20):  count=5, sum_score=300.0
+///   group 1 (id=1,5,9,13,17):   count=5, sum_score=225.0
+///   group 2 (id=2,6,10,14,18):  count=5, sum_score=250.0
+///   group 3 (id=3,7,11,15,19):  count=5, sum_score=275.0
+#[test]
+fn test_group_by_sum_count() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), COUNT(*), SUM(score) FROM {} GROUP BY MOD(id, 4) ORDER BY MOD(id, 4)",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
+    assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
+
+    // Expected values sorted by group key 0..3.
+    let expected_counts = [5i64, 5, 5, 5];
+    let expected_sums = [300.0f64, 225.0, 250.0, 275.0];
+
+    for i in 0..4 {
+        let count = parse_int(&cols[1][i]);
+        assert_eq!(
+            count, expected_counts[i],
+            "group {i}: COUNT(*) must be {}, got {count}",
+            expected_counts[i]
+        );
+        let sum = parse_numeric(&cols[2][i]);
+        assert!(
+            (sum - expected_sums[i]).abs() < 0.01,
+            "group {i}: SUM(score) must be {}, got {sum}",
+            expected_sums[i]
+        );
+    }
+
+    // Total rows across all groups = 20.
+    let total: i64 = cols[1].iter().map(parse_int).sum();
+    assert_eq!(
+        total, 20,
+        "total COUNT(*) across groups must be 20, got {total}"
+    );
+}
+
+/// Two GROUP BY keys with a WHERE filter returns correct per-group row counts.
+///
+/// Keys: MOD(id, 4) × MOD(id, 2), filter: score > 50.0 (id=11..20, 10 rows).
+///
+/// Expected 4 groups:
+///   (0, 0): id=12,16,20       → count=3
+///   (1, 1): id=13,17          → count=2
+///   (2, 0): id=14,18          → count=2
+///   (3, 1): id=11,15,19       → count=3
+#[test]
+fn test_group_by_multi_key_with_filter() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), MOD(id, 2), COUNT(*) \
+         FROM {} WHERE score > 50.0 \
+         GROUP BY MOD(id, 4), MOD(id, 2)",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
+    assert_eq!(cols[0].len(), 4, "expected 4 distinct groups: {cols:?}");
+
+    // Total rows across all groups = 10 (id=11..20).
+    let total: i64 = cols[2].iter().map(parse_int).sum();
+    assert_eq!(
+        total, 10,
+        "total COUNT(*) across all groups must be 10 (id=11..20), got {total}"
+    );
+
+    // No group can have more than 3 rows (id range 11..20 across 4 buckets).
+    for (i, v) in cols[2].iter().enumerate() {
+        let c = parse_int(v);
+        assert!(
+            (2..=3).contains(&c),
+            "group {i}: count must be 2 or 3, got {c}"
+        );
+    }
+}
+
+/// GROUP BY a scalar expression key returns correct per-group counts.
+///
+/// Key expression: CAST(score / 25.0 AS DECIMAL(4,0)) — supported arithmetic (FLOAT_DIV) + CAST.
+///
+/// Exasol's CAST-to-DECIMAL rounds half away from zero. For scores 5..100 in
+/// steps of 5, score/25 = 0.2, 0.4, ..., 4.0, which rounds to:
+///   key 0: scores {5,10}             → count=2
+///   key 1: scores {15,20,25,30,35}   → count=5
+///   key 2: scores {40,45,50,55,60}   → count=5
+///   key 3: scores {65,70,75,80,85}   → count=5
+///   key 4: scores {90,95,100}        → count=3
+/// (2+5+5+5+3 = 20.)
+#[test]
+fn test_group_by_expression_key() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT CAST(score / 25.0 AS DECIMAL(4,0)), COUNT(*) \
+         FROM {} \
+         GROUP BY CAST(score / 25.0 AS DECIMAL(4,0)) \
+         ORDER BY CAST(score / 25.0 AS DECIMAL(4,0))",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
+    assert_eq!(cols[0].len(), 5, "expected 5 groups: {cols:?}");
+
+    // Sort (key, count) pairs by key so the test is robust to row ordering.
+    let mut pairs: Vec<(i64, i64)> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+
+    let expected_counts = [2i64, 5, 5, 5, 3];
+    for (i, expected) in expected_counts.iter().enumerate() {
+        let (key, count) = pairs[i];
+        assert_eq!(
+            key, i as i64,
+            "group at position {i}: key must be {i}, got {key}"
+        );
+        assert_eq!(
+            count, *expected,
+            "group key {key}: COUNT(*) must be {expected}, got {count}"
+        );
+    }
+
+    // Total = 20.
+    let total: i64 = pairs.iter().map(|(_, c)| *c).sum();
+    assert_eq!(
+        total, 20,
+        "total rows across expression-key groups must be 20, got {total}"
+    );
+}
+
+/// AVG(score) per group is correct for groups with unequal row counts.
+///
+/// Key expression: CAST(score / 25.0 AS DECIMAL(4,0)) — Exasol rounds half away
+/// from zero, so score/25 (0.2..4.0) buckets into groups of sizes 2,5,5,5,3:
+///   key 0 (scores {5,10}):              AVG = 15.0 / 2  = 7.5
+///   key 1 (scores {15,20,25,30,35}):    AVG = 125.0 / 5 = 25.0
+///   key 2 (scores {40,45,50,55,60}):    AVG = 250.0 / 5 = 50.0
+///   key 3 (scores {65,70,75,80,85}):    AVG = 375.0 / 5 = 75.0
+///   key 4 (scores {90,95,100}):         AVG = 285.0 / 3 = 95.0
+#[test]
+fn test_group_by_avg_correctness() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT CAST(score / 25.0 AS DECIMAL(4,0)), AVG(score) \
+         FROM {} \
+         GROUP BY CAST(score / 25.0 AS DECIMAL(4,0)) \
+         ORDER BY CAST(score / 25.0 AS DECIMAL(4,0))",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (key, avg): {cols:?}");
+    assert_eq!(cols[0].len(), 5, "expected 5 groups: {cols:?}");
+
+    // Sort (key, avg) pairs by key so the test is robust to row ordering.
+    let mut pairs: Vec<(i64, f64)> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(k, a)| (parse_int(k), parse_numeric(a)))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+
+    let expected_avgs = [7.5f64, 25.0, 50.0, 75.0, 95.0];
+    for (i, expected) in expected_avgs.iter().enumerate() {
+        let (key, avg) = pairs[i];
+        assert_eq!(
+            key, i as i64,
+            "group at position {i}: key must be {i}, got {key}"
+        );
+        assert!(
+            (avg - expected).abs() < 0.01,
+            "group key {key}: AVG(score) must be {expected}, got {avg}"
+        );
+    }
+}
+
+/// GROUP BY a near-unique column (id) completes with correct per-group counts.
+///
+/// Exercises the high-cardinality path: 20 distinct groups, each with exactly one row.
+/// Verifies the memory-pool + spill backstop does not crash at high group cardinality.
+#[test]
+fn test_high_cardinality_group_by_spill() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, COUNT(*) FROM {} GROUP BY id ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, count): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "GROUP BY id must return 20 groups, got {}",
+        cols[0].len()
+    );
+
+    // Every group must have exactly one row (id is unique).
+    for (i, v) in cols[1].iter().enumerate() {
+        let count = parse_int(v);
+        assert_eq!(
+            count,
+            1,
+            "group at position {i} (id={}): COUNT(*) must be 1, got {count}",
+            parse_int(&cols[0][i])
+        );
+    }
+
+    // IDs must be 1..20 in order.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    for (pos, &id) in ids.iter().enumerate() {
+        let expected = (pos + 1) as i64;
+        assert_eq!(
+            id, expected,
+            "id at position {pos} must be {expected}, got {id}"
+        );
+    }
+}
+
+/// EXPLAIN VIRTUAL shows shard_key fan-out and no IPROC() in the pushed SQL.
+///
+/// Verifies: the VS generates `GROUP BY shard_key` (oversubscribed fan-out)
+/// and never falls back to the legacy `IPROC()` node-count sharding.
+#[test]
+fn test_shard_key_fanout_explain() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // EXPLAIN VIRTUAL returns the pushdown SQL as a single-column result set.
+    let sql = format!(
+        "EXPLAIN VIRTUAL SELECT id, COUNT(*) FROM {} GROUP BY id",
+        vs_table()
+    );
+    let resp = conn.execute(&sql);
+    // Collect all text from the result set — each element is a fragment of the SQL.
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+
+    // Flatten all returned text fragments into one string for pattern checks.
+    let pushed_sql: String = cols
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        pushed_sql.contains("shard_key"),
+        "EXPLAIN VIRTUAL output must contain 'shard_key' (oversubscribed fan-out), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("IPROC()"),
+        "EXPLAIN VIRTUAL output must NOT contain 'IPROC()' (legacy sharding), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("GROUP BY"),
+        "EXPLAIN VIRTUAL output must contain 'GROUP BY', got:\n{pushed_sql}"
+    );
+}
+
+/// NULL group keys are grouped together consistently.
+///
+/// Key: NULLIF(MOD(id, 5), 0) — multiples of 5 (id=5,10,15,20) yield NULL.
+/// Non-null groups are {1,2,3,4}, each with 4 rows; NULL group also has 4 rows.
+///
+/// Seed has no nullable columns; NULL is produced via NULLIF expression.
+#[test]
+fn test_group_by_null_key_grouping() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // NULLIF(MOD(id, 5), 0): id=5,10,15,20 → 0 → NULL; id=1..4 → 1..4; etc.
+    // Non-null groups: 1 (id=1,6,11,16), 2 (id=2,7,12,17), 3 (id=3,8,13,18), 4 (id=4,9,14,19)
+    // NULL group: id=5,10,15,20 → 4 rows
+    let sql = format!(
+        "SELECT NULLIF(MOD(id, 5), 0), COUNT(*) \
+         FROM {} \
+         GROUP BY NULLIF(MOD(id, 5), 0) \
+         ORDER BY NULLIF(MOD(id, 5), 0) NULLS LAST",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
+    // 5 groups: {1,2,3,4,NULL}
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "expected 5 groups (1,2,3,4,NULL): {cols:?}"
+    );
+
+    // All groups have exactly 4 rows.
+    for (i, v) in cols[1].iter().enumerate() {
+        let count = parse_int(v);
+        assert_eq!(
+            count, 4,
+            "group at position {i}: COUNT(*) must be 4, got {count}"
+        );
+    }
+
+    // Total rows = 20.
+    let total: i64 = cols[1].iter().map(parse_int).sum();
+    assert_eq!(
+        total, 20,
+        "total rows across all groups must be 20, got {total}"
+    );
+
+    // Exactly one group key must be NULL (the multiples-of-5 group).
+    // We scan for null entries rather than asserting a fixed position, because
+    // the ORDER BY NULLS LAST may not survive the GROUP BY pushdown — position
+    // is not guaranteed across execution paths.
+    let null_count = cols[0].iter().filter(|v| v.is_null()).count();
+    assert_eq!(
+        null_count, 1,
+        "exactly one NULL group key must exist (multiples of 5): {cols:?}"
+    );
+
+    // Find the null group's count and verify it is 4.
+    let null_group_count = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .find(|(k, _)| k.is_null())
+        .map(|(_, cnt)| parse_int(cnt))
+        .expect("NULL group must have a COUNT value");
+    assert_eq!(
+        null_group_count, 4,
+        "NULL group (multiples of 5) must have COUNT=4, got {null_group_count}"
+    );
+}

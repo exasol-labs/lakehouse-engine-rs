@@ -70,8 +70,41 @@ pub fn minio_url_internal() -> String {
 }
 
 /// The Exasol container name (for `docker exec` credential extraction).
+///
+/// Resolution order:
+/// 1. `EXASOL_CONTAINER` env var (CI / manual override).
+/// 2. Discover the running container by its Compose service label — works
+///    regardless of the Compose project prefix (`lakehouse-vs-*`,
+///    `lakehouse-engine-rs-*`, …), so the suite finds the stack however it was
+///    brought up.
+/// 3. Hardcoded directory-derived default.
 pub fn exasol_container() -> String {
-    std::env::var("EXASOL_CONTAINER").unwrap_or_else(|_| "lakehouse-engine-rs-exasol-1".to_string())
+    if let Ok(c) = std::env::var("EXASOL_CONTAINER")
+        && !c.trim().is_empty()
+    {
+        return c.trim().to_string();
+    }
+    // ponytail: filter on the compose service label; assumes a single running
+    // exasol service on the host (the sibling strata-rs stack is stopped during
+    // these E2E runs). Set EXASOL_CONTAINER to disambiguate if that changes.
+    if let Ok(out) = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=com.docker.compose.service=exasol",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+    {
+        if let Some(name) = String::from_utf8_lossy(&out.stdout).lines().next() {
+            let name = name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "lakehouse-engine-rs-exasol-1".to_string()
 }
 
 /// Extract the BucketFS write password.

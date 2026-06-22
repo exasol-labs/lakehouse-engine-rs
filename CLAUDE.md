@@ -28,6 +28,30 @@ their UDF model, workspace layout, and Makefile/E2E conventions. Likely converge
   discovers files itself. This seam is what later enables multi-node file sharding.
 - **File-level work assignment, no overlap** — a node scans only its assigned files.
 
+## UDF parallelization & memory model (Exasol engine internals)
+
+Verified against `exasol-db` (`script-languages`); cite these when revisiting fan-out or memory work.
+
+- **Groups drive UDF *invocations*, not OS processes.** Actual parallel instances on a node = a
+  fixed per-node VM pool sized to `NR_OF_CORES`
+  (`Engine/src/exscript/primitives.cpp:267`, `swigengine.cc:1147-1184`). Groups are multiplexed
+  onto that pool (`set_function.cpp:240-260`).
+- **Avoid `GROUP BY IPROC()` for parallelism.** `IPROC()` = node number, `NPROC()` = node count
+  (`misc_primitives.cpp:98-132`). `GROUP BY IPROC()` yields exactly one group per node → caps
+  parallelism at the node count and leaves a node's other cores idle. Use it only for the NPROC
+  node-count capture, never to shard scan work.
+- **Oversubscribe via `GROUP BY shard_key`.** Compute `G = node_count × parallelism_factor` and cap
+  G at **300** (Exasol's `max_dynamic_group_count` default). At/below 300 Exasol distributes groups
+  **round-robin** (balanced) across nodes; above it Exasol **hash-partitions** them (unbalanced) —
+  so keep G ≤ 300 (`globalgroupbyset5.cpp:295-341`). Clamp G to ≥1 and ≤ file_count.
+- **Per-instance memory limit comes from UDF metadata** (bytes), enforced by the DB via
+  `setrlimit(RLIMIT_RSS)` against the per-process heap (default 4096 MB). Read it via
+  `ctx.memory_limit()` (`language-container-rs:add-memory-limit-metadata`; `0` = unbounded/unknown).
+- **The engine self-throttles concurrency at 80%.** The dispatcher stalls additional concurrent VMs
+  once usage hits 80% of the per-process limit (`swigengine.cc:1574-1595`). Size the DataFusion
+  memory pool to a fraction (~0.6) of the per-instance limit so the engine can manage concurrency
+  rather than letting an instance OOM.
+
 ## Emit buffering
 
 - `ctx.emit` buffers rows and flushes an `MT_EMIT` at a **4,000,000-byte** threshold

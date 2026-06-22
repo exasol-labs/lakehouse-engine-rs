@@ -2,21 +2,23 @@
 
 Lets an Exasol user register an Iceberg table (resolved through an Iceberg REST
 catalog over S3-compatible storage) as a queryable virtual schema, so the table's
-columns appear to Exasol with correctly mapped SQL types, and records the cluster's
-active node count so later pushdowns can shard work across nodes.
+columns appear to Exasol with correctly mapped SQL types, and records — in the
+response `adapterNotes` — both the cluster's active node count (via `NPROC()`) and
+a parallelism factor, so later pushdowns can size the oversubscribed work-unit
+shard count.
 
 ## Background
 
-* The adapter holds no state between requests; any cluster information it needs is
-  resolved per request and returned in the `createVirtualSchema` response's
-  `adapterNotes` — a stringified-JSON schema-level note that Exasol persists and
-  round-trips back to the adapter via `schemaMetadataInfo.adapterNotes` at pushdown
-  time. The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as
-  Exasol 2025.2.1 silently drops adapter-returned properties (they never appear in any
-  catalog view). The `adapterNotes` channel is queryable via
-  `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
-* Connect-back is a read-only SQL session opened via `ctx.cluster_ip()` against
-  `<container-eth0-ip>:8563` using CONNECTION-object credentials.
+* The adapter holds no state between requests; cluster information is resolved per
+  request and returned in the `createVirtualSchema` response's `adapterNotes`
+  (stringified JSON), which Exasol persists and round-trips back at pushdown time.
+  The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as Exasol
+  2025.2.1 silently drops adapter-returned properties. The `adapterNotes` channel is
+  queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
+* `NPROC()` is obtained over a read-only connect-back session and recorded as
+  `CLUSTER_NODES`.
+* The parallelism factor is supplied as a VS/connection property and recorded
+  alongside `CLUSTER_NODES`.
 * Credentials MUST NOT appear in any error message or returned property.
 * The Iceberg REST catalog and the S3-compatible object store (MinIO) are reachable
   from the adapter via connection properties supplied at `CREATE VIRTUAL SCHEMA` time.
@@ -70,3 +72,18 @@ active node count so later pushdowns can shard work across nodes.
 * *THEN* the adapter SHALL write `CLUSTER_NODES: 1` into the `adapterNotes` of the `createVirtualSchema` response
 * *AND* the adapter SHALL still return a successful `createVirtualSchema` response describing the mapped table
 * *AND* the resulting single-shard behaviour MUST be identical to the pre-sharding single-node execution path
+
+### Scenario: Adapter records the parallelism factor in the virtual-schema adapterNotes
+
+* *GIVEN* a `createVirtualSchema` request that supplies a `PARALLELISM_FACTOR` connection/VS property
+* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
+* *THEN* the adapter SHALL record the supplied parallelism factor in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`
+* *AND* the adapter SHALL default the parallelism factor to a sensible value (8) when the property is absent or not a positive integer
+* *AND* the adapter MUST NOT persist the parallelism factor anywhere other than that returned `adapterNotes`
+
+### Scenario: Recorded node count and parallelism factor drive later work-unit sharding
+
+* *GIVEN* a `createVirtualSchema` request for which `NPROC()` resolves the active node count
+* *WHEN* the adapter returns the `createVirtualSchema` response
+* *THEN* the `adapterNotes` SHALL carry both the resolved `CLUSTER_NODES` node count and the `PARALLELISM_FACTOR`
+* *AND* both values SHALL be round-tripped back to the adapter at pushdown time so the shard count G can be computed as `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300

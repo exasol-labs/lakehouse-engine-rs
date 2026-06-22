@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-engine"]
+members = ["crates/lakehouse-engine", "crates/vs-expression"]
 # The UDF crate is a cdylib that MUST be compiled inside rust:1.92-bookworm
 # (glibc 2.36) via `make cross-musl-udf-build`. A bare host `cargo build
 # --release` must never emit the .so — it would write a host-glibc binary that
@@ -42,6 +42,8 @@ iceberg-storage-opendal = { version = "0.9.1", default-features = false, feature
 # Async runtime: tokio current-thread is sufficient for blocking UDF entry
 # points; full feature set available behind the exasol-e2e feature.
 tokio = { version = "1", features = ["rt", "macros"] }
+
+exasol-udf-sdk = { version = "0.14.0", features = ["connect-back"] }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
