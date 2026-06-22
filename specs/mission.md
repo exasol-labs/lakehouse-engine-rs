@@ -32,11 +32,13 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 2. **DataFusion-in-UDF execution** — a disposable Rust UDF creates a DataFusion session, registers
    Iceberg tables, applies pushdowns, scans its assigned files, and produces partial results.
 3. **File-level cluster parallelism** — resolve the Iceberg file list once per query and partition
-   files across active Exasol nodes (IPROC-aware) so no node scans another node's files.
-4. **Pushdown** — required: column projection, filter predicates, LIMIT. Desired: aggregation and
-   partial aggregation (node-local aggregate → Exasol final aggregate) to minimize network transfer.
+   files into G oversubscribed work-unit shards (G = node_count × parallelism_factor, capped at 300),
+   driven via `GROUP BY shard_key` so Exasol distributes shard groups across nodes and multiplexes
+   them onto each node's core pool; no node scans another node's files.
+4. **Pushdown** — required: column projection, filter predicates, LIMIT. Shipped: single-group aggregation and GROUP BY aggregation with partial/merge decomposition (node-local aggregate → Exasol final aggregate) to minimize network transfer.
 5. **Iceberg + Databricks access** — query both Apache Iceberg tables and Databricks-managed Iceberg
    through the same path.
+6. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool.
 
 ## Out of Scope
 
@@ -56,7 +58,8 @@ Every query is executed independently, starts from source metadata, and leaves n
 |------|------------|
 | Virtual Schema (VS) | Exasol adapter that makes an external data source queryable as a schema; here a thin stateless translation + planning layer |
 | Pushdown | Exasol delegating projection / filter / limit / aggregation to the VS so it executes at the source |
-| IPROC | Exasol's per-node execution process; the unit of cluster parallelism used to shard files across nodes |
+| IPROC / NPROC | `IPROC()` = node number, `NPROC()` = active node count. `NPROC()` is captured once at `createVirtualSchema` to size the shard count; sharding does NOT group on `IPROC()` (that would cap parallelism at the node count) |
+| Work-unit shard | One of G oversubscribed scan units (G = node_count × parallelism_factor, capped 300); each is its own `shard_key` group multiplexed onto a node's per-node VM pool (sized to `NR_OF_CORES`) |
 | DataFusion runtime | A node-local vectorized query engine instance created inside a UDF for the lifetime of one query |
 | Partial result | Per-node output (raw rows or node-local aggregate) merged by Exasol into the final result |
 | Disposable execution container | The UDF: created per query, holds no state, discarded on completion |
@@ -75,8 +78,9 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
 > Sibling projects: `strata-rs` (VS adapter + UDF conventions) and `language-container-rs` (the Rust
-> SLC and UDF runtime). This PoC reuses their UDF programming model and build/E2E workflow and may
-> converge with `strata-rs` (possibly a monorepo) in the long run.
+> SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
+> standalone `crates/vs-expression` expression-translation crate is designed to be shared with
+> `strata-rs` and will migrate to a monorepo layout when the projects converge.
 
 ## Commands
 
@@ -112,8 +116,8 @@ Layered, stateless, two-level parallelism. Data flow:
 User Query
   → Virtual Schema (translate, pushdown analysis, parallelization plan, result schema mapping)
   → resolve Iceberg snapshot + file list ONCE per query
-  → partition files across active Exasol nodes (IPROC-aware)
-  → parallel UDF execution: one DataFusion runtime per node over its file set
+  → partition files into G oversubscribed work-unit shards (GROUP BY shard_key, G = node_count × parallelism_factor capped 300)
+  → parallel UDF execution: one DataFusion runtime per shard invocation, multiplexed onto each node's core pool
   → Iceberg / Databricks Parquet files
   → partial results (raw rows or node-local aggregate)
   → Exasol final processing / merge
@@ -130,7 +134,7 @@ simultaneously. No state survives query completion.
   the UDF boundary (never Arrow types). Read DataFusion result batches and `ctx.emit` them
   incrementally; never materialize the whole result set. Metadata must be resolved once per query,
   not once per node. All DSN/connection strings include `validateservercertificate=0`.
-- **Business**: PoC only — feasibility and measurement, not production hardening.
+- **Usable engine**: correctness and safety guards are first-class requirements. The engine is designed to be operated, not just measured. Execution is bounded: the scan UDF sizes its DataFusion memory pool from the per-instance memory limit and either spills to disk (when `/tmp` is real disk) so high-cardinality grouped queries complete, or returns a clean `ResourcesExhausted` error rather than OOM-crashing — layered on oversubscribed sharding that shrinks per-instance footprint and the engine's own 80% concurrency throttle.
 - **Performance**: Must be faster than single-node DataFusion and scale with added Exasol nodes, with
   minimal duplicate scanning and acceptable metadata overhead.
 

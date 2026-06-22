@@ -1,0 +1,11 @@
+[package]
+name = "vs-expression"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "vs_expression"
+
+[dependencies]
+exasol-udf-sdk = { workspace = true }
+serde_json     = { workspace = true }

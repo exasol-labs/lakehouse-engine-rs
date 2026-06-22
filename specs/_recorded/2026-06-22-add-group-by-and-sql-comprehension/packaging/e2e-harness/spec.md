@@ -1,9 +1,6 @@
-# Feature: End-to-End Harness
+# Feature: E2E Harness
 
-End-to-end test suite that exercises the full lakehouse VS query path — from Exasol
-SQL through the adapter and scan UDF to Iceberg Parquet files in MinIO — verifying
-correctness of projection, filter, aggregation, and GROUP BY pushdown against a local
-Exasol Docker container.
+End-to-end test suite that exercises the full lakehouse VS query path — from Exasol SQL through the adapter and scan UDF to Iceberg Parquet files in MinIO — verifying correctness of projection, filter, aggregation, and GROUP BY pushdown against a local Exasol Docker container.
 
 ## Background
 
@@ -13,21 +10,7 @@ Exasol Docker container.
 
 ## Scenarios
 
-### Scenario: End-to-end projection + filter + LIMIT query returns correct rows
-
-* *GIVEN* the Docker stack is running with a seeded Iceberg table in the REST catalog over MinIO
-* *AND* the Rust SLC and the `.so` are installed and the virtual schema is created
-* *WHEN* a user runs `SELECT <subset of columns> FROM <vs>.<table> WHERE <predicate> LIMIT <n>`
-* *THEN* the query SHALL return exactly the rows that satisfy the predicate, capped at `n`, projected to the selected columns
-* *AND* the returned values SHALL match the seeded source data
-
-### Scenario: E2E suite fails when the stack is unavailable
-
-* *GIVEN* the Exasol container is not reachable
-* *WHEN* the `exasol-e2e` test suite runs
-* *THEN* the suite SHALL fail
-* *AND* the suite MUST NOT report the affected tests as skipped or passed
-
+<!-- DELTA:NEW -->
 ### Scenario: End-to-end grouped aggregate query returns correct per-group results
 
 * *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed
@@ -72,3 +55,4 @@ Exasol Docker container.
 * *WHEN* `EXPLAIN VIRTUAL SELECT region, COUNT(*) FROM vs.sales GROUP BY region` is executed
 * *THEN* the EXPLAIN VIRTUAL output SHALL show the scan-driving SQL grouping on `shard_key` (not `IPROC()`)
 * *AND* the test MUST fail (not skip) if the stack is unavailable
+<!-- /DELTA:NEW -->

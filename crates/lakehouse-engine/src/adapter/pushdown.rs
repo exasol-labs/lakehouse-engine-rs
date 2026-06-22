@@ -1,14 +1,3 @@
-/// Pushdown planning: resolve the Iceberg file list ONCE and build the
-/// scan-driving SQL that invokes the LAKEHOUSE_SCAN SET UDF.
-///
-/// Architecture invariants:
-/// - File list resolved exactly ONCE here, in the planning layer.
-/// - The scan SET UDF receives the explicit file list; it NEVER discovers files.
-/// - A predicate the adapter cannot translate is OMITTED from the spec
-///   (correctness backstop: Exasol keeps the predicate at its own level).
-/// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-/// - Credentials NEVER appear in any returned SQL string or error message.
-use crate::adapter::predicate::render_df_filter_safe;
 use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, ScanSpec, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -24,6 +13,17 @@ use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::sync::Arc;
+/// Pushdown planning: resolve the Iceberg file list ONCE and build the
+/// scan-driving SQL that invokes the LAKEHOUSE_SCAN SET UDF.
+///
+/// Architecture invariants:
+/// - File list resolved exactly ONCE here, in the planning layer.
+/// - The scan SET UDF receives the explicit file list; it NEVER discovers files.
+/// - A predicate the adapter cannot translate is OMITTED from the spec
+///   (correctness backstop: Exasol keeps the predicate at its own level).
+/// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
+/// - Credentials NEVER appear in any returned SQL string or error message.
+use vs_expression::{render_df_filter_safe, render_expression};
 
 /// Build a RestCatalog configured to read/write data files through the S3
 /// (MinIO) storage factory.
@@ -80,6 +80,25 @@ async fn build_rest_catalog(
 /// The registered SQL name of the scan SET UDF entry point.
 const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
+/// Maximum shard count: Exasol distributes groups round-robin below this threshold;
+/// above it Exasol hash-partitions them (no longer balanced).
+const MAX_SHARD_COUNT: usize = 300;
+
+/// Compute the work-unit shard count G for a given cluster configuration.
+///
+/// G = clamp(node_count × parallelism_factor, 1, min(file_count, 300)).
+///
+/// - The product is saturating (no overflow).
+/// - G is at least 1 and at most `file_count` so no shard is empty.
+/// - G is also at most 300 to stay in Exasol's round-robin distribution regime.
+///
+/// When `file_count` is zero this returns 1 (caller should skip partition_files).
+pub fn shard_count(node_count: usize, parallelism_factor: usize, file_count: usize) -> usize {
+    let raw = node_count.saturating_mul(parallelism_factor);
+    let upper = file_count.clamp(1, MAX_SHARD_COUNT);
+    raw.clamp(1, upper)
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate detection
 // ---------------------------------------------------------------------------
@@ -114,66 +133,78 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<AggregatePlan>> {
         if item.get("type").and_then(|t| t.as_str()) != Some("function_aggregate") {
             return None;
         }
-
-        // Reject DISTINCT aggregates.
-        if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
-            return None;
-        }
-
-        let fn_name = item
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("")
-            .to_uppercase();
-
-        let args = item.get("arguments").and_then(|a| a.as_array());
-
-        let plan = match fn_name.as_str() {
-            "COUNT" => {
-                // COUNT(*) has empty arguments; COUNT(col) has one column argument.
-                let col = args.and_then(|a| a.first()).and_then(|arg| {
-                    if arg.get("type").and_then(|t| t.as_str()) == Some("column") {
-                        arg.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_uppercase())
-                    } else {
-                        None
-                    }
-                });
-                if col.is_none() {
-                    AggregatePlan {
-                        kind: AggKind::Count,
-                        column: None,
-                    }
-                } else {
-                    AggregatePlan {
-                        kind: AggKind::CountCol,
-                        column: col,
-                    }
-                }
-            }
-            "SUM" => AggregatePlan {
-                kind: AggKind::Sum,
-                column: column_from_first_arg(args),
-            },
-            "MIN" => AggregatePlan {
-                kind: AggKind::Min,
-                column: column_from_first_arg(args),
-            },
-            "MAX" => AggregatePlan {
-                kind: AggKind::Max,
-                column: column_from_first_arg(args),
-            },
-            "AVG" => AggregatePlan {
-                kind: AggKind::Avg,
-                column: column_from_first_arg(args),
-            },
-            _ => return None, // Unsupported aggregate function — fall back.
-        };
+        let plan = parse_agg_item(item)?;
         plans.push(plan);
     }
 
     Some(plans)
+}
+
+/// Detect a GROUP BY aggregate pushdown and return the rendered group-key SQL
+/// fragments and the corresponding aggregate plans.
+///
+/// Returns `Some((group_keys, aggregate_plans))` only when **all** of the
+/// following hold:
+/// - `aggregationType` is exactly `"group_by"`.
+/// - `groupBy` is a non-empty array.
+/// - Every element of `groupBy` renders successfully via `render_expression`
+///   (any failure → `None` for the whole call).
+/// - Every element of `selectList` is either a `function_aggregate` (contributes
+///   an `AggregatePlan`) or a plain `column` reference (group-key projection —
+///   skipped for aggregate plan building). Any other type → `None`.
+/// - The `selectList` is non-empty.
+/// - No `function_aggregate` item uses `distinct: true`.
+///
+/// Returns `None` on any unsupported shape; the caller falls back to row
+/// scanning or single-group aggregate detection.
+pub fn detect_group_by_aggregates(
+    pushdown_req: &Json,
+) -> Option<(Vec<String>, Vec<AggregatePlan>)> {
+    // Must be a GROUP BY aggregate request.
+    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
+        return None;
+    }
+
+    // GROUP BY array must be present and non-empty.
+    let group_by = pushdown_req
+        .get("groupBy")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())?;
+
+    // Render each GROUP BY expression; any failure collapses the whole result.
+    let mut group_keys = Vec::with_capacity(group_by.len());
+    for node in group_by {
+        match render_expression(node) {
+            Ok(sql) => group_keys.push(sql),
+            Err(_) => return None,
+        }
+    }
+
+    // Collect aggregate plans from the select list.
+    let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
+    if list.is_empty() {
+        return None;
+    }
+
+    let mut plans = Vec::new();
+    for item in list {
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match item_type {
+            "column" => {
+                // Group-key column projection — not an aggregate; skip.
+            }
+            "function_aggregate" => {
+                let plan = parse_agg_item(item)?;
+                plans.push(plan);
+            }
+            _ => {
+                // Non-aggregate, non-column item (e.g., function_scalar) — fall back.
+                return None;
+            }
+        }
+    }
+
+    Some((group_keys, plans))
 }
 
 /// Extract the column name (uppercase) from the first argument of an aggregate function.
@@ -189,6 +220,69 @@ fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
     })
 }
 
+/// Parse a single `function_aggregate` select-list item into an `AggregatePlan`.
+///
+/// Returns `None` when the item uses `distinct: true` or the function name is
+/// not one of COUNT, SUM, MIN, MAX, AVG.
+///
+/// The caller must verify `item.type == "function_aggregate"` before calling.
+fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
+    if item.get("distinct").and_then(|d| d.as_bool()) == Some(true) {
+        return None;
+    }
+
+    let fn_name = item
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+
+    let args = item.get("arguments").and_then(|a| a.as_array());
+
+    let plan = match fn_name.as_str() {
+        "COUNT" => {
+            let col = args.and_then(|a| a.first()).and_then(|arg| {
+                if arg.get("type").and_then(|t| t.as_str()) == Some("column") {
+                    arg.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_uppercase())
+                } else {
+                    None
+                }
+            });
+            if col.is_none() {
+                AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                }
+            } else {
+                AggregatePlan {
+                    kind: AggKind::CountCol,
+                    column: col,
+                }
+            }
+        }
+        "SUM" => AggregatePlan {
+            kind: AggKind::Sum,
+            column: column_from_first_arg(args),
+        },
+        "MIN" => AggregatePlan {
+            kind: AggKind::Min,
+            column: column_from_first_arg(args),
+        },
+        "MAX" => AggregatePlan {
+            kind: AggKind::Max,
+            column: column_from_first_arg(args),
+        },
+        "AVG" => AggregatePlan {
+            kind: AggKind::Avg,
+            column: column_from_first_arg(args),
+        },
+        _ => return None,
+    };
+    Some(plan)
+}
+
 // ---------------------------------------------------------------------------
 // SQL builder (pure; used by handle_pushdown and unit tests)
 // ---------------------------------------------------------------------------
@@ -197,12 +291,15 @@ fn column_from_first_arg(args: Option<&Vec<Json>>) -> Option<String> {
 ///
 /// **Row queries** (no aggregates in spec):
 /// - Single shard: `SELECT * FROM (SELECT {udf}({spec}) EMITS ({emits})) LIMIT n`
-/// - Multi-shard: `SELECT * FROM (fan-out with IPROC GROUP BY) LIMIT n`
+/// - Multi-shard: `SELECT * FROM (fan-out with GROUP BY shard_key) LIMIT n`
 ///
-/// **Aggregate queries** (spec carries `aggregates`):
+/// **Aggregate queries** (spec carries `aggregates`, no `group_keys`):
 /// - Always wraps the fan-out in an outer merge aggregation (never SELECT *).
 /// - The EMITS clause and the outer merge follow the COLUMN CONTRACT from
 ///   `crate::scan::build_partial_agg_sql`.
+///
+/// For grouped aggregate queries (spec carries both `aggregates` and `group_keys`),
+/// use `build_grouped_aggregate_scan_sql` directly.
 ///
 /// `spec_template` carries the shared fields; only `files` is replaced per shard.
 /// `col_types` is the full table column type map `(uppercase_name, exasol_type)` used
@@ -301,6 +398,99 @@ fn build_aggregate_scan_sql(
     };
 
     format!("SELECT {merge_select} FROM ({fan_out})")
+}
+
+/// Build the grouped aggregate scan SQL.
+///
+/// ## Two-level grouping
+///
+/// Inner level: a `GROUP BY shard_key` fan-out runs one UDF invocation per shard.
+/// Each shard returns partial per-group results (DataFusion GROUP BY user keys inside
+/// the shard).  Outer level: Exasol re-groups on the user group-key columns and merges
+/// the partial aggregates.
+///
+/// ## EMITS column contract (Phase 3 / Group E must match this exactly)
+///
+/// Columns appear in this order, left to right:
+///
+/// 1. Group-key columns: `GK_0 VARCHAR(2000000)`, `GK_1 VARCHAR(2000000)`, …
+///    `GK_{n-1} VARCHAR(2000000)` — one column per group key, always VARCHAR(2000000)
+///    (Group E serialises the DataFusion group-key value to a string before emitting).
+///
+/// 2. Partial aggregate columns: same layout and naming as `partial_emits_items`
+///    (`PARTIAL_count_i`, `PARTIAL_sum_i`, `PARTIAL_min_i`, `PARTIAL_max_i`,
+///    `PARTIAL_avg_sum_i` / `PARTIAL_avg_cnt_i`).
+///
+/// ## LIMIT
+///
+/// LIMIT is never pushed into a shard spec for grouped queries (shard emits all
+/// partial groups; the outer wrapper applies the final LIMIT when needed).
+pub fn build_grouped_aggregate_scan_sql(
+    spec_template: &ScanSpec,
+    shards: Vec<Vec<String>>,
+    group_keys: &[String],
+    aggregates: &[AggregatePlan],
+    limit: Option<u64>,
+    col_types: &[(String, String)],
+    udf_name: &str,
+) -> String {
+    // Build EMITS: GK_* columns first, then PARTIAL_* columns.
+    let gk_emits: Vec<String> = (0..group_keys.len())
+        .map(|i| format!(r#""GK_{i}" VARCHAR(2000000)"#))
+        .collect();
+    let partial_items = partial_emits_items(aggregates, col_types);
+    let all_emits: Vec<String> = gk_emits
+        .iter()
+        .chain(partial_items.iter())
+        .cloned()
+        .collect();
+    let emits = all_emits.join(", ");
+
+    // Build outer merge SELECT: GK_* columns (identity projection) + merged aggregates.
+    let gk_select: Vec<String> = (0..group_keys.len())
+        .map(|i| format!(r#""GK_{i}""#))
+        .collect();
+    let merge_items = merge_select_items(aggregates);
+    let outer_select: Vec<String> = gk_select
+        .iter()
+        .chain(merge_items.iter())
+        .cloned()
+        .collect();
+    let outer_select_str = outer_select.join(", ");
+
+    // Group BY in outer: GK_0, GK_1, ...
+    let outer_group_by: Vec<String> = (0..group_keys.len())
+        .map(|i| format!(r#""GK_{i}""#))
+        .collect();
+    let outer_group_by_str = outer_group_by.join(", ");
+
+    // Build the inner fan-out.  Each shard spec must NOT carry a LIMIT (partial
+    // groups from different shards must all be emitted and merged by the outer wrapper).
+    let fan_out = if shards.len() == 1 {
+        let mut shard_spec = spec_template.clone();
+        shard_spec.files = shards.into_iter().next().unwrap_or_default();
+        shard_spec.limit = None; // No LIMIT inside shard spec for grouped queries.
+        let spec_literal = sql_string_literal(&shard_spec.to_json());
+        format!(
+            "SELECT {udf}({spec}) EMITS ({emits})",
+            udf = udf_name,
+            spec = spec_literal,
+            emits = emits,
+        )
+    } else {
+        build_fan_out_inner_with_spec(spec_template, &shards, &emits, udf_name, |spec| {
+            let mut s = spec.clone();
+            s.limit = None; // No LIMIT inside shard spec for grouped queries.
+            s.to_json()
+        })
+    };
+
+    let mut sql =
+        format!("SELECT {outer_select_str} FROM ({fan_out}) GROUP BY {outer_group_by_str}");
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    sql
 }
 
 /// Build the EMITS items for the aggregate fan-out, following the COLUMN CONTRACT.
@@ -426,13 +616,33 @@ fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
         .collect()
 }
 
-/// Builds the inner IPROC fan-out SELECT that Exasol distributes across nodes.
-/// Callers wrap it in `SELECT * FROM (...)` for row scans or an outer merge aggregation for aggregate pushdown.
+/// Builds the shard fan-out SELECT that Exasol distributes across nodes.
+///
+/// Uses `GROUP BY shard_key` (NOT `IPROC()`) so work units spread round-robin
+/// across nodes (G ≤ 300) and multiplex onto each node's core pool.
+/// Callers wrap it in `SELECT * FROM (...)` for row scans or an outer merge
+/// aggregation for aggregate pushdown.
 pub fn build_fan_out_inner(
     spec_template: &ScanSpec,
     shards: &[Vec<String>],
     emits: &str,
     udf_name: &str,
+) -> String {
+    build_fan_out_inner_with_spec(spec_template, shards, emits, udf_name, |spec| {
+        spec.to_json()
+    })
+}
+
+/// Core shard fan-out builder with a configurable spec serializer.
+///
+/// The `spec_to_json` closure lets grouped callers strip the LIMIT from each
+/// per-shard spec without affecting the row-scan / single-group path.
+fn build_fan_out_inner_with_spec(
+    spec_template: &ScanSpec,
+    shards: &[Vec<String>],
+    emits: &str,
+    udf_name: &str,
+    spec_to_json: impl Fn(&ScanSpec) -> String,
 ) -> String {
     let values: Vec<String> = shards
         .iter()
@@ -440,13 +650,13 @@ pub fn build_fan_out_inner(
         .map(|(i, files)| {
             let mut shard_spec = spec_template.clone();
             shard_spec.files = files.clone();
-            let lit = sql_string_literal(&shard_spec.to_json());
+            let lit = sql_string_literal(&spec_to_json(&shard_spec));
             format!("({i},{lit})")
         })
         .collect();
     let values_list = values.join(",");
     format!(
-        "SELECT {udf}(spec) EMITS ({emits}) FROM (VALUES {values}) AS shards(shard_key, spec) GROUP BY IPROC(), shard_key",
+        "SELECT {udf}(spec) EMITS ({emits}) FROM (VALUES {values}) AS shards(shard_key, spec) GROUP BY shard_key",
         udf = udf_name,
         emits = emits,
         values = values_list,
@@ -456,7 +666,10 @@ pub fn build_fan_out_inner(
 /// Resolve the Iceberg snapshot + file list and build pushdown SQL.
 ///
 /// `cluster_nodes` — the number of Exasol nodes read from the `CLUSTER_NODES`
-/// VS property (default 1 when absent or unparseable).
+/// adapterNotes entry (default 1 when absent or unparseable).
+///
+/// `parallelism_factor` — the oversubscription multiplier read from the
+/// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 pub async fn handle_pushdown(
@@ -466,6 +679,7 @@ pub async fn handle_pushdown(
     catalog: &CatalogProps,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
+    parallelism_factor: usize,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
         .get("pushdownRequest")
@@ -481,11 +695,7 @@ pub async fn handle_pushdown(
 
     let limit = extract_limit(&pushdown_req);
 
-    // After detection, validate that each SUM/MIN/MAX targets a supported column type;
-    // if any SUM targets a non-numeric type (DATE, VARCHAR, etc.), fall back to row scan.
     let col_types = extract_all_column_types(request);
-    let aggregates =
-        detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
 
     let files = resolve_file_list(catalog_uri, catalog, storage).await?;
 
@@ -493,7 +703,59 @@ pub async fn handle_pushdown(
         return Ok(empty_pushdown_sql(&proj_cols, &proj_types));
     }
 
-    let shards = crate::adapter::sharding::partition_files(files, cluster_nodes);
+    // Compute G = shard_count(node_count, parallelism_factor, file_count) and
+    // partition files into G balanced work-unit shards (GROUP BY shard_key fan-out).
+    let g = shard_count(cluster_nodes, parallelism_factor, files.len());
+    let shards = crate::adapter::sharding::partition_files(files, g);
+
+    // The scan UDF must be schema-qualified: the pushdown query executes
+    // outside the adapter script's schema, so an unqualified name would not
+    // resolve ("function or script LAKEHOUSE_SCAN not found").
+    let udf_name = match scan_schema {
+        Some(schema) if !schema.is_empty() => {
+            format!("{}.{}", quote_ident(schema), SCAN_UDF_NAME)
+        }
+        _ => SCAN_UDF_NAME.to_string(),
+    };
+
+    // Detection priority: GROUP BY aggregate → single-group aggregate → row scan.
+    if let Some((group_keys, grouped_agg_plans)) = detect_group_by_aggregates(&pushdown_req) {
+        // Validate aggregate column types for the grouped path — same guard as the
+        // single-group path below. SUM over a non-numeric column (VARCHAR, DATE, …)
+        // would produce an opaque UDF error; fall back to row scan instead.
+        if !validate_agg_col_types(&grouped_agg_plans, &col_types) {
+            // Fall through to single-group aggregate detection / row scan below.
+        } else {
+            // Grouped aggregate pushdown path.
+            // ponytail: PoC accepted risk — credentials embedded in spec literal.
+            let spec_template = ScanSpec {
+                files: vec![],
+                projection: proj_cols.clone(),
+                filter,
+                limit,
+                aggregates: Some(grouped_agg_plans.clone()),
+                group_keys: Some(group_keys.clone()),
+                storage: storage.clone(),
+                catalog: catalog.clone(),
+            };
+            let sql = build_grouped_aggregate_scan_sql(
+                &spec_template,
+                shards,
+                &group_keys,
+                &grouped_agg_plans,
+                limit,
+                &col_types,
+                &udf_name,
+            );
+            return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+        } // end else (validate_agg_col_types passed)
+    }
+
+    // Single-group aggregate or row scan.
+    // After detection, validate that each SUM/MIN/MAX targets a supported column type;
+    // if any SUM targets a non-numeric type (DATE, VARCHAR, etc.), fall back to row scan.
+    let aggregates =
+        detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
 
     // ponytail: PoC accepted risk — the S3 access/secret keys are embedded in
     // this scan-driving SQL literal (inside the ScanSpec JSON), which Exasol may
@@ -507,18 +769,9 @@ pub async fn handle_pushdown(
         filter,
         limit,
         aggregates,
+        group_keys: None,
         storage: storage.clone(),
         catalog: catalog.clone(),
-    };
-
-    // The scan UDF must be schema-qualified: the pushdown query executes
-    // outside the adapter script's schema, so an unqualified name would not
-    // resolve ("function or script LAKEHOUSE_SCAN not found").
-    let udf_name = match scan_schema {
-        Some(schema) if !schema.is_empty() => {
-            format!("{}.{}", quote_ident(schema), SCAN_UDF_NAME)
-        }
-        _ => SCAN_UDF_NAME.to_string(),
     };
 
     let sql = build_scan_driving_sql(
@@ -786,7 +1039,7 @@ fn exasol_type_from_json(dt: &Json) -> String {
 }
 
 /// Double-quote an identifier.
-pub fn quote_ident(name: &str) -> String {
+fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -803,8 +1056,46 @@ fn redact_catalog_error(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::predicate::render_df_filter_safe;
     use crate::scan::spec::{CatalogProps, StorageProps};
+    use vs_expression::render_df_filter_safe;
+
+    // ---------------------------------------------------------------------------
+    // Task 2.3: shard_count — cap/clamp boundary tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Shard count oversubscribes the cluster and is capped at 300.
+    /// 10 nodes × 50 factor = 500, capped to 300.
+    #[test]
+    fn shard_count_oversubscribes_and_caps_at_300() {
+        // 10 × 50 = 500 > 300 files; cap at 300.
+        assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
+        // 10 × 50 = 500 but only 350 files — still capped at 300 (min(350, 300)=300).
+        assert_eq!(
+            shard_count(10, 50, 350),
+            300,
+            "must be capped at min(files,300)=300"
+        );
+        // Exact cap: 1 × 300 = 300, 1000 files — stays 300.
+        assert_eq!(shard_count(1, 300, 1000), 300, "exactly 300 must stay 300");
+        // 1 × 301 = 301 > 300; capped at 300.
+        assert_eq!(shard_count(1, 301, 1000), 300, "301 must be capped at 300");
+    }
+
+    /// Scenario: Fewer files than G produces one shard per file with no empty shards.
+    /// node_count × parallelism_factor > file_count => clamp to file_count.
+    #[test]
+    fn shard_count_clamped_to_file_count_no_empty_shards() {
+        // 10 × 8 = 80 but only 3 files; clamp to 3.
+        assert_eq!(shard_count(10, 8, 3), 3, "must clamp to file_count=3");
+        // 4 × 8 = 32 but only 5 files; clamp to 5.
+        assert_eq!(shard_count(4, 8, 5), 5, "must clamp to file_count=5");
+        // 1 × 1 = 1, file_count=1; stays 1.
+        assert_eq!(shard_count(1, 1, 1), 1, "single file single shard");
+        // Minimum clamp: 0 × 8 = 0, clamp to min(1, …) = 1.
+        assert_eq!(shard_count(0, 8, 100), 1, "zero product must clamp to 1");
+        // parallelism_factor=0: 5 × 0 = 0, clamp to 1.
+        assert_eq!(shard_count(5, 0, 100), 1, "zero factor must clamp to 1");
+    }
 
     // ---------------------------------------------------------------------------
     // Helpers shared across tests
@@ -864,6 +1155,7 @@ mod tests {
             filter,
             limit,
             aggregates: None,
+            group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
         };
@@ -1231,6 +1523,7 @@ mod tests {
                     column: None,
                 },
             ]),
+            group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
         };
@@ -1281,11 +1574,11 @@ mod tests {
     // Task 3.3: IPROC fan-out + single-shard equivalence
     // ---------------------------------------------------------------------------
 
-    /// Task 3.3: multi_shard_sql_fans_via_iproc_group_by
-    /// Given files partitioned into >1 shard: SQL contains IPROC() and GROUP BY,
+    /// Task 3.3 (updated for task 2.8): multi_shard_sql_fans_via_shard_key_group_by
+    /// Given files partitioned into >1 shard: SQL contains GROUP BY shard_key (NOT IPROC()),
     /// invokes the scan UDF, and carries each shard's distinct files as separate spec literals.
     #[test]
-    fn multi_shard_sql_fans_via_iproc_group_by() {
+    fn multi_shard_sql_fans_via_shard_key_group_by() {
         let files = vec![
             "s3://warehouse/shard0/part-000.parquet".into(),
             "s3://warehouse/shard1/part-001.parquet".into(),
@@ -1301,14 +1594,18 @@ mod tests {
             3,
         );
 
-        // Must use IPROC and GROUP BY for the fan-out.
+        // Must use shard_key GROUP BY for the fan-out, NOT IPROC().
         assert!(
-            sql.contains("IPROC()"),
-            "multi-shard SQL must contain IPROC(): {sql}"
+            !sql.contains("IPROC()"),
+            "multi-shard SQL must NOT contain IPROC(): {sql}"
         );
         assert!(
             sql.contains("GROUP BY"),
             "multi-shard SQL must contain GROUP BY: {sql}"
+        );
+        assert!(
+            sql.contains("shard_key"),
+            "multi-shard SQL must use shard_key: {sql}"
         );
 
         // Must invoke the scan UDF.
@@ -1365,6 +1662,7 @@ mod tests {
             filter: None,
             limit: None,
             aggregates: Some(agg_plans),
+            group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
         };
@@ -1403,14 +1701,18 @@ mod tests {
         ];
         let sql = build_agg_sql(plans, files, 2);
 
-        // Must contain the IPROC fan-out.
+        // Must contain the shard_key fan-out (NOT IPROC).
         assert!(
-            sql.contains("IPROC()"),
-            "aggregate SQL must use IPROC fan-out: {sql}"
+            !sql.contains("IPROC()"),
+            "aggregate SQL must NOT use IPROC: {sql}"
         );
         assert!(
             sql.contains("GROUP BY"),
             "aggregate SQL must use GROUP BY: {sql}"
+        );
+        assert!(
+            sql.contains("shard_key"),
+            "aggregate SQL must use shard_key fan-out: {sql}"
         );
 
         // Must wrap with outer merge aggregation.
@@ -1644,6 +1946,65 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // FIX 1: grouped aggregate with invalid agg column type falls back
+    // ---------------------------------------------------------------------------
+
+    /// A grouped aggregate whose SUM targets a VARCHAR column must fall back to row
+    /// scan (return None from detect_group_by_aggregates + validate_agg_col_types) —
+    /// the same guard as the single-group path — rather than producing grouped scan SQL
+    /// that would generate an opaque UDF error at execution time.
+    #[test]
+    fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
+        // Simulate the detection + validation sequence that handle_pushdown runs.
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "REGION"}],
+            "selectList": [
+                {"type": "column", "name": "REGION"},
+                agg_item("SUM", Some("NAME"), false), // NAME is VARCHAR — invalid for SUM
+            ],
+        });
+
+        // detect_group_by_aggregates must accept the shape (it doesn't know types).
+        let detected = detect_group_by_aggregates(&req);
+        assert!(
+            detected.is_some(),
+            "detect_group_by_aggregates must accept the shape: {req}"
+        );
+        let (_, agg_plans) = detected.unwrap();
+
+        // Validation with VARCHAR col_types must fail — triggering fall-back.
+        let col_types = vec![
+            ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+            ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+        ];
+        assert!(
+            !validate_agg_col_types(&agg_plans, &col_types),
+            "validate_agg_col_types must fail for SUM over VARCHAR (fall back to row scan)"
+        );
+
+        // Confirm that a DATE column also fails for SUM.
+        let col_types_date = vec![
+            ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+            ("NAME".to_string(), "DATE".to_string()),
+        ];
+        assert!(
+            !validate_agg_col_types(&agg_plans, &col_types_date),
+            "validate_agg_col_types must fail for SUM over DATE (fall back to row scan)"
+        );
+
+        // Confirm a numeric type passes (no fall back).
+        let col_types_numeric = vec![
+            ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+            ("NAME".to_string(), "DOUBLE PRECISION".to_string()),
+        ];
+        assert!(
+            validate_agg_col_types(&agg_plans, &col_types_numeric),
+            "validate_agg_col_types must pass for SUM over DOUBLE PRECISION"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // R.2: multi-shard row-scan must append outer LIMIT
     // ---------------------------------------------------------------------------
 
@@ -1664,8 +2025,12 @@ mod tests {
             2,
         );
         assert!(
-            sql.contains("IPROC()"),
-            "must be multi-shard (has IPROC): {sql}"
+            !sql.contains("IPROC()"),
+            "must NOT use IPROC (uses shard_key): {sql}"
+        );
+        assert!(
+            sql.contains("shard_key"),
+            "must be multi-shard (uses shard_key): {sql}"
         );
         assert!(
             sql.contains("LIMIT 10"),
@@ -1725,5 +2090,453 @@ mod tests {
             sql.contains("part-00001.parquet"),
             "must carry file 1: {sql}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.5 tests — detect_group_by_aggregates
+    // ---------------------------------------------------------------------------
+
+    fn make_group_by_request(
+        group_by: serde_json::Value,
+        select_list: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": group_by,
+            "selectList": select_list,
+        })
+    }
+
+    /// Column reference in GROUP BY renders to a quoted identifier.
+    #[test]
+    fn detect_group_by_aggregates_column_key() {
+        let req = make_group_by_request(
+            serde_json::json!([{"type": "column", "name": "REGION"}]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                agg_item("COUNT", None, false),
+            ]),
+        );
+        let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        let (keys, plans) = result;
+        assert_eq!(keys.len(), 1, "one group key");
+        assert!(
+            keys[0].contains("REGION"),
+            "group key must reference REGION: {:?}",
+            keys[0]
+        );
+        assert_eq!(plans.len(), 1, "one aggregate plan");
+        assert_eq!(plans[0].kind, AggKind::Count);
+    }
+
+    /// Scalar expression in GROUP BY (e.g., function_scalar YEAR) renders via render_expression.
+    #[test]
+    fn detect_group_by_aggregates_expression_key() {
+        // A predicate_equal used as an expression key — render_expression can handle it.
+        let req = make_group_by_request(
+            serde_json::json!([{
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "STATUS"},
+                "right": {"type": "literal_string", "value": "active"},
+            }]),
+            serde_json::json!([agg_item("SUM", Some("AMOUNT"), false),]),
+        );
+        let result = detect_group_by_aggregates(&req);
+        // predicate_equal renders to (STATUS = 'active'), so it should succeed.
+        assert!(result.is_some(), "renderable expression key must succeed");
+        let (keys, plans) = result.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].contains("="), "rendered expression must contain =");
+        assert_eq!(plans[0].kind, AggKind::Sum);
+    }
+
+    /// An unsupported expression in GROUP BY causes the whole function to return None.
+    #[test]
+    fn detect_group_by_unsupported_expression_falls_back() {
+        let req = make_group_by_request(
+            serde_json::json!([{"type": "fn_custom_unsupported", "name": "MYSTERY"}]),
+            serde_json::json!([agg_item("COUNT", None, false)]),
+        );
+        assert!(
+            detect_group_by_aggregates(&req).is_none(),
+            "unsupported expression must fall back to None"
+        );
+    }
+
+    /// Select list with a non-aggregate, non-column item causes fallback.
+    #[test]
+    fn detect_group_by_mixed_select_falls_back() {
+        // function_scalar in selectList is not an aggregate and not a plain column.
+        let req = make_group_by_request(
+            serde_json::json!([{"type": "column", "name": "REGION"}]),
+            serde_json::json!([
+                {"type": "function_scalar", "name": "YEAR", "arguments": [{"type": "column", "name": "TS"}]},
+                agg_item("COUNT", None, false),
+            ]),
+        );
+        assert!(
+            detect_group_by_aggregates(&req).is_none(),
+            "non-aggregate non-column in selectList must fall back"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.4: partition_files_g_shards_balanced_disjoint_full_coverage
+    // ---------------------------------------------------------------------------
+
+    /// File list partitioned into G shards via shard_count is balanced, disjoint,
+    /// and covers every file with no empty shards.
+    #[test]
+    fn partition_files_g_shards_balanced_disjoint_full_coverage() {
+        use std::collections::HashSet;
+        // 3 nodes × 4 factor = 12, capped to 10 files → G = 10
+        let files: Vec<String> = (0..10).map(|i| format!("file-{i}.parquet")).collect();
+        let g = shard_count(3, 4, files.len());
+        assert_eq!(g, 10, "G must equal file_count when product > file_count");
+        let shards = crate::adapter::sharding::partition_files(files.clone(), g);
+        assert_eq!(shards.len(), 10, "must produce exactly G=10 shards");
+        // No shard is empty.
+        for (i, shard) in shards.iter().enumerate() {
+            assert!(!shard.is_empty(), "shard {i} must not be empty");
+        }
+        // All files covered exactly once.
+        let all: Vec<String> = shards.iter().flatten().cloned().collect();
+        let unique: HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "files must be disjoint across shards"
+        );
+        assert_eq!(
+            unique,
+            files.iter().collect::<HashSet<_>>(),
+            "all files must be covered"
+        );
+        // Balanced: sizes differ by at most 1.
+        let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
+        let max = *sizes.iter().max().unwrap();
+        let min = *sizes.iter().min().unwrap();
+        assert!(max - min <= 1, "shards not balanced: max={max} min={min}");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.8 / 2.11: scan_driving_sql_groups_by_shard_key_not_iproc
+    //   and single_shard_collapses_to_single_invocation
+    // ---------------------------------------------------------------------------
+
+    /// Multi-shard row-scan SQL uses GROUP BY shard_key, never IPROC().
+    #[test]
+    fn scan_driving_sql_groups_by_shard_key_not_iproc() {
+        let files: Vec<String> = (0..3)
+            .map(|i| format!("s3://warehouse/f{i}.parquet"))
+            .collect();
+        let g = shard_count(3, 1, files.len());
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec!["ID".into()],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = crate::adapter::sharding::partition_files(files, g);
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            shards,
+            &["ID".to_string()],
+            &["DECIMAL(20,0)".to_string()],
+            None,
+            &[],
+            SCAN_UDF_NAME,
+        );
+        assert!(
+            !sql.contains("IPROC()"),
+            "multi-shard SQL must NOT contain IPROC(): {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY"),
+            "multi-shard SQL must contain GROUP BY: {sql}"
+        );
+        assert!(
+            sql.contains("shard_key"),
+            "multi-shard SQL must use shard_key: {sql}"
+        );
+    }
+
+    /// Single-shard collapses to the single-invocation form (no VALUES, no GROUP BY).
+    #[test]
+    fn single_shard_collapses_to_single_invocation() {
+        let files = vec!["s3://warehouse/f0.parquet".to_string()];
+        let g = shard_count(1, 1, files.len());
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec!["ID".into()],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = crate::adapter::sharding::partition_files(files, g);
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            shards,
+            &["ID".to_string()],
+            &["DECIMAL(20,0)".to_string()],
+            None,
+            &[],
+            SCAN_UDF_NAME,
+        );
+        assert!(
+            !sql.contains("IPROC()"),
+            "single-shard SQL must not contain IPROC: {sql}"
+        );
+        assert!(
+            !sql.contains("VALUES"),
+            "single-shard SQL must not contain VALUES: {sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "single-shard SQL must not contain GROUP BY: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT * FROM (SELECT "),
+            "must start with SELECT * FROM (SELECT ...: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.11: grouped_scan_sql_groups_by_shard_key
+    // ---------------------------------------------------------------------------
+
+    /// Helper: build grouped aggregate scan SQL.
+    fn build_grouped_agg_sql(
+        group_keys: Vec<String>,
+        agg_plans: Vec<AggregatePlan>,
+        files: Vec<String>,
+        g: usize,
+    ) -> String {
+        let col_types: Vec<(String, String)> = vec![
+            ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
+            ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        ];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(agg_plans.clone()),
+            group_keys: Some(group_keys.clone()),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = crate::adapter::sharding::partition_files(files, g);
+        build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &group_keys,
+            &agg_plans,
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+        )
+    }
+
+    /// Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units.
+    #[test]
+    fn grouped_scan_sql_groups_by_shard_key() {
+        let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
+        let g = shard_count(2, 1, files.len());
+        let sql = build_grouped_agg_sql(
+            vec!["\"REGION\"".into()],
+            vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            }],
+            files,
+            g,
+        );
+        assert!(
+            !sql.contains("IPROC()"),
+            "grouped SQL must NOT contain IPROC(): {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY"),
+            "grouped SQL must contain GROUP BY: {sql}"
+        );
+        assert!(
+            sql.contains("shard_key"),
+            "grouped SQL inner must use shard_key: {sql}"
+        );
+        assert!(
+            sql.contains("VALUES"),
+            "grouped SQL must use VALUES fan-out: {sql}"
+        );
+    }
+
+    /// LIMIT is NOT pushed into per-shard scan for a grouped query.
+    /// The per-shard spec JSON must not carry "limit"; the outer wrapper may have LIMIT.
+    #[test]
+    fn grouped_scan_sql_has_no_per_shard_limit() {
+        let files = vec!["s3://w/f0.parquet".to_string()];
+        let g = shard_count(1, 1, files.len());
+        let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
+            aggregates: Some(vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            }]),
+            group_keys: Some(vec!["\"REGION\"".into()]),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let shards = crate::adapter::sharding::partition_files(files, g);
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &["\"REGION\"".to_string()],
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            }],
+            Some(100),
+            &col_types,
+            SCAN_UDF_NAME,
+        );
+        // The per-shard spec JSON must NOT carry "limit" — extract the embedded JSON literal
+        // (everything between the first ' and the matching ') and verify "limit" is absent.
+        // The SQL form is: SELECT UDF('...json...') EMITS (...)  or VALUES entry.
+        // Easiest: extract the embedded spec from between single-quotes.
+        let spec_start = sql.find('\'').expect("spec literal must start with '") + 1;
+        let spec_end = sql[spec_start..]
+            .find("') EMITS")
+            .unwrap_or(sql[spec_start..].find('\'').unwrap());
+        let spec_json = &sql[spec_start..spec_start + spec_end];
+        assert!(
+            !spec_json.contains("\"limit\""),
+            "per-shard spec must NOT carry limit: {spec_json}"
+        );
+        // The outer SQL may contain LIMIT (that's fine — it's the outer wrapper limit).
+        // Just confirm no "limit" key in the per-shard spec JSON.
+    }
+
+    /// Grouped aggregate wrapper SQL re-groups partial results per user group key.
+    #[test]
+    fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
+        let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
+        let g = shard_count(2, 1, files.len());
+        let sql = build_grouped_agg_sql(
+            vec!["\"REGION\"".into(), "\"YEAR\"".into()],
+            vec![
+                AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                },
+                AggregatePlan {
+                    kind: AggKind::Sum,
+                    column: Some("AMOUNT".into()),
+                },
+            ],
+            files,
+            g,
+        );
+        // Outer wrapper must GROUP BY GK_0, GK_1 (the group key columns).
+        assert!(
+            sql.contains("GK_0"),
+            "wrapper SQL must reference GK_0: {sql}"
+        );
+        assert!(
+            sql.contains("GK_1"),
+            "wrapper SQL must reference GK_1: {sql}"
+        );
+        // Outer GROUP BY must merge partial aggregates.
+        assert!(
+            sql.contains("SUM("),
+            "wrapper must contain SUM for merge: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_count_0"),
+            "wrapper must reference PARTIAL_count_0: {sql}"
+        );
+        assert!(
+            sql.contains("PARTIAL_sum_1"),
+            "wrapper must reference PARTIAL_sum_1: {sql}"
+        );
+        // Outer must have GROUP BY GK_0, GK_1.
+        let outer_group_by = sql
+            .rfind("GROUP BY")
+            .expect("must have GROUP BY in outer wrapper");
+        let outer_group_by_clause = &sql[outer_group_by..];
+        assert!(
+            outer_group_by_clause.contains("GK_0"),
+            "outer GROUP BY must include GK_0: {outer_group_by_clause}"
+        );
+        assert!(
+            outer_group_by_clause.contains("GK_1"),
+            "outer GROUP BY must include GK_1: {outer_group_by_clause}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.10: grouped_scan_spec_carries_group_keys
+    // ---------------------------------------------------------------------------
+
+    /// Grouped scan spec carries group-key rendered SQL fragments.
+    #[test]
+    fn grouped_scan_spec_carries_group_keys() {
+        let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
+        let spec = ScanSpec {
+            files: vec!["s3://w/f0.parquet".into()],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            }]),
+            group_keys: Some(group_keys.clone()),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+        };
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).expect("must round-trip");
+        let keys = back.group_keys.expect("group_keys must be present");
+        assert_eq!(keys, group_keys, "group_keys must survive spec round-trip");
+    }
+
+    /// aggregationType missing or not "group_by" returns None.
+    #[test]
+    fn detect_group_by_aggregates_no_group_by_type_returns_none() {
+        // No aggregationType.
+        let req1 = serde_json::json!({
+            "groupBy": [{"type": "column", "name": "REGION"}],
+            "selectList": [agg_item("COUNT", None, false)],
+        });
+        assert!(detect_group_by_aggregates(&req1).is_none());
+
+        // aggregationType is "single_group".
+        let req2 = serde_json::json!({
+            "aggregationType": "single_group",
+            "selectList": [agg_item("COUNT", None, false)],
+        });
+        assert!(detect_group_by_aggregates(&req2).is_none());
+    }
+
+    /// Empty groupBy array returns None.
+    #[test]
+    fn detect_group_by_aggregates_empty_group_by_returns_none() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [],
+            "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
+        });
+        assert!(detect_group_by_aggregates(&req).is_none());
     }
 }
