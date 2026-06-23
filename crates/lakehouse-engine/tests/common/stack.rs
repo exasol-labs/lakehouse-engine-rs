@@ -73,10 +73,10 @@ pub fn minio_url_internal() -> String {
 ///
 /// Resolution order:
 /// 1. `EXASOL_CONTAINER` env var (CI / manual override).
-/// 2. Discover the running container by its Compose service label — works
-///    regardless of the Compose project prefix (`lakehouse-vs-*`,
-///    `lakehouse-engine-rs-*`, …), so the suite finds the stack however it was
-///    brought up.
+/// 2. Discover the running container by its Compose service label, narrowed to
+///    the one publishing this stack's SQL port — works regardless of the
+///    Compose project prefix (`lakehouse-vs-*`, `lakehouse-engine-rs-*`, …) and
+///    stays correct when an unrelated Exasol stack is also running.
 /// 3. Hardcoded directory-derived default.
 pub fn exasol_container() -> String {
     if let Ok(c) = std::env::var("EXASOL_CONTAINER")
@@ -84,24 +84,25 @@ pub fn exasol_container() -> String {
     {
         return c.trim().to_string();
     }
-    // ponytail: filter on the compose service label; assumes a single running
-    // exasol service on the host (the sibling strata-rs stack is stopped during
-    // these E2E runs). Set EXASOL_CONTAINER to disambiguate if that changes.
+    // Disambiguate by the published SQL port so we never read credentials from a
+    // different Exasol stack that happens to share the `exasol` compose-service
+    // label. (A bare label filter assumes a single exasol container on the host.)
     if let Ok(out) = std::process::Command::new("docker")
         .args([
             "ps",
             "--filter",
             "label=com.docker.compose.service=exasol",
+            "--filter",
+            &format!("publish={}", exasol_sql_port()),
             "--format",
             "{{.Names}}",
         ])
         .output()
+        && let Some(name) = String::from_utf8_lossy(&out.stdout).lines().next()
     {
-        if let Some(name) = String::from_utf8_lossy(&out.stdout).lines().next() {
-            let name = name.trim();
-            if !name.is_empty() {
-                return name.to_string();
-            }
+        let name = name.trim();
+        if !name.is_empty() {
+            return name.to_string();
         }
     }
     "lakehouse-engine-rs-exasol-1".to_string()
@@ -114,15 +115,15 @@ pub fn exasol_container() -> String {
 /// 2. `BUCKETFS_WRITE_PASS` env var
 /// 3. docker exec into the Exasol container to read `/exa/etc/EXAConf`
 pub fn bucketfs_write_password() -> String {
-    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD") {
-        if !p.is_empty() {
-            return p;
-        }
+    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD")
+        && !p.is_empty()
+    {
+        return p;
     }
-    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASS") {
-        if !p.is_empty() {
-            return p;
-        }
+    if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASS")
+        && !p.is_empty()
+    {
+        return p;
     }
     let container = exasol_container();
     let script = "awk '/\\[\\[Bucket : default\\]\\]/{flag=1} flag && /WritePasswd/{print $3; exit}' /exa/etc/EXAConf | base64 -d";

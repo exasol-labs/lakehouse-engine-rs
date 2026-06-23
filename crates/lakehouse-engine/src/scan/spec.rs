@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// COUNT(*) maps to `Count` (no column), COUNT(col) maps to `CountCol`.
 /// AVG is decomposed into a (partial_sum, partial_count) pair in the scan UDF;
 /// the adapter wrapper SQL performs the final division.
+///
+/// STDDEV/VARIANCE family are decomposed into a (cnt, sum, sum_sq) sufficient-
+/// statistics triple; the wrapper reconstructs the population or sample statistic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggKind {
@@ -24,6 +27,14 @@ pub enum AggKind {
     Min,
     Max,
     Avg,
+    /// VAR_POP / VARIANCE_POP — divide final numer by N.
+    VarPop,
+    /// VAR_SAMP / VARIANCE / VARIANCE_SAMP — divide final numer by N-1.
+    VarSamp,
+    /// STDDEV_POP — sqrt(VAR_POP).
+    StddevPop,
+    /// STDDEV / STDDEV_SAMP — sqrt(VAR_SAMP).
+    StddevSamp,
 }
 
 /// One aggregate function in a pushed-down aggregate plan.
