@@ -1,2 +1,5 @@
 /target
 **/*.so
+
+# Serena MCP workspace cache
+.serena/
