@@ -30,6 +30,8 @@ It holds no state and discovers no files of its own.
 * The S3-compatible object store is MinIO; DataFusion's object store is configured with
   the supplied endpoint, region, and credentials and `validateservercertificate=0`
   semantics where applicable.
+* Memory budgeting and credential-passthrough scenarios (including vended STS tokens)
+  are in `datafusion-scan/scan-execution-memory-and-credentials`.
 
 ## Scenarios
 

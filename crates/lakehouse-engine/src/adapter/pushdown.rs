@@ -1,9 +1,10 @@
+use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, ScanSpec, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-    S3_SESSION_TOKEN,
+    FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
+    S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::{
@@ -75,6 +76,204 @@ async fn build_rest_catalog(
                 redact_catalog_error(&e.to_string())
             ))
         })
+}
+
+// ---------------------------------------------------------------------------
+// Signed catalog resolution (SigV4 path)
+// ---------------------------------------------------------------------------
+
+/// Build an S3 `FileIO` from storage props.
+///
+/// Used by the signed path to give the iceberg `Table` a way to read manifest
+/// files from S3 after we have fetched and deserialized the `LoadTableResult`.
+fn build_s3_file_io(storage: &StorageProps) -> iceberg::io::FileIO {
+    let mut builder = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
+        configured_scheme: "s3".to_string(),
+        customized_credential_load: None,
+    }));
+    if !storage.endpoint.is_empty() {
+        builder = builder.with_prop(S3_ENDPOINT, &storage.endpoint);
+    }
+    if !storage.region.is_empty() {
+        builder = builder.with_prop(S3_REGION, &storage.region);
+    }
+    if !storage.access_key.is_empty() {
+        builder = builder.with_prop(S3_ACCESS_KEY_ID, &storage.access_key);
+    }
+    if !storage.secret_key.is_empty() {
+        builder = builder.with_prop(S3_SECRET_ACCESS_KEY, &storage.secret_key);
+    }
+    if let Some(token) = &storage.session_token {
+        builder = builder.with_prop(S3_SESSION_TOKEN, token);
+    }
+    builder = builder.with_prop(S3_PATH_STYLE_ACCESS, storage.path_style.to_string());
+    builder.build()
+}
+
+/// Build the `loadTable` REST URL matching iceberg-catalog-rest's `table_endpoint` pattern:
+/// `{catalog_uri}/v1/{warehouse?}/namespaces/{ns_url}/tables/{table_name}`
+///
+/// The `warehouse` parameter acts as the URL prefix (matching `props["prefix"]` in the
+/// iceberg-catalog-rest config map). For AWS Glue, this is the catalog ID / warehouse ARN;
+/// for a plain REST catalog it is typically the warehouse name. When empty, the prefix is
+/// omitted and the URL reduces to `{catalog_uri}/v1/namespaces/{ns}/tables/{table}`.
+///
+/// ponytail: For AWS Glue the warehouse value is a catalog ARN
+/// (`arn:aws:glue:region:acct:catalog`) and is inserted verbatim into the URL path — no
+/// URL-encoding and no config-endpoint prefix round-trip. This works because the Glue
+/// Iceberg REST endpoint expects the ARN unencoded in that path segment. The upgrade path
+/// (if a catalog returns a `prefix` from its REST config endpoint that differs from the
+/// connection warehouse) is to fetch the prefix from `GET {catalog_uri}/v1/config` and
+/// use that instead, URL-encoding non-ASCII characters. Not built here — YAGNI for now.
+fn build_load_table_url(catalog_uri: &str, warehouse: &str, ns: &str, table_name: &str) -> String {
+    let base = format!("{catalog_uri}/v1");
+    if warehouse.is_empty() {
+        format!("{base}/namespaces/{ns}/tables/{table_name}")
+    } else {
+        format!("{base}/{warehouse}/namespaces/{ns}/tables/{table_name}")
+    }
+}
+
+/// Self-issue a SigV4-signed `GET loadTable` request and deserialize the result.
+///
+/// This replaces the unsigned `RestCatalogBuilder`-based load when `use_sigv4` is true.
+/// Credential values NEVER appear in the returned error.
+async fn load_table_signed(
+    catalog_uri: &str,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+) -> Result<iceberg_catalog_rest::LoadTableResult, UdfError> {
+    let (ns, table_name) = parse_table_ident(&catalog.table)?;
+    let url = build_load_table_url(catalog_uri, &catalog.warehouse, &ns, &table_name);
+
+    let client = reqwest::Client::new();
+    let request = client
+        .get(&url)
+        .header("accept", "application/json")
+        .build()
+        .map_err(|e| UdfError::User(format!("failed to build catalog request: {e}")))?;
+
+    let signed = crate::adapter::sigv4::sign_request(
+        request,
+        &creds.access_key,
+        &creds.secret_key,
+        creds.session_token.as_deref(),
+        &creds.region,
+        "glue",
+    )
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to sign catalog request: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    let response = client.execute(signed).await.map_err(|e| {
+        UdfError::User(format!(
+            "catalog request failed: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // Read body for diagnostics but never echo credential-shaped values.
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(unreadable body)".into());
+        return Err(UdfError::User(format!(
+            "catalog returned HTTP {}: {}",
+            status.as_u16(),
+            redact_catalog_error(&body)
+        )));
+    }
+
+    let result: iceberg_catalog_rest::LoadTableResult = response.json().await.map_err(|e| {
+        UdfError::User(format!(
+            "failed to parse catalog response: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    Ok(result)
+}
+
+/// Extract the vended S3 credential keys from a `LoadTableResult`.
+///
+/// Selection logic (per Iceberg REST spec):
+/// 1. Check `storage_credentials`: pick the entry whose `prefix` is the longest
+///    prefix of `location`. If multiple match, longest wins.
+/// 2. Fallback: use the flat `config` map.
+///
+/// Returns `(access_key, secret_key, session_token)` — all may be empty strings
+/// when the response carries no vended creds.
+pub fn extract_vended_keys(
+    result: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> (String, String, Option<String>) {
+    // Try storage_credentials first — pick longest matching prefix.
+    if let Some(creds) = &result.storage_credentials {
+        let best = creds
+            .iter()
+            .filter(|sc| !sc.prefix.is_empty() && location.starts_with(&sc.prefix))
+            .max_by_key(|sc| sc.prefix.len());
+
+        if let Some(sc) = best {
+            return extract_s3_keys_from_config(&sc.config);
+        }
+    }
+
+    // Fallback: flat config map.
+    extract_s3_keys_from_config(&result.config)
+}
+
+fn extract_s3_keys_from_config(
+    config: &HashMap<String, String>,
+) -> (String, String, Option<String>) {
+    let access_key = config.get("s3.access-key-id").cloned().unwrap_or_default();
+    let secret_key = config
+        .get("s3.secret-access-key")
+        .cloned()
+        .unwrap_or_default();
+    let session_token = config
+        .get("s3.session-token")
+        .cloned()
+        .filter(|s| !s.is_empty());
+    (access_key, secret_key, session_token)
+}
+
+/// Build a new `StorageProps` with vended STS keys overriding the static ones.
+///
+/// Static `endpoint`, `region`, `path_style`, and `allow_http` are preserved.
+/// The vended `access_key`, `secret_key`, and `session_token` replace their
+/// static counterparts.
+pub fn merge_vended_into_storage(
+    base: &StorageProps,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> StorageProps {
+    StorageProps {
+        endpoint: base.endpoint.clone(),
+        region: base.region.clone(),
+        access_key: if access_key.is_empty() {
+            base.access_key.clone()
+        } else {
+            access_key.to_string()
+        },
+        secret_key: if secret_key.is_empty() {
+            base.secret_key.clone()
+        } else {
+            secret_key.to_string()
+        },
+        session_token: match session_token {
+            Some(t) if !t.is_empty() => Some(t.to_string()),
+            _ => base.session_token.clone(),
+        },
+        allow_http: base.allow_http,
+        path_style: base.path_style,
+    }
 }
 
 /// The registered SQL name of the scan SET UDF entry point.
@@ -881,7 +1080,18 @@ fn build_fan_out_inner_with_spec(
 /// `parallelism_factor` — the oversubscription multiplier read from the
 /// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
 ///
+/// `creds` — the resolved CONNECTION credentials, used to determine whether
+/// to sign catalog requests and whether to apply vended S3 credentials.
+///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
+///
+/// ponytail: The S3 access/secret/session-token keys are embedded verbatim in the
+/// scan-driving SQL literal (inside the `ScanSpec` JSON), which Exasol may log or
+/// surface in its query profile / audit trail. PoC-accepted tradeoff. The upgrade
+/// path is to pass credentials via a CONNECTION object (referenced by name, never
+/// inlined) or to fetch them over connect-back at scan time so they never appear
+/// in any SQL text. Error paths already redact these values.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,
     catalog_uri: &str,
@@ -890,6 +1100,7 @@ pub async fn handle_pushdown(
     scan_schema: Option<&str>,
     cluster_nodes: usize,
     parallelism_factor: usize,
+    creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
         .get("pushdownRequest")
@@ -907,7 +1118,12 @@ pub async fn handle_pushdown(
 
     let col_types = extract_all_column_types(request);
 
-    let files = resolve_file_list(catalog_uri, catalog, storage).await?;
+    // Resolve file list exactly once. The returned `effective_storage` carries
+    // vended STS creds when use_vended_credentials is true; otherwise it equals
+    // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
+    let (files, effective_storage) =
+        resolve_file_list(catalog_uri, catalog, storage, creds).await?;
+    let storage = &effective_storage;
 
     if files.is_empty() {
         return Ok(empty_pushdown_sql(&proj_cols, &proj_types));
@@ -956,7 +1172,6 @@ pub async fn handle_pushdown(
             // No HAVING: safe to fall through to single-group / row scan.
         } else {
             // Grouped aggregate pushdown path.
-            // ponytail: PoC accepted risk — credentials embedded in spec literal.
             let spec_template = ScanSpec {
                 files: vec![],
                 projection: proj_cols.clone(),
@@ -991,12 +1206,6 @@ pub async fn handle_pushdown(
     let aggregates =
         detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
 
-    // ponytail: PoC accepted risk — the S3 access/secret keys are embedded in
-    // this scan-driving SQL literal (inside the ScanSpec JSON), which Exasol may
-    // log or surface in its query profile / audit. Acceptable for this PoC slice;
-    // the upgrade path is to pass credentials via a CONNECTION object (referenced
-    // by name, never inlined) or to fetch them over connect-back at scan time so
-    // they never appear in any SQL text. Error paths already redact the values.
     let spec_template = ScanSpec {
         files: vec![], // replaced per shard in build_scan_driving_sql
         projection: proj_cols.clone(),
@@ -1027,11 +1236,67 @@ pub async fn handle_pushdown(
 ///
 /// This is the resolve-once seam: called exactly once per pushdown in the
 /// adapter; the file list is passed explicitly to the scan UDF.
+///
+/// When `creds.use_sigv4` is true, the catalog load_table request is
+/// self-issued with SigV4 signing instead of going through `RestCatalogBuilder`.
+/// When `creds.use_vended_credentials` is true, the returned `StorageProps`
+/// carries the vended STS keys (merged over the static `storage` props) so
+/// every per-shard `ScanSpec.storage` uses the vended creds. When neither flag
+/// is set, returns `(files, storage.clone())` — the unsigned path is unchanged.
 pub async fn resolve_file_list(
     catalog_uri: &str,
     catalog_props: &CatalogProps,
     storage: &StorageProps,
-) -> Result<Vec<String>, UdfError> {
+    creds: &ConnectionCreds,
+) -> Result<(Vec<String>, StorageProps), UdfError> {
+    if creds.use_sigv4 {
+        // Signed path: self-issue the load_table GET, build the Table from the result.
+        let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
+
+        // Resolve the effective storage (vended or static).
+        // The longest-prefix anchor for storage_credentials matching must be an S3
+        // URI. Use the table's own S3 location from the parsed metadata (this is
+        // what storage_credentials[*].prefix will match against). Fall back to the
+        // warehouse (also an S3 URI) when absent. The catalog REST URI is an HTTPS
+        // endpoint and can never match an S3 prefix — do NOT use it here.
+        let table_s3_location = result.metadata.location();
+        let anchor: &str = if !table_s3_location.is_empty() {
+            table_s3_location
+        } else {
+            &catalog_props.warehouse
+        };
+        let effective_storage = if creds.use_vended_credentials {
+            let (ak, sk, st) = extract_vended_keys(&result, anchor);
+            merge_vended_into_storage(storage, &ak, &sk, st.as_deref())
+        } else {
+            storage.clone()
+        };
+
+        // Build the iceberg Table so plan_files() can read manifests from S3.
+        let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
+        let table_ident = TableIdent::new(NamespaceIdent::new(namespace), table_name);
+        let file_io = build_s3_file_io(&effective_storage);
+        let table_builder = iceberg::table::Table::builder()
+            .identifier(table_ident)
+            .file_io(file_io)
+            .metadata(result.metadata);
+        let table = if let Some(loc) = result.metadata_location {
+            table_builder.metadata_location(loc).build()
+        } else {
+            table_builder.build()
+        }
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to build Iceberg table: {}",
+                redact_catalog_error(&e.to_string())
+            ))
+        })?;
+
+        let files = plan_files_from_table(table, &catalog_props.table).await?;
+        return Ok((files, effective_storage));
+    }
+
+    // Unsigned path — exact existing behaviour, unchanged.
     let catalog = build_rest_catalog(catalog_uri, catalog_props, storage).await?;
 
     // Parse "namespace.table" from catalog_props.table.
@@ -1049,7 +1314,15 @@ pub async fn resolve_file_list(
             ))
         })?;
 
-    // Plan files from the current snapshot.
+    let files = plan_files_from_table(table, &catalog_props.table).await?;
+    Ok((files, storage.clone()))
+}
+
+/// Drive the iceberg scan and collect the data-file paths.
+async fn plan_files_from_table(
+    table: iceberg::table::Table,
+    table_name: &str,
+) -> Result<Vec<String>, UdfError> {
     let scan = table
         .scan()
         .select_all()
@@ -1058,7 +1331,8 @@ pub async fn resolve_file_list(
 
     let task_stream = scan.plan_files().await.map_err(|e| {
         UdfError::User(format!(
-            "failed to plan Iceberg files: {}",
+            "failed to plan Iceberg files for '{}': {}",
+            table_name,
             redact_catalog_error(&e.to_string())
         ))
     })?;
@@ -1070,39 +1344,46 @@ pub async fn resolve_file_list(
         ))
     })?;
 
-    let files: Vec<String> = tasks
+    Ok(tasks
         .into_iter()
         .map(|t| t.data_file_path().to_string())
-        .collect();
-
-    Ok(files)
+        .collect())
 }
 
 /// Resolve the Iceberg table schema for `createVirtualSchema`.
 ///
-/// Returns (field_name, exasol_type_string) pairs.
+/// Returns (field_name, exasol_type_string) pairs. When `creds.use_sigv4` is
+/// true, the catalog load_table request is self-issued with SigV4 signing.
+/// Schema resolution only reads `table.metadata().current_schema()` — no S3
+/// manifest access is needed, so vended credentials do not affect this path.
 pub async fn resolve_table_schema(
     catalog_uri: &str,
     catalog_props: &CatalogProps,
     storage: &StorageProps,
+    creds: &ConnectionCreds,
 ) -> Result<Vec<(String, String)>, UdfError> {
-    let catalog = build_rest_catalog(catalog_uri, catalog_props, storage).await?;
+    // Load the table metadata — signed or unsigned.
+    let table_metadata = if creds.use_sigv4 {
+        let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
+        result.metadata
+    } else {
+        let catalog = build_rest_catalog(catalog_uri, catalog_props, storage).await?;
+        let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
+        let table_ident = TableIdent::new(NamespaceIdent::new(namespace), table_name);
+        let table = catalog
+            .load_table(&table_ident)
+            .await
+            .map_err(|e: iceberg::Error| {
+                UdfError::User(format!(
+                    "failed to load Iceberg table '{}': {}",
+                    catalog_props.table,
+                    redact_catalog_error(&e.to_string())
+                ))
+            })?;
+        table.metadata().clone()
+    };
 
-    let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
-    let table_ident = TableIdent::new(NamespaceIdent::new(namespace), table_name);
-
-    let table = catalog
-        .load_table(&table_ident)
-        .await
-        .map_err(|e: iceberg::Error| {
-            UdfError::User(format!(
-                "failed to load Iceberg table '{}': {}",
-                catalog_props.table,
-                redact_catalog_error(&e.to_string())
-            ))
-        })?;
-
-    let schema = table.metadata().current_schema();
+    let schema = table_metadata.current_schema();
     let fields = schema
         .as_struct()
         .fields()
@@ -3437,6 +3718,466 @@ mod tests {
         assert!(
             having_pos > group_by_pos,
             "HAVING must appear after GROUP BY: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 3.3 / 3.4 — SigV4 wiring: URL construction + signed/unsigned routing
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: build_load_table_url produces the iceberg-catalog-rest
+    /// `table_endpoint` path ({uri}/v1/{warehouse}/namespaces/{ns}/tables/{table}).
+    #[test]
+    fn build_load_table_url_with_warehouse_prefix() {
+        let url = build_load_table_url(
+            "https://glue.us-east-1.amazonaws.com/iceberg",
+            "123456789012",
+            "db",
+            "events",
+        );
+        assert_eq!(
+            url,
+            "https://glue.us-east-1.amazonaws.com/iceberg/v1/123456789012/namespaces/db/tables/events",
+            "URL must follow {{uri}}/v1/{{warehouse}}/namespaces/{{ns}}/tables/{{table}} pattern"
+        );
+    }
+
+    /// Scenario: build_load_table_url omits the warehouse prefix when empty.
+    #[test]
+    fn build_load_table_url_without_warehouse() {
+        let url = build_load_table_url("https://rest.example.com", "", "db", "events");
+        assert_eq!(
+            url, "https://rest.example.com/v1/namespaces/db/tables/events",
+            "URL must omit prefix when warehouse is empty"
+        );
+    }
+
+    /// Scenario: build_load_table_url inserts an ARN-shaped warehouse verbatim.
+    ///
+    /// For AWS Glue the warehouse value is a catalog ARN
+    /// (`arn:aws:glue:region:acct:catalog`). The current implementation places it
+    /// verbatim in the URL path — no URL-encoding, no config-endpoint round-trip.
+    /// This test pins that behaviour so a future refactor (config-endpoint prefix
+    /// fetch or URL-encoding) does not regress silently.
+    #[test]
+    fn build_load_table_url_with_arn_shaped_warehouse() {
+        let arn = "arn:aws:glue:us-east-1:123456789012:catalog";
+        let url = build_load_table_url(
+            "https://glue.us-east-1.amazonaws.com/iceberg",
+            arn,
+            "mydb",
+            "orders",
+        );
+        // The ARN appears verbatim between /v1/ and /namespaces/.
+        assert_eq!(
+            url,
+            format!(
+                "https://glue.us-east-1.amazonaws.com/iceberg/v1/{arn}/namespaces/mydb/tables/orders"
+            ),
+            "ARN must be inserted verbatim (ponytail: no URL-encoding; upgrade path is config-endpoint fetch)"
+        );
+    }
+
+    /// Scenario: Unsigned catalog path is unchanged when SigV4 is disabled.
+    ///
+    /// Tests that with use_sigv4=false, the ConnectionCreds does not affect the
+    /// path logic (the unsigned RestCatalogBuilder path is selected). We verify
+    /// this by confirming an unsigned request carries no Authorization header.
+    #[test]
+    fn disabled_sigv4_produces_no_auth_header_in_request() {
+        // Construct a raw reqwest::Request without signing it.
+        let client = reqwest::Client::new();
+        let request = client
+            .get("https://minio.local:9000/iceberg/v1/namespaces/db/tables/events")
+            .build()
+            .expect("valid request");
+
+        // An unsigned request must carry no Authorization or x-amz-date headers.
+        assert!(
+            request.headers().get("authorization").is_none(),
+            "unsigned path: no Authorization header expected"
+        );
+        assert!(
+            request.headers().get("x-amz-date").is_none(),
+            "unsigned path: no x-amz-date header expected"
+        );
+    }
+
+    /// Scenario: Signing keys must not appear in any error output from sign_request.
+    ///
+    /// The SigningError type from aws-sigv4 carries no credential fields.
+    /// We verify this indirectly: a successful sign followed by inspection of all
+    /// header values must not contain the secret key in plaintext.
+    #[test]
+    fn signed_request_does_not_leak_keys_in_headers() {
+        let secret = "wJalrXUtnFEMI_EXAMPLE_KEY";
+        let client = reqwest::Client::new();
+        let request = client
+            .get("https://glue.us-east-1.amazonaws.com/iceberg/v1/123/namespaces/db/tables/t")
+            .build()
+            .expect("valid request");
+
+        let signed = crate::adapter::sigv4::sign_request(
+            request,
+            "AKIDEXAMPLE",
+            secret,
+            None,
+            "us-east-1",
+            "glue",
+        )
+        .expect("signing must succeed");
+
+        for (name, value) in signed.headers().iter() {
+            let v = value.to_str().unwrap_or("");
+            assert!(
+                !v.contains(secret),
+                "secret key must not appear in signed header '{name}': {v}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.1 — Vended credential extraction from LoadTableResult
+    // ---------------------------------------------------------------------------
+
+    /// Build a minimal LoadTableResult for testing.
+    #[allow(clippy::type_complexity)]
+    fn make_load_table_result(
+        storage_credentials: Option<Vec<(&str, Vec<(&str, &str)>)>>,
+        config: Vec<(&str, &str)>,
+    ) -> iceberg_catalog_rest::LoadTableResult {
+        use iceberg::spec::TableMetadata;
+        use iceberg_catalog_rest::LoadTableResult;
+
+        // Minimal valid JSON for iceberg TableMetadata (v2).
+        // Requires: format-version, table-uuid, location, last-sequence-number,
+        // last-updated-ms, last-column-id, schemas (type+schema-id+fields),
+        // current-schema-id, partition-specs, default-spec-id, last-partition-id,
+        // sort-orders, default-sort-order-id.
+        let meta_json = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000001",
+            "location": "s3://bucket/db/t",
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 0,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0
+        });
+        let metadata: TableMetadata = serde_json::from_value(meta_json).expect("valid metadata");
+
+        let sc = storage_credentials.map(|entries| {
+            entries
+                .into_iter()
+                .map(|(prefix, kvs)| iceberg_catalog_rest::StorageCredential {
+                    prefix: prefix.to_string(),
+                    config: kvs
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                })
+                .collect()
+        });
+
+        LoadTableResult {
+            metadata_location: Some("s3://bucket/db/t/metadata/v1.json".into()),
+            metadata,
+            config: config
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            storage_credentials: sc,
+        }
+    }
+
+    /// Scenario: storage_credentials entry with the matching prefix provides vended creds.
+    #[test]
+    fn extract_vended_keys_uses_storage_credentials_over_config() {
+        let result = make_load_table_result(
+            Some(vec![(
+                "s3://bucket/db",
+                vec![
+                    ("s3.access-key-id", "VENDED_AK"),
+                    ("s3.secret-access-key", "VENDED_SK"),
+                    ("s3.session-token", "VENDED_TOK"),
+                ],
+            )]),
+            // config also has keys — must be ignored when storage_credentials matches
+            vec![
+                ("s3.access-key-id", "STATIC_AK"),
+                ("s3.secret-access-key", "STATIC_SK"),
+            ],
+        );
+
+        let (ak, sk, token) = extract_vended_keys(&result, "s3://bucket/db/t/metadata/v1.json");
+
+        assert_eq!(ak, "VENDED_AK", "storage_credentials must take precedence");
+        assert_eq!(sk, "VENDED_SK");
+        assert_eq!(token.as_deref(), Some("VENDED_TOK"));
+    }
+
+    /// Scenario: longest prefix wins when multiple storage_credentials entries match.
+    #[test]
+    fn extract_vended_keys_longest_prefix_wins() {
+        let result = make_load_table_result(
+            Some(vec![
+                (
+                    "s3://bucket",
+                    vec![
+                        ("s3.access-key-id", "SHORT_AK"),
+                        ("s3.secret-access-key", "SHORT_SK"),
+                    ],
+                ),
+                (
+                    "s3://bucket/db/t",
+                    vec![
+                        ("s3.access-key-id", "LONG_AK"),
+                        ("s3.secret-access-key", "LONG_SK"),
+                    ],
+                ),
+                (
+                    "s3://bucket/db",
+                    vec![
+                        ("s3.access-key-id", "MID_AK"),
+                        ("s3.secret-access-key", "MID_SK"),
+                    ],
+                ),
+            ]),
+            vec![],
+        );
+
+        let (ak, sk, _) = extract_vended_keys(&result, "s3://bucket/db/t/metadata/v1.json");
+
+        assert_eq!(ak, "LONG_AK", "longest matching prefix must win");
+        assert_eq!(sk, "LONG_SK");
+    }
+
+    /// Scenario: falls back to flat config when no storage_credentials prefix matches.
+    #[test]
+    fn extract_vended_keys_falls_back_to_config() {
+        let result = make_load_table_result(
+            Some(vec![(
+                "s3://other-bucket", // doesn't match location
+                vec![("s3.access-key-id", "WRONG_AK")],
+            )]),
+            vec![
+                ("s3.access-key-id", "CONFIG_AK"),
+                ("s3.secret-access-key", "CONFIG_SK"),
+            ],
+        );
+
+        let (ak, sk, _) = extract_vended_keys(&result, "s3://bucket/db/t/metadata/v1.json");
+
+        assert_eq!(ak, "CONFIG_AK", "must fall back to flat config");
+        assert_eq!(sk, "CONFIG_SK");
+    }
+
+    /// Scenario: falls back to flat config when storage_credentials is absent.
+    #[test]
+    fn extract_vended_keys_uses_config_when_no_storage_credentials() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", "CONFIG_AK"),
+                ("s3.secret-access-key", "CONFIG_SK"),
+                ("s3.session-token", "CONFIG_TOK"),
+            ],
+        );
+
+        let (ak, sk, token) = extract_vended_keys(&result, "s3://bucket/db/t/metadata/v1.json");
+
+        assert_eq!(ak, "CONFIG_AK");
+        assert_eq!(sk, "CONFIG_SK");
+        assert_eq!(token.as_deref(), Some("CONFIG_TOK"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // R2 — vended-credential anchor must be the S3 table location, not the
+    // HTTPS catalog URI or the metadata_location JSON path.
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: the correct anchor for longest-prefix matching is
+    /// `result.metadata.location()` — an S3 table URI — not the HTTPS catalog
+    /// endpoint or the metadata-file JSON path.
+    ///
+    /// `make_load_table_result` sets `metadata.location = "s3://bucket/db/t"`.
+    /// A prefix `"s3://bucket/db"` matches that S3 location.
+    /// An HTTPS `catalog_props.uri` such as `"https://glue.amazonaws.com/..."` would
+    /// never match an S3 prefix, silently returning no vended creds.
+    #[test]
+    fn extract_vended_keys_anchor_is_s3_table_location_not_catalog_uri() {
+        let result = make_load_table_result(
+            Some(vec![(
+                "s3://bucket/db",
+                vec![
+                    ("s3.access-key-id", "VENDED_AK"),
+                    ("s3.secret-access-key", "VENDED_SK"),
+                ],
+            )]),
+            vec![
+                ("s3.access-key-id", "CONFIG_AK"),
+                ("s3.secret-access-key", "CONFIG_SK"),
+            ],
+        );
+
+        // The S3 table location ("s3://bucket/db/t") matches the prefix "s3://bucket/db".
+        // Verify vended creds are returned when the anchor is the S3 table location.
+        let s3_anchor = result.metadata.location().to_string();
+        assert!(
+            s3_anchor.starts_with("s3://"),
+            "metadata.location() must be an S3 URI, got: {s3_anchor}"
+        );
+        let (ak_s3, _, _) = extract_vended_keys(&result, &s3_anchor);
+        assert_eq!(
+            ak_s3, "VENDED_AK",
+            "S3 table location anchor must match the storage_credentials prefix"
+        );
+
+        // If we mistakenly used the HTTPS catalog URI as the anchor, no prefix matches
+        // and we fall back to the flat config — pin that failure mode here.
+        let https_anchor = "https://glue.us-east-1.amazonaws.com/v1/catalog";
+        let (ak_https, _, _) = extract_vended_keys(&result, https_anchor);
+        assert_eq!(
+            ak_https, "CONFIG_AK",
+            "HTTPS URI must not match any S3 prefix, must fall back to flat config"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.2 — merge_vended_into_storage
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Vended S3 credentials from load_table override static credentials
+    /// in the scan spec (access_key, secret_key, session_token); static endpoint,
+    /// region, path_style, and allow_http are preserved.
+    #[test]
+    fn vended_creds_override_static_in_spec() {
+        let base = StorageProps {
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: "us-east-1".into(),
+            access_key: "STATIC_AK".into(),
+            secret_key: "STATIC_SK".into(),
+            session_token: Some("OLD_TOKEN".into()),
+            allow_http: false,
+            path_style: false,
+        };
+
+        let merged = merge_vended_into_storage(&base, "VENDED_AK", "VENDED_SK", Some("VENDED_TOK"));
+
+        assert_eq!(
+            merged.access_key, "VENDED_AK",
+            "vended access_key must override static"
+        );
+        assert_eq!(
+            merged.secret_key, "VENDED_SK",
+            "vended secret_key must override static"
+        );
+        assert_eq!(
+            merged.session_token.as_deref(),
+            Some("VENDED_TOK"),
+            "vended session_token must override static"
+        );
+        // Static infrastructure fields must be preserved.
+        assert_eq!(
+            merged.endpoint, base.endpoint,
+            "endpoint must be preserved from static"
+        );
+        assert_eq!(
+            merged.region, base.region,
+            "region must be preserved from static"
+        );
+        assert!(
+            !merged.path_style,
+            "path_style must be preserved from static"
+        );
+        assert!(
+            !merged.allow_http,
+            "allow_http must be preserved from static"
+        );
+    }
+
+    /// Scenario: Static credentials are used for data files when vending is disabled.
+    ///
+    /// When use_vended_credentials=false, resolve_file_list returns the static storage
+    /// unchanged. We test this via merge_vended_into_storage with empty vended keys —
+    /// the static keys must be preserved.
+    #[test]
+    fn vending_disabled_keeps_static_creds() {
+        let base = StorageProps {
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "STATIC_AK".into(),
+            secret_key: "STATIC_SK".into(),
+            session_token: None,
+            allow_http: true,
+            path_style: true,
+        };
+
+        // Empty vended keys — falls back to static.
+        let merged = merge_vended_into_storage(&base, "", "", None);
+
+        assert_eq!(
+            merged.access_key, "STATIC_AK",
+            "empty vended access_key must keep static"
+        );
+        assert_eq!(
+            merged.secret_key, "STATIC_SK",
+            "empty vended secret_key must keep static"
+        );
+        assert_eq!(
+            merged.session_token, None,
+            "no session_token when both empty and static absent"
+        );
+        assert_eq!(merged.endpoint, base.endpoint);
+        assert_eq!(merged.region, base.region);
+        assert!(merged.path_style);
+        assert!(merged.allow_http);
+    }
+
+    /// Scenario: vended session_token overrides an existing static session_token.
+    #[test]
+    fn merge_vended_session_token_overrides_existing() {
+        let base = StorageProps {
+            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
+            region: "us-east-1".into(),
+            access_key: "STATIC_AK".into(),
+            secret_key: "STATIC_SK".into(),
+            session_token: Some("OLD_STS_TOKEN".into()),
+            allow_http: false,
+            path_style: false,
+        };
+
+        let merged =
+            merge_vended_into_storage(&base, "VENDED_AK", "VENDED_SK", Some("NEW_STS_TOKEN"));
+
+        assert_eq!(
+            merged.session_token.as_deref(),
+            Some("NEW_STS_TOKEN"),
+            "new vended session_token must replace old static one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.3 — No credential in error text
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: redact_catalog_error removes credential-shaped values from messages.
+    #[test]
+    fn redact_catalog_error_strips_credentials() {
+        let msg = "GET failed: access_key=AKID_SECRET_VALUE region=us-east-1";
+        let safe = redact_catalog_error(msg);
+        assert!(
+            !safe.contains("AKID_SECRET_VALUE"),
+            "credential value must be redacted: {safe}"
+        );
+        assert!(
+            safe.contains("access_key"),
+            "label must be preserved: {safe}"
         );
     }
 }

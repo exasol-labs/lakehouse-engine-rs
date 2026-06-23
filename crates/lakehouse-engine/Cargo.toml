@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [lib]
@@ -11,10 +11,14 @@ crate-type = ["cdylib", "rlib"]
 # feature. Test code enabled by this feature must FAIL (not skip) when the stack
 # is unreachable.
 exasol-e2e = []
+# Gate cloud E2E tests (require real AWS Glue + Exasol cluster) behind this
+# feature. Test code enabled by this feature SKIPS (never fails) when the
+# required environment variables are absent — the opposite of exasol-e2e.
+cloud-e2e = []
 
 [dependencies]
-exasol-udf-sdk    = { version = "0.14.0", features = ["connect-back"] }
-exasol-udf-macros = { version = "0.14.0" }
+exasol-udf-sdk    = { version = "0.16.0", features = ["connect-back"] }
+exasol-udf-macros = { version = "0.16.0" }
 
 vs-expression = { path = "../vs-expression" }
 
@@ -37,6 +41,21 @@ anyhow     = { workspace = true }
 chrono  = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
+
+# SigV4 signing for Glue REST catalog requests (engine-only: not used by vs-expression).
+# MSRV 1.91.1 — compatible with rustc 1.92 that builds the UDF .so.
+aws-sigv4             = { version = "1.4", default-features = true }
+aws-credential-types  = { version = "1.2" }
+# aws-smithy-runtime-api is a direct dependency of aws-sigv4 (for Identity); we declare
+# it explicitly so the `use aws_smithy_runtime_api::client::identity::Identity` import
+# in sigv4.rs resolves without relying on transitive re-export.
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+
+# Async reqwest client for the self-issued signed load_table GET (task 4.1).
+# Intentionally async (no "blocking" feature): the adapter's handle_pushdown_request runs
+# inside rt.block_on(async { ... }), so a blocking reqwest call would panic at runtime.
+# The dev-dependency reqwest uses "blocking" only for the test harness; that is independent.
+reqwest = { version = "0.12" }
 
 [dev-dependencies]
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
