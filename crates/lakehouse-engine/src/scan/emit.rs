@@ -72,31 +72,54 @@ pub fn redact_secret_values(s: &str, secrets: &[&str]) -> String {
 
 /// Replace credential-shaped substrings with "[REDACTED]".
 ///
-/// Catches common S3 credential patterns without pulling in a regex crate.
+/// Catches common S3 credential patterns, SigV4 Authorization headers, and
+/// vended STS keys without pulling in a regex crate.
 pub fn redact_credentials(s: &str) -> String {
     // Heuristic: anything that looks like an AWS key (long alphanum after
     // known key names) is replaced. We keep this simple and conservative.
     let patterns = [
+        // S3 credential field names (static and vended)
         "access_key",
         "secret_key",
         "session_token",
+        // Iceberg REST vended credential config keys
+        "s3.access-key-id",
+        "s3.secret-access-key",
+        "s3.session-token",
+        // SigV4 / HTTP header patterns
+        "Authorization",
+        "Bearer ",
         "X-Amz-Security-Token",
         "X-Amz-Credential",
+        // AWS environment variable names
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
     ];
+    const REDACTED: &str = "[REDACTED]";
     let mut result = s.to_string();
     for pat in patterns {
-        // Redact anything after the pattern up to the next quote/space/comma.
-        if let Some(idx) = result.to_lowercase().find(&pat.to_lowercase()) {
+        // Redact ALL occurrences of the pattern, not just the first.
+        // A single label that appears multiple times in one error string (e.g.
+        // a debug dump that prints every header) would otherwise leak on the
+        // 2nd+ occurrence if we stopped after the first match. The cursor
+        // advances past each redaction so the re-emitted label is never
+        // re-matched (which would loop forever).
+        let pat_lower = pat.to_lowercase();
+        let mut from = 0;
+        while let Some(rel) = result[from..].to_lowercase().find(&pat_lower) {
+            let idx = from + rel;
             let after = idx + pat.len();
-            // Find the end of the value (next quote, whitespace, comma, or ampersand)
+            // Find the end of the value (next quote, whitespace, comma, or ampersand).
             let end = result[after..]
                 .find(['"', '\'', ' ', '\n', ',', '&', '\r'])
                 .map(|i| after + i)
                 .unwrap_or(result.len());
-            result = format!("{}{}[REDACTED]{}", &result[..idx], pat, &result[end..]);
+            result = format!("{}{}{REDACTED}{}", &result[..idx], pat, &result[end..]);
+            from = after + REDACTED.len();
+            if from >= result.len() {
+                break;
+            }
         }
     }
     result
@@ -283,5 +306,95 @@ mod tests {
         for (i, row) in ctx.rows.iter().enumerate() {
             assert_eq!(row[0], Value::Int32((i as i32) + 1));
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.4 — Extended redaction: bearer token + SigV4 Authorization + vended STS
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Authorization header value (SigV4) is redacted from error messages.
+    #[test]
+    fn redact_credentials_strips_authorization_header() {
+        let auth_value = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231201/us-east-1/glue/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
+        let msg = format!("request failed: Authorization={auth_value}");
+        let safe = redact_credentials(&msg);
+        assert!(
+            !safe.contains(auth_value),
+            "Authorization value must be redacted: {safe}"
+        );
+        assert!(
+            safe.contains("Authorization"),
+            "Authorization label must be preserved: {safe}"
+        );
+    }
+
+    /// Scenario: Bearer token is redacted from error messages.
+    #[test]
+    fn redact_credentials_strips_bearer_token() {
+        let msg = "catalog error: Bearer my-secret-oauth-token-value";
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("my-secret-oauth-token-value"),
+            "Bearer token must be redacted: {safe}"
+        );
+    }
+
+    /// Scenario: Vended STS keys (Iceberg config map keys) are redacted.
+    #[test]
+    fn redact_credentials_strips_vended_sts_keys() {
+        let msg = r#"s3.access-key-id=VENDED_AKID s3.secret-access-key=VENDED_SK s3.session-token=VENDED_TOK"#;
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("VENDED_AKID"),
+            "vended access key must be redacted: {safe}"
+        );
+        assert!(
+            !safe.contains("VENDED_SK"),
+            "vended secret key must be redacted: {safe}"
+        );
+        assert!(
+            !safe.contains("VENDED_TOK"),
+            "vended session token must be redacted: {safe}"
+        );
+        // Labels must be preserved so the error is still readable.
+        assert!(
+            safe.contains("s3.access-key-id"),
+            "label must be preserved: {safe}"
+        );
+    }
+
+    /// Scenario: A label that appears MORE than once in the same error string is
+    /// fully redacted on every occurrence — not just the first.
+    ///
+    /// Without the `while let` loop the second `access_key` would remain visible.
+    #[test]
+    fn redact_credentials_redacts_all_occurrences_of_repeated_label() {
+        // Two occurrences of "access_key" with distinct values — both must vanish.
+        let msg = "access_key=FIRST_KEY_VALUE, access_key=SECOND_KEY_VALUE";
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("FIRST_KEY_VALUE"),
+            "first occurrence must be redacted: {safe}"
+        );
+        assert!(
+            !safe.contains("SECOND_KEY_VALUE"),
+            "second occurrence must be redacted: {safe}"
+        );
+        // Labels themselves should still be visible so the error is readable.
+        assert!(
+            safe.contains("access_key"),
+            "label must be preserved: {safe}"
+        );
+    }
+
+    /// Scenario: X-Amz-Security-Token (vended session token header) is redacted.
+    #[test]
+    fn redact_credentials_strips_x_amz_security_token() {
+        let msg = "X-Amz-Security-Token=AQoDYXdzEJr_STS_TOKEN_VALUE (403)";
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("AQoDYXdzEJr_STS_TOKEN_VALUE"),
+            "security token value must be redacted: {safe}"
+        );
     }
 }

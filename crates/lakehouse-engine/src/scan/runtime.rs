@@ -10,12 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 0.6 × limit — leaves headroom below the engine's 80% concurrency-stall threshold.
-const MEMORY_FRACTION: f64 = 0.6;
+pub(crate) const MEMORY_FRACTION: f64 = 0.6;
 
 /// Conservative default pool budget when the per-instance limit is unknown (0 sentinel).
 /// 1 GiB keeps a single shard comfortable without risking OOM on a low-memory node.
-// ponytail: raise budget once ctx.memory_limit() is wired
-const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Whether `/tmp` is usable as a spill directory.
 #[derive(Debug, Clone)]
@@ -42,7 +41,6 @@ pub enum SpillMode {
 ///    of write-readiness.
 ///
 /// Returns `Disk(PathBuf::from("/tmp"))` or `NoDisk`.
-// ponytail: ceiling is the write-probe succeeding; no statvfs libc dep added.
 // Spill is opportunistic — if the probe fails or the mounts file is unreadable
 // we conservatively return NoDisk rather than risk surprises.
 pub fn probe_tmp_spill() -> SpillMode {
