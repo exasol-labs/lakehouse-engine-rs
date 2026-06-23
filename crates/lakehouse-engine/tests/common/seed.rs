@@ -102,12 +102,12 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     let table_ident = TableIdent::new(ns.clone(), E2E_TABLE.to_string());
 
     // Short-circuit if already seeded.
-    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await? {
-        if !paths.is_empty() {
-            return Ok(SeedHandle {
-                data_file_paths: paths,
-            });
-        }
+    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
+        && !paths.is_empty()
+    {
+        return Ok(SeedHandle {
+            data_file_paths: paths,
+        });
     }
 
     // Create namespace if missing.
