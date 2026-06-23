@@ -1,5 +1,5 @@
 //! Stack readiness helpers and environment accessors for lakehouse-engine E2E tests.
-#![cfg(feature = "exasol-e2e")]
+#![cfg(any(feature = "exasol-e2e", feature = "cloud-e2e"))]
 
 use std::time::{Duration, Instant};
 
@@ -229,6 +229,7 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
 }
 
 /// Path (host-side) of the compiled lakehouse-engine .so.
+#[cfg(feature = "exasol-e2e")]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -238,4 +239,88 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
         .and_then(|p| p.parent())
         .expect("could not navigate to workspace root from CARGO_MANIFEST_DIR")
         .join("target/release/liblakehouse_engine.so")
+}
+
+// ---------------------------------------------------------------------------
+// CONNECTION credential helpers (shared by local-E2E and cloud-E2E)
+// ---------------------------------------------------------------------------
+
+/// Build the JSON password string for a catalog CONNECTION object.
+///
+/// The resulting string is suitable for use in:
+///   `CREATE OR REPLACE CONNECTION <name> TO '<uri>' USER '' IDENTIFIED BY '<json>'`
+///
+/// All boolean flags default to `false`; `path_style` defaults to `true`.
+pub struct CatalogConnectionPassword {
+    pub warehouse: String,
+    pub endpoint: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub path_style: bool,
+    pub use_sigv4: bool,
+    pub use_vended_credentials: bool,
+}
+
+impl CatalogConnectionPassword {
+    /// Serialize to a JSON string suitable for the CONNECTION `IDENTIFIED BY` clause.
+    ///
+    /// Single quotes within the value are escaped as `''` for SQL embedding.
+    pub fn to_sql_password_json(&self) -> String {
+        let mut obj = serde_json::json!({
+            "warehouse": self.warehouse,
+            "endpoint": self.endpoint,
+            "region": self.region,
+            "access_key": self.access_key,
+            "secret_key": self.secret_key,
+            "path_style": self.path_style,
+            "use_sigv4": self.use_sigv4,
+            "use_vended_credentials": self.use_vended_credentials,
+        });
+        if let Some(token) = &self.session_token {
+            obj["session_token"] = serde_json::Value::String(token.clone());
+        }
+        // Escape single quotes for safe SQL embedding (SQL string literal).
+        obj.to_string().replace('\'', "''")
+    }
+}
+
+/// Build the `CREATE OR REPLACE CONNECTION` SQL statement for a catalog connection.
+///
+/// `conn_name`: the Exasol CONNECTION object name (bare, no quoting)
+/// `catalog_uri`: the Iceberg REST catalog address (goes into CONNECTION address)
+/// `password`: credential parameters for the JSON password
+pub fn build_create_connection_sql(
+    conn_name: &str,
+    catalog_uri: &str,
+    password: &CatalogConnectionPassword,
+) -> String {
+    let json_pw = password.to_sql_password_json();
+    // catalog_uri goes into TO '...' — escape any single quotes in it too.
+    let safe_uri = catalog_uri.replace('\'', "''");
+    format!(
+        "CREATE OR REPLACE CONNECTION {conn_name} TO '{safe_uri}' USER '' IDENTIFIED BY '{json_pw}'"
+    )
+}
+
+/// Build and return the `CatalogConnectionPassword` for the local Docker stack
+/// (MinIO + Iceberg REST catalog, internal Docker network addresses).
+///
+/// Uses the same internal URLs that `create_virtual_schema` uses for
+/// CATALOG_URI / S3_ENDPOINT — these are the addresses reachable from
+/// inside the Exasol UDF container.
+#[cfg(feature = "exasol-e2e")]
+pub fn local_stack_connection_password() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        endpoint: minio_url_internal(),
+        region: "us-east-1".to_string(),
+        access_key: "minioadmin".to_string(),
+        secret_key: "minioadmin".to_string(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+    }
 }

@@ -3,7 +3,6 @@
 //! Mirrors strata-rs/tests/common/exasol_ws.rs but is self-contained.
 //! Implements just enough of the Exasol WebSocket API v3 to authenticate,
 //! execute SQL, and fetch scalar / multi-row results.
-#![cfg(feature = "exasol-e2e")]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use native_tls::TlsConnector;

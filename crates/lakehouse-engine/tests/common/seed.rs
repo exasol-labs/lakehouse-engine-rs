@@ -15,7 +15,6 @@
 //!
 //! Table: e2e_lakehouse.events (namespace=e2e_lakehouse, table=events)
 //! Rows: 20 deterministic rows so LIMIT 5 and WHERE score > 15.0 are both testable.
-#![cfg(feature = "exasol-e2e")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
