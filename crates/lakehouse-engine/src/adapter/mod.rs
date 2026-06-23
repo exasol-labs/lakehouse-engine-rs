@@ -3,10 +3,14 @@
 ///
 /// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
 pub mod capabilities;
+pub mod connection;
 pub mod pushdown;
 pub mod sharding;
+pub mod sigv4;
 
 use crate::adapter::capabilities::get_capabilities_response;
+use crate::adapter::connection::ConnectionCreds;
+use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
 use crate::scan::spec::{CatalogProps, StorageProps};
 use exasol_udf_sdk::context::UdfContext;
@@ -14,16 +18,13 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::{Value as Json, json};
 
 // Property key names sent in VS request `properties` / `schemaMetadataInfo.properties`.
-const PROP_CATALOG_URI: &str = "CATALOG_URI";
-const PROP_WAREHOUSE: &str = "WAREHOUSE";
 // `TABLE` is an Exasol reserved keyword and cannot be used as a bare VS property
 // name in CREATE VIRTUAL SCHEMA, so the property is named TABLE_NAME.
 const PROP_TABLE: &str = "TABLE_NAME";
-const PROP_S3_ENDPOINT: &str = "S3_ENDPOINT";
-const PROP_S3_REGION: &str = "S3_REGION";
-const PROP_ACCESS_KEY: &str = "ACCESS_KEY";
-const PROP_SECRET_KEY: &str = "SECRET_KEY";
-const PROP_SESSION_TOKEN: &str = "SESSION_TOKEN";
+// Required: name of the Exasol CONNECTION object that holds the catalog URI
+// (as its address) and the credential JSON (as its password).
+const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
+// Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 // Schema that holds the LAKEHOUSE_SCAN SET script. The pushdown SQL must
 // reference the scan UDF schema-qualified, because it executes outside the
@@ -74,11 +75,20 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
+            // Resolve credentials synchronously before entering the async runtime.
+            // ctx.connection() is a synchronous call that must not be invoked inside
+            // an async context (it may block on the UDF host). Mirror the pattern
+            // used by resolve_cluster_nodes.
+            let props = get_properties(request);
+            let (catalog_uri, storage, catalog, creds) = resolve_connection_config(ctx, &props)?;
+
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
-            rt.block_on(async { handle_pushdown_request(request).await })
+            rt.block_on(async {
+                handle_pushdown_request(request, &catalog_uri, &storage, &catalog, &creds).await
+            })
         }
         other => Err(UdfError::User(format!(
             "unsupported VS request type: {}",
@@ -87,12 +97,32 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     }
 }
 
+/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION`
+/// object and the `TABLE_NAME` property. Shared by the createVirtualSchema and
+/// pushdown entry points. `ctx.connection()` is synchronous and must be called
+/// before entering any async runtime.
+fn resolve_connection_config(
+    ctx: &dyn UdfContext,
+    props: &Json,
+) -> Result<(String, StorageProps, CatalogProps, ConnectionCreds), UdfError> {
+    let resolved = read_connection(ctx, str_prop(props, PROP_CATALOG_CONNECTION))?;
+    let mut storage = storage_block(&resolved.creds);
+    let table = str_prop(props, PROP_TABLE)
+        .ok_or_else(|| UdfError::User(format!("property '{PROP_TABLE}' is required")))?
+        .to_string();
+    let catalog = catalog_block(&resolved.creds, &resolved.uri, &table);
+    storage.allow_http = str_prop(props, PROP_ALLOW_HTTP)
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    Ok((resolved.uri, storage, catalog, resolved.creds))
+}
+
 fn handle_create_virtual_schema(
     ctx: &mut dyn UdfContext,
     request: &Json,
 ) -> Result<Json, UdfError> {
     let props = get_properties(request);
-    let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
+    let (catalog_uri, storage, catalog, creds) = resolve_connection_config(ctx, &props)?;
 
     let cluster_nodes = resolve_cluster_nodes(ctx, &props);
     let parallelism_factor = resolve_parallelism_factor(&props);
@@ -103,7 +133,7 @@ fn handle_create_virtual_schema(
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
     let fields: Vec<(String, String)> = rt
-        .block_on(async { resolve_table_schema(&catalog_uri, &catalog, &storage).await })
+        .block_on(async { resolve_table_schema(&catalog_uri, &catalog, &storage, &creds).await })
         .map_err(|e| redact_error(&storage, e))?;
 
     // Build the virtual table columns JSON.
@@ -149,9 +179,14 @@ fn handle_create_virtual_schema(
     }))
 }
 
-async fn handle_pushdown_request(request: &Json) -> Result<Json, UdfError> {
+async fn handle_pushdown_request(
+    request: &Json,
+    catalog_uri: &str,
+    storage: &StorageProps,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+) -> Result<Json, UdfError> {
     let props = get_properties(request);
-    let (catalog_uri, storage, catalog) = extract_connection_props(&props)?;
     let scan_schema = str_prop(&props, PROP_SCAN_SCHEMA).map(|s| s.to_string());
     // CLUSTER_NODES and PARALLELISM_FACTOR are carried in adapterNotes (persisted
     // by Exasol), NOT in properties (dropped by Exasol). Read them from
@@ -166,15 +201,16 @@ async fn handle_pushdown_request(request: &Json) -> Result<Json, UdfError> {
         .unwrap_or(DEFAULT_PARALLELISM_FACTOR);
     handle_pushdown(
         request,
-        &catalog_uri,
-        &storage,
-        &catalog,
+        catalog_uri,
+        storage,
+        catalog,
         scan_schema.as_deref(),
         cluster_nodes,
         parallelism_factor,
+        creds,
     )
     .await
-    .map_err(|e| redact_error(&storage, e))
+    .map_err(|e| redact_error(storage, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -255,53 +291,6 @@ fn resolve_parallelism_factor(props: &Json) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_PARALLELISM_FACTOR)
-}
-
-/// Extract catalog URI, StorageProps, and CatalogProps from the VS properties.
-/// Returns credential-safe errors.
-fn extract_connection_props(
-    props: &Json,
-) -> Result<(String, StorageProps, CatalogProps), UdfError> {
-    let catalog_uri = str_prop(props, PROP_CATALOG_URI)
-        .ok_or_else(|| {
-            UdfError::User(format!(
-                "property '{PROP_CATALOG_URI}' is required (the Iceberg REST catalog endpoint)"
-            ))
-        })?
-        .to_string();
-
-    let warehouse = str_prop(props, PROP_WAREHOUSE)
-        .ok_or_else(|| UdfError::User(format!("property '{PROP_WAREHOUSE}' is required")))?
-        .to_string();
-
-    let table = str_prop(props, PROP_TABLE)
-        .ok_or_else(|| UdfError::User(format!("property '{PROP_TABLE}' is required")))?
-        .to_string();
-
-    let access_key = str_prop(props, PROP_ACCESS_KEY).unwrap_or("").to_string();
-    let secret_key = str_prop(props, PROP_SECRET_KEY).unwrap_or("").to_string();
-
-    let storage = StorageProps {
-        endpoint: str_prop(props, PROP_S3_ENDPOINT).unwrap_or("").to_string(),
-        region: str_prop(props, PROP_S3_REGION)
-            .unwrap_or("us-east-1")
-            .to_string(),
-        access_key,
-        secret_key,
-        session_token: str_prop(props, PROP_SESSION_TOKEN).map(|s| s.to_string()),
-        allow_http: str_prop(props, PROP_ALLOW_HTTP)
-            .map(|s| s.eq_ignore_ascii_case("true"))
-            .unwrap_or(true),
-        path_style: true, // MinIO requires path-style access.
-    };
-
-    let catalog = CatalogProps {
-        uri: catalog_uri.clone(),
-        warehouse,
-        table,
-    };
-
-    Ok((catalog_uri, storage, catalog))
 }
 
 /// Open a connect-back session and run `SELECT NPROC()` to obtain the active

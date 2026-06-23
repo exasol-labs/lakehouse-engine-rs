@@ -8,7 +8,7 @@
 //!
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
-//! 2. Install SLC 0.14.0 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
+//! 2. Install SLC 0.16.0 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
 //! 3. Create the LAKEHOUSE_ADAPTER script and LAKEHOUSE_SCAN script.
 //! 4. Create the LHVS Virtual Schema over the seeded table.
 //!
@@ -20,9 +20,10 @@ mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{E2E_QUALIFIED_TABLE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, seed_events};
 use common::stack::{
-    bucketfs_port, bucketfs_write_password, exasol_host, exasol_sql_port, iceberg_catalog_url,
-    iceberg_catalog_url_internal, lakehouse_engine_so_path, minio_url_internal, upload_to_bucketfs,
-    wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
+    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
+    local_stack_connection_password, minio_url_internal, upload_to_bucketfs, wait_for_exasol,
+    wait_for_iceberg_catalog, wait_for_minio,
 };
 
 use std::sync::OnceLock;
@@ -44,8 +45,10 @@ const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_en
 /// BucketFS path for the SLC tarball.
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
 /// SLC version we link against.
-const SLC_VERSION: &str = "0.14.0";
-/// Language alias for our SLC 0.14.0. This Exasol is dedicated to lakehouse-engine
+const SLC_VERSION: &str = "0.16.0";
+/// Name of the Exasol CONNECTION carrying catalog + storage credentials.
+const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
+/// Language alias for our SLC. This Exasol is dedicated to lakehouse-engine
 /// (the sibling strata-rs stack is stopped), so we register the canonical RUST
 /// alias cleanly rather than coexisting with a foreign RUST= entry.
 const LANG_ALIAS: &str = "RUST";
@@ -75,8 +78,8 @@ fn setup_e2e() {
                 .expect("seed Iceberg events table")
         });
 
-        // 3. Install SLC 0.14.0 (download + upload + ALTER SYSTEM).
-        install_slc_0_14();
+        // 3. Install SLC 0.16.0 (download + upload + ALTER SYSTEM).
+        install_slc();
 
         // 4. Upload the .so to BucketFS.
         let so_path = lakehouse_engine_so_path();
@@ -89,8 +92,8 @@ fn setup_e2e() {
     });
 }
 
-/// Install SLC 0.14.0 for the LHRUST language alias.
-fn install_slc_0_14() {
+/// Install SLC 0.16.0 for the LHRUST language alias.
+fn install_slc() {
     // Download the SLC tarball.
     let slc_url = format!(
         "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
@@ -130,7 +133,7 @@ fn install_slc_0_14() {
     );
 
     // Register the RUST language alias, replacing any existing RUST= entry so
-    // the alias points at our freshly-uploaded 0.14.0 SLC. This Exasol is
+    // the alias points at our freshly-uploaded 0.16.0 SLC. This Exasol is
     // dedicated to lakehouse-engine, so a clean replacement is correct.
     let mut conn = exa_conn();
     let rust_def = format!(
@@ -195,27 +198,27 @@ EMITS (...) AS
 
 /// Create the Virtual Schema pointing at the seeded Iceberg table.
 ///
+/// Credentials are stored in an Exasol CONNECTION (CATALOG_CONN_NAME) whose
+/// address is the catalog URI and whose password is a JSON credential object.
 /// VS properties use docker-network-internal URLs because the adapter UDF
 /// runs inside the Exasol container and must reach services by hostname.
 fn create_virtual_schema(conn: &mut ExaConn) {
+    // Create the catalog CONNECTION first (idempotent: CREATE OR REPLACE).
+    let password = local_stack_connection_password();
+    let catalog_uri = iceberg_catalog_url_internal();
+    let create_conn_sql = build_create_connection_sql(CATALOG_CONN_NAME, &catalog_uri, &password);
+    conn.execute(&create_conn_sql);
+
     // Drop the VS first (idempotent).
     let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
-
-    let catalog_uri = iceberg_catalog_url_internal();
-    let s3_endpoint = minio_url_internal();
 
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_URI   = '{catalog_uri}'
-  WAREHOUSE     = 's3://warehouse/'
-  TABLE_NAME    = '{E2E_QUALIFIED_TABLE}'
-  SCAN_SCHEMA   = '{SCHEMA_NAME}'
-  S3_ENDPOINT   = '{s3_endpoint}'
-  S3_REGION     = 'us-east-1'
-  ACCESS_KEY    = 'minioadmin'
-  SECRET_KEY    = 'minioadmin'
-  ALLOW_HTTP    = 'true'"#
+  CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
+  TABLE_NAME         = '{E2E_QUALIFIED_TABLE}'
+  SCAN_SCHEMA        = '{SCHEMA_NAME}'
+  ALLOW_HTTP         = 'true'"#
     ));
 }
 
@@ -450,22 +453,38 @@ fn mixed_column_parquet_round_trips() {
 }
 
 /// Error scenario: CREATE VS with unreachable catalog returns a clear error without secrets.
+///
+/// The secret value lives in the CONNECTION password JSON (not in the SQL).
+/// The test asserts the error message does not contain the credential values.
 #[test]
 fn create_vs_unreachable_catalog_errors_no_secret() {
     setup_e2e();
     let mut conn = exa_conn();
 
+    // Create a CONNECTION with a bogus catalog URI and bogus credentials.
+    // The credential values must not appear in any error message.
+    let bogus_password = common::stack::CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        endpoint: "http://does-not-exist.invalid:9000".to_string(),
+        region: "us-east-1".to_string(),
+        access_key: "SUPER_SECRET_KEY".to_string(),
+        secret_key: "SUPER_SECRET_VALUE".to_string(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+    };
+    let bogus_uri = "http://does-not-exist.invalid:8181";
+    let create_conn_sql =
+        build_create_connection_sql("BAD_CATALOG_CREDS", bogus_uri, &bogus_password);
+    conn.execute(&create_conn_sql);
+
     let resp = conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_URI = 'http://does-not-exist.invalid:8181'
-  WAREHOUSE   = 's3://warehouse/'
-  TABLE_NAME  = 'ns.table'
-  S3_ENDPOINT = 'http://does-not-exist.invalid:9000'
-  S3_REGION   = 'us-east-1'
-  ACCESS_KEY  = 'SUPER_SECRET_KEY'
-  SECRET_KEY  = 'SUPER_SECRET_VALUE'
-  ALLOW_HTTP  = 'true'"#
+  CATALOG_CONNECTION = 'BAD_CATALOG_CREDS'
+  TABLE_NAME         = 'ns.table'
+  ALLOW_HTTP         = 'true'"#
     ));
     assert_eq!(
         resp["status"].as_str(),
@@ -485,21 +504,31 @@ fn scan_unreadable_file_errors_no_secret() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Drop and recreate a VS pointing at a non-existent file path.
-    // We do this by using a table name that doesn't exist in the catalog.
+    // Create a CONNECTION with the local stack credentials but a bad secret key,
+    // then point the VS at a non-existent table.
+    let bad_password = common::stack::CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        endpoint: minio_url_internal(),
+        region: "us-east-1".to_string(),
+        access_key: "minioadmin".to_string(),
+        secret_key: "topsecretvalue".to_string(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+    };
+    let catalog_uri = iceberg_catalog_url_internal();
+    let create_conn_sql =
+        build_create_connection_sql("BAD_TABLE_CREDS", &catalog_uri, &bad_password);
+    conn.execute(&create_conn_sql);
+
+    // Drop and recreate a VS pointing at a non-existent table name.
     let resp = conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA BAD_TABLE_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_URI = '{}'
-  WAREHOUSE   = 's3://warehouse/'
-  TABLE_NAME  = 'e2e_lakehouse.no_such_table'
-  S3_ENDPOINT = '{}'
-  S3_REGION   = 'us-east-1'
-  ACCESS_KEY  = 'minioadmin'
-  SECRET_KEY  = 'topsecretvalue'
-  ALLOW_HTTP  = 'true'"#,
-        iceberg_catalog_url_internal(),
-        minio_url_internal()
+  CATALOG_CONNECTION = 'BAD_TABLE_CREDS'
+  TABLE_NAME         = 'e2e_lakehouse.no_such_table'
+  ALLOW_HTTP         = 'true'"#
     ));
     assert_eq!(
         resp["status"].as_str(),

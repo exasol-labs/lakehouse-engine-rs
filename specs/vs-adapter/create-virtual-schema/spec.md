@@ -1,14 +1,18 @@
 # Feature: Create Virtual Schema
 
 Lets an Exasol user register an Iceberg table (resolved through an Iceberg REST
-catalog over S3-compatible storage) as a queryable virtual schema, so the table's
-columns appear to Exasol with correctly mapped SQL types, and records — in the
-response `adapterNotes` — both the cluster's active node count (via `NPROC()`) and
-a parallelism factor, so later pushdowns can size the oversubscribed work-unit
-shard count.
+catalog over S3-compatible storage, including AWS Glue with SigV4-signed requests)
+as a queryable virtual schema, so the table's columns appear to Exasol with correctly
+mapped SQL types, and records — in the response `adapterNotes` — both the cluster's
+active node count (via `NPROC()`) and a parallelism factor, so later pushdowns can
+size the oversubscribed work-unit shard count.
 
 ## Background
 
+* Catalog endpoint and storage credentials are supplied through a CONNECTION object
+  named by `CATALOG_CONNECTION`. The adapter resolves credentials via `ctx.connection`
+  and never persists catalog metadata between requests.
+* Credentials MUST NOT appear in any returned response or error message.
 * The adapter holds no state between requests; cluster information is resolved per
   request and returned in the `createVirtualSchema` response's `adapterNotes`
   (stringified JSON), which Exasol persists and round-trips back at pushdown time.
@@ -19,9 +23,6 @@ shard count.
   `CLUSTER_NODES`.
 * The parallelism factor is supplied as a VS/connection property and recorded
   alongside `CLUSTER_NODES`.
-* Credentials MUST NOT appear in any error message or returned property.
-* The Iceberg REST catalog and the S3-compatible object store (MinIO) are reachable
-  from the adapter via connection properties supplied at `CREATE VIRTUAL SCHEMA` time.
 * The adapter is the Rust ADAPTER SCRIPT entry point of a single `.so`; it speaks the
   Exasol virtual-schema JSON protocol (request in, JSON response out).
 * Schema mapping (C.2) MUST use the same mapping as the scan, defined in the
@@ -42,19 +43,19 @@ shard count.
 
 ### Scenario: Create virtual schema maps the Iceberg table schema
 
-* *GIVEN* an Iceberg table exists in the REST catalog backed by MinIO
-* *AND* the catalog and storage connection properties are supplied to the adapter
+* *GIVEN* an Iceberg table exists in the REST catalog
+* *AND* the catalog endpoint and storage credentials are supplied through the CONNECTION object named by `CATALOG_CONNECTION`
 * *WHEN* Exasol sends a `createVirtualSchema` request naming that table
-* *THEN* the adapter SHALL resolve the table's current Iceberg schema from the catalog
-* *AND* the adapter SHALL return a JSON response describing one virtual table whose columns map each Iceberg field to an Exasol SQL type per the `datafusion-scan/type-mapping` table, declaring any Exasol-incompatible type as `VARCHAR(2000000)` rather than failing
+* *THEN* the adapter SHALL resolve credentials via `ctx.connection`, SigV4-sign the catalog requests when enabled, and resolve the table's current Iceberg schema
+* *AND* the adapter SHALL return a JSON response describing one virtual table whose columns map each Iceberg field to an Exasol SQL type per the type-mapping table, declaring any Exasol-incompatible type as VARCHAR rather than failing
 * *AND* the adapter MUST NOT persist any catalog metadata between requests
 
 ### Scenario: Create virtual schema fails clearly when the catalog is unreachable
 
-* *GIVEN* the supplied Iceberg REST catalog endpoint cannot be reached
+* *GIVEN* the Iceberg REST catalog endpoint resolved from the CONNECTION cannot be reached
 * *WHEN* Exasol sends a `createVirtualSchema` request
 * *THEN* the adapter SHALL return an error describing that the catalog could not be reached
-* *AND* the error message MUST NOT contain storage access keys or secret keys
+* *AND* the error message MUST NOT contain storage access keys, secret keys, session tokens, or any SigV4 signing key
 
 ### Scenario: Adapter records the cluster node count in the virtual-schema adapterNotes
 
