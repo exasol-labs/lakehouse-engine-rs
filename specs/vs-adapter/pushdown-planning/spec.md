@@ -1,15 +1,19 @@
 # Feature: Pushdown Planning
 
 Translates an Exasol query against the virtual schema into a pushdown plan: it
-resolves the Iceberg data-file list once, captures the requested projection, filter,
-LIMIT, and any supported single-group or grouped aggregate, and emits the SQL that
-drives the DataFusion scan SET UDF — fanned out across G oversubscribed work-unit
-shards via `GROUP BY shard_key` — over exactly those files.
+resolves the Iceberg data-file list once (signing catalog requests with AWS SigV4
+and applying vended S3 credentials when the CONNECTION enables them), captures the
+requested projection, filter, LIMIT, and any supported single-group or grouped
+aggregate, and emits the SQL that drives the DataFusion scan SET UDF — fanned out
+across G oversubscribed work-unit shards via `GROUP BY shard_key` — over exactly
+those files.
 
 ## Background
 
 * The adapter receives a `pushdown` request carrying the projection, filter, and
   aggregate specification from Exasol.
+* Catalog and storage credentials are resolved from the CONNECTION object, not plain
+  properties. See `vs-adapter/connection-credentials`.
 * The adapter resolves the Iceberg snapshot and file list exactly once per query.
 * The shard count G is `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped
   to the file count, per the `parallelism/work-unit-sharding` feature; the scan-driving
@@ -17,6 +21,8 @@ shards via `GROUP BY shard_key` — over exactly those files.
 * Credentials MUST NOT appear in any returned SQL or error message.
 * A predicate or group-key expression the adapter cannot translate is omitted from the
   scan spec; Exasol keeps it as a correctness backstop.
+* SigV4 signing and credential vending scenarios are in
+  `vs-adapter/pushdown-planning-cloud-credentials`.
 
 ## Scenarios
 

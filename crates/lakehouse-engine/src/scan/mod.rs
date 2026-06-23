@@ -55,7 +55,8 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 }
 
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
-    let session_ctx = build_session_context(spec)?;
+    let memory_limit_bytes = ctx.memory_limit();
+    let session_ctx = build_session_context(spec, memory_limit_bytes)?;
     if spec.aggregates.is_some() {
         run_partial_aggregate(ctx, &session_ctx, spec).await
     } else {
@@ -434,15 +435,13 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
 /// Sizes the DataFusion memory pool from `memory_limit_bytes` (UDF per-instance
 /// limit in bytes; `0` = unknown sentinel → conservative 1024 MB default) and
 /// probes `/tmp` for disk-spill eligibility.
-///
-/// # ponytail: pass ctx.memory_limit() once exasol-udf-sdk publishes the accessor
-/// Until that bump the call site passes `0` (→ 1024 MB default budget).
-/// Do NOT hand-roll the accessor.
-fn build_session_context(spec: &ScanSpec) -> Result<SessionContext, UdfError> {
+fn build_session_context(
+    spec: &ScanSpec,
+    memory_limit_bytes: u64,
+) -> Result<SessionContext, UdfError> {
     let config = SessionConfig::new().with_information_schema(false);
 
     // Memory pool + spill config.
-    let memory_limit_bytes: u64 = 0; // 0-sentinel → default 1024 MB budget
     let spill = probe_tmp_spill();
     let runtime_env = build_runtime_env(memory_limit_bytes, spill)
         .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
@@ -676,7 +675,67 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::spec::{AggKind, AggregatePlan};
+    use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MEMORY_FRACTION};
+    use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, StorageProps};
+    use datafusion::execution::memory_pool::MemoryLimit;
+
+    // ---------------------------------------------------------------------------
+    // build_session_context memory pool sizing — seam tests for task 1.3
+    // ---------------------------------------------------------------------------
+
+    /// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
+    fn minimal_spec() -> ScanSpec {
+        ScanSpec {
+            files: vec!["s3://test-bucket/data/part-0.parquet".into()],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "testkey".into(),
+                secret_key: "testsecret".into(),
+                session_token: None,
+                allow_http: true,
+                path_style: true,
+            },
+            catalog: CatalogProps {
+                uri: "http://localhost:8181".into(),
+                warehouse: "wh".into(),
+                table: "db.tbl".into(),
+            },
+        }
+    }
+
+    /// A positive memory limit causes the DataFusion pool to be sized at 0.6 × limit.
+    #[test]
+    fn session_context_sizes_pool_from_ctx_limit() {
+        let limit: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+        let expected_budget = (limit as f64 * MEMORY_FRACTION) as usize;
+        let ctx = build_session_context(&minimal_spec(), limit).expect("build must succeed");
+        match ctx.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(actual) => assert_eq!(
+                actual, expected_budget,
+                "pool budget must be 0.6 × the reported per-instance limit"
+            ),
+            _ => panic!("expected Finite pool limit"),
+        }
+    }
+
+    /// A zero memory limit causes the DataFusion pool to use the conservative default budget.
+    #[test]
+    fn session_context_uses_default_budget_on_zero_limit() {
+        let ctx = build_session_context(&minimal_spec(), 0).expect("build must succeed");
+        match ctx.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(actual) => assert_eq!(
+                actual, DEFAULT_BUDGET_BYTES as usize,
+                "pool budget must equal the 1 GiB default when limit is unknown (0)"
+            ),
+            _ => panic!("expected Finite pool limit"),
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // build_partial_agg_sql — host-runnable unit tests

@@ -23,9 +23,10 @@ mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{E2E_QUALIFIED_TABLE, E2E_TABLE, seed_events};
 use common::stack::{
-    bucketfs_port, bucketfs_write_password, exasol_host, exasol_sql_port, iceberg_catalog_url,
-    iceberg_catalog_url_internal, lakehouse_engine_so_path, minio_url_internal, upload_to_bucketfs,
-    wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
+    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
+    local_stack_connection_password, upload_to_bucketfs, wait_for_exasol, wait_for_iceberg_catalog,
+    wait_for_minio,
 };
 
 use std::sync::OnceLock;
@@ -43,8 +44,10 @@ const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-const SLC_VERSION: &str = "0.14.0";
+const SLC_VERSION: &str = "0.16.0";
 const LANG_ALIAS: &str = "RUST";
+/// Name of the Exasol CONNECTION carrying catalog + storage credentials.
+const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
 // ---------------------------------------------------------------------------
 // One-time setup (idempotent; identical to e2e_scan_test.rs)
@@ -70,7 +73,7 @@ fn setup_e2e() {
                 .expect("seed Iceberg events table")
         });
 
-        install_slc_0_14();
+        install_slc();
 
         let so_path = lakehouse_engine_so_path();
         upload_to_bucketfs(&so_path, SO_BUCKETFS_PUT_PATH);
@@ -81,7 +84,7 @@ fn setup_e2e() {
     });
 }
 
-fn install_slc_0_14() {
+fn install_slc() {
     let slc_url = format!(
         "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
     );
@@ -163,21 +166,20 @@ EMITS (...) AS
 }
 
 fn create_virtual_schema(conn: &mut ExaConn) {
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
+    // Create the catalog CONNECTION first (idempotent: CREATE OR REPLACE).
+    let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
-    let s3_endpoint = minio_url_internal();
+    let create_conn_sql = build_create_connection_sql(CATALOG_CONN_NAME, &catalog_uri, &password);
+    conn.execute(&create_conn_sql);
+
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_URI   = '{catalog_uri}'
-  WAREHOUSE     = 's3://warehouse/'
-  TABLE_NAME    = '{E2E_QUALIFIED_TABLE}'
-  SCAN_SCHEMA   = '{SCHEMA_NAME}'
-  S3_ENDPOINT   = '{s3_endpoint}'
-  S3_REGION     = 'us-east-1'
-  ACCESS_KEY    = 'minioadmin'
-  SECRET_KEY    = 'minioadmin'
-  ALLOW_HTTP    = 'true'"#
+  CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
+  TABLE_NAME         = '{E2E_QUALIFIED_TABLE}'
+  SCAN_SCHEMA        = '{SCHEMA_NAME}'
+  ALLOW_HTTP         = 'true'"#
     ));
 }
 
