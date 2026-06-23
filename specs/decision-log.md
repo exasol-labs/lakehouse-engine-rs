@@ -474,3 +474,114 @@ Render the HAVING predicate via the shared `vs-expression` translator and apply 
 ### Consequences
 
 The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never does. This is the same structural pattern as the outer-wrapper aggregate merge in ADR-008 and ADR-016: logic that requires the full group picture goes in the wrapper, not the shard.
+
+---
+
+## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror strata-rs)
+
+**Date:** 2026-06-23
+**Plan:** `add-glue-catalog-sigv4-connection`
+**Status:** Accepted
+
+### Context
+
+The engine previously read catalog URI and S3 credentials straight from plain VS properties (`CATALOG_URI`, `ACCESS_KEY`, `SECRET_KEY`, etc.). This means credentials appear in the `CREATE VIRTUAL SCHEMA` SQL text, are visible to anyone who can read the query profile, and cannot be rotated without re-issuing the DDL. The strata-rs sibling project already uses Exasol CONNECTION objects to solve this problem, with `ctx.connection(name)` returning `{address, password}` where the password is a JSON credential block.
+
+### Decision
+
+Read the catalog URI and all S3/signing credentials from `ctx.connection(<CATALOG_CONNECTION>)`. The `address` field is the catalog endpoint; the `password` field is a JSON object parsed for `warehouse`, `endpoint`, `region`, `access_key`, `secret_key`, and optional `session_token`/`path_style`/`use_sigv4`/`use_vended_credentials`. Both adapter entry points (`createVirtualSchema` and `pushdown`) resolve credentials through this path. Error messages never echo the password text.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| CONNECTION object via `ctx.connection` (mirror strata-rs) | ✓ Chosen — keeps secrets out of SQL text; Exasol access-controls the CONNECTION; mirrors the existing sibling convention |
+| Keep reading plain VS properties | ✗ Rejected — leaks credentials into `CREATE VIRTUAL SCHEMA` text and query profile; no rotation without DDL change |
+| Inject credentials via request JSON | ✗ Rejected — not how the SDK surfaces them; would require a custom request-shape convention |
+
+### Consequences
+
+The `CATALOG_CONNECTION` VS property is now required. The old plain-property credential path (`extract_connection_props`) is removed. All credential-carrying code paths must ensure the password text never appears in error output. The opt-out flags (`use_sigv4`, `use_vended_credentials`) default to false so existing MinIO/REST stacks continue to work with a CONNECTION that omits them.
+
+---
+
+## ADR-019: Self-Issue a SigV4-Signed load_table GET Instead of Using RestCatalogBuilder
+
+**Date:** 2026-06-23
+**Plan:** `add-glue-catalog-sigv4-connection`
+**Status:** Accepted
+
+### Context
+
+To query AWS Glue's Iceberg REST catalog the adapter must (a) SigV4-sign catalog HTTP requests and (b) recover the short-lived vended S3 credentials from the `load_table` response's `storage_credentials` block. Research confirmed that `iceberg-catalog-rest` 0.9.1 accepts only a plain `reqwest::Client` via `RestCatalogBuilder::with_client`, dispatches it internally with no per-request signing seam, and silently drops the `storage_credentials` field from `LoadTableResult`.
+
+### Decision
+
+For the Glue path, the adapter issues the `load_table` GET itself using a SigV4-signing `reqwest` client, deserializes the public `iceberg_catalog_rest::LoadTableResult` type, and extracts vended credentials from the `storage_credentials[*].config` block (longest-prefix match, with fallback to the flat `config` map). The unsigned/non-vended path continues using the existing `RestCatalogBuilder` flow unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Self-issued signed GET + parse `LoadTableResult` | ✓ Chosen — only clean in-tree path; accesses the public type; recovers `storage_credentials` |
+| `RestCatalogBuilder::with_client` (plain client) | ✗ Rejected — 0.9.1 has no per-request signing seam; internal dispatch bypasses middleware |
+| Fork `iceberg-catalog-rest` | ✗ Rejected — heavier maintenance burden; risk of diverging from upstream |
+
+### Consequences
+
+The Glue catalog path does not use `RestCatalogBuilder` for the signed load-table call. Unsigned paths are unchanged. The `LoadTableResult` deserialization depends on the `iceberg-catalog-rest` public type remaining stable; if the crate later exposes a signing hook this custom path can be removed.
+
+---
+
+## ADR-020: Apply Vended Credentials via merge_vended_into_storage in the Planning Layer
+
+**Date:** 2026-06-23
+**Plan:** `add-glue-catalog-sigv4-connection`
+**Status:** Accepted
+
+### Context
+
+When `use_vended_credentials` is true, the Glue `load_table` response carries short-lived STS credentials (`s3.access-key-id`, `s3.secret-access-key`, `s3.session-token`) that must be used for data-file reads instead of the static CONNECTION credentials. These must be resolved once per query — not once per shard or node — to honour the stateless-UDF and resolve-once invariants.
+
+### Decision
+
+After the self-issued signed `load_table` GET (see ADR-019), the adapter extracts the vended keys from `storage_credentials[*].config` (longest-prefix match) or the flat `config` fallback, then calls `merge_vended_into_storage(static, vended)` to produce a storage block in which the STS keys override the static `access_key`/`secret_key`/`session_token` while the static `endpoint`, `region`, and `path_style` are preserved. This merged block is embedded in every per-shard `ScanSpec` by the planning layer; the scan UDF never contacts the catalog or re-requests credentials.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Resolve vended creds once in the planning layer, embed in each ScanSpec | ✓ Chosen — honours resolve-once and stateless-UDF invariants; mirrors strata-rs shape |
+| Rely on `iceberg-catalog-rest` to auto-apply vended creds | ✗ Rejected — 0.9.1 silently drops `storage_credentials`; not viable |
+| Re-vend per node inside the scan UDF | ✗ Rejected — violates resolve-once invariant; adds catalog access to the UDF |
+
+### Consequences
+
+Each `ScanSpec` carries the final storage credentials (static or vended). The scan UDF is credential-passive: it configures its S3 store from the spec and never re-authenticates. Vended STS tokens have a limited lifetime; if a query takes longer than the token TTL, the scan will fail — this is accepted as a known limitation of the resolve-once design.
+
+---
+
+## ADR-021: Separate cloud-e2e Cargo Feature with Skip-When-Absent Semantics
+
+**Date:** 2026-06-23
+**Plan:** `add-glue-catalog-sigv4-connection`
+**Status:** Accepted
+
+### Context
+
+The local Docker E2E suite (`exasol-e2e` feature) is designed to FAIL when its Exasol + MinIO + REST stack is down — this is intentional. Adding a cloud smoke/perf test for AWS Glue to the same feature would break that contract, because a cloud account is not always attached in every developer or CI environment.
+
+### Decision
+
+Gate the Glue smoke and performance tests behind a new `cloud-e2e` cargo feature, distinct from `exasol-e2e`. When the AWS credential environment variables are absent, the cloud tests skip (early return, no failure, no network call). The local Docker suite's fail-when-down semantics are unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| New `cloud-e2e` cargo feature with skip-when-absent | ✓ Chosen — keeps the two harnesses orthogonal; safe to run in CI without cloud creds |
+| Reuse `exasol-e2e` feature | ✗ Rejected — mixing in a skip-when-absent test breaks the local fail-when-down contract |
+
+### Consequences
+
+Developers must explicitly pass `--features cloud-e2e` to run the Glue smoke test. The feature is safe to enable in CI pipelines that inject AWS credentials as secrets and omit them otherwise. The skip path must not attempt any network call so absence of credentials is truly zero-cost.
