@@ -1114,10 +1114,9 @@ pub async fn handle_pushdown(
 
     let (proj_cols, proj_types) = extract_projection(request, &pushdown_req)?;
 
-    let filter = pushdown_req
-        .get("filter")
-        .filter(|f| !f.is_null())
-        .and_then(render_df_filter_safe);
+    let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
+
+    let filter = filter_json_raw.and_then(render_df_filter_safe);
 
     let limit = extract_limit(&pushdown_req);
 
@@ -1126,8 +1125,10 @@ pub async fn handle_pushdown(
     // Resolve file list exactly once. The returned `effective_storage` carries
     // vended STS creds when use_vended_credentials is true; otherwise it equals
     // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
+    // filter_json_raw is forwarded for Iceberg-level file pruning; ScanSpec.filter
+    // (DataFusion SQL string) is set separately above and left completely unchanged.
     let (files, effective_storage) =
-        resolve_file_list(catalog_uri, catalog, storage, creds).await?;
+        resolve_file_list(catalog_uri, catalog, storage, creds, filter_json_raw).await?;
     let storage = &effective_storage;
 
     if files.is_empty() {
@@ -1256,11 +1257,15 @@ pub async fn handle_pushdown(
 /// carries the vended STS keys (merged over the static `storage` props) so
 /// every per-shard `ScanSpec.storage` uses the vended creds. When neither flag
 /// is set, returns `(files, storage.clone())` — the unsigned path is unchanged.
+///
+/// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
+/// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
 pub async fn resolve_file_list(
     catalog_uri: &str,
     catalog_props: &CatalogProps,
     storage: &StorageProps,
     creds: &ConnectionCreds,
+    filter_json: Option<&Json>,
 ) -> Result<(Vec<(String, u64)>, StorageProps), UdfError> {
     if creds.use_sigv4 {
         // Signed path: self-issue the load_table GET, build the Table from the result.
@@ -1305,7 +1310,7 @@ pub async fn resolve_file_list(
             ))
         })?;
 
-        let files = plan_files_from_table(table, &catalog_props.table).await?;
+        let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
         return Ok((files, effective_storage));
     }
 
@@ -1327,17 +1332,28 @@ pub async fn resolve_file_list(
             ))
         })?;
 
-    let files = plan_files_from_table(table, &catalog_props.table).await?;
+    let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
     Ok((files, storage.clone()))
 }
 
 /// Drive the iceberg scan and collect the data-file paths with their sizes.
+///
+/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
+/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
+/// remains the row-level correctness backstop; this is pruning-only.
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
+    filter_json: Option<&Json>,
 ) -> Result<Vec<(String, u64)>, UdfError> {
-    let scan = table
-        .scan()
+    let mut scan_builder = table.scan();
+    if let Some(fj) = filter_json {
+        let schema = table.metadata().current_schema();
+        if let Some(pred) = crate::adapter::iceberg_predicate::to_iceberg_predicate(fj, schema) {
+            scan_builder = scan_builder.with_filter(pred);
+        }
+    }
+    let scan = scan_builder
         .select_all()
         .build()
         .map_err(|e| UdfError::User(format!("failed to build Iceberg scan: {e}")))?;
@@ -4496,6 +4512,111 @@ mod tests {
             merged.session_token.as_deref(),
             Some("NEW_STS_TOKEN"),
             "new vended session_token must replace old static one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.1 — Pushdown wiring: filter JSON reaches Iceberg predicate and
+    // ScanSpec.filter (DataFusion string) is preserved on both paths.
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Filter predicate is pushed into the scan spec.
+    ///
+    /// For a translatable filter (equality on a typed column):
+    /// - `ScanSpec.filter` (DataFusion SQL string) is `Some`.
+    /// - `to_iceberg_predicate` over the same JSON + a matching schema is `Some`.
+    ///
+    /// Both coexist: Iceberg prunes files; DataFusion enforces row correctness.
+    #[test]
+    fn pushdown_carries_filter_and_iceberg_prune() {
+        use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+        use iceberg::spec::{NestedField, Schema, Type};
+        use std::sync::Arc;
+
+        // Build a minimal schema with an Int column "id".
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+
+        let filter_json = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "id"},
+            "right": {"type": "literal_exactnumeric", "value": 42}
+        });
+
+        // DataFusion path: render_df_filter_safe must produce Some.
+        let df_filter = render_df_filter_safe(&filter_json);
+        assert!(
+            df_filter.is_some(),
+            "translatable filter must produce a DataFusion SQL string"
+        );
+
+        // Iceberg path: to_iceberg_predicate over the same JSON must produce Some.
+        let iceberg_pred = to_iceberg_predicate(&filter_json, &schema);
+        assert!(
+            iceberg_pred.is_some(),
+            "translatable filter must produce an Iceberg predicate"
+        );
+
+        // Confirm the DataFusion string survives into the spec literal.
+        let sql = build_sql_for_fixture(
+            vec!["s3://warehouse/f.parquet".into()],
+            vec!["ID".into()],
+            vec!["DECIMAL(10,0)".into()],
+            df_filter,
+            None,
+        );
+        assert!(
+            sql.contains("42"),
+            "filter value must survive into spec literal: {sql}"
+        );
+    }
+
+    /// Scenario: A LIKE-only filter still yields a valid `ScanSpec.filter` (DataFusion
+    /// evaluates it) while `to_iceberg_predicate` returns `None` (no file pruning).
+    ///
+    /// This confirms the correctness invariant: LIKE is not prunable but remains
+    /// fully enforced by DataFusion.
+    #[test]
+    fn like_filter_yields_df_string_and_no_iceberg_predicate() {
+        use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+        use iceberg::spec::{NestedField, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "name",
+                Type::Primitive(iceberg::spec::PrimitiveType::String),
+            ))])
+            .build()
+            .unwrap();
+
+        let filter_json = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+
+        // DataFusion path must still yield Some (LIKE is translatable to DataFusion SQL).
+        let df_filter = render_df_filter_safe(&filter_json);
+        assert!(
+            df_filter.is_some(),
+            "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
+        );
+
+        // Iceberg path must be None — LIKE is not soundly prunable.
+        let iceberg_pred = to_iceberg_predicate(&filter_json, &schema);
+        assert!(
+            iceberg_pred.is_none(),
+            "LIKE filter must produce no Iceberg predicate"
         );
     }
 

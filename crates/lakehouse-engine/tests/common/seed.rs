@@ -15,6 +15,11 @@
 //!
 //! Table: e2e_lakehouse.events (namespace=e2e_lakehouse, table=events)
 //! Rows: 20 deterministic rows so LIMIT 5 and WHERE score > 15.0 are both testable.
+//!
+//! Table: e2e_lakehouse.regions (namespace=e2e_lakehouse, table=regions)
+//! Partitioned by `region` (identity transform), one data file per partition value.
+//! Per-file id ranges are disjoint so both partition pruning and per-file min/max
+//! range pruning are observable in E2E tests.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,8 +36,8 @@ use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
 use iceberg::spec::{
-    DataFileFormat, NestedField, PrimitiveType, Schema as IcebergSchema, Struct, Type,
-    UnboundPartitionSpec,
+    DataFileFormat, Literal, NestedField, PrimitiveType, Schema as IcebergSchema, Struct,
+    Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -63,6 +68,39 @@ pub const SEED_ROWS_SCORE_GT_15: usize = 17;
 /// Total rows seeded into the labels table (one label per id in 1..=SEED_TOTAL_ROWS).
 pub const SEED_LABELS_ROWS: usize = SEED_TOTAL_ROWS;
 
+// ---------------------------------------------------------------------------
+// Partitioned table (regions) — exported constants for E2E file-pruning tests
+// ---------------------------------------------------------------------------
+
+/// Table name for the partitioned seed table used in file-pruning E2E tests.
+pub const E2E_PART_TABLE: &str = "regions";
+
+/// Partition column name (identity transform, VARCHAR).
+pub const PART_COL: &str = "region";
+
+/// Partition value for file 1: "north".  Data file contains ids 1..=5.
+pub const PART_VAL_NORTH: &str = "north";
+/// Partition value for file 2: "central".  Data file contains ids 6..=10.
+pub const PART_VAL_CENTRAL: &str = "central";
+/// Partition value for file 3: "south".  Data file contains ids 11..=15.
+pub const PART_VAL_SOUTH: &str = "south";
+
+/// Ordered partition values — one data file is written per value.
+pub const PART_VALUES: [&str; 3] = [PART_VAL_NORTH, PART_VAL_CENTRAL, PART_VAL_SOUTH];
+
+/// Inclusive id range written into the "north" partition file.
+pub const PART_NORTH_IDS: (usize, usize) = (1, 5);
+/// Inclusive id range written into the "central" partition file.
+pub const PART_CENTRAL_IDS: (usize, usize) = (6, 10);
+/// Inclusive id range written into the "south" partition file.
+pub const PART_SOUTH_IDS: (usize, usize) = (11, 15);
+
+/// Rows per partition file (all partitions are equal-sized).
+pub const PART_ROWS_PER_FILE: usize = 5;
+
+/// Total rows across all partition files.
+pub const PART_TOTAL_ROWS: usize = PART_ROWS_PER_FILE * PART_VALUES.len();
+
 /// Date32 days-since-epoch for 2024-01-01.
 const BASE_DATE: i32 = 19_723;
 /// Microseconds since UNIX_EPOCH for 2024-01-01T00:00:00Z.
@@ -74,17 +112,20 @@ pub struct SeedHandle {
     pub data_file_paths: Vec<String>,
 }
 
-/// Seed both the E2E events and labels tables into the REST catalog. Idempotent.
+/// Seed all E2E tables (events, labels, regions) into the REST catalog. Idempotent.
 pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
     let events_handle = seed_events_table(catalog_url, warehouse).await?;
     seed_labels_table(catalog_url, warehouse).await?;
+    seed_partitioned(catalog_url, warehouse).await?;
     Ok(events_handle)
 }
 
-/// Seed only the events table into the REST catalog. Idempotent.
-async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
-    // The seed runs on the host, so it reaches MinIO at the host-published
-    // endpoint (localhost:<minio_port>), not the in-container `minio:9000`.
+/// Build a REST catalog client for seed operations.
+async fn build_seed_catalog(
+    catalog_url: &str,
+    warehouse: &str,
+    label: &str,
+) -> Result<impl Catalog> {
     let s3_endpoint = super::stack::minio_url();
 
     let mut props = HashMap::new();
@@ -99,14 +140,19 @@ async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHan
     props.insert(S3_SECRET_ACCESS_KEY.to_string(), "minioadmin".to_string());
     props.insert(S3_PATH_STYLE_ACCESS.to_string(), "true".to_string());
 
-    let catalog = RestCatalogBuilder::default()
+    RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
-        .load("lakehouse-e2e-seed", props)
+        .load(label, props)
         .await
-        .context("connect to Iceberg REST catalog for seeding")?;
+        .context("connect to Iceberg REST catalog for seeding")
+}
+
+/// Seed only the events table into the REST catalog. Idempotent.
+async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed").await?;
 
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
     let table_ident = TableIdent::new(ns.clone(), E2E_TABLE.to_string());
@@ -414,28 +460,7 @@ fn uuid_suffix() -> String {
 /// namespace. The table contains one row per id in 1..=SEED_LABELS_ROWS with
 /// `label = "label-NN"`, matching the events ids so an Exasol-side JOIN works.
 async fn seed_labels_table(catalog_url: &str, warehouse: &str) -> Result<()> {
-    let s3_endpoint = super::stack::minio_url();
-
-    let mut props = HashMap::new();
-    props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_url.to_string());
-    props.insert(
-        REST_CATALOG_PROP_WAREHOUSE.to_string(),
-        warehouse.to_string(),
-    );
-    props.insert(S3_ENDPOINT.to_string(), s3_endpoint);
-    props.insert(S3_REGION.to_string(), "us-east-1".to_string());
-    props.insert(S3_ACCESS_KEY_ID.to_string(), "minioadmin".to_string());
-    props.insert(S3_SECRET_ACCESS_KEY.to_string(), "minioadmin".to_string());
-    props.insert(S3_PATH_STYLE_ACCESS.to_string(), "true".to_string());
-
-    let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
-            customized_credential_load: None,
-        }))
-        .load("lakehouse-e2e-seed-labels", props)
-        .await
-        .context("connect to Iceberg REST catalog for labels seeding")?;
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-labels").await?;
 
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
     let table_ident = TableIdent::new(ns.clone(), E2E_TABLE_2.to_string());
@@ -574,4 +599,194 @@ async fn write_one_labels_data_file<C: Catalog>(
         .context("commit labels Iceberg snapshot")?;
 
     Ok(paths)
+}
+
+// ---------------------------------------------------------------------------
+// Partitioned table (regions) seeding
+// ---------------------------------------------------------------------------
+
+/// Seed the `regions` table into the `e2e_lakehouse` namespace. Idempotent.
+///
+/// Schema: `id` INT64, `region` VARCHAR.
+/// Partition spec: identity transform on `region` (field id 2, source id 2).
+/// Data layout: one data file per partition value; id ranges are disjoint and
+/// contiguous so per-file min/max bounds are tight:
+///
+/// | partition | ids     |
+/// |-----------|---------|
+/// | north     | 1 – 5   |
+/// | central   | 6 – 10  |
+/// | south     | 11 – 15 |
+///
+/// See `PART_NORTH_IDS`, `PART_CENTRAL_IDS`, `PART_SOUTH_IDS` for the
+/// exact bounds the E2E assertions must reference.
+pub async fn seed_partitioned(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-regions").await?;
+
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let table_ident = TableIdent::new(ns.clone(), E2E_PART_TABLE.to_string());
+
+    // Short-circuit if already seeded.
+    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
+        && !paths.is_empty()
+    {
+        return Ok(());
+    }
+
+    // Namespace is created by seed_events_table; it must exist by now.
+    let iceberg_schema = regions_iceberg_schema()?;
+    // Identity transform on the `region` field (source_id = 2, the field id of `region`).
+    // The partition field needs an explicit field-id (Iceberg partition ids start at 1000);
+    // an unbound spec serializes `field-id: null`, which the REST catalog rejects on create.
+    let partition_field = UnboundPartitionField::builder()
+        .source_id(2)
+        .field_id(1000)
+        .name(PART_COL.to_string())
+        .transform(Transform::Identity)
+        .build();
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(1)
+        .add_partition_fields([partition_field])
+        .context("build regions partition spec")?
+        .build();
+
+    let creation = TableCreation::builder()
+        .name(E2E_PART_TABLE.to_string())
+        .schema(iceberg_schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    let table = match catalog.create_table(&ns, creation).await {
+        Ok(t) => t,
+        Err(_) => catalog
+            .load_table(&table_ident)
+            .await
+            .context("load existing regions table after create failed")?,
+    };
+
+    // Check again after load (race).
+    let existing = collect_current_snapshot_paths(&table).await?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    write_regions_and_commit(&catalog, table).await?;
+    Ok(())
+}
+
+fn regions_iceberg_schema() -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, PART_COL, Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build regions Iceberg schema")
+}
+
+/// Build a RecordBatch for the given id range, all rows tagged with `region`.
+fn make_regions_batch(first_id: usize, last_id: usize, region: &str) -> RecordBatch {
+    let ids: Vec<i64> = (first_id as i64..=last_id as i64).collect();
+    let regions: Vec<&str> = vec![region; last_id - first_id + 1];
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(PART_COL, DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(regions)),
+        ],
+    )
+    .expect("regions RecordBatch construction is infallible")
+}
+
+/// Write one file per partition, committing each as a separate fast-append.
+async fn write_regions_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<()> {
+    let ranges: [(&str, usize, usize); 3] = [
+        (PART_VAL_NORTH, PART_NORTH_IDS.0, PART_NORTH_IDS.1),
+        (PART_VAL_CENTRAL, PART_CENTRAL_IDS.0, PART_CENTRAL_IDS.1),
+        (PART_VAL_SOUTH, PART_SOUTH_IDS.0, PART_SOUTH_IDS.1),
+    ];
+
+    let mut current_table = table;
+    for (region, first_id, last_id) in ranges {
+        write_one_partitioned_file(catalog, &current_table, first_id, last_id, region).await?;
+        // Reload so the next append builds on the latest snapshot.
+        current_table = catalog
+            .load_table(current_table.identifier())
+            .await
+            .context("reload regions table between partition appends")?;
+    }
+    Ok(())
+}
+
+/// Write rows for one partition (identity-partitioned by `region`) as a single
+/// Parquet file and fast-append it to the table.
+async fn write_one_partitioned_file<C: Catalog>(
+    catalog: &C,
+    table: &Table,
+    first_id: usize,
+    last_id: usize,
+    region: &str,
+) -> Result<()> {
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let file_io = table.file_io().clone();
+    let table_location = table.metadata().location().to_string();
+    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+    let location_gen = FlatLocationGenerator {
+        base: table_location.clone(),
+    };
+    let file_name_gen = DefaultFileNameGenerator::new(
+        format!("{E2E_PART_TABLE}-{region}"),
+        Some(uuid_suffix()),
+        DataFileFormat::Parquet,
+    );
+
+    let parquet_builder =
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io.clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    // Partition key carries the identity-transformed region value.
+    let partition_data = Struct::from_iter([Some(Literal::string(region))]);
+    let partition_key =
+        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), partition_data);
+
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .build(Some(partition_key))
+        .await
+        .context("build regions data file writer")?;
+
+    let batch = make_regions_batch(first_id, last_id, region);
+    let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
+    writer
+        .write(batch)
+        .await
+        .context("write regions Arrow batch")?;
+    let data_files = writer
+        .close()
+        .await
+        .context("close regions data file writer")?;
+
+    let tx = Transaction::new(table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action
+        .apply(tx)
+        .context("apply regions fast-append action")?;
+    tx.commit(catalog)
+        .await
+        .context("commit regions Iceberg snapshot")?;
+
+    Ok(())
 }
