@@ -1,27 +1,44 @@
-/// Partitions a list of file paths into balanced, disjoint shards for
-/// multi-node scan distribution.
+/// Partitions a list of `(file_path, size_bytes)` pairs into `n` byte-balanced,
+/// disjoint shards using the Longest-Processing-Time-first (LPT) greedy heuristic.
 ///
-/// Produces exactly `min(n.max(1), files.len())` shards. File counts across
-/// shards differ by at most one. Returns an empty `Vec` when `files` is empty.
-/// When `n` is zero it is treated as one, so a non-empty file list always
-/// yields at least one shard.
-pub fn partition_files(files: Vec<String>, n: usize) -> Vec<Vec<String>> {
+/// Algorithm:
+/// 1. Clamp `n` to `[1, files.len()]` so every shard is non-empty.
+/// 2. Sort files by size descending (treat 0-byte files as 1 byte so they are
+///    never skipped and land in the currently lightest shard).
+/// 3. Greedily assign each file to the shard with the smallest cumulative byte total.
+///
+/// Returns `Vec<Vec<String>>` (paths only, no sizes). Empty input → empty `Vec`.
+pub fn partition_files_by_bytes(files: Vec<(String, u64)>, n: usize) -> Vec<Vec<String>> {
     if files.is_empty() {
         return vec![];
     }
-    let len = files.len();
-    let shard_count = n.max(1).min(len);
-    let base = len / shard_count;
-    let remainder = len % shard_count;
-    let mut shards = Vec::with_capacity(shard_count);
-    let mut start = 0;
-    for i in 0..shard_count {
-        let extra = usize::from(i < remainder);
-        let end = start + base + extra;
-        shards.push(files[start..end].to_vec());
-        start = end;
+
+    let shard_count = n.max(1).min(files.len());
+
+    // Sort descending by effective size (0 treated as 1 for ordering).
+    let mut sorted = files;
+    sorted.sort_by(|(_, a), (_, b)| {
+        let ea = if *a == 0 { 1 } else { *a };
+        let eb = if *b == 0 { 1 } else { *b };
+        eb.cmp(&ea)
+    });
+
+    // Each entry: (file_paths, cumulative_bytes).
+    let mut shards: Vec<(Vec<String>, u64)> = (0..shard_count).map(|_| (vec![], 0u64)).collect();
+
+    for (path, size) in sorted {
+        let effective_size = if size == 0 { 1 } else { size };
+        // Find the shard with the smallest cumulative byte total.
+        let (lightest_idx, _) = shards
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, bytes))| *bytes)
+            .expect("shards is non-empty");
+        shards[lightest_idx].0.push(path);
+        shards[lightest_idx].1 += effective_size;
     }
-    shards
+
+    shards.into_iter().map(|(paths, _)| paths).collect()
 }
 
 #[cfg(test)]
@@ -29,85 +46,116 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    fn file_list(count: usize) -> Vec<String> {
-        (0..count).map(|i| format!("file-{i}.parquet")).collect()
+    // ---------------------------------------------------------------------------
+    // partition_files_by_bytes tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: G shards are byte-balanced — the maximum cumulative shard size
+    /// minus the minimum is less than the largest single file size.
+    #[test]
+    fn partition_by_bytes_balances_cumulative_size() {
+        // 6 files with sizes: 100, 200, 300, 400, 500, 600 → total 2100
+        let files: Vec<(String, u64)> = vec![
+            ("a.parquet".into(), 100),
+            ("b.parquet".into(), 200),
+            ("c.parquet".into(), 300),
+            ("d.parquet".into(), 400),
+            ("e.parquet".into(), 500),
+            ("f.parquet".into(), 600),
+        ];
+        let shards = partition_files_by_bytes(files, 3);
+        assert_eq!(shards.len(), 3, "expected 3 shards");
+
+        // Compute cumulative byte size per shard.
+        let sizes_map: std::collections::HashMap<String, u64> = vec![
+            ("a.parquet".to_string(), 100),
+            ("b.parquet".to_string(), 200),
+            ("c.parquet".to_string(), 300),
+            ("d.parquet".to_string(), 400),
+            ("e.parquet".to_string(), 500),
+            ("f.parquet".to_string(), 600),
+        ]
+        .into_iter()
+        .collect();
+
+        let shard_bytes: Vec<u64> = shards
+            .iter()
+            .map(|s| s.iter().map(|f: &String| sizes_map[f.as_str()]).sum())
+            .collect();
+
+        let max_bytes = *shard_bytes.iter().max().unwrap();
+        let min_bytes = *shard_bytes.iter().min().unwrap();
+        // 100+200+300+400+500+600 = 2100 over 3 shards; LPT lands exactly 700 each.
+        assert_eq!(
+            max_bytes, min_bytes,
+            "shards not perfectly balanced: max={max_bytes}, min={min_bytes}"
+        );
     }
 
+    /// Scenario: All files appear exactly once across the shards (disjoint + full coverage).
     #[test]
-    fn partition_balanced_disjoint_full_coverage() {
-        let files = file_list(10);
-        let n = 3;
-        let shards = partition_files(files.clone(), n);
-
-        let expected_shard_count = n.min(files.len());
-        assert_eq!(shards.len(), expected_shard_count, "wrong shard count");
+    fn partition_by_bytes_disjoint_full_coverage() {
+        let files: Vec<(String, u64)> = (0..10)
+            .map(|i| (format!("file-{i}.parquet"), (i as u64 + 1) * 100))
+            .collect();
+        let shards = partition_files_by_bytes(files.clone(), 4);
 
         let all_files: Vec<String> = shards.iter().flatten().cloned().collect();
-        let unique_files: HashSet<&String> = all_files.iter().collect();
+        let unique: HashSet<&String> = all_files.iter().collect();
+
+        assert_eq!(unique.len(), all_files.len(), "duplicate files in shards");
         assert_eq!(
-            unique_files.len(),
-            all_files.len(),
-            "files appear in more than one shard"
-        );
-        assert_eq!(
-            unique_files,
-            files.iter().collect::<HashSet<_>>(),
+            unique,
+            files.iter().map(|(p, _)| p).collect::<HashSet<_>>(),
             "not all files covered"
         );
+    }
 
-        let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
-        let max_size = *sizes.iter().max().unwrap();
-        let min_size = *sizes.iter().min().unwrap();
+    /// Scenario: Files with size 0 are treated as size 1 and are never skipped.
+    #[test]
+    fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
+        let files: Vec<(String, u64)> = vec![
+            ("big.parquet".into(), 1000),
+            ("zero1.parquet".into(), 0),
+            ("zero2.parquet".into(), 0),
+            ("tiny.parquet".into(), 1),
+        ];
+        let shards = partition_files_by_bytes(files.clone(), 2);
+
+        let all_files: Vec<String> = shards.iter().flatten().cloned().collect();
+        // All 4 files must appear.
+        assert_eq!(all_files.len(), 4, "a zero-size file was dropped");
+
+        let unique: HashSet<&String> = all_files.iter().collect();
+        assert_eq!(unique.len(), 4, "duplicate files");
         assert!(
-            max_size - min_size <= 1,
-            "shards are not balanced: max={max_size}, min={min_size}"
+            unique.contains(&"zero1.parquet".to_string()),
+            "zero1 must be present"
+        );
+        assert!(
+            unique.contains(&"zero2.parquet".to_string()),
+            "zero2 must be present"
         );
     }
 
+    /// Scenario: When G >= file_count, each file gets its own shard.
     #[test]
-    fn partition_caps_shards_at_file_count() {
-        let files = file_list(3);
-        let shards = partition_files(files.clone(), 10);
+    fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
+        let files: Vec<(String, u64)> = vec![
+            ("a.parquet".into(), 100),
+            ("b.parquet".into(), 200),
+            ("c.parquet".into(), 300),
+        ];
+        // Request more shards than files.
+        let shards = partition_files_by_bytes(files.clone(), 10);
 
-        assert_eq!(
-            shards.len(),
-            files.len(),
-            "shard count must equal file count"
-        );
+        assert_eq!(shards.len(), 3_usize, "shard count must equal file count");
         for shard in &shards {
-            assert_eq!(shard.len(), 1, "each shard must contain exactly one file");
+            assert_eq!(
+                shard.len(),
+                1_usize,
+                "each shard must contain exactly one file"
+            );
         }
-    }
-
-    #[test]
-    fn partition_single_node_returns_one_shard_with_all_files_in_order() {
-        let files = file_list(5);
-        let shards = partition_files(files.clone(), 1);
-
-        assert_eq!(shards.len(), 1);
-        assert_eq!(shards[0], files);
-    }
-
-    #[test]
-    fn partition_empty_input_returns_empty_vec() {
-        let shards = partition_files(vec![], 4);
-        assert!(shards.is_empty());
-    }
-
-    #[test]
-    fn partition_uneven_split_sizes_differ_by_one() {
-        let files = file_list(7);
-        let shards = partition_files(files.clone(), 3);
-
-        assert_eq!(shards.len(), 3);
-        let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
-        assert_eq!(
-            sizes,
-            vec![3, 2, 2],
-            "expected sizes 3,2,2 for 7 files into 3 shards"
-        );
-
-        let all_files: Vec<String> = shards.into_iter().flatten().collect();
-        assert_eq!(all_files, files, "file order must be preserved");
     }
 }

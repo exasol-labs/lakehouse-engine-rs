@@ -133,6 +133,25 @@ pub struct ScanSpec {
 
     pub storage: StorageProps,
     pub catalog: CatalogProps,
+
+    /// DataFusion `target_partitions` for this scan instance.
+    /// Controls the number of logical partitions DataFusion creates internally.
+    /// Defaults to 1 (no intra-instance partitioning) so the cluster-level shard
+    /// fan-out is the sole source of parallelism and nodes are not oversubscribed.
+    /// Old specs that lack this field deserialize to 1 (backward-compatible).
+    #[serde(default = "default_one_usize")]
+    pub df_target_partitions: usize,
+
+    /// Number of Tokio worker threads for the scan runtime.
+    /// When 1 (the default), `new_current_thread()` is used (one OS thread).
+    /// When > 1, `new_multi_thread().worker_threads(n)` is used.
+    /// Old specs that lack this field deserialize to 1 (backward-compatible).
+    #[serde(default = "default_one_usize")]
+    pub df_threads_per_udf: usize,
+}
+
+fn default_one_usize() -> usize {
+    1
 }
 
 impl ScanSpec {
@@ -180,6 +199,8 @@ mod tests {
                 warehouse: "warehouse".into(),
                 table: "db.table".into(),
             },
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         }
     }
 
@@ -333,5 +354,66 @@ mod tests {
         assert!(!err.contains("TOPSECRET"));
         // But it should say something useful.
         assert!(err.contains("scan spec deserialization failed"));
+    }
+
+    /// T8 — ScanSpec threading fields round-trip and default to 1 when absent.
+    ///
+    /// Verifies that:
+    /// 1. Explicit `df_target_partitions` / `df_threads_per_udf` values survive
+    ///    serialize → deserialize.
+    /// 2. A legacy JSON payload that lacks these fields deserializes with both
+    ///    fields defaulting to 1 (backward-compatible with pre-existing specs).
+    #[test]
+    fn scan_spec_threading_fields_round_trip_and_default_to_one() {
+        // 1. Explicit values round-trip.
+        let mut spec = sample_spec();
+        spec.df_target_partitions = 4;
+        spec.df_threads_per_udf = 2;
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.df_target_partitions, 4,
+            "df_target_partitions must survive round-trip"
+        );
+        assert_eq!(
+            back.df_threads_per_udf, 2,
+            "df_threads_per_udf must survive round-trip"
+        );
+
+        // 2. The fields are present in the serialized JSON.
+        assert!(
+            json.contains("df_target_partitions"),
+            "serialized JSON must carry df_target_partitions: {json}"
+        );
+        assert!(
+            json.contains("df_threads_per_udf"),
+            "serialized JSON must carry df_threads_per_udf: {json}"
+        );
+
+        // 3. A legacy payload without these fields deserializes with both defaulting to 1.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.df_target_partitions, 1,
+            "missing df_target_partitions must default to 1 (backward-compat)"
+        );
+        assert_eq!(
+            legacy.df_threads_per_udf, 1,
+            "missing df_threads_per_udf must default to 1 (backward-compat)"
+        );
     }
 }
