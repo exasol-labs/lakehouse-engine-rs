@@ -48,16 +48,20 @@ use iceberg_catalog_rest::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
-/// Namespace and table names for the E2E seed table.
+/// Namespace and table names for the E2E seed tables.
 pub const E2E_NAMESPACE: &str = "e2e_lakehouse";
 pub const E2E_TABLE: &str = "events";
-/// Qualified table name for VS properties.
+/// Second E2E table: labels, with columns `id` and `label`.
+pub const E2E_TABLE_2: &str = "labels";
+/// Qualified table name for the events table (kept for any external reference).
 pub const E2E_QUALIFIED_TABLE: &str = "e2e_lakehouse.events";
 
-/// Total rows seeded. Enough that LIMIT 5 < total and WHERE score > 15.0 excludes some.
+/// Total rows seeded into the events table.
 pub const SEED_TOTAL_ROWS: usize = 20;
 /// Rows with score > 15.0 (scores are 5.0 * (i+1) for i=0..19, so > 15.0 means i >= 3 → 17 rows).
 pub const SEED_ROWS_SCORE_GT_15: usize = 17;
+/// Total rows seeded into the labels table (one label per id in 1..=SEED_TOTAL_ROWS).
+pub const SEED_LABELS_ROWS: usize = SEED_TOTAL_ROWS;
 
 /// Date32 days-since-epoch for 2024-01-01.
 const BASE_DATE: i32 = 19_723;
@@ -70,8 +74,15 @@ pub struct SeedHandle {
     pub data_file_paths: Vec<String>,
 }
 
-/// Seed the E2E events table into the REST catalog. Idempotent.
+/// Seed both the E2E events and labels tables into the REST catalog. Idempotent.
 pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
+    let events_handle = seed_events_table(catalog_url, warehouse).await?;
+    seed_labels_table(catalog_url, warehouse).await?;
+    Ok(events_handle)
+}
+
+/// Seed only the events table into the REST catalog. Idempotent.
+async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
     // The seed runs on the host, so it reaches MinIO at the host-published
     // endpoint (localhost:<minio_port>), not the in-container `minio:9000`.
     let s3_endpoint = super::stack::minio_url();
@@ -393,4 +404,174 @@ fn uuid_suffix() -> String {
         .unwrap_or(0);
     let seq = CTR.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}-{seq:x}")
+}
+
+// ---------------------------------------------------------------------------
+// Labels table seeding
+// ---------------------------------------------------------------------------
+
+/// Seed the `labels` table (id INT64, label VARCHAR) into the `e2e_lakehouse`
+/// namespace. The table contains one row per id in 1..=SEED_LABELS_ROWS with
+/// `label = "label-NN"`, matching the events ids so an Exasol-side JOIN works.
+async fn seed_labels_table(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let s3_endpoint = super::stack::minio_url();
+
+    let mut props = HashMap::new();
+    props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_url.to_string());
+    props.insert(
+        REST_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse.to_string(),
+    );
+    props.insert(S3_ENDPOINT.to_string(), s3_endpoint);
+    props.insert(S3_REGION.to_string(), "us-east-1".to_string());
+    props.insert(S3_ACCESS_KEY_ID.to_string(), "minioadmin".to_string());
+    props.insert(S3_SECRET_ACCESS_KEY.to_string(), "minioadmin".to_string());
+    props.insert(S3_PATH_STYLE_ACCESS.to_string(), "true".to_string());
+
+    let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+            configured_scheme: "s3".to_string(),
+            customized_credential_load: None,
+        }))
+        .load("lakehouse-e2e-seed-labels", props)
+        .await
+        .context("connect to Iceberg REST catalog for labels seeding")?;
+
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let table_ident = TableIdent::new(ns.clone(), E2E_TABLE_2.to_string());
+
+    // Short-circuit if already seeded.
+    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
+        && !paths.is_empty()
+    {
+        return Ok(());
+    }
+
+    // Namespace is created by seed_events_table; it must exist by now.
+    let iceberg_schema = labels_iceberg_schema()?;
+    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+
+    let creation = TableCreation::builder()
+        .name(E2E_TABLE_2.to_string())
+        .schema(iceberg_schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    let table = match catalog.create_table(&ns, creation).await {
+        Ok(t) => t,
+        Err(_) => catalog
+            .load_table(&table_ident)
+            .await
+            .context("load existing labels table after create failed")?,
+    };
+
+    // Check again after load (race).
+    let existing = collect_current_snapshot_paths(&table).await?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    write_labels_and_commit(&catalog, table).await?;
+    Ok(())
+}
+
+fn labels_iceberg_schema() -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "label", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build labels Iceberg schema")
+}
+
+fn make_labels_batch(first_id: usize, last_id: usize) -> RecordBatch {
+    let ids: Vec<i64> = (first_id as i64..=last_id as i64).collect();
+    let labels: Vec<String> = (first_id..=last_id)
+        .map(|i| format!("label-{i:02}"))
+        .collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(labels)),
+        ],
+    )
+    .expect("labels RecordBatch construction is infallible")
+}
+
+async fn write_labels_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<Vec<String>> {
+    write_one_labels_data_file(catalog, &table, 1, SEED_LABELS_ROWS).await
+}
+
+async fn write_one_labels_data_file<C: Catalog>(
+    catalog: &C,
+    table: &Table,
+    first_id: usize,
+    last_id: usize,
+) -> Result<Vec<String>> {
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let file_io = table.file_io().clone();
+    let table_location = table.metadata().location().to_string();
+    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+    let location_gen = FlatLocationGenerator {
+        base: table_location.clone(),
+    };
+    let file_name_gen = DefaultFileNameGenerator::new(
+        E2E_TABLE_2.to_string(),
+        Some(uuid_suffix()),
+        DataFileFormat::Parquet,
+    );
+
+    let parquet_builder =
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io.clone(),
+        location_gen,
+        file_name_gen,
+    );
+
+    let partition_key =
+        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), Struct::empty());
+
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .build(Some(partition_key))
+        .await
+        .context("build labels data file writer")?;
+
+    let batch = make_labels_batch(first_id, last_id);
+    let batch = overlay_iceberg_field_ids(&batch, &iceberg_schema)?;
+    writer
+        .write(batch)
+        .await
+        .context("write labels Arrow batch")?;
+    let data_files = writer
+        .close()
+        .await
+        .context("close labels data file writer")?;
+    let paths: Vec<String> = data_files
+        .iter()
+        .map(|df| df.file_path().to_string())
+        .collect();
+
+    let tx = Transaction::new(table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action
+        .apply(tx)
+        .context("apply labels fast-append action")?;
+    tx.commit(catalog)
+        .await
+        .context("commit labels Iceberg snapshot")?;
+
+    Ok(paths)
 }

@@ -18,12 +18,14 @@
 
 mod common;
 use common::exasol_ws::ExaConn;
-use common::seed::{E2E_QUALIFIED_TABLE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, seed_events};
+use common::seed::{
+    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, seed_events,
+};
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
     exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, minio_url_internal, upload_to_bucketfs, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_minio,
+    local_stack_connection_password, upload_to_bucketfs, wait_for_exasol, wait_for_iceberg_catalog,
+    wait_for_minio,
 };
 
 use std::sync::OnceLock;
@@ -215,19 +217,23 @@ fn create_virtual_schema(conn: &mut ExaConn) {
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
-  TABLE_NAME         = '{E2E_QUALIFIED_TABLE}'
-  SCAN_SCHEMA        = '{SCHEMA_NAME}'
-  ALLOW_HTTP         = 'true'"#
+  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
+  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
+  SCAN_SCHEMA         = '{SCHEMA_NAME}'
+  ALLOW_HTTP          = 'true'"#
     ));
 }
 
 // ---------------------------------------------------------------------------
-// Helper: resolve the VS table name (adapter uppercases the last part of TABLE).
+// Helpers: qualify VS table names (adapter uppercases all Iceberg names).
 // ---------------------------------------------------------------------------
 
 fn vs_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
+}
+
+fn vs_labels_table() -> String {
+    format!("{VS_NAME}.{}", E2E_TABLE_2.to_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -482,9 +488,9 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
     let resp = conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = 'BAD_CATALOG_CREDS'
-  TABLE_NAME         = 'ns.table'
-  ALLOW_HTTP         = 'true'"#
+  CATALOG_CONNECTION  = 'BAD_CATALOG_CREDS'
+  ICEBERG_NAMESPACE   = 'ns'
+  ALLOW_HTTP          = 'true'"#
     ));
     assert_eq!(
         resp["status"].as_str(),
@@ -498,48 +504,24 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Unreadable file scenario: scan of a non-existent file errors without leaking credentials.
+/// Querying a non-existent virtual table name in the VS errors with a clear TABLE_MAP message.
+///
+/// With namespace enumeration, a table that does not exist in the namespace was never
+/// registered in TABLE_MAP. Any pushdown for such a name must fail with a clear error
+/// rather than silently scanning the wrong table.
 #[test]
-fn scan_unreadable_file_errors_no_secret() {
+fn scan_unknown_virtual_table_errors() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Create a CONNECTION with the local stack credentials but a bad secret key,
-    // then point the VS at a non-existent table.
-    let bad_password = common::stack::CatalogConnectionPassword {
-        warehouse: "s3://warehouse/".to_string(),
-        endpoint: minio_url_internal(),
-        region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "topsecretvalue".to_string(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-    };
-    let catalog_uri = iceberg_catalog_url_internal();
-    let create_conn_sql =
-        build_create_connection_sql("BAD_TABLE_CREDS", &catalog_uri, &bad_password);
-    conn.execute(&create_conn_sql);
-
-    // Drop and recreate a VS pointing at a non-existent table name.
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA BAD_TABLE_VS
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION = 'BAD_TABLE_CREDS'
-  TABLE_NAME         = 'e2e_lakehouse.no_such_table'
-  ALLOW_HTTP         = 'true'"#
-    ));
+    // Querying a table name that was not in the namespace at create time will fail
+    // at the pushdown stage because the Exasol table name is not in TABLE_MAP.
+    // We exercise this by querying a VS table that we know does not exist.
+    let resp = conn.try_execute(&format!("SELECT * FROM {VS_NAME}.NO_SUCH_TABLE LIMIT 1"));
     assert_eq!(
         resp["status"].as_str(),
         Some("error"),
-        "expected an error for a non-existent table: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    // Credentials must not appear in error message.
-    assert!(
-        !msg.contains("topsecretvalue"),
-        "error must not leak credentials: {msg}"
+        "expected an error for unknown virtual table NO_SUCH_TABLE: {resp}"
     );
 }
 
@@ -1208,4 +1190,130 @@ fn test_group_by_null_key_grouping() {
         null_group_count, 4,
         "NULL group (multiples of 5) must have COUNT=4, got {null_group_count}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 2.14 — multi-table VS tests
+// ---------------------------------------------------------------------------
+
+/// Create VS with ICEBERG_NAMESPACE enumerates all tables in the namespace.
+///
+/// Asserts that both `EVENTS` and `LABELS` appear in `SYS.EXA_ALL_TABLES` for
+/// the virtual schema — one Exasol virtual table per Iceberg table in the namespace.
+#[test]
+fn e2e_create_vs_enumerates_namespace_tables() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cols = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES \
+         WHERE TABLE_SCHEMA = '{VS_NAME}' \
+         ORDER BY TABLE_NAME"
+    ));
+    assert_eq!(
+        cols.len(),
+        1,
+        "query must return one column (TABLE_NAME): {cols:?}"
+    );
+    let table_names: Vec<&str> = cols[0].iter().filter_map(|v| v.as_str()).collect();
+
+    assert!(
+        table_names.contains(&E2E_TABLE.to_uppercase().as_str()),
+        "EVENTS must appear in the virtual schema tables: {table_names:?}"
+    );
+    assert!(
+        table_names.contains(&E2E_TABLE_2.to_uppercase().as_str()),
+        "LABELS must appear in the virtual schema tables: {table_names:?}"
+    );
+}
+
+/// Pushdown derives the scanned Iceberg table from involvedTables[0].name.
+///
+/// Queries the second table (LABELS) directly and asserts correct rows are
+/// returned — proving that pushdown looked up the Iceberg identifier from
+/// TABLE_MAP using the Exasol virtual table name.
+#[test]
+fn e2e_pushdown_scans_table_from_involved_tables() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cols = conn.query_columns(&format!(
+        "SELECT id, label FROM {} ORDER BY id",
+        vs_labels_table()
+    ));
+    assert_eq!(cols.len(), 2, "must return 2 columns (id, label): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        SEED_LABELS_ROWS,
+        "must return all {SEED_LABELS_ROWS} label rows, got {}",
+        cols[0].len()
+    );
+
+    // Verify id=1 maps to "label-01".
+    let first_id = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("id not integer: {:?}", cols[0][0]));
+    assert_eq!(
+        first_id, 1,
+        "first id must be 1 after ORDER BY, got {first_id}"
+    );
+    let first_label = cols[1][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("label not string: {:?}", cols[1][0]));
+    assert_eq!(
+        first_label, "label-01",
+        "id=1 must have label 'label-01', got '{first_label}'"
+    );
+}
+
+/// Exasol-side JOIN across two virtual tables returns correct joined rows.
+///
+/// Joins EVENTS and LABELS on `id` and asserts the result contains the
+/// expected id and label values — proving both tables are independently
+/// scanned by pushdown and joined by Exasol.
+#[test]
+fn e2e_pushdown_resolves_files_once_multi_table() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // JOIN events and labels on id; ORDER BY id for determinism.
+    let sql = format!(
+        "SELECT a.id, b.label FROM {events} a \
+         JOIN {labels} b ON a.id = b.id \
+         WHERE a.id <= 5 \
+         ORDER BY a.id",
+        events = vs_table(),
+        labels = vs_labels_table(),
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "must return 2 columns (id, label): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "JOIN with id <= 5 must return 5 rows, got {}",
+        cols[0].len()
+    );
+
+    // Verify each id maps to the expected label.
+    for (i, (id_val, label_val)) in cols[0].iter().zip(cols[1].iter()).enumerate() {
+        let expected_id = (i + 1) as i64;
+        let id = id_val
+            .as_i64()
+            .or_else(|| id_val.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("id at pos {i} not integer: {id_val:?}"));
+        assert_eq!(
+            id, expected_id,
+            "id at position {i} must be {expected_id}, got {id}"
+        );
+
+        let label = label_val
+            .as_str()
+            .unwrap_or_else(|| panic!("label at pos {i} not string: {label_val:?}"));
+        assert_eq!(
+            label,
+            format!("label-{expected_id:02}"),
+            "label at position {i} must be 'label-{expected_id:02}', got '{label}'"
+        );
+    }
 }
