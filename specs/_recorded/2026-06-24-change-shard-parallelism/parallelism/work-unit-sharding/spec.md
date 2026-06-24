@@ -17,11 +17,11 @@ own shard of files and no file is scanned twice.
   schema's `adapterNotes` (captured once at `createVirtualSchema` via `NPROC()`),
   round-tripped to the adapter at pushdown time (default `1`).
 * The shard count G is `node_count × parallelism_factor`, where
-  `parallelism_factor` is a VS property. G is capped at `300` so it
-  stays at or below Exasol's `max_dynamic_group_count` default — at or below that
-  threshold Exasol distributes groups round-robin (balanced) across nodes; above
-  it Exasol hash-partitions groups (no longer balanced). G is also clamped to
-  `≥ 1` and `≤ file_count` so no shard is empty.
+  `parallelism_factor` is a VS property. G is capped at `300` so it stays at or
+  below Exasol's `max_dynamic_group_count` default — at or below that threshold
+  Exasol distributes groups round-robin (balanced) across nodes; above it Exasol
+  hash-partitions groups (no longer balanced). G is also clamped to `≥ 1` and
+  `≤ file_count` so no shard is empty.
 * Files are assigned to the G shards by a byte-balanced split
   (`partition_files_by_bytes`), called with G instead of node_count. Each file
   carries its `file_size_in_bytes` from the Iceberg `FileScanTask`; the split
@@ -39,14 +39,7 @@ own shard of files and no file is scanned twice.
 
 ## Scenarios
 
-### Scenario: Shard count oversubscribes the cluster and is capped at the round-robin threshold
-
-* *GIVEN* a resolved data-file list, a `CLUSTER_NODES` value, and a `PARALLELISM_FACTOR` VS property
-* *WHEN* the adapter computes the shard count G for the scan-driving query
-* *THEN* the adapter SHALL compute `G = CLUSTER_NODES × PARALLELISM_FACTOR`
-* *AND* the adapter SHALL cap G at 300 so the resulting group set stays in Exasol's round-robin distribution regime
-* *AND* the adapter SHALL clamp G to be at least 1 and at most the resolved file count
-
+<!-- DELTA:CHANGED -->
 ### Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 
 * *GIVEN* a resolved data-file list in which each file carries its `file_size_in_bytes` (from the Iceberg `FileScanTask`) and a computed shard count G
@@ -55,27 +48,4 @@ own shard of files and no file is scanned twice.
 * *AND* the adapter SHALL treat any file whose reported `file_size_in_bytes` is 0 as weighing 1 byte, so the file is still assigned to a shard and never skipped
 * *AND* every resolved file SHALL appear in exactly one shard and no file SHALL appear in more than one shard
 * *AND* when G is at least the file count the adapter SHALL produce exactly one file per shard with no empty shards
-
-### Scenario: Fewer files than G produces one shard per file with no empty shards
-
-* *GIVEN* a resolved file list whose length is smaller than the otherwise-computed G
-* *WHEN* the adapter computes the shard count and partitions the files
-* *THEN* the adapter SHALL clamp G down to the file count
-* *AND* the adapter SHALL produce exactly one shard per file
-* *AND* the adapter MUST NOT emit a scan invocation for an empty file shard
-
-### Scenario: Scan-driving query fans the SET UDF across shards via GROUP BY shard_key
-
-* *GIVEN* a file list partitioned into more than one shard
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL invoke the scan SET UDF once per shard
-* *AND* the SQL SHALL carry each shard's file subset as that invocation's explicit scan-spec argument
-* *AND* the SQL SHALL group the shard rows on a per-shard `shard_key` (NOT on `IPROC()`) so Exasol distributes shard groups across nodes and multiplexes them onto each node's core pool
-* *AND* the union of all shard outputs SHALL be identical in row content to the equivalent single-shard scan
-
-### Scenario: Single node with G collapsing to one preserves the single-invocation query
-
-* *GIVEN* a `CLUSTER_NODES` value of one and a configuration where G resolves to 1 (single file, or a parallelism factor of 1 on a single file)
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL emit a single scan SET UDF invocation over the whole file list
-* *AND* the generated SQL MUST be behaviourally identical to the pre-sharding single-invocation execution path
+<!-- /DELTA:CHANGED -->
