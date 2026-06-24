@@ -585,3 +585,90 @@ Gate the Glue smoke and performance tests behind a new `cloud-e2e` cargo feature
 ### Consequences
 
 Developers must explicitly pass `--features cloud-e2e` to run the Glue smoke test. The feature is safe to enable in CI pipelines that inject AWS credentials as secrets and omit them otherwise. The skip path must not attempt any network call so absence of credentials is truly zero-cost.
+
+---
+
+## ADR-022: Byte-Balanced Sharding via LPT Greedy Assignment
+
+**Date:** 2026-06-24
+**Plan:** `change-shard-parallelism`
+**Status:** Accepted
+
+### Context
+
+The previous `partition_files` split files into G equal-count groups. Equal file count does not mean equal scan work: a shard of three 1 GB files does far more I/O than a shard of three 1 KB files, so the slowest shard (straggler) dominates wall-clock time. Iceberg's `FileScanTask` already reports `file_size_in_bytes` at zero extra metadata cost.
+
+### Decision
+
+Replace count-balanced `partition_files` with `partition_files_by_bytes`, which sorts files by `file_size_in_bytes` descending (treating size 0 as 1 byte) and greedily assigns each to the shard whose running byte total is currently smallest (Longest-Processing-Time-first heuristic). The shard shape (`Vec<Vec<String>>`) is unchanged, so all downstream SQL builders are unaffected.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| LPT greedy byte balancing | ✓ Chosen — O(n log n), deterministic, near-optimal makespan minimisation |
+| Strict prefix-sum equal-byte split (file order preserved) | ✗ Rejected — a single large file can badly skew shards |
+| Full DP optimum partition | ✗ Rejected — overkill for a balancing heuristic |
+| Keep count-balanced split | ✗ Rejected — equal file count ≠ equal scan work; straggler dominates latency |
+
+### Consequences
+
+Shards are balanced by cumulative bytes rather than file count, reducing straggler-dominated tail latency. A file with `file_size_in_bytes == 0` is weighted as 1 byte so it is assigned to the lightest shard and never dropped from the scan. The resolve→partition seam is the only code path that changes; the shard shape and all SQL builders are unaffected.
+
+---
+
+## ADR-023: Hardware-Aware Default Parallelism Factor (`max(NR_OF_CORES × 2, 8)`)
+
+**Date:** 2026-06-24
+**Plan:** `change-shard-parallelism`
+**Status:** Accepted
+
+### Context
+
+The previous default `PARALLELISM_FACTOR` was the magic constant 8. Per-node parallelism is bounded by a fixed VM pool sized to `NR_OF_CORES` (verified against the Exasol engine internals). A default unrelated to actual core count under-subscribes large nodes and may over-subscribe tiny nodes.
+
+### Decision
+
+Capture `NR_OF_CORES` via `SELECT PARAM_VALUE('NR_OF_CORES')` during `createVirtualSchema` (in the same connect-back session already opened for `SELECT NPROC()`). Use `max(NR_OF_CORES × 2, 8)` as the default `PARALLELISM_FACTOR` when the property is absent or invalid. An explicitly supplied `PARALLELISM_FACTOR` property always overrides the default.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `max(NR_OF_CORES × 2, 8)` default | ✓ Chosen — two-times oversubscription absorbs stragglers; floor at 8 preserves prior behaviour when cores unavailable |
+| Keep static constant 8 | ✗ Rejected — magic number unrelated to the node's actual core pool |
+| Multiplier × 1 | ✗ Rejected — leaves no headroom for straggler absorption |
+| Multiplier × 4 | ✗ Rejected — excessive session-startup overhead per interview |
+
+### Consequences
+
+The default shard count scales with the cluster's real core pool, making it sensible for the deployed hardware without requiring operator intervention. The floor at 8 ensures that a dev/single-core VM or a failed `NR_OF_CORES` lookup (→0) does not collapse the factor. The user retains full control via the `PARALLELISM_FACTOR` property.
+
+---
+
+## ADR-024: Per-Instance CPU Bound via Two Orthogonal VS Properties, Defaulting to 1
+
+**Date:** 2026-06-24
+**Plan:** `change-shard-parallelism`
+**Status:** Accepted
+
+### Context
+
+DataFusion's `SessionConfig::new()` defaults `target_partitions` to the host core count. With Exasol multiplexing up to `NR_OF_CORES` concurrent UDF instances per node, the effective thread count is `instances × target_partitions` ≈ `NR_OF_CORES²` (e.g. 32 × 32 = 1024 on a 32-core node) — massive oversubscription that thrashes the node. Tokio was already `new_current_thread()` (correct), but `target_partitions` was never overridden.
+
+### Decision
+
+Expose two independent VS properties — `DATAFUSION_TARGET_PARTITIONS` (→ DataFusion `target_partitions`) and `DATAFUSION_THREADS_PER_UDF` (→ Tokio runtime kind / worker threads). Both are stored as `DF_TARGET_PARTITIONS` / `DF_THREADS_PER_UDF` in `adapterNotes`, round-tripped into new optional `ScanSpec` fields (`df_target_partitions`, `df_threads_per_udf`, both `#[serde(default)]` to 1), and consumed in the scan UDF. With the defaults each UDF instance uses exactly one core; the cluster-level shard fan-out provides the parallelism. The recommended scale-up formula `max(1, floor(NR_OF_CORES / parallelism_factor))` is documented guidance only — the defaults stay 1 unless the operator overrides them.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Two orthogonal VS properties, both default 1 | ✓ Chosen — each is a clean operator lever; default 1+1 = one core per instance |
+| A single combined "df_parallelism" knob | ✗ Rejected — DataFusion partition count and Tokio worker threads are orthogonal |
+| Leave `target_partitions` at DataFusion's default | ✗ Rejected — this is the `instances × cores` oversubscription bug |
+| Auto-derive `target_partitions` from cores in code | ✗ Rejected — hides cross-layer coupling, removes operator control |
+
+### Consequences
+
+By default each scan UDF instance uses exactly one core (one DataFusion partition, one Tokio thread). The cluster-level shard fan-out is the single, predictable source of parallelism and a node is never oversubscribed by default. Operators may raise both settings for workloads that benefit from intra-instance parallelism. The `ScanSpec` fields are optional with serde defaults so pre-existing serialized specs deserialize unchanged (backward-compatible ABI extension).
