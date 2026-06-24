@@ -66,6 +66,16 @@ const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
 const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
 /// Default Tokio worker threads per UDF instance (1 = current-thread runtime).
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
+// VS property and adapterNotes key names for the DataFusion memory pool sizing parameters.
+const PROP_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
+const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
+const NOTE_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
+const NOTE_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
+/// Fraction of the net per-instance RSS budget allocated to the DataFusion memory pool.
+const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
+/// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
+/// applying the pool fraction.
+const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
 
 /// Main adapter dispatch function.
 ///
@@ -141,6 +151,8 @@ fn handle_create_virtual_schema(
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
     let df_target_partitions = resolve_df_target_partitions(&props);
     let df_threads_per_udf = resolve_df_threads_per_udf(&props);
+    let memory_pool_fraction = resolve_memory_pool_fraction(&props);
+    let instance_overhead_mb = resolve_instance_overhead_mb(&props);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -179,6 +191,8 @@ fn handle_create_virtual_schema(
         parallelism_factor,
         df_target_partitions,
         df_threads_per_udf,
+        memory_pool_fraction,
+        instance_overhead_mb,
     );
     let schema_metadata = json!({
         "tables": [{
@@ -224,11 +238,18 @@ async fn handle_pushdown_request(
     let df_target_partitions = adapter_note(request, NOTE_DF_TARGET_PARTITIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(1);
+        .unwrap_or(DEFAULT_DF_TARGET_PARTITIONS);
     let df_threads_per_udf = adapter_note(request, NOTE_DF_THREADS_PER_UDF)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(1);
+        .unwrap_or(DEFAULT_DF_THREADS_PER_UDF);
+    let memory_pool_fraction = adapter_note(request, NOTE_MEMORY_POOL_FRACTION)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&x| x > 0.0 && x <= 1.0)
+        .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION);
+    let instance_overhead_mb = adapter_note(request, NOTE_INSTANCE_OVERHEAD_MB)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB);
     handle_pushdown(
         request,
         catalog_uri,
@@ -239,6 +260,8 @@ async fn handle_pushdown_request(
         parallelism_factor,
         df_target_partitions,
         df_threads_per_udf,
+        memory_pool_fraction,
+        instance_overhead_mb,
         creds,
     )
     .await
@@ -301,8 +324,12 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
 /// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
-/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, and DF_THREADS_PER_UDF. Any
-/// pre-existing notes on the request are preserved (merge, not clobber).
+/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF,
+/// MEMORY_POOL_FRACTION, and INSTANCE_OVERHEAD_MB. Any pre-existing notes on
+/// the request are preserved (merge, not clobber).
+// ponytail: args mirror the resolved notes fields one-to-one; a params struct is
+// pure boilerplate for a single private callee.
+#[allow(clippy::too_many_arguments)]
 fn build_adapter_notes(
     request: &Json,
     cluster_nodes: u32,
@@ -310,6 +337,8 @@ fn build_adapter_notes(
     parallelism_factor: usize,
     df_target_partitions: usize,
     df_threads_per_udf: usize,
+    memory_pool_fraction: f64,
+    instance_overhead_mb: u64,
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
     notes.insert(
@@ -331,6 +360,14 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_DF_THREADS_PER_UDF.to_string(),
         Json::String(df_threads_per_udf.to_string()),
+    );
+    notes.insert(
+        NOTE_MEMORY_POOL_FRACTION.to_string(),
+        Json::String(memory_pool_fraction.to_string()),
+    );
+    notes.insert(
+        NOTE_INSTANCE_OVERHEAD_MB.to_string(),
+        Json::String(instance_overhead_mb.to_string()),
     );
     Json::String(Json::Object(notes).to_string())
 }
@@ -369,6 +406,28 @@ fn resolve_df_threads_per_udf(props: &Json) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_DF_THREADS_PER_UDF)
+}
+
+/// Read and validate the MEMORY_POOL_FRACTION VS property.
+///
+/// Accepts any value in the range (0.0, 1.0]. When the property is absent, empty,
+/// zero, out-of-range, or unparseable the default is `DEFAULT_MEMORY_POOL_FRACTION`.
+fn resolve_memory_pool_fraction(props: &Json) -> f64 {
+    str_prop(props, PROP_MEMORY_POOL_FRACTION)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|&x| x > 0.0 && x <= 1.0)
+        .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION)
+}
+
+/// Read and validate the INSTANCE_OVERHEAD_MB VS property.
+///
+/// Any successfully parsed u64 value (including zero) is accepted. When the
+/// property is absent, empty, or unparseable the default is
+/// `DEFAULT_INSTANCE_OVERHEAD_MB`.
+fn resolve_instance_overhead_mb(props: &Json) -> u64 {
+    str_prop(props, PROP_INSTANCE_OVERHEAD_MB)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
 }
 
 /// Open a connect-back session and run `SELECT NPROC()` and
@@ -603,6 +662,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let schema_metadata = serde_json::json!({
             "tables": [],
@@ -645,6 +706,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -701,6 +764,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -735,6 +800,8 @@ mod tests {
             factor,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
         let parsed: serde_json::Value =
@@ -775,6 +842,8 @@ mod tests {
             12,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -810,6 +879,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -913,6 +984,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             val,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -952,6 +1025,8 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             val,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -959,6 +1034,139 @@ mod tests {
             parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
             Some("2"),
             "DF_THREADS_PER_UDF must round-trip through adapterNotes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 5.1 — MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB resolver tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: resolve_memory_pool_fraction defaults/validates.
+    #[test]
+    fn resolve_memory_pool_fraction_defaults_and_validates() {
+        // Absent → default.
+        let absent = serde_json::json!({});
+        assert_eq!(
+            resolve_memory_pool_fraction(&absent),
+            DEFAULT_MEMORY_POOL_FRACTION,
+            "absent → default 0.6"
+        );
+
+        // Empty string → default (str_prop filters empty strings).
+        let empty = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "" });
+        assert_eq!(
+            resolve_memory_pool_fraction(&empty),
+            DEFAULT_MEMORY_POOL_FRACTION,
+            "empty → default 0.6"
+        );
+
+        // "0" → out of range (must be > 0.0) → default.
+        let zero = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0" });
+        assert_eq!(
+            resolve_memory_pool_fraction(&zero),
+            DEFAULT_MEMORY_POOL_FRACTION,
+            "\"0\" is out of range → default 0.6"
+        );
+
+        // "1.5" → > 1.0, out of range → default.
+        let too_large = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.5" });
+        assert_eq!(
+            resolve_memory_pool_fraction(&too_large),
+            DEFAULT_MEMORY_POOL_FRACTION,
+            "\"1.5\" is out of range → default 0.6"
+        );
+
+        // "0.5" → valid.
+        let valid = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0.5" });
+        assert_eq!(
+            resolve_memory_pool_fraction(&valid),
+            0.5,
+            "\"0.5\" must be accepted"
+        );
+
+        // "1.0" → exactly 1.0, boundary valid.
+        let one = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.0" });
+        assert_eq!(
+            resolve_memory_pool_fraction(&one),
+            1.0,
+            "\"1.0\" is exactly at the upper bound and must be accepted"
+        );
+    }
+
+    /// Scenario: resolve_instance_overhead_mb defaults/validates.
+    #[test]
+    fn resolve_instance_overhead_mb_defaults_and_validates() {
+        // Absent → default.
+        let absent = serde_json::json!({});
+        assert_eq!(
+            resolve_instance_overhead_mb(&absent),
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            "absent → default 200"
+        );
+
+        // Empty string → default (str_prop filters empty strings).
+        let empty = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "" });
+        assert_eq!(
+            resolve_instance_overhead_mb(&empty),
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            "empty → default 200"
+        );
+
+        // "0" → valid (zero overhead is permitted).
+        let zero = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "0" });
+        assert_eq!(
+            resolve_instance_overhead_mb(&zero),
+            0,
+            "\"0\" is a valid overhead (zero)"
+        );
+
+        // "256" → valid.
+        let valid = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "256" });
+        assert_eq!(
+            resolve_instance_overhead_mb(&valid),
+            256,
+            "\"256\" must be returned as-is"
+        );
+
+        // Garbage → default.
+        let garbage = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "not-a-number" });
+        assert_eq!(
+            resolve_instance_overhead_mb(&garbage),
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            "unparseable value → default 200"
+        );
+    }
+
+    /// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through
+    /// build_adapter_notes → adapter_note (mirroring adapter_notes_cluster_nodes_round_trips).
+    #[test]
+    fn memory_budget_params_round_trip_through_adapter_notes() {
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &create_req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            0.5,
+            256,
+        );
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+        });
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_MEMORY_POOL_FRACTION).as_deref(),
+            Some("0.5"),
+            "MEMORY_POOL_FRACTION must round-trip through adapterNotes"
+        );
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_INSTANCE_OVERHEAD_MB).as_deref(),
+            Some("256"),
+            "INSTANCE_OVERHEAD_MB must round-trip through adapterNotes"
         );
     }
 }
