@@ -1,17 +1,10 @@
 # Feature: Create Virtual Schema
 
-Lets an Exasol user register an Iceberg table (resolved through an Iceberg REST
-catalog over S3-compatible storage, including AWS Glue with SigV4-signed requests)
-as a queryable virtual schema, so the table's columns appear to Exasol with correctly
-mapped SQL types, and records — in the response `adapterNotes` — the cluster's
-active node count (via `NPROC()`), the per-node core count (via
-`PARAM_VALUE('NR_OF_CORES')`), a parallelism factor, the per-UDF DataFusion
-threading configuration (target partitions and Tokio worker threads), and the
-per-instance memory budget controls (memory-pool fraction and container-overhead
-megabytes), so later pushdowns can size the oversubscribed work-unit shard count
-and bound each scan UDF instance's CPU and memory usage.
+Lets an Exasol user register every Iceberg table in a configured namespace (resolved through an Iceberg REST catalog over S3-compatible storage, including AWS Glue with SigV4-signed requests) as queryable virtual tables, so each table's columns appear to Exasol with correctly mapped SQL types, and records — in the response adapterNotes — the cluster's active node count, per-node core count, parallelism factor, DataFusion threading and memory-budget controls, and the Exasol-name to Iceberg-identifier map so later pushdowns can size sharding and recover the scanned table.
 
 ## Background
+
+The catalog endpoint and storage credentials are supplied through the Exasol CONNECTION object named by the `CATALOG_CONNECTION` property; the namespace to expose is supplied by the `ICEBERG_NAMESPACE` property. The adapter holds no state between requests other than the values it returns in `schemaMetadata.adapterNotes`, which Exasol persists.
 
 * Catalog endpoint and storage credentials are supplied through a CONNECTION object
   named by `CATALOG_CONNECTION`. The adapter resolves credentials via `ctx.connection`
@@ -23,32 +16,15 @@ and bound each scan UDF instance's CPU and memory usage.
   The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as Exasol
   2025.2.1 silently drops adapter-returned properties. The `adapterNotes` channel is
   queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
-* `NPROC()` and `PARAM_VALUE('NR_OF_CORES')` are obtained over a single read-only
-  connect-back session and recorded as `CLUSTER_NODES` and `NR_OF_CORES`.
-* The parallelism factor is supplied as a VS/connection property and recorded
-  alongside `CLUSTER_NODES` and `NR_OF_CORES`; when absent it defaults to a
-  hardware-aware value derived from `NR_OF_CORES`.
-* The DataFusion threading configuration is two independent VS/connection
-  properties — `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` —
-  each recorded in `adapterNotes` and each defaulting to `1`. They bound how many
-  DataFusion partitions and Tokio worker threads a single scan UDF instance uses,
-  so that the product of (per-node concurrent UDF instances) × (per-instance
-  threads) does not oversubscribe a node's cores. The recommended scale-up value
-  for `DATAFUSION_TARGET_PARTITIONS` is `max(1, floor(NR_OF_CORES / parallelism_factor))`;
-  this is documented guidance, not enforced — the defaults stay `1` unless the user
-  overrides them.
-* The per-instance memory budget is two independent VS/connection properties —
-  `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) —
-  each recorded in `adapterNotes` and round-tripped into every per-shard scan spec,
-  where the scan UDF sizes its DataFusion pool to
-  `fraction × (per_instance_limit − overhead_bytes)`.
 * The adapter is the Rust ADAPTER SCRIPT entry point of a single `.so`; it speaks the
   Exasol virtual-schema JSON protocol (request in, JSON response out).
-* Schema mapping (C.2) MUST use the same mapping as the scan, defined in the
+* Schema mapping MUST use the same mapping as the scan, defined in the
   `datafusion-scan/type-mapping` feature. Columns whose Arrow type Exasol cannot
   represent (list, struct, map, binary, out-of-range decimal, and the other incompatible
   types) are declared as `VARCHAR(2000000)` — they MUST NOT cause `createVirtualSchema`
   to error.
+* Cluster configuration and the Exasol-name to Iceberg-identifier map are recorded in
+  `adapterNotes` per `vs-adapter/create-virtual-schema-adapter-notes`.
 
 ## Scenarios
 
@@ -60,97 +36,35 @@ and bound each scan UDF instance's CPU and memory usage.
 * *AND* the capabilities list MUST NOT include `FN_PRED_GREATER` or `FN_PRED_GREATEREQUAL` (those names do not exist in the Exasol capability vocabulary — Exasol normalises `a > b` to `b < a` and `a >= b` to `b <= a` before it reaches the adapter — so advertising them is misleading dead capability), nor any of `ORDER_BY_COLUMN`/`ORDER_BY_EXPRESSION`, `JOIN*`, geospatial (`FN_ST_*`), Exasol-only session functions (`FN_CURRENT_USER`/`FN_SYS_GUID`/`FN_CURRENT_SCHEMA`), `LITERAL_INTERVAL`, `AGGREGATE_GROUP_BY_TUPLE`, any `*_DISTINCT` aggregate, `FN_AGG_MEDIAN`, `FN_AGG_APPROXIMATE_COUNT_DISTINCT`, or any `FN_AGG_GROUP_CONCAT*`/`FN_AGG_LISTAGG`
 * *AND* every advertised capability name MUST be one the adapter can either translate via the VS expression translator or decompose into a correct partial/merge plan, so the advertised set never claims behaviour the engine cannot execute correctly
 
-### Scenario: Create virtual schema maps the Iceberg table schema
+### Scenario: Create virtual schema enumerates every table in the configured namespace
 
-* *GIVEN* an Iceberg table exists in the REST catalog
-* *AND* the catalog endpoint and storage credentials are supplied through the CONNECTION object named by `CATALOG_CONNECTION`
-* *WHEN* Exasol sends a `createVirtualSchema` request naming that table
-* *THEN* the adapter SHALL resolve credentials via `ctx.connection`, SigV4-sign the catalog requests when enabled, and resolve the table's current Iceberg schema
-* *AND* the adapter SHALL return a JSON response describing one virtual table whose columns map each Iceberg field to an Exasol SQL type per the type-mapping table, declaring any Exasol-incompatible type as VARCHAR rather than failing
-* *AND* the adapter MUST NOT persist any catalog metadata between requests
+* *GIVEN* an Iceberg REST catalog reachable through the CONNECTION named by `CATALOG_CONNECTION`
+* *AND* a `createVirtualSchema` request that supplies an `ICEBERG_NAMESPACE` property naming an Iceberg namespace (one or more dot-separated levels, e.g. `finance` or `prod.finance`)
+* *WHEN* Exasol sends the `createVirtualSchema` request
+* *THEN* the adapter SHALL list every table contained in that namespace and in each of its descendant namespaces, resolving credentials via `CATALOG_CONNECTION` and SigV4-signing the catalog requests when enabled
+* *AND* the adapter SHALL return a JSON response describing one virtual table per discovered Iceberg table, whose Exasol name is the namespace segments below the configured namespace plus the table name joined with `__` and uppercased, mapping each Iceberg field to an Exasol SQL type per the type-mapping table and declaring any incompatible type as VARCHAR rather than failing
+* *AND* the adapter MUST NOT persist any catalog metadata between requests other than the table-name map recorded in `adapterNotes`
 
 ### Scenario: Create virtual schema fails clearly when the catalog is unreachable
 
 * *GIVEN* the Iceberg REST catalog endpoint resolved from the CONNECTION cannot be reached
 * *WHEN* Exasol sends a `createVirtualSchema` request
-* *THEN* the adapter SHALL return an error describing that the catalog could not be reached
+* *THEN* the adapter SHALL return an error describing that the catalog could not be reached or the namespace could not be listed
 * *AND* the error message MUST NOT contain storage access keys, secret keys, session tokens, or any SigV4 signing key
 
-### Scenario: Adapter records the cluster node count in the virtual-schema adapterNotes
+### Scenario: Create virtual schema records the Exasol-name to Iceberg-identifier map in adapterNotes
 
-* *GIVEN* an Exasol session that has installed the VS adapter script
-* *AND* the catalog and storage connection properties are supplied to the adapter
-* *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL open a connect-back session to Exasol and run `SELECT NPROC()` to obtain the count of active cluster nodes
-* *AND* the adapter SHALL return the resolved node count as a positive-integer `CLUSTER_NODES` entry inside the `createVirtualSchema` response's `adapterNotes` (stringified JSON), which Exasol persists and which is queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`
-* *AND* the adapter MUST NOT persist the node count anywhere other than that returned `adapterNotes`
+* *GIVEN* a `createVirtualSchema` request that enumerates one or more tables in the configured namespace
+* *WHEN* the adapter builds the `createVirtualSchema` response
+* *THEN* the adapter SHALL record, inside the response's `schemaMetadata.adapterNotes` (a stringified JSON object), a `TABLE_MAP` entry mapping each uppercased `__`-flattened Exasol table name to its original-cased fully-qualified Iceberg identifier (dot-joined namespace segments plus table name)
+* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry (`CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion threading and memory-budget entries) when writing `TABLE_MAP`
+* *AND* the recorded map SHALL round-trip back to the adapter at pushdown time so a pushdown can recover the exact Iceberg identifier from the Exasol table name without re-listing the catalog
+* *AND* the adapter MUST NOT persist the map anywhere other than the returned `adapterNotes`
 
-### Scenario: Cluster node count defaults to one when it cannot be determined
+### Scenario: Multi-level Iceberg namespaces flatten deterministically into Exasol table names
 
-* *GIVEN* the VS adapter cannot open a connect-back session or `SELECT NPROC()` fails
-* *WHEN* Exasol sends a `createVirtualSchema` request
-* *THEN* the adapter SHALL write `CLUSTER_NODES: 1` into the `adapterNotes` of the `createVirtualSchema` response
-* *AND* the adapter SHALL still return a successful `createVirtualSchema` response describing the mapped table
-* *AND* the resulting single-shard behaviour MUST be identical to the pre-sharding single-node execution path
-
-### Scenario: Adapter records the parallelism factor in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that supplies a `PARALLELISM_FACTOR` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the supplied parallelism factor in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES` and `NR_OF_CORES`
-* *AND* when the `PARALLELISM_FACTOR` property is absent or not a positive integer the adapter SHALL default the parallelism factor to `NR_OF_CORES × 2`
-* *AND* the adapter SHALL floor that default at 8 so that when `NR_OF_CORES` is 0, unavailable, or yields a product below 8 the parallelism factor is at least 8, persisting it nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the per-node core count in the virtual-schema adapterNotes
-
-* *GIVEN* an Exasol session that has installed the VS adapter script and supplies the catalog and storage connection properties
-* *WHEN* Exasol sends a `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL, in the same read-only connect-back session it opens for `SELECT NPROC()`, run `SELECT PARAM_VALUE('NR_OF_CORES')` to obtain the per-node core count
-* *AND* the adapter SHALL parse the returned VARCHAR to a non-negative integer and record it as an `NR_OF_CORES` entry inside the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES` and `PARALLELISM_FACTOR`
-* *AND* the adapter SHALL write `NR_OF_CORES: 0` and still return a successful `createVirtualSchema` response when the session cannot be opened, the query fails, or the value cannot be parsed, persisting the core count nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the DataFusion target partition count in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_TARGET_PARTITIONS` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, and `PARALLELISM_FACTOR`
-* *AND* the adapter SHALL default the target partition count to `1` when the `DATAFUSION_TARGET_PARTITIONS` property is absent, empty, zero, or not a positive integer
-* *AND* the adapter SHALL use the supplied value when it is a positive integer, persisting the count nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_THREADS_PER_UDF` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved DataFusion threads-per-UDF count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion target partition count
-* *AND* the adapter SHALL default the threads-per-UDF count to `1` when the `DATAFUSION_THREADS_PER_UDF` property is absent, empty, zero, or not a positive integer
-* *AND* the adapter SHALL use the supplied value when it is a positive integer, persisting the count nowhere other than that returned `adapterNotes`
-
-### Scenario: Recorded node count and parallelism factor drive later work-unit sharding
-
-* *GIVEN* a `createVirtualSchema` request for which `NPROC()` resolves the active node count
-* *WHEN* the adapter returns the `createVirtualSchema` response
-* *THEN* the `adapterNotes` SHALL carry both the resolved `CLUSTER_NODES` node count and the `PARALLELISM_FACTOR`
-* *AND* both values SHALL be round-tripped back to the adapter at pushdown time so the shard count G can be computed as `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300
-
-### Scenario: Adapter records the memory-pool fraction in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `MEMORY_POOL_FRACTION` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved memory-pool fraction in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion threading entries
-* *AND* the adapter SHALL default the memory-pool fraction to `0.6` when the `MEMORY_POOL_FRACTION` property is absent, empty, not a positive number, or greater than `1.0`
-* *AND* the adapter SHALL use the supplied value when it is a positive number not greater than `1.0`, persisting the fraction nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the instance-overhead megabytes in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply an `INSTANCE_OVERHEAD_MB` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved instance-overhead megabytes in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading entries, and the memory-pool fraction
-* *AND* the adapter SHALL default the instance-overhead megabytes to `200` when the `INSTANCE_OVERHEAD_MB` property is absent, empty, or not a non-negative integer
-* *AND* the adapter SHALL use the supplied value when it is a non-negative integer, persisting the overhead nowhere other than that returned `adapterNotes`
-
-### Scenario: Recorded memory budget controls round-trip into the scan spec
-
-* *GIVEN* a `createVirtualSchema` request that records a memory-pool fraction and instance-overhead megabytes in `adapterNotes`
-* *WHEN* Exasol round-trips those `adapterNotes` back to the adapter at pushdown time and the adapter builds each per-shard scan spec
-* *THEN* the adapter SHALL carry the resolved memory-pool fraction and instance-overhead bytes into every per-shard scan spec
-* *AND* a scan spec that lacks these fields (a pre-existing spec) SHALL deserialize to the default fraction `0.6` and default overhead `200` megabytes
+* *GIVEN* a configured namespace `prod.finance` containing an Iceberg table `orders` and a child namespace `prod.finance.eu` containing a table `orders`
+* *WHEN* Exasol sends the `createVirtualSchema` request naming namespace `prod.finance`
+* *THEN* the adapter SHALL name the first virtual table `ORDERS` and the second `EU__ORDERS`, flattening only the namespace segments below the configured namespace using `__` and uppercasing the result
+* *AND* the adapter SHALL apply the same flatten function when building the `TABLE_MAP` so the Exasol name maps back to the correct original-cased Iceberg identifier
+* *AND* when two distinct Iceberg identifiers flatten to the same Exasol name (a `__` collision) the adapter SHALL return an error naming the colliding Exasol table name rather than silently dropping or overwriting a table

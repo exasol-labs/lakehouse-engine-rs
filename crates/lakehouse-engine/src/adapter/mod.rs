@@ -7,20 +7,22 @@ pub mod connection;
 pub mod pushdown;
 pub mod sharding;
 pub mod sigv4;
+pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
-use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
-use crate::scan::spec::{CatalogProps, StorageProps};
+use crate::adapter::pushdown::{handle_pushdown, list_namespace_tables, resolve_table_schema};
+use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
+use crate::scan::spec::StorageProps;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::{Value as Json, json};
+use std::collections::HashMap;
 
-// Property key names sent in VS request `properties` / `schemaMetadataInfo.properties`.
-// `TABLE` is an Exasol reserved keyword and cannot be used as a bare VS property
-// name in CREATE VIRTUAL SCHEMA, so the property is named TABLE_NAME.
-const PROP_TABLE: &str = "TABLE_NAME";
+// The Iceberg namespace to expose. Replaces the old TABLE_NAME property.
+// (TABLE is an Exasol reserved keyword; ICEBERG_NAMESPACE is not.)
+const PROP_ICEBERG_NAMESPACE: &str = "ICEBERG_NAMESPACE";
 // Required: name of the Exasol CONNECTION object that holds the catalog URI
 // (as its address) and the credential JSON (as its password).
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
@@ -76,6 +78,8 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 /// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
 /// applying the pool fraction.
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
+// adapterNotes key for the Exasol-name → Iceberg-identifier map persisted at create time.
+const NOTE_TABLE_MAP: &str = "TABLE_MAP";
 
 /// Main adapter dispatch function.
 ///
@@ -103,14 +107,14 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // an async context (it may block on the UDF host). Mirror the pattern
             // used by resolve_cluster_nodes.
             let props = get_properties(request);
-            let (catalog_uri, storage, catalog, creds) = resolve_connection_config(ctx, &props)?;
+            let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
             rt.block_on(async {
-                handle_pushdown_request(request, &catalog_uri, &storage, &catalog, &creds).await
+                handle_pushdown_request(request, &catalog_uri, &storage, &creds).await
             })
         }
         other => Err(UdfError::User(format!(
@@ -120,24 +124,22 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     }
 }
 
-/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION`
-/// object and the `TABLE_NAME` property. Shared by the createVirtualSchema and
-/// pushdown entry points. `ctx.connection()` is synchronous and must be called
-/// before entering any async runtime.
+/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION` object.
+///
+/// Shared by the createVirtualSchema and pushdown entry points. `ctx.connection()`
+/// is synchronous and must be called before entering any async runtime.
+/// Table identity is no longer fixed at config-resolution time; callers build
+/// `CatalogProps` with the specific per-table identifier when known.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageProps, CatalogProps, ConnectionCreds), UdfError> {
+) -> Result<(String, StorageProps, ConnectionCreds), UdfError> {
     let resolved = read_connection(ctx, str_prop(props, PROP_CATALOG_CONNECTION))?;
     let mut storage = storage_block(&resolved.creds);
-    let table = str_prop(props, PROP_TABLE)
-        .ok_or_else(|| UdfError::User(format!("property '{PROP_TABLE}' is required")))?
-        .to_string();
-    let catalog = catalog_block(&resolved.creds, &resolved.uri, &table);
     storage.allow_http = str_prop(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    Ok((resolved.uri, storage, catalog, resolved.creds))
+    Ok((resolved.uri, storage, resolved.creds))
 }
 
 fn handle_create_virtual_schema(
@@ -145,7 +147,16 @@ fn handle_create_virtual_schema(
     request: &Json,
 ) -> Result<Json, UdfError> {
     let props = get_properties(request);
-    let (catalog_uri, storage, catalog, creds) = resolve_connection_config(ctx, &props)?;
+    let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
+
+    let iceberg_namespace = str_prop(&props, PROP_ICEBERG_NAMESPACE)
+        .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
+        .to_string();
+
+    let configured_ns: Vec<String> = iceberg_namespace
+        .split('.')
+        .map(|s| s.to_string())
+        .collect();
 
     let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(ctx, &props);
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
@@ -159,31 +170,44 @@ fn handle_create_virtual_schema(
         .build()
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
-    let fields: Vec<(String, String)> = rt
-        .block_on(async { resolve_table_schema(&catalog_uri, &catalog, &storage, &creds).await })
+    let table_idents = rt
+        .block_on(async {
+            list_namespace_tables(&catalog_uri, &configured_ns, &storage, &creds).await
+        })
         .map_err(|e| redact_error(&storage, e))?;
 
-    // Build the virtual table columns JSON.
-    let columns: Vec<Json> = fields
-        .iter()
-        .map(|(name, ty)| {
-            json!({
-                "name": name,
-                "dataType": exasol_type_to_json(ty),
-            })
-        })
-        .collect();
+    let table_map =
+        build_table_map(&configured_ns, &table_idents).map_err(|e| redact_error(&storage, e))?;
 
-    let table_name = catalog
-        .table
-        .split('.')
-        .next_back()
-        .unwrap_or(&catalog.table)
-        .to_uppercase();
-    // Exasol persists `adapterNotes` (a JSON *string*) at the schema level and
-    // passes it back in `schemaMetadataInfo.adapterNotes` on later requests.
-    // Carry the resolved node count and parallelism factor there; merge into any
-    // pre-existing notes so we never clobber state another channel may have written.
+    let mut tables_json: Vec<Json> = Vec::with_capacity(table_idents.len());
+    for ident in &table_idents {
+        let exasol_name = flatten_table_name(&configured_ns, ident);
+        let iceberg_id = iceberg_identifier_string(ident);
+        let per_table_catalog = catalog_block(&creds, &catalog_uri, &iceberg_id);
+
+        let fields = rt
+            .block_on(async {
+                resolve_table_schema(&catalog_uri, &per_table_catalog, &storage, &creds).await
+            })
+            .map_err(|e| redact_error(&storage, e))?;
+
+        let columns: Vec<Json> = fields
+            .iter()
+            .map(|(name, ty)| {
+                json!({
+                    "name": name,
+                    "dataType": exasol_type_to_json(ty),
+                })
+            })
+            .collect();
+
+        tables_json.push(json!({
+            "name": exasol_name,
+            "columns": columns,
+        }));
+    }
+
+    // Build adapterNotes including TABLE_MAP (merge, not clobber).
     let adapter_notes = build_adapter_notes(
         request,
         cluster_nodes,
@@ -193,12 +217,11 @@ fn handle_create_virtual_schema(
         df_threads_per_udf,
         memory_pool_fraction,
         instance_overhead_mb,
+        &table_map,
     );
+
     let schema_metadata = json!({
-        "tables": [{
-            "name": table_name,
-            "columns": columns,
-        }],
+        "tables": tables_json,
         "adapterNotes": adapter_notes,
     });
 
@@ -219,7 +242,6 @@ async fn handle_pushdown_request(
     request: &Json,
     catalog_uri: &str,
     storage: &StorageProps,
-    catalog: &CatalogProps,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
     let props = get_properties(request);
@@ -250,11 +272,16 @@ async fn handle_pushdown_request(
     let instance_overhead_mb = adapter_note(request, NOTE_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB);
+
+    // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
+    let iceberg_identifier = resolve_pushdown_identifier(request)?;
+    let catalog = catalog_block(creds, catalog_uri, &iceberg_identifier);
+
     handle_pushdown(
         request,
         catalog_uri,
         storage,
-        catalog,
+        &catalog,
         scan_schema.as_deref(),
         cluster_nodes,
         parallelism_factor,
@@ -322,11 +349,79 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Read the TABLE_MAP nested object from adapterNotes.
+///
+/// Returns a `HashMap<String, String>` mapping Exasol table name → original-cased
+/// Iceberg identifier. Returns an empty map when TABLE_MAP is absent or malformed.
+fn read_table_map(request: &Json) -> HashMap<String, String> {
+    parse_adapter_notes(request)
+        .get(NOTE_TABLE_MAP)
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Flatten each `TableIdent` to an Exasol name, detect `__` collisions, and
+/// return the `(exasol_name, iceberg_identifier_string)` pairs.
+///
+/// Returns an error naming the colliding Exasol table name when two distinct
+/// identifiers flatten to the same Exasol name.
+fn build_table_map(
+    configured_ns: &[String],
+    idents: &[iceberg::TableIdent],
+) -> Result<Vec<(String, String)>, UdfError> {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    let mut table_map: Vec<(String, String)> = Vec::with_capacity(idents.len());
+    for ident in idents {
+        let exasol_name = flatten_table_name(configured_ns, ident);
+        let iceberg_id = iceberg_identifier_string(ident);
+        if let Some(existing) = seen.get(&exasol_name) {
+            return Err(UdfError::User(format!(
+                "table name collision: '{exasol_name}' maps to both '{existing}' and '{iceberg_id}'"
+            )));
+        }
+        seen.insert(exasol_name.clone(), iceberg_id.clone());
+        table_map.push((exasol_name, iceberg_id));
+    }
+    Ok(table_map)
+}
+
+/// Resolve the Iceberg identifier for the pushdown's involved virtual table.
+///
+/// Reads `involvedTables[0].name`, looks it up in the persisted `TABLE_MAP`, and
+/// returns the original-cased Iceberg identifier. Errors when the request carries
+/// no involved table, or the name is absent from `TABLE_MAP` (never silently
+/// scans a different or stale table).
+fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
+    let involved_table_name = request
+        .get("involvedTables")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|t| t.get("name"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| UdfError::User("pushdown request missing involvedTables[0].name".into()))?;
+
+    read_table_map(request)
+        .get(involved_table_name)
+        .cloned()
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "pushdown: virtual table '{involved_table_name}' is not in TABLE_MAP; \
+                 drop and recreate the virtual schema"
+            ))
+        })
+}
+
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
 /// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
 /// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF,
-/// MEMORY_POOL_FRACTION, and INSTANCE_OVERHEAD_MB. Any pre-existing notes on
-/// the request are preserved (merge, not clobber).
+/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, and TABLE_MAP (a nested JSON
+/// object mapping Exasol table names to original-cased Iceberg identifiers).
+/// Any pre-existing notes on the request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
@@ -339,6 +434,7 @@ fn build_adapter_notes(
     df_threads_per_udf: usize,
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
+    table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
     notes.insert(
@@ -369,6 +465,12 @@ fn build_adapter_notes(
         NOTE_INSTANCE_OVERHEAD_MB.to_string(),
         Json::String(instance_overhead_mb.to_string()),
     );
+    // TABLE_MAP: nested JSON object within the notes string.
+    let map_obj: serde_json::Map<String, Json> = table_map
+        .iter()
+        .map(|(k, v)| (k.clone(), Json::String(v.clone())))
+        .collect();
+    notes.insert(NOTE_TABLE_MAP.to_string(), Json::Object(map_obj));
     Json::String(Json::Object(notes).to_string())
 }
 
@@ -664,6 +766,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let schema_metadata = serde_json::json!({
             "tables": [],
@@ -708,6 +811,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -766,6 +870,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -802,6 +907,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
         let parsed: serde_json::Value =
@@ -844,6 +950,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -881,6 +988,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -986,6 +1094,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -1027,6 +1136,7 @@ mod tests {
             val,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
         );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -1151,6 +1261,7 @@ mod tests {
             DEFAULT_DF_THREADS_PER_UDF,
             0.5,
             256,
+            &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -1167,6 +1278,307 @@ mod tests {
             adapter_note(&pushdown_req, NOTE_INSTANCE_OVERHEAD_MB).as_deref(),
             Some("256"),
             "INSTANCE_OVERHEAD_MB must round-trip through adapterNotes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // TABLE_MAP round-trip, pushdown table derivation, and collision tests.
+    // ---------------------------------------------------------------------------
+
+    /// TABLE_MAP round-trips through build_adapter_notes → read_table_map.
+    #[test]
+    fn table_map_round_trips_through_adapter_notes() {
+        let table_map = vec![
+            ("ORDERS".to_string(), "prod.finance.orders".to_string()),
+            (
+                "EU__ORDERS".to_string(),
+                "prod.finance.eu.orders".to_string(),
+            ),
+        ];
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &create_req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &table_map,
+        );
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+        });
+        let recovered = read_table_map(&pushdown_req);
+        assert_eq!(
+            recovered.get("ORDERS").map(|s| s.as_str()),
+            Some("prod.finance.orders"),
+            "ORDERS must map to prod.finance.orders"
+        );
+        assert_eq!(
+            recovered.get("EU__ORDERS").map(|s| s.as_str()),
+            Some("prod.finance.eu.orders"),
+            "EU__ORDERS must map to prod.finance.eu.orders"
+        );
+        assert_eq!(recovered.len(), 2, "map must have exactly two entries");
+    }
+
+    /// TABLE_MAP is stored as a nested JSON object, not a string.
+    #[test]
+    fn table_map_stored_as_nested_json_object() {
+        let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &create_req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &table_map,
+        );
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+        // TABLE_MAP must be a JSON object, not a string.
+        assert!(
+            parsed[NOTE_TABLE_MAP].is_object(),
+            "TABLE_MAP must be a nested JSON object: {parsed}"
+        );
+        assert_eq!(
+            parsed[NOTE_TABLE_MAP]["EVENTS"].as_str(),
+            Some("db.events"),
+            "TABLE_MAP.EVENTS must equal 'db.events'"
+        );
+    }
+
+    /// TABLE_MAP round-trip preserves other adapterNotes entries (merge, not clobber).
+    #[test]
+    fn table_map_merges_with_existing_notes() {
+        let req = serde_json::json!({
+            "type": "refreshVirtualSchema",
+            "schemaMetadataInfo": {
+                "adapterNotes": "{\"CLUSTER_NODES\":\"5\",\"OTHER\":\"preserved\"}"
+            },
+        });
+        let notes = build_adapter_notes(
+            &req,
+            5,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[("T".to_string(), "ns.t".to_string())],
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
+        assert_eq!(parsed[NOTE_CLUSTER_NODES].as_str(), Some("5"));
+        assert!(parsed[NOTE_TABLE_MAP].is_object());
+    }
+
+    /// read_table_map returns an empty map when TABLE_MAP is absent from adapterNotes.
+    #[test]
+    fn read_table_map_absent_returns_empty() {
+        let req = serde_json::json!({"type": "pushdown"});
+        let map = read_table_map(&req);
+        assert!(map.is_empty(), "absent TABLE_MAP must return empty map");
+
+        // adapterNotes present but no TABLE_MAP key.
+        let req2 = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": {
+                "adapterNotes": "{\"CLUSTER_NODES\":\"1\"}"
+            },
+        });
+        let map2 = read_table_map(&req2);
+        assert!(
+            map2.is_empty(),
+            "missing TABLE_MAP key must return empty map"
+        );
+    }
+
+    /// Build a pushdown request whose adapterNotes carry `table_map` and whose
+    /// involved virtual table is `involved`.
+    fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &str) -> Json {
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &create_req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            table_map,
+        );
+        let notes_str = notes.as_str().unwrap().to_string();
+        serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+            "involvedTables": [{"name": involved, "columns": []}],
+        })
+    }
+
+    /// Pushdown with an unknown virtual table name returns a clear error naming it.
+    #[test]
+    fn pushdown_unknown_involved_table_errors() {
+        let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
+        let request = pushdown_request_with_table_map(&table_map, "UNKNOWN_TABLE");
+
+        let err = resolve_pushdown_identifier(&request).unwrap_err();
+        assert!(
+            err.to_string().contains("UNKNOWN_TABLE"),
+            "error must name the unknown table: {err}"
+        );
+    }
+
+    /// TABLE_MAP lookup succeeds for a known virtual table name.
+    #[test]
+    fn pushdown_known_involved_table_resolves_identifier() {
+        let table_map = vec![("ORDERS".to_string(), "prod.finance.orders".to_string())];
+        let request = pushdown_request_with_table_map(&table_map, "ORDERS");
+
+        assert_eq!(
+            resolve_pushdown_identifier(&request).unwrap(),
+            "prod.finance.orders",
+            "ORDERS must resolve to prod.finance.orders"
+        );
+    }
+
+    /// Multi-level namespace flattening is deterministic and collision detection
+    /// returns a clear error naming the colliding Exasol table name.
+    ///
+    /// Scenario: configured `prod.finance` namespace.
+    /// - ns `prod.finance` table `orders`   → Exasol name `ORDERS`
+    /// - ns `prod.finance.eu` table `orders` → Exasol name `EU__ORDERS`
+    ///
+    /// Collision pair: ns `prod.finance` table `eu__orders` AND
+    /// ns `prod.finance.eu` table `orders` both flatten to `EU__ORDERS`.
+    #[test]
+    fn flatten_multilevel_namespace_and_detect_collision() {
+        use iceberg::{NamespaceIdent, TableIdent};
+
+        let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+
+        let direct = TableIdent::new(
+            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
+            "orders".into(),
+        );
+        let descendant = TableIdent::new(
+            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()]).unwrap(),
+            "orders".into(),
+        );
+
+        let result = build_table_map(&configured_ns, &[direct, descendant]).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            ("ORDERS".to_string(), "prod.finance.orders".to_string())
+        );
+        assert_eq!(
+            result[1],
+            (
+                "EU__ORDERS".to_string(),
+                "prod.finance.eu.orders".to_string()
+            )
+        );
+
+        // Collision: ns `prod.finance` table `eu__orders` clashes with
+        // ns `prod.finance.eu` table `orders` — both flatten to `EU__ORDERS`.
+        let collider_a = TableIdent::new(
+            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
+            "eu__orders".into(),
+        );
+        let collider_b = TableIdent::new(
+            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()]).unwrap(),
+            "orders".into(),
+        );
+        let err = build_table_map(&configured_ns, &[collider_a, collider_b]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("EU__ORDERS"),
+            "error must name the colliding Exasol table name: {msg}"
+        );
+        assert!(
+            msg.contains("collision"),
+            "error must mention 'collision': {msg}"
+        );
+    }
+
+    /// Build a table_map, write it through build_adapter_notes, parse the
+    /// adapterNotes JSON string, and assert:
+    /// - TABLE_MAP contains the expected Exasol-name → Iceberg-identifier entries.
+    /// - A pre-existing note (CLUSTER_NODES) is still present after the merge.
+    #[test]
+    fn create_vs_records_table_map_in_adapter_notes() {
+        use iceberg::{NamespaceIdent, TableIdent};
+
+        let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+        let idents = vec![
+            TableIdent::new(
+                NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
+                "orders".into(),
+            ),
+            TableIdent::new(
+                NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()])
+                    .unwrap(),
+                "orders".into(),
+            ),
+        ];
+        let table_map = build_table_map(&configured_ns, &idents).unwrap();
+
+        // Simulate a request with a pre-existing CLUSTER_NODES note.
+        let request = serde_json::json!({
+            "type": "createVirtualSchema",
+            "schemaMetadataInfo": {
+                "adapterNotes": "{\"CLUSTER_NODES\":\"3\"}"
+            }
+        });
+        let notes = build_adapter_notes(
+            &request,
+            3,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &table_map,
+        );
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+
+        // TABLE_MAP must be a nested object mapping Exasol names → Iceberg identifiers.
+        let table_map_obj = parsed[NOTE_TABLE_MAP]
+            .as_object()
+            .expect("TABLE_MAP must be a JSON object");
+        assert_eq!(
+            table_map_obj.get("ORDERS").and_then(|v| v.as_str()),
+            Some("prod.finance.orders"),
+            "TABLE_MAP must map ORDERS → prod.finance.orders"
+        );
+        assert_eq!(
+            table_map_obj.get("EU__ORDERS").and_then(|v| v.as_str()),
+            Some("prod.finance.eu.orders"),
+            "TABLE_MAP must map EU__ORDERS → prod.finance.eu.orders"
+        );
+
+        // Pre-existing CLUSTER_NODES must survive the merge (not clobbered).
+        assert_eq!(
+            parsed[NOTE_CLUSTER_NODES].as_str(),
+            Some("3"),
+            "CLUSTER_NODES must be preserved after build_adapter_notes"
         );
     }
 }
