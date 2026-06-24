@@ -672,3 +672,55 @@ Expose two independent VS properties — `DATAFUSION_TARGET_PARTITIONS` (→ Dat
 ### Consequences
 
 By default each scan UDF instance uses exactly one core (one DataFusion partition, one Tokio thread). The cluster-level shard fan-out is the single, predictable source of parallelism and a node is never oversubscribed by default. Operators may raise both settings for workloads that benefit from intra-instance parallelism. The `ScanSpec` fields are optional with serde defaults so pre-existing serialized specs deserialize unchanged (backward-compatible ABI extension).
+
+## ADR-025: Subtract a Constant Container-Overhead Before Applying the Memory-Pool Fraction
+
+**Date:** 2026-06-24
+**Plan:** `change-memory-pool-sizing`
+**Status:** Accepted
+
+### Context
+
+`build_runtime_env` sized the DataFusion memory pool to `0.6 × ctx.memory_limit()`. `ctx.memory_limit()` is the per-process `RLIMIT_RSS` cap, which counts everything resident in the process — the Rust SLC binary, shared libraries, allocator arenas, and stacks — before DataFusion's allocator takes over. The Rust SLC container consumes roughly 150 MB of that budget at startup. Treating the full RSS limit as DataFusion-available systematically over-allocates the pool, pushing each instance closer to the engine's 80% concurrency-stall threshold and increasing OOM risk on dense nodes.
+
+### Decision
+
+The new positive-limit formula is `budget = max(fraction × (limit − overhead_bytes), MIN_POOL_FLOOR_BYTES)`. The overhead is subtracted as an absolute byte count before applying the fraction. Both `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) are VS properties, recorded in `adapterNotes`, round-tripped at pushdown, and carried in each per-shard `ScanSpec`. Only `ctx.memory_limit()` is read at UDF runtime.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Subtract a constant overhead before applying the fraction | ✓ Chosen — overhead is constant in absolute bytes, not proportional to the limit |
+| Lower the fraction (e.g. 0.5) to implicitly account for overhead | ✗ Rejected — a proportional reduction is wrong as the limit scales; a constant subtraction models reality |
+| No change (keep `0.6 × limit`) | ✗ Rejected — systematically over-allocates by ~150 MB per instance |
+
+### Consequences
+
+The pool budget is `fraction × (limit − overhead)` for any positive-limit invocation. Subtracting overhead can only lower the budget, so the handbrake invariant (`budget < 0.8 × limit`) is preserved for any non-negative overhead. The formula stays correct as the RSS limit scales. The zero-limit fallback (`DEFAULT_BUDGET_BYTES = 1 GiB`) is unchanged. Both inputs are VS-configurable and default-safe.
+
+## ADR-026: Default `INSTANCE_OVERHEAD_MB` to 200 MB
+
+**Date:** 2026-06-24
+**Plan:** `change-memory-pool-sizing`
+**Status:** Accepted
+
+### Context
+
+The empirical Rust SLC container overhead at startup (binary + shared libraries + allocator arenas + stacks) is approximately 150 MB. A default for `INSTANCE_OVERHEAD_MB` must be chosen conservatively: under-sizing the overhead causes the pool budget to be too large and risks OOM; over-sizing it merely gives DataFusion a slightly smaller pool.
+
+### Decision
+
+Default `INSTANCE_OVERHEAD_MB` to `200` MB. This adds a ~50 MB cushion over the empirical 150 MB estimate to absorb variance from shared-library versions, allocator arena growth, and stack usage, without materially shrinking the DataFusion pool relative to the pre-change `0.6 × limit` formula.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| 200 MB | ✓ Chosen — 50 MB margin over the empirical estimate; OOM risk lowered without material pool reduction |
+| 150 MB (empirical estimate) | ✗ Rejected — no margin for variance; under-sizing risks OOM, which is strictly worse than a slightly smaller pool |
+| 256 MB | ✗ Rejected — unnecessarily large; shrinks the pool by an extra 56 MB versus 200 MB with no additional safety |
+
+### Consequences
+
+On the default 4096 MB per-instance limit the new budget is `0.6 × (4096 − 200) = 2338 MB`, versus `0.6 × 4096 = 2458 MB` previously — a ~120 MB reduction, well within the engine's `0.8 × 4096 = 3277 MB` handbrake. Operators may tune `INSTANCE_OVERHEAD_MB` via a VS property if their container footprint is measurably different.
