@@ -19,7 +19,9 @@
 mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_NAMESPACE, E2E_TABLE, E2E_TABLE_2, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, seed_events,
+    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, PART_CENTRAL_IDS, PART_COL,
+    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
+    SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, seed_events,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -27,6 +29,10 @@ use common::stack::{
     local_stack_connection_password, upload_to_bucketfs, wait_for_exasol, wait_for_iceberg_catalog,
     wait_for_minio,
 };
+
+use lakehouse_engine::adapter::connection::ConnectionCreds;
+use lakehouse_engine::adapter::pushdown::resolve_file_list;
+use lakehouse_engine::scan::spec::{CatalogProps, StorageProps};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1264,6 +1270,275 @@ fn e2e_pushdown_scans_table_from_involved_tables() {
     assert_eq!(
         first_label, "label-01",
         "id=1 must have label 'label-01', got '{first_label}'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Group E — Iceberg file-pruning E2E tests (tasks 5.2 + 5.3)
+//
+// Seed recap (regions table, 3 files):
+//   north   → ids 1..=5    (5 rows per file, partition value "north")
+//   central → ids 6..=10   (5 rows per file, partition value "central")
+//   south   → ids 11..=15  (5 rows per file, partition value "south")
+//
+// The VS exposes the table as MY_LAKEHOUSE.REGIONS (Exasol-uppercased).
+// ---------------------------------------------------------------------------
+
+/// Helper: virtual schema name for the partitioned regions table.
+fn vs_regions_table() -> String {
+    format!("{VS_NAME}.{}", E2E_PART_TABLE.to_uppercase())
+}
+
+/// Build a `ConnectionCreds` pointing at the host-visible local Docker stack.
+///
+/// Used by the adapter-level file-resolution tests (task 5.3) that call
+/// `resolve_file_list` directly rather than going through Exasol pushdown.
+/// The host-visible catalog and MinIO URLs (not the internal Docker aliases)
+/// are used because the test process runs on the host, not inside a container.
+fn local_stack_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "s3://warehouse/".to_string(),
+        endpoint: common::stack::minio_url(),
+        region: "us-east-1".to_string(),
+        access_key: "minioadmin".to_string(),
+        secret_key: "minioadmin".to_string(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+    }
+}
+
+/// Build `StorageProps` for the host-visible local Docker stack.
+fn local_stack_storage() -> StorageProps {
+    StorageProps {
+        endpoint: common::stack::minio_url(),
+        region: "us-east-1".to_string(),
+        access_key: "minioadmin".to_string(),
+        secret_key: "minioadmin".to_string(),
+        session_token: None,
+        allow_http: true,
+        path_style: true,
+    }
+}
+
+/// Build `CatalogProps` for the host-visible local Docker stack, for `table`.
+fn local_stack_catalog(table: &str) -> CatalogProps {
+    CatalogProps {
+        uri: common::stack::iceberg_catalog_url(),
+        warehouse: "s3://warehouse/".to_string(),
+        table: table.to_string(),
+    }
+}
+
+/// Task 5.2 — Partition filter prunes and returns correct rows.
+///
+/// Asserts:
+/// - `SELECT id FROM {VS}.REGIONS WHERE region = 'north'` returns exactly ids 1..=5
+///   (5 rows, matching PART_NORTH_IDS) — correct rows, partition pruning applied.
+/// - `SELECT id FROM {VS}.REGIONS WHERE region = 'central'` returns exactly ids 6..=10
+///   (5 rows, matching PART_CENTRAL_IDS) — a second partition value to increase
+///   confidence that the filter is correct, not just returning all rows.
+/// - Correctness is the primary assertion; file-count pruning is asserted in 5.3.
+#[test]
+fn e2e_partition_filter_prunes_and_returns_correct_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // --- north partition: ids 1..=5 ---
+    let north_sql = format!(
+        "SELECT id FROM {} WHERE {} = '{}' ORDER BY id",
+        vs_regions_table(),
+        PART_COL,
+        PART_VAL_NORTH,
+    );
+    let north_cols = conn.query_columns(&north_sql);
+    assert_eq!(
+        north_cols.len(),
+        1,
+        "SELECT id FROM REGIONS WHERE region='north' must return 1 column: {north_cols:?}"
+    );
+    assert_eq!(
+        north_cols[0].len(),
+        PART_ROWS_PER_FILE,
+        "north partition must return exactly {} rows, got {}: {north_cols:?}",
+        PART_ROWS_PER_FILE,
+        north_cols[0].len()
+    );
+
+    let north_ids: Vec<i64> = north_cols[0]
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("north id not integer: {v:?}"))
+        })
+        .collect();
+
+    let expected_north: Vec<i64> = (PART_NORTH_IDS.0 as i64..=PART_NORTH_IDS.1 as i64).collect();
+    assert_eq!(
+        north_ids, expected_north,
+        "north partition ids must be exactly {expected_north:?}, got {north_ids:?}"
+    );
+
+    // --- central partition: ids 6..=10 ---
+    let central_sql = format!(
+        "SELECT id FROM {} WHERE {} = '{}' ORDER BY id",
+        vs_regions_table(),
+        PART_COL,
+        PART_VAL_CENTRAL,
+    );
+    let central_cols = conn.query_columns(&central_sql);
+    assert_eq!(
+        central_cols[0].len(),
+        PART_ROWS_PER_FILE,
+        "central partition must return exactly {} rows, got {}: {central_cols:?}",
+        PART_ROWS_PER_FILE,
+        central_cols[0].len()
+    );
+
+    let central_ids: Vec<i64> = central_cols[0]
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("central id not integer: {v:?}"))
+        })
+        .collect();
+
+    let expected_central: Vec<i64> =
+        (PART_CENTRAL_IDS.0 as i64..=PART_CENTRAL_IDS.1 as i64).collect();
+    assert_eq!(
+        central_ids, expected_central,
+        "central partition ids must be exactly {expected_central:?}, got {central_ids:?}"
+    );
+
+    // --- total row count sanity: filtering all partitions yields the full table ---
+    let total = conn.query_row_count(&format!("SELECT id FROM {}", vs_regions_table()));
+    assert_eq!(
+        total, PART_TOTAL_ROWS as i64,
+        "REGIONS total row count must be {PART_TOTAL_ROWS} (all 3 partitions), got {total}"
+    );
+
+    // --- LIKE correctness: untranslatable predicate → DataFusion applies it, correct count ---
+    // ponytail: LIKE is not pushed to Iceberg (untranslatable); DataFusion applies the full
+    // filter as correctness backstop. Verifies the untranslatable-conjunct path.
+    let like_count = conn.query_row_count(&format!(
+        "SELECT id FROM {} WHERE {} LIKE 'nor%'",
+        vs_regions_table(),
+        PART_COL,
+    ));
+    assert_eq!(
+        like_count, PART_ROWS_PER_FILE as i64,
+        "LIKE 'nor%' (untranslatable, DataFusion applies) must return {PART_ROWS_PER_FILE} rows, \
+         got {like_count}"
+    );
+}
+
+/// Adapter-level file-count pruning, asserted by calling `resolve_file_list`
+/// directly (bypassing Exasol) with and without a filter and comparing the
+/// resolved file counts against the unfiltered snapshot. Both pruning paths the
+/// plan claims are exercised against the seeded `regions` table (3 files, one
+/// per partition, disjoint id ranges):
+///
+/// 1. Partition pruning (`region = 'north'`): Iceberg identity-partition pruning
+///    eliminates the central and south files → 1 file.
+/// 2. Per-file min/max range pruning (`id <= 5`): files whose id min > 5
+///    (central: min=6, south: min=11) are eliminated by
+///    `InclusiveMetricsEvaluator` → 1 file (north only, ids 1..=5).
+#[test]
+fn e2e_range_filter_prunes_by_file_bounds() {
+    setup_e2e();
+
+    let catalog_uri = common::stack::iceberg_catalog_url();
+    let catalog_props = local_stack_catalog(&format!("{E2E_NAMESPACE}.{E2E_PART_TABLE}"));
+    let storage = local_stack_storage();
+    let creds = local_stack_creds();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for file-count pruning test");
+
+    // --- baseline: no filter → 3 data files (one per partition) ---
+    let all_files = rt
+        .block_on(async {
+            resolve_file_list(&catalog_uri, &catalog_props, &storage, &creds, None).await
+        })
+        .expect("resolve_file_list (no filter) must succeed");
+    let all_files = all_files.0;
+    assert_eq!(
+        all_files.len(),
+        3,
+        "unfiltered REGIONS must resolve 3 data files (one per partition), got {}: {all_files:?}",
+        all_files.len()
+    );
+
+    // --- partition pruning: region = 'north' → exactly 1 file ---
+    // Filter JSON shape mirrors the Exasol pushdown format the translator expects.
+    // Column names are Exasol-uppercase; the translator resolves them case-insensitively.
+    let partition_filter = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "REGION"},
+        "right": {"type": "literal_string", "value": "north"}
+    });
+    let pruned_partition = rt
+        .block_on(async {
+            resolve_file_list(
+                &catalog_uri,
+                &catalog_props,
+                &storage,
+                &creds,
+                Some(&partition_filter),
+            )
+            .await
+        })
+        .expect("resolve_file_list (partition filter) must succeed");
+    let pruned_partition = pruned_partition.0;
+    assert_eq!(
+        pruned_partition.len(),
+        1,
+        "partition filter 'region = north' must resolve 1 file, got {}: {pruned_partition:?}",
+        pruned_partition.len()
+    );
+    assert!(
+        pruned_partition.len() < all_files.len(),
+        "partition filter must prune files: pruned={} is not < unfiltered={}",
+        pruned_partition.len(),
+        all_files.len()
+    );
+
+    // --- per-file min/max range pruning: id <= 5 → files with min(id) > 5 are pruned ---
+    // The regions table has disjoint id ranges per file:
+    //   north   id 1..=5  (max=5)
+    //   central id 6..=10 (min=6 > 5 → pruned)
+    //   south   id 11..=15(min=11 > 5 → pruned)
+    // With Iceberg's InclusiveMetricsEvaluator, `id <= 5` prunes files where min(id) > 5.
+    let range_filter = serde_json::json!({
+        "type": "predicate_lessequal",
+        "left": {"type": "column", "name": "ID"},
+        "right": {"type": "literal_exactnumeric", "value": "5"}
+    });
+    let pruned_range = rt
+        .block_on(async {
+            resolve_file_list(
+                &catalog_uri,
+                &catalog_props,
+                &storage,
+                &creds,
+                Some(&range_filter),
+            )
+            .await
+        })
+        .expect("resolve_file_list (range filter) must succeed");
+    let pruned_range = pruned_range.0;
+    // Only the north file (ids 1..=5) overlaps `id <= 5`; central (min=6) and
+    // south (min=11) are pruned by their per-file min/max bounds.
+    assert_eq!(
+        pruned_range.len(),
+        1,
+        "range filter 'id <= 5' must resolve only the north file, got {}: {pruned_range:?}",
+        pruned_range.len()
     );
 }
 

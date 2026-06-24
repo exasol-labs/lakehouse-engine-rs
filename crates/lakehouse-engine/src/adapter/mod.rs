@@ -4,6 +4,7 @@
 /// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
 pub mod capabilities;
 pub mod connection;
+pub mod iceberg_predicate;
 pub mod pushdown;
 pub mod sharding;
 pub mod sigv4;
