@@ -21,7 +21,7 @@
 
 mod common;
 use common::exasol_ws::ExaConn;
-use common::seed::{E2E_QUALIFIED_TABLE, E2E_TABLE, seed_events};
+use common::seed::{E2E_NAMESPACE, E2E_TABLE, seed_events};
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
     exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
@@ -177,7 +177,7 @@ fn create_virtual_schema(conn: &mut ExaConn) {
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
-  TABLE_NAME         = '{E2E_QUALIFIED_TABLE}'
+  ICEBERG_NAMESPACE  = '{E2E_NAMESPACE}'
   SCAN_SCHEMA        = '{SCHEMA_NAME}'
   ALLOW_HTTP         = 'true'"#
     ));

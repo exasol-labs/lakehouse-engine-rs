@@ -724,3 +724,53 @@ Default `INSTANCE_OVERHEAD_MB` to `200` MB. This adds a ~50 MB cushion over the 
 ### Consequences
 
 On the default 4096 MB per-instance limit the new budget is `0.6 × (4096 − 200) = 2338 MB`, versus `0.6 × 4096 = 2458 MB` previously — a ~120 MB reduction, well within the engine's `0.8 × 4096 = 3277 MB` handbrake. Operators may tune `INSTANCE_OVERHEAD_MB` via a VS property if their container footprint is measurably different.
+
+## ADR-027: Confine Multi-Table VS Change to the VS-Adapter Layer; Scan Crate Unchanged
+
+**Date:** 2026-06-24
+**Plan:** `change-multi-table-virtual-schema`
+**Status:** Accepted
+
+### Context
+
+Expanding the virtual schema from a single fixed table (`TABLE_NAME`) to an entire Iceberg namespace required choosing where in the stack to make the change. The verified Exasol VS protocol behaviour is that Exasol issues one single-table pushdown per table, even for JOINs — Exasol joins per-table result sets itself. This means each pushdown is already single-table and the scan layer (`ScanSpec`, `CatalogProps`, the scan UDF, and the sharding/fan-out SQL) does not need to be widened.
+
+### Decision
+
+Keep `ScanSpec`, `CatalogProps`, the scan UDF, and the sharding/fan-out SQL unchanged. Multi-table capability is implemented entirely in the VS-adapter layer: table identity moves from a create-time-fixed property to a per-pushdown value derived from `involvedTables[0].name` via the `TABLE_MAP` in `adapterNotes`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Confine the change to the VS-adapter layer; scan crate unchanged | ✓ Chosen — the Exasol protocol already issues one single-table pushdown per table; widening the scan seam is dead complexity |
+| Carry multiple tables in a single `ScanSpec`/pushdown | ✗ Rejected — Exasol issues one single-table pushdown per table even for JOINs, so a multi-table scan seam would never be invoked |
+
+### Consequences
+
+The scan crate and UDF are unchanged and continue to handle exactly one Iceberg table per invocation. Future multi-table scan pushdown (e.g. DataFusion JOIN) remains a separate plan. The VS-adapter layer alone carries the per-table identity routing.
+
+## ADR-028: Persist Exasol-Name to Iceberg-Identifier Map in adapterNotes (Strategy B)
+
+**Date:** 2026-06-24
+**Plan:** `change-multi-table-virtual-schema`
+**Status:** Accepted
+
+### Context
+
+Pushdown requests carry `involvedTables[0].name` as an uppercased, `__`-flattened Exasol table name. Recovering the original-cased, multi-level Iceberg `TableIdent` from this name at pushdown time requires either re-listing the catalog or reading a pre-built map. Strategy (A) re-lists the namespace at pushdown and matches case-insensitively. Strategy (B) records the `EXASOL_NAME → original-cased Iceberg identifier` map in `adapterNotes` at create time and reads it back at pushdown.
+
+### Decision
+
+Use strategy (B): `createVirtualSchema` enumerates the namespace (required regardless to build `schemaMetadata.tables`) and records a `TABLE_MAP` in `adapterNotes`; pushdown reads it back without a second catalog round-trip. `adapterNotes` is the proven persisted round-trip channel (`CLUSTER_NODES`, `NR_OF_CORES`, etc.).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| adapterNotes `TABLE_MAP` (strategy B) | ✓ Chosen — no per-query catalog call; exact casing and multi-level path recovered deterministically; collision-detectable at create time; reuses proven channel |
+| Re-list namespace at pushdown and case-insensitive match (strategy A) | ✗ Rejected — adds a catalog call per query; requires implementing signed `list_namespaces`/`list_tables` for the SigV4/Glue path (only `load_table` is signed today); casing recovery is heuristic, not exact |
+
+### Consequences
+
+`adapterNotes` grows by one `TABLE_MAP` entry (a JSON object mapping Exasol names to Iceberg identifiers). Pushdown never re-lists the catalog; recovery of original casing and multi-level namespace path is exact. `__` name collisions are detected at create time and fail loudly. Iceberg view support remains deferred (iceberg-rust 0.9.1 `Catalog` trait has no `list_views`).
