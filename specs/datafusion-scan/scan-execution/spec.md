@@ -32,6 +32,8 @@ It holds no state and discovers no files of its own.
   semantics where applicable.
 * Memory budgeting and credential-passthrough scenarios (including vended STS tokens)
   are in `datafusion-scan/scan-execution-memory-and-credentials`.
+* CPU-bounding configuration (DataFusion target partitions and Tokio worker threads per
+  UDF instance) is in `datafusion-scan/scan-execution-threading`.
 
 ## Scenarios
 
