@@ -774,3 +774,54 @@ Use strategy (B): `createVirtualSchema` enumerates the namespace (required regar
 ### Consequences
 
 `adapterNotes` grows by one `TABLE_MAP` entry (a JSON object mapping Exasol names to Iceberg identifiers). Pushdown never re-lists the catalog; recovery of original casing and multi-level namespace path is exact. `__` name collisions are detected at create time and fail loudly. Iceberg view support remains deferred (iceberg-rust 0.9.1 `Catalog` trait has no `list_views`).
+
+## ADR-029: Sound-Partial Iceberg Predicate Translation — Strict OR/NOT Handling
+
+**Date:** 2026-06-24
+**Plan:** `add-iceberg-predicate-pruning`
+**Status:** Accepted
+
+### Context
+
+Translating the Exasol WHERE predicate into an `iceberg::expr::Predicate` for file-level pruning requires a policy for nodes that cannot be translated (e.g. LIKE, REGEXP_LIKE, scalar-function predicates). The policy must never produce a predicate that drops result rows — only a predicate that keeps too many files is safe. The subtle correctness trap is in `OR` and `NOT`: pruning on only the translatable branch of an `OR` can skip files that the untranslatable branch could match. `NOT` of an unknown expression similarly cannot be safely negated.
+
+### Decision
+
+`to_iceberg_predicate` returns `Option<Predicate>` where `None` = "no constraint — treat as no-op". Under `AND` a `None` child is dropped and the other child is kept (dropping a conjunct under AND only widens the surviving file set — sound). Under `OR`, ANY `None` child collapses the whole `OR` to `None` (pruning on the translatable branch alone would wrongly skip files containing rows that match the untranslatable branch). `NOT` of a `None` child returns `None` (cannot soundly negate an unknown). Leaves translate only when the column resolves in the Iceberg schema and a type-matching `Datum` can be built; otherwise `None`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Sound-partial: drop untranslatable nodes; strict OR/NOT collapse | ✓ Chosen — DataFusion is the correctness backstop; less pruning is always safe; the strict OR/NOT rule is the correctness core |
+| Decline pushdown / error when any node is untranslatable | ✗ Rejected — forfeits the optimisation for any query with a LIKE; DataFusion already handles correctness |
+| Prune on the translatable branch of an OR alone | ✗ Rejected — unsound: a row matching the untranslatable branch may live in any pruned file; would silently drop result rows |
+
+### Consequences
+
+Any query with an `OR` involving a non-translatable predicate receives no Iceberg pruning — it falls back to full file resolution while DataFusion applies the full filter. This is safe and correct. Queries with translatable `AND` conjuncts alongside LIKE predicates do receive pruning on the translatable part. The contract mirrors `render_df_filter_safe`'s existing conservative approach.
+
+## ADR-030: New `adapter/iceberg_predicate.rs` Module; `iceberg-rust` Types Stay out of `vs-expression`
+
+**Date:** 2026-06-24
+**Plan:** `add-iceberg-predicate-pruning`
+**Status:** Accepted
+
+### Context
+
+Iceberg file-level pruning requires constructing `iceberg::expr::Predicate` values from the Exasol filter JSON. Two candidate homes exist: the shared `crates/vs-expression` crate (already parses and translates Exasol filter JSON for DataFusion) or a new lakehouse-engine-specific module. The `vs-expression` crate is designed to be shared with the sibling `strata-rs` project and is intentionally free of `iceberg-rust` dependencies.
+
+### Decision
+
+Author a dedicated `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs` module in lakehouse-engine. It consumes the same raw Exasol filter JSON that the DataFusion path reads and emits `Option<iceberg::expr::Predicate>`. The `vs-expression` crate is not extended.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| New `adapter/iceberg_predicate.rs` in lakehouse-engine | ✓ Chosen — keeps `iceberg-rust` types out of the strata-rs-shared `vs-expression` crate; iceberg coupling lives only where iceberg is already a dependency |
+| Extend `vs-expression` to also emit `iceberg::expr::Predicate` | ✗ Rejected — would add `iceberg-rust` as a dependency of `vs-expression`, polluting the strata-rs cross-project sharing contract |
+
+### Consequences
+
+`vs-expression` remains `iceberg-rust`-free and sharable with `strata-rs` unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future strata-rs project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
