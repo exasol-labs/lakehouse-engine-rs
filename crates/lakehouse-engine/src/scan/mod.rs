@@ -26,6 +26,41 @@ use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use url::Url;
 
+/// Build the Tokio runtime for the scan UDF.
+///
+/// When `threads` is 1 (the default), a current-thread runtime is created —
+/// one OS thread, matching Exasol's per-instance model and the
+/// `NR_OF_CORES`-bound VM pool. When `threads` exceeds 1, a multi-thread
+/// runtime is created with exactly `threads` worker threads, which is only
+/// correct when the operator has explicitly widened the thread budget via the
+/// `DATAFUSION_THREADS_PER_UDF` VS property.
+fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
+    if threads <= 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build current-thread tokio runtime: {e}"))
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to build multi-thread tokio runtime: {e}"))
+    }
+}
+
+/// Build the DataFusion `SessionConfig` for the given scan spec.
+///
+/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1),
+/// which controls how many logical partitions DataFusion creates internally.
+/// With the default of 1 and a current-thread Tokio runtime, each UDF instance
+/// uses exactly one core; cluster-level shard fan-out provides all parallelism.
+fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
+    SessionConfig::new()
+        .with_information_schema(false)
+        .with_target_partitions(spec.df_target_partitions.max(1))
+}
+
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
 ///
 /// Reads the scan spec from the first input column (VARCHAR JSON), builds a
@@ -42,14 +77,13 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
         .get_string(0)?
         .ok_or_else(|| UdfError::User("scan spec input is NULL".into()))?;
 
+    // Parse spec BEFORE building the runtime: the runtime kind depends on
+    // spec.df_threads_per_udf, so we must deserialize first.
     let spec = ScanSpec::from_json(spec_json).map_err(UdfError::User)?;
 
-    // Run async DataFusion scan on a current-thread tokio runtime.
+    // Build the Tokio runtime according to the spec's thread configuration.
     // A fresh runtime per call is correct for a stateless disposable UDF.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
+    let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
 
     rt.block_on(async { run_scan_async(ctx, &spec).await })
 }
@@ -439,7 +473,7 @@ fn build_session_context(
     spec: &ScanSpec,
     memory_limit_bytes: u64,
 ) -> Result<SessionContext, UdfError> {
-    let config = SessionConfig::new().with_information_schema(false);
+    let config = session_config_for_spec(spec);
 
     // Memory pool + spill config.
     let spill = probe_tmp_spill();
@@ -706,6 +740,8 @@ mod tests {
                 warehouse: "wh".into(),
                 table: "db.tbl".into(),
             },
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         }
     }
 
@@ -1081,6 +1117,51 @@ mod tests {
             assert_eq!(row[1], Value::Null, "{kind:?} sum must be NULL");
             assert_eq!(row[2], Value::Null, "{kind:?} sumsq must be NULL");
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // T7 — runtime selection and session config from ScanSpec
+    // ---------------------------------------------------------------------------
+
+    /// SessionConfig applies target_partitions from the spec.
+    ///
+    /// Scenario: session_config_uses_spec_target_partitions
+    #[test]
+    fn session_config_uses_spec_target_partitions() {
+        let mut spec = minimal_spec();
+        spec.df_target_partitions = 4;
+        let config = session_config_for_spec(&spec);
+        assert_eq!(
+            config.target_partitions(),
+            4,
+            "SessionConfig must use df_target_partitions from spec"
+        );
+    }
+
+    /// A spec with df_threads_per_udf == 1 selects the current-thread runtime.
+    ///
+    /// Scenario: runtime_is_current_thread_when_threads_is_one
+    #[test]
+    fn runtime_is_current_thread_when_threads_is_one() {
+        let rt = build_scan_runtime(1).expect("runtime must build");
+        assert_eq!(
+            rt.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+            "df_threads_per_udf == 1 must yield a current-thread runtime"
+        );
+    }
+
+    /// A spec with df_threads_per_udf > 1 selects the multi-thread runtime.
+    ///
+    /// Scenario: runtime_is_multi_thread_when_threads_exceeds_one
+    #[test]
+    fn runtime_is_multi_thread_when_threads_exceeds_one() {
+        let rt = build_scan_runtime(4).expect("runtime must build");
+        assert_eq!(
+            rt.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+            "df_threads_per_udf > 1 must yield a multi-thread runtime"
+        );
     }
 
     /// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.

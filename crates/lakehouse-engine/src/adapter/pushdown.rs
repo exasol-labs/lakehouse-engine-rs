@@ -1100,6 +1100,8 @@ pub async fn handle_pushdown(
     scan_schema: Option<&str>,
     cluster_nodes: usize,
     parallelism_factor: usize,
+    df_target_partitions: usize,
+    df_threads_per_udf: usize,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
@@ -1130,9 +1132,9 @@ pub async fn handle_pushdown(
     }
 
     // Compute G = shard_count(node_count, parallelism_factor, file_count) and
-    // partition files into G balanced work-unit shards (GROUP BY shard_key fan-out).
+    // partition files into G byte-balanced work-unit shards (GROUP BY shard_key fan-out).
     let g = shard_count(cluster_nodes, parallelism_factor, files.len());
-    let shards = crate::adapter::sharding::partition_files(files, g);
+    let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
 
     // The scan UDF must be schema-qualified: the pushdown query executes
     // outside the adapter script's schema, so an unqualified name would not
@@ -1181,6 +1183,8 @@ pub async fn handle_pushdown(
                 group_keys: Some(group_keys.clone()),
                 storage: storage.clone(),
                 catalog: catalog.clone(),
+                df_target_partitions,
+                df_threads_per_udf,
             };
             let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys);
             let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -1215,6 +1219,8 @@ pub async fn handle_pushdown(
         group_keys: None,
         storage: storage.clone(),
         catalog: catalog.clone(),
+        df_target_partitions,
+        df_threads_per_udf,
     };
 
     let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -1248,7 +1254,7 @@ pub async fn resolve_file_list(
     catalog_props: &CatalogProps,
     storage: &StorageProps,
     creds: &ConnectionCreds,
-) -> Result<(Vec<String>, StorageProps), UdfError> {
+) -> Result<(Vec<(String, u64)>, StorageProps), UdfError> {
     if creds.use_sigv4 {
         // Signed path: self-issue the load_table GET, build the Table from the result.
         let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
@@ -1318,11 +1324,11 @@ pub async fn resolve_file_list(
     Ok((files, storage.clone()))
 }
 
-/// Drive the iceberg scan and collect the data-file paths.
+/// Drive the iceberg scan and collect the data-file paths with their sizes.
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
-) -> Result<Vec<String>, UdfError> {
+) -> Result<Vec<(String, u64)>, UdfError> {
     let scan = table
         .scan()
         .select_all()
@@ -1346,7 +1352,7 @@ async fn plan_files_from_table(
 
     Ok(tasks
         .into_iter()
-        .map(|t| t.data_file_path().to_string())
+        .map(|t| (t.data_file_path().to_string(), t.file_size_in_bytes))
         .collect())
 }
 
@@ -1767,8 +1773,12 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, cluster_nodes);
+        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let shards =
+            crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
             &spec_template,
             shards,
@@ -2189,6 +2199,8 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
 
         // Build single-shard SQL and decode the embedded spec literal.
@@ -2329,8 +2341,12 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, cluster_nodes);
+        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let shards =
+            crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
             &spec_template,
             shards,
@@ -2452,6 +2468,8 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
         let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
         let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
@@ -2488,6 +2506,8 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
         let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
         let sql = build_scan_driving_sql(
@@ -2927,7 +2947,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // partition_files — G shards balanced, disjoint, full coverage
+    // partition_files_by_bytes — G shards balanced, disjoint, full coverage
     // ---------------------------------------------------------------------------
 
     /// File list partitioned into G shards via shard_count is balanced, disjoint,
@@ -2936,10 +2956,15 @@ mod tests {
     fn partition_files_g_shards_balanced_disjoint_full_coverage() {
         use std::collections::HashSet;
         // 3 nodes × 4 factor = 12, capped to 10 files → G = 10
-        let files: Vec<String> = (0..10).map(|i| format!("file-{i}.parquet")).collect();
+        let file_names: Vec<String> = (0..10).map(|i| format!("file-{i}.parquet")).collect();
+        let files: Vec<(String, u64)> = file_names
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.clone(), (i as u64 + 1) * 100))
+            .collect();
         let g = shard_count(3, 4, files.len());
         assert_eq!(g, 10, "G must equal file_count when product > file_count");
-        let shards = crate::adapter::sharding::partition_files(files.clone(), g);
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files.clone(), g);
         assert_eq!(shards.len(), 10, "must produce exactly G=10 shards");
         // No shard is empty.
         for (i, shard) in shards.iter().enumerate() {
@@ -2955,14 +2980,9 @@ mod tests {
         );
         assert_eq!(
             unique,
-            files.iter().collect::<HashSet<_>>(),
+            file_names.iter().collect::<HashSet<_>>(),
             "all files must be covered"
         );
-        // Balanced: sizes differ by at most 1.
-        let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
-        let max = *sizes.iter().max().unwrap();
-        let min = *sizes.iter().min().unwrap();
-        assert!(max - min <= 1, "shards not balanced: max={max} min={min}");
     }
 
     // ---------------------------------------------------------------------------
@@ -2972,8 +2992,8 @@ mod tests {
     /// Multi-shard row-scan SQL uses GROUP BY shard_key, never IPROC().
     #[test]
     fn scan_driving_sql_groups_by_shard_key_not_iproc() {
-        let files: Vec<String> = (0..3)
-            .map(|i| format!("s3://warehouse/f{i}.parquet"))
+        let files: Vec<(String, u64)> = (0..3)
+            .map(|i| (format!("s3://warehouse/f{i}.parquet"), (i as u64 + 1) * 100))
             .collect();
         let g = shard_count(3, 1, files.len());
         let spec_template = ScanSpec {
@@ -2985,8 +3005,10 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, g);
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
             &spec_template,
             shards,
@@ -3014,7 +3036,7 @@ mod tests {
     /// Single-shard collapses to the single-invocation form (no VALUES, no GROUP BY).
     #[test]
     fn single_shard_collapses_to_single_invocation() {
-        let files = vec!["s3://warehouse/f0.parquet".to_string()];
+        let files = vec![("s3://warehouse/f0.parquet".to_string(), 500u64)];
         let g = shard_count(1, 1, files.len());
         let spec_template = ScanSpec {
             files: vec![],
@@ -3025,8 +3047,10 @@ mod tests {
             group_keys: None,
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, g);
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
             &spec_template,
             shards,
@@ -3079,8 +3103,11 @@ mod tests {
             group_keys: Some(group_keys.clone()),
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, g);
+        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
         build_grouped_aggregate_scan_sql(
             &spec_template,
             shards,
@@ -3131,7 +3158,7 @@ mod tests {
     /// The per-shard spec JSON must not carry "limit"; the outer wrapper may have LIMIT.
     #[test]
     fn grouped_scan_sql_has_no_per_shard_limit() {
-        let files = vec!["s3://w/f0.parquet".to_string()];
+        let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
         let g = shard_count(1, 1, files.len());
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
@@ -3146,8 +3173,10 @@ mod tests {
             group_keys: Some(vec!["\"REGION\"".into()]),
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
-        let shards = crate::adapter::sharding::partition_files(files, g);
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_grouped_aggregate_scan_sql(
             &spec_template,
             shards,
@@ -3257,6 +3286,8 @@ mod tests {
             group_keys: Some(group_keys.clone()),
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).expect("must round-trip");
@@ -3682,6 +3713,8 @@ mod tests {
             group_keys: Some(vec![r#""REGION""#.to_string()]),
             storage: sample_storage(),
             catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_threads_per_udf: 1,
         };
         let shards = vec![vec!["s3://wh/f.parquet".into()]];
         let col_types = vec![

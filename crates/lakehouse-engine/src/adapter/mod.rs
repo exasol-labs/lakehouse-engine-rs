@@ -47,12 +47,25 @@ const PROP_CONNECTION_NAME: &str = "CONNECTION_NAME";
 // SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES. Exasol requires adapterNotes to be
 // a JSON *string* (a raw JSON object fails with "No valid json string").
 const NOTE_CLUSTER_NODES: &str = "CLUSTER_NODES";
+// adapterNotes key for the per-node CPU core count captured at createVirtualSchema time.
+const NOTE_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property name for the parallelism factor (oversubscription multiplier).
-// Default: 8. Stored in adapterNotes so the pushdown path can read it back.
+// Default: max(NR_OF_CORES * 2, 8). Stored in adapterNotes so the pushdown path
+// can read it back.
 const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
-/// Default parallelism factor when not supplied or invalid.
+/// Minimum parallelism factor (floor applied when NR_OF_CORES is 0 or very small).
 const DEFAULT_PARALLELISM_FACTOR: usize = 8;
+// VS property names for DataFusion per-instance thread configuration.
+const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
+const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
+// adapterNotes keys for the DataFusion thread configuration.
+const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
+const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
+/// Default DataFusion `target_partitions` per UDF instance (1 = no intra-instance partitioning).
+const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
+/// Default Tokio worker threads per UDF instance (1 = current-thread runtime).
+const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
 
 /// Main adapter dispatch function.
 ///
@@ -124,8 +137,10 @@ fn handle_create_virtual_schema(
     let props = get_properties(request);
     let (catalog_uri, storage, catalog, creds) = resolve_connection_config(ctx, &props)?;
 
-    let cluster_nodes = resolve_cluster_nodes(ctx, &props);
-    let parallelism_factor = resolve_parallelism_factor(&props);
+    let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(ctx, &props);
+    let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
+    let df_target_partitions = resolve_df_target_partitions(&props);
+    let df_threads_per_udf = resolve_df_threads_per_udf(&props);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -157,7 +172,14 @@ fn handle_create_virtual_schema(
     // passes it back in `schemaMetadataInfo.adapterNotes` on later requests.
     // Carry the resolved node count and parallelism factor there; merge into any
     // pre-existing notes so we never clobber state another channel may have written.
-    let adapter_notes = build_adapter_notes(request, cluster_nodes, parallelism_factor);
+    let adapter_notes = build_adapter_notes(
+        request,
+        cluster_nodes,
+        nr_of_cores,
+        parallelism_factor,
+        df_target_partitions,
+        df_threads_per_udf,
+    );
     let schema_metadata = json!({
         "tables": [{
             "name": table_name,
@@ -199,6 +221,14 @@ async fn handle_pushdown_request(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_PARALLELISM_FACTOR);
+    let df_target_partitions = adapter_note(request, NOTE_DF_TARGET_PARTITIONS)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let df_threads_per_udf = adapter_note(request, NOTE_DF_THREADS_PER_UDF)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
     handle_pushdown(
         request,
         catalog_uri,
@@ -207,6 +237,8 @@ async fn handle_pushdown_request(
         scan_schema.as_deref(),
         cluster_nodes,
         parallelism_factor,
+        df_target_partitions,
+        df_threads_per_udf,
         creds,
     )
     .await
@@ -268,49 +300,110 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 }
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
-/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES and
-/// PARALLELISM_FACTOR. Any pre-existing notes on the request are preserved
-/// (merge, not clobber).
-fn build_adapter_notes(request: &Json, cluster_nodes: u32, parallelism_factor: usize) -> Json {
+/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
+/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, and DF_THREADS_PER_UDF. Any
+/// pre-existing notes on the request are preserved (merge, not clobber).
+fn build_adapter_notes(
+    request: &Json,
+    cluster_nodes: u32,
+    nr_of_cores: u32,
+    parallelism_factor: usize,
+    df_target_partitions: usize,
+    df_threads_per_udf: usize,
+) -> Json {
     let mut notes = parse_adapter_notes(request);
     notes.insert(
         NOTE_CLUSTER_NODES.to_string(),
         Json::String(cluster_nodes.to_string()),
     );
     notes.insert(
+        NOTE_NR_OF_CORES.to_string(),
+        Json::String(nr_of_cores.to_string()),
+    );
+    notes.insert(
         NOTE_PARALLELISM_FACTOR.to_string(),
         Json::String(parallelism_factor.to_string()),
+    );
+    notes.insert(
+        NOTE_DF_TARGET_PARTITIONS.to_string(),
+        Json::String(df_target_partitions.to_string()),
+    );
+    notes.insert(
+        NOTE_DF_THREADS_PER_UDF.to_string(),
+        Json::String(df_threads_per_udf.to_string()),
     );
     Json::String(Json::Object(notes).to_string())
 }
 
 /// Read and validate the PARALLELISM_FACTOR VS property.
-/// Returns DEFAULT_PARALLELISM_FACTOR when absent, empty, zero, or not a valid integer.
-fn resolve_parallelism_factor(props: &Json) -> usize {
+///
+/// When the property is absent, empty, zero, or invalid, the default is
+/// `max(nr_of_cores * 2, DEFAULT_PARALLELISM_FACTOR)` — hardware-aware but
+/// floored at `DEFAULT_PARALLELISM_FACTOR` so a dev VM or failed core-count
+/// lookup (nr_of_cores = 0) never collapses the factor below a useful minimum.
+fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
     str_prop(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_PARALLELISM_FACTOR)
+        .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
 }
 
-/// Open a connect-back session and run `SELECT NPROC()` to obtain the active
-/// cluster node count. Returns 1 on any failure so `createVirtualSchema` never
-/// fails due to an unreachable or misconfigured connect-back path.
-fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> u32 {
+/// Read and validate the DATAFUSION_TARGET_PARTITIONS VS property.
+///
+/// When the property is absent, empty, zero, or invalid the default is 1 (one
+/// DataFusion partition per UDF instance, which prevents intra-instance CPU
+/// fan-out from multiplying with the cluster-level shard fan-out).
+fn resolve_df_target_partitions(props: &Json) -> usize {
+    str_prop(props, PROP_DF_TARGET_PARTITIONS)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_DF_TARGET_PARTITIONS)
+}
+
+/// Read and validate the DATAFUSION_THREADS_PER_UDF VS property.
+///
+/// When the property is absent, empty, zero, or invalid the default is 1 (one
+/// Tokio worker thread per UDF instance, matching `new_current_thread()` behaviour).
+fn resolve_df_threads_per_udf(props: &Json) -> usize {
+    str_prop(props, PROP_DF_THREADS_PER_UDF)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_DF_THREADS_PER_UDF)
+}
+
+/// Open a connect-back session and run `SELECT NPROC()` and
+/// `SELECT PARAM_VALUE('NR_OF_CORES')` to obtain the active cluster node count
+/// and the per-node CPU core count.
+///
+/// Returns `(1, 0)` when `CONNECTION_NAME` is absent and `(1, 0)` on any
+/// connect-back failure so `createVirtualSchema` never fails due to an
+/// unreachable or misconfigured connect-back path. A `nr_of_cores` of `0`
+/// signals "unknown"; callers must handle the floor case.
+fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> (u32, u32) {
     let Some(conn_name) = str_prop(props, PROP_CONNECTION_NAME) else {
-        return 1;
+        return (1, 0);
     };
-    let result = (|| -> Result<u32, UdfError> {
+    let result = (|| -> Result<(u32, u32), UdfError> {
         let conn_obj = ctx.connection(conn_name)?;
         let mut session = ctx.connect_back(&conn_obj)?;
-        let rows = session.query("SELECT NPROC()")?;
-        let value = rows
+
+        let nproc_rows = session.query("SELECT NPROC()")?;
+        let nproc_value = nproc_rows
             .into_iter()
             .next()
             .and_then(|row| row.into_iter().next());
-        Ok(nproc_value_to_count(value))
+        let cluster_nodes = nproc_value_to_count(nproc_value);
+
+        let cores_rows = session.query("SELECT PARAM_VALUE('NR_OF_CORES')")?;
+        let cores_value = cores_rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next());
+        let nr_of_cores = varchar_value_to_u32(cores_value);
+
+        Ok((cluster_nodes, nr_of_cores))
     })();
-    result.unwrap_or(1)
+    result.unwrap_or((1, 0))
 }
 
 /// Convert the first cell of a `SELECT NPROC()` result to a positive node count.
@@ -324,6 +417,17 @@ fn nproc_value_to_count(value: Option<exasol_udf_sdk::value::Value>) -> u32 {
         _ => 0,
     };
     if n >= 1 { n as u32 } else { 1 }
+}
+
+/// Convert the first cell of a `SELECT PARAM_VALUE(...)` result (a VARCHAR) to a
+/// `u32`. Returns `0` for NULL, empty, non-numeric, zero, or negative values.
+fn varchar_value_to_u32(value: Option<exasol_udf_sdk::value::Value>) -> u32 {
+    use exasol_udf_sdk::value::Value;
+    let s = match value {
+        Some(Value::String(s)) => s,
+        _ => return 0,
+    };
+    s.trim().parse::<u32>().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,15 +570,16 @@ mod tests {
         let props = serde_json::json!({
             PROP_CONNECTION_NAME: "SOME_CONNECTION"
         });
-        let count = resolve_cluster_nodes(&mut NoopCtx, &props);
+        let (count, _cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
         assert_eq!(count, 1u32);
     }
 
     #[test]
     fn cluster_nodes_defaults_to_one_when_no_connection_name() {
         let props = serde_json::json!({});
-        let count = resolve_cluster_nodes(&mut NoopCtx, &props);
+        let (count, cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
         assert_eq!(count, 1u32);
+        assert_eq!(cores, 0u32);
     }
 
     /// Verifies that the createVirtualSchema response JSON carries CLUSTER_NODES
@@ -485,14 +590,20 @@ mod tests {
     #[test]
     fn create_response_carries_cluster_nodes_property() {
         let props = serde_json::json!({});
-        let cluster_nodes = resolve_cluster_nodes(&mut NoopCtx, &props);
+        let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
         assert_eq!(cluster_nodes, 1u32, "default cluster_nodes must be 1");
 
         // Replicate the schema_metadata construction from handle_create_virtual_schema.
         // The request has no pre-existing adapterNotes (clean set path).
         let request = serde_json::json!({"type": "createVirtualSchema"});
-        let adapter_notes =
-            build_adapter_notes(&request, cluster_nodes, DEFAULT_PARALLELISM_FACTOR);
+        let adapter_notes = build_adapter_notes(
+            &request,
+            cluster_nodes,
+            nr_of_cores,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
         let schema_metadata = serde_json::json!({
             "tables": [],
             "adapterNotes": adapter_notes,
@@ -527,7 +638,14 @@ mod tests {
     fn adapter_notes_cluster_nodes_round_trips() {
         // createVirtualSchema produces the adapterNotes string for, say, 4 nodes.
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
-        let notes = build_adapter_notes(&create_req, 4, DEFAULT_PARALLELISM_FACTOR);
+        let notes = build_adapter_notes(
+            &create_req,
+            4,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
         // Exasol persists that string and hands it back under
@@ -576,7 +694,14 @@ mod tests {
                 "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
             },
         });
-        let notes = build_adapter_notes(&req, 3, DEFAULT_PARALLELISM_FACTOR);
+        let notes = build_adapter_notes(
+            &req,
+            3,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
         assert_eq!(
@@ -595,14 +720,22 @@ mod tests {
     /// Covers scenario `create_vs_records_parallelism_factor`.
     #[test]
     fn create_vs_records_parallelism_factor() {
-        // Request with an explicit PARALLELISM_FACTOR property.
+        // Request with an explicit PARALLELISM_FACTOR property — nr_of_cores is
+        // irrelevant because the explicit property wins.
         let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
-        let factor = resolve_parallelism_factor(&props);
+        let factor = resolve_parallelism_factor(&props, 16);
         assert_eq!(factor, 4, "factor must be read from the property");
 
         // Build adapterNotes and verify PARALLELISM_FACTOR is present.
         let request = serde_json::json!({"type": "createVirtualSchema"});
-        let notes = build_adapter_notes(&request, 2, factor);
+        let notes = build_adapter_notes(
+            &request,
+            2,
+            16,
+            factor,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
         let parsed: serde_json::Value =
             serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
@@ -612,17 +745,17 @@ mod tests {
             "PARALLELISM_FACTOR must be recorded in adapterNotes"
         );
 
-        // Default when property absent.
+        // Default when property absent and nr_of_cores = 0 → floor at DEFAULT_PARALLELISM_FACTOR.
         let empty_props = serde_json::json!({});
-        let default_factor = resolve_parallelism_factor(&empty_props);
+        let default_factor = resolve_parallelism_factor(&empty_props, 0);
         assert_eq!(
             default_factor, DEFAULT_PARALLELISM_FACTOR,
-            "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent"
+            "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent and cores=0"
         );
 
-        // Zero or invalid value also defaults.
+        // Zero or invalid value also defaults (explicit "0" is treated as absent).
         let zero_props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "0" });
-        let zero_factor = resolve_parallelism_factor(&zero_props);
+        let zero_factor = resolve_parallelism_factor(&zero_props, 0);
         assert_eq!(
             zero_factor, DEFAULT_PARALLELISM_FACTOR,
             "zero must fall back to default"
@@ -635,7 +768,14 @@ mod tests {
     fn adapter_notes_carry_cluster_nodes_and_parallelism_factor() {
         // createVirtualSchema records both values.
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
-        let notes = build_adapter_notes(&create_req, 6, 12);
+        let notes = build_adapter_notes(
+            &create_req,
+            6,
+            0,
+            12,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
         // Exasol persists that string and hands it back on the next pushdown request.
@@ -652,6 +792,173 @@ mod tests {
             adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
             Some("12"),
             "PARALLELISM_FACTOR must round-trip through adapterNotes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // T5 — NR_OF_CORES note tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Adapter records the per-node core count in the virtual-schema adapterNotes.
+    #[test]
+    fn adapter_notes_records_nr_of_cores() {
+        let req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &req,
+            2,
+            16,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(
+            parsed[NOTE_NR_OF_CORES].as_str(),
+            Some("16"),
+            "NR_OF_CORES must be written into adapterNotes"
+        );
+    }
+
+    /// Scenario: NR_OF_CORES defaults to 0 when resolve_cluster_nodes cannot reach
+    /// the database (NoopCtx returns an error for all connect-back calls).
+    #[test]
+    fn nr_of_cores_defaults_to_zero_when_unavailable() {
+        let props = serde_json::json!({ PROP_CONNECTION_NAME: "SOME_CONNECTION" });
+        let (_nodes, nr_of_cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
+        assert_eq!(
+            nr_of_cores, 0u32,
+            "nr_of_cores must default to 0 on connect-back failure"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // T5 — parallelism factor formula tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Default parallelism factor equals NR_OF_CORES × 2 when cores > 4.
+    #[test]
+    fn default_parallelism_factor_is_cores_times_two() {
+        let props = serde_json::json!({});
+        // 10 cores × 2 = 20, which is > DEFAULT_PARALLELISM_FACTOR (8), so 20 wins.
+        let factor = resolve_parallelism_factor(&props, 10);
+        assert_eq!(
+            factor, 20,
+            "factor must equal nr_of_cores × 2 when that exceeds 8"
+        );
+    }
+
+    /// Scenario: Default parallelism factor is floored at DEFAULT_PARALLELISM_FACTOR (8)
+    /// when NR_OF_CORES × 2 would produce a smaller value (e.g., 0 or 2).
+    #[test]
+    fn default_parallelism_factor_floors_at_eight() {
+        let props = serde_json::json!({});
+        // 0 cores × 2 = 0; must floor to DEFAULT_PARALLELISM_FACTOR.
+        let factor_zero = resolve_parallelism_factor(&props, 0);
+        assert_eq!(
+            factor_zero, DEFAULT_PARALLELISM_FACTOR,
+            "must floor at 8 when cores=0"
+        );
+
+        // 2 cores × 2 = 4; still below floor.
+        let factor_small = resolve_parallelism_factor(&props, 2);
+        assert_eq!(
+            factor_small, DEFAULT_PARALLELISM_FACTOR,
+            "must floor at 8 when cores×2 < 8"
+        );
+    }
+
+    /// Scenario: An explicit PARALLELISM_FACTOR property overrides the default formula.
+    #[test]
+    fn explicit_parallelism_factor_overrides_default() {
+        let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "5" });
+        // Even with 32 cores (32×2=64 > 8), the explicit prop wins.
+        let factor = resolve_parallelism_factor(&props, 32);
+        assert_eq!(
+            factor, 5,
+            "explicit property must override the NR_OF_CORES formula"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // T8 — DF_TARGET_PARTITIONS and DF_THREADS_PER_UDF note tests
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: DF_TARGET_PARTITIONS defaults to 1 when property is absent/zero/invalid.
+    #[test]
+    fn df_target_partitions_defaults_to_one() {
+        let absent = serde_json::json!({});
+        assert_eq!(resolve_df_target_partitions(&absent), 1, "absent → 1");
+
+        let zero = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" });
+        assert_eq!(resolve_df_target_partitions(&zero), 1, "zero → 1");
+
+        let invalid = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" });
+        assert_eq!(resolve_df_target_partitions(&invalid), 1, "invalid → 1");
+    }
+
+    /// Scenario: An explicit positive DATAFUSION_TARGET_PARTITIONS property is used as-is.
+    #[test]
+    fn df_target_partitions_uses_supplied_value() {
+        let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
+        let val = resolve_df_target_partitions(&props);
+        assert_eq!(val, 4, "explicit value must be returned");
+
+        // Verify it round-trips through adapterNotes.
+        let req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            val,
+            DEFAULT_DF_THREADS_PER_UDF,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(
+            parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
+            Some("4"),
+            "DF_TARGET_PARTITIONS must round-trip through adapterNotes"
+        );
+    }
+
+    /// Scenario: DF_THREADS_PER_UDF defaults to 1 when property is absent/zero/invalid.
+    #[test]
+    fn df_threads_per_udf_defaults_to_one() {
+        let absent = serde_json::json!({});
+        assert_eq!(resolve_df_threads_per_udf(&absent), 1, "absent → 1");
+
+        let zero = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" });
+        assert_eq!(resolve_df_threads_per_udf(&zero), 1, "zero → 1");
+
+        let invalid = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "not-a-number" });
+        assert_eq!(resolve_df_threads_per_udf(&invalid), 1, "invalid → 1");
+    }
+
+    /// Scenario: An explicit positive DATAFUSION_THREADS_PER_UDF property is used as-is.
+    #[test]
+    fn df_threads_per_udf_uses_supplied_value() {
+        let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
+        let val = resolve_df_threads_per_udf(&props);
+        assert_eq!(val, 2, "explicit value must be returned");
+
+        // Verify it round-trips through adapterNotes.
+        let req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            val,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(
+            parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
+            Some("2"),
+            "DF_THREADS_PER_UDF must round-trip through adapterNotes"
         );
     }
 }
