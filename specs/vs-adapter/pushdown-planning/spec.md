@@ -1,6 +1,6 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan for a single involved table: it derives the scanned Iceberg table from `involvedTables[0].name` via the create-time `TABLE_MAP`, resolves that table's Iceberg data-file list once (signing catalog requests with AWS SigV4 and applying vended S3 credentials when enabled), captures projection, filter, LIMIT, and any supported aggregate, and emits the SQL that drives the DataFusion scan SET UDF over exactly those files.
+Translates an Exasol query against the virtual schema into a pushdown plan for a single involved table: it derives the scanned Iceberg table from `involvedTables[0].name` via the create-time `TABLE_MAP`, resolves that table's Iceberg data-file list once (signing catalog requests with AWS SigV4 and applying vended S3 credentials when enabled), captures projection, filter, LIMIT, and any supported aggregate, and emits the SQL that drives the DataFusion scan SET UDF over exactly those files. At file-resolution time the adapter additionally translates the soundly-translatable conjuncts of the WHERE predicate into an `iceberg::expr::Predicate` so `plan_files` prunes data files before any S3 I/O; DataFusion always applies the full filter as the sole source of row-level correctness. File-pruning-specific scenarios are in `vs-adapter/pushdown-file-pruning`.
 
 ## Background
 
@@ -51,8 +51,9 @@ Each pushdown request concerns exactly one virtual table — Exasol issues a sep
 
 * *GIVEN* a query with a WHERE predicate over a supported column and operator
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL translate the predicate into the scan spec passed to the UDF
-* *AND* a predicate the adapter cannot translate SHALL be omitted from the scan spec rather than produce an incorrect result
+* *THEN* the adapter SHALL translate the predicate into the scan spec passed to the UDF, omitting (never mistranslating) any node it cannot render
+* *AND* the adapter SHALL ALSO translate the soundly-translatable conjuncts into an `iceberg::expr::Predicate` applied to the Iceberg table scan as a file-pruning filter, dropping any node it cannot translate soundly rather than skipping a file that could match
+* *AND* the DataFusion scan SHALL always apply the full `ScanSpec.filter`, so the Iceberg pruning filter only narrows which files are opened and never changes the result set
 
 ### Scenario: LIMIT is pushed into the scan spec
 
