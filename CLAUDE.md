@@ -31,6 +31,8 @@ their UDF model, workspace layout, and Makefile/E2E conventions. Likely converge
 ## UDF parallelization & memory model (Exasol engine internals)
 
 Verified against `exasol-db` (`script-languages`); cite these when revisiting fan-out or memory work.
+The instances-vs-groups mental model (from the Exasol engine architect, with a worked example) is in
+`specs/udf-context.md` — read it before changing the shard count or fan-out shape.
 
 - **Groups drive UDF *invocations*, not OS processes.** Actual parallel instances on a node = a
   fixed per-node VM pool sized to `NR_OF_CORES`
