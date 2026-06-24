@@ -477,8 +477,13 @@ fn build_session_context(
 
     // Memory pool + spill config.
     let spill = probe_tmp_spill();
-    let runtime_env = build_runtime_env(memory_limit_bytes, spill)
-        .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
+    let runtime_env = build_runtime_env(
+        memory_limit_bytes,
+        spec.memory_pool_fraction,
+        spec.instance_overhead_mb * 1024 * 1024,
+        spill,
+    )
+    .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
 
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
@@ -709,7 +714,7 @@ fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MEMORY_FRACTION};
+    use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
     use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
 
@@ -742,19 +747,25 @@ mod tests {
             },
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         }
     }
 
-    /// A positive memory limit causes the DataFusion pool to be sized at 0.6 × limit.
+    /// A positive memory limit causes the DataFusion pool to be sized at fraction × (limit − overhead).
+    /// Uses minimal_spec defaults: fraction=0.6, overhead=200 MiB.
     #[test]
     fn session_context_sizes_pool_from_ctx_limit() {
         let limit: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-        let expected_budget = (limit as f64 * MEMORY_FRACTION) as usize;
-        let ctx = build_session_context(&minimal_spec(), limit).expect("build must succeed");
+        let spec = minimal_spec();
+        let overhead_bytes = spec.instance_overhead_mb * 1024 * 1024;
+        let net = limit - overhead_bytes;
+        let expected_budget = (net as f64 * spec.memory_pool_fraction) as usize;
+        let ctx = build_session_context(&spec, limit).expect("build must succeed");
         match ctx.runtime_env().memory_pool.memory_limit() {
             MemoryLimit::Finite(actual) => assert_eq!(
                 actual, expected_budget,
-                "pool budget must be 0.6 × the reported per-instance limit"
+                "pool budget must be fraction × (limit − overhead)"
             ),
             _ => panic!("expected Finite pool limit"),
         }
@@ -771,6 +782,35 @@ mod tests {
             ),
             _ => panic!("expected Finite pool limit"),
         }
+    }
+
+    /// Task 5.2: explicit non-default fraction/overhead in spec flow through to pool sizing.
+    ///
+    /// Builds a spec with fraction=0.5 and overhead=256 MiB, calls build_session_context
+    /// with a known limit (4 GiB), and asserts the pool equals 0.5 × (4 GiB − 256 MiB).
+    /// This proves the values are read from the spec, not from hardcoded constants.
+    #[test]
+    fn memory_budget_round_trips_into_scan_spec() {
+        let mut spec = minimal_spec();
+        spec.memory_pool_fraction = 0.5;
+        spec.instance_overhead_mb = 256;
+        let limit: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+        let overhead_bytes = 256_u64 * 1024 * 1024;
+        let net = limit - overhead_bytes;
+        let expected = (net as f64 * 0.5_f64) as usize;
+        let ctx = build_session_context(&spec, limit).expect("build must succeed");
+        match ctx.runtime_env().memory_pool.memory_limit() {
+            MemoryLimit::Finite(actual) => assert_eq!(
+                actual, expected,
+                "pool budget must be 0.5 × (4 GiB − 256 MiB); got {actual}, expected {expected}"
+            ),
+            _ => panic!("expected Finite pool limit"),
+        }
+        // Verify this is NOT the MIN_POOL_FLOOR_BYTES (it should be much larger).
+        assert!(
+            expected > MIN_POOL_FLOOR_BYTES as usize,
+            "expected budget must exceed the floor"
+        );
     }
 
     // ---------------------------------------------------------------------------

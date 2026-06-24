@@ -5,10 +5,11 @@ catalog over S3-compatible storage, including AWS Glue with SigV4-signed request
 as a queryable virtual schema, so the table's columns appear to Exasol with correctly
 mapped SQL types, and records — in the response `adapterNotes` — the cluster's
 active node count (via `NPROC()`), the per-node core count (via
-`PARAM_VALUE('NR_OF_CORES')`), a parallelism factor, and the per-UDF DataFusion
-threading configuration (target partitions and Tokio worker threads), so later
-pushdowns can size the oversubscribed work-unit shard count and bound each scan
-UDF instance's CPU usage.
+`PARAM_VALUE('NR_OF_CORES')`), a parallelism factor, the per-UDF DataFusion
+threading configuration (target partitions and Tokio worker threads), and the
+per-instance memory budget controls (memory-pool fraction and container-overhead
+megabytes), so later pushdowns can size the oversubscribed work-unit shard count
+and bound each scan UDF instance's CPU and memory usage.
 
 ## Background
 
@@ -36,6 +37,11 @@ UDF instance's CPU usage.
   for `DATAFUSION_TARGET_PARTITIONS` is `max(1, floor(NR_OF_CORES / parallelism_factor))`;
   this is documented guidance, not enforced — the defaults stay `1` unless the user
   overrides them.
+* The per-instance memory budget is two independent VS/connection properties —
+  `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) —
+  each recorded in `adapterNotes` and round-tripped into every per-shard scan spec,
+  where the scan UDF sizes its DataFusion pool to
+  `fraction × (per_instance_limit − overhead_bytes)`.
 * The adapter is the Rust ADAPTER SCRIPT entry point of a single `.so`; it speaks the
   Exasol virtual-schema JSON protocol (request in, JSON response out).
 * Schema mapping (C.2) MUST use the same mapping as the scan, defined in the
@@ -125,3 +131,26 @@ UDF instance's CPU usage.
 * *WHEN* the adapter returns the `createVirtualSchema` response
 * *THEN* the `adapterNotes` SHALL carry both the resolved `CLUSTER_NODES` node count and the `PARALLELISM_FACTOR`
 * *AND* both values SHALL be round-tripped back to the adapter at pushdown time so the shard count G can be computed as `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300
+
+### Scenario: Adapter records the memory-pool fraction in the virtual-schema adapterNotes
+
+* *GIVEN* a `createVirtualSchema` request that may supply a `MEMORY_POOL_FRACTION` connection/VS property
+* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
+* *THEN* the adapter SHALL record the resolved memory-pool fraction in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion threading entries
+* *AND* the adapter SHALL default the memory-pool fraction to `0.6` when the `MEMORY_POOL_FRACTION` property is absent, empty, not a positive number, or greater than `1.0`
+* *AND* the adapter SHALL use the supplied value when it is a positive number not greater than `1.0`, persisting the fraction nowhere other than that returned `adapterNotes`
+
+### Scenario: Adapter records the instance-overhead megabytes in the virtual-schema adapterNotes
+
+* *GIVEN* a `createVirtualSchema` request that may supply an `INSTANCE_OVERHEAD_MB` connection/VS property
+* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
+* *THEN* the adapter SHALL record the resolved instance-overhead megabytes in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading entries, and the memory-pool fraction
+* *AND* the adapter SHALL default the instance-overhead megabytes to `200` when the `INSTANCE_OVERHEAD_MB` property is absent, empty, or not a non-negative integer
+* *AND* the adapter SHALL use the supplied value when it is a non-negative integer, persisting the overhead nowhere other than that returned `adapterNotes`
+
+### Scenario: Recorded memory budget controls round-trip into the scan spec
+
+* *GIVEN* a `createVirtualSchema` request that records a memory-pool fraction and instance-overhead megabytes in `adapterNotes`
+* *WHEN* Exasol round-trips those `adapterNotes` back to the adapter at pushdown time and the adapter builds each per-shard scan spec
+* *THEN* the adapter SHALL carry the resolved memory-pool fraction and instance-overhead bytes into every per-shard scan spec
+* *AND* a scan spec that lacks these fields (a pre-existing spec) SHALL deserialize to the default fraction `0.6` and default overhead `200` megabytes

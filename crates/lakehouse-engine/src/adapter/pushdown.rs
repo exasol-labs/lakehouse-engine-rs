@@ -1102,6 +1102,8 @@ pub async fn handle_pushdown(
     parallelism_factor: usize,
     df_target_partitions: usize,
     df_threads_per_udf: usize,
+    memory_pool_fraction: f64,
+    instance_overhead_mb: u64,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
@@ -1185,6 +1187,8 @@ pub async fn handle_pushdown(
                 catalog: catalog.clone(),
                 df_target_partitions,
                 df_threads_per_udf,
+                memory_pool_fraction,
+                instance_overhead_mb,
             };
             let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys);
             let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -1221,6 +1225,8 @@ pub async fn handle_pushdown(
         catalog: catalog.clone(),
         df_target_partitions,
         df_threads_per_udf,
+        memory_pool_fraction,
+        instance_overhead_mb,
     };
 
     let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -1775,6 +1781,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards =
@@ -2201,6 +2209,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
 
         // Build single-shard SQL and decode the embedded spec literal.
@@ -2343,6 +2353,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards =
@@ -2470,6 +2482,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
         let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
@@ -2508,6 +2522,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
         let sql = build_scan_driving_sql(
@@ -3007,6 +3023,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
@@ -3049,6 +3067,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
@@ -3105,6 +3125,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
@@ -3175,6 +3197,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_grouped_aggregate_scan_sql(
@@ -3288,6 +3312,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).expect("must round-trip");
@@ -3715,6 +3741,8 @@ mod tests {
             catalog: sample_catalog(),
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         };
         let shards = vec![vec!["s3://wh/f.parquet".into()]];
         let col_types = vec![
