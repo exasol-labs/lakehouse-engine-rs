@@ -1,3 +1,7 @@
+[lakehouse-engine](../README.md) › [Docs](index.md) › Capabilities
+
+---
+
 # Capability Support Overview
 
 Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates
@@ -9,7 +13,7 @@ correct partial/merge plan. Source of truth: `crates/lakehouse-engine/src/adapte
 |---|---|---|---|---|
 | `SELECTLIST_PROJECTION` | `SELECT id, name` | Reads only projected columns from Parquet | Concatenates shard outputs | ✅ |
 | `SELECTLIST_EXPRESSIONS` | `SELECT price*1.2` | Evaluates the expression during scan | Pass-through | ✅ |
-| `FILTER_EXPRESSIONS` + predicates (`FN_PRED_EQUAL/LESS/BETWEEN/IN/IS_NULL/LIKE/REGEXP_LIKE`, `AND/OR/NOT`) | `WHERE region='EU' AND qty>10` | Applies predicate during scan (skips non-matching rows/row-groups) | Re-checks only untranslatable predicates it kept | ✅ |
+| `FILTER_EXPRESSIONS` + predicates (`FN_PRED_EQUAL/LESS/BETWEEN/IN/IS_NULL/LIKE/REGEXP_LIKE`, `AND/OR/NOT`) | `WHERE region='EU' AND qty>10` | Prunes whole data files via Iceberg manifest stats, then applies the predicate during scan (skips non-matching row-groups/rows) | Re-checks only untranslatable predicates it kept | ✅ |
 | Literals (`LITERAL_STRING/DOUBLE/DATE/TIMESTAMP/...`) | `WHERE d = DATE '2024-01-01'` | Consumes the typed literal in the predicate | — | ✅ |
 | `LIMIT` | `... LIMIT 100` | Stops scanning early per shard | Re-applies `LIMIT` as correctness backstop across shards | ✅ |
 | Math fns (`FN_ABS`, `FN_ROUND`, `FN_SQRT`, …25) | `SELECT ROUND(amt,2)` | Computes via vs-expression→DataFusion SQL | Pass-through | ✅ |
@@ -21,7 +25,7 @@ correct partial/merge plan. Source of truth: `crates/lakehouse-engine/src/adapte
 | Statistical (`FN_AGG_STDDEV*`, `FN_AGG_VAR*`) | `SELECT STDDEV(x)` | Emits sufficient stats (n, Σx, Σx²) per shard | Combines stats into final stddev/variance | ✅ |
 | `AGGREGATE_GROUP_BY_COLUMN` / `_EXPRESSION` | `SELECT k, SUM(v) GROUP BY k` | Per-shard partial aggregate grouped by key | Final `GROUP BY` merge across shards | ✅ |
 | `AGGREGATE_HAVING` | `... HAVING SUM(v)>100` | (filter applies post-merge) | Applies `HAVING` on the merged result | ✅ |
-| **JOIN** (`JOIN`, `JOIN_TYPE_*`, `JOIN_CONDITION_*`) | `FROM a JOIN b ON a.id=b.id` | — (not pushed) | **Exasol** issues one pushdown per table, joins result sets itself | ⛔ not advertised → **enabled by multi-table VS** |
+| **JOIN** (`JOIN`, `JOIN_TYPE_*`, `JOIN_CONDITION_*`) | `FROM a JOIN b ON a.id=b.id` | — (not pushed) | **Exasol** issues one pushdown per table, joins result sets itself | ⛔ not advertised → **usable via multi-table VS** |
 | `ORDER BY` | `... ORDER BY ts` | — | Sorts the final result | ⛔ not advertised; Exasol-side |
 | `COUNT(DISTINCT)` / `MEDIAN` / `APPROX_COUNT_DISTINCT` | `COUNT(DISTINCT u)` | — (not decomposable into partial/merge) | Exasol computes after raw rows returned | ⛔ not advertised |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | — | Exasol-side | ⛔ not advertised |
@@ -29,6 +33,6 @@ correct partial/merge plan. Source of truth: `crates/lakehouse-engine/src/adapte
 
 **Why the ⛔ rows aren't pushed down:** JOIN, ORDER BY, and DISTINCT/MEDIAN aggregates
 don't fit the per-shard→merge model, so Exasol handles them after partial results
-return — correct, just less pushdown. JOIN specifically becomes *usable* once the VS
-exposes multiple tables (this plan), because Exasol can then resolve each table's
-pushdown independently and join the result sets itself.
+return — correct, just less pushdown. JOIN is nonetheless *usable*: the VS exposes
+every table in the Iceberg namespace (multi-table VS), so Exasol resolves each table's
+pushdown independently and joins the result sets itself.
