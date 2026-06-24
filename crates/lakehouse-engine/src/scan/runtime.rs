@@ -9,12 +9,16 @@ use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 0.6 × limit — leaves headroom below the engine's 80% concurrency-stall threshold.
-pub(crate) const MEMORY_FRACTION: f64 = 0.6;
-
 /// Conservative default pool budget when the per-instance limit is unknown (0 sentinel).
 /// 1 GiB keeps a single shard comfortable without risking OOM on a low-memory node.
 pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Minimum DataFusion memory pool budget (256 MiB).
+///
+/// Guards against degenerate inputs where `overhead_bytes ≥ memory_limit_bytes` causes
+/// `net` to collapse toward zero and `fraction × net` to become near-zero. The floor
+/// ensures a usable pool so the session context still builds and a scan can run.
+pub(crate) const MIN_POOL_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Whether `/tmp` is usable as a spill directory.
 #[derive(Debug, Clone)]
@@ -98,18 +102,22 @@ fn write_probe_succeeds(dir: &std::path::Path) -> bool {
 
 /// Build a `RuntimeEnv` sized from the per-instance memory limit.
 ///
-/// - `memory_limit_bytes == 0` (unknown / unavailable sentinel) → default 1024 MB pool.
-/// - `memory_limit_bytes  > 0` → pool budget = `MEMORY_FRACTION × limit` (≈ 0.6 ×).
+/// - `memory_limit_bytes == 0` (unknown / unavailable sentinel) → default 1024 MB pool;
+///   `fraction` and `overhead_bytes` are ignored.
+/// - `memory_limit_bytes  > 0` → `net = limit − overhead` (saturating); `budget = max(net × fraction, MIN_POOL_FLOOR_BYTES)`.
 /// - `Disk(path)` → `FairSpillPool` + `DiskManager` rooted at `path` (spill-to-disk path).
 /// - `NoDisk`     → `GreedyMemoryPool` (returns `ResourcesExhausted` when budget exceeded).
 pub fn build_runtime_env(
     memory_limit_bytes: u64,
+    fraction: f64,
+    overhead_bytes: u64,
     spill: SpillMode,
 ) -> Result<RuntimeEnv, datafusion::error::DataFusionError> {
     let budget = if memory_limit_bytes == 0 {
         DEFAULT_BUDGET_BYTES
     } else {
-        (memory_limit_bytes as f64 * MEMORY_FRACTION) as u64
+        let net = memory_limit_bytes.saturating_sub(overhead_bytes);
+        ((net as f64 * fraction) as u64).max(MIN_POOL_FLOOR_BYTES)
     };
 
     // usize cast: safe on 64-bit Linux (budget ≤ memory_limit_bytes ≤ u64::MAX, and
@@ -135,12 +143,15 @@ mod tests {
     use super::*;
     use datafusion::execution::memory_pool::MemoryConsumer;
 
-    /// When a positive memory limit is supplied, the pool budget is ~0.6 × limit.
+    /// When a positive memory limit is supplied, the pool budget is fraction × (limit − overhead).
     #[test]
-    fn build_runtime_env_sizes_pool_from_limit_fraction() {
-        let limit: u64 = 1024 * 1024 * 1024; // 1 GiB
-        let env = build_runtime_env(limit, SpillMode::NoDisk).unwrap();
-        let expected = (limit as f64 * MEMORY_FRACTION) as usize;
+    fn build_runtime_env_sizes_pool_from_net_budget() {
+        let limit: u64 = 4096 * 1024 * 1024; // 4 GiB
+        let overhead: u64 = 200 * 1024 * 1024; // 200 MiB
+        let fraction = 0.6_f64;
+        let env = build_runtime_env(limit, fraction, overhead, SpillMode::NoDisk).unwrap();
+        let net = limit - overhead;
+        let expected = (net as f64 * fraction) as usize;
         // Verify indirectly: try to grow to the expected budget — must succeed.
         let reservation = MemoryConsumer::new("test").register(&env.memory_pool);
         assert!(
@@ -155,10 +166,30 @@ mod tests {
         );
     }
 
-    /// When the limit sentinel is 0, a 1024 MB default budget is used.
+    /// When overhead ≥ limit, net collapses to 0 and the floor MIN_POOL_FLOOR_BYTES is used.
+    #[test]
+    fn build_runtime_env_clamps_to_floor_when_overhead_exceeds_limit() {
+        let limit: u64 = 100 * 1024 * 1024; // 100 MiB — smaller than the default 200 MiB overhead
+        let overhead: u64 = 200 * 1024 * 1024; // 200 MiB > limit
+        let fraction = 0.6_f64;
+        let env = build_runtime_env(limit, fraction, overhead, SpillMode::NoDisk).unwrap();
+        let expected = MIN_POOL_FLOOR_BYTES as usize;
+        let reservation = MemoryConsumer::new("test").register(&env.memory_pool);
+        assert!(
+            reservation.try_grow(expected).is_ok(),
+            "floor budget must be usable when overhead exceeds limit"
+        );
+        let reservation2 = MemoryConsumer::new("test2").register(&env.memory_pool);
+        assert!(
+            reservation2.try_grow(1).is_err(),
+            "one byte beyond the floor must fail"
+        );
+    }
+
+    /// When the limit sentinel is 0, a 1024 MB default budget is used (fraction/overhead ignored).
     #[test]
     fn build_runtime_env_uses_default_budget_on_zero_limit() {
-        let env = build_runtime_env(0, SpillMode::NoDisk).unwrap();
+        let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();
         let default_budget = DEFAULT_BUDGET_BYTES as usize;
         let reservation = MemoryConsumer::new("test").register(&env.memory_pool);
         assert!(
@@ -176,7 +207,7 @@ mod tests {
     #[test]
     fn build_runtime_env_uses_fair_spill_pool_when_disk() {
         let tmp = std::env::temp_dir();
-        let env = build_runtime_env(0, SpillMode::Disk(tmp)).unwrap();
+        let env = build_runtime_env(0, 0.6, 0, SpillMode::Disk(tmp)).unwrap();
         assert_eq!(
             env.memory_pool.name(),
             "fair",
@@ -187,7 +218,7 @@ mod tests {
     /// When SpillMode::NoDisk is supplied the pool is GreedyMemoryPool (name() == "greedy").
     #[test]
     fn build_runtime_env_uses_greedy_pool_when_no_disk() {
-        let env = build_runtime_env(0, SpillMode::NoDisk).unwrap();
+        let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();
         assert_eq!(
             env.memory_pool.name(),
             "greedy",

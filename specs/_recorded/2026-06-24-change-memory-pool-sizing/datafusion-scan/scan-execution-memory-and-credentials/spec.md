@@ -24,6 +24,7 @@ configurable fraction, and to consume storage credentials carried in the scan sp
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Scan sizes its memory pool from the reported per-instance limit
 
 * *GIVEN* a scan UDF invocation whose UDF context reports a positive per-instance memory limit via `ctx.memory_limit()`
@@ -32,14 +33,18 @@ configurable fraction, and to consume storage credentials carried in the scan sp
 * *THEN* the UDF SHALL subtract the container-overhead bytes from the per-instance limit and size the DataFusion memory pool to the configured fraction of that net budget
 * *AND* the resulting pool budget MUST stay below the Exasol engine's 80% concurrency-stall threshold for the reported limit
 * *AND* the UDF MUST NOT hardcode the pool budget to the unknown-limit default when a positive limit is reported
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Scan falls back to the default budget when no memory limit is reported
 
 * *GIVEN* a scan UDF invocation whose `ctx.memory_limit()` returns `0` (the unknown / unavailable sentinel)
 * *WHEN* the scan UDF builds its DataFusion session context
 * *THEN* the UDF SHALL size the DataFusion memory pool to the conservative default budget, ignoring the configured fraction and overhead
 * *AND* the scan SHALL otherwise execute identically to the positive-limit path
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:NEW -->
 ### Scenario: Scan clamps the memory pool to a minimum floor when overhead exceeds the limit
 
 * *GIVEN* a scan UDF invocation whose `ctx.memory_limit()` reports a positive per-instance limit
@@ -47,11 +52,4 @@ configurable fraction, and to consume storage credentials carried in the scan sp
 * *WHEN* the scan UDF builds its DataFusion session context
 * *THEN* the UDF SHALL clamp the DataFusion memory pool budget to a minimum non-zero floor rather than producing a zero or negative budget
 * *AND* the scan SHALL still build a usable session context that can execute a scan
-
-### Scenario: Scan reads data files with vended credentials carried in the scan spec
-
-* *GIVEN* a scan spec whose storage block carries vended S3 credentials (access key, secret key, session token) resolved once by the planning layer
-* *WHEN* the scan UDF builds its object store and reads its assigned files
-* *THEN* the UDF SHALL configure its S3 object store from the credentials in the scan spec
-* *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials
-* *AND* a credential value MUST NOT appear in any error message the UDF returns
+<!-- /DELTA:NEW -->
