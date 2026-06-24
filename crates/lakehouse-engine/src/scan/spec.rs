@@ -148,10 +148,30 @@ pub struct ScanSpec {
     /// Old specs that lack this field deserialize to 1 (backward-compatible).
     #[serde(default = "default_one_usize")]
     pub df_threads_per_udf: usize,
+
+    /// Fraction of the net per-instance budget given to the DataFusion memory pool.
+    /// Net budget = per-instance RSS limit − container overhead. Old specs that lack
+    /// this field deserialize to 0.6 (backward-compatible).
+    #[serde(default = "default_memory_pool_fraction")]
+    pub memory_pool_fraction: f64,
+
+    /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance
+    /// limit before applying `memory_pool_fraction`. Old specs that lack this field
+    /// deserialize to 200 (backward-compatible).
+    #[serde(default = "default_instance_overhead_mb")]
+    pub instance_overhead_mb: u64,
 }
 
 fn default_one_usize() -> usize {
     1
+}
+
+fn default_memory_pool_fraction() -> f64 {
+    0.6
+}
+
+fn default_instance_overhead_mb() -> u64 {
+    200
 }
 
 impl ScanSpec {
@@ -201,6 +221,8 @@ mod tests {
             },
             df_target_partitions: 1,
             df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
         }
     }
 
@@ -414,6 +436,55 @@ mod tests {
         assert_eq!(
             legacy.df_threads_per_udf, 1,
             "missing df_threads_per_udf must default to 1 (backward-compat)"
+        );
+    }
+
+    /// Task 1.2: memory_pool_fraction and instance_overhead_mb round-trip and default correctly.
+    ///
+    /// Verifies that:
+    /// 1. Explicit values survive serialize → deserialize.
+    /// 2. A legacy JSON payload lacking both fields deserializes to 0.6 / 200.
+    #[test]
+    fn scan_spec_memory_fields_round_trip_and_default() {
+        // 1. Explicit non-default values round-trip.
+        let mut spec = sample_spec();
+        spec.memory_pool_fraction = 0.5;
+        spec.instance_overhead_mb = 256;
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.memory_pool_fraction, 0.5,
+            "memory_pool_fraction must survive round-trip"
+        );
+        assert_eq!(
+            back.instance_overhead_mb, 256,
+            "instance_overhead_mb must survive round-trip"
+        );
+
+        // 2. Legacy payload without these fields → defaults 0.6 / 200.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.memory_pool_fraction, 0.6,
+            "missing memory_pool_fraction must default to 0.6 (backward-compat)"
+        );
+        assert_eq!(
+            legacy.instance_overhead_mb, 200,
+            "missing instance_overhead_mb must default to 200 (backward-compat)"
         );
     }
 }
