@@ -27,7 +27,7 @@ services:
       start_period: 10s
     networks:
       lakehouse:
-        ipv4_address: 172.21.0.10
+        ipv4_address: 10.84.0.10
 
   minio-init:
     image: minio/mc:latest
@@ -67,7 +67,7 @@ services:
       start_period: 20s
     networks:
       lakehouse:
-        ipv4_address: 172.21.0.11
+        ipv4_address: 10.84.0.11
 
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.2.1}"
@@ -91,15 +91,15 @@ services:
     # extra_hosts also sets the same entries at the Docker layer (intent + the brief
     # window before exaconf runs).
     extra_hosts:
-      - "minio:172.21.0.10"
-      - "iceberg-rest:172.21.0.11"
+      - "minio:10.84.0.10"
+      - "iceberg-rest:10.84.0.11"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts; then
-              printf '172.21.0.10 minio\n172.21.0.11 iceberg-rest\n' >> /etc/hosts
+              printf '10.84.0.10 minio\n10.84.0.11 iceberg-rest\n' >> /etc/hosts
             fi
             sleep 2
           done ) &
@@ -112,7 +112,7 @@ services:
       start_period: 180s
     networks:
       lakehouse:
-        ipv4_address: 172.21.0.20
+        ipv4_address: 10.84.0.20
 
 volumes:
   minio-data:
@@ -120,7 +120,10 @@ volumes:
 
 networks:
   lakehouse:
-    name: lakehouse
+    # Project-unique name + a dedicated subnet outside Docker's common 172.x
+    # auto-pool, so this stack never collides with a generically-named
+    # `lakehouse` network or the 172.21.x range a sibling stack might use.
+    name: lakehouse-engine
     ipam:
       config:
-        - subnet: 172.21.0.0/16
+        - subnet: 10.84.0.0/16

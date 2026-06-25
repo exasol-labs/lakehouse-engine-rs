@@ -70,6 +70,11 @@ parquet             = { workspace = true }
 ice_arrow_array     = { package = "arrow-array", version = "57" }
 ice_arrow_schema    = { package = "arrow-schema", version = "57" }
 ice_parquet         = { package = "parquet", version = "57" }
+# TPC-H generator for the live smoke test loader (tests/tpch_loader.rs). Pins
+# arrow ^57.1 — same major as the iceberg 0.9.1 write stack above, so the Arrow
+# RecordBatch it yields feeds straight into iceberg's writer with no conversion.
+tpchgen             = { version = "2.0.2" }
+tpchgen-arrow       = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 reqwest             = { version = "0.12", features = ["blocking"] }
