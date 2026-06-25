@@ -72,6 +72,9 @@ services:
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.2.1}"
     privileged: true
+    # Give Exasol multiple CPUs so the scan UDF's shard fan-out + DataFusion
+    # threading have cores to run on (the live-smoke test exercises this).
+    cpus: "${LH_EXASOL_CPUS:-4}"
     shm_size: "1g"
     environment:
       EXA_DB_MEM_SIZE: "${EXASOL_DB_MEM_SIZE:-4 GiB}"

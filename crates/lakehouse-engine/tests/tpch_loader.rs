@@ -81,42 +81,58 @@ async fn load_tpch() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.3);
     let namespace = std::env::var("ICEBERG_NAMESPACE").unwrap_or_else(|_| "tpch".to_string());
+    // Number of Parquet files for the big tables (lineitem, orders). >1 makes the
+    // adapter's GROUP BY shard_key fan-out (one shard per file) observable. Small
+    // tables stay single-file. tpchgen's (scale, part, N) yields N disjoint parts.
+    let files: i32 = std::env::var("TPCH_FILES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4);
     const BATCH_SIZE: usize = 60_000;
 
     let catalog_url = stack::iceberg_catalog_url();
     let warehouse = "s3://warehouse/";
     let catalog = seed::build_seed_catalog(&catalog_url, warehouse, "tpch-loader").await?;
-    println!("Loading TPC-H (SF={scale}) into namespace '{namespace}' at {catalog_url}");
+    println!("Loading TPC-H (SF={scale}, big tables in {files} files) into '{namespace}' at {catalog_url}");
 
-    // Each TPC-H table: build the generator + Arrow iterator, derive the Iceberg
-    // schema from the Arrow schema, and create+append (idempotent). Defined as a
-    // macro because the 8 generator/Arrow types are distinct (no common trait
-    // object that also yields a usable schema).
+    // Each TPC-H table: build N disjoint generator parts (one Arrow iterator per
+    // file), derive the Iceberg schema from the first part's Arrow schema, and
+    // create + append each part as its own data file (idempotent). A macro because
+    // the 8 generator/Arrow types are distinct (no common trait object).
     macro_rules! load_table {
-        ($gen:ty, $arrow:ident, $name:literal) => {{
-            let g = <$gen>::new(scale, 1, 1);
-            let arrow_it = $arrow::new(g).with_batch_size(BATCH_SIZE);
-            let iceberg_schema = arrow_schema_to_iceberg(arrow_it.schema())
+        ($gen:ty, $arrow:ident, $name:literal, $nfiles:expr) => {{
+            let n: i32 = $nfiles;
+            let parts: Vec<$arrow> = (1..=n)
+                .map(|part| $arrow::new(<$gen>::new(scale, part, n)).with_batch_size(BATCH_SIZE))
+                .collect();
+            let iceberg_schema = arrow_schema_to_iceberg(parts[0].schema())
                 .with_context(|| format!("derive Iceberg schema for {}", $name))?;
-            let wrote = seed::create_and_append(&catalog, &namespace, $name, iceberg_schema, arrow_it)
-                .await
-                .with_context(|| format!("load TPC-H table {}", $name))?;
+            let wrote =
+                seed::create_and_append_files(&catalog, &namespace, $name, iceberg_schema, parts)
+                    .await
+                    .with_context(|| format!("load TPC-H table {}", $name))?;
             println!(
-                "  {:<9} {}",
+                "  {:<9} {} ({} file(s))",
                 $name,
-                if wrote { "loaded" } else { "skipped (already present)" }
+                if wrote {
+                    "loaded"
+                } else {
+                    "skipped (already present)"
+                },
+                n
             );
         }};
     }
 
-    load_table!(RegionGenerator, RegionArrow, "region");
-    load_table!(NationGenerator, NationArrow, "nation");
-    load_table!(SupplierGenerator, SupplierArrow, "supplier");
-    load_table!(CustomerGenerator, CustomerArrow, "customer");
-    load_table!(PartGenerator, PartArrow, "part");
-    load_table!(PartSuppGenerator, PartSuppArrow, "partsupp");
-    load_table!(OrderGenerator, OrderArrow, "orders");
-    load_table!(LineItemGenerator, LineItemArrow, "lineitem");
+    load_table!(RegionGenerator, RegionArrow, "region", 1);
+    load_table!(NationGenerator, NationArrow, "nation", 1);
+    load_table!(SupplierGenerator, SupplierArrow, "supplier", 1);
+    load_table!(CustomerGenerator, CustomerArrow, "customer", 1);
+    load_table!(PartGenerator, PartArrow, "part", 1);
+    load_table!(PartSuppGenerator, PartSuppArrow, "partsupp", 1);
+    load_table!(OrderGenerator, OrderArrow, "orders", files);
+    load_table!(LineItemGenerator, LineItemArrow, "lineitem", files);
 
     Ok(())
 }
