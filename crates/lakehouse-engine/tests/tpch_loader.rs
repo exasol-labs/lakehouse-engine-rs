@@ -1,9 +1,9 @@
-//! TPC-H data loader for the live smoke test (NOT part of `make test-e2e`).
+//! TPC-H data loader for the live benchmark (NOT part of `make test-e2e`).
 //!
 //! Generates the 8 TPC-H tables with `tpchgen-arrow` and writes them into the
 //! local Docker Iceberg REST catalog (MinIO-backed), reusing the proven write
 //! path in `common::seed` (`build_seed_catalog` + `create_and_append`). Run by
-//! `scripts/live-smoke.sh` in docker mode:
+//! `bench/run.sh` in docker mode:
 //!
 //!   cargo test --features exasol-e2e --test tpch_loader -- --nocapture
 //!
