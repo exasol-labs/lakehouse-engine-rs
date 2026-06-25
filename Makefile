@@ -47,7 +47,7 @@ test:
 
 # Host ports of the dedicated lakehouse-engine compose stack. Overridable so the
 # suite can always pick free ports; defaults match docker-compose.yml.
-# Exasol host. Defaults to localhost (Docker stack); the live-smoke script
+# Exasol host. Defaults to localhost (Docker stack); the bench script
 # overrides it to target a remote cluster. install-slc / bucketfs-upload-so use
 # it so the same targets work against Docker and remote Exasol.
 EXASOL_HOST      ?= localhost
@@ -148,11 +148,11 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
-# Manually-invoked live smoke test against a real AWS S3 + Glue Iceberg TPC-H
-# catalog. Builds the working-tree .so, then runs scripts/live-smoke.sh, which
-# reads config from a gitignored .env (see .env.example). NOT part of CI —
-# test-e2e stays the pipeline path.
-live-smoke: cross-musl-udf-build
-	./scripts/live-smoke.sh
+# Manually-invoked live benchmark: docker (self-contained local stack) or remote
+# (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
+# working-tree .so, then runs bench/run.sh, which reads config from a gitignored
+# bench/.env (see bench/.env.example). NOT part of CI — test-e2e stays the path.
+bench: cross-musl-udf-build
+	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint live-smoke
+.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench

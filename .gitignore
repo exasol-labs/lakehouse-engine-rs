@@ -7,6 +7,6 @@
 # Local follow-up scratch notes (not tracked)
 next.md
 
-# Live smoke-test local config + reports
-.env
-live-smoke-report-*.txt
+# Benchmark local config + reports
+bench/.env
+bench/reports/

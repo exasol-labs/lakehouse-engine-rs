@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 #
-# Manually-invoked live smoke test for the lakehouse-engine VS. NOT part of CI
-# (`make test-e2e` is the pipeline path). Two modes (config from a gitignored
-# .env — see .env.example):
+# Manually-invoked live benchmark for the lakehouse-engine VS: exercises the full
+# query path against a live system and times it. NOT part of CI (`make test-e2e`
+# is the pipeline path). Two modes (config from a gitignored bench/.env — see
+# bench/.env.example):
 #
 #   docker (default) — SELF-CONTAINED: brings up the local Docker stack (MinIO +
 #       Iceberg REST + Exasol), loads TPC-H into the local catalog, and verifies
 #       wiring + first perf indicators. No AWS needed; .env is optional.
 #   remote — runs against a real AWS Glue catalog + an external Exasol cluster
-#       (the later cluster perf phase). Requires AWS_*/EXASOL_* in .env.
+#       (the cluster perf phase, with PROFILE). Requires AWS_*/EXASOL_* in .env.
 #
-#   make live-smoke
-#   ./scripts/live-smoke.sh selftest   # offline self-check of the string logic
+#   make bench
+#   ./bench/run.sh selftest   # offline self-check of the string logic
 #
 set -euo pipefail
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 # Object names — match the e2e harness so the same .so entry points resolve.
 SCHEMA=LHVS
@@ -61,9 +63,9 @@ if [ "${1:-}" = "selftest" ]; then
 fi
 
 # ---- config ------------------------------------------------------------------
-[ -f .env ] && { set -a; . ./.env; set +a; }   # .env optional (required vars validated per mode)
+[ -f "$SCRIPT_DIR/.env" ] && { set -a; . "$SCRIPT_DIR/.env"; set +a; }   # .env optional (required vars validated per mode)
 
-TARGET="${LIVE_SMOKE_TARGET:-docker}"
+TARGET="${BENCH_TARGET:-docker}"
 EXA_PORT="${LH_EXASOL_PORT:-28563}"
 BFS_PORT="${LH_BUCKETFS_PORT:-22581}"
 TPCH_SCALE="${TPCH_SCALE:-0.3}"
@@ -80,7 +82,7 @@ case "$TARGET" in
     # DataFusion target-partitions / threads-per-UDF defaults so scans use the cores;
     # multi-file tables (loader) + PARALLELISM_FACTOR drive the GROUP BY shard_key fan-out.
     VS_EXTRA_PROPS="$(printf "\n  ALLOW_HTTP          = 'true'\n  NR_OF_CORES         = '%s'\n  PARALLELISM_FACTOR  = '%s'" \
-      "${LIVE_SMOKE_NR_OF_CORES:-4}" "${LIVE_SMOKE_PARALLELISM_FACTOR:-8}")"
+      "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON=0
     echo "== docker: bringing up local stack (minio, iceberg-rest, exasol) =="
     docker compose up -d
@@ -95,13 +97,14 @@ case "$TARGET" in
     CATALOG_URI="$GLUE_CATALOG_URI"
     CONN_PW="$(build_conn_password_cloud)"
     VS_EXTRA_PROPS=""
-    PROFILE_ON="${LIVE_SMOKE_PROFILE:-1}"
+    PROFILE_ON="${BENCH_PROFILE:-1}"
     ;;
-  *) echo "ERROR: LIVE_SMOKE_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;
+  *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;
 esac
 
 DSN="exasol://sys:${SYS_PASS}@${HOST}:${EXA_PORT}?validateservercertificate=0"
-REPORT="live-smoke-report-$(date +%Y%m%d-%H%M%S).txt"
+mkdir -p "$SCRIPT_DIR/reports"
+REPORT="$SCRIPT_DIR/reports/bench-report-$(date +%Y%m%d-%H%M%S).txt"
 FAILED=0
 
 # exapump reads SQL from stdin (keeps secrets out of argv); -f sets output format.
@@ -170,7 +173,7 @@ USING ${SCHEMA}.${ADAPTER} WITH
   SCAN_SCHEMA         = '${SCHEMA}'${VS_EXTRA_PROPS}"
 
 {
-  echo "lakehouse-engine live smoke test — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
+  echo "lakehouse-engine benchmark — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
   echo "namespace=${NAMESPACE}"
   echo
   echo "== tables exposed by ${VS} =="
@@ -297,6 +300,6 @@ fi
 
 echo
 if [ "$FAILED" -ne 0 ]; then
-  echo "SMOKE TEST FAILED (see counts above). Report: ${REPORT}"; exit 1
+  echo "BENCHMARK FAILED (see counts above). Report: ${REPORT}"; exit 1
 fi
 echo "Done. Full report: ${REPORT}"
