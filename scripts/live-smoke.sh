@@ -76,7 +76,11 @@ case "$TARGET" in
     NAMESPACE="${ICEBERG_NAMESPACE:-tpch}"
     CATALOG_URI="http://iceberg-rest:8181"          # internal: reachable from the UDF
     CONN_PW="$(build_conn_password_local)"
-    VS_EXTRA_PROPS=$'\n  ALLOW_HTTP          = '\''true'\'''   # http catalog + http S3
+    # http catalog/S3 + parallelism knobs. NR_OF_CORES (new VS property) drives the
+    # DataFusion target-partitions / threads-per-UDF defaults so scans use the cores;
+    # multi-file tables (loader) + PARALLELISM_FACTOR drive the GROUP BY shard_key fan-out.
+    VS_EXTRA_PROPS="$(printf "\n  ALLOW_HTTP          = 'true'\n  NR_OF_CORES         = '%s'\n  PARALLELISM_FACTOR  = '%s'" \
+      "${LIVE_SMOKE_NR_OF_CORES:-4}" "${LIVE_SMOKE_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON=0
     echo "== docker: bringing up local stack (minio, iceberg-rest, exasol) =="
     docker compose up -d
@@ -134,8 +138,8 @@ if [ "$TARGET" = "docker" ]; then
   wait_http "http://localhost:${LH_MINIO_PORT:-19000}/minio/health/live" "MinIO"
   wait_http "http://localhost:${LH_REST_PORT:-18181}/v1/config" "Iceberg REST"
   wait_exasol
-  echo "== loading TPC-H (SF=${TPCH_SCALE}) into local catalog namespace '${NAMESPACE}' =="
-  TPCH_SCALE="$TPCH_SCALE" ICEBERG_NAMESPACE="$NAMESPACE" \
+  echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
+  TPCH_SCALE="$TPCH_SCALE" ICEBERG_NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
     cargo test --features exasol-e2e --test tpch_loader -- --nocapture
 else
   wait_exasol
@@ -232,6 +236,53 @@ run_query "Q3 orders x lineitem + filter + GROUP BY" \
  WHERE o.O_ORDERDATE >= DATE '1994-01-01' AND o.O_ORDERDATE < DATE '1995-01-01'
  GROUP BY o.O_ORDERPRIORITY
  ORDER BY o.O_ORDERPRIORITY"
+
+run_query "Q4 lineitem pricing summary (TPC-H Q1 shape; multi-file -> parallel scan)" \
+"SELECT L_RETURNFLAG, L_LINESTATUS, SUM(L_QUANTITY) AS sum_qty, SUM(L_EXTENDEDPRICE) AS sum_base_price,
+        AVG(L_DISCOUNT) AS avg_disc, COUNT(*) AS count_order
+ FROM ${VS}.LINEITEM
+ WHERE L_SHIPDATE <= DATE '1998-09-01'
+ GROUP BY L_RETURNFLAG, L_LINESTATUS
+ ORDER BY L_RETURNFLAG, L_LINESTATUS"
+
+# ---- pushdown analysis: confirm projection/filter/limit + shard fan-out ------
+# EXPLAIN VIRTUAL is introspection (not a timed query): it prints the scan spec the
+# adapter generates. Assert the expected elements are actually pushed into the scan.
+pushdown_check() {
+  local name="$1" q="$2"; shift 2
+  local out needle
+  { echo; echo "### PUSHDOWN: ${name}"; } | tee -a "$REPORT"
+  if ! out="$(sqlf "EXPLAIN VIRTUAL ${q}" 2>&1)"; then
+    echo "  FAIL  EXPLAIN VIRTUAL errored" | tee -a "$REPORT"; echo "$out" >>"$REPORT"; FAILED=1; return
+  fi
+  echo "$out" >>"$REPORT"
+  for needle in "$@"; do
+    if printf '%s' "$out" | grep -qiF -- "$needle"; then
+      echo "  OK    pushed: ${needle}" | tee -a "$REPORT"
+    else
+      echo "  FAIL  not pushed: ${needle}" | tee -a "$REPORT"; FAILED=1
+    fi
+  done
+}
+
+# Shard fan-out active for the multi-file LINEITEM (one shard per file).
+pushdown_check "shard fan-out (multi-file LINEITEM)" \
+  "SELECT COUNT(*) FROM ${VS}.LINEITEM" "shard_key"
+# LIMIT pushdown.
+pushdown_check "LIMIT" \
+  "SELECT * FROM ${VS}.LINEITEM LIMIT 10" "limit"
+# Projection + filter (BETWEEN) + single-group aggregate.
+pushdown_check "filter (BETWEEN) + projection" \
+  "SELECT COUNT(*), MIN(L_SHIPDATE), MAX(L_SHIPDATE), AVG(L_EXTENDEDPRICE) FROM ${VS}.LINEITEM WHERE L_DISCOUNT BETWEEN 0.05 AND 0.07" \
+  "filter" "L_DISCOUNT"
+# Filter with GROUP BY aggregate (TPC-H Q1 shape).
+pushdown_check "filter + GROUP BY agg" \
+  "SELECT L_RETURNFLAG, L_LINESTATUS, COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPDATE <= DATE '1998-09-01' GROUP BY L_RETURNFLAG, L_LINESTATUS" \
+  "filter" "L_RETURNFLAG"
+# Complex predicate: IN list + OR + comparison.
+pushdown_check "filter (IN / OR / comparison)" \
+  "SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPMODE IN ('AIR','RAIL') AND (L_RETURNFLAG = 'R' OR L_QUANTITY > 45)" \
+  "filter" "AIR"
 
 # ---- remote-only best-effort PROFILE dump ------------------------------------
 if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then

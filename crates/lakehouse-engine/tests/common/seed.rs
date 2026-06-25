@@ -151,12 +151,10 @@ pub async fn build_seed_catalog(
 }
 
 /// Create `namespace.table_name` (unpartitioned) with `iceberg_schema` if absent,
-/// then append `batches` as Parquet data file(s) via a single fast-append.
+/// then append `batches` as a single Parquet data file via one fast-append.
 ///
 /// Idempotent: returns `Ok(false)` without writing if the table already has data
-/// files. Returns `Ok(true)` when rows were written. Reused by the TPC-H loader
-/// (`tests/tpch_loader.rs`) to write arbitrary tables; the per-batch field-id
-/// overlay + write/commit is the same pattern as the events/labels/regions seeds.
+/// files. Convenience wrapper over [`create_and_append_files`] for a single file.
 pub async fn create_and_append(
     catalog: &impl Catalog,
     namespace: &str,
@@ -164,6 +162,36 @@ pub async fn create_and_append(
     iceberg_schema: IcebergSchema,
     batches: impl IntoIterator<Item = RecordBatch>,
 ) -> Result<bool> {
+    create_and_append_files(
+        catalog,
+        namespace,
+        table_name,
+        iceberg_schema,
+        std::iter::once(batches),
+    )
+    .await
+}
+
+/// Create `namespace.table_name` (unpartitioned) with `iceberg_schema` if absent,
+/// then write each element of `files` as its OWN Parquet data file (one fast-append
+/// per file, reloading the table between appends). Writing multiple files makes the
+/// adapter's `GROUP BY shard_key` fan-out observable (one shard per file).
+///
+/// Idempotent: returns `Ok(false)` without writing if the table already has data
+/// files; `Ok(true)` when files were written. Reused by the TPC-H loader
+/// (`tests/tpch_loader.rs`); the per-batch field-id overlay + write/commit is the
+/// same pattern as the events/labels/regions seeds.
+pub async fn create_and_append_files<F, B>(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    files: F,
+) -> Result<bool>
+where
+    F: IntoIterator<Item = B>,
+    B: IntoIterator<Item = RecordBatch>,
+{
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
@@ -190,7 +218,7 @@ pub async fn create_and_append(
         .partition_spec(partition_spec)
         .properties(HashMap::new())
         .build();
-    let table = match catalog.create_table(&ns, creation).await {
+    let mut table = match catalog.create_table(&ns, creation).await {
         Ok(t) => t,
         Err(_) => catalog
             .load_table(&ident)
@@ -203,6 +231,26 @@ pub async fn create_and_append(
         return Ok(false);
     }
 
+    let mut wrote_any = false;
+    for batches in files {
+        write_one_file_append(catalog, &table, table_name, batches).await?;
+        wrote_any = true;
+        // Reload so the next append builds on the latest snapshot.
+        table = catalog
+            .load_table(&ident)
+            .await
+            .context("reload table between appends")?;
+    }
+    Ok(wrote_any)
+}
+
+/// Write `batches` as a single Parquet data file and fast-append it to `table`.
+async fn write_one_file_append(
+    catalog: &impl Catalog,
+    table: &Table,
+    table_name: &str,
+    batches: impl IntoIterator<Item = RecordBatch>,
+) -> Result<()> {
     let schema = table.metadata().current_schema().clone();
     let file_io = table.file_io().clone();
     let location_gen = FlatLocationGenerator {
@@ -237,13 +285,13 @@ pub async fn create_and_append(
     }
     let data_files = writer.close().await.context("close data file writer")?;
 
-    let tx = Transaction::new(&table);
+    let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("apply fast-append action")?;
     tx.commit(catalog)
         .await
         .context("commit Iceberg snapshot")?;
-    Ok(true)
+    Ok(())
 }
 
 /// Seed only the events table into the REST catalog. Idempotent.
