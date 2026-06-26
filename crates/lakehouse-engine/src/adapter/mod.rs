@@ -59,15 +59,24 @@ const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 /// Minimum parallelism factor (floor applied when NR_OF_CORES is 0 or very small).
 const DEFAULT_PARALLELISM_FACTOR: usize = 8;
+// VS property name for the per-node CPU core count override. When set to a
+// positive integer it is used directly and the connect-back `PARAM_VALUE('NR_OF_CORES')`
+// query is skipped; absent, empty, zero, or non-numeric values fall through to
+// the auto-detect path.
+const PROP_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property names for DataFusion per-instance thread configuration.
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
 const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
 // adapterNotes keys for the DataFusion thread configuration.
 const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
 const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
-/// Default DataFusion `target_partitions` per UDF instance (1 = no intra-instance partitioning).
+/// Pushdown-path fallback for `target_partitions` when the adapterNote is absent or
+/// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
+/// `resolve_df_target_partitions`.)
 const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
-/// Default Tokio worker threads per UDF instance (1 = current-thread runtime).
+/// Pushdown-path fallback for threads-per-UDF when the adapterNote is absent or
+/// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
+/// `resolve_df_threads_per_udf`.)
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
 // VS property and adapterNotes key names for the DataFusion memory pool sizing parameters.
 const PROP_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
@@ -161,8 +170,8 @@ fn handle_create_virtual_schema(
 
     let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(ctx, &props);
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
-    let df_target_partitions = resolve_df_target_partitions(&props);
-    let df_threads_per_udf = resolve_df_threads_per_udf(&props);
+    let df_target_partitions = resolve_df_target_partitions(&props, nr_of_cores);
+    let df_threads_per_udf = resolve_df_threads_per_udf(&props, nr_of_cores);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
 
@@ -490,25 +499,28 @@ fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
 
 /// Read and validate the DATAFUSION_TARGET_PARTITIONS VS property.
 ///
-/// When the property is absent, empty, zero, or invalid the default is 1 (one
-/// DataFusion partition per UDF instance, which prevents intra-instance CPU
-/// fan-out from multiplying with the cluster-level shard fan-out).
-fn resolve_df_target_partitions(props: &Json) -> usize {
+/// An explicit positive-integer property wins. When absent, empty, zero, or
+/// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
+/// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
+/// the default falls back to `1`, preserving prior single-threaded behavior.
+fn resolve_df_target_partitions(props: &Json, nr_of_cores: u32) -> usize {
     str_prop(props, PROP_DF_TARGET_PARTITIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_DF_TARGET_PARTITIONS)
+        .unwrap_or_else(|| (nr_of_cores as usize).max(1))
 }
 
 /// Read and validate the DATAFUSION_THREADS_PER_UDF VS property.
 ///
-/// When the property is absent, empty, zero, or invalid the default is 1 (one
-/// Tokio worker thread per UDF instance, matching `new_current_thread()` behaviour).
-fn resolve_df_threads_per_udf(props: &Json) -> usize {
+/// An explicit positive-integer property wins. When absent, empty, zero, or
+/// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
+/// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
+/// the default falls back to `1`, preserving prior single-threaded behavior.
+fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
     str_prop(props, PROP_DF_THREADS_PER_UDF)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_DF_THREADS_PER_UDF)
+        .unwrap_or_else(|| (nr_of_cores as usize).max(1))
 }
 
 /// Read and validate the MEMORY_POOL_FRACTION VS property.
@@ -533,18 +545,43 @@ fn resolve_instance_overhead_mb(props: &Json) -> u64 {
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
 }
 
-/// Open a connect-back session and run `SELECT NPROC()` and
-/// `SELECT PARAM_VALUE('NR_OF_CORES')` to obtain the active cluster node count
-/// and the per-node CPU core count.
+/// Parse the `NR_OF_CORES` VS property into an override value.
+///
+/// Returns `Some(n)` when the property is present, non-empty, and parses to a
+/// `u32` that is ≥ 1. Returns `None` for absent, empty, zero, negative, or
+/// non-numeric values, signalling that the caller should fall back to
+/// auto-detection via `SELECT PARAM_VALUE('NR_OF_CORES')`.
+fn parse_nr_of_cores_override(props: &Json) -> Option<u32> {
+    str_prop(props, PROP_NR_OF_CORES)
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+}
+
+/// Open a connect-back session and run `SELECT NPROC()` to obtain the active
+/// cluster node count and, unless overridden by the `NR_OF_CORES` VS property,
+/// `SELECT PARAM_VALUE('NR_OF_CORES')` to obtain the per-node CPU core count.
 ///
 /// Returns `(1, 0)` when `CONNECTION_NAME` is absent and `(1, 0)` on any
 /// connect-back failure so `createVirtualSchema` never fails due to an
 /// unreachable or misconfigured connect-back path. A `nr_of_cores` of `0`
 /// signals "unknown"; callers must handle the floor case.
+///
+/// When the `NR_OF_CORES` VS property resolves to a positive integer, it is
+/// used directly as `nr_of_cores` and the `SELECT PARAM_VALUE('NR_OF_CORES')`
+/// query is not issued. The `SELECT NPROC()` cluster-nodes detection always
+/// runs when a connect-back session is available.
 fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> (u32, u32) {
+    // Check for a property-level override of the core count BEFORE opening the
+    // connect-back session. If present and ≥ 1, we still need NPROC() for the
+    // cluster node count but can skip the PARAM_VALUE cores query.
+    let cores_override = parse_nr_of_cores_override(props);
+
     let Some(conn_name) = str_prop(props, PROP_CONNECTION_NAME) else {
-        return (1, 0);
+        // No connect-back configured: cluster nodes defaults to 1; cores from
+        // override or 0 (unknown).
+        return (1, cores_override.unwrap_or(0));
     };
+
     let result = (|| -> Result<(u32, u32), UdfError> {
         let conn_obj = ctx.connection(conn_name)?;
         let mut session = ctx.connect_back(&conn_obj)?;
@@ -556,12 +593,17 @@ fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> (u32, u32) {
             .and_then(|row| row.into_iter().next());
         let cluster_nodes = nproc_value_to_count(nproc_value);
 
-        let cores_rows = session.query("SELECT PARAM_VALUE('NR_OF_CORES')")?;
-        let cores_value = cores_rows
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next());
-        let nr_of_cores = varchar_value_to_u32(cores_value);
+        // Only query PARAM_VALUE when no property override was supplied.
+        let nr_of_cores = if let Some(overridden) = cores_override {
+            overridden
+        } else {
+            let cores_rows = session.query("SELECT PARAM_VALUE('NR_OF_CORES')")?;
+            let cores_value = cores_rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next());
+            varchar_value_to_u32(cores_value)
+        };
 
         Ok((cluster_nodes, nr_of_cores))
     })();
@@ -1064,24 +1106,25 @@ mod tests {
     // T8 — DF_TARGET_PARTITIONS and DF_THREADS_PER_UDF note tests
     // ---------------------------------------------------------------------------
 
-    /// Scenario: DF_TARGET_PARTITIONS defaults to 1 when property is absent/zero/invalid.
+    /// Scenario: DF_TARGET_PARTITIONS defaults to 1 when property is absent/zero/invalid
+    /// and nr_of_cores is 0 (unknown).
     #[test]
     fn df_target_partitions_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_target_partitions(&absent), 1, "absent → 1");
+        assert_eq!(resolve_df_target_partitions(&absent, 0), 1, "absent → 1");
 
         let zero = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" });
-        assert_eq!(resolve_df_target_partitions(&zero), 1, "zero → 1");
+        assert_eq!(resolve_df_target_partitions(&zero, 0), 1, "zero → 1");
 
         let invalid = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" });
-        assert_eq!(resolve_df_target_partitions(&invalid), 1, "invalid → 1");
+        assert_eq!(resolve_df_target_partitions(&invalid, 0), 1, "invalid → 1");
     }
 
     /// Scenario: An explicit positive DATAFUSION_TARGET_PARTITIONS property is used as-is.
     #[test]
     fn df_target_partitions_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
-        let val = resolve_df_target_partitions(&props);
+        let val = resolve_df_target_partitions(&props, 0);
         assert_eq!(val, 4, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
@@ -1106,24 +1149,25 @@ mod tests {
         );
     }
 
-    /// Scenario: DF_THREADS_PER_UDF defaults to 1 when property is absent/zero/invalid.
+    /// Scenario: DF_THREADS_PER_UDF defaults to 1 when property is absent/zero/invalid
+    /// and nr_of_cores is 0 (unknown).
     #[test]
     fn df_threads_per_udf_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_threads_per_udf(&absent), 1, "absent → 1");
+        assert_eq!(resolve_df_threads_per_udf(&absent, 0), 1, "absent → 1");
 
         let zero = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" });
-        assert_eq!(resolve_df_threads_per_udf(&zero), 1, "zero → 1");
+        assert_eq!(resolve_df_threads_per_udf(&zero, 0), 1, "zero → 1");
 
         let invalid = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "not-a-number" });
-        assert_eq!(resolve_df_threads_per_udf(&invalid), 1, "invalid → 1");
+        assert_eq!(resolve_df_threads_per_udf(&invalid, 0), 1, "invalid → 1");
     }
 
     /// Scenario: An explicit positive DATAFUSION_THREADS_PER_UDF property is used as-is.
     #[test]
     fn df_threads_per_udf_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-        let val = resolve_df_threads_per_udf(&props);
+        let val = resolve_df_threads_per_udf(&props, 0);
         assert_eq!(val, 2, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
@@ -1279,6 +1323,154 @@ mod tests {
             adapter_note(&pushdown_req, NOTE_INSTANCE_OVERHEAD_MB).as_deref(),
             Some("256"),
             "INSTANCE_OVERHEAD_MB must round-trip through adapterNotes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tasks 2.1–2.8 — NR_OF_CORES property override and cores-driven defaults.
+    // ---------------------------------------------------------------------------
+
+    /// Task 2.1 — NR_OF_CORES VS property ≥ 1 is used directly; the connect-back
+    /// PARAM_VALUE query is not needed (tested via the pure helper).
+    #[test]
+    fn nr_of_cores_property_overrides_connect_back() {
+        // A positive integer property must parse to Some(n).
+        let props_4 = serde_json::json!({ PROP_NR_OF_CORES: "4" });
+        assert_eq!(
+            parse_nr_of_cores_override(&props_4),
+            Some(4u32),
+            "NR_OF_CORES=4 must return Some(4)"
+        );
+
+        let props_1 = serde_json::json!({ PROP_NR_OF_CORES: "1" });
+        assert_eq!(
+            parse_nr_of_cores_override(&props_1),
+            Some(1u32),
+            "NR_OF_CORES=1 (minimum valid) must return Some(1)"
+        );
+
+        // When override is present, resolve_cluster_nodes with no CONNECTION_NAME
+        // returns the override directly without connect-back.
+        let (nodes, cores) =
+            resolve_cluster_nodes(&mut NoopCtx, &serde_json::json!({ PROP_NR_OF_CORES: "8" }));
+        assert_eq!(nodes, 1u32, "default cluster nodes when no CONNECTION_NAME");
+        assert_eq!(cores, 8u32, "NR_OF_CORES override must be returned");
+    }
+
+    /// Task 2.2 — NR_OF_CORES absent, empty, zero, or negative falls back to
+    /// auto-detect (tested via the pure helper returning None, and the connect-back
+    /// fallback returning 0 on NoopCtx failure).
+    #[test]
+    fn nr_of_cores_property_falls_back_to_auto_detect() {
+        // Absent → None.
+        assert_eq!(
+            parse_nr_of_cores_override(&serde_json::json!({})),
+            None,
+            "absent NR_OF_CORES must return None"
+        );
+
+        // Empty string → None (str_prop filters empty strings).
+        assert_eq!(
+            parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "" })),
+            None,
+            "empty NR_OF_CORES must return None"
+        );
+
+        // Zero → None (fails the ≥ 1 filter).
+        assert_eq!(
+            parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "0" })),
+            None,
+            "NR_OF_CORES=0 must return None"
+        );
+
+        // Negative (u32 parse fails) → None.
+        assert_eq!(
+            parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "-1" })),
+            None,
+            "NR_OF_CORES=-1 must return None"
+        );
+
+        // Non-numeric → None.
+        assert_eq!(
+            parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "bad" })),
+            None,
+            "NR_OF_CORES=bad must return None"
+        );
+
+        // With CONNECTION_NAME but no override: connect-back fails (NoopCtx) → (1, 0).
+        let (nodes, cores) = resolve_cluster_nodes(
+            &mut NoopCtx,
+            &serde_json::json!({ PROP_CONNECTION_NAME: "SOME_CONNECTION" }),
+        );
+        assert_eq!(nodes, 1u32);
+        assert_eq!(cores, 0u32, "connect-back failure must yield nr_of_cores=0");
+    }
+
+    /// Task 2.3 — Explicit DATAFUSION_TARGET_PARTITIONS wins over cores-driven default.
+    #[test]
+    fn df_target_partitions_explicit_wins() {
+        let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
+        // Even with nr_of_cores=8, explicit "3" must win.
+        assert_eq!(
+            resolve_df_target_partitions(&props, 8),
+            3,
+            "explicit DATAFUSION_TARGET_PARTITIONS must override nr_of_cores default"
+        );
+    }
+
+    /// Task 2.4 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=8 defaults to 8.
+    #[test]
+    fn df_target_partitions_defaults_to_nr_of_cores() {
+        let props = serde_json::json!({});
+        assert_eq!(
+            resolve_df_target_partitions(&props, 8),
+            8,
+            "absent property with nr_of_cores=8 must default to 8"
+        );
+    }
+
+    /// Task 2.5 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=0 defaults to 1.
+    #[test]
+    fn df_target_partitions_unknown_cores_defaults_to_1() {
+        let props = serde_json::json!({});
+        assert_eq!(
+            resolve_df_target_partitions(&props, 0),
+            1,
+            "absent property with nr_of_cores=0 (unknown) must default to 1"
+        );
+    }
+
+    /// Task 2.6 — Explicit DATAFUSION_THREADS_PER_UDF wins over cores-driven default.
+    #[test]
+    fn df_threads_per_udf_explicit_wins() {
+        let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
+        // Even with nr_of_cores=16, explicit "2" must win.
+        assert_eq!(
+            resolve_df_threads_per_udf(&props, 16),
+            2,
+            "explicit DATAFUSION_THREADS_PER_UDF must override nr_of_cores default"
+        );
+    }
+
+    /// Task 2.7 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=8 defaults to 8.
+    #[test]
+    fn df_threads_per_udf_defaults_to_nr_of_cores() {
+        let props = serde_json::json!({});
+        assert_eq!(
+            resolve_df_threads_per_udf(&props, 8),
+            8,
+            "absent property with nr_of_cores=8 must default to 8"
+        );
+    }
+
+    /// Task 2.8 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=0 defaults to 1.
+    #[test]
+    fn df_threads_per_udf_unknown_cores_defaults_to_1() {
+        let props = serde_json::json!({});
+        assert_eq!(
+            resolve_df_threads_per_udf(&props, 0),
+            1,
+            "absent property with nr_of_cores=0 (unknown) must default to 1"
         );
     }
 
