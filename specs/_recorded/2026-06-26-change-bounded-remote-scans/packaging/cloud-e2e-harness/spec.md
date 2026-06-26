@@ -21,38 +21,7 @@ harness (`bench/run.sh` with `BENCH_TARGET=remote`), which builds the
 
 ## Scenarios
 
-### Scenario: Cloud smoke test queries a real Glue-backed virtual schema
-
-* *GIVEN* the AWS credential and endpoint environment variables are present
-* *AND* an Exasol cluster reachable from the test, with the SLC and engine `.so` installed
-* *AND* an Exasol CONNECTION whose address is the Glue Iceberg REST endpoint and whose password JSON enables SigV4 and supplies the region and keys
-* *WHEN* the test creates a virtual schema over a Glue-managed Iceberg table loaded with meaningful data and runs a projection + filter query through it
-* *THEN* the query SHALL return rows consistent with the seeded data (correct columns, predicate honoured)
-* *AND* the test SHALL exercise the SigV4-signed catalog path and the S3 data-file read path end to end
-
-### Scenario: Cloud test skips cleanly when AWS credentials are absent
-
-* *GIVEN* the AWS credential environment variables are not set
-* *WHEN* the cloud E2E test runs
-* *THEN* the test SHALL skip without failing
-* *AND* the test MUST NOT attempt any network call to AWS or Exasol
-* *AND* the skip behaviour MUST be distinct from the local-Docker suite, which still FAILS when its stack is down
-
-### Scenario: Cloud performance smoke records timing and row-count sanity
-
-* *GIVEN* the AWS credentials are present and a Glue-backed virtual schema over a meaningfully-sized table
-* *WHEN* the test runs an aggregate query (e.g. a grouped COUNT/SUM) through the virtual schema
-* *THEN* the result row count and aggregate values SHALL be sane (non-zero, matching the seeded data shape)
-* *AND* the test SHALL record the wall-clock query duration for manual inspection
-* *AND* the test MUST NOT assert a hard latency threshold (timing is observational, not a pass/fail gate)
-
-### Scenario: Vended credentials are exercised end to end against Glue
-
-* *GIVEN* the AWS credentials are present and the CONNECTION enables `use_vended_credentials`
-* *WHEN* the test runs a scan query whose data files are read using credentials vended by Glue's `load_table` response
-* *THEN* the scan SHALL successfully read the data files using the vended credentials
-* *AND* the test output MUST NOT contain any vended or static credential value
-
+<!-- DELTA:NEW -->
 ### Scenario: Remote bench wires NR_OF_CORES and PARALLELISM_FACTOR into the virtual schema
 
 * *GIVEN* the remote bench target running against a real Glue catalog and external Exasol cluster
@@ -61,3 +30,4 @@ harness (`bench/run.sh` with `BENCH_TARGET=remote`), which builds the
 * *THEN* the harness SHALL pass `NR_OF_CORES` and `PARALLELISM_FACTOR` as virtual-schema properties on the remote target, just as the docker target already does
 * *AND* the property values SHALL come from `BENCH_NR_OF_CORES` and `BENCH_PARALLELISM_FACTOR`, applying the same defaults the docker path uses when those variables are unset
 * *AND* the remote path MUST NOT emit an empty extra-properties block that drops these parallelism knobs (the prior behaviour where the cluster ran at its built-in defaults)
+<!-- /DELTA:NEW -->

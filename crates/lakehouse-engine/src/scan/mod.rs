@@ -7,7 +7,7 @@ pub mod runtime;
 pub mod spec;
 
 use crate::scan::convert::arrow_value_at;
-use crate::scan::emit::{emit_stream, redact_storage_error};
+use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
@@ -51,14 +51,15 @@ fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String>
 
 /// Build the DataFusion `SessionConfig` for the given scan spec.
 ///
-/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1),
-/// which controls how many logical partitions DataFusion creates internally.
-/// With the default of 1 and a current-thread Tokio runtime, each UDF instance
-/// uses exactly one core; cluster-level shard fan-out provides all parallelism.
+/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1)
+/// and `batch_size` from `spec.df_batch_size` (clamped to ≥1).
+/// With the default of 1 partition and a current-thread Tokio runtime, each UDF
+/// instance uses exactly one core; cluster-level shard fan-out provides all parallelism.
 fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(spec.df_target_partitions.max(1))
+        .with_batch_size(spec.df_batch_size.max(1))
 }
 
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
@@ -99,7 +100,7 @@ async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(),
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+            .map_err(|e| classify_scan_error(e, &secrets))?;
         emit_stream(ctx, stream, &secrets).await?;
         Ok(())
     }
@@ -154,7 +155,7 @@ async fn run_partial_aggregate(
     let batches = df
         .collect()
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
@@ -235,12 +236,12 @@ async fn run_grouped_partial_aggregate(
     let mut stream = df
         .execute_stream()
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     let n_group_keys = group_keys.len();
 
     while let Some(result) = stream.next().await {
-        let batch = result.map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
 
         for row_idx in 0..batch.num_rows() {
             // Group-key columns come first (columns 0 .. n_group_keys - 1).
@@ -587,10 +588,11 @@ async fn register_files(
         .collect::<Result<_, _>>()?;
 
     // Resolve the schema from the first file so we know column types.
+    let secrets = spec.storage.secret_values();
     let resolved_schema = listing_options
         .infer_schema(&ctx.state(), &table_paths[0])
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &spec.storage.secret_values()))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     let config = ListingTableConfig::new_with_multi_paths(table_paths)
         .with_listing_options(listing_options)
@@ -755,6 +757,7 @@ mod tests {
                 table: "db.tbl".into(),
             },
             df_target_partitions: 1,
+            df_batch_size: 8192,
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
@@ -1172,6 +1175,33 @@ mod tests {
     // T7 — runtime selection and session config from ScanSpec
     // ---------------------------------------------------------------------------
 
+    /// Task 4.3: session_config_for_spec applies df_batch_size and clamps sub-1 values to 1.
+    ///
+    /// Verifies that:
+    /// 1. An explicit batch size flows through to SessionConfig::batch_size().
+    /// 2. A zero batch size is clamped to 1 (sub-1 values must not reach DataFusion as-is).
+    #[test]
+    fn session_config_applies_batch_size_and_clamps_floor() {
+        // 1. Explicit batch size is applied.
+        let mut spec = minimal_spec();
+        spec.df_batch_size = 4096;
+        let config = session_config_for_spec(&spec);
+        assert_eq!(
+            config.batch_size(),
+            4096,
+            "SessionConfig must use df_batch_size from spec"
+        );
+
+        // 2. Zero (sub-1) batch size is clamped to 1.
+        spec.df_batch_size = 0;
+        let config_clamped = session_config_for_spec(&spec);
+        assert_eq!(
+            config_clamped.batch_size(),
+            1,
+            "df_batch_size of 0 must be clamped to 1"
+        );
+    }
+
     /// SessionConfig applies target_partitions from the spec.
     ///
     /// Scenario: session_config_uses_spec_target_partitions
@@ -1239,6 +1269,72 @@ mod tests {
         assert!(
             sql.contains("PARTIAL_stat_sumsq_1"),
             "stat sumsq at index 1: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // R2 — classify_scan_error on the partial-aggregate paths
+    // ---------------------------------------------------------------------------
+
+    /// R2: ResourcesExhausted on the grouped/ungrouped partial-aggregate paths surfaces
+    /// as a memory-exhaustion error, not a storage error, and leaks no credentials.
+    ///
+    /// This test exercises classify_scan_error directly (the same function now called
+    /// at all five mod.rs error sites) to confirm the classification is correct for
+    /// the DataFusion error shapes that aggregation and execution produce.
+    #[test]
+    fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
+        use crate::scan::emit::classify_scan_error;
+        use datafusion::error::DataFusionError;
+
+        let secret = "my-secret-key-value";
+        let secrets = [secret];
+
+        // 1. Direct ResourcesExhausted (e.g., from HashAggregateExec OOM).
+        let direct = DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 512 MiB for HashAggregateExec".to_string(),
+        );
+        let err = classify_scan_error(direct, &secrets);
+        let text = err.to_string();
+        assert!(
+            text.contains("memory exhausted"),
+            "direct ResourcesExhausted must surface as memory error: {text}"
+        );
+        assert!(
+            !text.contains("assigned data could not be read"),
+            "must NOT be classified as storage error: {text}"
+        );
+        assert!(!text.contains(secret), "must not leak credentials: {text}");
+
+        // 2. Context-wrapped ResourcesExhausted (DataFusion sort wraps with .context()).
+        let ctx_wrapped = DataFusionError::ResourcesExhausted("pool limit hit".to_string())
+            .context(format!("External sort failed secret={secret}"));
+        let err_ctx = classify_scan_error(ctx_wrapped, &secrets);
+        let text_ctx = err_ctx.to_string();
+        assert!(
+            text_ctx.contains("memory exhausted"),
+            "context-wrapped must surface as memory error: {text_ctx}"
+        );
+        assert!(
+            !text_ctx.contains("assigned data could not be read"),
+            "must NOT be classified as storage error: {text_ctx}"
+        );
+        assert!(
+            !text_ctx.contains(secret),
+            "context-wrapped must not leak credentials: {text_ctx}"
+        );
+
+        // 3. Non-ResourcesExhausted errors still route to the storage-error path.
+        let storage_err = DataFusionError::Execution("S3 403 Forbidden".to_string());
+        let err_storage = classify_scan_error(storage_err, &[]);
+        let text_storage = err_storage.to_string();
+        assert!(
+            text_storage.contains("assigned data could not be read"),
+            "non-OOM error must use the storage path: {text_storage}"
+        );
+        assert!(
+            !text_storage.contains("memory exhausted"),
+            "non-OOM error must NOT look like a memory error: {text_storage}"
         );
     }
 }
