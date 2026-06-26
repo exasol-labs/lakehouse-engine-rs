@@ -6,3 +6,7 @@
 
 # Local follow-up scratch notes (not tracked)
 next.md
+
+# Benchmark local config + reports
+bench/.env
+bench/reports/
