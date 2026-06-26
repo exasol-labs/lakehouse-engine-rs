@@ -505,12 +505,21 @@ fn build_s3_store(
 ) -> Result<impl ObjectStore, UdfError> {
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_endpoint(&storage.endpoint)
         .with_region(&storage.region)
         .with_access_key_id(&storage.access_key)
         .with_secret_access_key(&storage.secret_key)
-        .with_virtual_hosted_style_request(!storage.path_style)
         .with_allow_http(storage.allow_http);
+
+    // Path-style stores (MinIO and other S3-compatibles) need the explicit endpoint
+    // and path-style addressing. For real AWS S3 (virtual-hosted) we must NOT set an
+    // endpoint: object_store derives https://<bucket>.s3.<region>.amazonaws.com from
+    // the region. Setting a regional endpoint without the bucket sends requests to
+    // the account root -> S3 returns 403 (s3:ListAllMyBuckets).
+    if storage.path_style {
+        builder = builder
+            .with_endpoint(&storage.endpoint)
+            .with_virtual_hosted_style_request(false);
+    }
 
     if let Some(token) = &storage.session_token {
         builder = builder.with_token(token);
