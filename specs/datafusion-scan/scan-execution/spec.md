@@ -3,37 +3,26 @@
 A disposable Rust SET UDF that, for one query, builds a DataFusion session, registers
 exactly the Iceberg/Parquet data files assigned to its shard, sizes its DataFusion
 `RuntimeEnv` memory pool from the per-instance memory limit reported in UDF metadata,
-applies the pushed-down projection, filter, and LIMIT, and either streams the matching
-rows back or — when the spec carries aggregate instructions — emits one node-local
-partial-aggregate row per distinct group (or a single row for ungrouped aggregates).
-It holds no state and discovers no files of its own.
+applies the pushed-down projection, filter, and LIMIT, and streams the matching rows
+back as Arrow IPC batches. It holds no state and discovers no files of its own.
 
 ## Background
 
 * The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
 * The UDF MUST register only its assigned files and MUST NOT discover additional files.
-* Only SDK Value types cross the .so boundary; no Arrow types.
+* On the raw-row path the UDF emits each Arrow `RecordBatch` via the SDK's Arrow-IPC
+  emit path (`EmitBatch`, behind the `emit-arrow` feature), which serializes the batch
+  to Arrow IPC bytes internally — only IPC bytes cross the `.so` boundary, never typed
+  Arrow objects, and no `Vec<Value>` intermediate is built per batch.
+* DataFusion execution is bounded; a memory bound that cannot spill MUST surface as a
+  clean error, never an OOM VM crash.
 * Credentials MUST NOT appear in any error message.
-* The per-instance memory limit is read from `ctx.memory_limit()` (bytes; `0` =
-  unbounded/unknown sentinel), provided by the `language-container-rs:add-memory-limit-metadata`
-  SDK accessor. Exasol enforces the same per-process heap limit via `setrlimit(RLIMIT_RSS)` and
-  stalls additional concurrent VMs once usage reaches 80% of it, so a pool sized under the limit
-  lets the engine self-manage concurrency.
-* The spill backstop directory is `/tmp`; the UDF probes at runtime whether `/tmp` is real disk
-  with free space (tmpfs detection via `/proc/mounts` plus `statvfs` free-space check). Any `/tmp`
-  spill is transient per-invocation scratch — NOT persistent state.
-* The emit buffer auto-flushes at 4,000,000 bytes; the UDF relies on that rather than
-  collecting the full result set.
-* Arrow→`Value` conversion MUST implement the full mapping defined in the
-  `datafusion-scan/type-mapping` feature — every compatible Arrow type plus the JSON
-  fallback for out-of-range Decimal128 and all incompatible types.
-* The S3-compatible object store is MinIO; DataFusion's object store is configured with
-  the supplied endpoint, region, and credentials and `validateservercertificate=0`
-  semantics where applicable.
-* Memory budgeting and credential-passthrough scenarios (including vended STS tokens)
-  are in `datafusion-scan/scan-execution-memory-and-credentials`.
-* CPU-bounding configuration (DataFusion target partitions and Tokio worker threads per
-  UDF instance) is in `datafusion-scan/scan-execution-threading`.
+* See `datafusion-scan/scan-execution-memory-and-credentials` for pool sizing and
+  decode-bound scenarios.
+* See `datafusion-scan/scan-execution-partial-agg` for partial-aggregate output scenarios
+  (ungrouped COUNT/SUM/MIN/MAX/AVG).
+* See `datafusion-scan/scan-execution-grouped-agg` for grouped partial-aggregate
+  memory, spill, and group-key scenarios.
 
 ## Scenarios
 
@@ -59,13 +48,13 @@ It holds no state and discovers no files of its own.
 * *WHEN* the scan UDF runs
 * *THEN* the UDF SHALL emit no more rows than the limit
 
-### Scenario: Arrow batches are converted to Value rows and emitted incrementally
+### Scenario: Arrow batches are emitted incrementally as Arrow IPC and never double-materialized
 
 * *GIVEN* a scan whose result spans multiple Arrow record batches
 * *WHEN* the scan UDF processes the result stream
-* *THEN* the UDF SHALL convert each batch to SDK `Value` rows and `ctx.emit` them before fetching the next batch
-* *AND* the UDF MUST NOT materialize the entire result set in memory before emitting
-* *AND* no Arrow type SHALL cross the `.so` boundary
+* *THEN* the UDF SHALL emit each batch via the SDK's Arrow-batch emit path (the `EmitBatch` API, gated by the `emit-arrow` feature), serializing the batch to Arrow IPC bytes so only IPC bytes cross the `.so` boundary
+* *AND* the UDF SHALL fetch one batch, emit it, and drop it before fetching the next, never materializing the entire result set
+* *AND* the UDF MUST NOT build an intermediate `Vec<Value>` row collection on the raw-row scan path, and no typed Arrow value SHALL cross the `.so` boundary — only the serialized IPC byte buffer
 
 ### Scenario: Arrow types map to the correct SDK Value variants
 
@@ -88,28 +77,10 @@ It holds no state and discovers no files of its own.
 * *THEN* the UDF SHALL return an error identifying that the assigned data could not be read
 * *AND* the error message MUST NOT contain storage access keys or secret keys
 
-### Scenario: Scan computes a node-local partial aggregate instead of raw rows
+### Scenario: Scan surfaces a clean memory-exhaustion error instead of crashing the VM
 
-* *GIVEN* a scan spec carrying partial-aggregate instructions and the files assigned to this shard
-* *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL register only its assigned files and apply any pushed-down filter
-* *AND* the UDF SHALL compute the requested aggregates over its assigned files locally in DataFusion
-* *AND* the UDF SHALL emit a single partial-result row carrying the per-shard partial aggregate values rather than the scanned rows
-* *AND* no Arrow type SHALL cross the `.so` boundary
-
-### Scenario: Partial COUNT, SUM, MIN, and MAX are emitted in their merge-ready form
-
-* *GIVEN* a scan spec requesting any of partial `COUNT`, `SUM`, `MIN`, or `MAX`
-* *WHEN* the scan UDF computes its shard's partial aggregate
-* *THEN* a partial `COUNT` SHALL be the count of matching rows in this shard, emitted as a value the wrapper can sum
-* *AND* a partial `SUM` SHALL be the sum over this shard's matching rows, emitted as a value the wrapper can sum
-* *AND* partial `MIN` and `MAX` SHALL be this shard's minimum and maximum, emitted as values the wrapper can re-`MIN`/`MAX`
-* *AND* an empty shard SHALL emit a partial `COUNT` of zero and a NULL partial `SUM`/`MIN`/`MAX` that the wrapper's merge ignores
-
-### Scenario: AVG is emitted as a partial sum and partial count pair
-
-* *GIVEN* a scan spec requesting partial `AVG(col)`
-* *WHEN* the scan UDF computes its shard's partial aggregate
-* *THEN* the UDF SHALL emit a `(partial_sum, partial_count)` pair for that column
-* *AND* the UDF MUST NOT emit a per-shard average
-* *AND* the partial count SHALL exclude rows where the target column is NULL so the merged average matches single-node `AVG` semantics
+* *GIVEN* a scan whose execution exhausts the configured DataFusion memory pool (a `ResourcesExhausted` condition) on a node whose `/tmp` is not spill-capable disk
+* *WHEN* the scan UDF runs
+* *THEN* the UDF SHALL surface a clean error that identifies memory/resource exhaustion as the cause, and MUST NOT crash the UDF VM
+* *AND* the error-redaction path MUST NOT reclassify a `ResourcesExhausted` condition as an "assigned data could not be read" storage error
+* *AND* the surfaced error message MUST NOT contain any storage access key, secret key, or session token

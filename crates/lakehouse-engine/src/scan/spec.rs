@@ -142,6 +142,13 @@ pub struct ScanSpec {
     #[serde(default = "default_one_usize")]
     pub df_target_partitions: usize,
 
+    /// DataFusion `batch_size` (rows per Arrow RecordBatch) for this scan instance.
+    /// Controls the granularity of DataFusion's internal execution batches.
+    /// Defaults to 8192 (DataFusion's own default).
+    /// Old specs that lack this field deserialize to 8192 (backward-compatible).
+    #[serde(default = "default_batch_size")]
+    pub df_batch_size: usize,
+
     /// Number of Tokio worker threads for the scan runtime.
     /// When 1 (the default), `new_current_thread()` is used (one OS thread).
     /// When > 1, `new_multi_thread().worker_threads(n)` is used.
@@ -164,6 +171,10 @@ pub struct ScanSpec {
 
 fn default_one_usize() -> usize {
     1
+}
+
+fn default_batch_size() -> usize {
+    8192
 }
 
 fn default_memory_pool_fraction() -> f64 {
@@ -220,6 +231,7 @@ mod tests {
                 table: "db.table".into(),
             },
             df_target_partitions: 1,
+            df_batch_size: 8192,
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
@@ -436,6 +448,52 @@ mod tests {
         assert_eq!(
             legacy.df_threads_per_udf, 1,
             "missing df_threads_per_udf must default to 1 (backward-compat)"
+        );
+    }
+
+    /// Task 4.3: df_batch_size round-trips through JSON and defaults correctly on a legacy spec.
+    ///
+    /// Verifies that:
+    /// 1. An explicit `df_batch_size` value survives serialize → deserialize.
+    /// 2. A legacy JSON payload lacking the field deserializes to 8192 (backward-compatible).
+    #[test]
+    fn df_batch_size_round_trips_and_defaults() {
+        // 1. Explicit non-default value round-trips.
+        let mut spec = sample_spec();
+        spec.df_batch_size = 4096;
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.df_batch_size, 4096,
+            "df_batch_size must survive round-trip"
+        );
+
+        // 2. The field is present in the serialized JSON.
+        assert!(
+            json.contains("df_batch_size"),
+            "serialized JSON must carry df_batch_size: {json}"
+        );
+
+        // 3. A legacy payload without df_batch_size deserializes to 8192.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.df_batch_size, 8192,
+            "missing df_batch_size must default to 8192 (backward-compat)"
         );
     }
 

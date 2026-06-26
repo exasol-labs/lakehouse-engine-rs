@@ -66,17 +66,23 @@ The instances-vs-groups mental model (from the Exasol engine architect, with a w
   (`EMIT_BUFFER_LIMIT_BYTES`) — 4 *million* bytes, NOT 4 MiB. Do not send a message per call.
 - **Always flush at end of `run()`**, even if the threshold was not reached.
 - A single row > threshold is still sent as one `MT_EMIT` (only the 2 GB per-value limit remains).
+- **Raw-scan path uses `ctx.emit_batch(&RecordBatch)`** (SDK 0.18.0, `emit-arrow` feature). The SDK
+  serializes the batch to Arrow IPC bytes internally; only bytes cross the `.so` boundary, not Arrow
+  types. Partial-aggregate single-row emits still use `ctx.emit` with `Value` types.
 
 ## DataFusion streaming
 
-- Stream the DataFusion result: fetch one Arrow `RecordBatch` at a time, convert it → `Vec<Value>`,
-  `ctx.emit` it, then **drop the batch before fetching the next**. Architect rule: "du musst
-  resultset in batches lesen und dann gleich emitten".
-- Never collect all `RecordBatch`es before converting — that holds two full copies (Arrow + Value)
-  in memory at once.
-- **Only SDK `Value` types cross the `.so` boundary — never Arrow types.** Arrow `TypeId` is not
-  stable across the dynamic-library boundary (the `.so` links its own arrow copy). Convert
-  Arrow→`Value` inside the UDF before emitting.
+- Stream the DataFusion result: fetch one Arrow `RecordBatch` at a time, emit it, then **drop the
+  batch before fetching the next**. Architect rule: "du musst resultset in batches lesen und dann
+  gleich emitten".
+- **Raw scan path**: call `ctx.emit_batch(&batch)` — no `Vec<Value>` intermediate; the SDK
+  serializes the batch to Arrow IPC bytes inside the UDF crate.
+- **Partial-aggregate path**: convert the single summary row to `Vec<Value>` and call `ctx.emit`.
+- Never collect all `RecordBatch`es before emitting — that holds two full copies in memory at once.
+- **Arrow *types* must not cross the `.so` boundary — but Arrow IPC bytes (via `emit_batch`) may.**
+  Arrow `TypeId` is not stable across the dynamic-library boundary (the `.so` links its own arrow
+  copy). `emit_batch` serializes to IPC bytes inside the UDF before anything crosses that boundary,
+  so the discipline is preserved. Do not pass Arrow structs or trait objects across the boundary.
 
 ## Connect-back
 
@@ -124,3 +130,5 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - One crate / one `.so` exports **both** entry points (VS adapter + DataFusion scan SET UDF) —
   `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
+- SDK: `exasol-udf-sdk` **0.18.0** + `exasol-udf-macros` **0.18.0**. In 0.18.0, `connect-back`
+  is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.

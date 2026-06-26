@@ -825,3 +825,79 @@ Author a dedicated `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs` mo
 ### Consequences
 
 `vs-expression` remains `iceberg-rust`-free and sharable with `strata-rs` unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future strata-rs project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
+
+## ADR-031: Adopt Arrow-IPC `emit_batch` on the Raw-Row Scan Path
+
+**Date:** 2026-06-26
+**Plan:** `change-bounded-remote-scans`
+**Status:** Accepted
+
+### Context
+
+The raw-row scan path previously converted each `RecordBatch` to a `Vec<Value>` and emitted rows one at a time. For large result sets (e.g. a ~60M-row join on the live AWS Glue cluster) this held two full copies of every batch in memory simultaneously: the original `RecordBatch` and the `Vec<Value>` copy built from it. This double-materialization was measured as a root cause of the OOM-induced VM crashes observed on the live 3-node cluster.
+
+### Decision
+
+Emit each `RecordBatch` via the SDK's `EmitBatch` API (the `emit-arrow` feature, SDK 0.18.0), which serializes the batch to Arrow IPC bytes internally. Only IPC bytes cross the `.so` boundary; no typed Arrow objects and no `Vec<Value>` intermediate are present on the raw-row path. Each batch is fetched, emitted, and dropped before the next is fetched.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Arrow-IPC `emit_batch` via `EmitBatch` API | ✓ Chosen — removes the `Vec<Value>` copy entirely; IPC bytes preserve the Arrow-TypeId-ABI safety rule (no typed Arrow objects cross the `.so` boundary) |
+| Keep row-by-row `Vec<Value>` emit, shrink batches only | ✗ Rejected — still holds two full copies of every batch at peak; reduces footprint but does not eliminate double-materialization |
+| Emit raw Arrow types across the `.so` boundary | ✗ Rejected — violates the Arrow-TypeId stability contract; Arrow `TypeId` is not stable across dynamic-library boundaries |
+
+### Consequences
+
+Peak per-batch memory footprint on the raw-row path is approximately halved (one `RecordBatch` at a time, no simultaneous `Vec<Value>` copy). A `normalize_view_types` pass (Utf8View→Utf8, BinaryView→Binary) is required before `emit_batch` because DataFusion 58 can produce view types that the IPC encoder rejects; this is applied as a pre-emit normalization step.
+
+## ADR-032: Surface `ResourcesExhausted` as a Distinct Clean Error, Not a Storage Error
+
+**Date:** 2026-06-26
+**Plan:** `change-bounded-remote-scans`
+**Status:** Accepted
+
+### Context
+
+When the DataFusion memory pool is exhausted (a `ResourcesExhausted` condition) and `/tmp` is not spill-capable disk (as on the live cluster where `/tmp` is RAM-backed tmpfs), the UDF had no spill backstop. The existing `redact_storage_error` path reclassified any scan error — including `ResourcesExhausted` — as "assigned data could not be read", masking the true cause and leaving the operator without actionable information to right-size cores or parallelism.
+
+### Decision
+
+Classify a `ResourcesExhausted` condition before the storage-redaction step and surface it as a clean memory-exhaustion error, distinct from the "assigned data could not be read" wrapping. The classification is applied on all scan error paths (both the raw-row path and all five partial-aggregate error sites). Credential redaction is applied on both the memory-exhaustion and storage-error paths.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Classify `ResourcesExhausted` before redaction; surface as memory error | ✓ Chosen — gives the operator the true cause; enables right-sizing of cores/parallelism; satisfies the mission's "usable engine" constraint |
+| Let `ResourcesExhausted` fall through the existing `redact_storage_error` path | ✗ Rejected — reclassifies a genuine memory bound as a misleading storage-read failure; the operator cannot distinguish OOM from a corrupted/missing file |
+
+### Consequences
+
+Operators running queries that hit the memory pool ceiling on a tmpfs cluster receive a clean error identifying memory/resource exhaustion rather than a confusing storage error. The bounded clean error is the correct backstop when `/tmp` cannot spill; `probe_tmp_spill` returning `NoDisk` for tmpfs remains correct and is not changed.
+
+## ADR-033: Bound Parquet Decode Working Set via `batch_size` in `session_config_for_spec`
+
+**Date:** 2026-06-26
+**Plan:** `change-bounded-remote-scans`
+**Status:** Accepted
+
+### Context
+
+DataFusion's `GreedyMemoryPool` / `FairSpillPool` bound aggregation, sort, and join memory — but NOT the Parquet→Arrow decode and scan buffers. On the live AWS Glue cluster, Parquet decode for wide tables at the DataFusion default batch size was a measured root cause of peak memory spikes that pushed instances past the per-node free limit before the pool could throttle them. The `batch_size` session config is the lever DataFusion exposes to bound that out-of-pool working set.
+
+### Decision
+
+Set `batch_size` in `session_config_for_spec` from a `df_batch_size` field carried in the `ScanSpec`. A spec lacking the field deserializes to a conservative built-in default (backward compatible). A sub-1 value is clamped to 1. The setting is applied on both the raw-row scan path and the partial-aggregate path, since both decode Parquet source files.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Set `batch_size` in `session_config_for_spec` from spec field | ✓ Chosen — bounds the out-of-pool decode working set; spec-sourced so the VS can tune it per deployment; backward-compatible default for existing specs |
+| Rely on the memory pool alone | ✗ Rejected — the pool does not account for Parquet→Arrow decode buffers; high-cardinality wide tables can exceed the per-instance limit before the pool throttles |
+
+### Consequences
+
+Per-batch peak memory on Parquet decode is bounded by `batch_size` rather than left at the DataFusion default (8192 rows). The conservative default shrinks per-instance footprint at the cost of slightly more DataFusion scheduling overhead per batch. The `df_batch_size` field follows the same JSON round-trip + backward-compat-default pattern as `df_target_partitions`.

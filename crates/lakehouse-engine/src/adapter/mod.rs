@@ -78,6 +78,12 @@ const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
 /// `resolve_df_threads_per_udf`.)
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
+// VS property and adapterNotes key names for the DataFusion batch_size parameter.
+const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
+const NOTE_DF_BATCH_SIZE: &str = "DF_BATCH_SIZE";
+/// Pushdown-path fallback for `batch_size` when the adapterNote is absent or unparseable.
+/// Matches DataFusion's own default of 8192 rows per RecordBatch.
+const DEFAULT_DF_BATCH_SIZE: usize = 8192;
 // VS property and adapterNotes key names for the DataFusion memory pool sizing parameters.
 const PROP_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
 const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
@@ -172,6 +178,7 @@ fn handle_create_virtual_schema(
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
     let df_target_partitions = resolve_df_target_partitions(&props, nr_of_cores);
     let df_threads_per_udf = resolve_df_threads_per_udf(&props, nr_of_cores);
+    let df_batch_size = resolve_df_batch_size(&props);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
 
@@ -225,6 +232,7 @@ fn handle_create_virtual_schema(
         parallelism_factor,
         df_target_partitions,
         df_threads_per_udf,
+        df_batch_size,
         memory_pool_fraction,
         instance_overhead_mb,
         &table_map,
@@ -271,6 +279,10 @@ async fn handle_pushdown_request(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_DF_TARGET_PARTITIONS);
+    let df_batch_size = adapter_note(request, NOTE_DF_BATCH_SIZE)
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_DF_BATCH_SIZE);
     let df_threads_per_udf = adapter_note(request, NOTE_DF_THREADS_PER_UDF)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
@@ -296,6 +308,7 @@ async fn handle_pushdown_request(
         cluster_nodes,
         parallelism_factor,
         df_target_partitions,
+        df_batch_size,
         df_threads_per_udf,
         memory_pool_fraction,
         instance_overhead_mb,
@@ -428,7 +441,7 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
 /// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
-/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF,
+/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, and TABLE_MAP (a nested JSON
 /// object mapping Exasol table names to original-cased Iceberg identifiers).
 /// Any pre-existing notes on the request are preserved (merge, not clobber).
@@ -442,6 +455,7 @@ fn build_adapter_notes(
     parallelism_factor: usize,
     df_target_partitions: usize,
     df_threads_per_udf: usize,
+    df_batch_size: usize,
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
     table_map: &[(String, String)],
@@ -466,6 +480,10 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_DF_THREADS_PER_UDF.to_string(),
         Json::String(df_threads_per_udf.to_string()),
+    );
+    notes.insert(
+        NOTE_DF_BATCH_SIZE.to_string(),
+        Json::String(df_batch_size.to_string()),
     );
     notes.insert(
         NOTE_MEMORY_POOL_FRACTION.to_string(),
@@ -521,6 +539,18 @@ fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| (nr_of_cores as usize).max(1))
+}
+
+/// Read and validate the DATAFUSION_BATCH_SIZE VS property.
+///
+/// An explicit positive-integer property wins. When absent, empty, zero, or
+/// invalid the default is `DEFAULT_DF_BATCH_SIZE` (8192, matching DataFusion's
+/// built-in default). A supplied value is clamped to ≥1.
+fn resolve_df_batch_size(props: &Json) -> usize {
+    str_prop(props, PROP_DF_BATCH_SIZE)
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_DF_BATCH_SIZE)
 }
 
 /// Read and validate the MEMORY_POOL_FRACTION VS property.
@@ -807,6 +837,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -852,6 +883,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -911,6 +943,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -948,6 +981,7 @@ mod tests {
             factor,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -991,6 +1025,7 @@ mod tests {
             12,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -1029,6 +1064,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -1136,6 +1172,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             val,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -1146,6 +1183,62 @@ mod tests {
             parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
             Some("4"),
             "DF_TARGET_PARTITIONS must round-trip through adapterNotes"
+        );
+    }
+
+    /// R1: Supplied DATAFUSION_BATCH_SIZE flows create → adapterNote → pushdown → ScanSpec.
+    ///
+    /// Verifies the full round-trip: resolve_df_batch_size reads the VS property,
+    /// build_adapter_notes persists it as NOTE_DF_BATCH_SIZE, and the pushdown path
+    /// reads it back via adapter_note. Also checks default and zero-clamp behaviour.
+    #[test]
+    fn df_batch_size_uses_supplied_value() {
+        // Explicit value is returned as-is (clamped to ≥1, but 4096 is already ≥1).
+        let props = serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" });
+        let val = resolve_df_batch_size(&props);
+        assert_eq!(val, 4096, "explicit DATAFUSION_BATCH_SIZE must be returned");
+
+        // Zero is clamped to 1.
+        let zero_props = serde_json::json!({ PROP_DF_BATCH_SIZE: "0" });
+        assert_eq!(
+            resolve_df_batch_size(&zero_props),
+            1,
+            "DATAFUSION_BATCH_SIZE=0 must be clamped to 1"
+        );
+
+        // Absent → default.
+        let absent = serde_json::json!({});
+        assert_eq!(
+            resolve_df_batch_size(&absent),
+            DEFAULT_DF_BATCH_SIZE,
+            "absent property must return DEFAULT_DF_BATCH_SIZE (8192)"
+        );
+
+        // Verify it round-trips through adapterNotes (create → note → pushdown).
+        let req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            val,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
+        );
+        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
+
+        // Pushdown reads it back.
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes_str },
+        });
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_DF_BATCH_SIZE).as_deref(),
+            Some("4096"),
+            "DF_BATCH_SIZE must round-trip through adapterNotes"
         );
     }
 
@@ -1179,6 +1272,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             val,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[],
@@ -1304,6 +1398,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             0.5,
             256,
             &[],
@@ -1496,6 +1591,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &table_map,
@@ -1532,6 +1628,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &table_map,
@@ -1567,6 +1664,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &[("T".to_string(), "ns.t".to_string())],
@@ -1610,6 +1708,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             table_map,
@@ -1744,6 +1843,7 @@ mod tests {
             DEFAULT_PARALLELISM_FACTOR,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             &table_map,
