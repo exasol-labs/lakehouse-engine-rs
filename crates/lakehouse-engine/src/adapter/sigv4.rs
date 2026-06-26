@@ -9,7 +9,9 @@
 ///     short-lived `&str` function parameters and are handed directly to the signing library.
 ///   - `SigningError` from aws-sigv4 carries no credential fields.
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningError, SigningSettings, sign};
+use aws_sigv4::http_request::{
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningError, SigningSettings, sign,
+};
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use std::time::SystemTime;
@@ -38,7 +40,11 @@ pub fn sign_request(
     );
     let identity: Identity = creds.into();
 
-    let settings = SigningSettings::default();
+    let mut settings = SigningSettings::default();
+    // Emit `x-amz-content-sha256` and sign over the actual body hash. Without this,
+    // signing UnsignedPayload but sending no such header makes AWS Glue recompute a
+    // different payload hash → canonical-request mismatch → 403 SignatureDoesNotMatch.
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
     // All builder fields are set; `.expect` is unreachable.
     let params: aws_sigv4::http_request::SigningParams<'_> = v4::SigningParams::builder()
         .identity(&identity)
@@ -84,9 +90,10 @@ pub fn sign_request(
         request.method().as_str(),
         &url,
         header_pairs.into_iter(),
-        // Catalog load_table is a GET with no body; UnsignedPayload is correct and
-        // avoids materializing the (absent) body for hashing.
-        SignableBody::UnsignedPayload,
+        // Read-path requests (loadTable / listTables / config) are GETs with no body.
+        // Sign over the empty-body SHA256 (a constant) so Glue's recomputed canonical
+        // request matches; paired with XAmzSha256 above it also sends the header.
+        SignableBody::Bytes(&[]),
     )?;
 
     let (instructions, _signature) = sign(signable, &params)?.into_parts();
