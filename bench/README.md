@@ -48,3 +48,26 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
 - The TPC-H loader is a cargo test binary at
   `crates/lakehouse-engine/tests/tpch_loader.rs` (run automatically in docker mode).
 - `run.sh` pins `SLC_VERSION` to match the `.so` ABI — don't bump it blindly.
+
+## Remote pre-staged artifacts (when BucketFS write is blocked)
+
+If you can't let the bench PUT to BucketFS (e.g. write is proxied/blocked and you
+upload via AdminUI), set in `bench/.env`:
+
+- `BENCH_SKIP_UPLOAD=1` — skip the SLC + `.so` PUTs; the bench still registers the
+  RUST alias and builds the VS.
+- `BENCH_SO_UDF_OBJECT=buckets/bfsdefault/default/<name>.so` — where the `.so` sits.
+- `BENCH_SLC_BUCKET_PATH=bfsdefault/default/<slc-dir>` — the **extracted** SLC dir
+  (a `foo.tar.gz` upload extracts to `foo`).
+
+**Always upload a rebuilt `.so` under a NEW filename** (e.g. `…_v2.so`, `…_v3.so`)
+and repoint `BENCH_SO_UDF_OBJECT`. Overwriting the same BucketFS path can leave the
+UDF node serving a stale cache (`cannot open shared object file`) for many minutes;
+a fresh path forces a clean fetch.
+
+## Remote Glue (AWS) gotchas
+
+- `GLUE_WAREHOUSE` must be the REST prefix Glue's `/v1/config` reports —
+  `catalogs/<account-id>`, NOT an `s3://` path and NOT the bare account id.
+- The S3 data endpoint defaults to `https://s3.$AWS_REGION.amazonaws.com`; the scan
+  derives the virtual-hosted bucket URL from the region (no explicit endpoint).

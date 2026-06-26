@@ -24,8 +24,8 @@ ADAPTER=LAKEHOUSE_ADAPTER
 SCAN=LAKEHOUSE_SCAN
 CONN=LAKEHOUSE_CATALOG_CREDS
 VS=TPCH
-SO_UDF_OBJECT=buckets/bfsdefault/default/udf/liblakehouse_engine.so
-SLC_VERSION=0.16.0  # matches the .so ABI fingerprint; do not "upgrade" blindly
+# NB: BucketFS-path / SLC / skip-upload settings are env-overridable, so they are
+# resolved AFTER .env is sourced (see the config section below), not here.
 
 require() {
   local v
@@ -34,12 +34,14 @@ require() {
   done
 }
 
-# Remote (AWS Glue) catalog-connection password JSON: SigV4 + static creds,
-# region-driven endpoint. Mirrors cloud_e2e_test.rs::catalog_connection_password.
+# Remote (AWS Glue) catalog-connection password JSON: SigV4 + static creds.
+# The adapter requires a non-empty S3 `endpoint`; for real AWS S3 that's the
+# regional endpoint (override with AWS_S3_ENDPOINT, e.g. for an S3-compat store).
 build_conn_password_cloud() {
-  local token_field=""
+  local token_field="" s3_endpoint
+  s3_endpoint="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
   [ -n "${AWS_SESSION_TOKEN:-}" ] && token_field=",\"session_token\":\"${AWS_SESSION_TOKEN}\""
-  local json="{\"warehouse\":\"${GLUE_WAREHOUSE}\",\"endpoint\":\"\",\"region\":\"${AWS_REGION}\",\"access_key\":\"${AWS_ACCESS_KEY_ID}\",\"secret_key\":\"${AWS_SECRET_ACCESS_KEY}\",\"path_style\":false,\"use_sigv4\":true,\"use_vended_credentials\":false${token_field}}"
+  local json="{\"warehouse\":\"${GLUE_WAREHOUSE}\",\"endpoint\":\"${s3_endpoint}\",\"region\":\"${AWS_REGION}\",\"access_key\":\"${AWS_ACCESS_KEY_ID}\",\"secret_key\":\"${AWS_SECRET_ACCESS_KEY}\",\"path_style\":false,\"use_sigv4\":true,\"use_vended_credentials\":false${token_field}}"
   printf '%s' "${json//\'/\'\'}"  # SQL string-literal escaping: ' -> ''
 }
 
@@ -69,6 +71,17 @@ TARGET="${BENCH_TARGET:-docker}"
 EXA_PORT="${LH_EXASOL_PORT:-28563}"
 BFS_PORT="${LH_BUCKETFS_PORT:-22581}"
 TPCH_SCALE="${TPCH_SCALE:-0.3}"
+
+SLC_VERSION="${BENCH_SLC_VERSION:-0.16.0}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
+# BucketFS object path for the .so, as referenced by %udf_object in CREATE SCRIPT.
+SO_UDF_OBJECT="${BENCH_SO_UDF_OBJECT:-buckets/bfsdefault/default/udf/liblakehouse_engine.so}"
+# BucketFS path of the EXTRACTED SLC dir (the RUST language alias points inside it,
+# at <SLC_BUCKET_PATH>/exaudf/exaudfclient). A foo.tar.gz upload extracts to foo, so
+# set this to bfsdefault/<bucket>/<archive-name-without-.tar.gz>.
+SLC_BUCKET_PATH="${BENCH_SLC_BUCKET_PATH:-bfsdefault/default/slc/lakehouse-rustslc}"
+# Skip BucketFS uploads (SLC tarball + .so) — use when both are already staged in
+# BucketFS (e.g. uploaded via AdminUI). Still registers the RUST alias + builds the VS.
+SKIP_UPLOAD="${BENCH_SKIP_UPLOAD:-0}"
 
 case "$TARGET" in
   docker)
@@ -113,6 +126,20 @@ sqlf() { printf '%s' "$1" | exapump sql -d "$DSN" -f "${2:-csv}"; }
 # First data cell of a single-value query (skip CSV header, strip quotes/space).
 query_scalar() { printf '%s' "$1" | exapump sql -d "$DSN" -f csv | tail -n +2 | head -1 | tr -d '"[:space:]'; }
 
+# Register/replace the RUST language alias to point at an already-staged SLC in
+# BucketFS (skip-upload path). Mirrors Makefile install-slc's merge logic, but
+# path-parameterized via SLC_BUCKET_PATH. Preserves all non-RUST language defs.
+register_rust_alias() {
+  local rust_def current new
+  rust_def="RUST=localzmq+protobuf:///${SLC_BUCKET_PATH}?lang=rust#buckets/${SLC_BUCKET_PATH}/exaudf/exaudfclient"
+  # Raw value (keeps internal spaces; only strip surrounding quotes) — query_scalar would mangle it.
+  current="$(printf '%s' "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES'" \
+    | exapump sql -d "$DSN" -f csv | tail -n +2 | head -1 | sed 's/^"//;s/"$//')"
+  new="$(echo "$current $rust_def" | awk '{sep=""; for(i=1;i<=NF;i++){if($i ~ /^RUST=/ && i<NF) continue; printf "%s%s",sep,$i; sep=" "}}')"
+  echo "  SCRIPT_LANGUAGES <- ${new}"
+  sql "ALTER SYSTEM SET SCRIPT_LANGUAGES = '${new}'"
+}
+
 wait_http() {  # url name
   local url="$1" name="$2" i
   echo "== waiting for ${name} (${url}) =="
@@ -148,11 +175,17 @@ else
   wait_exasol
 fi
 
-# ---- install SLC + upload .so ------------------------------------------------
-echo "== installing SLC ${SLC_VERSION} + uploading .so =="
-make install-slc bucketfs-upload-so \
-  EXASOL_HOST="$HOST" LH_EXASOL_PORT="$EXA_PORT" LH_BUCKETFS_PORT="$BFS_PORT" \
-  SLC_VERSION="$SLC_VERSION" EXASOL_SYS_PASSWORD="$SYS_PASS"
+# ---- install SLC + upload .so (or skip if already staged in BucketFS) --------
+if [ "$SKIP_UPLOAD" = "1" ]; then
+  echo "== SKIP_UPLOAD=1: assuming SLC + .so already in BucketFS =="
+  echo "   SLC dir: ${SLC_BUCKET_PATH}    .so: ${SO_UDF_OBJECT}"
+  register_rust_alias
+else
+  echo "== installing SLC ${SLC_VERSION} + uploading .so =="
+  make install-slc bucketfs-upload-so \
+    EXASOL_HOST="$HOST" LH_EXASOL_PORT="$EXA_PORT" LH_BUCKETFS_PORT="$BFS_PORT" \
+    SLC_VERSION="$SLC_VERSION" EXASOL_SYS_PASSWORD="$SYS_PASS"
+fi
 
 # ---- create schema, scripts, connection, VS (all idempotent) -----------------
 echo "== creating schema, scripts, connection, VS '${VS}' =="
