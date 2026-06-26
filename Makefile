@@ -47,6 +47,10 @@ test:
 
 # Host ports of the dedicated lakehouse-engine compose stack. Overridable so the
 # suite can always pick free ports; defaults match docker-compose.yml.
+# Exasol host. Defaults to localhost (Docker stack); the bench script
+# overrides it to target a remote cluster. install-slc / bucketfs-upload-so use
+# it so the same targets work against Docker and remote Exasol.
+EXASOL_HOST      ?= localhost
 LH_EXASOL_PORT   ?= 28563
 LH_BUCKETFS_PORT ?= 22581
 LH_MINIO_PORT    ?= 19000
@@ -99,20 +103,20 @@ install-slc:
 	@echo "=== install-slc: uploading SLC to BucketFS ==="
 	curl -sf -u "w:$(BFSPASS)" \
 	    -T /tmp/lakehouse-rustslc.tar.gz \
-	    "https://localhost:$(LH_BUCKETFS_PORT)/default/slc/lakehouse-rustslc.tar.gz" \
+	    "https://$(EXASOL_HOST):$(LH_BUCKETFS_PORT)/default/slc/lakehouse-rustslc.tar.gz" \
 	    --insecure
 	@echo "=== install-slc: registering RUST language alias (clean replace) ==="
 	@set -e; \
 	CURRENT=$$(exapump sql \
 	  "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES'" \
-	  -d "exasol://sys:$(EXASOL_SYS_PASSWORD)@localhost:$(LH_EXASOL_PORT)?validateservercertificate=0" \
+	  -d "exasol://sys:$(EXASOL_SYS_PASSWORD)@$(EXASOL_HOST):$(LH_EXASOL_PORT)?validateservercertificate=0" \
 	  2>&1 | grep -v '^\[' | grep -v '^SYSTEM_VALUE' | grep -v '^[0-9]' | grep -v '^$$' | grep -v 'Error' | head -1); \
 	RUST_DEF="RUST=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"; \
 	NEW=$$(echo "$$CURRENT $$RUST_DEF" | awk '{sep=""; for(i=1;i<=NF;i++){if($$i ~ /^RUST=/ && i<NF) continue; printf "%s%s",sep,$$i; sep=" "}}'); \
 	echo "Setting SCRIPT_LANGUAGES = $$NEW"; \
 	exapump sql \
 	  "ALTER SYSTEM SET SCRIPT_LANGUAGES = '$$NEW'" \
-	  -d "exasol://sys:$(EXASOL_SYS_PASSWORD)@localhost:$(LH_EXASOL_PORT)?validateservercertificate=0"
+	  -d "exasol://sys:$(EXASOL_SYS_PASSWORD)@$(EXASOL_HOST):$(LH_EXASOL_PORT)?validateservercertificate=0"
 	@echo "=== install-slc: done ==="
 
 # Upload the compiled .so to BucketFS.
@@ -134,7 +138,7 @@ bucketfs-upload-so: $(VS_SO)
 	@echo "=== bucketfs-upload-so: uploading liblakehouse_engine.so ==="
 	curl -sf -u "w:$(BFSPASS)" \
 	    -T $(VS_SO) \
-	    "https://localhost:$(LH_BUCKETFS_PORT)$(SO_BUCKETFS_PATH)" \
+	    "https://$(EXASOL_HOST):$(LH_BUCKETFS_PORT)$(SO_BUCKETFS_PATH)" \
 	    --insecure
 	@echo "=== bucketfs-upload-so: done ==="
 
@@ -144,4 +148,11 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
-.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint
+# Manually-invoked live benchmark: docker (self-contained local stack) or remote
+# (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
+# working-tree .so, then runs bench/run.sh, which reads config from a gitignored
+# bench/.env (see bench/.env.example). NOT part of CI — test-e2e stays the path.
+bench: cross-musl-udf-build
+	./bench/run.sh
+
+.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench

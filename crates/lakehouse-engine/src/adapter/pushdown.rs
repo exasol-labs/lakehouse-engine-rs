@@ -1641,22 +1641,22 @@ fn list_in_namespace_signed<'a>(
             })?;
         all.extend(tables_response.identifiers);
 
-        // List child namespaces and recurse.
+        // List child namespaces and recurse. Best-effort: flat catalogs (e.g. AWS
+        // Glue) reject nested-namespace listing with HTTP 400 "does not support
+        // multipart namespace" — treat any failure here as "no children" and return
+        // the tables already collected from this namespace.
+        // ponytail: swallows ALL child-listing errors, not just the flat-catalog 400;
+        // on a genuinely nested catalog a transient error would silently skip a
+        // subtree. Upgrade path: branch on catalog capability from GET /v1/config.
         let ns_url = build_list_namespaces_url(catalog_uri, warehouse, ns);
-        let ns_json = signed_get_json(&ns_url, creds).await.map_err(|e| {
-            UdfError::User(format!(
-                "failed to list namespaces under '{}': {}",
-                ns.join("."),
-                redact_catalog_error(&e.to_string())
-            ))
-        })?;
-        let ns_response: ListNamespaceResponse = serde_json::from_value(ns_json).map_err(|e| {
-            UdfError::User(format!(
-                "failed to parse list-namespaces response for '{}': {}",
-                ns.join("."),
-                redact_catalog_error(&e.to_string())
-            ))
-        })?;
+        let ns_json = match signed_get_json(&ns_url, creds).await {
+            Ok(j) => j,
+            Err(_) => return Ok(all),
+        };
+        let ns_response: ListNamespaceResponse = match serde_json::from_value(ns_json) {
+            Ok(r) => r,
+            Err(_) => return Ok(all),
+        };
 
         for child in ns_response.namespaces {
             let child_tables =
