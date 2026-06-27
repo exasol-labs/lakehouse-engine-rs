@@ -1,3 +1,5 @@
+#[cfg(test)]
+use arrow::array::RecordBatch;
 /// Arrow RecordBatch → SDK Value row conversion.
 ///
 /// Implements the full datafusion-scan/type-mapping table including null + JSON
@@ -6,9 +8,9 @@
 /// Only SDK `Value` types are produced — no Arrow types cross the `.so` boundary.
 use arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -146,6 +148,7 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
 /// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>).
 ///
 /// Row order matches the batch order; columns match the batch schema order.
+#[cfg(test)]
 pub fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Value>> {
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();

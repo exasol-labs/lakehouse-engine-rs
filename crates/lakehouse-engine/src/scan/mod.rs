@@ -7,7 +7,7 @@ pub mod runtime;
 pub mod spec;
 
 use crate::scan::convert::arrow_value_at;
-use crate::scan::emit::{emit_stream, redact_storage_error};
+use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
@@ -25,6 +25,41 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use url::Url;
+
+/// Bounded grace period for draining background async work at runtime teardown.
+///
+/// After the scan future returns, object_store's S3 client (hyper) may still hold
+/// detached connection-pool tasks and open sockets. Dropping the Tokio runtime
+/// while those are mid-flight is a non-deterministic teardown race: a detached
+/// task's `Drop` can touch the reactor after it has been torn down, aborting the
+/// VM process *after* the final emit/flush — outside the entry-point's
+/// `catch_unwind`, so it surfaces as an `err_zombie` VM crash with no Rust panic
+/// text. `shutdown_timeout` instead drives the runtime down deterministically:
+/// it drives pending tasks for up to this window, then cancels what remains in a
+/// defined order. The value is a teardown bound, not a query timeout — the scan
+/// future has already completed before it applies.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `future` to completion on `rt`, then shut the runtime down deterministically.
+///
+/// This is the abort-free teardown seam for the scan UDF. The future MUST resolve
+/// to a value that owns no async resources (no DataFusion `SessionContext`, no
+/// `RecordBatch` stream, no object-store handle): everything async-borrowing must
+/// be dropped *inside* the future, before it returns. Given that, the result is
+/// fully materialized while the runtime is still live, and the runtime is then
+/// torn down via `shutdown_timeout` from this synchronous (non-async) context —
+/// never by an implicit `Drop` that could race hyper's detached connection tasks.
+fn run_on_runtime<T>(
+    rt: tokio::runtime::Runtime,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let result = rt.block_on(future);
+    // Explicit, bounded teardown from the synchronous context. Replaces the
+    // implicit `drop(rt)` whose internal task/IO teardown raced hyper background
+    // work and intermittently aborted the VM at end-of-life.
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
+}
 
 /// Build the Tokio runtime for the scan UDF.
 ///
@@ -51,14 +86,15 @@ fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String>
 
 /// Build the DataFusion `SessionConfig` for the given scan spec.
 ///
-/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1),
-/// which controls how many logical partitions DataFusion creates internally.
-/// With the default of 1 and a current-thread Tokio runtime, each UDF instance
-/// uses exactly one core; cluster-level shard fan-out provides all parallelism.
+/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1)
+/// and `batch_size` from `spec.df_batch_size` (clamped to ≥1).
+/// With the default of 1 partition and a current-thread Tokio runtime, each UDF
+/// instance uses exactly one core; cluster-level shard fan-out provides all parallelism.
 fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(spec.df_target_partitions.max(1))
+        .with_batch_size(spec.df_batch_size.max(1))
 }
 
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
@@ -85,7 +121,14 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // A fresh runtime per call is correct for a stateless disposable UDF.
     let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
 
-    rt.block_on(async { run_scan_async(ctx, &spec).await })
+    // Run on the runtime and tear it down deterministically. The implicit `drop(rt)`
+    // path raced object_store's detached hyper tasks at end-of-life and aborted the
+    // VM after the final flush (err_zombie, no panic text); `run_on_runtime` drives
+    // shutdown via `shutdown_timeout` from this synchronous context instead.
+    // run_scan_async returns a value owning no async resources (the SessionContext,
+    // streams, and object store are all dropped inside the future), satisfying
+    // run_on_runtime's contract.
+    run_on_runtime(rt, async { run_scan_async(ctx, &spec).await })
 }
 
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
@@ -99,8 +142,8 @@ async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(),
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
-        emit_stream(ctx, stream, &secrets).await?;
+            .map_err(|e| classify_scan_error(e, &secrets))?;
+        emit_stream(ctx, stream, &secrets, &spec.emit_exa_types).await?;
         Ok(())
     }
 }
@@ -154,7 +197,7 @@ async fn run_partial_aggregate(
     let batches = df
         .collect()
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
@@ -235,12 +278,12 @@ async fn run_grouped_partial_aggregate(
     let mut stream = df
         .execute_stream()
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     let n_group_keys = group_keys.len();
 
     while let Some(result) = stream.next().await {
-        let batch = result.map_err(|e| redact_storage_error(e.to_string(), &secrets))?;
+        let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
 
         for row_idx in 0..batch.num_rows() {
             // Group-key columns come first (columns 0 .. n_group_keys - 1).
@@ -587,10 +630,11 @@ async fn register_files(
         .collect::<Result<_, _>>()?;
 
     // Resolve the schema from the first file so we know column types.
+    let secrets = spec.storage.secret_values();
     let resolved_schema = listing_options
         .infer_schema(&ctx.state(), &table_paths[0])
         .await
-        .map_err(|e| redact_storage_error(e.to_string(), &spec.storage.secret_values()))?;
+        .map_err(|e| classify_scan_error(e, &secrets))?;
 
     let config = ListingTableConfig::new_with_multi_paths(table_paths)
         .with_listing_options(listing_options)
@@ -740,6 +784,7 @@ mod tests {
             limit: None,
             aggregates: None,
             group_keys: None,
+            emit_exa_types: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -755,6 +800,7 @@ mod tests {
                 table: "db.tbl".into(),
             },
             df_target_partitions: 1,
+            df_batch_size: 8192,
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
@@ -1172,6 +1218,33 @@ mod tests {
     // T7 — runtime selection and session config from ScanSpec
     // ---------------------------------------------------------------------------
 
+    /// Task 4.3: session_config_for_spec applies df_batch_size and clamps sub-1 values to 1.
+    ///
+    /// Verifies that:
+    /// 1. An explicit batch size flows through to SessionConfig::batch_size().
+    /// 2. A zero batch size is clamped to 1 (sub-1 values must not reach DataFusion as-is).
+    #[test]
+    fn session_config_applies_batch_size_and_clamps_floor() {
+        // 1. Explicit batch size is applied.
+        let mut spec = minimal_spec();
+        spec.df_batch_size = 4096;
+        let config = session_config_for_spec(&spec);
+        assert_eq!(
+            config.batch_size(),
+            4096,
+            "SessionConfig must use df_batch_size from spec"
+        );
+
+        // 2. Zero (sub-1) batch size is clamped to 1.
+        spec.df_batch_size = 0;
+        let config_clamped = session_config_for_spec(&spec);
+        assert_eq!(
+            config_clamped.batch_size(),
+            1,
+            "df_batch_size of 0 must be clamped to 1"
+        );
+    }
+
     /// SessionConfig applies target_partitions from the spec.
     ///
     /// Scenario: session_config_uses_spec_target_partitions
@@ -1213,6 +1286,67 @@ mod tests {
         );
     }
 
+    /// Teardown regression: a multi-thread runtime that still has detached
+    /// background tasks live when `block_on` returns must be torn down
+    /// deterministically, not by an implicit `Drop` that races those tasks.
+    ///
+    /// This reproduces the *mechanism* of the live `err_zombie` VM abort: the scan
+    /// future completes and returns its result while object_store's hyper client
+    /// (modeled here by a spawned task parked past the future's return) is still
+    /// alive. The fix is `run_on_runtime`, which drives the runtime down via
+    /// `shutdown_timeout` from the synchronous context. The invariants:
+    ///   1. the future's result is returned intact (work completed before teardown);
+    ///   2. `run_on_runtime` returns within the grace window (it drains/cancels the
+    ///      detached task rather than blocking forever or aborting);
+    ///   3. control reaches the assertions — a raced teardown abort would have
+    ///      killed the test process before this point.
+    ///
+    /// A real VM-process abort cannot be reproduced on the host (it needs Exasol's
+    /// VM teardown), so this asserts the deterministic-shutdown seam the abort-free
+    /// fix depends on; the live bench is the end-to-end arbiter.
+    #[test]
+    fn run_on_runtime_tears_down_multi_thread_runtime_with_live_background_task() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = build_scan_runtime(2).expect("multi-thread runtime must build");
+        let parked_started = Arc::new(AtomicBool::new(false));
+        let started_in_future = parked_started.clone();
+
+        let before = std::time::Instant::now();
+        let result = run_on_runtime(rt, async move {
+            // Spawn a detached task that outlives the future's return — the
+            // host analog of hyper's connection-pool/reaper tasks that object_store
+            // keeps alive past the last poll of the scan stream.
+            tokio::spawn(async move {
+                started_in_future.store(true, Ordering::SeqCst);
+                // Park far longer than the grace window; shutdown must cancel it.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            });
+            // Let the detached task reach its park point before returning, so the
+            // runtime genuinely has live background work at teardown time.
+            tokio::task::yield_now().await;
+            42_u32
+        });
+        let elapsed = before.elapsed();
+
+        // 1. The future's result survives the explicit teardown.
+        assert_eq!(result, 42, "future result must be returned before teardown");
+        // 2. Teardown is bounded — it returns near-immediately (the detached task
+        //    is cancelled), never blocking on the 3600s park.
+        assert!(
+            elapsed < RUNTIME_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            "run_on_runtime must return within the bounded grace window, took {elapsed:?}"
+        );
+        // 3. The detached task was genuinely live (otherwise the test proves nothing).
+        assert!(
+            parked_started.load(Ordering::SeqCst),
+            "the detached background task must have started before teardown"
+        );
+        // Reaching here without a process abort is the core assertion: deterministic
+        // shutdown replaced the racy implicit drop.
+    }
+
     /// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.
     #[test]
     fn stat_aggregate_index_follows_plan_order() {
@@ -1239,6 +1373,72 @@ mod tests {
         assert!(
             sql.contains("PARTIAL_stat_sumsq_1"),
             "stat sumsq at index 1: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // R2 — classify_scan_error on the partial-aggregate paths
+    // ---------------------------------------------------------------------------
+
+    /// R2: ResourcesExhausted on the grouped/ungrouped partial-aggregate paths surfaces
+    /// as a memory-exhaustion error, not a storage error, and leaks no credentials.
+    ///
+    /// This test exercises classify_scan_error directly (the same function now called
+    /// at all five mod.rs error sites) to confirm the classification is correct for
+    /// the DataFusion error shapes that aggregation and execution produce.
+    #[test]
+    fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
+        use crate::scan::emit::classify_scan_error;
+        use datafusion::error::DataFusionError;
+
+        let secret = "my-secret-key-value";
+        let secrets = [secret];
+
+        // 1. Direct ResourcesExhausted (e.g., from HashAggregateExec OOM).
+        let direct = DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 512 MiB for HashAggregateExec".to_string(),
+        );
+        let err = classify_scan_error(direct, &secrets);
+        let text = err.to_string();
+        assert!(
+            text.contains("memory exhausted"),
+            "direct ResourcesExhausted must surface as memory error: {text}"
+        );
+        assert!(
+            !text.contains("assigned data could not be read"),
+            "must NOT be classified as storage error: {text}"
+        );
+        assert!(!text.contains(secret), "must not leak credentials: {text}");
+
+        // 2. Context-wrapped ResourcesExhausted (DataFusion sort wraps with .context()).
+        let ctx_wrapped = DataFusionError::ResourcesExhausted("pool limit hit".to_string())
+            .context(format!("External sort failed secret={secret}"));
+        let err_ctx = classify_scan_error(ctx_wrapped, &secrets);
+        let text_ctx = err_ctx.to_string();
+        assert!(
+            text_ctx.contains("memory exhausted"),
+            "context-wrapped must surface as memory error: {text_ctx}"
+        );
+        assert!(
+            !text_ctx.contains("assigned data could not be read"),
+            "must NOT be classified as storage error: {text_ctx}"
+        );
+        assert!(
+            !text_ctx.contains(secret),
+            "context-wrapped must not leak credentials: {text_ctx}"
+        );
+
+        // 3. Non-ResourcesExhausted errors still route to the storage-error path.
+        let storage_err = DataFusionError::Execution("S3 403 Forbidden".to_string());
+        let err_storage = classify_scan_error(storage_err, &[]);
+        let text_storage = err_storage.to_string();
+        assert!(
+            text_storage.contains("assigned data could not be read"),
+            "non-OOM error must use the storage path: {text_storage}"
+        );
+        assert!(
+            !text_storage.contains("memory exhausted"),
+            "non-OOM error must NOT look like a memory error: {text_storage}"
         );
     }
 }

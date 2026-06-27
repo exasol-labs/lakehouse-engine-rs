@@ -131,6 +131,16 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
 
+    /// Declared Exasol EMITS type string for each output column, positionally
+    /// aligned with the row-scan projection. The scan coerces each emitted Arrow
+    /// column to the type this ExaType accepts (via `emit_batch`'s strict feed)
+    /// before emitting. Populated by the adapter from the SAME types it writes
+    /// into the EMITS clause. Empty (the default) for aggregate scans — which use
+    /// the freely-coercing Value emit path — and for specs that predate this
+    /// field (backward-compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emit_exa_types: Vec<String>,
+
     pub storage: StorageProps,
     pub catalog: CatalogProps,
 
@@ -141,6 +151,13 @@ pub struct ScanSpec {
     /// Old specs that lack this field deserialize to 1 (backward-compatible).
     #[serde(default = "default_one_usize")]
     pub df_target_partitions: usize,
+
+    /// DataFusion `batch_size` (rows per Arrow RecordBatch) for this scan instance.
+    /// Controls the granularity of DataFusion's internal execution batches.
+    /// Defaults to 8192 (DataFusion's own default).
+    /// Old specs that lack this field deserialize to 8192 (backward-compatible).
+    #[serde(default = "default_batch_size")]
+    pub df_batch_size: usize,
 
     /// Number of Tokio worker threads for the scan runtime.
     /// When 1 (the default), `new_current_thread()` is used (one OS thread).
@@ -164,6 +181,10 @@ pub struct ScanSpec {
 
 fn default_one_usize() -> usize {
     1
+}
+
+fn default_batch_size() -> usize {
+    8192
 }
 
 fn default_memory_pool_fraction() -> f64 {
@@ -205,6 +226,7 @@ mod tests {
             limit: Some(100),
             aggregates: None,
             group_keys: None,
+            emit_exa_types: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -220,6 +242,7 @@ mod tests {
                 table: "db.table".into(),
             },
             df_target_partitions: 1,
+            df_batch_size: 8192,
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
@@ -274,6 +297,64 @@ mod tests {
         assert!(
             !json.contains("group_keys"),
             "group_keys field must be absent when None: {json}"
+        );
+    }
+
+    /// `emit_exa_types` round-trips through JSON, is omitted when empty, and a
+    /// legacy payload lacking it deserializes to an empty Vec (backward-compatible).
+    #[test]
+    fn emit_exa_types_round_trips_and_defaults_to_empty() {
+        // Empty (default): the field is omitted from serialized JSON.
+        let row_spec = sample_spec();
+        assert!(row_spec.emit_exa_types.is_empty());
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("emit_exa_types"),
+            "empty emit_exa_types must be absent from JSON: {row_json}"
+        );
+
+        // Non-empty: the declared EMITS types survive the round-trip in order.
+        let mut spec = sample_spec();
+        spec.emit_exa_types = vec![
+            "DECIMAL(20,0)".to_string(),
+            "VARCHAR(2000000)".to_string(),
+            "DOUBLE PRECISION".to_string(),
+        ];
+        let json = spec.to_json();
+        assert!(
+            json.contains("emit_exa_types"),
+            "non-empty emit_exa_types must appear in JSON: {json}"
+        );
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.emit_exa_types,
+            vec![
+                "DECIMAL(20,0)".to_string(),
+                "VARCHAR(2000000)".to_string(),
+                "DOUBLE PRECISION".to_string()
+            ]
+        );
+
+        // Legacy payload without the field deserializes to an empty Vec.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.emit_exa_types.is_empty(),
+            "missing emit_exa_types must default to empty (backward-compat)"
         );
     }
 
@@ -436,6 +517,52 @@ mod tests {
         assert_eq!(
             legacy.df_threads_per_udf, 1,
             "missing df_threads_per_udf must default to 1 (backward-compat)"
+        );
+    }
+
+    /// Task 4.3: df_batch_size round-trips through JSON and defaults correctly on a legacy spec.
+    ///
+    /// Verifies that:
+    /// 1. An explicit `df_batch_size` value survives serialize → deserialize.
+    /// 2. A legacy JSON payload lacking the field deserializes to 8192 (backward-compatible).
+    #[test]
+    fn df_batch_size_round_trips_and_defaults() {
+        // 1. Explicit non-default value round-trips.
+        let mut spec = sample_spec();
+        spec.df_batch_size = 4096;
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.df_batch_size, 4096,
+            "df_batch_size must survive round-trip"
+        );
+
+        // 2. The field is present in the serialized JSON.
+        assert!(
+            json.contains("df_batch_size"),
+            "serialized JSON must carry df_batch_size: {json}"
+        );
+
+        // 3. A legacy payload without df_batch_size deserializes to 8192.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.df_batch_size, 8192,
+            "missing df_batch_size must default to 8192 (backward-compat)"
         );
     }
 
