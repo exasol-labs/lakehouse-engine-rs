@@ -2,7 +2,7 @@
 /// declaration and Arrow→Value conversion in the scan.
 ///
 /// The mapping is pure: no I/O, no external state.
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 
 /// The Exasol SQL type string for a given Arrow data type.
 ///
@@ -38,6 +38,113 @@ pub fn arrow_to_exasol_type(dt: &DataType) -> String {
         // Out-of-range Decimal128 or any incompatible type: VARCHAR via JSON fallback.
         _ => "VARCHAR(2000000)".to_string(),
     }
+}
+
+/// The canonical Arrow `DataType` that the engine's `emit_batch` IPC feed accepts
+/// for a column declared as the given Exasol EMITS type string.
+///
+/// This is the inverse of [`arrow_to_exasol_type`] and is the single source of
+/// truth for the type an emitted Arrow column must have so the strict
+/// Arrow→ExaType validation in `emit_batch` accepts it. The scan coerces every
+/// output column to this target before emitting.
+///
+/// The input is a declared Exasol type string exactly as it appears in an EMITS
+/// clause (e.g. `"DECIMAL(20,0)"`, `"DOUBLE PRECISION"`, `"VARCHAR(2000000)"`).
+/// Parsing is case-insensitive and tolerant of surrounding whitespace.
+///
+/// Returns `None` for a type string that maps to `VARCHAR` (string family) —
+/// the caller routes those through the JSON/Utf8 string path, which already
+/// handles arbitrary Arrow source types (including the incompatible set). A
+/// `VARCHAR` target is intentionally not represented as a single fixed Arrow
+/// type because the correct source coercion (display/JSON for incompatible
+/// types vs a plain Utf8 cast) depends on the source column, not the target.
+///
+/// ## DECIMAL precision binning (CRITICAL)
+///
+/// Exasol does NOT represent every `DECIMAL(p,s)` as the same internal type.
+/// The engine bins a `DECIMAL(p,s)` into an ExaType **by precision when the
+/// scale is 0**, and `emit_batch` requires the fed Arrow column to match that
+/// ExaType's Arrow representation:
+///
+/// - scale 0, precision ≤ [`DECIMAL_INT32_MAX_PRECISION`] (9)  → ExaType Int32 → Arrow `Int32`
+/// - scale 0, precision ≤ [`DECIMAL_INT64_MAX_PRECISION`] (18) → ExaType Int64 → Arrow `Int64`
+/// - scale > 0, OR precision 19..=36                            → ExaType Numeric → Arrow `Decimal128(p,s)`
+///
+/// These 9 / 18 thresholds are the standard Exasol DECIMAL internal
+/// representation (precision ≤ 9 fits a 32-bit int, ≤ 18 fits a 64-bit int,
+/// ≤ 36 needs 128-bit). Confirmed by:
+/// - Exasol "Sizing for Data Types" docs (DECIMAL with total precision ≤ 18
+///   fits 64-bit);
+/// - the SLC emit block layout (`exa-udf-runtime` `rowset.rs`): `ExaType::Int32`
+///   → int32 block, `ExaType::Int64` → int64 block, `ExaType::Numeric` → string
+///   (decimal) block;
+/// - the two live bench failures: `DECIMAL(10,0)` (COUNT(*)) binned to ExaType
+///   Int64 (rejecting a `Decimal128(10,0)` feed), and an Iceberg `int`
+///   (`DECIMAL(10,0)`, p≤18) binned to Int64 (rejecting an `Int32` feed).
+///
+/// A previous version mapped every `DECIMAL(p,s)` → `Decimal128(p,s)`, which is
+/// wrong for the integer-binned cases (the engine rejects `Decimal128(10,0)` for
+/// an Int64 column).
+pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
+    let upper = exasol_type.trim().to_uppercase();
+
+    if upper == "BOOLEAN" {
+        return Some(DataType::Boolean);
+    }
+    if upper == "DOUBLE PRECISION" || upper == "DOUBLE" {
+        return Some(DataType::Float64);
+    }
+    if upper == "DATE" {
+        return Some(DataType::Date32);
+    }
+    if upper == "TIMESTAMP" {
+        return Some(DataType::Timestamp(TimeUnit::Microsecond, None));
+    }
+    if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
+        return Some(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+    }
+    if let Some((p, s)) = parse_decimal_args(&upper) {
+        // Replicate Exasol's DECIMAL→ExaType precision binning (see doc comment).
+        if s == 0 && p <= DECIMAL_INT32_MAX_PRECISION {
+            return Some(DataType::Int32);
+        }
+        if s == 0 && p <= DECIMAL_INT64_MAX_PRECISION {
+            return Some(DataType::Int64);
+        }
+        return Some(DataType::Decimal128(p, s));
+    }
+
+    // VARCHAR / CHAR / unknown → string path (handled by the caller, not a fixed
+    // Arrow target). Returning None signals "route through the Utf8/JSON path".
+    None
+}
+
+/// Max precision a scale-0 DECIMAL fits into a 32-bit int (Exasol ExaType Int32).
+pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
+
+/// Max precision a scale-0 DECIMAL fits into a 64-bit int (Exasol ExaType Int64).
+pub const DECIMAL_INT64_MAX_PRECISION: u8 = 18;
+
+/// Parse the `(p,s)` arguments of a `DECIMAL(p,s)` Exasol type string.
+///
+/// Accepts `DECIMAL(p,s)` and `DECIMAL(p)` (scale defaults to 0). The input is
+/// expected to be already upper-cased and trimmed. Returns `None` for any string
+/// that is not a well-formed DECIMAL declaration.
+fn parse_decimal_args(upper: &str) -> Option<(u8, i8)> {
+    let inner = upper.strip_prefix("DECIMAL(")?.strip_suffix(')')?;
+    let mut parts = inner.split(',');
+    let p: u8 = parts.next()?.trim().parse().ok()?;
+    let s: i8 = match parts.next() {
+        Some(s_str) => s_str.trim().parse().ok()?,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((p, s))
 }
 
 /// Whether an Arrow DataType needs JSON serialization before crossing the boundary.
@@ -106,7 +213,7 @@ pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, TimeUnit};
+    use arrow::datatypes::DataType;
     use iceberg::spec::{PrimitiveType, Type};
 
     /// Scenario: Compatible Arrow types map to their Exasol type
@@ -287,6 +394,96 @@ mod tests {
             iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Time)),
             "VARCHAR(2000000)"
         );
+    }
+
+    /// Scenario: `exasol_type_to_arrow` reproduces Exasol's EXACT DECIMAL→ExaType
+    /// precision binning, plus the non-DECIMAL types.
+    ///
+    /// The target is the Arrow type the engine's `emit_batch` feed accepts for the
+    /// declared EMITS type — NOT a round-trip of `arrow_to_exasol_type` (which is
+    /// not an identity, because the engine bins DECIMAL precision into Int32 /
+    /// Int64 / Numeric). Bins asserted here:
+    ///   scale 0, p ≤ 9   → Arrow Int32   (ExaType Int32)
+    ///   scale 0, 10 ≤ p ≤ 18 → Arrow Int64   (ExaType Int64)
+    ///   scale > 0, OR 19 ≤ p ≤ 36 → Arrow Decimal128(p,s) (ExaType Numeric)
+    #[test]
+    fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
+        let cases: &[(&str, DataType)] = &[
+            ("BOOLEAN", DataType::Boolean),
+            ("DOUBLE PRECISION", DataType::Float64),
+            ("DATE", DataType::Date32),
+            (
+                "TIMESTAMP",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "TIMESTAMP WITH LOCAL TIME ZONE",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            // --- Int32 bin: scale 0, precision 1..=9 ---
+            ("DECIMAL(1,0)", DataType::Int32),
+            ("DECIMAL(3,0)", DataType::Int32),
+            ("DECIMAL(9,0)", DataType::Int32), // boundary: 9 is the last Int32
+            // --- Int64 bin: scale 0, precision 10..=18 ---
+            ("DECIMAL(10,0)", DataType::Int64), // boundary: COUNT(*) live case
+            ("DECIMAL(18,0)", DataType::Int64), // boundary: 18 is the last Int64
+            ("DECIMAL(20,0)", DataType::Decimal128(20, 0)), // p>18 → Numeric/Decimal128
+            // --- Numeric/Decimal128 bin: scale > 0, OR precision 19..=36 ---
+            ("DECIMAL(19,0)", DataType::Decimal128(19, 0)), // boundary: first >Int64
+            ("DECIMAL(36,0)", DataType::Decimal128(36, 0)),
+            ("DECIMAL(9,2)", DataType::Decimal128(9, 2)), // scale>0 → Decimal128 even at p≤9
+            ("DECIMAL(18,4)", DataType::Decimal128(18, 4)),
+            ("DECIMAL(36,36)", DataType::Decimal128(36, 36)),
+        ];
+        for (declared, expected_arrow) in cases {
+            let arrow = exasol_type_to_arrow(declared)
+                .unwrap_or_else(|| panic!("{declared} must map to a concrete Arrow type"));
+            assert_eq!(&arrow, expected_arrow, "wrong Arrow target for {declared}");
+        }
+    }
+
+    /// Scenario: the live bench failures map to the correct integer Arrow target.
+    ///
+    /// Both live "cannot feed declared ExaType Int64" errors were DECIMAL columns
+    /// in the Int64 bin (p 10..=18, scale 0). The target must be Arrow `Int64` —
+    /// NOT `Decimal128`, which the engine rejects for an Int64 column.
+    #[test]
+    fn exasol_type_to_arrow_count_star_decimal_is_int64() {
+        // COUNT(*) is declared DECIMAL(10,0) by Exasol → ExaType Int64.
+        assert_eq!(exasol_type_to_arrow("DECIMAL(10,0)"), Some(DataType::Int64));
+        // An Iceberg `int` column declared DECIMAL(10,0) → also Int64 (p≤18).
+        // (The first live error: an Arrow Int32 source must be cast Int32→Int64.)
+        assert_eq!(exasol_type_to_arrow("DECIMAL(18,0)"), Some(DataType::Int64));
+        // Small scale-0 DECIMALs are Int32, not Decimal128.
+        assert_eq!(exasol_type_to_arrow("DECIMAL(9,0)"), Some(DataType::Int32));
+    }
+
+    /// Scenario: String-family declared types (VARCHAR/CHAR) and unknown strings
+    /// return `None` — the caller routes them through the Utf8/JSON string path
+    /// rather than a fixed Arrow target.
+    #[test]
+    fn exasol_type_to_arrow_returns_none_for_string_family() {
+        assert_eq!(exasol_type_to_arrow("VARCHAR(2000000)"), None);
+        assert_eq!(exasol_type_to_arrow("VARCHAR(100)"), None);
+        assert_eq!(exasol_type_to_arrow("CHAR(10)"), None);
+        // Unknown / unsupported declarations also route to the string path.
+        assert_eq!(exasol_type_to_arrow("GEOMETRY"), None);
+        assert_eq!(exasol_type_to_arrow("HASHTYPE"), None);
+    }
+
+    /// Scenario: parsing is case-insensitive and whitespace-tolerant.
+    #[test]
+    fn exasol_type_to_arrow_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            exasol_type_to_arrow("  decimal(20,0) "),
+            Some(DataType::Decimal128(20, 0))
+        );
+        assert_eq!(
+            exasol_type_to_arrow("double precision"),
+            Some(DataType::Float64)
+        );
+        // DECIMAL(p) with no scale defaults to scale 0 → Int32 bin (p=9 ≤ 9).
+        assert_eq!(exasol_type_to_arrow("DECIMAL(9)"), Some(DataType::Int32));
     }
 
     /// D.5 — one test per mapping category asserting BOTH the declared Exasol type

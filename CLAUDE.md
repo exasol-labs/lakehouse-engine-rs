@@ -66,17 +66,65 @@ The instances-vs-groups mental model (from the Exasol engine architect, with a w
   (`EMIT_BUFFER_LIMIT_BYTES`) — 4 *million* bytes, NOT 4 MiB. Do not send a message per call.
 - **Always flush at end of `run()`**, even if the threshold was not reached.
 - A single row > threshold is still sent as one `MT_EMIT` (only the 2 GB per-value limit remains).
+- **Raw-scan path uses `ctx.emit_batch(&RecordBatch)`** (SDK 0.19.0, `emit-arrow` feature). The SDK
+  serializes the batch to Arrow IPC bytes internally; only bytes cross the `.so` boundary, not Arrow
+  types. Partial-aggregate single-row emits still use `ctx.emit` with `Value` types.
+
+## VM crashes & failure modes (Exasol engine internals)
+
+Verified on the live AWS Glue cluster (2026-06-27) while fixing the lineitem "Q3 crash". See
+`[[slc-zmq-recv-timeout-bug]]` / `[[live-cluster-memory-budget]]` in auto-memory.
+
+- **`cleanup VM failed: VM crashed` (SQL state 22002, `err_zombie:TRUE/err_except:FALSE`) is an
+  abnormal native VM exit — NOT necessarily OOM, NOT a Rust panic.** Before blaming memory, check:
+  RSS (was ~120 MB, 33× under the 4096 MB limit), `oom_kill`/dmesg (clean), core dumps
+  (`[redacted]`, none), and the `set_hook` panic log (absent). A clean process exit with
+  no core is NOT `panic=abort` (which SIGABRTs + cores) and NOT a panic.
+- **Engine SIGKILL fan-out.** When ONE UDF VM of a statement part dies abnormally (engine controller
+  `[redacted] ... state=15; signaled=FALSE` → `Sending SIGKILL to partID`), the engine **SIGKILLs
+  every sibling VM** of that part (`[redacted]: child (exaudfclient) terminated with signal 9`). So a
+  cluster-wide "all VMs crashed on all nodes" symptom can originate from a SINGLE VM's abnormal exit
+  — find the EARLIEST death (one VM closes slightly ahead, then a tight cluster of SIGKILLs).
+- **`MT_EMIT` is synchronous request/reply.** Every emit flush (and the final `MT_FINISHED`) is a
+  send-then-wait-for-ack round-trip over the SLC's ZMQ REQ socket; a large emit = hundreds of
+  round-trips, each subject to the SLC's socket timeouts. Under load the engine can take >1 s to ack.
+  The Rust SLC's ZMQ transport had `RCVTIMEO/SNDTIMEO=1000` (1 s) treated as FATAL with no retry →
+  a slow-but-alive ack broke the REQ/REP lockstep → abnormal VM exit → SIGKILL fan-out. **Fixed in
+  lc-rs 0.19.1** (`exa-zmq-protocol` retries transient `EAGAIN`; PR #38). Was volume+load correlated,
+  intermittent (~67–90%); reproduces WITHOUT a join via a single-leg large raw emit.
+- **SLC/`.so` fingerprint must match exactly.** `EXA_SDK_FINGERPRINT = "{exasol-udf-sdk version}:{rustc_hash}"`
+  is checked at UDF load; e.g. a 0.19.1 SLC rejects a 0.19.0-SDK `.so` with `F-UDF-CL-RUST-9001:
+  Fingerprint mismatch`. Keep the SLC and the consumer crate's `exasol-udf-sdk` version in lockstep,
+  built with the same rustc (the `rust:1.92-bookworm` SLC builder).
+
+## Live debugging (lc-rs 0.19.0 debug surface)
+
+- **`ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<host>:<port>'`** redirects the UDF VM's fd1/fd2 to a
+  listener (`nc -l`), capturing runtime tracing + startup/abort output the Rust SLC otherwise
+  discards. (The docs' `SET SESSION SCRIPT OUTPUT ADDRESS` form was REJECTED on this cluster — use
+  the `ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS` form.) The listener must be reachable FROM the
+  cluster nodes (a jumphost/private IP; a NAT'd local client cannot receive the connect-back).
+- **`%udf_debug_level debug|info|warn|error`** in the script source (same channel as `%udf_object`)
+  sets verbosity; at `debug` the SLC auto-emits per-VM-tagged (`pid`/`node_id`/`session_id`/`vm_id`)
+  emit/flush + RSS telemetry with NO UDF code. `udf_log!(ctx, level, …)` + `ctx.debug_level()` emit
+  UDF-side lines. Wire it env-gated in the scan-script DDL (`LAKEHOUSE_UDF_DEBUG_LEVEL`, default `info`).
+- **CAVEAT: the redirect + per-row debug tracing destabilizes MULTI-LEG JOIN queries** — they can
+  crash under debug even when they pass without it. Diagnose with SINGLE-LEG repros (one scan leg +
+  engine-side aggregation), which are stable under the redirect.
 
 ## DataFusion streaming
 
-- Stream the DataFusion result: fetch one Arrow `RecordBatch` at a time, convert it → `Vec<Value>`,
-  `ctx.emit` it, then **drop the batch before fetching the next**. Architect rule: "du musst
-  resultset in batches lesen und dann gleich emitten".
-- Never collect all `RecordBatch`es before converting — that holds two full copies (Arrow + Value)
-  in memory at once.
-- **Only SDK `Value` types cross the `.so` boundary — never Arrow types.** Arrow `TypeId` is not
-  stable across the dynamic-library boundary (the `.so` links its own arrow copy). Convert
-  Arrow→`Value` inside the UDF before emitting.
+- Stream the DataFusion result: fetch one Arrow `RecordBatch` at a time, emit it, then **drop the
+  batch before fetching the next**. Architect rule: "du musst resultset in batches lesen und dann
+  gleich emitten".
+- **Raw scan path**: call `ctx.emit_batch(&batch)` — no `Vec<Value>` intermediate; the SDK
+  serializes the batch to Arrow IPC bytes inside the UDF crate.
+- **Partial-aggregate path**: convert the single summary row to `Vec<Value>` and call `ctx.emit`.
+- Never collect all `RecordBatch`es before emitting — that holds two full copies in memory at once.
+- **Arrow *types* must not cross the `.so` boundary — but Arrow IPC bytes (via `emit_batch`) may.**
+  Arrow `TypeId` is not stable across the dynamic-library boundary (the `.so` links its own arrow
+  copy). `emit_batch` serializes to IPC bytes inside the UDF before anything crosses that boundary,
+  so the discipline is preserved. Do not pass Arrow structs or trait objects across the boundary.
 
 ## Connect-back
 
@@ -124,3 +172,5 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - One crate / one `.so` exports **both** entry points (VS adapter + DataFusion scan SET UDF) —
   `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
+- SDK: `exasol-udf-sdk` **0.18.0** + `exasol-udf-macros` **0.18.0**. In 0.18.0, `connect-back`
+  is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.

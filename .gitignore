@@ -6,6 +6,8 @@
 
 # Local follow-up scratch notes (not tracked)
 next.md
+current-state.md
+debug-cluster.md
 
 # Benchmark local config + reports
 bench/.env

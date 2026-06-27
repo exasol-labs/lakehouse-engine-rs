@@ -34,6 +34,19 @@ require() {
   done
 }
 
+# Build the VS_EXTRA_PROPS string: NR_OF_CORES + PARALLELISM_FACTOR, and optionally
+# ALLOW_HTTP for targets that use plain-HTTP catalogs/storage (docker only).
+# Args: allow_http (true|false) nr_of_cores parallelism_factor
+build_vs_extra_props() {
+  local allow_http="$1" nr_of_cores="$2" parallelism_factor="$3"
+  local props
+  props="$(printf "\n  NR_OF_CORES         = '%s'\n  PARALLELISM_FACTOR  = '%s'" \
+    "${nr_of_cores}" "${parallelism_factor}")"
+  [ "$allow_http" = "true" ] && \
+    props="$(printf "\n  ALLOW_HTTP          = 'true'")${props}"
+  printf '%s' "${props}"
+}
+
 # Remote (AWS Glue) catalog-connection password JSON: SigV4 + static creds.
 # The adapter requires a non-empty S3 `endpoint`; for real AWS S3 that's the
 # regional endpoint (override with AWS_S3_ENDPOINT, e.g. for an S3-compat store).
@@ -61,6 +74,14 @@ if [ "${1:-}" = "selftest" ]; then
   case "$(build_conn_password_local)" in
     *'"path_style":true'*'"use_sigv4":false'*) ;; *) echo "FAIL: local password shape"; exit 1;; esac
   if (require __DEFINITELY_UNSET_VAR__ >/dev/null 2>&1); then echo "FAIL: require passed on unset"; exit 1; fi
+  # build_vs_extra_props: docker path includes ALLOW_HTTP; remote path does not.
+  docker_props="$(build_vs_extra_props true 8 16)"
+  case "$docker_props" in *"ALLOW_HTTP"*"NR_OF_CORES"*"'8'"*"PARALLELISM_FACTOR"*"'16'"*) ;; \
+    *) echo "FAIL: docker vs_extra_props shape: $docker_props"; exit 1;; esac
+  remote_props="$(build_vs_extra_props false 8 8)"
+  case "$remote_props" in *"ALLOW_HTTP"*) echo "FAIL: remote vs_extra_props must not contain ALLOW_HTTP: $remote_props"; exit 1;; esac
+  case "$remote_props" in *"NR_OF_CORES"*"'8'"*"PARALLELISM_FACTOR"*"'8'"*) ;; \
+    *) echo "FAIL: remote vs_extra_props shape: $remote_props"; exit 1;; esac
   echo "selftest OK"; exit 0
 fi
 
@@ -75,6 +96,9 @@ TPCH_SCALE="${TPCH_SCALE:-0.3}"
 SLC_VERSION="${BENCH_SLC_VERSION:-0.16.0}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
 # BucketFS object path for the .so, as referenced by %udf_object in CREATE SCRIPT.
 SO_UDF_OBJECT="${BENCH_SO_UDF_OBJECT:-buckets/bfsdefault/default/udf/liblakehouse_engine.so}"
+# Debug level forwarded to the UDF via %udf_debug_level (0.19.0+ live debug surface).
+# Valid values: debug|info|warn|error. Default: info (low-noise; set to debug for traces).
+UDF_DEBUG_LEVEL="${LAKEHOUSE_UDF_DEBUG_LEVEL:-info}"
 # BucketFS path of the EXTRACTED SLC dir (the RUST language alias points inside it,
 # at <SLC_BUCKET_PATH>/exaudf/exaudfclient). A foo.tar.gz upload extracts to foo, so
 # set this to bfsdefault/<bucket>/<archive-name-without-.tar.gz>.
@@ -94,8 +118,7 @@ case "$TARGET" in
     # http catalog/S3 + parallelism knobs. NR_OF_CORES (new VS property) drives the
     # DataFusion target-partitions / threads-per-UDF defaults so scans use the cores;
     # multi-file tables (loader) + PARALLELISM_FACTOR drive the GROUP BY shard_key fan-out.
-    VS_EXTRA_PROPS="$(printf "\n  ALLOW_HTTP          = 'true'\n  NR_OF_CORES         = '%s'\n  PARALLELISM_FACTOR  = '%s'" \
-      "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
+    VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON=0
     echo "== docker: bringing up local stack (minio, iceberg-rest, exasol) =="
     docker compose up -d
@@ -109,7 +132,7 @@ case "$TARGET" in
     NAMESPACE="$ICEBERG_NAMESPACE"
     CATALOG_URI="$GLUE_CATALOG_URI"
     CONN_PW="$(build_conn_password_cloud)"
-    VS_EXTRA_PROPS=""
+    VS_EXTRA_PROPS="$(build_vs_extra_props false "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON="${BENCH_PROFILE:-1}"
     ;;
   *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;
@@ -192,10 +215,12 @@ echo "== creating schema, scripts, connection, VS '${VS}' =="
 sql "CREATE SCHEMA IF NOT EXISTS ${SCHEMA}"
 sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
+%udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 sql "CREATE OR REPLACE RUST SET SCRIPT ${SCHEMA}.${SCAN}(spec VARCHAR(2000000))
 EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
+%udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' IDENTIFIED BY '${CONN_PW}'"
 sql "DROP VIRTUAL SCHEMA IF EXISTS ${VS} CASCADE" || true

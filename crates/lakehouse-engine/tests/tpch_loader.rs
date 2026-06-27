@@ -94,7 +94,9 @@ async fn load_tpch() -> Result<()> {
     let catalog_url = stack::iceberg_catalog_url();
     let warehouse = "s3://warehouse/";
     let catalog = seed::build_seed_catalog(&catalog_url, warehouse, "tpch-loader").await?;
-    println!("Loading TPC-H (SF={scale}, big tables in {files} files) into '{namespace}' at {catalog_url}");
+    println!(
+        "Loading TPC-H (SF={scale}, big tables in {files} files) into '{namespace}' at {catalog_url}"
+    );
 
     // Each TPC-H table: build N disjoint generator parts (one Arrow iterator per
     // file), derive the Iceberg schema from the first part's Arrow schema, and
