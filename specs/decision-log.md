@@ -901,3 +901,156 @@ Set `batch_size` in `session_config_for_spec` from a `df_batch_size` field carri
 ### Consequences
 
 Per-batch peak memory on Parquet decode is bounded by `batch_size` rather than left at the DataFusion default (8192 rows). The conservative default shrinks per-instance footprint at the cost of slightly more DataFusion scheduling overhead per batch. The `df_batch_size` field follows the same JSON round-trip + backward-compat-default pattern as `df_target_partitions`.
+
+## ADR-034: AUTO/FIXED Threading Mode Resolved at the Thin VS; Integers Only to the UDF
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+DataFusion's `SessionConfig::new()` defaults `target_partitions` to the host core count. Without an explicit setting, each UDF instance spawns core-count partitions, oversubscribing the node by `(instances × cores)`. The prior behaviour supplied explicit `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF` VS properties with a FIXED numeric default, but there was no safe auto-derive path that respects the per-node UDF fan-out, and no way for an operator to pin values for repeatable benchmarks without giving up the safety invariant.
+
+### Decision
+
+A `DATAFUSION_THREADING_MODE` VS property (values `AUTO` or `FIXED`, default `AUTO`, case-insensitive) selects how thread/partition budgets are computed at `createVirtualSchema` time. In `AUTO` mode the adapter derives `df_threads_per_udf = max(1, floor(NR_OF_CORES / udf_instances_per_node))` with `df_target_partitions` held in lockstep, so `(udf_instances_per_node × df_threads_per_udf) ≤ NR_OF_CORES`. In `FIXED` mode, supplied values are used verbatim (each defaulting to `max(NR_OF_CORES, 1)` when absent). Only the resolved integer fields ever reach the scan UDF — the UDF stays mode-agnostic.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| AUTO/FIXED mode in the adapter; integers only to the UDF | ✓ Chosen — honors "auto but overridable" (Q3); preserves thin-VS / stateless-UDF boundary; lockstep prevents oversubscription in AUTO; operator can pin for benchmarks in FIXED |
+| Always-auto (no override) | ✗ Rejected — operator cannot pin values for repeatable benchmark sweeps |
+| Always-manual (FIXED only) | ✗ Rejected — easy to misconfigure and oversubscribe the node |
+| Bake a fixed thread count at compile time | ✗ Rejected — no config-driven tuning without recompilation |
+
+### Consequences
+
+Operators get a safe default (AUTO) that does not oversubscribe a node and a FIXED lever for benchmark sweeps. The UDF layer is unchanged: it consumes `df_threads_per_udf` and `df_target_partitions` as integers regardless of how they were derived. Note: AUTO's anti-oversubscription premise is most valuable for CPU/memory-bound workloads; I/O-bound far-VPC scans can benefit from deliberate oversubscription (see ADR-038).
+
+## ADR-035: Telemetry Built on Archived Checkpoint Infrastructure; Default OFF
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+Throughput bottleneck attribution required phase timing (startup / object-storage import / send-back/emit) per UDF VM, but the project had no instrumentation surface. A fresh telemetry module would duplicate concurrency-safety and per-PID isolation work already proven in the `archive/udf-diagnostics-checkpoints` branch (`scan/diagnostics.rs`: per-PID file isolation, monotonic sequence, best-effort RSS sampling). The lc-rs 0.19.0 debug surface provided the per-VM-tagged emit channel keyed by `LAKEHOUSE_UDF_DEBUG_LEVEL`.
+
+### Decision
+
+Restore `scan/diagnostics.rs` from `archive/udf-diagnostics-checkpoints` and add three monotonic-clock phase accumulators (startup / object-storage import / send-back) wired at existing checkpoint sites. Gate all emission on the lc-rs debug level (`LAKEHOUSE_UDF_DEBUG_LEVEL`); emit nothing at the production default `info`. Every telemetry write is best-effort and never fails a scan.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Restore archived checkpoint infra; add phase boundaries | ✓ Chosen — reuses proven concurrency-safe, per-PID, crash-durable infra (Q2); zero production overhead; object-storage import phase isolates S3 travel cost for future in-VPC plan |
+| Fresh telemetry module from scratch | ✗ Rejected — duplicates already-proven concurrency-safety and per-PID isolation; Q2 explicitly endorsed reuse |
+
+### Consequences
+
+Zero production overhead: final benchmark runs execute with telemetry OFF. The object-storage-import timing becomes the measurement lever for the future S3-in-VPC plan. The archived `diagnostics.rs` checkpoint trail (~170 lines) is restored but has zero production callers beyond the telemetry functions; flagged as trimmable-to-telemetry-only if the dormant checkpoint trail is unwanted (see review findings in the plan decision log).
+
+## ADR-036: Decode-Emit Overlap Buffer Is Conditional / Measure-First; Not Committed
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+A bounded producer/consumer queue between the DataFusion stream and the emit calls could theoretically overlap S3 read latency with SLC send-back time. However, the `scan-execution` streaming discipline (fetch-one / emit / drop) was designed to bound memory, and adding a buffer introduces concurrency complexity and a held-in-memory batch per slot.
+
+### Decision
+
+Do NOT build the bounded `DF_MAX_BUFFERED_BATCHES` producer/consumer buffer. The `scan-execution` spec describes it only as a conditional capability gated on phase-telemetry evidence (see `datafusion-scan/scan-execution-telemetry`). The committed scenario is authored only after the gate passes: the phase telemetry must show that the emit phase and the object-storage import phase are both material AND serialized, and that decoupling them yields a measured throughput gain.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Commit buffer only after telemetry gate passes | ✓ Chosen — avoids speculative work; the gate failed (ADR-037): emit ~2ms vs import ~650ms, so the buffer yields essentially zero gain on the far-VPC workload |
+| Build the buffer immediately | ✗ Rejected per Q1 — measure first; the S3-in-VPC plan + telemetry must first show read and emit don't already overlap and that decoupling pays |
+
+### Consequences
+
+The streaming discipline (fetch-one / emit / drop) stays intact. Memory is bounded by the `batch_size` lever. The gate result (ADR-037) confirmed this decision: the scan is overwhelmingly import-bound on the far-VPC path; overlapping a ~2ms emit with a ~650ms import yields essentially zero wall-clock gain.
+
+## ADR-037: Scope Split — Engine Features Get Specs; Benchmarks and Sweeps Are Tasks Only
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+The throughput plan combined two kinds of deliverables: (1) engine feature changes with stable behavioral contracts (threading mode, telemetry capability, repartition-free pipeline guarantee, Parquet pruning flag, adapter-notes recording), and (2) benchmark harness, synthetic micro-benchmarks, parameter sweeps, and baseline measurements that measure the engine but are not themselves engine behaviors.
+
+### Decision
+
+Spec deltas cover only engine feature changes (Threading Mode, On-Demand Phase Telemetry, Raw-Scan Pipeline Shape, Parquet Pruning, AdapterNotes recording). The E2E/benchmark harness, synthetic emit/scan benchmarks, parameter sweeps, baseline measurement, and the empirical >1-thread test live in the plan's task list (Tasks 5–9) with no spec scenarios.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Spec engine features only; tasks for benchmark/harness/sweep | ✓ Chosen — specs describe product behavior; measurement tooling evolves faster and is not a behavioral contract |
+| Spec benchmark behavior too | ✗ Rejected — benchmarks measure the engine, they are not engine capabilities; spec should describe behavior under test, not the test rig |
+
+### Consequences
+
+The spec library remains a description of product behavior, not a test harness manifest. Measurement tooling (bench scripts, sweep drivers, report formats) can evolve without requiring spec changes or ADR entries.
+
+## ADR-038: AUTO Threading Default Safe but Not Fastest for I/O-Bound Remote Scans; FIXED Recommended
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+The threading sweep on the live AWS Glue cluster (NR_OF_CORES=4, PARALLELISM_FACTOR=8, lineitem ~1.7 GB) produced: 1/1 thread/partition → Q4 12.45s; 2/2 → 10.52s; 4/4 → 8.94s (best); 8/8 → 10.02s. AUTO derives `max(1, floor(4/8)) = 1` for this configuration, which is +39% slower than the optimal 4/4. The root cause: the scan is I/O-bound (S3 across the VPC), so threads overlap S3 read latency rather than competing for CPU — more threads per instance help up to ≈NR_OF_CORES even though `instances × threads` exceeds the VS-reported core count in this regime.
+
+### Decision
+
+Keep AUTO as the spec'd general safety default (never oversubscribes a CPU-bound or memory-bound workload). Document that the measured-optimal config for far-VPC I/O-bound remote scans is `DATAFUSION_THREADING_MODE=FIXED` with `DATAFUSION_THREADS_PER_UDF = DATAFUSION_TARGET_PARTITIONS = NR_OF_CORES`. The bench harness and recommended production config for remote scans use FIXED. A future "I/O-aware AUTO" that deliberately oversubscribes when read-bound is a potential follow-up.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| AUTO safety default + FIXED lever + documented recommendation | ✓ Chosen — principled: safety by default, tunable by measurement; avoids hardcoding oversubscription for all deployments |
+| Change AUTO to always oversubscribe | ✗ Rejected — correct for I/O-bound remote scans, wrong for CPU/memory-bound or local-storage deployments |
+| Remove AUTO, FIXED only | ✗ Rejected — loses the safety invariant for deployments that don't tune |
+
+### Consequences
+
+Operators running far-VPC remote scans should set `DATAFUSION_THREADING_MODE=FIXED` with threads=cores for best throughput. The AUTO default remains correct and safe for all other workload shapes. The empirical result (8 instances × 4 threads = 32 concurrent threads on a 4-core node yields best results) documents that the I/O-bound assumption breaks the core-count anti-oversubscription heuristic.
+
+## ADR-039: Throughput Bottleneck Is Far-VPC S3 Read Latency; UDF Engine Is Not the Limiter
+
+**Date:** 2026-06-27
+**Plan:** `change-engine-throughput`
+**Status:** Accepted
+
+### Context
+
+Live-cluster baseline was ~0.2 GB/s, 5× short of the 1 GB/s target. After delivering all engine-side levers (Parquet `pushdown_filters`, lean repartition-free plan, row-group/page pruning, optimal threading, projection/partial-agg pushdown), the measured improvement was ~30–40% rather than the 5× needed to reach 1 GB/s.
+
+### Decision
+
+The engine-side levers in this plan are delivered and measurably improve throughput, but the ~5× gap is dominated by S3 read latency across the VPC, confirmed three independent ways: (a) phase telemetry: object-storage import ≈650ms vs emit ≈2ms per shard VM — the scan is overwhelmingly import-bound; (b) threading results: throughput improves by overlapping S3 waits, not by adding compute; (c) native Exasol `IMPORT FROM PARQUET` of the same lineitem files reaches the same ~0.17 GB/s ceiling (10.07s wall-clock) — the VS path is competitive or faster via pushdown. Moving S3 into the VPC is the highest-value next throughput lever.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Continue optimizing the UDF engine path | ✗ Rejected — measurement confirms UDF layer is not the limiter; native IMPORT reaches the same ceiling |
+| Move S3 into the VPC (separate future plan) | ✓ Endorsed — the only lever that can close the ~5× gap; removes the dominant latency source |
+
+### Consequences
+
+The throughput plan is complete as an engine-side optimization effort. The next throughput action is the S3-in-VPC plan. The UDF layer overhead (vs native IMPORT) is small enough that the VS path is not the bottleneck. The IMPORT FROM PARQUET benchmark result is recorded as the reference ceiling for future comparison.

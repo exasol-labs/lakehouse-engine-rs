@@ -110,6 +110,7 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 * *AND* the error-redaction path MUST NOT reclassify a `ResourcesExhausted` condition as an "assigned data could not be read" storage error
 * *AND* the surfaced error message MUST NOT contain any storage access key, secret key, or session token
 
+<!-- DELTA:NEW -->
 ### Scenario: Raw-scan physical plan carries no needless repartition or coalesce-partitions stage
 
 * *GIVEN* a scan spec on the raw-row path whose `df_target_partitions` is `1` (one partition per shard, the single-instance scan unit)
@@ -117,3 +118,4 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 * *THEN* the physical plan SHALL NOT contain a `RepartitionExec`, a `CoalescePartitionsExec`, a global `SortExec`, or a global aggregate stage on the raw-row path
 * *AND* the plan SHALL be the lean pipeline `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec` feeding the incremental emit, so no stage redistributes or re-buffers rows beyond what projection, filter, and batch coalescing require
 * *AND* the emitted rows SHALL be identical to those the unpruned, un-optimized plan would produce
+<!-- /DELTA:NEW -->
