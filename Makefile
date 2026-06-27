@@ -67,7 +67,7 @@ export LH_REST_PORT
 test-e2e: cross-musl-udf-build
 	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test -- --test-threads=1
 
-# Install and register the Rust SLC 0.14.0 into Exasol under the RUST alias.
+# Install and register the Rust SLC 0.19.0 into Exasol under the RUST alias.
 #
 # This Exasol is the dedicated lakehouse-engine stack (the sibling strata-rs stack
 # is stopped), so we register the canonical RUST alias cleanly. The Rust E2E
@@ -75,14 +75,14 @@ test-e2e: cross-musl-udf-build
 # the equivalent manual / convenience path.
 #
 # Steps:
-#   1. Download lc-rust-0.14.0.tar.gz from GitHub releases.
+#   1. Download lc-rust-0.19.0.tar.gz from GitHub releases.
 #   2. Upload it to BucketFS at /default/slc/lakehouse-rustslc.tar.gz.
 #   3. ALTER SYSTEM SET SCRIPT_LANGUAGES = '... RUST=...' (replacing any
 #      pre-existing RUST= entry).
 #
 # BucketFS write password is extracted at runtime from EXAConf.
 # Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
-SLC_VERSION ?= 0.14.0
+SLC_VERSION ?= 0.19.0
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 
@@ -155,4 +155,41 @@ lint:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench
+# --- Host repro: Q3 LINEITEM scan-leg memory blow-up -------------------------
+# Reproduces Q3's RAW-ROW lineitem scan (projection L_ORDERKEY + L_EXTENDEDPRICE,
+# no filter, no limit) ON THE HOST against the LIVE Glue lineitem table, sampling
+# RSS over time so we can prove whether the scan/emit streams (flat RSS) or
+# accumulates (climbing RSS). Sources bench/.env the SAME way bench/run.sh does
+# so AWS/Glue creds reach the environment — secrets are never printed.
+#
+# Host DEBUG build only (a debug `cargo test` is allowed; NEVER cargo build
+# --release on the host — that writes a host-glibc .so). Runs two variants:
+# df_threads=4 (the cluster config, concurrency exercised) and df_threads=1
+# (serial baseline). REPRO_MEMORY_LIMIT_MB is set large so the DataFusion pool is
+# effectively unbounded and we observe the scan's TRUE footprint (the host has no
+# 4 GB engine kill). /usr/bin/time -v captures Max RSS when available.
+#
+# Output is teed to bench/reports/q3-rss-repro.log.
+REPRO_MEMORY_LIMIT_MB ?= 65536
+REPRO_LOG := bench/reports/q3-rss-repro.log
+
+repro:
+	@mkdir -p bench/reports
+	@set -a; [ -f bench/.env ] && . bench/.env; set +a; \
+	export RUST_BACKTRACE=1; \
+	export REPRO_MEMORY_LIMIT_MB="$(REPRO_MEMORY_LIMIT_MB)"; \
+	TIME=; command -v /usr/bin/time >/dev/null 2>&1 && TIME="/usr/bin/time -v"; \
+	{ \
+	  echo "######## REPRO VARIANT: df_threads=4 (concurrent) ########"; \
+	  REPRO_DF_THREADS=4 $$TIME \
+	    cargo test -p lakehouse-engine --test q3_lineitem_rss_repro -- \
+	    --ignored --nocapture --test-threads=1; \
+	  echo; \
+	  echo "######## REPRO VARIANT: df_threads=1 (serial) ########"; \
+	  REPRO_DF_THREADS=1 $$TIME \
+	    cargo test -p lakehouse-engine --test q3_lineitem_rss_repro -- \
+	    --ignored --nocapture --test-threads=1; \
+	} 2>&1 | tee "$(REPRO_LOG)"
+	@echo "=== repro: full trail written to $(REPRO_LOG) ==="
+
+.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench repro
