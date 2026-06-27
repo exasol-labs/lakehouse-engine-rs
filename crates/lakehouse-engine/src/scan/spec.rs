@@ -131,6 +131,16 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
 
+    /// Declared Exasol EMITS type string for each output column, positionally
+    /// aligned with the row-scan projection. The scan coerces each emitted Arrow
+    /// column to the type this ExaType accepts (via `emit_batch`'s strict feed)
+    /// before emitting. Populated by the adapter from the SAME types it writes
+    /// into the EMITS clause. Empty (the default) for aggregate scans — which use
+    /// the freely-coercing Value emit path — and for specs that predate this
+    /// field (backward-compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emit_exa_types: Vec<String>,
+
     pub storage: StorageProps,
     pub catalog: CatalogProps,
 
@@ -216,6 +226,7 @@ mod tests {
             limit: Some(100),
             aggregates: None,
             group_keys: None,
+            emit_exa_types: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -286,6 +297,64 @@ mod tests {
         assert!(
             !json.contains("group_keys"),
             "group_keys field must be absent when None: {json}"
+        );
+    }
+
+    /// `emit_exa_types` round-trips through JSON, is omitted when empty, and a
+    /// legacy payload lacking it deserializes to an empty Vec (backward-compatible).
+    #[test]
+    fn emit_exa_types_round_trips_and_defaults_to_empty() {
+        // Empty (default): the field is omitted from serialized JSON.
+        let row_spec = sample_spec();
+        assert!(row_spec.emit_exa_types.is_empty());
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("emit_exa_types"),
+            "empty emit_exa_types must be absent from JSON: {row_json}"
+        );
+
+        // Non-empty: the declared EMITS types survive the round-trip in order.
+        let mut spec = sample_spec();
+        spec.emit_exa_types = vec![
+            "DECIMAL(20,0)".to_string(),
+            "VARCHAR(2000000)".to_string(),
+            "DOUBLE PRECISION".to_string(),
+        ];
+        let json = spec.to_json();
+        assert!(
+            json.contains("emit_exa_types"),
+            "non-empty emit_exa_types must appear in JSON: {json}"
+        );
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.emit_exa_types,
+            vec![
+                "DECIMAL(20,0)".to_string(),
+                "VARCHAR(2000000)".to_string(),
+                "DOUBLE PRECISION".to_string()
+            ]
+        );
+
+        // Legacy payload without the field deserializes to an empty Vec.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.emit_exa_types.is_empty(),
+            "missing emit_exa_types must default to empty (backward-compat)"
         );
     }
 

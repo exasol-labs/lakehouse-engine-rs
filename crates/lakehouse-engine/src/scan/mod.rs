@@ -2,6 +2,7 @@
 /// DataFusion SessionContext, registers ONLY the assigned files over MinIO,
 /// applies projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
+pub mod diagnostics;
 pub mod emit;
 pub mod runtime;
 pub mod spec;
@@ -25,6 +26,41 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use url::Url;
+
+/// Bounded grace period for draining background async work at runtime teardown.
+///
+/// After the scan future returns, object_store's S3 client (hyper) may still hold
+/// detached connection-pool tasks and open sockets. Dropping the Tokio runtime
+/// while those are mid-flight is a non-deterministic teardown race: a detached
+/// task's `Drop` can touch the reactor after it has been torn down, aborting the
+/// VM process *after* the final emit/flush — outside the entry-point's
+/// `catch_unwind`, so it surfaces as an `err_zombie` VM crash with no Rust panic
+/// text. `shutdown_timeout` instead drives the runtime down deterministically:
+/// it drives pending tasks for up to this window, then cancels what remains in a
+/// defined order. The value is a teardown bound, not a query timeout — the scan
+/// future has already completed before it applies.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `future` to completion on `rt`, then shut the runtime down deterministically.
+///
+/// This is the abort-free teardown seam for the scan UDF. The future MUST resolve
+/// to a value that owns no async resources (no DataFusion `SessionContext`, no
+/// `RecordBatch` stream, no object-store handle): everything async-borrowing must
+/// be dropped *inside* the future, before it returns. Given that, the result is
+/// fully materialized while the runtime is still live, and the runtime is then
+/// torn down via `shutdown_timeout` from this synchronous (non-async) context —
+/// never by an implicit `Drop` that could race hyper's detached connection tasks.
+fn run_on_runtime<T>(
+    rt: tokio::runtime::Runtime,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let result = rt.block_on(future);
+    // Explicit, bounded teardown from the synchronous context. Replaces the
+    // implicit `drop(rt)` whose internal task/IO teardown raced hyper background
+    // work and intermittently aborted the VM at end-of-life.
+    rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
+}
 
 /// Build the Tokio runtime for the scan UDF.
 ///
@@ -62,15 +98,86 @@ fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .with_batch_size(spec.df_batch_size.max(1))
 }
 
+/// DIAGNOSTIC (temporary): one-line summary of the scan spec's shape and every
+/// knob that drives per-instance memory growth, for the SPEC SUMMARY checkpoint.
+///
+/// Reports the execution PATH (raw-row stream / ungrouped partial-agg / GROUPED
+/// partial-agg), projection column count, whether a filter is present, the
+/// aggregate and group-key counts and kinds, assigned file count plus a short
+/// fingerprint (first file basename) so we can tell WHICH shard's VM died, and
+/// the DataFusion sizing knobs including the real `ctx.memory_limit()` byte
+/// value. Carries no credentials (only counts, kinds, and a file basename).
+fn spec_summary(spec: &ScanSpec, memory_limit_bytes: u64) -> String {
+    let path = if let Some(gks) = &spec.group_keys
+        && !gks.is_empty()
+    {
+        "GROUPED-partial-agg"
+    } else if spec.aggregates.is_some() {
+        "ungrouped-partial-agg"
+    } else {
+        "raw-row-stream"
+    };
+
+    let agg_kinds: Vec<String> = spec
+        .aggregates
+        .as_deref()
+        .map(|a| a.iter().map(|p| format!("{:?}", p.kind)).collect())
+        .unwrap_or_default();
+    let n_aggs = agg_kinds.len();
+    let n_group_keys = spec.group_keys.as_deref().map(|g| g.len()).unwrap_or(0);
+
+    // First-file basename fingerprint: identifies which shard this VM is, with
+    // no credentials (the file URI path component only).
+    let first_file_fp = spec
+        .files
+        .first()
+        .and_then(|f| f.rsplit('/').next())
+        .unwrap_or("<none>");
+
+    format!(
+        "SPEC SUMMARY path={path} projection_cols={proj} filter_present={filt} \
+         aggregates={n_aggs} agg_kinds=[{kinds}] group_keys={n_group_keys} \
+         assigned_files={files} first_file={first_file_fp} \
+         df_target_partitions={tp} df_threads_per_udf={th} df_batch_size={bs} \
+         memory_pool_fraction={frac} instance_overhead_mb={ovh} \
+         ctx_memory_limit_bytes={memory_limit_bytes}",
+        proj = spec.projection.len(),
+        filt = spec.filter.as_deref().is_some_and(|f| !f.is_empty()),
+        kinds = agg_kinds.join(","),
+        files = spec.files.len(),
+        tp = spec.df_target_partitions,
+        th = spec.df_threads_per_udf,
+        bs = spec.df_batch_size,
+        frac = spec.memory_pool_fraction,
+        ovh = spec.instance_overhead_mb,
+    )
+}
+
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
 ///
 /// Reads the scan spec from the first input column (VARCHAR JSON), builds a
 /// DataFusion session, scans the assigned files, and emits rows.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
+    // DIAGNOSTIC: install the process-wide panic hook before any DataFusion /
+    // Tokio worker thread is spawned, so a worker-thread panic (the suspected
+    // err_zombie crash that the entry-point catch_unwind never sees) is captured
+    // to stderr and /tmp/lakehouse_udf_panic.log. Idempotent; see diagnostics.rs.
+    diagnostics::install_panic_hook();
+
+    // DIAGNOSTIC (temporary): ENTER checkpoint — first line in the per-process
+    // debug file. Records the node IP (best-effort; connect-back may be absent)
+    // once at entry so we can attribute the file to a node after fetching from
+    // all nodes' COS /tmp. See diagnostics.rs for the file path/line format.
+    let node_ip = ctx
+        .cluster_ip()
+        .unwrap_or_else(|_| "<unavailable>".to_string());
+    diagnostics::debug_checkpoint(&format!("ENTER run_scan node_ip={node_ip}"));
+
     // Advance to the first (and only) input row.
     let has_row = ctx.next()?;
     if !has_row {
         // No input row — nothing to scan.
+        diagnostics::debug_checkpoint("EXIT run_scan ok (no input row)");
         return Ok(());
     }
 
@@ -82,26 +189,48 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // spec.df_threads_per_udf, so we must deserialize first.
     let spec = ScanSpec::from_json(spec_json).map_err(UdfError::User)?;
 
+    // DIAGNOSTIC (temporary): SPEC SUMMARY — which path this shard takes plus
+    // every knob that drives memory growth, including ctx.memory_limit() (the
+    // real per-instance limit byte value we never captured before).
+    diagnostics::debug_checkpoint(&spec_summary(&spec, ctx.memory_limit()));
+
     // Build the Tokio runtime according to the spec's thread configuration.
     // A fresh runtime per call is correct for a stateless disposable UDF.
     let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
+    // DIAGNOSTIC (temporary): the runtime is the first big allocation owner.
+    diagnostics::debug_checkpoint("runtime built");
 
-    rt.block_on(async { run_scan_async(ctx, &spec).await })
+    // Run on the runtime and tear it down deterministically. The implicit `drop(rt)`
+    // path raced object_store's detached hyper tasks at end-of-life and aborted the
+    // VM after the final flush (err_zombie, no panic text); `run_on_runtime` drives
+    // shutdown via `shutdown_timeout` from this synchronous context instead.
+    // run_scan_async returns a value owning no async resources (the SessionContext,
+    // streams, and object store are all dropped inside the future), satisfying
+    // run_on_runtime's contract.
+    run_on_runtime(rt, async { run_scan_async(ctx, &spec).await })
 }
 
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
     let session_ctx = build_session_context(spec, memory_limit_bytes)?;
+    // DIAGNOSTIC (temporary): session + memory pool now built.
+    diagnostics::debug_checkpoint("session built");
     if spec.aggregates.is_some() {
         run_partial_aggregate(ctx, &session_ctx, spec).await
     } else {
         let secrets = spec.storage.secret_values();
         let df = build_dataframe(&session_ctx, spec).await?;
+        // DIAGNOSTIC (temporary): logical plan / dataframe built (files registered).
+        diagnostics::debug_checkpoint("dataframe/plan built (raw-row path)");
         let stream = df
             .execute_stream()
             .await
             .map_err(|e| classify_scan_error(e, &secrets))?;
-        emit_stream(ctx, stream, &secrets).await?;
+        // DIAGNOSTIC (temporary): physical stream created; emit loop next.
+        diagnostics::debug_checkpoint("stream created (raw-row path)");
+        emit_stream(ctx, stream, &secrets, &spec.emit_exa_types).await?;
+        // DIAGNOSTIC (temporary): stream drained + final flush done by emit_stream.
+        diagnostics::debug_checkpoint("EXIT run_scan ok (raw-row path)");
         Ok(())
     }
 }
@@ -125,6 +254,9 @@ async fn run_partial_aggregate(
     {
         return run_grouped_partial_aggregate(ctx, session_ctx, spec).await;
     }
+
+    // DIAGNOSTIC (temporary): entered the ungrouped (single-group) partial-agg path.
+    diagnostics::debug_checkpoint("ENTER ungrouped partial-agg");
 
     let secrets = spec.storage.secret_values();
     let aggregates = spec
@@ -151,11 +283,18 @@ async fn run_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("partial aggregate SQL error: {e}")))?;
 
+    // DIAGNOSTIC (temporary): ungrouped aggregate plan built; collect (the whole
+    // single-group aggregation) runs next — this is where memory accumulates.
+    diagnostics::debug_checkpoint("ungrouped agg plan built; collect start");
+
     // Execute and collect the single partial-aggregate row.
     let batches = df
         .collect()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
+
+    // DIAGNOSTIC (temporary): aggregation collected (one partial row).
+    diagnostics::debug_checkpoint("ungrouped agg collected");
 
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
@@ -174,6 +313,8 @@ async fn run_partial_aggregate(
     };
 
     ctx.emit(&row)?;
+    // DIAGNOSTIC (temporary): ungrouped partial-agg emitted its single row.
+    diagnostics::debug_checkpoint("EXIT ungrouped partial-agg ok");
     Ok(())
 }
 
@@ -197,6 +338,10 @@ async fn run_grouped_partial_aggregate(
     session_ctx: &SessionContext,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
+    // DIAGNOSTIC (temporary): entered the GROUPED partial-agg path (the
+    // node-local HashAggregate that grows with group cardinality).
+    diagnostics::debug_checkpoint("ENTER grouped partial-agg");
+
     let secrets = spec.storage.secret_values();
     let group_keys = spec
         .group_keys
@@ -232,13 +377,25 @@ async fn run_grouped_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("grouped partial aggregate SQL error: {e}")))?;
 
+    // DIAGNOSTIC (temporary): grouped aggregate plan built; stream next.
+    diagnostics::debug_checkpoint("grouped agg plan built");
+
     // Stream result batches — fetch one RecordBatch at a time, convert → emit → drop.
     let mut stream = df
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
+    // DIAGNOSTIC (temporary): grouped agg physical stream created; emit loop next.
+    diagnostics::debug_checkpoint("grouped agg stream created");
+
     let n_group_keys = group_keys.len();
+
+    // DIAGNOSTIC (temporary): per-batch trail (every N batches) over the grouped
+    // result — climbing RSS here indicates the HashAggregate grouping state grows.
+    const DIAG_BATCH_INTERVAL: u64 = 32;
+    let mut batch_no: u64 = 0;
+    let mut rows_emitted: u64 = 0;
 
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
@@ -262,10 +419,24 @@ async fn run_grouped_partial_aggregate(
             }
 
             ctx.emit(&row_values)?;
+            rows_emitted += 1;
         }
         // Drop the batch before fetching the next — never hold two batches at once.
         drop(batch);
+
+        // DIAGNOSTIC (temporary): coarse per-batch trail (every N batches).
+        batch_no += 1;
+        if batch_no.is_multiple_of(DIAG_BATCH_INTERVAL) {
+            diagnostics::debug_set_rows(rows_emitted);
+            diagnostics::debug_checkpoint(&format!("batch #{batch_no} (grouped agg path)"));
+        }
     }
+
+    // DIAGNOSTIC (temporary): grouped agg stream exhausted; partial rows emitted.
+    diagnostics::debug_set_rows(rows_emitted);
+    diagnostics::debug_checkpoint(&format!(
+        "EXIT grouped partial-agg ok total_batches={batch_no} groups_emitted={rows_emitted}"
+    ));
 
     Ok(())
 }
@@ -742,6 +913,7 @@ mod tests {
             limit: None,
             aggregates: None,
             group_keys: None,
+            emit_exa_types: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -1241,6 +1413,67 @@ mod tests {
             tokio::runtime::RuntimeFlavor::MultiThread,
             "df_threads_per_udf > 1 must yield a multi-thread runtime"
         );
+    }
+
+    /// Teardown regression: a multi-thread runtime that still has detached
+    /// background tasks live when `block_on` returns must be torn down
+    /// deterministically, not by an implicit `Drop` that races those tasks.
+    ///
+    /// This reproduces the *mechanism* of the live `err_zombie` VM abort: the scan
+    /// future completes and returns its result while object_store's hyper client
+    /// (modeled here by a spawned task parked past the future's return) is still
+    /// alive. The fix is `run_on_runtime`, which drives the runtime down via
+    /// `shutdown_timeout` from the synchronous context. The invariants:
+    ///   1. the future's result is returned intact (work completed before teardown);
+    ///   2. `run_on_runtime` returns within the grace window (it drains/cancels the
+    ///      detached task rather than blocking forever or aborting);
+    ///   3. control reaches the assertions — a raced teardown abort would have
+    ///      killed the test process before this point.
+    ///
+    /// A real VM-process abort cannot be reproduced on the host (it needs Exasol's
+    /// VM teardown), so this asserts the deterministic-shutdown seam the abort-free
+    /// fix depends on; the live bench is the end-to-end arbiter.
+    #[test]
+    fn run_on_runtime_tears_down_multi_thread_runtime_with_live_background_task() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let rt = build_scan_runtime(2).expect("multi-thread runtime must build");
+        let parked_started = Arc::new(AtomicBool::new(false));
+        let started_in_future = parked_started.clone();
+
+        let before = std::time::Instant::now();
+        let result = run_on_runtime(rt, async move {
+            // Spawn a detached task that outlives the future's return — the
+            // host analog of hyper's connection-pool/reaper tasks that object_store
+            // keeps alive past the last poll of the scan stream.
+            tokio::spawn(async move {
+                started_in_future.store(true, Ordering::SeqCst);
+                // Park far longer than the grace window; shutdown must cancel it.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            });
+            // Let the detached task reach its park point before returning, so the
+            // runtime genuinely has live background work at teardown time.
+            tokio::task::yield_now().await;
+            42_u32
+        });
+        let elapsed = before.elapsed();
+
+        // 1. The future's result survives the explicit teardown.
+        assert_eq!(result, 42, "future result must be returned before teardown");
+        // 2. Teardown is bounded — it returns near-immediately (the detached task
+        //    is cancelled), never blocking on the 3600s park.
+        assert!(
+            elapsed < RUNTIME_SHUTDOWN_GRACE + std::time::Duration::from_secs(2),
+            "run_on_runtime must return within the bounded grace window, took {elapsed:?}"
+        );
+        // 3. The detached task was genuinely live (otherwise the test proves nothing).
+        assert!(
+            parked_started.load(Ordering::SeqCst),
+            "the detached background task must have started before teardown"
+        );
+        // Reaching here without a process abort is the core assertion: deterministic
+        // shutdown replaced the racy implicit drop.
     }
 
     /// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.

@@ -96,6 +96,9 @@ TPCH_SCALE="${TPCH_SCALE:-0.3}"
 SLC_VERSION="${BENCH_SLC_VERSION:-0.16.0}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
 # BucketFS object path for the .so, as referenced by %udf_object in CREATE SCRIPT.
 SO_UDF_OBJECT="${BENCH_SO_UDF_OBJECT:-buckets/bfsdefault/default/udf/liblakehouse_engine.so}"
+# Debug level forwarded to the UDF via %udf_debug_level (0.19.0+ live debug surface).
+# Valid values: debug|info|warn|error. Default: info (low-noise; set to debug for traces).
+UDF_DEBUG_LEVEL="${LAKEHOUSE_UDF_DEBUG_LEVEL:-info}"
 # BucketFS path of the EXTRACTED SLC dir (the RUST language alias points inside it,
 # at <SLC_BUCKET_PATH>/exaudf/exaudfclient). A foo.tar.gz upload extracts to foo, so
 # set this to bfsdefault/<bucket>/<archive-name-without-.tar.gz>.
@@ -212,10 +215,12 @@ echo "== creating schema, scripts, connection, VS '${VS}' =="
 sql "CREATE SCHEMA IF NOT EXISTS ${SCHEMA}"
 sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
+%udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 sql "CREATE OR REPLACE RUST SET SCRIPT ${SCHEMA}.${SCAN}(spec VARCHAR(2000000))
 EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
+%udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' IDENTIFIED BY '${CONN_PW}'"
 sql "DROP VIRTUAL SCHEMA IF EXISTS ${VS} CASCADE" || true

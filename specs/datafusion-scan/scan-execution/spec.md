@@ -77,6 +77,17 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 * *THEN* the UDF SHALL return an error identifying that the assigned data could not be read
 * *AND* the error message MUST NOT contain storage access keys or secret keys
 
+### Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
+
+* *GIVEN* a scan spec carrying `emit_exa_types` (the declared Exasol EMITS type string per output column, positionally aligned)
+* *AND* a result Arrow batch whose column types diverge from those declarations (e.g. an `Int32` column declared `DECIMAL(10,0)`, a `Utf8View` column declared `VARCHAR`, or a `Decimal128(10,0)` column declared `DECIMAL(10,0)`)
+* *WHEN* the scan UDF processes the batch
+* *THEN* the UDF SHALL coerce each output column to the Arrow type that `emit_batch`'s strict IPC feed requires for its declared ExaType, before passing the batch to `emit_batch`
+* *AND* the coercion SHALL reproduce Exasol's DECIMAL precision binning: scale-0 precision ≤ 9 → `Int32`; scale-0 precision ≤ 18 → `Int64`; scale > 0 or precision 19..=36 → `Decimal128(p,s)`
+* *AND* string-family declarations (`VARCHAR`, `CHAR`) SHALL coerce the column to `Utf8`, subsuming `Utf8View`/`BinaryView` view-type normalization
+* *AND* a column already of the correct Arrow type SHALL be passed through unchanged (zero-copy fast path)
+* *AND* when `emit_exa_types` is absent or shorter than the column count (specs that predate this field), unmatched columns SHALL fall back to view-type normalization only (`Utf8View` → `Utf8`, `BinaryView` → `Binary`)
+
 ### Scenario: Scan surfaces a clean memory-exhaustion error instead of crashing the VM
 
 * *GIVEN* a scan whose execution exhausts the configured DataFusion memory pool (a `ResourcesExhausted` condition) on a node whose `/tmp` is not spill-capable disk
