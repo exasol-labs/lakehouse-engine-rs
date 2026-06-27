@@ -2,7 +2,6 @@
 /// DataFusion SessionContext, registers ONLY the assigned files over MinIO,
 /// applies projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
-pub mod diagnostics;
 pub mod emit;
 pub mod runtime;
 pub mod spec;
@@ -98,86 +97,15 @@ fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .with_batch_size(spec.df_batch_size.max(1))
 }
 
-/// DIAGNOSTIC (temporary): one-line summary of the scan spec's shape and every
-/// knob that drives per-instance memory growth, for the SPEC SUMMARY checkpoint.
-///
-/// Reports the execution PATH (raw-row stream / ungrouped partial-agg / GROUPED
-/// partial-agg), projection column count, whether a filter is present, the
-/// aggregate and group-key counts and kinds, assigned file count plus a short
-/// fingerprint (first file basename) so we can tell WHICH shard's VM died, and
-/// the DataFusion sizing knobs including the real `ctx.memory_limit()` byte
-/// value. Carries no credentials (only counts, kinds, and a file basename).
-fn spec_summary(spec: &ScanSpec, memory_limit_bytes: u64) -> String {
-    let path = if let Some(gks) = &spec.group_keys
-        && !gks.is_empty()
-    {
-        "GROUPED-partial-agg"
-    } else if spec.aggregates.is_some() {
-        "ungrouped-partial-agg"
-    } else {
-        "raw-row-stream"
-    };
-
-    let agg_kinds: Vec<String> = spec
-        .aggregates
-        .as_deref()
-        .map(|a| a.iter().map(|p| format!("{:?}", p.kind)).collect())
-        .unwrap_or_default();
-    let n_aggs = agg_kinds.len();
-    let n_group_keys = spec.group_keys.as_deref().map(|g| g.len()).unwrap_or(0);
-
-    // First-file basename fingerprint: identifies which shard this VM is, with
-    // no credentials (the file URI path component only).
-    let first_file_fp = spec
-        .files
-        .first()
-        .and_then(|f| f.rsplit('/').next())
-        .unwrap_or("<none>");
-
-    format!(
-        "SPEC SUMMARY path={path} projection_cols={proj} filter_present={filt} \
-         aggregates={n_aggs} agg_kinds=[{kinds}] group_keys={n_group_keys} \
-         assigned_files={files} first_file={first_file_fp} \
-         df_target_partitions={tp} df_threads_per_udf={th} df_batch_size={bs} \
-         memory_pool_fraction={frac} instance_overhead_mb={ovh} \
-         ctx_memory_limit_bytes={memory_limit_bytes}",
-        proj = spec.projection.len(),
-        filt = spec.filter.as_deref().is_some_and(|f| !f.is_empty()),
-        kinds = agg_kinds.join(","),
-        files = spec.files.len(),
-        tp = spec.df_target_partitions,
-        th = spec.df_threads_per_udf,
-        bs = spec.df_batch_size,
-        frac = spec.memory_pool_fraction,
-        ovh = spec.instance_overhead_mb,
-    )
-}
-
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
 ///
 /// Reads the scan spec from the first input column (VARCHAR JSON), builds a
 /// DataFusion session, scans the assigned files, and emits rows.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
-    // DIAGNOSTIC: install the process-wide panic hook before any DataFusion /
-    // Tokio worker thread is spawned, so a worker-thread panic (the suspected
-    // err_zombie crash that the entry-point catch_unwind never sees) is captured
-    // to stderr and /tmp/lakehouse_udf_panic.log. Idempotent; see diagnostics.rs.
-    diagnostics::install_panic_hook();
-
-    // DIAGNOSTIC (temporary): ENTER checkpoint — first line in the per-process
-    // debug file. Records the node IP (best-effort; connect-back may be absent)
-    // once at entry so we can attribute the file to a node after fetching from
-    // all nodes' COS /tmp. See diagnostics.rs for the file path/line format.
-    let node_ip = ctx
-        .cluster_ip()
-        .unwrap_or_else(|_| "<unavailable>".to_string());
-    diagnostics::debug_checkpoint(&format!("ENTER run_scan node_ip={node_ip}"));
-
     // Advance to the first (and only) input row.
     let has_row = ctx.next()?;
     if !has_row {
         // No input row — nothing to scan.
-        diagnostics::debug_checkpoint("EXIT run_scan ok (no input row)");
         return Ok(());
     }
 
@@ -189,16 +117,9 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // spec.df_threads_per_udf, so we must deserialize first.
     let spec = ScanSpec::from_json(spec_json).map_err(UdfError::User)?;
 
-    // DIAGNOSTIC (temporary): SPEC SUMMARY — which path this shard takes plus
-    // every knob that drives memory growth, including ctx.memory_limit() (the
-    // real per-instance limit byte value we never captured before).
-    diagnostics::debug_checkpoint(&spec_summary(&spec, ctx.memory_limit()));
-
     // Build the Tokio runtime according to the spec's thread configuration.
     // A fresh runtime per call is correct for a stateless disposable UDF.
     let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
-    // DIAGNOSTIC (temporary): the runtime is the first big allocation owner.
-    diagnostics::debug_checkpoint("runtime built");
 
     // Run on the runtime and tear it down deterministically. The implicit `drop(rt)`
     // path raced object_store's detached hyper tasks at end-of-life and aborted the
@@ -213,24 +134,16 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
     let session_ctx = build_session_context(spec, memory_limit_bytes)?;
-    // DIAGNOSTIC (temporary): session + memory pool now built.
-    diagnostics::debug_checkpoint("session built");
     if spec.aggregates.is_some() {
         run_partial_aggregate(ctx, &session_ctx, spec).await
     } else {
         let secrets = spec.storage.secret_values();
         let df = build_dataframe(&session_ctx, spec).await?;
-        // DIAGNOSTIC (temporary): logical plan / dataframe built (files registered).
-        diagnostics::debug_checkpoint("dataframe/plan built (raw-row path)");
         let stream = df
             .execute_stream()
             .await
             .map_err(|e| classify_scan_error(e, &secrets))?;
-        // DIAGNOSTIC (temporary): physical stream created; emit loop next.
-        diagnostics::debug_checkpoint("stream created (raw-row path)");
         emit_stream(ctx, stream, &secrets, &spec.emit_exa_types).await?;
-        // DIAGNOSTIC (temporary): stream drained + final flush done by emit_stream.
-        diagnostics::debug_checkpoint("EXIT run_scan ok (raw-row path)");
         Ok(())
     }
 }
@@ -254,9 +167,6 @@ async fn run_partial_aggregate(
     {
         return run_grouped_partial_aggregate(ctx, session_ctx, spec).await;
     }
-
-    // DIAGNOSTIC (temporary): entered the ungrouped (single-group) partial-agg path.
-    diagnostics::debug_checkpoint("ENTER ungrouped partial-agg");
 
     let secrets = spec.storage.secret_values();
     let aggregates = spec
@@ -283,18 +193,11 @@ async fn run_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("partial aggregate SQL error: {e}")))?;
 
-    // DIAGNOSTIC (temporary): ungrouped aggregate plan built; collect (the whole
-    // single-group aggregation) runs next — this is where memory accumulates.
-    diagnostics::debug_checkpoint("ungrouped agg plan built; collect start");
-
     // Execute and collect the single partial-aggregate row.
     let batches = df
         .collect()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
-
-    // DIAGNOSTIC (temporary): aggregation collected (one partial row).
-    diagnostics::debug_checkpoint("ungrouped agg collected");
 
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
@@ -313,8 +216,6 @@ async fn run_partial_aggregate(
     };
 
     ctx.emit(&row)?;
-    // DIAGNOSTIC (temporary): ungrouped partial-agg emitted its single row.
-    diagnostics::debug_checkpoint("EXIT ungrouped partial-agg ok");
     Ok(())
 }
 
@@ -338,10 +239,6 @@ async fn run_grouped_partial_aggregate(
     session_ctx: &SessionContext,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
-    // DIAGNOSTIC (temporary): entered the GROUPED partial-agg path (the
-    // node-local HashAggregate that grows with group cardinality).
-    diagnostics::debug_checkpoint("ENTER grouped partial-agg");
-
     let secrets = spec.storage.secret_values();
     let group_keys = spec
         .group_keys
@@ -377,25 +274,13 @@ async fn run_grouped_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("grouped partial aggregate SQL error: {e}")))?;
 
-    // DIAGNOSTIC (temporary): grouped aggregate plan built; stream next.
-    diagnostics::debug_checkpoint("grouped agg plan built");
-
     // Stream result batches — fetch one RecordBatch at a time, convert → emit → drop.
     let mut stream = df
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
-    // DIAGNOSTIC (temporary): grouped agg physical stream created; emit loop next.
-    diagnostics::debug_checkpoint("grouped agg stream created");
-
     let n_group_keys = group_keys.len();
-
-    // DIAGNOSTIC (temporary): per-batch trail (every N batches) over the grouped
-    // result — climbing RSS here indicates the HashAggregate grouping state grows.
-    const DIAG_BATCH_INTERVAL: u64 = 32;
-    let mut batch_no: u64 = 0;
-    let mut rows_emitted: u64 = 0;
 
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
@@ -419,24 +304,10 @@ async fn run_grouped_partial_aggregate(
             }
 
             ctx.emit(&row_values)?;
-            rows_emitted += 1;
         }
         // Drop the batch before fetching the next — never hold two batches at once.
         drop(batch);
-
-        // DIAGNOSTIC (temporary): coarse per-batch trail (every N batches).
-        batch_no += 1;
-        if batch_no.is_multiple_of(DIAG_BATCH_INTERVAL) {
-            diagnostics::debug_set_rows(rows_emitted);
-            diagnostics::debug_checkpoint(&format!("batch #{batch_no} (grouped agg path)"));
-        }
     }
-
-    // DIAGNOSTIC (temporary): grouped agg stream exhausted; partial rows emitted.
-    diagnostics::debug_set_rows(rows_emitted);
-    diagnostics::debug_checkpoint(&format!(
-        "EXIT grouped partial-agg ok total_batches={batch_no} groups_emitted={rows_emitted}"
-    ));
 
     Ok(())
 }
