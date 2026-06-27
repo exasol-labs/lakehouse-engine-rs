@@ -838,7 +838,7 @@ The raw-row scan path previously converted each `RecordBatch` to a `Vec<Value>` 
 
 ### Decision
 
-Emit each `RecordBatch` via the SDK's `EmitBatch` API (the `emit-arrow` feature, SDK 0.18.0), which serializes the batch to Arrow IPC bytes internally. Only IPC bytes cross the `.so` boundary; no typed Arrow objects and no `Vec<Value>` intermediate are present on the raw-row path. Each batch is fetched, emitted, and dropped before the next is fetched.
+Emit each `RecordBatch` via the SDK's `EmitBatch` API (the `emit-arrow` feature, SDK 0.19.0), which serializes the batch to Arrow IPC bytes internally. Only IPC bytes cross the `.so` boundary; no typed Arrow objects and no `Vec<Value>` intermediate are present on the raw-row path. Each batch is fetched, emitted, and dropped before the next is fetched. (The migration landed on 0.19.0, which also introduced the live debug surface; the plan was drafted against 0.18.0 docs.)
 
 ### Options Considered
 
