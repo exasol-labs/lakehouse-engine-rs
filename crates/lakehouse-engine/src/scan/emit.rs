@@ -38,11 +38,6 @@ pub async fn emit_stream(
     exa_types: &[String],
 ) -> Result<u64, UdfError> {
     let mut total: u64 = 0;
-    // DIAGNOSTIC (temporary): per-batch checkpoint cadence. Every N batches we
-    // log cumulative rows + RSS so the trail reveals streaming (flat RSS) vs
-    // accumulation (climbing RSS). N keeps overhead modest on 60M-row scans.
-    const DIAG_BATCH_INTERVAL: u64 = 32;
-    let mut batch_no: u64 = 0;
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, secrets))?;
         // Coerce each column to the Arrow type its declared EMITS ExaType accepts,
@@ -54,23 +49,7 @@ pub async fn emit_stream(
         total += batch.num_rows() as u64;
         ctx.emit_batch(&batch)?;
         drop(batch);
-
-        // DIAGNOSTIC (temporary): coarse per-batch trail (every N batches).
-        batch_no += 1;
-        if batch_no.is_multiple_of(DIAG_BATCH_INTERVAL) {
-            crate::scan::diagnostics::debug_set_rows(total);
-            crate::scan::diagnostics::debug_checkpoint(&format!(
-                "batch #{batch_no} (raw-row path)"
-            ));
-        }
     }
-    // DIAGNOSTIC (temporary): stream exhausted; emit_batch's 4M-byte buffer is
-    // flushed by the SDK at end of run(), so RSS here is the high-water mark of
-    // the streaming path.
-    crate::scan::diagnostics::debug_set_rows(total);
-    crate::scan::diagnostics::debug_checkpoint(&format!(
-        "stream exhausted (raw-row path) total_batches={batch_no}"
-    ));
     Ok(total)
 }
 
