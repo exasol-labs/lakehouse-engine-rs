@@ -67,9 +67,15 @@ const PROP_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property names for DataFusion per-instance thread configuration.
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
 const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
+// VS/connection property selecting how the DataFusion thread/partition budget is
+// derived: AUTO (adapter derives a non-oversubscribing per-instance budget) or
+// FIXED (operator-supplied values used verbatim). Default AUTO. Case-insensitive.
+const PROP_DF_THREADING_MODE: &str = "DATAFUSION_THREADING_MODE";
 // adapterNotes keys for the DataFusion thread configuration.
 const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
 const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
+// adapterNotes key recording the resolved threading mode (AUTO|FIXED).
+const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
 /// Pushdown-path fallback for `target_partitions` when the adapterNote is absent or
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
 /// `resolve_df_target_partitions`.)
@@ -176,8 +182,16 @@ fn handle_create_virtual_schema(
 
     let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(ctx, &props);
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
-    let df_target_partitions = resolve_df_target_partitions(&props, nr_of_cores);
-    let df_threads_per_udf = resolve_df_threads_per_udf(&props, nr_of_cores);
+    // At createVirtualSchema the file list is not yet known, so the per-node UDF
+    // instance share cannot use the file-count clamp. Before that clamp,
+    // G = node_count × parallelism_factor distributes round-robin, so the per-node
+    // share is exactly `parallelism_factor`. Using the un-clamped factor is the
+    // conservative choice for AUTO derivation: it assumes the maximal per-node
+    // fan-out, so the derived thread budget never oversubscribes a node even when
+    // the shard fan-out reaches its configured maximum.
+    let df_threading_mode = resolve_threading_mode(&props);
+    let (df_target_partitions, df_threads_per_udf) =
+        resolve_df_threading(df_threading_mode, &props, nr_of_cores, parallelism_factor);
     let df_batch_size = resolve_df_batch_size(&props);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
@@ -230,6 +244,7 @@ fn handle_create_virtual_schema(
         cluster_nodes,
         nr_of_cores,
         parallelism_factor,
+        df_threading_mode,
         df_target_partitions,
         df_threads_per_udf,
         df_batch_size,
@@ -453,6 +468,7 @@ fn build_adapter_notes(
     cluster_nodes: u32,
     nr_of_cores: u32,
     parallelism_factor: usize,
+    df_threading_mode: ThreadingMode,
     df_target_partitions: usize,
     df_threads_per_udf: usize,
     df_batch_size: usize,
@@ -472,6 +488,10 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_PARALLELISM_FACTOR.to_string(),
         Json::String(parallelism_factor.to_string()),
+    );
+    notes.insert(
+        NOTE_DF_THREADING_MODE.to_string(),
+        Json::String(df_threading_mode.as_note().to_string()),
     );
     notes.insert(
         NOTE_DF_TARGET_PARTITIONS.to_string(),
@@ -513,6 +533,81 @@ fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
+}
+
+/// How the DataFusion per-instance thread/partition budget is derived.
+///
+/// `Auto` lets the adapter compute a non-oversubscribing budget from the node's
+/// core count and the per-node UDF-instance share; `Fixed` uses operator-supplied
+/// property values verbatim (the pre-mode behaviour). The mode is a planning-time
+/// concept resolved at `createVirtualSchema`; only the resulting integers reach
+/// the scan UDF, which stays mode-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadingMode {
+    Auto,
+    Fixed,
+}
+
+impl ThreadingMode {
+    /// The adapterNotes string form (`AUTO` / `FIXED`).
+    fn as_note(self) -> &'static str {
+        match self {
+            ThreadingMode::Auto => "AUTO",
+            ThreadingMode::Fixed => "FIXED",
+        }
+    }
+}
+
+/// Resolve the DATAFUSION_THREADING_MODE VS property.
+///
+/// Parses `AUTO` / `FIXED` case-insensitively. An absent, empty, or unrecognized
+/// value resolves to `Auto`.
+fn resolve_threading_mode(props: &Json) -> ThreadingMode {
+    match str_prop(props, PROP_DF_THREADING_MODE) {
+        Some(s) if s.eq_ignore_ascii_case("FIXED") => ThreadingMode::Fixed,
+        _ => ThreadingMode::Auto,
+    }
+}
+
+/// Resolve the `(df_target_partitions, df_threads_per_udf)` pair for the selected
+/// threading mode.
+///
+/// In `Fixed` mode each field is the supplied property when it is a positive
+/// integer, else `max(nr_of_cores, 1)` (the pre-mode behaviour). In `Auto` mode
+/// the adapter derives a per-instance thread budget that does not oversubscribe a
+/// node — `threads = max(1, floor(nr_of_cores / udf_instances_per_node))` — and
+/// holds the target partition count in lockstep with it, ignoring any supplied
+/// `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF` values. When
+/// `nr_of_cores` is `0` (unknown) both fields are `1`.
+fn resolve_df_threading(
+    mode: ThreadingMode,
+    props: &Json,
+    nr_of_cores: u32,
+    udf_instances_per_node: usize,
+) -> (usize, usize) {
+    match mode {
+        ThreadingMode::Fixed => (
+            resolve_df_target_partitions(props, nr_of_cores),
+            resolve_df_threads_per_udf(props, nr_of_cores),
+        ),
+        ThreadingMode::Auto => {
+            let threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
+            (threads, threads)
+        }
+    }
+}
+
+/// Derive the AUTO-mode per-instance thread budget.
+///
+/// `max(1, floor(nr_of_cores / udf_instances_per_node))`, with `0` cores (unknown)
+/// yielding `1`. The floor guarantees the non-oversubscription invariant
+/// `udf_instances_per_node × threads ≤ nr_of_cores` whenever the node has at least
+/// as many cores as instances; when instances exceed cores the `max(1, …)` floor
+/// keeps each instance single-threaded (the engine multiplexes the surplus
+/// instances onto the core pool).
+fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usize {
+    let instances = udf_instances_per_node.max(1);
+    ((nr_of_cores as usize) / instances).max(1)
 }
 
 /// Read and validate the DATAFUSION_TARGET_PARTITIONS VS property.
@@ -835,6 +930,7 @@ mod tests {
             cluster_nodes,
             nr_of_cores,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -881,6 +977,7 @@ mod tests {
             4,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -941,6 +1038,7 @@ mod tests {
             3,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -979,6 +1077,7 @@ mod tests {
             2,
             16,
             factor,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1023,6 +1122,7 @@ mod tests {
             6,
             0,
             12,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1062,6 +1162,7 @@ mod tests {
             2,
             16,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1170,6 +1271,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             val,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1221,6 +1323,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             val,
@@ -1270,6 +1373,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             val,
             DEFAULT_DF_BATCH_SIZE,
@@ -1396,6 +1500,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1570,6 +1675,145 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Task 1 — Threading mode AUTO/FIXED tests
+    // ---------------------------------------------------------------------------
+
+    /// 1.1 — DATAFUSION_THREADING_MODE parses case-insensitively; absent / empty /
+    /// unrecognized values resolve to AUTO.
+    #[test]
+    fn threading_mode_parses_case_insensitively() {
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "fixed" })),
+            ThreadingMode::Fixed,
+            "lowercase 'fixed' must parse to Fixed"
+        );
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "FiXeD" })),
+            ThreadingMode::Fixed,
+            "mixed-case 'FiXeD' must parse to Fixed"
+        );
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "AUTO" })),
+            ThreadingMode::Auto,
+            "'AUTO' must parse to Auto"
+        );
+    }
+
+    /// 1.5 — Threading mode defaults to AUTO when the property is absent, empty,
+    /// or holds an unrecognized value; the resolved mode is recorded in adapterNotes.
+    #[test]
+    fn threading_mode_defaults_to_auto() {
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({})),
+            ThreadingMode::Auto,
+            "absent property → Auto"
+        );
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "" })),
+            ThreadingMode::Auto,
+            "empty property → Auto"
+        );
+        assert_eq!(
+            resolve_threading_mode(&serde_json::json!({ PROP_DF_THREADING_MODE: "garbage" })),
+            ThreadingMode::Auto,
+            "unrecognized value → Auto"
+        );
+
+        // The resolved AUTO mode is recorded in adapterNotes.
+        let req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            &[],
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert_eq!(
+            parsed[NOTE_DF_THREADING_MODE].as_str(),
+            Some("AUTO"),
+            "DF_THREADING_MODE: AUTO must be recorded in adapterNotes"
+        );
+    }
+
+    /// 1.5 — AUTO mode derives a per-instance thread budget that does not
+    /// oversubscribe a node: instances × threads ≤ NR_OF_CORES, with target
+    /// partitions held in lockstep with threads.
+    #[test]
+    fn auto_mode_derives_non_oversubscribing_threads() {
+        // 16 cores, parallelism_factor (= udf_instances_per_node) = 4 → 16/4 = 4.
+        let (target_partitions, threads) =
+            resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 16, 4);
+        assert_eq!(threads, 4, "16 cores / 4 instances → 4 threads");
+        assert_eq!(
+            target_partitions, threads,
+            "target_partitions must equal threads (lockstep)"
+        );
+        // The oversubscription invariant must hold explicitly.
+        assert!(
+            4 * threads <= 16,
+            "udf_instances_per_node × threads must not exceed NR_OF_CORES"
+        );
+
+        // Non-divisible case: 10 cores / 3 instances → floor(10/3) = 3; 3×3=9 ≤ 10.
+        let (tp, th) = resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 10, 3);
+        assert_eq!(th, 3, "floor(10/3) = 3");
+        assert_eq!(tp, th, "lockstep");
+        assert!(3 * th <= 10, "invariant: 3 × 3 = 9 ≤ 10");
+
+        // A supplied DATAFUSION_TARGET_PARTITIONS is ignored in AUTO mode.
+        let (tp_ignored, th_ignored) = resolve_df_threading(
+            ThreadingMode::Auto,
+            &serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "99", PROP_DF_THREADS_PER_UDF: "99" }),
+            16,
+            4,
+        );
+        assert_eq!(th_ignored, 4, "AUTO ignores supplied threads");
+        assert_eq!(tp_ignored, 4, "AUTO ignores supplied target partitions");
+    }
+
+    /// 1.5 — AUTO mode falls back to a single thread / partition when the core
+    /// count is unknown (NR_OF_CORES = 0).
+    #[test]
+    fn auto_mode_falls_back_to_one_when_cores_zero() {
+        let (target_partitions, threads) =
+            resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 0, 8);
+        assert_eq!(threads, 1, "cores=0 → 1 thread");
+        assert_eq!(target_partitions, 1, "cores=0 → 1 target partition");
+    }
+
+    /// 1.5 — FIXED mode uses the operator-supplied values verbatim; absent or
+    /// non-positive values fall back to max(NR_OF_CORES, 1) per field.
+    #[test]
+    fn fixed_mode_uses_supplied_values() {
+        // Explicit positive values are used verbatim, regardless of cores.
+        let props = serde_json::json!({
+            PROP_DF_TARGET_PARTITIONS: "3",
+            PROP_DF_THREADS_PER_UDF: "2",
+        });
+        let (tp, th) = resolve_df_threading(ThreadingMode::Fixed, &props, 16, 4);
+        assert_eq!(tp, 3, "FIXED uses supplied target partitions verbatim");
+        assert_eq!(th, 2, "FIXED uses supplied threads verbatim");
+
+        // Absent values fall back to max(NR_OF_CORES, 1) — the pre-mode behaviour.
+        let (tp_d, th_d) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8, 4);
+        assert_eq!(tp_d, 8, "absent target partitions → max(cores,1) = 8");
+        assert_eq!(th_d, 8, "absent threads → max(cores,1) = 8");
+
+        // Unknown cores → 1.
+        let (tp_z, th_z) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 0, 4);
+        assert_eq!(tp_z, 1, "absent target partitions, cores=0 → 1");
+        assert_eq!(th_z, 1, "absent threads, cores=0 → 1");
+    }
+
+    // ---------------------------------------------------------------------------
     // TABLE_MAP round-trip, pushdown table derivation, and collision tests.
     // ---------------------------------------------------------------------------
 
@@ -1589,6 +1833,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1626,6 +1871,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1662,6 +1908,7 @@ mod tests {
             5,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1706,6 +1953,7 @@ mod tests {
             1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,
@@ -1841,6 +2089,7 @@ mod tests {
             3,
             0,
             DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
             DEFAULT_DF_TARGET_PARTITIONS,
             DEFAULT_DF_THREADS_PER_UDF,
             DEFAULT_DF_BATCH_SIZE,

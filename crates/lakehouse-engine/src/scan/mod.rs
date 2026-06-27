@@ -2,6 +2,7 @@
 /// DataFusion SessionContext, registers ONLY the assigned files over MinIO,
 /// applies projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
+pub mod diagnostics;
 pub mod emit;
 pub mod runtime;
 pub mod spec;
@@ -19,6 +20,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::udf_log;
 use exasol_udf_sdk::value::Value;
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -90,11 +92,23 @@ fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String>
 /// and `batch_size` from `spec.df_batch_size` (clamped to ≥1).
 /// With the default of 1 partition and a current-thread Tokio runtime, each UDF
 /// instance uses exactly one core; cluster-level shard fan-out provides all parallelism.
-fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
+///
+/// Parquet pruning is enabled explicitly rather than left to the DataFusion
+/// defaults: row-group statistics pruning (`pruning`) and page-index pruning
+/// (`enable_page_index`) default on, but predicate pushdown into the decode
+/// (`pushdown_filters`) defaults OFF — so a pushed-down filter would not skip
+/// rows during decode unless we turn it on. These compose with the Iceberg
+/// file-level pruning the planning layer already applies: Iceberg drops whole
+/// files, the Parquet reader then drops row groups and pages within survivors.
+/// Pruning narrows what is read; it never changes the result set.
+pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(spec.df_target_partitions.max(1))
         .with_batch_size(spec.df_batch_size.max(1))
+        .with_parquet_pruning(true)
+        .with_parquet_page_index_pruning(true)
+        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
 }
 
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
@@ -132,20 +146,64 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 }
 
 async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
+    // Phase telemetry (Task 4): the startup clock starts at scan-body entry and
+    // is sealed at the first batch fetch inside emit_stream. Always measured
+    // (monotonic-clock arithmetic is cheap); emission is gated on the debug
+    // level so production at the default `info` level stays silent.
+    let mut timers = diagnostics::PhaseTimers::start();
+
     let memory_limit_bytes = ctx.memory_limit();
     let session_ctx = build_session_context(spec, memory_limit_bytes)?;
     if spec.aggregates.is_some() {
+        // Partial-aggregate paths emit a single summary row; phase telemetry
+        // targets the raw-row streaming path where startup / import / send-back
+        // are the throughput question. Leave the aggregate path unchanged.
         run_partial_aggregate(ctx, &session_ctx, spec).await
     } else {
-        let secrets = spec.storage.secret_values();
-        let df = build_dataframe(&session_ctx, spec).await?;
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| classify_scan_error(e, &secrets))?;
-        emit_stream(ctx, stream, &secrets, &spec.emit_exa_types).await?;
-        Ok(())
+        run_raw_scan_with_session(ctx, &session_ctx, spec, &mut timers).await
     }
+}
+
+/// Stream the raw-row scan over an already-built session and emit phase telemetry.
+///
+/// Registers the assigned files as `scan_target`, builds the projection/filter/
+/// LIMIT DataFrame, executes it, and streams batches through [`emit_stream`]
+/// (one fetched, emitted, dropped before the next). On completion it emits the
+/// single gated per-VM phase-telemetry record. Exposed so a host integration
+/// test can drive the exact production streaming + telemetry path against a
+/// local Parquet file (no S3 store), feeding its own `SessionContext`.
+pub async fn run_raw_scan_with_session(
+    ctx: &mut dyn UdfContext,
+    session_ctx: &SessionContext,
+    spec: &ScanSpec,
+    timers: &mut diagnostics::PhaseTimers,
+) -> Result<(), UdfError> {
+    let secrets = spec.storage.secret_values();
+    let df = build_dataframe(session_ctx, spec).await?;
+    let stream = df
+        .execute_stream()
+        .await
+        .map_err(|e| classify_scan_error(e, &secrets))?;
+    emit_stream(ctx, stream, &secrets, &spec.emit_exa_types, timers).await?;
+    // One per-VM telemetry record at completion. Gated + best-effort: a
+    // logging/sink failure NEVER fails the scan (the scan already succeeded).
+    emit_phase_telemetry(ctx, timers);
+    Ok(())
+}
+
+/// Emit the per-VM phase-telemetry record, gated on the debug level.
+///
+/// Best-effort: at the production default level (`info`) this is a no-op; at
+/// `debug` it writes one `LHTELEM` line to stderr (auto-tagged per-VM by the SLC
+/// fd-redirect) and appends it to the per-process telemetry file. Every write is
+/// swallowed — a telemetry failure must never surface as a scan error.
+fn emit_phase_telemetry(ctx: &dyn UdfContext, timers: &diagnostics::PhaseTimers) {
+    if !diagnostics::telemetry_enabled(ctx.debug_level()) {
+        return;
+    }
+    let record = diagnostics::telemetry_record(timers);
+    udf_log!(ctx, debug, "{}", record);
+    diagnostics::write_telemetry_file(&record);
 }
 
 /// Run a node-local partial aggregate and emit exactly one row per shard.
@@ -647,6 +705,29 @@ async fn register_files(
         .map_err(|e| UdfError::User(format!("failed to register table: {e}")))?;
 
     Ok(())
+}
+
+/// Build the raw-row-path DataFusion physical plan for a session whose scan
+/// table is already registered as `scan_target`.
+///
+/// This is the exact production raw-scan pipeline: it reuses [`build_scan_sql`]
+/// (the same projection / filter / LIMIT SQL the UDF runs) and DataFusion's
+/// `create_physical_plan`. Exposed so plan-shape and pruning-parity integration
+/// tests can inspect the committed pipeline without standing up an S3 store —
+/// the caller registers a local Parquet file as `scan_target`, then asks for
+/// the plan this function produces.
+pub async fn build_raw_scan_physical_plan(
+    ctx: &SessionContext,
+    spec: &ScanSpec,
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, UdfError> {
+    let sql = build_scan_sql(ctx, "scan_target", spec).await?;
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| UdfError::User(format!("DataFusion SQL error: {e}")))?;
+    df.create_physical_plan()
+        .await
+        .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
 /// Build the SQL string for the scan query.
@@ -1245,6 +1326,29 @@ mod tests {
         );
     }
 
+    /// Parquet row-group statistics pruning, page-index pruning, and predicate
+    /// pushdown are all enabled on the session config — not left to the
+    /// DataFusion defaults (`pushdown_filters` defaults to `false`).
+    ///
+    /// Scenario: Scan enables Parquet row-group and page pruning.
+    #[test]
+    fn session_config_enables_parquet_pruning_flags() {
+        let config = session_config_for_spec(&minimal_spec());
+        let parquet = &config.options().execution.parquet;
+        assert!(
+            parquet.pruning,
+            "row-group statistics pruning must be enabled"
+        );
+        assert!(
+            parquet.enable_page_index,
+            "page-index pruning must be enabled"
+        );
+        assert!(
+            parquet.pushdown_filters,
+            "predicate pushdown into the Parquet decode must be enabled (DataFusion defaults it off)"
+        );
+    }
+
     /// SessionConfig applies target_partitions from the spec.
     ///
     /// Scenario: session_config_uses_spec_target_partitions
@@ -1313,6 +1417,7 @@ mod tests {
         let parked_started = Arc::new(AtomicBool::new(false));
         let started_in_future = parked_started.clone();
 
+        let started_in_outer = parked_started.clone();
         let before = std::time::Instant::now();
         let result = run_on_runtime(rt, async move {
             // Spawn a detached task that outlives the future's return — the
@@ -1323,9 +1428,16 @@ mod tests {
                 // Park far longer than the grace window; shutdown must cancel it.
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
             });
-            // Let the detached task reach its park point before returning, so the
-            // runtime genuinely has live background work at teardown time.
-            tokio::task::yield_now().await;
+            // Yield until the detached task has actually reached its body (set the
+            // flag) so the runtime genuinely has live background work at teardown
+            // time. A single `yield_now()` is not enough under a loaded scheduler:
+            // the detached task may not be polled before this future returns,
+            // which made the "task started" assertion flaky. The bounded yield
+            // loop is deterministic without changing what is tested — the task is
+            // still parked on its 3600s sleep when teardown runs.
+            while !started_in_outer.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             42_u32
         });
         let elapsed = before.elapsed();
