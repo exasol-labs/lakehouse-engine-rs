@@ -72,6 +72,7 @@ or pin exact values.
 * *THEN* the UDF SHALL build a multi-threaded Tokio runtime configured with M worker threads
 * *AND* the UDF SHALL parse `df_threads_per_udf` from the ScanSpec before it constructs the runtime, so the runtime kind is chosen from the spec value
 
+<!-- DELTA:NEW -->
 ### Scenario: AUTO mode derives a per-instance thread budget that does not oversubscribe a node
 
 * *GIVEN* a `createVirtualSchema` request whose `DATAFUSION_THREADING_MODE` property is `AUTO`
@@ -80,7 +81,9 @@ or pin exact values.
 * *THEN* the adapter SHALL compute `df_threads_per_udf` as `max(1, floor(NR_OF_CORES / udf_instances_per_node))` so that `(udf_instances_per_node × df_threads_per_udf)` does not exceed `NR_OF_CORES`
 * *AND* the adapter SHALL set `df_target_partitions` equal to the derived `df_threads_per_udf` so the partition count never exceeds the per-instance thread budget
 * *AND* the adapter SHALL record the resolved values and the selected mode in the `createVirtualSchema` response `adapterNotes`, so the per-shard scan spec carries integer fields the mode-agnostic scan UDF consumes unchanged
+<!-- /DELTA:NEW -->
 
+<!-- DELTA:NEW -->
 ### Scenario: AUTO mode falls back to a single thread when the core count is unknown
 
 * *GIVEN* a `createVirtualSchema` request whose `DATAFUSION_THREADING_MODE` property is `AUTO`
@@ -88,7 +91,9 @@ or pin exact values.
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL set both `df_threads_per_udf` and `df_target_partitions` to `1`, preserving the prior single-threaded per-instance behaviour
 * *AND* the adapter SHALL still return a successful `createVirtualSchema` response
+<!-- /DELTA:NEW -->
 
+<!-- DELTA:NEW -->
 ### Scenario: FIXED mode uses the operator-supplied thread and partition values verbatim
 
 * *GIVEN* a `createVirtualSchema` request whose `DATAFUSION_THREADING_MODE` property is `FIXED`
@@ -96,10 +101,13 @@ or pin exact values.
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL record `df_target_partitions` and `df_threads_per_udf` equal to the supplied property values, without applying the AUTO derivation
 * *AND* when a property is absent or not a positive integer the adapter SHALL fall back to `max(NR_OF_CORES, 1)` for that field, exactly as the pre-mode behaviour did
+<!-- /DELTA:NEW -->
 
+<!-- DELTA:NEW -->
 ### Scenario: Threading mode defaults to AUTO when the property is absent
 
 * *GIVEN* a `createVirtualSchema` request that supplies no `DATAFUSION_THREADING_MODE` property, or supplies a value that is neither `AUTO` nor `FIXED`
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL select `AUTO` mode and derive the thread/partition budget per the AUTO scenario
 * *AND* the adapter SHALL record `DATAFUSION_THREADING_MODE: AUTO` in the `createVirtualSchema` response `adapterNotes`
+<!-- /DELTA:NEW -->

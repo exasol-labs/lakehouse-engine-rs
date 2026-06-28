@@ -44,6 +44,14 @@ build_vs_extra_props() {
     "${nr_of_cores}" "${parallelism_factor}")"
   [ "$allow_http" = "true" ] && \
     props="$(printf "\n  ALLOW_HTTP          = 'true'")${props}"
+  # Sweep knobs (Task 7.1): append DataFusion threading props only when set in env,
+  # so the default run is unchanged and the offline selftest still passes.
+  [ -n "${BENCH_DF_THREADING_MODE:-}" ] && \
+    props="${props}$(printf "\n  DATAFUSION_THREADING_MODE   = '%s'" "${BENCH_DF_THREADING_MODE}")"
+  [ -n "${BENCH_DF_THREADS_PER_UDF:-}" ] && \
+    props="${props}$(printf "\n  DATAFUSION_THREADS_PER_UDF  = '%s'" "${BENCH_DF_THREADS_PER_UDF}")"
+  [ -n "${BENCH_DF_TARGET_PARTITIONS:-}" ] && \
+    props="${props}$(printf "\n  DATAFUSION_TARGET_PARTITIONS = '%s'" "${BENCH_DF_TARGET_PARTITIONS}")"
   printf '%s' "${props}"
 }
 
@@ -229,6 +237,14 @@ USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION  = '${CONN}'
   ICEBERG_NAMESPACE   = '${NAMESPACE}'
   SCAN_SCHEMA         = '${SCHEMA}'${VS_EXTRA_PROPS}"
+
+# Telemetry harness hook (Task 6.2): build scripts+VS then stop, so a separate
+# single-leg session can drive queries under a SCRIPT_OUTPUT_ADDRESS redirect
+# without the bench's multi-leg joins (which can crash under debug tracing).
+if [ "${BENCH_DDL_ONLY:-0}" = "1" ]; then
+  echo "== BENCH_DDL_ONLY=1: scripts + VS '${VS}' created (debug_level=${UDF_DEBUG_LEVEL}); skipping queries =="
+  exit 0
+fi
 
 {
   echo "lakehouse-engine benchmark — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
