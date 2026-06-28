@@ -79,6 +79,7 @@ the catalog.
 * *AND* the configured `batch_size` SHALL be sourced from the scan spec when present and otherwise from a conservative built-in default, clamped to at least 1
 * *AND* the bound SHALL apply on both the raw-row scan path and the partial-aggregate path, since both decode source Parquet files
 
+<!-- DELTA:NEW -->
 ### Scenario: Scan enables Parquet row-group and page pruning so the reader skips non-matching data
 
 * *GIVEN* a scan UDF building its DataFusion session configuration for a scan spec carrying a filter predicate
@@ -87,3 +88,4 @@ the catalog.
 * *AND* a row group whose column statistics provably exclude the predicate SHALL NOT be decoded
 * *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `vs-adapter/pushdown-file-pruning` — files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
+<!-- /DELTA:NEW -->

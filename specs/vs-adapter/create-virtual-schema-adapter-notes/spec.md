@@ -12,12 +12,15 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * The parallelism factor is supplied as a VS/connection property and recorded
   alongside `CLUSTER_NODES` and `NR_OF_CORES`; when absent it defaults to a
   hardware-aware value derived from `NR_OF_CORES`.
-* The DataFusion threading configuration is two independent VS/connection
-  properties — `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` —
-  each recorded in `adapterNotes`. When a property is absent or not a positive
-  integer, the default is `max(NR_OF_CORES, 1)` so scans auto-parallelize to the
-  detected or overridden core count; when `NR_OF_CORES` is `0` (unknown), the
-  default falls back to `1`, preserving prior single-threaded behavior.
+* The DataFusion threading configuration is selected by a `DATAFUSION_THREADING_MODE`
+  VS/connection property (`AUTO` or `FIXED`, default `AUTO`) and recorded in
+  `adapterNotes`. In `FIXED` mode the two independent properties
+  `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` are used verbatim
+  (each defaulting to `max(NR_OF_CORES, 1)`); in `AUTO` mode the adapter derives a
+  per-instance thread budget that does not oversubscribe a node (see
+  `datafusion-scan/scan-execution-threading`). Whichever mode is selected, only the
+  resolved integer `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF`
+  values are round-tripped into the per-shard scan spec.
 * The per-instance memory budget is two independent VS/connection properties —
   `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) —
   each recorded in `adapterNotes` and round-tripped into every per-shard scan spec,
@@ -29,6 +32,8 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
   The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as Exasol
   2025.2.1 silently drops adapter-returned properties. The `adapterNotes` channel is
   queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
+* See `vs-adapter/create-virtual-schema-adapter-notes-resources` for the resource
+  configuration scenarios (parallelism factor, DataFusion threading, memory budget).
 
 ## Scenarios
 
@@ -71,59 +76,3 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL fall back to obtaining the core count via `SELECT PARAM_VALUE('NR_OF_CORES')` over the connect-back session, and SHALL write `NR_OF_CORES: 0` when that also fails
 * *AND* the adapter SHALL NOT use the invalid property value as the core count
-
-### Scenario: Adapter records the parallelism factor in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that supplies a `PARALLELISM_FACTOR` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the supplied parallelism factor in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES` and `NR_OF_CORES`
-* *AND* when the `PARALLELISM_FACTOR` property is absent or not a positive integer the adapter SHALL default the parallelism factor to `NR_OF_CORES × 2`
-* *AND* the adapter SHALL floor that default at 8 so that when `NR_OF_CORES` is 0, unavailable, or yields a product below 8 the parallelism factor is at least 8, persisting it nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the DataFusion target partition count in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_TARGET_PARTITIONS` connection/VS property
-* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, connect-back auto-detect, or `0` when unknown)
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, and `PARALLELISM_FACTOR`
-* *AND* the adapter SHALL default the target partition count to `max(nr_of_cores, 1)` when the `DATAFUSION_TARGET_PARTITIONS` property is absent, empty, zero, or not a positive integer
-* *AND* the adapter SHALL use the supplied value when it is a positive integer, persisting the count nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_THREADS_PER_UDF` connection/VS property
-* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, connect-back auto-detect, or `0` when unknown)
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved DataFusion threads-per-UDF count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion target partition count
-* *AND* the adapter SHALL default the threads-per-UDF count to `max(nr_of_cores, 1)` when the `DATAFUSION_THREADS_PER_UDF` property is absent, empty, zero, or not a positive integer
-* *AND* the adapter SHALL use the supplied value when it is a positive integer, persisting the count nowhere other than that returned `adapterNotes`
-
-### Scenario: Recorded node count and parallelism factor drive later work-unit sharding
-
-* *GIVEN* a `createVirtualSchema` request for which `NPROC()` resolves the active node count
-* *WHEN* the adapter returns the `createVirtualSchema` response
-* *THEN* the `adapterNotes` SHALL carry both the resolved `CLUSTER_NODES` node count and the `PARALLELISM_FACTOR`
-* *AND* both values SHALL be round-tripped back to the adapter at pushdown time so the shard count G can be computed as `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300
-
-### Scenario: Adapter records the memory-pool fraction in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply a `MEMORY_POOL_FRACTION` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved memory-pool fraction in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion threading entries
-* *AND* the adapter SHALL default the memory-pool fraction to `0.6` when the `MEMORY_POOL_FRACTION` property is absent, empty, not a positive number, or greater than `1.0`
-* *AND* the adapter SHALL use the supplied value when it is a positive number not greater than `1.0`, persisting the fraction nowhere other than that returned `adapterNotes`
-
-### Scenario: Adapter records the instance-overhead megabytes in the virtual-schema adapterNotes
-
-* *GIVEN* a `createVirtualSchema` request that may supply an `INSTANCE_OVERHEAD_MB` connection/VS property
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL record the resolved instance-overhead megabytes in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading entries, and the memory-pool fraction
-* *AND* the adapter SHALL default the instance-overhead megabytes to `200` when the `INSTANCE_OVERHEAD_MB` property is absent, empty, or not a non-negative integer
-* *AND* the adapter SHALL use the supplied value when it is a non-negative integer, persisting the overhead nowhere other than that returned `adapterNotes`
-
-### Scenario: Recorded memory budget controls round-trip into the scan spec
-
-* *GIVEN* a `createVirtualSchema` request that records a memory-pool fraction and instance-overhead megabytes in `adapterNotes`
-* *WHEN* Exasol round-trips those `adapterNotes` back to the adapter at pushdown time and the adapter builds each per-shard scan spec
-* *THEN* the adapter SHALL carry the resolved memory-pool fraction and instance-overhead bytes into every per-shard scan spec
-* *AND* a scan spec that lacks these fields (a pre-existing spec) SHALL deserialize to the default fraction `0.6` and default overhead `200` megabytes

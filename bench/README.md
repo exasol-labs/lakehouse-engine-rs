@@ -41,6 +41,35 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
 (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the
 `GROUP BY shard_key` fan-out. See `../CLAUDE.md` for the engine memory/fan-out model.
 
+## Synthetic micro-benchmarks (no cluster, no DB)
+
+Two host-runnable micro-benchmarks isolate the two halves of the per-instance
+scan path so end-to-end throughput can be attributed (plan tasks 5.1 / 5.2).
+They live in `crates/lakehouse-engine/tests/micro_bench.rs` (an `#[ignore]`-gated
+test target — no new dependency, no `criterion`) and need neither MinIO nor a
+cluster:
+
+- **5.1 emit-only** — the pre-SDK emit work on every batch: `coerce_batch_to_exa_types`
+  (the real coercion the emit loop runs) + Arrow IPC `StreamWriter` serialization,
+  which is exactly what `ctx.emit_batch` does internally before bytes cross the
+  `.so`. It does NOT include the ZMQ `MT_EMIT` round-trip (only measurable on the
+  cluster, tasks 6/7). Schemas: BIGINT / DOUBLE / TIMESTAMP / DECIMAL / VARCHAR and
+  a TPC-H `lineitem`-shaped mixed row.
+- **5.2 scan-only** — Parquet read+decode → DataFusion stream, drained WITHOUT
+  emitting, over a self-contained local Parquet file. Reuses the production
+  `session_config_for_spec` + `build_raw_scan_physical_plan` seams.
+
+```bash
+# full numbers (prints rows/sec, GB/sec, RSS delta per schema):
+cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture
+# release-opt numbers — write to an out-of-tree target dir so the Docker-owned
+# target/release tree (and its root-owned .cargo-lock) is never touched:
+CARGO_TARGET_DIR=/tmp/lh-bench cargo test -p lakehouse-engine --test micro_bench \
+  --release -- --ignored --nocapture
+# CI smoke (non-ignored): asserts each path yields a positive GB/sec
+cargo test -p lakehouse-engine --test micro_bench
+```
+
 ## Notes
 
 - Table names assume a flat `tpch` namespace (`LINEITEM`, …); a nested namespace

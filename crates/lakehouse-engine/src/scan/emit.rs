@@ -8,6 +8,7 @@
 ///   drop the batch before fetching the next.
 /// - Rely on the SDK's 4,000,000-byte auto-flush; always flush at end.
 /// - Only IPC bytes cross the .so boundary — never Arrow types or Value intermediates.
+use crate::scan::diagnostics::PhaseTimers;
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
@@ -31,26 +32,62 @@ use std::sync::Arc;
 /// accepts before `emit_batch` — DataFusion's physical Parquet type can diverge
 /// from the Iceberg logical type the VS declared, and `emit_batch` rejects ANY
 /// mismatch. Pass `&[]` to fall back to view-type normalization only.
+///
+/// `timers` carries the phase accumulators (Task 4): the wait for each
+/// `stream.next()` is attributed to the object-storage import phase, and the
+/// coercion + `emit_batch` of each batch is attributed to the send-back/emit
+/// phase. The timing only reads a monotonic clock around the SAME fetch / emit /
+/// drop operations — it does NOT change the streaming discipline (one batch
+/// fetched, emitted, dropped before the next).
 pub async fn emit_stream(
     ctx: &mut dyn UdfContext,
     mut stream: SendableRecordBatchStream,
     secrets: &[&str],
     exa_types: &[String],
+    timers: &mut PhaseTimers,
 ) -> Result<u64, UdfError> {
     let mut total: u64 = 0;
-    while let Some(result) = stream.next().await {
-        let batch = result.map_err(|e| classify_scan_error(e, secrets))?;
-        // Coerce each column to the Arrow type its declared EMITS ExaType accepts,
-        // so emit_batch's strict Arrow→ExaType validation never rejects a column.
-        // Generalizes the old Utf8View→Utf8 normalization across the full mapping.
-        let batch = coerce_batch_to_exa_types(batch, exa_types)
-            .map_err(|e| UdfError::User(format!("emit type coercion failed: {e}")))?;
-        // Count rows before emitting — batch is borrowed by emit_batch.
-        total += batch.num_rows() as u64;
-        ctx.emit_batch(&batch)?;
-        drop(batch);
+    // Startup ends at the first batch fetch — seal it as the import loop opens.
+    timers.seal_startup();
+    loop {
+        // --- object-storage import phase: await the next batch ---
+        timers.import_started();
+        let next = stream.next().await;
+        timers.import_ended();
+
+        let Some(result) = next else { break };
+
+        // --- send-back/emit phase: coerce + emit this batch ---
+        timers.emit_started();
+        let emit_result = emit_one_batch(ctx, result, secrets, exa_types);
+        timers.emit_ended();
+        total += emit_result?;
     }
     Ok(total)
+}
+
+/// Coerce and emit one fetched batch, returning the row count it contributed.
+///
+/// Factored out so the emit phase boundary in [`emit_stream`] brackets exactly
+/// the coercion + `emit_batch` work, with the batch dropped before the next
+/// fetch — preserving the never-hold-two-batches discipline.
+fn emit_one_batch(
+    ctx: &mut dyn UdfContext,
+    result: Result<RecordBatch, DataFusionError>,
+    secrets: &[&str],
+    exa_types: &[String],
+) -> Result<u64, UdfError> {
+    let batch = result.map_err(|e| classify_scan_error(e, secrets))?;
+    // Coerce each column to the Arrow type its declared EMITS ExaType accepts,
+    // so emit_batch's strict Arrow→ExaType validation never rejects a column.
+    // Generalizes the old Utf8View→Utf8 normalization across the full mapping.
+    let batch = coerce_batch_to_exa_types(batch, exa_types)
+        .map_err(|e| UdfError::User(format!("emit type coercion failed: {e}")))?;
+    // Count rows before emitting — batch is borrowed by emit_batch.
+    let rows = batch.num_rows() as u64;
+    ctx.emit_batch(&batch)?;
+    drop(batch);
+    Ok(rows)
 }
 
 /// Coerce every column of a RecordBatch to the Arrow type the engine's strict
@@ -459,7 +496,10 @@ mod tests {
         let stream = Box::pin(VecStream::new(input_batches));
 
         let mut ctx = CapturingCtx::new();
-        let total = emit_stream(&mut ctx, stream, &[], &[]).await.unwrap();
+        let mut timers = PhaseTimers::start();
+        let total = emit_stream(&mut ctx, stream, &[], &[], &mut timers)
+            .await
+            .unwrap();
 
         // 1. Row count is the sum of num_rows across all batches.
         assert_eq!(total, 6, "total must equal sum of all batch row counts");
@@ -940,7 +980,8 @@ mod tests {
         let exa_types = vec!["DECIMAL(10,0)".to_string(), "VARCHAR(2000000)".to_string()];
 
         // Must not error — previously crashed with the two "cannot feed" errors.
-        let total = emit_stream(&mut ctx, stream, &[], &exa_types)
+        let mut timers = PhaseTimers::start();
+        let total = emit_stream(&mut ctx, stream, &[], &exa_types, &mut timers)
             .await
             .expect("emit_stream must succeed and coerce to declared ExaTypes");
 
