@@ -38,7 +38,7 @@ Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both
 ## 2. Register the Rust SLC
 
 ```sh
-make install-slc               # downloads lc-rust 0.14.0, uploads to BucketFS, sets the RUST alias
+make install-slc               # downloads lc-rust 0.19.1, uploads to BucketFS, sets the RUST alias
 ```
 
 Uploads the SLC to BucketFS `/default/slc/` and registers `SCRIPT_LANGUAGES` with a `RUST=` alias (replacing any existing one).
@@ -69,6 +69,25 @@ EMITS (...) AS
 ## 5. Create the catalog CONNECTION
 
 Catalog URI goes in `TO`; S3 + warehouse credentials go in the `IDENTIFIED BY` JSON password.
+The fields are the same across backends; only their values and a few flags differ.
+
+| JSON field | Required | Meaning |
+|---|---|---|
+| `warehouse` (or `wh`) | yes | Iceberg warehouse location (`s3://…`, or an AWS account id for Glue) |
+| `endpoint` | yes | S3 endpoint URL |
+| `region` | yes | S3 region |
+| `access_key` / `secret_key` | yes | S3 credentials |
+| `session_token` | no | Temporary STS token |
+| `path_style` | no | Path-style S3 addressing (`true` for MinIO; `false` for AWS S3) |
+| `use_sigv4` | no | SigV4-sign the catalog REST requests (`true` for AWS Glue) |
+| `use_vended_credentials` | no | Take short-lived S3 credentials vended by the catalog (Glue) |
+
+Credential values never appear in error messages or logs, and are passed to the scan UDF
+inside the per-query scan spec — never stored in VS properties.
+
+### Local (MinIO + Iceberg REST)
+
+For the bundled Docker stack. Note the internal hostnames and `path_style: true`.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -84,15 +103,46 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   }';
 ```
 
-| JSON field | Required | Meaning |
+### Production (AWS Glue + S3)
+
+The validated production path. Catalog is the Glue Iceberg REST endpoint; `warehouse` is the
+AWS **account id** (not an `s3://` path); SigV4 and vended credentials are on.
+
+```sql
+CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+  TO 'https://glue.us-east-1.amazonaws.com/iceberg'
+  USER ''
+  IDENTIFIED BY '{
+    "warehouse":              "123456789012",
+    "endpoint":               "https://s3.us-east-1.amazonaws.com",
+    "region":                 "us-east-1",
+    "access_key":             "AKIA...",
+    "secret_key":             "...",
+    "session_token":          "...",
+    "path_style":             false,
+    "use_sigv4":              true,
+    "use_vended_credentials": true
+  }';
+```
+
+Field differences at a glance:
+
+| Field | Local MinIO | AWS Glue |
 |---|---|---|
-| `warehouse` (or `wh`) | yes | Iceberg warehouse location (`s3://…`) |
-| `endpoint` | yes | S3 endpoint URL |
-| `region` | yes | S3 region |
-| `access_key` / `secret_key` | yes | S3 credentials |
-| `session_token` | no | Temporary-credential token |
-| `path_style` | no | Path-style S3 addressing (`true` for MinIO) |
-| `use_vended_credentials` | no | Take S3 credentials vended by the catalog instead |
+| `TO` (catalog URI) | `http://iceberg-rest:8181` | `https://glue.<region>.amazonaws.com/iceberg` |
+| `warehouse` | `s3://warehouse/` | AWS account id, e.g. `123456789012` |
+| `endpoint` | `http://minio:9000` | `https://s3.<region>.amazonaws.com` |
+| `path_style` | `true` | `false` |
+| `use_sigv4` | `false` (omit) | `true` |
+| `use_vended_credentials` | `false` (omit) | `true` |
+
+### Databricks-managed Iceberg
+
+Databricks-managed tables are reached through the same Iceberg REST path: point `TO` at the
+Databricks Unity Catalog Iceberg REST endpoint and supply its auth in place of Glue's. The
+exact endpoint/auth shape for a Databricks workspace is not yet exercised by the test suite in
+this repo — treat the Glue recipe as the template and adjust the catalog URI and credential
+flags to the Databricks endpoint.
 
 ## 6. Create the Virtual Schema
 
@@ -126,6 +176,27 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 
 Projection, filter predicates, `LIMIT`, and aggregation are pushed down. See
 [Capabilities](capabilities.md) for the full matrix.
+
+## End-to-end tests
+
+`make test-e2e` builds the `.so`, then runs the Rust E2E suite against the bundled stack
+(Exasol + MinIO + Iceberg REST from `docker-compose.yml`). It seeds Iceberg tables
+in-process, runs serially (`--test-threads=1`), and **fails — never skips — if no Exasol is
+reachable**.
+
+```sh
+docker compose up -d
+make test-e2e
+```
+
+Port overrides (host side; defaults match `docker-compose.yml`):
+
+| Env var | Default | Service |
+|---|---|---|
+| `LH_EXASOL_PORT` | `28563` | Exasol SQL |
+| `LH_BUCKETFS_PORT` | `22581` | BucketFS |
+| `LH_MINIO_PORT` | `19000` | MinIO S3 |
+| `LH_REST_PORT` | `18181` | Iceberg REST |
 
 ## Addressing note
 

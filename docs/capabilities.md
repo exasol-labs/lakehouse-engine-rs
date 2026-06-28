@@ -7,7 +7,8 @@
 Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates across
 shards and handles anything not pushed down.** A capability is advertised only if the VS can
 translate it (vs-expression translator) or decompose it into a correct partial/merge plan.
-Source of truth: `crates/lakehouse-engine/src/adapter/capabilities.rs`.
+Source of truth: `crates/lakehouse-engine/src/adapter/capabilities.rs`. For *how* the
+per-shard / parent-level split works, see [Architecture](architecture.md).
 
 ## Projection & expressions ✅
 
@@ -57,9 +58,9 @@ Partial aggregate per shard → merged by Exasol.
 
 `COUNT` emits partial sum/count and `AVG` emits sum + count (not an average); statistical aggregates emit sufficient stats (n, Σx, Σx²). Exasol combines them into the final result.
 
-## Not pushed down ⛔
+## Handled by Exasol 🤝
 
-Exasol handles these after partial results return — correct, just less pushdown.
+Not pushed to the scan — Exasol computes these on the returned partial results. Correct and fast; just not decomposable into a partial/merge plan.
 
 | Capability | Example | Where it runs |
 |---|---|---|
