@@ -15,17 +15,8 @@ stateless — no caching, no materialization, no data movement.
 
 | Doc | What it covers |
 |-----|----------------|
-| [Install](install.md) | Build the `.so`, register the Rust SLC, deploy the scripts + CONNECTION + Virtual Schema |
+| [Install](install.md) | Build the `.so`, register the Rust SLC, deploy the scripts + CONNECTION (local / Glue / Databricks) + Virtual Schema, run E2E |
 | [Capabilities](capabilities.md) | Pushdown support matrix — what runs in DataFusion vs. Exasol |
-
-## Design & specs
-
-Spec-driven development via the `speq` skill; the spec library is the design source of truth:
-
-- [`specs/mission.md`](../specs/mission.md) — purpose, problem statement, tech stack
-- [`specs/decision-log.md`](../specs/decision-log.md) — architecture decision records
-- [`specs/vs-adapter/`](../specs/vs-adapter/) — create-virtual-schema, pushdown planning
-- [`specs/datafusion-scan/`](../specs/datafusion-scan/) — scan execution, aggregation, type mapping
-- [`specs/parallelism/`](../specs/parallelism/) — work-unit sharding
-- [`specs/sql-comprehension/`](../specs/sql-comprehension/) — the `vs-expression` translator
-- [`specs/packaging/`](../specs/packaging/) — single-`.so` two-entry-points layout, E2E harness
+| [Architecture](architecture.md) | Parallelism, sharding & how pushdown combines with parent-level Exasol execution |
+| [Performance](performance.md) | Benchmark results, tuning recommendations & outlook |
+| [Tuning](tuning.md) | Parameters reference & telemetry |
