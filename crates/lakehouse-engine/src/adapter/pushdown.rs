@@ -36,6 +36,7 @@ async fn build_rest_catalog(
     catalog_uri: &str,
     catalog: &CatalogProps,
     storage: &StorageProps,
+    creds: &ConnectionCreds,
 ) -> Result<RestCatalog, UdfError> {
     let mut props = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_uri.to_string());
@@ -63,6 +64,8 @@ async fn build_rest_catalog(
         storage.path_style.to_string(),
     );
 
+    inject_catalog_auth_props(&mut props, creds);
+
     RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
@@ -73,9 +76,77 @@ async fn build_rest_catalog(
         .map_err(|e: iceberg::Error| {
             UdfError::User(format!(
                 "failed to connect to Iceberg catalog: {}",
-                redact_catalog_error(&e.to_string())
+                redact_catalog_auth_error(&e.to_string(), creds)
             ))
         })
+}
+
+/// REST-catalog auth property keys (literal strings, fixed by `iceberg-catalog-rest`
+/// 0.9.1; the crate exports no constants for them). They flow through
+/// `RestCatalogBuilder::load`, which copies every prop except `uri`/`warehouse`.
+const REST_CATALOG_PROP_TOKEN: &str = "token";
+const REST_CATALOG_PROP_CREDENTIAL: &str = "credential";
+const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
+const REST_CATALOG_PROP_SCOPE: &str = "scope";
+
+/// Inject catalog-auth props from the resolved credentials into the REST-catalog
+/// props map. Three mutually exclusive modes:
+///
+/// * no `token` and no client credentials → inject nothing (no-auth, default).
+/// * non-empty `token` → inject only `token` (the bearer header; the crate never
+///   consults `oauth2-server-uri`/`scope` in this mode).
+/// * non-empty `client_id` + `client_secret` → inject `credential` =
+///   `"client_id:client_secret"`, plus `oauth2-server-uri` ONLY when a non-empty
+///   `oauth2_server_uri` is supplied and `scope` ONLY when a non-empty `scope` is
+///   supplied; never inject `token` in this mode.
+///
+/// Token and client-credentials are mutually exclusive by construction.
+fn inject_catalog_auth_props(props: &mut HashMap<String, String>, creds: &ConnectionCreds) {
+    let token = non_empty(&creds.token);
+    let client_id = non_empty(&creds.client_id);
+    let client_secret = non_empty(&creds.client_secret);
+
+    if let (Some(id), Some(secret)) = (client_id, client_secret) {
+        props.insert(
+            REST_CATALOG_PROP_CREDENTIAL.to_string(),
+            format!("{id}:{secret}"),
+        );
+        if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
+            props.insert(
+                REST_CATALOG_PROP_OAUTH2_SERVER_URI.to_string(),
+                uri.to_string(),
+            );
+        }
+        if let Some(scope) = non_empty(&creds.scope) {
+            props.insert(REST_CATALOG_PROP_SCOPE.to_string(), scope.to_string());
+        }
+    } else if let Some(token) = token {
+        props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
+    }
+}
+
+/// Borrow the inner value of an `Option<String>` only when it is non-empty.
+fn non_empty(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|v| !v.is_empty())
+}
+
+/// Redact a catalog error that may have surfaced an auth value. Applies the
+/// generic label/pattern redaction AND strips the literal `token`, `client_secret`,
+/// and joined `credential` values so an OAuth2/bearer secret echoed without a
+/// recognizable label can never leak.
+fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
+    let mut secrets: Vec<String> = Vec::new();
+    if let Some(token) = non_empty(&creds.token) {
+        secrets.push(token.to_string());
+    }
+    if let Some(secret) = non_empty(&creds.client_secret) {
+        // The joined `credential` ("<id>:<secret>") need not be pushed separately:
+        // stripping the bare secret first already removes the only sensitive
+        // portion, leaving the non-secret `id`.
+        secrets.push(secret.to_string());
+    }
+    let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    crate::scan::emit::redact_secret_values(&redact_catalog_error(msg), &secret_refs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1397,7 @@ pub async fn resolve_file_list(
     }
 
     // Unsigned path — exact existing behaviour, unchanged.
-    let catalog = build_rest_catalog(catalog_uri, catalog_props, storage).await?;
+    let catalog = build_rest_catalog(catalog_uri, catalog_props, storage, creds).await?;
 
     // Parse "namespace.table" from catalog_props.table.
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
@@ -1407,7 +1478,7 @@ pub async fn resolve_table_schema(
         let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
         result.metadata
     } else {
-        let catalog = build_rest_catalog(catalog_uri, catalog_props, storage).await?;
+        let catalog = build_rest_catalog(catalog_uri, catalog_props, storage, creds).await?;
         let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
         let table_ident = TableIdent::new(namespace, table_name);
         let table = catalog
@@ -1468,7 +1539,8 @@ pub async fn list_namespace_tables(
     if creds.use_sigv4 {
         list_in_namespace_signed(catalog_uri, &ns_ident, &creds.warehouse, creds).await
     } else {
-        list_namespace_tables_unsigned(catalog_uri, &ns_ident, &creds.warehouse, storage).await
+        list_namespace_tables_unsigned(catalog_uri, &ns_ident, &creds.warehouse, storage, creds)
+            .await
     }
 }
 
@@ -1481,6 +1553,7 @@ async fn list_namespace_tables_unsigned(
     parent: &NamespaceIdent,
     warehouse: &str,
     storage: &StorageProps,
+    creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
     // Build a temporary CatalogProps with an empty table to construct the RestCatalog.
     let dummy_catalog = crate::scan::spec::CatalogProps {
@@ -1488,7 +1561,7 @@ async fn list_namespace_tables_unsigned(
         warehouse: warehouse.to_string(),
         table: String::new(),
     };
-    let catalog = build_rest_catalog(catalog_uri, &dummy_catalog, storage).await?;
+    let catalog = build_rest_catalog(catalog_uri, &dummy_catalog, storage, creds).await?;
     list_in_namespace_unsigned(&catalog, parent).await
 }
 
@@ -4669,6 +4742,292 @@ mod tests {
         assert!(
             safe.contains("access_key"),
             "label must be preserved: {safe}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 5 — catalog-auth prop injection (inject_catalog_auth_props)
+    //
+    // The pure prop-map seam is tested directly: `inject_catalog_auth_props`
+    // mutates a `HashMap<String,String>` from the resolved `ConnectionCreds`,
+    // which is exactly what `build_rest_catalog` does before the async
+    // `RestCatalogBuilder::load`. Asserting against the map needs no network I/O.
+    // ---------------------------------------------------------------------------
+
+    /// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
+    /// Individual tests set only the auth fields under test.
+    fn base_creds() -> ConnectionCreds {
+        ConnectionCreds {
+            warehouse: "warehouse".into(),
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            session_token: None,
+            path_style: true,
+            use_sigv4: false,
+            use_vended_credentials: false,
+            token: None,
+            client_id: None,
+            client_secret: None,
+            oauth2_server_uri: None,
+            scope: None,
+        }
+    }
+
+    /// The four REST-catalog auth prop keys, for negative assertions.
+    const AUTH_PROP_KEYS: [&str; 4] = [
+        REST_CATALOG_PROP_TOKEN,
+        REST_CATALOG_PROP_CREDENTIAL,
+        REST_CATALOG_PROP_OAUTH2_SERVER_URI,
+        REST_CATALOG_PROP_SCOPE,
+    ];
+
+    /// Scenario: Static bearer token is attached to unsigned catalog requests.
+    ///
+    /// A token-only config injects `"token"` and NONE of
+    /// `"credential"`/`"oauth2-server-uri"`/`"scope"` — the token mode never
+    /// consults the OAuth2 endpoint/scope.
+    #[test]
+    fn build_rest_catalog_sets_token_prop() {
+        let mut creds = base_creds();
+        creds.token = Some("bearer-secret-123".into());
+        // oauth2_server_uri / scope present but irrelevant: token mode ignores them.
+        creds.oauth2_server_uri = Some("https://auth.example/token".into());
+        creds.scope = Some("catalog".into());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        assert_eq!(
+            props.get(REST_CATALOG_PROP_TOKEN).map(String::as_str),
+            Some("bearer-secret-123"),
+            "token mode must set the token prop"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_CREDENTIAL),
+            "token mode must NOT set credential"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_OAUTH2_SERVER_URI),
+            "token mode must NOT set oauth2-server-uri (never consulted)"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_SCOPE),
+            "token mode must NOT set scope (never consulted)"
+        );
+    }
+
+    /// An empty-string token (`Some("")`) is treated as ABSENT, not present:
+    /// the empty-vs-absent distinction must not inject a blank `"token"` prop.
+    #[test]
+    fn build_rest_catalog_empty_token_injects_nothing() {
+        let mut creds = base_creds();
+        creds.token = Some(String::new());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        for key in AUTH_PROP_KEYS {
+            assert!(
+                !props.contains_key(key),
+                "empty-string token must inject no auth prop, but {key} was set"
+            );
+        }
+    }
+
+    /// Scenario: OAuth2 client credentials drive the catalog client-credentials grant.
+    ///
+    /// OAuth config sets `"credential"` = `"id:secret"`; includes
+    /// `"oauth2-server-uri"`/`"scope"` ONLY when supplied (here: both supplied),
+    /// and NEVER sets `"token"`.
+    #[test]
+    fn build_rest_catalog_sets_credential_and_oauth_props() {
+        // (a) Both oauth2_server_uri and scope supplied → both injected.
+        let mut creds = base_creds();
+        creds.client_id = Some("client-abc".into());
+        creds.client_secret = Some("secret-xyz".into());
+        creds.oauth2_server_uri = Some("https://auth.example/token".into());
+        creds.scope = Some("catalog-read".into());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        assert_eq!(
+            props.get(REST_CATALOG_PROP_CREDENTIAL).map(String::as_str),
+            Some("client-abc:secret-xyz"),
+            "credential must be the colon-joined client_id:client_secret"
+        );
+        assert_eq!(
+            props
+                .get(REST_CATALOG_PROP_OAUTH2_SERVER_URI)
+                .map(String::as_str),
+            Some("https://auth.example/token"),
+            "oauth2-server-uri must be set when supplied"
+        );
+        assert_eq!(
+            props.get(REST_CATALOG_PROP_SCOPE).map(String::as_str),
+            Some("catalog-read"),
+            "scope must be set when supplied"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_TOKEN),
+            "OAuth mode must NEVER set token"
+        );
+
+        // (b) Neither oauth2_server_uri nor scope supplied → omitted (catalog defaults).
+        let mut creds = base_creds();
+        creds.client_id = Some("client-abc".into());
+        creds.client_secret = Some("secret-xyz".into());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        assert_eq!(
+            props.get(REST_CATALOG_PROP_CREDENTIAL).map(String::as_str),
+            Some("client-abc:secret-xyz"),
+            "credential still set when oauth2-server-uri/scope omitted"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_OAUTH2_SERVER_URI),
+            "oauth2-server-uri must be omitted when not supplied (catalog defaults)"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_SCOPE),
+            "scope must be omitted when not supplied (catalog defaults)"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_TOKEN),
+            "OAuth mode must NEVER set token"
+        );
+
+        // (c) Mutual exclusivity by construction: client-credentials present alongside
+        //     a stray token → credential wins, token is never injected.
+        let mut creds = base_creds();
+        creds.client_id = Some("client-abc".into());
+        creds.client_secret = Some("secret-xyz".into());
+        creds.token = Some("stray-token".into());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        assert!(
+            props.contains_key(REST_CATALOG_PROP_CREDENTIAL),
+            "credential must be set when client credentials present"
+        );
+        assert!(
+            !props.contains_key(REST_CATALOG_PROP_TOKEN),
+            "client-credentials mode must NOT inject token even if one is set"
+        );
+
+        // (d) Incomplete client credentials (only client_id, empty secret) must NOT
+        //     enter the credential branch (guards the non_empty filter + the
+        //     all-or-nothing pair requirement).
+        let mut creds = base_creds();
+        creds.client_id = Some("client-abc".into());
+        creds.client_secret = Some(String::new());
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        for key in AUTH_PROP_KEYS {
+            assert!(
+                !props.contains_key(key),
+                "incomplete client credentials must inject no auth prop, but {key} was set"
+            );
+        }
+    }
+
+    /// Scenario: No catalog auth props are set when neither token nor OAuth
+    /// credentials are supplied — the prop map is shape-identical to before.
+    #[test]
+    fn build_rest_catalog_no_auth_props_when_no_auth() {
+        let creds = base_creds();
+
+        let mut props = HashMap::new();
+        inject_catalog_auth_props(&mut props, &creds);
+
+        assert!(
+            props.is_empty(),
+            "no-auth config must inject nothing into the props map: {props:?}"
+        );
+        for key in AUTH_PROP_KEYS {
+            assert!(
+                !props.contains_key(key),
+                "no-auth config must not set {key}"
+            );
+        }
+    }
+
+    /// Scenario: Catalog auth props are never placed in any scan spec.
+    ///
+    /// The UDF-boundary secret invariant: auth lives on `ConnectionCreds` and is
+    /// consumed only in the planning-layer catalog build. A `ScanSpec` (serialized
+    /// for the UDF boundary) must carry none of the auth field NAMES nor any auth
+    /// VALUE — the scan UDF never calls the catalog.
+    #[test]
+    fn scan_spec_carries_no_catalog_auth_props() {
+        // Distinctive sentinels: any of these surfacing in the serialized spec is a leak.
+        const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_VALUE";
+        const SECRET_SENTINEL: &str = "CLIENT_SECRET_SENTINEL_VALUE";
+        const OAUTH_URI_SENTINEL: &str = "https://oauth-uri-sentinel.example/token";
+        const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
+
+        // Build a spec exactly as handle_pushdown does — auth creds exist but are
+        // NEVER threaded into ScanSpec (it has no auth fields by construction).
+        let spec = ScanSpec {
+            files: vec!["s3://warehouse/db/events/part-00000.parquet".into()],
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: Some("(\"ID\" > 10)".into()),
+            limit: Some(100),
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+
+        let json = spec.to_json();
+
+        // No auth field NAMES (planning-layer concepts) in the serialized spec.
+        for field in [
+            "token",
+            "credential",
+            "client_id",
+            "client_secret",
+            "oauth2_server_uri",
+            "oauth2-server-uri",
+            "scope",
+        ] {
+            assert!(
+                !json.contains(field),
+                "ScanSpec JSON must not carry auth field '{field}': {json}"
+            );
+        }
+
+        // No auth VALUES, even if a future refactor wired creds in by mistake.
+        for value in [
+            TOKEN_SENTINEL,
+            SECRET_SENTINEL,
+            OAUTH_URI_SENTINEL,
+            SCOPE_SENTINEL,
+        ] {
+            assert!(
+                !json.contains(value),
+                "ScanSpec JSON must not carry auth value '{value}': {json}"
+            );
+        }
+
+        // The storage block carries only the S3 storage credentials, exactly as
+        // in the established credential flows.
+        assert!(
+            json.contains("minioadmin"),
+            "storage S3 creds must still be present: {json}"
         );
     }
 }
