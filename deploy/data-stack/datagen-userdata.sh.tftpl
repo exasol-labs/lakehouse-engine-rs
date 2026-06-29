@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Data-gen bootstrap. Installs python+duckdb+pyiceberg, runs gen_load.py against Glue,
+# records status in SSM, then terminates the instance (shutdown -h now + terminate behavior).
+set -uo pipefail
+exec > >(tee /var/log/datagen.log) 2>&1
+
+REGION="${region}"
+BUCKET="${bucket}"
+STATUS_PARAM="${done_param}"
+
+put_status() {
+  aws ssm put-parameter --region "$REGION" --name "$STATUS_PARAM" \
+    --type String --overwrite --value "$1" || true
+}
+trap 'put_status "FAILED@$(date -u +%FT%TZ)"; shutdown -h now' ERR
+
+put_status "RUNNING@$(date -u +%FT%TZ)"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq python3-pip python3-venv awscli
+
+python3 -m venv /opt/gen
+/opt/gen/bin/pip install --quiet --upgrade pip
+/opt/gen/bin/pip install --quiet duckdb pyiceberg[glue,pyarrow] pyarrow boto3
+
+aws s3 cp "s3://$BUCKET/${script_key}" /opt/gen/gen_load.py --region "$REGION"
+
+/opt/gen/bin/python /opt/gen/gen_load.py \
+  --region "$REGION" \
+  --warehouse "${warehouse}" \
+  --glue-uri "${glue_uri}" \
+  --bucket "$BUCKET" \
+  --tpch-db "${tpch_db}" \
+  --perf-db "${perf_db}" \
+  --tpch-scale "${scale}" \
+  --lineitem-files "${lineitem_files}" \
+  --perf-sizes "${perf_sizes}" \
+  --perf-files "${perf_files}"
+
+put_status "DONE@$(date -u +%FT%TZ)"
+shutdown -h now

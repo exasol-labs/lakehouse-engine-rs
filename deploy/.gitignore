@@ -1,0 +1,11 @@
+# OpenTofu working dirs + state (lock files .terraform.lock.hcl ARE tracked)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# python
+**/__pycache__/
+*.pyc
