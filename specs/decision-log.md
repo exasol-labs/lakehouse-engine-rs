@@ -1054,3 +1054,104 @@ The engine-side levers in this plan are delivered and measurably improve through
 ### Consequences
 
 The throughput plan is complete as an engine-side optimization effort. The next throughput action is the S3-in-VPC plan. The UDF layer overhead (vs native IMPORT) is small enough that the VS path is not the bottleneck. The IMPORT FROM PARQUET benchmark result is recorded as the reference ceiling for future comparison.
+
+## ADR-040: Catalog Auth Credentials Live on `ConnectionCreds`, Never on the UDF-Boundary Payload
+
+**Date:** 2026-06-29
+**Plan:** `add-rest-catalog-oauth-auth`
+**Status:** Accepted
+
+### Context
+
+REST-catalog authentication (a static bearer `token` or an OAuth2 `client_id`/`client_secret` exchange) had to be threaded into the unsigned catalog build. `CatalogProps` and `StorageProps` are serialized into `ScanSpec`, which crosses the stateless UDF boundary; the scan UDF never calls the catalog. Catalog secrets must never cross that boundary.
+
+### Decision
+
+Carry `token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope` (all `Option<String>`) on `ConnectionCreds`, strictly within the planning layer. Inject the corresponding `iceberg-catalog-rest` props inside `build_rest_catalog`, which already receives `creds` via `resolve_file_list`. No auth field is ever placed in `CatalogProps`/`StorageProps`/`ScanSpec`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Auth fields on `ConnectionCreds`, injected at catalog-build time | ✓ Chosen — keeps secrets in the planning layer; preserves the stateless-UDF boundary |
+| Widen `CatalogProps`/`ScanSpec` with the auth fields | ✗ Rejected — would carry catalog secrets across the UDF boundary the scan node never needs |
+
+### Consequences
+
+The "UDFs are stateless and never authenticate to catalogs" architecture boundary holds. A unit test (`scan_spec_carries_no_catalog_auth_props`) guards the invariant that no auth field name or value appears in a serialized scan spec.
+
+## ADR-041: SigV4 and Catalog Token/OAuth Authentication Are Mutually Exclusive, Rejected at Validation
+
+**Date:** 2026-06-29
+**Plan:** `add-rest-catalog-oauth-auth`
+**Status:** Accepted
+
+### Context
+
+The AWS Glue SigV4 path signs the `load_table` request with static AWS credentials and bypasses `RestCatalogBuilder`; catalog token/OAuth authenticates to the REST catalog itself through the builder props. A CONNECTION that enables both expresses two conflicting strategies, and the SigV4 path would silently drop the token/OAuth props.
+
+### Decision
+
+Reject a CONNECTION that sets `use_sigv4` while also supplying any catalog-auth field (`token`, or `client_id`/`client_secret`), with a credential-safe error. The check runs before the SigV4 S3-field guard so the dominant configuration conflict surfaces first.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Explicit mutual-exclusivity error | ✓ Chosen — an operated engine must not silently ignore supplied credentials |
+| Let SigV4 win and silently ignore token/OAuth | ✗ Rejected — a silent misconfiguration trap |
+
+### Consequences
+
+Misconfigured CONNECTIONs fail fast with a clear message. `has_catalog_auth()` returns true even on partial OAuth (lone `client_id`), so a SigV4 + partial-OAuth combo trips this guard rather than the incomplete-OAuth branch.
+
+## ADR-042: Static S3 Fields Are Unconditionally Optional; `warehouse` the Only Always-Required Field
+
+**Date:** 2026-06-29
+**Plan:** `add-rest-catalog-oauth-auth`
+**Status:** Accepted
+
+### Context
+
+`REQUIRED_CRED_KEYS` required all five of `warehouse`, `endpoint`, `region`, `access_key`, `secret_key`. Source review of `iceberg-catalog-rest` 0.9.1 showed catalog auth and S3 storage credentials are fully orthogonal: `authenticate()` supports a no-auth mode and `use_vended_credentials` governs S3 vending independently — even an unauthenticated catalog can vend S3 credentials. The flat five-field requirement was pre-existing over-strictness that rejected valid vended/token/OAuth configurations.
+
+### Decision
+
+Reduce base required-field validation to `warehouse` only. The four S3 fields become optional at the base level, independent of catalog auth and `use_vended_credentials`. (The SigV4 path retains a conditional requirement — see ADR-043.)
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `warehouse`-only base requirement; S3 fields optional | ✓ Chosen — matches the crate's auth/storage orthogonality; loosening never rejects a previously valid password |
+| Keep all five always required | ✗ Rejected — forces dummy S3 values for vended/token/OAuth catalogs |
+| Require S3 only when no catalog auth present | ✗ Rejected — a no-auth catalog can still vend, so the conditional mismodels the crate |
+
+### Consequences
+
+Existing static-S3 connections continue to validate and behave identically (they already supply all five fields); only acceptance widens. Backward compatibility is verified by test.
+
+## ADR-043: When SigV4 Is Enabled, `access_key`/`secret_key`/`region` Are Required (Orthogonal to Vending)
+
+**Date:** 2026-06-29
+**Plan:** `add-rest-catalog-oauth-auth`
+**Status:** Accepted
+
+### Context
+
+ADR-042 loosens base validation to `warehouse`-only. But the Glue path signs the `load_table` request with exactly `access_key`/`secret_key`/`region` (`sign_request`, service `glue`) BEFORE any vended credentials are swapped in. Without a guard, a `use_sigv4` connection missing those — previously caught by the flat `REQUIRED_CRED_KEYS` — would pass validation and fail later with an opaque signing error: a Glue-path regression.
+
+### Decision
+
+When `use_sigv4` is true, require `access_key`, `secret_key`, and `region` to be present and non-empty; reject with a credential-safe error naming the missing field(s) and referencing SigV4. Apply this regardless of `use_vended_credentials` (the static creds sign the catalog request first). `endpoint` is excluded — it is not fed to the signer.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Conditional SigV4 guard on the three signer fields | ✓ Chosen — restores the SigV4 safety net precisely scoped to the fields the signer consumes |
+| Rely on ADR-042's `warehouse`-only validation for all cases | ✗ Rejected — reintroduces an opaque late signing failure on the Glue path |
+
+### Consequences
+
+Non-SigV4 cases stay as loose as ADR-042 specifies; the SigV4 path keeps its fail-fast validation. The guard holds even with vending enabled.
