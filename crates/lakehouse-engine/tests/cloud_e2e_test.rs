@@ -52,11 +52,26 @@ const ENV_EXASOL_PORT: &str = "LH_EXASOL_PORT";
 const ENV_EXASOL_USER: &str = "LH_EXASOL_USER";
 const ENV_EXASOL_PASSWORD: &str = "LH_EXASOL_PASSWORD";
 
+// Catalog-auth E2E env vars (token or OAuth2 client-credentials REST catalog).
+// Required: CATALOG_AUTH_URI, CATALOG_AUTH_WAREHOUSE, CATALOG_AUTH_TABLE, EXASOL_HOST,
+//           LH_EXASOL_PASSWORD, and at least one of CATALOG_AUTH_TOKEN or
+//           (CATALOG_AUTH_CLIENT_ID + CATALOG_AUTH_CLIENT_SECRET).
+// Optional: CATALOG_AUTH_OAUTH2_SERVER_URI, CATALOG_AUTH_SCOPE (OAuth path only).
+const ENV_CATALOG_AUTH_URI: &str = "CATALOG_AUTH_URI";
+const ENV_CATALOG_AUTH_WAREHOUSE: &str = "CATALOG_AUTH_WAREHOUSE";
+const ENV_CATALOG_AUTH_TABLE: &str = "CATALOG_AUTH_TABLE";
+const ENV_CATALOG_AUTH_TOKEN: &str = "CATALOG_AUTH_TOKEN";
+const ENV_CATALOG_AUTH_CLIENT_ID: &str = "CATALOG_AUTH_CLIENT_ID";
+const ENV_CATALOG_AUTH_CLIENT_SECRET: &str = "CATALOG_AUTH_CLIENT_SECRET";
+const ENV_CATALOG_AUTH_OAUTH2_SERVER_URI: &str = "CATALOG_AUTH_OAUTH2_SERVER_URI";
+const ENV_CATALOG_AUTH_SCOPE: &str = "CATALOG_AUTH_SCOPE";
+
 const CLOUD_SCHEMA_NAME: &str = "CLOUD_LHVS";
 const CLOUD_VS_NAME: &str = "CLOUD_LAKEHOUSE";
 const CLOUD_ADAPTER_SCRIPT: &str = "LAKEHOUSE_ADAPTER";
 const CLOUD_CATALOG_CONN: &str = "GLUE_CATALOG_CREDS";
 const CLOUD_CATALOG_CONN_VENDED: &str = "GLUE_CATALOG_CREDS_VENDED";
+const CLOUD_CATALOG_CONN_AUTH: &str = "CATALOG_AUTH_CREDS";
 
 // ---------------------------------------------------------------------------
 // CloudEnv: discovered credentials and endpoints
@@ -151,6 +166,144 @@ impl CloudEnv {
             use_vended_credentials: true,
             ..self.catalog_connection_password()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CatalogAuthEnv: credentials for the catalog-auth (token/OAuth) E2E test
+// ---------------------------------------------------------------------------
+
+/// Credentials and endpoints for a token/OAuth2-authenticated REST catalog E2E test.
+///
+/// Gating: same convention as the other cloud-e2e tests — returns `None` when
+/// any required variable is absent; the test early-returns (skip) rather than
+/// failing. A live catalog auth smoke run sets all vars and exercises the live path.
+struct CatalogAuthEnv {
+    catalog_uri: String,
+    catalog_warehouse: String,
+    catalog_table: String,
+    /// Static bearer token (token mode). `None` when `CATALOG_AUTH_TOKEN` is absent.
+    catalog_token: Option<String>,
+    /// OAuth2 client ID (client-credentials mode). `None` when absent.
+    catalog_client_id: Option<String>,
+    /// OAuth2 client secret (client-credentials mode). `None` when absent.
+    catalog_client_secret: Option<String>,
+    /// Optional OAuth2 token endpoint. Absent → catalog defaults to `{uri}/v1/oauth/tokens`.
+    catalog_oauth2_server_uri: Option<String>,
+    /// Optional OAuth2 scope. Absent → catalog applies its default (`catalog`).
+    catalog_scope: Option<String>,
+    exasol_host: String,
+    exasol_port: u16,
+    exasol_user: String,
+    exasol_password: String,
+}
+
+impl CatalogAuthEnv {
+    /// Attempt to read all required environment variables.
+    ///
+    /// Returns `None` when any base-required variable is absent or empty, or when
+    /// neither a token nor both OAuth client credentials are present.
+    /// Never panics; never makes a network call.
+    fn from_env() -> Option<Self> {
+        // Base required vars (catalog endpoint + Exasol connection).
+        let base_required = [
+            ENV_CATALOG_AUTH_URI,
+            ENV_CATALOG_AUTH_WAREHOUSE,
+            ENV_CATALOG_AUTH_TABLE,
+            ENV_EXASOL_HOST,
+            ENV_EXASOL_PASSWORD,
+        ];
+        for var in base_required {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => {}
+                _ => {
+                    println!("SKIPPED: catalog-auth E2E requires env var {var} — set it to enable");
+                    return None;
+                }
+            }
+        }
+
+        let catalog_token = std::env::var(ENV_CATALOG_AUTH_TOKEN)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let catalog_client_id = std::env::var(ENV_CATALOG_AUTH_CLIENT_ID)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let catalog_client_secret = std::env::var(ENV_CATALOG_AUTH_CLIENT_SECRET)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        // At least one auth mode must be configured: token or both OAuth fields.
+        let has_token = catalog_token.is_some();
+        let has_oauth = catalog_client_id.is_some() && catalog_client_secret.is_some();
+        if !has_token && !has_oauth {
+            println!(
+                "SKIPPED: catalog-auth E2E requires either {} or ({} + {}) — set one to enable",
+                ENV_CATALOG_AUTH_TOKEN, ENV_CATALOG_AUTH_CLIENT_ID, ENV_CATALOG_AUTH_CLIENT_SECRET,
+            );
+            return None;
+        }
+
+        let exasol_port = std::env::var(ENV_EXASOL_PORT)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(28563);
+
+        Some(CatalogAuthEnv {
+            catalog_uri: std::env::var(ENV_CATALOG_AUTH_URI).unwrap(),
+            catalog_warehouse: std::env::var(ENV_CATALOG_AUTH_WAREHOUSE).unwrap(),
+            catalog_table: std::env::var(ENV_CATALOG_AUTH_TABLE).unwrap(),
+            catalog_token,
+            catalog_client_id,
+            catalog_client_secret,
+            catalog_oauth2_server_uri: std::env::var(ENV_CATALOG_AUTH_OAUTH2_SERVER_URI)
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            catalog_scope: std::env::var(ENV_CATALOG_AUTH_SCOPE)
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            exasol_host: std::env::var(ENV_EXASOL_HOST).unwrap(),
+            exasol_port,
+            exasol_user: std::env::var(ENV_EXASOL_USER).unwrap_or_else(|_| "sys".to_string()),
+            exasol_password: std::env::var(ENV_EXASOL_PASSWORD).unwrap(),
+        })
+    }
+
+    /// Build the `CREATE OR REPLACE CONNECTION` SQL for the catalog-auth connection.
+    ///
+    /// Constructs the JSON password directly, injecting token or OAuth2 client-credentials
+    /// fields from the environment (mirrors the `ConnectionCreds` JSON schema consumed by
+    /// `connection.rs::parse_creds`). No credential value is embedded in any printed output.
+    fn build_create_connection_sql(&self) -> String {
+        let mut obj = serde_json::json!({
+            "warehouse": self.catalog_warehouse,
+            "use_sigv4": false,
+            "use_vended_credentials": false,
+        });
+        // Token mode: inject `token`.
+        if let Some(token) = &self.catalog_token {
+            obj["token"] = serde_json::Value::String(token.clone());
+        } else {
+            // OAuth2 client-credentials mode: inject `client_id`, `client_secret`, and
+            // optionally `oauth2_server_uri` and `scope`.
+            if let Some(client_id) = &self.catalog_client_id {
+                obj["client_id"] = serde_json::Value::String(client_id.clone());
+            }
+            if let Some(client_secret) = &self.catalog_client_secret {
+                obj["client_secret"] = serde_json::Value::String(client_secret.clone());
+            }
+            if let Some(uri) = &self.catalog_oauth2_server_uri {
+                obj["oauth2_server_uri"] = serde_json::Value::String(uri.clone());
+            }
+            if let Some(scope) = &self.catalog_scope {
+                obj["scope"] = serde_json::Value::String(scope.clone());
+            }
+        }
+        let json_pw = obj.to_string().replace('\'', "''");
+        let safe_uri = self.catalog_uri.replace('\'', "''");
+        format!(
+            "CREATE OR REPLACE CONNECTION {CLOUD_CATALOG_CONN_AUTH} TO '{safe_uri}' USER '' IDENTIFIED BY '{json_pw}'"
+        )
     }
 }
 
@@ -626,4 +779,98 @@ fn cloud_scan_reads_with_vended_credentials() {
 
     // Credential values must not appear in printed output above.
     // (Static keys and vended keys are never embedded in any printed variable.)
+}
+
+/// Catalog token/OAuth2 auth end-to-end: resolves a file list from a REST catalog
+/// that requires catalog-level authentication (static bearer token or OAuth2
+/// client-credentials grant), then asserts the VS returns rows.
+///
+/// Gating: mirrors `cloud_scan_reads_with_vended_credentials` — skips when any
+/// required environment variable is absent; env vars documented at the top of this
+/// module. No credential value is printed to test output.
+///
+/// Required env vars:
+///   CATALOG_AUTH_URI          — Iceberg REST catalog endpoint requiring auth
+///   CATALOG_AUTH_WAREHOUSE    — S3 URI of the Iceberg warehouse
+///   CATALOG_AUTH_TABLE        — Fully-qualified table name (e.g. my_db.my_table)
+///   EXASOL_HOST               — Exasol hostname/IP
+///   LH_EXASOL_PASSWORD        — Exasol password
+/// Auth (at least one mode required):
+///   CATALOG_AUTH_TOKEN                 — static bearer token (token mode)
+///   CATALOG_AUTH_CLIENT_ID             — OAuth2 client ID   \  client-credentials
+///   CATALOG_AUTH_CLIENT_SECRET         — OAuth2 client secret /  mode
+///   CATALOG_AUTH_OAUTH2_SERVER_URI     — (optional) OAuth2 token endpoint
+///   CATALOG_AUTH_SCOPE                 — (optional) OAuth2 scope
+#[test]
+fn catalog_token_oauth_auth_resolves_files_e2e() {
+    let env = match CatalogAuthEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: catalog_token_oauth_auth_resolves_files_e2e — env vars absent");
+            return;
+        }
+    };
+
+    let mut conn = CloudExaConn::connect(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let create_conn_sql = env.build_create_connection_sql();
+    conn.execute(&create_conn_sql);
+
+    let auth_vs_name = format!("{CLOUD_VS_NAME}_AUTH");
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {auth_vs_name} CASCADE"
+    ));
+
+    let namespace = env
+        .catalog_table
+        .rsplit_once('.')
+        .map_or(env.catalog_table.as_str(), |(ns, _)| ns);
+
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {auth_vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_AUTH}'
+  ICEBERG_NAMESPACE  = '{namespace}'"#
+    ));
+
+    let table_part = env
+        .catalog_table
+        .split('.')
+        .next_back()
+        .unwrap_or(&env.catalog_table)
+        .to_uppercase();
+    let vs_table = format!("{auth_vs_name}.{table_part}");
+
+    // A SELECT proves that `resolve_file_list` succeeded against the auth-gated catalog.
+    let cols = conn.query_columns(&format!("SELECT * FROM {vs_table} LIMIT 5"));
+    assert!(
+        !cols.is_empty(),
+        "catalog-auth scan must return at least one column"
+    );
+    assert!(
+        !cols[0].is_empty(),
+        "catalog-auth scan must return at least one row — catalog auth succeeded and files were resolved"
+    );
+
+    let auth_mode = if env.catalog_token.is_some() {
+        "token"
+    } else {
+        "oauth2-client-credentials"
+    };
+    println!(
+        "catalog_token_oauth_auth_resolves_files_e2e: {} columns, {} rows via {} auth",
+        cols.len(),
+        cols[0].len(),
+        auth_mode
+    );
+
+    // Token and client_secret values must not appear in any printed output above.
+    // (Auth credentials are never embedded in any variable printed above.)
 }
