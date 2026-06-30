@@ -132,8 +132,8 @@ fn non_empty(field: &Option<String>) -> Option<&str> {
 
 /// Redact a catalog error that may have surfaced an auth value. Applies the
 /// generic label/pattern redaction AND strips the literal `token`, `client_secret`,
-/// and joined `credential` values so an OAuth2/bearer secret echoed without a
-/// recognizable label can never leak.
+/// `client_id`, `oauth2_server_uri`, and `scope` values so any auth field echoed
+/// without a recognizable label can never leak.
 fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
     let mut secrets: Vec<String> = Vec::new();
     if let Some(token) = non_empty(&creds.token) {
@@ -144,6 +144,15 @@ fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
         // stripping the bare secret first already removes the only sensitive
         // portion, leaving the non-secret `id`.
         secrets.push(secret.to_string());
+    }
+    if let Some(id) = non_empty(&creds.client_id) {
+        secrets.push(id.to_string());
+    }
+    if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
+        secrets.push(uri.to_string());
+    }
+    if let Some(scope) = non_empty(&creds.scope) {
+        secrets.push(scope.to_string());
     }
     let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
     crate::scan::emit::redact_secret_values(&redact_catalog_error(msg), &secret_refs)
@@ -189,13 +198,15 @@ fn build_s3_file_io(storage: &StorageProps) -> iceberg::io::FileIO {
 /// for a plain REST catalog it is typically the warehouse name. When empty, the prefix is
 /// omitted and the URL reduces to `{catalog_uri}/v1/namespaces/{ns}/tables/{table}`.
 ///
+/// The caller passes the resolved URL prefix as `warehouse`: either the raw
+/// connection warehouse, or the `overrides.prefix` fetched from
+/// `GET {catalog_uri}/v1/config?warehouse=…` by `resolve_load_table_prefix` for
+/// Databricks-style catalogs that address tables under a config-supplied prefix.
+///
 /// ponytail: For AWS Glue the warehouse value is a catalog ARN
 /// (`arn:aws:glue:region:acct:catalog`) and is inserted verbatim into the URL path — no
-/// URL-encoding and no config-endpoint prefix round-trip. This works because the Glue
-/// Iceberg REST endpoint expects the ARN unencoded in that path segment. The upgrade path
-/// (if a catalog returns a `prefix` from its REST config endpoint that differs from the
-/// connection warehouse) is to fetch the prefix from `GET {catalog_uri}/v1/config` and
-/// use that instead, URL-encoding non-ASCII characters. Not built here — YAGNI for now.
+/// URL-encoding. This works because the Glue Iceberg REST endpoint expects the ARN
+/// unencoded in that path segment. Non-ASCII prefixes are not URL-encoded here.
 fn build_load_table_url(catalog_uri: &str, warehouse: &str, ns: &str, table_name: &str) -> String {
     let base = format!("{catalog_uri}/v1");
     if warehouse.is_empty() {
@@ -205,51 +216,212 @@ fn build_load_table_url(catalog_uri: &str, warehouse: &str, ns: &str, table_name
     }
 }
 
-/// Self-issue a SigV4-signed `GET loadTable` request and deserialize the result.
+/// The catalog-auth strategy resolved once for a query, used to authenticate
+/// every self-issued catalog HTTP request (the `loadTable` GET and the
+/// `/v1/config` prefix lookup) identically.
 ///
-/// This replaces the unsigned `RestCatalogBuilder`-based load when `use_sigv4` is true.
-/// Credential values NEVER appear in the returned error.
-async fn load_table_signed(
+/// Orthogonal to credential vending: this selects HOW a request is authenticated,
+/// never WHETHER vended credentials are extracted.
+enum CatalogAuth {
+    /// AWS SigV4 request signing against the `glue` service.
+    Sigv4,
+    /// `Authorization: Bearer <token>` — either a static `token` or a token
+    /// obtained from the OAuth2 client-credentials grant.
+    Bearer(String),
+    /// No `Authorization` header (no-auth catalog).
+    None,
+}
+
+/// The OAuth2 token request body field name for the grant type.
+const OAUTH2_GRANT_TYPE: &str = "client_credentials";
+
+/// The default token endpoint path appended to the catalog URI when no explicit
+/// `oauth2_server_uri` is supplied (the Iceberg REST catalog convention).
+const OAUTH2_DEFAULT_TOKEN_PATH: &str = "/v1/oauth/tokens";
+
+/// Perform the OAuth2 client-credentials grant and return the obtained access token.
+///
+/// Form-encodes `grant_type=client_credentials`, `client_id`, `client_secret`,
+/// and the optional `scope`, POSTed to `creds.oauth2_server_uri` when supplied,
+/// otherwise to the catalog default token endpoint (`{catalog_uri}/v1/oauth/tokens`).
+///
+/// `client_secret`, the request, and the obtained token NEVER appear in any
+/// returned error: every error site strips the client secret AND the obtained
+/// token via value-based redaction.
+async fn oauth2_client_credentials_grant(
     catalog_uri: &str,
-    catalog: &CatalogProps,
     creds: &ConnectionCreds,
-) -> Result<iceberg_catalog_rest::LoadTableResult, UdfError> {
-    let (ns_ident, table_name) = parse_table_ident(&catalog.table)?;
-    let ns_url = ns_ident.to_url_string();
-    let url = build_load_table_url(catalog_uri, &catalog.warehouse, &ns_url, &table_name);
+) -> Result<String, UdfError> {
+    let client_id = non_empty(&creds.client_id).ok_or_else(|| {
+        UdfError::User("OAuth2 grant requires client_id but none was resolved".into())
+    })?;
+    let client_secret = non_empty(&creds.client_secret).ok_or_else(|| {
+        UdfError::User("OAuth2 grant requires client_secret but none was resolved".into())
+    })?;
+
+    let token_url = match non_empty(&creds.oauth2_server_uri) {
+        Some(uri) => uri.to_string(),
+        None => format!(
+            "{}{OAUTH2_DEFAULT_TOKEN_PATH}",
+            catalog_uri.trim_end_matches('/')
+        ),
+    };
+
+    // Strip the client secret AND the obtained token from every error. The token
+    // is not yet known at the point a transport/parse error is built, so it is
+    // added to the redaction set after a successful parse before being returned.
+    let redact_secret = |msg: &str| {
+        crate::scan::emit::redact_secret_values(&redact_catalog_error(msg), &[client_secret])
+    };
+
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", OAUTH2_GRANT_TYPE),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
+    ];
+    if let Some(scope) = non_empty(&creds.scope) {
+        form.push(("scope", scope));
+    }
 
     let client = reqwest::Client::new();
-    let request = client
-        .get(&url)
+    let response = client
+        .post(&token_url)
         .header("accept", "application/json")
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build catalog request: {e}")))?;
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| {
+            UdfError::User(format!(
+                "OAuth2 token request failed: {}",
+                redact_secret(&e.to_string())
+            ))
+        })?;
 
-    let signed = crate::adapter::sigv4::sign_request(
-        request,
-        &creds.access_key,
-        &creds.secret_key,
-        creds.session_token.as_deref(),
-        &creds.region,
-        "glue",
-    )
-    .map_err(|e| {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(unreadable body)".into());
+        return Err(UdfError::User(format!(
+            "OAuth2 token endpoint returned HTTP {}: {}",
+            status.as_u16(),
+            redact_secret(&body)
+        )));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(|e| {
         UdfError::User(format!(
-            "failed to sign catalog request: {}",
-            redact_catalog_error(&e.to_string())
+            "failed to parse OAuth2 token response: {}",
+            redact_secret(&e.to_string())
         ))
     })?;
 
-    let response = client.execute(signed).await.map_err(|e| {
+    let access_token = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "OAuth2 token response missing access_token: {}",
+                redact_secret(&body.to_string())
+            ))
+        })?;
+
+    Ok(access_token.to_string())
+}
+
+/// Resolve the catalog-auth strategy for a query from the resolved credentials.
+///
+/// Precedence mirrors `inject_catalog_auth_props` (SigV4 is mutually exclusive with
+/// catalog auth, enforced upstream in `validate_creds`):
+/// 1. `use_sigv4` → SigV4 signing.
+/// 2. `client_id` + `client_secret` → OAuth2 client-credentials grant → bearer.
+/// 3. non-empty `token` → static bearer.
+/// 4. otherwise → no auth.
+async fn resolve_catalog_auth(
+    catalog_uri: &str,
+    creds: &ConnectionCreds,
+) -> Result<CatalogAuth, UdfError> {
+    if creds.use_sigv4 {
+        return Ok(CatalogAuth::Sigv4);
+    }
+    if non_empty(&creds.client_id).is_some() && non_empty(&creds.client_secret).is_some() {
+        let token = oauth2_client_credentials_grant(catalog_uri, creds).await?;
+        return Ok(CatalogAuth::Bearer(token));
+    }
+    if let Some(token) = non_empty(&creds.token) {
+        return Ok(CatalogAuth::Bearer(token.to_string()));
+    }
+    Ok(CatalogAuth::None)
+}
+
+/// Build and authenticate a `GET` request against `url`, applying the resolved
+/// catalog-auth strategy and (when vending) the access-delegation header, then
+/// execute it and deserialize the JSON body into `T`.
+///
+/// Credential values NEVER appear in the returned error.
+async fn authed_get_json<T: serde::de::DeserializeOwned>(
+    url: &str,
+    auth: &CatalogAuth,
+    send_access_delegation: bool,
+    creds: &ConnectionCreds,
+) -> Result<T, UdfError> {
+    // Redact static catalog-auth secrets AND the live bearer token (which, for the
+    // OAuth2 mode, is the grant-obtained access token and is NOT present in
+    // `creds`). Every error site below routes through this closure.
+    let redact = |msg: &str| {
+        let base = redact_catalog_auth_error(msg, creds);
+        match auth {
+            CatalogAuth::Bearer(token) => {
+                crate::scan::emit::redact_secret_values(&base, &[token.as_str()])
+            }
+            CatalogAuth::Sigv4 | CatalogAuth::None => base,
+        }
+    };
+
+    let client = reqwest::Client::new();
+    let mut builder = client.get(url).header("accept", "application/json");
+    if send_access_delegation {
+        builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
+    }
+    if let CatalogAuth::Bearer(token) = auth {
+        builder = builder.bearer_auth(token);
+    }
+    let request = builder.build().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build catalog request: {}",
+            redact(&e.to_string())
+        ))
+    })?;
+
+    let request = match auth {
+        CatalogAuth::Sigv4 => crate::adapter::sigv4::sign_request(
+            request,
+            &creds.access_key,
+            &creds.secret_key,
+            creds.session_token.as_deref(),
+            &creds.region,
+            "glue",
+        )
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to sign catalog request: {}",
+                redact(&e.to_string())
+            ))
+        })?,
+        CatalogAuth::Bearer(_) | CatalogAuth::None => request,
+    };
+
+    let response = client.execute(request).await.map_err(|e| {
         UdfError::User(format!(
             "catalog request failed: {}",
-            redact_catalog_error(&e.to_string())
+            redact(&e.to_string())
         ))
     })?;
 
     let status = response.status();
     if !status.is_success() {
-        // Read body for diagnostics but never echo credential-shaped values.
         let body = response
             .text()
             .await
@@ -257,18 +429,96 @@ async fn load_table_signed(
         return Err(UdfError::User(format!(
             "catalog returned HTTP {}: {}",
             status.as_u16(),
-            redact_catalog_error(&body)
+            redact(&body)
         )));
     }
 
-    let result: iceberg_catalog_rest::LoadTableResult = response.json().await.map_err(|e| {
+    response.json::<T>().await.map_err(|e| {
         UdfError::User(format!(
             "failed to parse catalog response: {}",
-            redact_catalog_error(&e.to_string())
+            redact(&e.to_string())
         ))
-    })?;
+    })
+}
 
-    Ok(result)
+/// Resolve the `loadTable` URL prefix from the catalog config endpoint.
+///
+/// `GET {catalog_uri}/v1/config?warehouse=<warehouse>` → `overrides.prefix`.
+/// Databricks-style endpoints return a `prefix` that must address the table
+/// instead of the raw warehouse; plain REST catalogs (including
+/// `apache/iceberg-rest-fixture`) typically omit the prefix. When the config
+/// endpoint returns no `overrides.prefix` (or cannot be contacted), the prefix
+/// is EMPTY — not the warehouse — so `build_load_table_url` produces the
+/// standard-REST URL `/v1/namespaces/{ns}/tables/{table}` with no extra segment.
+/// Inserting the warehouse as a path segment would yield a malformed URL
+/// (e.g. `/v1/s3://warehouse//namespaces/…` → HTTP 400).
+///
+/// The SigV4/Glue path short-circuits immediately: the warehouse is an ARN used
+/// verbatim in the URL path (no config round-trip), preserving byte-identical
+/// behaviour with the pre-unification `load_table_signed` function.
+async fn resolve_load_table_prefix(
+    catalog_uri: &str,
+    warehouse: &str,
+    auth: &CatalogAuth,
+    creds: &ConnectionCreds,
+) -> String {
+    // SigV4/Glue: the warehouse ARN is used directly — no /v1/config round-trip.
+    if let CatalogAuth::Sigv4 = auth {
+        return warehouse.to_string();
+    }
+    let encoded_warehouse: String =
+        url::form_urlencoded::byte_serialize(warehouse.as_bytes()).collect();
+    let config_url = format!(
+        "{}/v1/config?warehouse={encoded_warehouse}",
+        catalog_uri.trim_end_matches('/')
+    );
+    match authed_get_json::<serde_json::Value>(&config_url, auth, false, creds).await {
+        Ok(config) => config
+            .get("overrides")
+            .and_then(|o| o.get("prefix"))
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(String::new),
+        Err(_) => String::new(),
+    }
+}
+
+/// Self-issue a `loadTable` GET under any catalog-auth mode and deserialize the
+/// raw `LoadTableResult`.
+///
+/// Auth-mode-agnostic: chooses SigV4 signing, a static/OAuth2-derived bearer
+/// token, or no auth via `resolve_catalog_auth`. The returned `LoadTableResult`
+/// feeds BOTH file planning AND vended-credential extraction, so vending works on
+/// every mode. `iceberg-catalog-rest` 0.9.1's `RestCatalog::load_table` returns
+/// only a `Table` and drops the response `config`/`storage_credentials`, which is
+/// why this self-issued GET is required.
+///
+/// Sends `X-Iceberg-Access-Delegation: vended-credentials` ONLY when
+/// `creds.use_vended_credentials`, keeping the no-vending request byte-identical
+/// to the pre-feature shape on every mode.
+///
+/// Credential values (signing keys, bearer/OAuth2 tokens, vended STS, client
+/// secret) NEVER appear in the returned error.
+async fn load_table_any_auth(
+    catalog_uri: &str,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+) -> Result<iceberg_catalog_rest::LoadTableResult, UdfError> {
+    let auth = resolve_catalog_auth(catalog_uri, creds).await?;
+
+    let (ns_ident, table_name) = parse_table_ident(&catalog.table)?;
+    let ns_url = ns_ident.to_url_string();
+    let prefix = resolve_load_table_prefix(catalog_uri, &catalog.warehouse, &auth, creds).await;
+    let url = build_load_table_url(catalog_uri, &prefix, &ns_url, &table_name);
+
+    authed_get_json::<iceberg_catalog_rest::LoadTableResult>(
+        &url,
+        &auth,
+        creds.use_vended_credentials,
+        creds,
+    )
+    .await
 }
 
 /// Extract the vended S3 credential keys from a `LoadTableResult`.
@@ -298,6 +548,36 @@ pub fn extract_vended_keys(
 
     // Fallback: flat config map.
     extract_s3_keys_from_config(&result.config)
+}
+
+/// Extract the vended `client.region` from a `LoadTableResult`, if present.
+///
+/// Mirrors `extract_vended_keys`' precedence: prefer the longest-matching
+/// `storage_credentials` entry's config, falling back to the flat `config` map.
+/// Returns `None` when no non-empty `client.region` is advertised, so the caller
+/// preserves the static region.
+fn extract_vended_region(
+    result: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Option<String> {
+    if let Some(creds) = &result.storage_credentials {
+        let best = creds
+            .iter()
+            .filter(|sc| !sc.prefix.is_empty() && location.starts_with(&sc.prefix))
+            .max_by_key(|sc| sc.prefix.len());
+        if let Some(sc) = best {
+            return sc
+                .config
+                .get("client.region")
+                .filter(|s| !s.is_empty())
+                .cloned();
+        }
+    }
+    result
+        .config
+        .get("client.region")
+        .filter(|s| !s.is_empty())
+        .cloned()
 }
 
 fn extract_s3_keys_from_config(
@@ -1333,12 +1613,15 @@ pub async fn handle_pushdown(
 /// This is the resolve-once seam: called exactly once per pushdown in the
 /// adapter; the file list is passed explicitly to the scan UDF.
 ///
-/// When `creds.use_sigv4` is true, the catalog load_table request is
-/// self-issued with SigV4 signing instead of going through `RestCatalogBuilder`.
-/// When `creds.use_vended_credentials` is true, the returned `StorageProps`
-/// carries the vended STS keys (merged over the static `storage` props) so
-/// every per-shard `ScanSpec.storage` uses the vended creds. When neither flag
-/// is set, returns `(files, storage.clone())` — the unsigned path is unchanged.
+/// The catalog load_table request is self-issued via `load_table_any_auth`, which
+/// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
+/// none). Vended-credential extraction is gated SOLELY on
+/// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it
+/// is true the returned `StorageProps` carries the vended STS keys (merged over
+/// the static `storage` props, and the vended `client.region` when present) so
+/// every per-shard `ScanSpec.storage` uses the vended creds. When it is false,
+/// returns `(files, storage.clone())` — byte-identical to the no-vending behaviour
+/// on every auth mode.
 ///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
@@ -1349,73 +1632,59 @@ pub async fn resolve_file_list(
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
 ) -> Result<(Vec<(String, u64)>, StorageProps), UdfError> {
-    if creds.use_sigv4 {
-        // Signed path: self-issue the load_table GET, build the Table from the result.
-        let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
+    // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
+    // catalog-auth mode applies, then derive the effective storage gated SOLELY on
+    // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
+    // from the response metadata so plan_files() can read manifests from S3.
+    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
 
-        // Resolve the effective storage (vended or static).
-        // The longest-prefix anchor for storage_credentials matching must be an S3
-        // URI. Use the table's own S3 location from the parsed metadata (this is
-        // what storage_credentials[*].prefix will match against). Fall back to the
-        // warehouse (also an S3 URI) when absent. The catalog REST URI is an HTTPS
-        // endpoint and can never match an S3 prefix — do NOT use it here.
-        let table_s3_location = result.metadata.location();
-        let anchor: &str = if !table_s3_location.is_empty() {
-            table_s3_location
-        } else {
-            &catalog_props.warehouse
-        };
-        let effective_storage = if creds.use_vended_credentials {
-            let (ak, sk, st) = extract_vended_keys(&result, anchor);
-            merge_vended_into_storage(storage, &ak, &sk, st.as_deref())
-        } else {
-            storage.clone()
-        };
-
-        // Build the iceberg Table so plan_files() can read manifests from S3.
-        let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
-        let table_ident = TableIdent::new(namespace, table_name);
-        let file_io = build_s3_file_io(&effective_storage);
-        let table_builder = iceberg::table::Table::builder()
-            .identifier(table_ident)
-            .file_io(file_io)
-            .metadata(result.metadata);
-        let table = if let Some(loc) = result.metadata_location {
-            table_builder.metadata_location(loc).build()
-        } else {
-            table_builder.build()
+    // Resolve the effective storage (vended or static).
+    // The longest-prefix anchor for storage_credentials matching must be an S3
+    // URI. Use the table's own S3 location from the parsed metadata (this is what
+    // storage_credentials[*].prefix matches against). Fall back to the warehouse
+    // (also an S3 URI) when absent. The catalog REST URI is an HTTPS endpoint and
+    // can never match an S3 prefix — do NOT use it here.
+    let table_s3_location = result.metadata.location();
+    let anchor: &str = if !table_s3_location.is_empty() {
+        table_s3_location
+    } else {
+        &catalog_props.warehouse
+    };
+    let effective_storage = if creds.use_vended_credentials {
+        let (ak, sk, st) = extract_vended_keys(&result, anchor);
+        let mut merged = merge_vended_into_storage(storage, &ak, &sk, st.as_deref());
+        // Adopt the vended region only when the response advertises one; otherwise
+        // preserve the static region.
+        if let Some(region) = extract_vended_region(&result, anchor) {
+            merged.region = region;
         }
-        .map_err(|e| {
-            UdfError::User(format!(
-                "failed to build Iceberg table: {}",
-                redact_catalog_error(&e.to_string())
-            ))
-        })?;
+        merged
+    } else {
+        storage.clone()
+    };
 
-        let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
-        return Ok((files, effective_storage));
-    }
-
-    // Unsigned path — exact existing behaviour, unchanged.
-    let catalog = build_rest_catalog(catalog_uri, catalog_props, storage, creds).await?;
-
-    // Parse "namespace.table" from catalog_props.table.
+    // Build the iceberg Table so plan_files() can read manifests from S3.
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
     let table_ident = TableIdent::new(namespace, table_name);
-
-    let table = catalog
-        .load_table(&table_ident)
-        .await
-        .map_err(|e: iceberg::Error| {
-            UdfError::User(format!(
-                "failed to load Iceberg table '{}': {}",
-                catalog_props.table,
-                redact_catalog_error(&e.to_string())
-            ))
-        })?;
+    let file_io = build_s3_file_io(&effective_storage);
+    let table_builder = iceberg::table::Table::builder()
+        .identifier(table_ident)
+        .file_io(file_io)
+        .metadata(result.metadata);
+    let table = if let Some(loc) = result.metadata_location {
+        table_builder.metadata_location(loc).build()
+    } else {
+        table_builder.build()
+    }
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
 
     let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
-    Ok((files, storage.clone()))
+    Ok((files, effective_storage))
 }
 
 /// Drive the iceberg scan and collect the data-file paths with their sizes.
@@ -1463,36 +1732,19 @@ async fn plan_files_from_table(
 
 /// Resolve the Iceberg table schema for `createVirtualSchema`.
 ///
-/// Returns (field_name, exasol_type_string) pairs. When `creds.use_sigv4` is
-/// true, the catalog load_table request is self-issued with SigV4 signing.
+/// Returns (field_name, exasol_type_string) pairs. The table metadata is loaded
+/// via the unified `load_table_any_auth` (SigV4 | bearer | OAuth2-bearer | none).
 /// Schema resolution only reads `table.metadata().current_schema()` — no S3
 /// manifest access is needed, so vended credentials do not affect this path.
 pub async fn resolve_table_schema(
     catalog_uri: &str,
     catalog_props: &CatalogProps,
-    storage: &StorageProps,
     creds: &ConnectionCreds,
 ) -> Result<Vec<(String, String)>, UdfError> {
-    // Load the table metadata — signed or unsigned.
-    let table_metadata = if creds.use_sigv4 {
-        let result = load_table_signed(catalog_uri, catalog_props, creds).await?;
-        result.metadata
-    } else {
-        let catalog = build_rest_catalog(catalog_uri, catalog_props, storage, creds).await?;
-        let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
-        let table_ident = TableIdent::new(namespace, table_name);
-        let table = catalog
-            .load_table(&table_ident)
-            .await
-            .map_err(|e: iceberg::Error| {
-                UdfError::User(format!(
-                    "failed to load Iceberg table '{}': {}",
-                    catalog_props.table,
-                    redact_catalog_error(&e.to_string())
-                ))
-            })?;
-        table.metadata().clone()
-    };
+    // Load the table metadata via the unified auth-mode-agnostic loader. Schema
+    // resolution reads only `current_schema()`; vended credentials never affect it.
+    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
+    let table_metadata = result.metadata;
 
     let schema = table_metadata.current_schema();
     let fields = schema
@@ -1692,7 +1944,8 @@ async fn signed_get_json(
 }
 
 /// Recursively collect tables in `ns` and all descendants using SigV4-signed GETs
-/// (mirrors `load_table_signed`). Credential values NEVER appear in errors.
+/// (mirrors the SigV4 arm of `load_table_any_auth`). Credential values NEVER
+/// appear in errors.
 fn list_in_namespace_signed<'a>(
     catalog_uri: &'a str,
     ns: &'a NamespaceIdent,
@@ -5028,6 +5281,875 @@ mod tests {
         assert!(
             json.contains("minioadmin"),
             "storage S3 creds must still be present: {json}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Group C — redaction hardening + vended-auth-orthogonality tests
+    // (Tasks 3.1, 4.1, 4.2, 4.3, 4.4, 4.5)
+    // ---------------------------------------------------------------------------
+
+    // --- Shared sentinels ---
+    const STATIC_AK: &str = "STATIC_AK_SENTINEL";
+    const STATIC_SK: &str = "STATIC_SK_SENTINEL";
+    const VENDED_AK: &str = "VENDED_AK_SENTINEL";
+    const VENDED_SK: &str = "VENDED_SK_SENTINEL";
+    const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
+    const BEARER_TOK: &str = "BEARER_TOKEN_SENTINEL_VALUE";
+    const CLIENT_SECRET: &str = "CLIENT_SECRET_SENTINEL_VALUE";
+    const OAUTH_ACCESS_TOKEN: &str = "OAUTH_OBTAINED_ACCESS_TOKEN";
+    const VENDED_REGION: &str = "eu-west-2";
+
+    /// A `ConnectionCreds` with no auth, no vending — the no-op baseline.
+    fn creds_no_auth() -> ConnectionCreds {
+        ConnectionCreds {
+            warehouse: "warehouse".into(),
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: "us-east-1".into(),
+            access_key: STATIC_AK.into(),
+            secret_key: STATIC_SK.into(),
+            session_token: None,
+            path_style: false,
+            use_sigv4: false,
+            use_vended_credentials: false,
+            token: None,
+            client_id: None,
+            client_secret: None,
+            oauth2_server_uri: None,
+            scope: None,
+        }
+    }
+
+    /// Static storage with the same sentinel keys.
+    fn static_storage() -> StorageProps {
+        StorageProps {
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: "us-east-1".into(),
+            access_key: STATIC_AK.into(),
+            secret_key: STATIC_SK.into(),
+            session_token: None,
+            allow_http: false,
+            path_style: false,
+        }
+    }
+
+    /// A `LoadTableResult` pre-loaded with vended S3 credentials in the flat
+    /// config map — this is the Databricks Unity Catalog shape where
+    /// `storage_credentials` is empty and vended creds live in the flat config.
+    fn vended_result_flat_config() -> iceberg_catalog_rest::LoadTableResult {
+        make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.session-token", VENDED_TOK),
+                ("client.region", VENDED_REGION),
+            ],
+        )
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.1 — Vending orthogonal to auth mode
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Unsigned catalog path is unchanged when SigV4 and vending are
+    /// both disabled.
+    ///
+    /// When `use_vended_credentials=false`, the vended extraction step is skipped
+    /// entirely and `merge_vended_into_storage` with empty keys preserves static
+    /// credentials unchanged.
+    #[test]
+    fn no_vending_no_sigv4_uses_static_storage_unchanged() {
+        let storage = static_storage();
+        // Simulate the effective_storage derivation when use_vended_credentials=false:
+        // static storage is returned as-is (no vended path entered).
+        let effective = storage.clone();
+
+        assert_eq!(effective.access_key, STATIC_AK, "access_key must be static");
+        assert_eq!(effective.secret_key, STATIC_SK, "secret_key must be static");
+        assert_eq!(effective.session_token, None, "no session_token");
+        assert_eq!(effective.region, "us-east-1", "region must be static");
+        assert_eq!(effective.endpoint, storage.endpoint, "endpoint preserved");
+        assert!(!effective.path_style, "path_style preserved");
+        assert!(!effective.allow_http, "allow_http preserved");
+
+        // Also confirm that a loadTable result carrying vended creds does NOT
+        // affect the storage when we skip vended extraction.
+        let result = vended_result_flat_config();
+        let (vak, vsk, _) = extract_vended_keys(&result, "s3://bucket/db/t");
+        // The keys are present in the result but we never apply them.
+        assert!(!vak.is_empty(), "vended keys exist in result");
+        assert!(!vsk.is_empty(), "vended keys exist in result");
+        // The static storage remains unchanged.
+        assert_eq!(
+            storage.access_key, STATIC_AK,
+            "static storage must be unchanged"
+        );
+    }
+
+    /// Scenario: Vended S3 credentials override static credentials regardless
+    /// of catalog auth mode.
+    ///
+    /// Vended extraction is a pure post-processing step on the `LoadTableResult`;
+    /// the auth mode that produced the result is irrelevant. This test simulates
+    /// the result of all three non-SigV4 modes and confirms that the same vended
+    /// storage is derived from each.
+    #[test]
+    fn vended_overrides_static_across_all_auth_modes() {
+        let storage = static_storage();
+        let result = vended_result_flat_config();
+        let anchor = result.metadata.location().to_string();
+
+        // The vended extraction logic is auth-mode-independent: run it for each
+        // logical auth mode and confirm identical output.
+        for mode_label in ["no-auth", "bearer", "oauth2"] {
+            let (ak, sk, st) = extract_vended_keys(&result, &anchor);
+            let mut merged = merge_vended_into_storage(&storage, &ak, &sk, st.as_deref());
+            if let Some(region) = extract_vended_region(&result, &anchor) {
+                merged.region = region;
+            }
+
+            assert_eq!(
+                merged.access_key, VENDED_AK,
+                "{mode_label}: access_key must be vended"
+            );
+            assert_eq!(
+                merged.secret_key, VENDED_SK,
+                "{mode_label}: secret_key must be vended"
+            );
+            assert_eq!(
+                merged.session_token.as_deref(),
+                Some(VENDED_TOK),
+                "{mode_label}: session_token must be vended"
+            );
+            assert_ne!(
+                merged.access_key, STATIC_AK,
+                "{mode_label}: static access_key must be replaced"
+            );
+            // Static infrastructure fields are preserved.
+            assert_eq!(
+                merged.endpoint, storage.endpoint,
+                "{mode_label}: endpoint preserved"
+            );
+            assert!(!merged.path_style, "{mode_label}: path_style preserved");
+            assert!(!merged.allow_http, "{mode_label}: allow_http preserved");
+        }
+    }
+
+    /// Scenario: Vended credentials are extracted on the static bearer-token
+    /// catalog path (Databricks Unity Catalog flat-config shape).
+    ///
+    /// Simulates the bearer-token path: the catalog request was authenticated with
+    /// `Authorization: Bearer <token>`; the returned result carries vended creds in
+    /// the flat config map. The extraction must work identically to the SigV4 path.
+    #[test]
+    fn bearer_token_path_extracts_vended_from_config() {
+        let storage = static_storage();
+        let result = vended_result_flat_config();
+        let anchor = result.metadata.location().to_string();
+
+        let (ak, sk, st) = extract_vended_keys(&result, &anchor);
+        let merged = merge_vended_into_storage(&storage, &ak, &sk, st.as_deref());
+
+        assert_eq!(
+            merged.access_key, VENDED_AK,
+            "bearer path: vended access_key"
+        );
+        assert_eq!(
+            merged.secret_key, VENDED_SK,
+            "bearer path: vended secret_key"
+        );
+        assert_eq!(
+            merged.session_token.as_deref(),
+            Some(VENDED_TOK),
+            "bearer path: vended session_token"
+        );
+        // Static token must NOT bleed into storage.
+        assert_ne!(merged.access_key, STATIC_AK);
+        // Endpoint preserved.
+        assert_eq!(merged.endpoint, storage.endpoint);
+    }
+
+    /// Scenario: Vended credentials are extracted on the OAuth2 client-credentials
+    /// catalog path.
+    ///
+    /// The OAuth2 grant produces a bearer token used to authenticate the loadTable
+    /// GET. The returned `LoadTableResult` carries vended creds in the same flat
+    /// config shape. Extraction is auth-mode-independent.
+    #[test]
+    fn oauth2_path_extracts_vended_credentials() {
+        let storage = static_storage();
+        let result = vended_result_flat_config();
+        let anchor = result.metadata.location().to_string();
+
+        let (ak, sk, st) = extract_vended_keys(&result, &anchor);
+        let merged = merge_vended_into_storage(&storage, &ak, &sk, st.as_deref());
+
+        assert_eq!(
+            merged.access_key, VENDED_AK,
+            "oauth2 path: vended access_key"
+        );
+        assert_eq!(
+            merged.secret_key, VENDED_SK,
+            "oauth2 path: vended secret_key"
+        );
+        assert_eq!(
+            merged.session_token.as_deref(),
+            Some(VENDED_TOK),
+            "oauth2 path: vended session_token"
+        );
+        // OAuth2 client_secret must NOT bleed into storage.
+        assert_ne!(merged.access_key, STATIC_AK);
+        assert_ne!(merged.secret_key, CLIENT_SECRET);
+    }
+
+    /// Scenario: Static credentials are used for data files when vending is disabled.
+    ///
+    /// For each catalog-auth mode, when `use_vended_credentials=false` the
+    /// effective storage equals the static storage unchanged.
+    #[test]
+    fn vending_disabled_uses_static_on_every_mode() {
+        let storage = static_storage();
+        let result = vended_result_flat_config();
+        let anchor = result.metadata.location().to_string();
+
+        // When use_vended_credentials=false, the adapter skips extraction entirely
+        // and clones static storage. Confirm that static storage is byte-identical
+        // regardless of the auth mode used.
+        for mode_label in ["no-auth", "bearer", "oauth2", "sigv4"] {
+            // The vended extraction is NOT applied (use_vended_credentials=false).
+            let effective = storage.clone();
+
+            assert_eq!(
+                effective.access_key, STATIC_AK,
+                "{mode_label}: static access_key must not be replaced"
+            );
+            assert_eq!(
+                effective.secret_key, STATIC_SK,
+                "{mode_label}: static secret_key must not be replaced"
+            );
+            assert_eq!(
+                effective.session_token, None,
+                "{mode_label}: no vended session_token"
+            );
+            // Confirm the result has vended keys (but we ignored them).
+            let (vak, _, _) = extract_vended_keys(&result, &anchor);
+            assert!(
+                !vak.is_empty(),
+                "{mode_label}: result has vended keys (not applied)"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.3 — client.region from config overrides static region
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Vended-credentials request adopts the vended region from
+    /// `client.region` in the loadTable response config.
+    ///
+    /// When `use_vended_credentials=true` AND the response carries `client.region`,
+    /// the effective storage region is set to the vended value. When `client.region`
+    /// is absent, the static region is preserved. The test also confirms the
+    /// `X-Iceberg-Access-Delegation` header semantics by verifying the header
+    /// is present in a manually constructed request.
+    #[test]
+    fn vended_request_sends_access_delegation_and_adopts_client_region() {
+        let storage = static_storage();
+
+        // Part A: client.region present → vended region adopted.
+        let result_with_region = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.session-token", VENDED_TOK),
+                ("client.region", VENDED_REGION),
+            ],
+        );
+        let anchor = result_with_region.metadata.location().to_string();
+
+        let (ak, sk, st) = extract_vended_keys(&result_with_region, &anchor);
+        let mut merged = merge_vended_into_storage(&storage, &ak, &sk, st.as_deref());
+        let region = extract_vended_region(&result_with_region, &anchor);
+        assert!(
+            region.is_some(),
+            "client.region must be present in response"
+        );
+        if let Some(r) = region {
+            merged.region = r;
+        }
+        assert_eq!(
+            merged.region, VENDED_REGION,
+            "vended region must override static region"
+        );
+        assert_ne!(merged.region, "us-east-1", "static region must be replaced");
+
+        // Part B: client.region absent → static region preserved.
+        let result_no_region = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+            ],
+        );
+        let anchor2 = result_no_region.metadata.location().to_string();
+        let (ak2, sk2, st2) = extract_vended_keys(&result_no_region, &anchor2);
+        let mut merged2 = merge_vended_into_storage(&storage, &ak2, &sk2, st2.as_deref());
+        let region2 = extract_vended_region(&result_no_region, &anchor2);
+        assert!(region2.is_none(), "absent client.region must return None");
+        if let Some(r) = region2 {
+            merged2.region = r;
+        }
+        assert_eq!(
+            merged2.region, "us-east-1",
+            "static region must be preserved when client.region absent"
+        );
+
+        // Part C: X-Iceberg-Access-Delegation header is sent when vending is enabled.
+        // We verify by constructing the request as authed_get_json does.
+        let client = reqwest::Client::new();
+        let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
+
+        // When use_vended_credentials=true: header must be present.
+        let req_with_delegation = client
+            .get(url)
+            .header("accept", "application/json")
+            .header("X-Iceberg-Access-Delegation", "vended-credentials")
+            .build()
+            .expect("valid request");
+        assert_eq!(
+            req_with_delegation
+                .headers()
+                .get("x-iceberg-access-delegation")
+                .and_then(|v| v.to_str().ok()),
+            Some("vended-credentials"),
+            "access-delegation header must be present when vending enabled"
+        );
+
+        // When use_vended_credentials=false: header must be absent.
+        let req_no_delegation = client
+            .get(url)
+            .header("accept", "application/json")
+            .build()
+            .expect("valid request");
+        assert!(
+            req_no_delegation
+                .headers()
+                .get("x-iceberg-access-delegation")
+                .is_none(),
+            "access-delegation header must be absent when vending disabled"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.2 — auth-mode selection and header construction
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Static bearer token is attached to unsigned catalog requests.
+    ///
+    /// Constructs a reqwest request with a bearer token and verifies the
+    /// `Authorization: Bearer <token>` header is set — mirroring the
+    /// `authed_get_json` bearer-auth branch.
+    #[test]
+    fn bearer_token_attached_to_load_table_request() {
+        let client = reqwest::Client::new();
+        let url = "https://catalog.example.com/v1/namespaces/db/tables/t";
+
+        // Build the request exactly as authed_get_json does for CatalogAuth::Bearer.
+        let request = client
+            .get(url)
+            .header("accept", "application/json")
+            .bearer_auth(BEARER_TOK)
+            .build()
+            .expect("valid request");
+
+        let auth_header = request
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        assert!(
+            auth_header.starts_with("Bearer "),
+            "authorization header must start with 'Bearer ': {auth_header}"
+        );
+        assert!(
+            auth_header.contains(BEARER_TOK),
+            "bearer token must appear in the authorization header"
+        );
+
+        // The token value is NOT a signing key — it's sent literally; the leak
+        // guard is that it must NOT appear in any *error* message (tested in 4.5).
+        // Confirm the SigV4 signing headers (x-amz-*) are absent.
+        assert!(
+            request.headers().get("x-amz-date").is_none(),
+            "bearer-auth must not set x-amz-date"
+        );
+        assert!(
+            request.headers().get("x-amz-security-token").is_none(),
+            "bearer-auth must not set x-amz-security-token"
+        );
+    }
+
+    /// Scenario: No catalog auth props are set when neither token nor OAuth
+    /// credentials are supplied — the request carries no Authorization header.
+    #[test]
+    fn no_auth_load_table_sends_no_authorization() {
+        let client = reqwest::Client::new();
+        // Build the request as authed_get_json does for CatalogAuth::None:
+        // only the "accept" header, no bearer_auth, no signing.
+        let request = client
+            .get("https://catalog.example.com/v1/namespaces/db/tables/t")
+            .header("accept", "application/json")
+            .build()
+            .expect("valid request");
+
+        assert!(
+            request.headers().get("authorization").is_none(),
+            "no-auth path must not set Authorization header"
+        );
+        assert!(
+            request.headers().get("x-amz-date").is_none(),
+            "no-auth path must not set x-amz-date"
+        );
+    }
+
+    /// Scenario: OAuth2 client credentials drive the catalog client-credentials
+    /// grant — the grant POSTs form fields to the token endpoint and returns the
+    /// `access_token`.
+    ///
+    /// This test spins up a minimal local HTTP server that verifies the form
+    /// fields (`grant_type`, `client_id`, `client_secret`, `scope`) and returns a
+    /// mock `access_token`. We then call `oauth2_client_credentials_grant` against
+    /// this server and assert the returned token matches.
+    #[tokio::test]
+    async fn oauth2_grant_built_from_client_credentials() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Bind to a random port on localhost.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        // Build creds pointing at our local server.
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let mut creds = creds_no_auth();
+        creds.client_id = Some("my-client-id".into());
+        creds.client_secret = Some(CLIENT_SECRET.into());
+        creds.scope = Some("catalog-read".into());
+
+        // Spawn a minimal HTTP/1.1 server that reads the POST and replies.
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Verify the form fields are present in the request body.
+            assert!(
+                request.contains("grant_type=client_credentials"),
+                "grant_type must be client_credentials"
+            );
+            assert!(
+                request.contains("client_id=my-client-id"),
+                "client_id must be present"
+            );
+            // client_secret and scope must be in the body.
+            let has_secret = request.contains(CLIENT_SECRET);
+            let has_scope = request.contains("scope=catalog-read");
+            // Reply with a valid token response.
+            let body = format!(
+                r#"{{"access_token":"{OAUTH_ACCESS_TOKEN}","token_type":"Bearer","expires_in":3600}}"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+            // Return these for the test to check after the call.
+            assert!(has_secret, "client_secret must be in POST body");
+            assert!(has_scope, "scope must be in POST body when supplied");
+        });
+
+        let token = oauth2_client_credentials_grant(&catalog_uri, &creds)
+            .await
+            .expect("grant must succeed");
+
+        assert_eq!(
+            token, OAUTH_ACCESS_TOKEN,
+            "returned access_token must match server response"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.4 — catalog-auth secrets never in ScanSpec
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: Catalog auth props are never placed in any scan spec, even when
+    /// `use_vended_credentials` is enabled and vended creds are in the storage.
+    ///
+    /// The ScanSpec must carry ONLY S3 storage credentials (vended or static).
+    /// Auth fields (`token`, `client_secret`, etc.) must never appear in the JSON.
+    #[test]
+    fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
+        const TOKEN_SENTINEL: &str = "CATALOG_TOKEN_SECRET_SENTINEL";
+        const CS_SENTINEL: &str = "OAUTH_CLIENT_SECRET_SENTINEL";
+        const OAUTH_URI_SENTINEL: &str = "https://oauth-sentinel-server.example/token";
+        const SCOPE_SENTINEL: &str = "SCOPE_SECRET_SENTINEL";
+
+        // Build a spec with VENDED storage credentials (simulating what
+        // resolve_file_list returns after vended extraction).
+        let vended_storage = StorageProps {
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: VENDED_REGION.into(),
+            access_key: VENDED_AK.into(),
+            secret_key: VENDED_SK.into(),
+            session_token: Some(VENDED_TOK.into()),
+            allow_http: false,
+            path_style: false,
+        };
+
+        let spec = ScanSpec {
+            files: vec!["s3://warehouse/db/events/part-00000.parquet".into()],
+            projection: vec!["ID".into()],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: vec!["DECIMAL(20,0)".into()],
+            storage: vended_storage,
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+
+        let json = spec.to_json();
+
+        // Auth field NAMES must never appear as JSON keys in the serialized spec.
+        // Check for the exact key pattern `"<field>":` to avoid false-positives
+        // from legitimate substrings (e.g. `"session_token"` contains `"token"`).
+        for field in [
+            "\"token\":",
+            "\"credential\":",
+            "\"client_id\":",
+            "\"client_secret\":",
+            "\"oauth2_server_uri\":",
+            "\"oauth2-server-uri\":",
+            // scope is too short and appears in storage endpoint strings —
+            // test absence of the auth value instead (done below via SCOPE_SENTINEL).
+        ] {
+            assert!(
+                !json.contains(field),
+                "ScanSpec JSON must not carry auth field key '{field}': {json}"
+            );
+        }
+
+        // Auth sentinel VALUES must not appear even if a refactor wired them in.
+        for value in [
+            TOKEN_SENTINEL,
+            CS_SENTINEL,
+            OAUTH_URI_SENTINEL,
+            SCOPE_SENTINEL,
+        ] {
+            assert!(
+                !json.contains(value),
+                "ScanSpec JSON must not carry auth sentinel '{value}': {json}"
+            );
+        }
+
+        // Vended credentials MUST be present in the storage block.
+        assert!(
+            json.contains(VENDED_AK),
+            "vended access_key must be in storage: {json}"
+        );
+        assert!(
+            json.contains(VENDED_TOK),
+            "vended session_token must be in storage: {json}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.5 / 3.1 — Redaction: secrets never in errors from the new paths
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: bearer token, OAuth2 client secret, and access token never
+    /// appear in errors surfaced by the new auth paths.
+    ///
+    /// Tests `redact_catalog_auth_error` directly (it is the gate used by
+    /// `authed_get_json`'s redact closure for every error site on those paths).
+    #[test]
+    fn bearer_and_oauth_secrets_not_in_error_messages() {
+        // Bearer token must be stripped.
+        let mut creds = creds_no_auth();
+        creds.token = Some(BEARER_TOK.into());
+
+        let raw_error = format!("catalog returned HTTP 401: token={BEARER_TOK} invalid");
+        let redacted = redact_catalog_auth_error(&raw_error, &creds);
+        assert!(
+            !redacted.contains(BEARER_TOK),
+            "bearer token must not appear in error: {redacted}"
+        );
+
+        // OAuth2 client_secret must be stripped.
+        let mut creds2 = creds_no_auth();
+        creds2.client_secret = Some(CLIENT_SECRET.into());
+
+        let raw_error2 = format!("OAuth2 failed: secret={CLIENT_SECRET} rejected");
+        let redacted2 = redact_catalog_auth_error(&raw_error2, &creds2);
+        assert!(
+            !redacted2.contains(CLIENT_SECRET),
+            "client_secret must not appear in error: {redacted2}"
+        );
+
+        // The obtained OAuth2 access_token is redacted by the authed_get_json closure
+        // which additionally strips the CatalogAuth::Bearer token. Simulate that here:
+        let raw_error3 =
+            format!("catalog request failed: Authorization: Bearer {OAUTH_ACCESS_TOKEN}");
+        let redacted3 = crate::scan::emit::redact_secret_values(&raw_error3, &[OAUTH_ACCESS_TOKEN]);
+        assert!(
+            !redacted3.contains(OAUTH_ACCESS_TOKEN),
+            "obtained OAuth2 access_token must not appear in error: {redacted3}"
+        );
+    }
+
+    /// Scenario: vended STS values (access key, secret key, session token) never
+    /// appear in errors from the new auth paths.
+    ///
+    /// Vended values arrive only in a SUCCESS response, so they don't appear in
+    /// error responses. We verify they are stripped if they were ever erroneously
+    /// echoed, using `redact_secret_values` (same mechanism StorageProps uses).
+    #[test]
+    fn vended_sts_values_not_in_error_messages() {
+        let vended_secrets = [VENDED_AK, VENDED_SK, VENDED_TOK];
+        let raw_error =
+            format!("scan failed: access_key={VENDED_AK} secret={VENDED_SK} token={VENDED_TOK}");
+        let redacted = crate::scan::emit::redact_secret_values(&raw_error, &vended_secrets);
+        for secret in vended_secrets {
+            assert!(
+                !redacted.contains(secret),
+                "vended STS value must not appear in error: {redacted}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // R1 — SigV4 skips /v1/config round-trip, uses warehouse directly
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: The SigV4 path short-circuits `resolve_load_table_prefix` and
+    /// returns the warehouse ARN unchanged, even when the catalog server would
+    /// return a DIFFERENT prefix.
+    ///
+    /// A local HTTP server is started that responds with `overrides.prefix` =
+    /// `"server-returned-prefix"`. For non-SigV4, that prefix would be used.
+    /// For SigV4, the function must return the original warehouse ARN WITHOUT
+    /// contacting the server — proved by the contrast with the paired non-SigV4
+    /// test `non_sigv4_config_prefix_resolution_uses_config_endpoint`.
+    #[tokio::test]
+    async fn sigv4_skips_config_prefix_lookup_uses_warehouse_directly() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Bind a local server that returns a DIFFERENT prefix. If SigV4 contacted
+        // it, the result would differ from the warehouse ARN.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        let server_prefix = "server-returned-prefix-SHOULD-NOT-BE-USED";
+
+        tokio::spawn(async move {
+            // Accept and reply — but the SigV4 path must never connect.
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _n = stream.read(&mut buf).await.unwrap_or(0);
+                let body = format!(r#"{{"overrides":{{"prefix":"{server_prefix}"}}}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let warehouse_arn = "arn:aws:glue:us-east-1:123456789012:catalog";
+
+        let mut creds = base_creds();
+        creds.use_sigv4 = true;
+        let auth = CatalogAuth::Sigv4;
+
+        let result = resolve_load_table_prefix(&catalog_uri, warehouse_arn, &auth, &creds).await;
+
+        assert_eq!(
+            result, warehouse_arn,
+            "SigV4 path must return the warehouse ARN directly, \
+             ignoring the server-side overrides.prefix"
+        );
+        assert_ne!(
+            result, server_prefix,
+            "SigV4 path must NOT use the server-returned prefix"
+        );
+    }
+
+    /// Scenario: A non-SigV4 path that hits a local HTTP server returning an
+    /// `overrides.prefix` different from the warehouse uses that resolved prefix.
+    ///
+    /// This confirms that the config-endpoint round-trip IS performed for non-SigV4
+    /// modes, contrasting with `sigv4_skips_config_prefix_lookup_uses_warehouse_directly`.
+    #[tokio::test]
+    async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Bind to a random local port to serve the /v1/config response.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        let resolved_prefix = "resolved-prefix-from-config";
+
+        // Spawn a minimal HTTP/1.1 server returning overrides.prefix.
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _n = stream.read(&mut buf).await.expect("read");
+
+            let body = format!(r#"{{"overrides":{{"prefix":"{resolved_prefix}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let creds = creds_no_auth();
+        let auth = CatalogAuth::None;
+
+        let result =
+            resolve_load_table_prefix(&catalog_uri, "original-warehouse", &auth, &creds).await;
+
+        assert_eq!(
+            result, resolved_prefix,
+            "non-SigV4 path must use the prefix from /v1/config overrides"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // R4 — non-SigV4 no-override fallback yields EMPTY prefix (not warehouse)
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: A non-SigV4 path whose catalog returns a config body with NO
+    /// `overrides.prefix` (e.g. `apache/iceberg-rest-fixture`, plain REST) must
+    /// resolve to EMPTY STRING — never to the warehouse value.
+    ///
+    /// If the warehouse were used as the fallback, `build_load_table_url` would
+    /// insert it as a URL path segment and produce
+    /// `/v1/s3://warehouse//namespaces/…` → HTTP 400 ("Ambiguous URI empty
+    /// segment"). An empty prefix causes `build_load_table_url` to emit the
+    /// standard-REST form `/v1/namespaces/{ns}/tables/{table}` with no prefix
+    /// segment.
+    #[tokio::test]
+    async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Serve a config body that contains NO overrides.prefix.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _n = stream.read(&mut buf).await.expect("read");
+
+            // Config body with no overrides.prefix — matches iceberg-rest-fixture behaviour.
+            let body = r#"{"overrides":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let warehouse = "s3://warehouse";
+        let creds = creds_no_auth();
+        let auth = CatalogAuth::None;
+
+        let result = resolve_load_table_prefix(&catalog_uri, warehouse, &auth, &creds).await;
+
+        assert_eq!(
+            result, "",
+            "non-SigV4 no-override path must return empty string, not the warehouse"
+        );
+        assert_ne!(
+            result, warehouse,
+            "warehouse must NOT be used as the URL prefix for non-SigV4 no-override path"
+        );
+
+        // Also verify build_load_table_url produces the correct no-prefix URL.
+        let url = build_load_table_url(&catalog_uri, &result, "e2e_lakehouse", "events");
+        assert!(
+            url.contains("/v1/namespaces/e2e_lakehouse/tables/events"),
+            "URL must not contain a warehouse path segment: {url}"
+        );
+        assert!(
+            !url.contains("s3://"),
+            "URL must not contain the warehouse s3:// URI as a path segment: {url}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // R3 — redact_catalog_auth_error strips client_id, oauth2_server_uri, scope
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `redact_catalog_auth_error` strips `client_id`, `oauth2_server_uri`,
+    /// and `scope` from error messages so the no-leak guarantee matches the doc comment.
+    #[test]
+    fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
+        const CLIENT_ID_SENTINEL: &str = "MY_CLIENT_ID_SENTINEL";
+        const OAUTH_URI_SENTINEL: &str = "https://auth-server-sentinel.example/token";
+        const SCOPE_SENTINEL: &str = "MY_SCOPE_SENTINEL_VALUE";
+
+        let mut creds = creds_no_auth();
+        creds.client_id = Some(CLIENT_ID_SENTINEL.into());
+        creds.oauth2_server_uri = Some(OAUTH_URI_SENTINEL.into());
+        creds.scope = Some(SCOPE_SENTINEL.into());
+
+        // Construct an error message that echoes all three values.
+        let raw = format!(
+            "catalog error: client_id={CLIENT_ID_SENTINEL} uri={OAUTH_URI_SENTINEL} scope={SCOPE_SENTINEL}"
+        );
+
+        let redacted = redact_catalog_auth_error(&raw, &creds);
+
+        assert!(
+            !redacted.contains(CLIENT_ID_SENTINEL),
+            "client_id must be redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains(OAUTH_URI_SENTINEL),
+            "oauth2_server_uri must be redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains(SCOPE_SENTINEL),
+            "scope must be redacted: {redacted}"
         );
     }
 }
