@@ -1306,6 +1306,11 @@ fn local_stack_creds() -> ConnectionCreds {
         path_style: true,
         use_sigv4: false,
         use_vended_credentials: false,
+        token: None,
+        client_id: None,
+        client_secret: None,
+        oauth2_server_uri: None,
+        scope: None,
     }
 }
 
