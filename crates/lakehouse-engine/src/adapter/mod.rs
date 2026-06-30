@@ -218,7 +218,7 @@ fn handle_create_virtual_schema(
 
         let fields = rt
             .block_on(async {
-                resolve_table_schema(&catalog_uri, &per_table_catalog, &storage, &creds).await
+                resolve_table_schema(&catalog_uri, &per_table_catalog, &creds).await
             })
             .map_err(|e| redact_error(&storage, e))?;
 
