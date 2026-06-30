@@ -12,30 +12,33 @@ separate from, and mutually exclusive with, AWS SigV4 request signing.
 
 ## Background
 
-* The exact REST-catalog property keys are fixed by `iceberg-catalog-rest` 0.9.1: `token`
-  (static bearer), `credential` (the string `"client_id:client_secret"` for the OAuth2
-  client-credentials grant), `oauth2-server-uri` (optional token endpoint; the crate
-  defaults it to `{uri}/v1/oauth/tokens`), and `scope` (optional; the crate defaults it to
-  `catalog`). These keys flow through `RestCatalogBuilder::load` in the same props map that
-  carries `uri`, `warehouse`, and the S3 keys — the builder copies every prop except
-  `uri`/`warehouse` into the catalog config.
-* The token and client-credentials modes are distinct in the crate's `authenticate()`
-  (`client.rs:211`): when a `token` is present it is used directly as the bearer header and
-  `oauth2-server-uri`/`scope` are never consulted; `oauth2-server-uri` is read ONLY inside
-  the credential-exchange path (`exchange_credential_for_token`, `client.rs:112`). When both
-  `credential` and `token` are missing, authentication is skipped (no-auth mode).
-* Catalog auth props are consumed ONLY in the planning layer's unsigned catalog-build path
-  (`build_rest_catalog`). They are NOT carried in `ScanSpec` and MUST NOT cross the UDF
-  boundary; the scan UDF works from pre-resolved file paths and never calls the catalog.
-* Catalog auth and SigV4 are mutually exclusive auth strategies: SigV4 self-issues signed
-  HTTP requests and bypasses `RestCatalogBuilder` entirely, so token/OAuth props would be
-  silently ignored on that path. The combination is rejected at credential-resolution time
-  (see `vs-adapter/connection-credentials`).
-* Token and `client_secret` values MUST NEVER appear in any returned SQL string, error
-  message, or log line.
+* Catalog authentication and credential vending are orthogonal. The catalog-auth
+  mode (no-auth / static bearer `token` / OAuth2 client-credentials) selects how
+  the table-load request is authenticated; `use_vended_credentials` independently
+  selects whether short-lived S3 STS credentials are extracted from the `loadTable`
+  response and carried in the scan specs. Either mode may combine with vending on
+  or off. The vended-credential extraction mechanics live in
+  `vs-adapter/pushdown-planning-cloud-credentials`; this feature only guarantees the
+  catalog-auth secrets themselves never leak into any scan spec.
+* The adapter self-issues the `loadTable` GET on every catalog-auth mode (no-auth,
+  bearer token, OAuth2-grant-derived bearer), authenticating the request accordingly.
+  The adapter performs the OAuth2 client-credentials grant itself: a form-encoded
+  POST (`grant_type=client_credentials`, `client_id`, `client_secret`, optional
+  `scope`) to `oauth2_server_uri` or the catalog default token endpoint, returning the
+  `access_token` used as the bearer.
+* Catalog auth props (`token`, `client_id`, `client_secret`, `oauth2_server_uri`,
+  `scope`) are consumed ONLY in the planning layer. They are NOT carried in `ScanSpec`
+  and MUST NOT cross the UDF boundary; the scan UDF works from pre-resolved file paths
+  and never calls the catalog.
+* Catalog auth and SigV4 are mutually exclusive auth strategies: SigV4 self-issues
+  signed HTTP requests using the SigV4 signing path; token/OAuth and SigV4 may not
+  be combined. The combination is rejected at credential-resolution time (see
+  `vs-adapter/connection-credentials`).
+* Token, `client_secret`, and obtained OAuth2 bearer token values MUST NEVER appear
+  in any returned SQL string, error message, or log line.
 * See `vs-adapter/connection-credentials` for credential parsing and the orthogonal,
-  always-optional static-S3 fields, and `vs-adapter/pushdown-planning-cloud-credentials` for
-  the SigV4 and vended-credential flows.
+  always-optional static-S3 fields, and `vs-adapter/pushdown-planning-cloud-credentials`
+  for the SigV4, vended-credential, and orthogonality flows.
 
 ## Scenarios
 
@@ -66,7 +69,7 @@ separate from, and mutually exclusive with, AWS SigV4 request signing.
 
 ### Scenario: Catalog auth props are never placed in any scan spec
 
-* *GIVEN* a virtual schema whose CONNECTION credentials supply a `token` or OAuth2 client credentials
+* *GIVEN* a virtual schema whose CONNECTION credentials supply a `token` or OAuth2 client credentials, with `use_vended_credentials` either enabled or disabled
 * *WHEN* the adapter builds the per-shard scan specs after resolving the file list
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
-* *AND* each `ScanSpec` storage block SHALL carry only the S3 storage credentials (vended or static) exactly as in the established credential flows
+* *AND* each `ScanSpec` storage block SHALL carry only the S3 storage credentials — the vended STS credentials when `use_vended_credentials` is enabled and they were resolved, otherwise the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials`

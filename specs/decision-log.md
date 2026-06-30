@@ -1155,3 +1155,57 @@ When `use_sigv4` is true, require `access_key`, `secret_key`, and `region` to be
 ### Consequences
 
 Non-SigV4 cases stay as loose as ADR-042 specifies; the SigV4 path keeps its fail-fast validation. The guard holds even with vending enabled.
+
+---
+
+## ADR-044: Unify Table Loading Behind One Auth-Mode-Agnostic Self-Issued `loadTable` GET
+
+**Date:** 2026-06-30
+**Plan:** `change-vended-credentials-auth-orthogonal`
+**Status:** Accepted
+
+### Context
+
+`resolve_file_list` previously extracted vended S3 credentials ONLY on the `use_sigv4` branch by self-issuing a signed `loadTable` GET. The unsigned branch called `iceberg-catalog-rest` 0.9.1's `RestCatalog::load_table`, which returns only a `Table` and silently discards the response `config`/`storage_credentials`. Because there is no public hook to recover those fields, the crate path cannot surface vended creds — so on the no-auth, static-bearer-token, and OAuth2 paths the adapter shipped static storage to every scan spec, and vended STS credentials never reached DataFusion. For Databricks Unity Catalog managed storage — where no usable static S3 creds exist — this was a hard failure.
+
+### Decision
+
+Replace the `use_sigv4` if/else split in `resolve_file_list` with a single `load_table_any_auth` function that returns the raw `LoadTableResult`. Its auth arm is chosen by catalog-auth mode: SigV4 signature | `Authorization: Bearer <token>` | OAuth2-grant-derived bearer | none. The one response feeds both Iceberg file planning and vended-credential extraction on every mode. Vended extraction becomes a single cross-cutting step gated solely on `use_vended_credentials`, never on the catalog-auth mode.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Single auth-mode-agnostic `load_table_any_auth` returning raw `LoadTableResult` | ✓ Chosen — one response feeds both planning and vending on every mode; eliminates the `RestCatalog`-drops-config problem; satisfies the `use_vended_credentials` orthogonality principle |
+| Keep `RestCatalog::load_table` for unsigned modes and layer vending on top | ✗ Rejected — `iceberg-catalog-rest` 0.9.1's `load_table` returns a `Table` and discards `config`/`storage_credentials` with no public hook to recover them; the crate path structurally cannot vend |
+
+### Consequences
+
+Every catalog-auth mode now self-issues the `loadTable` GET and returns the raw response. `use_vended_credentials` is completely orthogonal to authentication: vended extraction runs on no-auth, static bearer token, OAuth2, and SigV4 identically. The `load_table_signed` function and both `use_sigv4` if/else branches in `resolve_file_list` / `resolve_table_schema` are removed as dead code. SigV4/Glue skips the `/v1/config` prefix lookup and uses the warehouse ARN directly; non-SigV4 uses the `overrides.prefix` from the config endpoint, falling back to an empty prefix (matching the REST spec) rather than the warehouse.
+
+---
+
+## ADR-045: Perform the OAuth2 Client-Credentials Grant In-Adapter
+
+**Date:** 2026-06-30
+**Plan:** `change-vended-credentials-auth-orthogonal`
+**Status:** Accepted
+
+### Context
+
+To support OAuth2 client-credentials as a catalog-auth mode in the unified `load_table_any_auth` loader (ADR-044), the adapter must obtain a bearer token before issuing the self-issued `loadTable` GET. The `iceberg-catalog-rest` crate's internal token cache (`authenticate()`, `exchange_credential_for_token`) is `pub(crate)` and tied to the crate's own request pipeline; it cannot authenticate a self-issued GET issued outside the crate's `HttpClient`. With ADR-044 requiring a self-issued GET on every mode, the only viable path is to perform the grant directly in the adapter.
+
+### Decision
+
+The adapter issues its own form-encoded `client_credentials` POST (`grant_type=client_credentials`, `client_id`, `client_secret`, optional `scope`) to `oauth2_server_uri` or the catalog default token endpoint (`{catalog_uri}/v1/oauth/tokens`), returning the `access_token` used as the `Authorization: Bearer` header for the self-issued `loadTable` GET. The grant runs once per query (resolve-once-per-query); the `client_secret` and obtained bearer token are redacted from every error path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Perform the OAuth2 grant in-adapter via a direct `client_credentials` POST | ✓ Chosen — orthogonality requires OAuth2 to be covered alongside bearer and no-auth on the self-issued GET path; the grant is small and runs once per query |
+| Reuse `iceberg-catalog-rest`'s internal token cache / `authenticate()` | ✗ Rejected — the crate's machinery is `pub(crate)` and bound to its own request pipeline; it cannot authenticate a self-issued request |
+
+### Consequences
+
+The adapter is responsible for the OAuth2 client-credentials round-trip on every query where `client_id` + `client_secret` are supplied. Token refresh and re-vending are not implemented (resolve-once-per-query; STS lifetime far exceeds a single query). The `client_secret` and obtained access token must never appear in error messages or SQL output — enforced by `redact_catalog_auth_error`. No new crate dependencies are required (uses `reqwest`, already a dependency).
