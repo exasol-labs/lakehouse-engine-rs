@@ -27,7 +27,7 @@ output "glue_uri" {
 }
 
 output "glue_warehouse" {
-  value = local.account_id
+  value = local.glue_warehouse
 }
 
 output "tpch_database" {

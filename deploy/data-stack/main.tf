@@ -5,7 +5,9 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   bucket     = "${local.prefix}-lakehouse-${local.account_id}"
   glue_uri   = "https://glue.${var.region}.amazonaws.com/iceberg"
-  ssm_root   = "/spot-strata/${var.env_name}"
+  # Glue's Iceberg REST endpoint requires the warehouse as 'catalogs/{accountId}'.
+  glue_warehouse = "catalogs/${local.account_id}"
+  ssm_root       = "/spot-strata/${var.env_name}"
 }
 
 # --- Network: VPC + public subnet + IGW + S3 gateway endpoint --------------
@@ -155,7 +157,7 @@ resource "aws_ssm_parameter" "glue_uri" {
 resource "aws_ssm_parameter" "glue_warehouse" {
   name  = "${local.ssm_root}/glue/warehouse"
   type  = "String"
-  value = local.account_id
+  value = local.glue_warehouse
 }
 
 resource "aws_ssm_parameter" "region" {

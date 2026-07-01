@@ -9,3 +9,9 @@ crash.log
 # python
 **/__pycache__/
 *.pyc
+
+# local c4 binary cache
+.c4/
+
+# c4-downloaded Exasol package tarballs
+exasol-*.tar.gz
