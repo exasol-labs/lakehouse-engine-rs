@@ -47,7 +47,12 @@ tofu apply -var run_data_gen=false      # reconcile state after it's gone (data 
 Sizing knobs (defaults in `variables.tf`): `tpch_scale_factor=30` (≈5–6 GB lineitem),
 `perf_table_sizes_gb=[10,20,30,40,80]`, `lineitem_files`, `perf_files`, `datagen_instance_type`,
 `datagen_scratch_gb`. Same-region EC2→S3 means **no data-transfer cost**; the only standing cost is
-S3 storage (~180 GB).
+S3 storage (~110 GiB for the full set).
+
+> **Perf table sizes are approximate (row-count calibrated) and undershoot the nominal label** —
+> `gen_load.py` estimates bytes/row from a small sample, but snappy compresses better at scale, so
+> `t_80g` lands ≈46 GiB on disk (~57% of 80). Row-count ratios (10:20:30:40:80) are exact. Bump the
+> targets or the calibration sample if you need precise on-disk sizes.
 
 ## 2. Test cluster (ephemeral — per benchmark)
 
