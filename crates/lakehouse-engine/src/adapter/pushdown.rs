@@ -1,5 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, ScanSpec, StorageProps};
+use crate::scan::spec::{
+    AggKind, AggregatePlan, CatalogProps, LogicalField, ScanSpec, StorageProps,
+};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::io::{
@@ -1479,7 +1481,7 @@ pub async fn handle_pushdown(
     // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
     // filter_json_raw is forwarded for Iceberg-level file pruning; ScanSpec.filter
     // (DataFusion SQL string) is set separately above and left completely unchanged.
-    let (files, effective_storage) =
+    let (files, effective_storage, logical_schema) =
         resolve_file_list(catalog_uri, catalog, storage, creds, filter_json_raw).await?;
     let storage = &effective_storage;
 
@@ -1540,6 +1542,7 @@ pub async fn handle_pushdown(
                 // Aggregate scans emit via the freely-coercing Value path, not the
                 // strict emit_batch IPC path, so no per-column declared types needed.
                 emit_exa_types: Vec::new(),
+                logical_schema: logical_schema.clone(),
                 storage: storage.clone(),
                 catalog: catalog.clone(),
                 df_target_partitions,
@@ -1584,6 +1587,7 @@ pub async fn handle_pushdown(
         // accepts before emit_batch. Ignored when `aggregates` is Some (that path
         // emits via the Value path). Same list the EMITS clause is built from.
         emit_exa_types: proj_types.clone(),
+        logical_schema,
         storage: storage.clone(),
         catalog: catalog.clone(),
         df_target_partitions,
@@ -1606,6 +1610,29 @@ pub async fn handle_pushdown(
     );
 
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// Build the logical schema (`Vec<LogicalField>`) from an Iceberg current schema.
+///
+/// Iterates over the top-level struct fields of `schema` and maps each to a
+/// `LogicalField` carrying its Iceberg field-id, current name, Arrow type tag,
+/// and nullability (required → `false`, optional → `true`).
+fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| {
+            let arrow_dt = crate::types::mapping::iceberg_type_to_arrow(&f.field_type);
+            let arrow_type = crate::types::mapping::arrow_type_to_tag(&arrow_dt);
+            LogicalField {
+                field_id: f.id,
+                name: f.name.clone(),
+                arrow_type,
+                nullable: !f.required,
+            }
+        })
+        .collect()
 }
 
 /// Resolve the data-file list from the Iceberg REST catalog.
@@ -1631,7 +1658,7 @@ pub async fn resolve_file_list(
     storage: &StorageProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
-) -> Result<(Vec<(String, u64)>, StorageProps), UdfError> {
+) -> Result<(Vec<(String, u64)>, StorageProps, Vec<LogicalField>), UdfError> {
     // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
     // catalog-auth mode applies, then derive the effective storage gated SOLELY on
     // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
@@ -1683,8 +1710,11 @@ pub async fn resolve_file_list(
         ))
     })?;
 
+    // Extract the logical schema before `plan_files_from_table` consumes `table`.
+    let logical_schema = build_logical_schema(table.metadata().current_schema());
+
     let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
-    Ok((files, effective_storage))
+    Ok((files, effective_storage, logical_schema))
 }
 
 /// Drive the iceberg scan and collect the data-file paths with their sizes.
@@ -2381,6 +2411,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -2837,6 +2868,7 @@ mod tests {
             ]),
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -2983,6 +3015,7 @@ mod tests {
             aggregates: Some(agg_plans),
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3114,6 +3147,7 @@ mod tests {
             aggregates: Some(plans.clone()),
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3156,6 +3190,7 @@ mod tests {
             aggregates: Some(plans.clone()),
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3659,6 +3694,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3705,6 +3741,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3765,6 +3802,7 @@ mod tests {
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3839,6 +3877,7 @@ mod tests {
             }]),
             group_keys: Some(vec!["\"REGION\"".into()]),
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -3956,6 +3995,7 @@ mod tests {
             }]),
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -4387,6 +4427,7 @@ mod tests {
             }]),
             group_keys: Some(vec![r#""REGION""#.to_string()]),
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -5236,6 +5277,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+            logical_schema: Vec::new(),
             storage: sample_storage(),
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -5821,6 +5863,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
+            logical_schema: Vec::new(),
             storage: vended_storage,
             catalog: sample_catalog(),
             df_target_partitions: 1,
@@ -6151,5 +6194,116 @@ mod tests {
             !redacted.contains(SCOPE_SENTINEL),
             "scope must be redacted: {redacted}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 3.2 — Pushdown spec carries logical schema field-ids
+    // ---------------------------------------------------------------------------
+
+    /// Scenario (pushdown-planning): A pushdown request produces a scan spec whose
+    /// `logical_schema` carries the expected field-ids, current names, and nullability.
+    ///
+    /// Builds an in-memory Iceberg schema and verifies that `build_logical_schema`
+    /// produces a `Vec<LogicalField>` with the correct field-id, name, arrow_type
+    /// tag, and nullable flag for each field. This covers: required field (nullable=false),
+    /// optional field (nullable=true), and multiple Iceberg type families.
+    #[test]
+    fn pushdown_spec_carries_logical_schema_field_ids() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        // Construct an Iceberg schema with 4 fields covering required, optional,
+        // and several type families.
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "score",
+                    Type::Primitive(PrimitiveType::Double),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "label",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::optional(
+                    4,
+                    "amount",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 18,
+                        scale: 4,
+                    }),
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+
+        assert_eq!(logical.len(), 4, "must carry all 4 fields");
+
+        // Field 1: required Int → nullable=false, arrow_type="int32"
+        assert_eq!(logical[0].field_id, 1);
+        assert_eq!(logical[0].name, "id");
+        assert_eq!(logical[0].arrow_type, "int32");
+        assert!(
+            !logical[0].nullable,
+            "required field must have nullable=false"
+        );
+
+        // Field 2: optional Double → nullable=true, arrow_type="float64"
+        assert_eq!(logical[1].field_id, 2);
+        assert_eq!(logical[1].name, "score");
+        assert_eq!(logical[1].arrow_type, "float64");
+        assert!(
+            logical[1].nullable,
+            "optional field must have nullable=true"
+        );
+
+        // Field 3: required String → nullable=false, arrow_type="utf8"
+        assert_eq!(logical[2].field_id, 3);
+        assert_eq!(logical[2].name, "label");
+        assert_eq!(logical[2].arrow_type, "utf8");
+        assert!(!logical[2].nullable);
+
+        // Field 4: optional Decimal(18,4) → nullable=true, arrow_type="decimal128(18,4)"
+        assert_eq!(logical[3].field_id, 4);
+        assert_eq!(logical[3].name, "amount");
+        assert_eq!(logical[3].arrow_type, "decimal128(18,4)");
+        assert!(logical[3].nullable);
+
+        // Verify round-trip through ScanSpec: logical_schema survives JSON serde.
+        let spec = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: Vec::new(),
+            logical_schema: logical.clone(),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.logical_schema.len(),
+            4,
+            "logical_schema must survive ScanSpec JSON round-trip"
+        );
+        assert_eq!(back.logical_schema[0], logical[0]);
+        assert_eq!(back.logical_schema[3], logical[3]);
     }
 }
