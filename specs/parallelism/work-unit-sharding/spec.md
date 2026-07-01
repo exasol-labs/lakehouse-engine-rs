@@ -14,8 +14,9 @@ own shard of files and no file is scanned twice.
 ## Background
 
 * The cluster node count is taken from the `CLUSTER_NODES` entry in the virtual
-  schema's `adapterNotes` (captured once at `createVirtualSchema` via `NPROC()`),
-  round-tripped to the adapter at pushdown time (default `1`).
+  schema's `adapterNotes` (captured once at `createVirtualSchema` via
+  `UdfContext::node_count()`), round-tripped to the adapter at pushdown time
+  (default `1`).
 * The shard count G is `node_count × parallelism_factor`, where
   `parallelism_factor` is a VS property. G is capped at `300` so it
   stays at or below Exasol's `max_dynamic_group_count` default — at or below that
