@@ -146,7 +146,7 @@ Every Iceberg column is surfaced in the virtual schema, even complex types. Inco
 
 **Date:** 2026-06-21
 **Plan:** `add-multinode-sharding-and-agg-pushdown`
-**Status:** Accepted
+**Status:** Superseded by ADR-048
 
 ### Context
 
@@ -621,7 +621,7 @@ Shards are balanced by cumulative bytes rather than file count, reducing straggl
 
 **Date:** 2026-06-24
 **Plan:** `change-shard-parallelism`
-**Status:** Accepted
+**Status:** Accepted (core-count capture superseded by ADR-049; the `max(NR_OF_CORES × 2, 8)` default formula itself is unchanged)
 
 ### Context
 
@@ -1264,3 +1264,59 @@ With the `FieldIdExprAdapter` approach selected (ADR-046), the scope of the cust
 ### Consequences
 
 The `FieldIdExprAdapter` is a thin wrapper: only the resolution mapping changes. Null-fill, cast, and required-missing-error behavior is inherited from `DefaultPhysicalExprAdapter` and stays in sync with DataFusion upgrades automatically. Out-of-scope behaviors (#27 initial-default fill, #28 name-mapping property) are tracked as separate issues and do not block this change.
+
+---
+
+## ADR-048: Source Cluster Node Count from `UdfContext::node_count()`, Not a Connect-Back `SELECT NPROC()` (Supersedes ADR-006)
+
+**Date:** 2026-07-01
+**Plan:** `fix-createvs-cores-nodecount`
+**Status:** Accepted
+
+### Context
+
+`resolve_cluster_nodes` (ADR-006) obtained the active node count over a connect-back session (`SELECT NPROC()`) inside a closure whose `?` also propagated the sibling `PARAM_VALUE('NR_OF_CORES')` query's failure. Because `PARAM_VALUE` is not a real Exasol function and always errors, the shared `?` discarded the valid node count too, collapsing `(cluster_nodes, nr_of_cores)` to `(1, 0)` on every real cluster (issue #32). SDK 0.20.0 exposes `UdfContext::node_count() -> u32` from the live UDF handshake metadata, making the node count available in-process with no SQL round-trip, session, or failure mode.
+
+### Decision
+
+Read the active node count from `UdfContext::node_count()` in-process, mapping the neutral `0` (no live handshake — stub/test double/broken handshake) to a `CLUSTER_NODES` default of `1`; any live cluster (single-node included) reports `≥ 1` and is used verbatim. Delete the connect-back branch, the `CONNECTION_NAME` VS property, and the `SELECT NPROC()` query and its `nproc_value_to_count` parsing helper entirely — no defensive connect-back fallback is retained.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `UdfContext::node_count()` in-process, `0 → 1` default | ✓ Chosen — the handshake already carries the node count; no session, auth, or transaction; no query that can fail-and-discard the value |
+| Keep `SELECT NPROC()` over connect-back (ADR-006 original) | ✗ Rejected — root cause of issue #32's shared-closure `?` discarding the node count; strictly less reliable than an in-process read |
+| Keep connect-back as a defensive fallback behind `node_count()` | ✗ Rejected — grep-verified `CONNECTION_NAME`/connect-back is single-purpose (topology only) in this crate; a fallback re-introduces the exact fragile SQL path being removed |
+
+### Consequences
+
+`resolve_cluster_nodes` opens no read-only SQL session for topology discovery. The `CONNECTION_NAME` VS property is no longer read; existing VS instances that set it for this purpose ignore it silently. `CLUSTER_NODES` is now correct on every real cluster (previously collapsed to `1` whenever `NR_OF_CORES` was unset). The `CATALOG_CONNECTION` credential mechanism is untouched.
+
+---
+
+## ADR-049: Source Per-Node Core Count from `available_parallelism()`, Not the Bogus `PARAM_VALUE('NR_OF_CORES')` Connect-Back Query (Supersedes the Core-Count Capture in ADR-023)
+
+**Date:** 2026-07-01
+**Plan:** `fix-createvs-cores-nodecount`
+**Status:** Accepted
+
+### Context
+
+ADR-023's default-parallelism-factor design captured `NR_OF_CORES` via `SELECT PARAM_VALUE('NR_OF_CORES')` over the same connect-back session used for the node count. `PARAM_VALUE` is not a real Exasol function — the query always fails, and its failure discarded the node count too (see ADR-048; issue #32). The `max(NR_OF_CORES × 2, 8)` default formula itself is unaffected; only the acquisition source for `NR_OF_CORES` changes. `available_parallelism()` is already trusted for the scan UDF's DataFusion `target_partitions` under ADR-023's sibling precedent on the same target clusters.
+
+### Decision
+
+Read the per-node core count from `std::thread::available_parallelism()` on the executing node when the `NR_OF_CORES` override is absent/invalid; treat an unavailable reading as `0` ("unknown"), preserving the downstream parallelism-factor floor-of-8 contract unchanged. Do not add a live-cluster verification task for `available_parallelism()` accuracy. Delete the `SELECT PARAM_VALUE('NR_OF_CORES')` query and its `varchar_value_to_u32` parsing helper.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `available_parallelism()` in-process, `0` = unknown sentinel | ✓ Chosen — `PARAM_VALUE` was the root cause of issue #32; `available_parallelism()` is already proven for DataFusion `target_partitions` in this codebase on the same clusters |
+| Keep `SELECT PARAM_VALUE('NR_OF_CORES')` over connect-back | ✗ Rejected — not a real Exasol function; never worked; discarded the node count via the shared-closure `?` |
+| Add a live-cluster verification task for `available_parallelism()` | ✗ Rejected — redundant given the existing ADR-023 precedent trusting the same source on the same target clusters |
+
+### Consequences
+
+`NR_OF_CORES` auto-detection no longer depends on any SQL session. The `NR_OF_CORES` override contract and its precedence over auto-detection are unchanged (see the plan's decision-log entry [4], not promoted to ADR). The parallelism-factor default formula (`max(NR_OF_CORES × 2, 8)`, ADR-023) is unaffected by this change.
