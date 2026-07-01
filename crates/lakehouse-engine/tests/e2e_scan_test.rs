@@ -1280,6 +1280,241 @@ fn test_group_by_null_key_grouping() {
     );
 }
 
+/// Aggregate placed before the group key in the select list (GitHub #33 repro).
+///
+/// `SELECT SUM(score), MOD(id, 4) ... GROUP BY MOD(id, 4)` — the aggregate is
+/// select-list position 0, the group key is position 1. Before the fix, the
+/// adapter always emitted keys first in the outer merge SELECT, transposing
+/// this query's columns relative to `selectListDataTypes` and failing with a
+/// "Data type mismatch in column number 1" error. Values must match the
+/// already-correct key-first form (`test_group_by_sum_count`).
+///
+/// Key: MOD(id, 4) — four equal-sized groups (5 rows each).
+///   group 0 (id=4,8,12,16,20):  sum_score=300.0
+///   group 1 (id=1,5,9,13,17):   sum_score=225.0
+///   group 2 (id=2,6,10,14,18):  sum_score=250.0
+///   group 3 (id=3,7,11,15,19):  sum_score=275.0
+#[test]
+fn test_group_by_agg_before_key() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4)",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (sum, key): {cols:?}");
+    assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
+
+    // Sort (key, sum) pairs by key so the test is robust to row ordering.
+    let mut pairs: Vec<(i64, f64)> = cols[1]
+        .iter()
+        .zip(cols[0].iter())
+        .map(|(k, s)| (parse_int(k), parse_numeric(s)))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+
+    let expected_sums = [300.0f64, 225.0, 250.0, 275.0];
+    for (i, expected) in expected_sums.iter().enumerate() {
+        let (key, sum) = pairs[i];
+        assert_eq!(
+            key, i as i64,
+            "group at position {i}: key must be {i}, got {key}"
+        );
+        assert!(
+            (sum - expected).abs() < 0.01,
+            "group key {key}: SUM(score) must be {expected}, got {sum}"
+        );
+    }
+
+    // Total across all groups = 5.0 * (1+2+...+20) = 1050.0.
+    let total: f64 = pairs.iter().map(|(_, s)| *s).sum();
+    assert!(
+        (total - 1050.0).abs() < 0.01,
+        "total SUM(score) across groups must be 1050.0, got {total}"
+    );
+}
+
+/// Interleaved multi-key GROUP BY: a group key, an aggregate, then a second
+/// group key — `SELECT MOD(id,4), SUM(score), MOD(id,2) ... GROUP BY MOD(id,4), MOD(id,2)`.
+///
+/// Select-list order is key(0), agg(1), key(2), which does not match either the
+/// keys-first or aggregate-first outer-SELECT ordering — exercising general
+/// positional reassembly rather than either single-swap special case.
+///
+/// Groups (16 combinations possible; only even/odd-consistent pairs occur since
+/// MOD(id,4) mod 2 == MOD(id,2)):
+///   (0,0): id=4,8,12,16,20  → sum=300.0
+///   (1,1): id=1,5,9,13,17   → sum=225.0
+///   (2,0): id=2,6,10,14,18  → sum=250.0
+///   (3,1): id=3,7,11,15,19  → sum=275.0
+#[test]
+fn test_group_by_interleaved_multi_key() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), SUM(score), MOD(id, 2) FROM {} GROUP BY MOD(id, 4), MOD(id, 2)",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (key1, sum, key2): {cols:?}"
+    );
+    assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
+
+    // Sort (key1, sum, key2) triples by key1 so the test is robust to row ordering.
+    let mut rows: Vec<(i64, f64, i64)> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .zip(cols[2].iter())
+        .map(|((k1, s), k2)| (parse_int(k1), parse_numeric(s), parse_int(k2)))
+        .collect();
+    rows.sort_by_key(|(k1, _, _)| *k1);
+
+    let expected = [
+        (0i64, 300.0f64, 0i64),
+        (1, 225.0, 1),
+        (2, 250.0, 0),
+        (3, 275.0, 1),
+    ];
+    for (i, (exp_k1, exp_sum, exp_k2)) in expected.iter().enumerate() {
+        let (k1, sum, k2) = rows[i];
+        assert_eq!(
+            k1, *exp_k1,
+            "group at position {i}: MOD(id,4) key must be {exp_k1}, got {k1}"
+        );
+        assert!(
+            (sum - exp_sum).abs() < 0.01,
+            "group key {k1}: SUM(score) must be {exp_sum}, got {sum}"
+        );
+        assert_eq!(
+            k2, *exp_k2,
+            "group key {k1}: MOD(id,2) key must be {exp_k2}, got {k2}"
+        );
+    }
+
+    // Total across all groups = 1050.0.
+    let total: f64 = rows.iter().map(|(_, s, _)| *s).sum();
+    assert!(
+        (total - 1050.0).abs() < 0.01,
+        "total SUM(score) across groups must be 1050.0, got {total}"
+    );
+}
+
+/// Expression group key placed after an aggregate — `SELECT COUNT(*), MOD(id,4)
+/// ... GROUP BY MOD(id,4)` — and the key column's declared type must survive
+/// as its resolved DECIMAL type, not fall back to VARCHAR.
+///
+/// Guards against the secondary fragility described in the plan: resolving a
+/// group key's declared type by rendered-string comparison silently defaults
+/// to VARCHAR(2000000) if detection and lookup disagree; the fix resolves the
+/// type by select-list index instead.
+///
+/// Key: MOD(id, 4) — four equal-sized groups (5 rows each), counts of 5 each.
+#[test]
+fn test_group_by_expr_key_after_agg() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*), MOD(id, 4) FROM {} GROUP BY MOD(id, 4)",
+        vs_table()
+    );
+    let resp = conn.execute(&sql);
+
+    // Assert the key column (position 1) carries a DECIMAL data type, not VARCHAR.
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let column_type = result_set["columns"][1]["dataType"]["type"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected dataType.type for column 1: {result_set:?}"));
+    assert_eq!(
+        column_type, "DECIMAL",
+        "MOD(id,4) group key column must carry DECIMAL type, not VARCHAR fallback: {result_set:?}"
+    );
+
+    let cols = conn.fetch_result_columns(result_set);
+    assert_eq!(cols.len(), 2, "expected 2 columns (count, key): {cols:?}");
+    assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
+
+    // Sort (key, count) pairs by key so the test is robust to row ordering.
+    let mut pairs: Vec<(i64, i64)> = cols[1]
+        .iter()
+        .zip(cols[0].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+
+    for (i, (key, count)) in pairs.iter().enumerate() {
+        assert_eq!(
+            *key, i as i64,
+            "group at position {i}: key must be {i}, got {key}"
+        );
+        assert_eq!(
+            *count, 5,
+            "group key {key}: COUNT(*) must be 5, got {count}"
+        );
+    }
+
+    let total: i64 = pairs.iter().map(|(_, c)| *c).sum();
+    assert_eq!(
+        total, 20,
+        "total COUNT(*) across groups must be 20, got {total}"
+    );
+}
+
+/// Aggregate-first GROUP BY combined with HAVING — exercises the HAVING-present
+/// outer-wrapper path with the aggregate ahead of the group key in the select
+/// list: `SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4) HAVING SUM(score) > n`.
+///
+/// Group sums (from `test_group_by_agg_before_key`): {0: 300.0, 1: 225.0, 2:
+/// 250.0, 3: 275.0}. HAVING SUM(score) > 250.0 keeps groups 0 and 3 only.
+#[test]
+fn test_group_by_agg_first_with_having() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (sum, key): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "HAVING SUM(score) > 250.0 must keep exactly 2 groups (0 and 3): {cols:?}"
+    );
+
+    // Sort (key, sum) pairs by key so the test is robust to row ordering.
+    let mut pairs: Vec<(i64, f64)> = cols[1]
+        .iter()
+        .zip(cols[0].iter())
+        .map(|(k, s)| (parse_int(k), parse_numeric(s)))
+        .collect();
+    pairs.sort_by_key(|(k, _)| *k);
+
+    let expected = [(0i64, 300.0f64), (3, 275.0)];
+    for (i, (exp_key, exp_sum)) in expected.iter().enumerate() {
+        let (key, sum) = pairs[i];
+        assert_eq!(
+            key, *exp_key,
+            "group at position {i}: key must be {exp_key}, got {key}"
+        );
+        assert!(
+            (sum - exp_sum).abs() < 0.01,
+            "group key {key}: SUM(score) must be {exp_sum}, got {sum}"
+        );
+        assert!(
+            sum > 250.0,
+            "group key {key}: SUM(score) must satisfy HAVING > 250.0, got {sum}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task 2.14 — multi-table VS tests
 // ---------------------------------------------------------------------------
