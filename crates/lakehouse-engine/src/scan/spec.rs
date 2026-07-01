@@ -100,6 +100,31 @@ pub struct CatalogProps {
     pub table: String,
 }
 
+/// One field in the logical schema carried by `ScanSpec::logical_schema`.
+///
+/// The `arrow_type` is a compact string tag produced by
+/// `types::mapping::arrow_type_to_tag` and parsed back by
+/// `types::mapping::arrow_type_from_tag`. Using a string tag rather than a
+/// serialized `DataType` keeps the field credential-free and JSON-portable.
+///
+/// Supported tags:
+/// - Primitives: `"bool"`, `"int32"`, `"int64"`, `"float32"`, `"float64"`,
+///   `"utf8"`, `"date32"`
+/// - Timestamps: `"timestamp_us"`, `"timestamp_ns"`,
+///   `"timestamptz_us"`, `"timestamptz_ns"`
+/// - Decimal: `"decimal128(p,s)"` (e.g. `"decimal128(18,4)"`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalField {
+    /// Iceberg field-id for this column.
+    pub field_id: i32,
+    /// Current logical name (from the Iceberg schema at query time).
+    pub name: String,
+    /// Compact Arrow type tag (see struct doc for the tag vocabulary).
+    pub arrow_type: String,
+    /// Whether the column is nullable (`optional` in Iceberg terms).
+    pub nullable: bool,
+}
+
 /// The scan specification passed from the adapter to the scan SET UDF.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSpec {
@@ -140,6 +165,21 @@ pub struct ScanSpec {
     /// field (backward-compatible).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emit_exa_types: Vec<String>,
+
+    /// Full logical schema of the Iceberg table at query time: every column
+    /// (not just the projected subset), each carrying its Iceberg field-id,
+    /// current logical name, Arrow type tag, and nullability.
+    ///
+    /// The VS adapter populates this once at `resolve_file_list` from
+    /// `table.metadata().current_schema()`. The scan UDF uses it to build the
+    /// logical Arrow schema and install a `FieldIdExprAdapter` so column binding
+    /// is field-id-first (name fallback) — correct across Iceberg schema evolution
+    /// (renames, drops, nullable additions).
+    ///
+    /// Absent (empty, the default) for specs that predate this field; the scan
+    /// UDF falls back to first-file schema inference (backward-compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logical_schema: Vec<LogicalField>,
 
     pub storage: StorageProps,
     pub catalog: CatalogProps,
@@ -227,6 +267,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -457,6 +498,101 @@ mod tests {
         assert!(!err.contains("TOPSECRET"));
         // But it should say something useful.
         assert!(err.contains("scan spec deserialization failed"));
+    }
+
+    /// Task 2.2: logical_schema round-trips through JSON (spec WITH the field) and
+    /// a legacy spec WITHOUT it deserializes correctly (backward-compatible default).
+    #[test]
+    fn logical_schema_round_trips_and_defaults_to_empty() {
+        // A spec with a populated logical_schema.
+        let mut spec = sample_spec();
+        spec.logical_schema = vec![
+            LogicalField {
+                field_id: 1,
+                name: "id".to_string(),
+                arrow_type: "int32".to_string(),
+                nullable: false,
+            },
+            LogicalField {
+                field_id: 2,
+                name: "rating".to_string(),
+                arrow_type: "float64".to_string(),
+                nullable: true,
+            },
+            LogicalField {
+                field_id: 3,
+                name: "label".to_string(),
+                arrow_type: "utf8".to_string(),
+                nullable: true,
+            },
+            LogicalField {
+                field_id: 4,
+                name: "ts".to_string(),
+                arrow_type: "timestamp_us".to_string(),
+                nullable: true,
+            },
+            LogicalField {
+                field_id: 5,
+                name: "amount".to_string(),
+                arrow_type: "decimal128(18,4)".to_string(),
+                nullable: false,
+            },
+        ];
+        let json = spec.to_json();
+
+        // The field must appear in the serialized JSON when non-empty.
+        assert!(
+            json.contains("logical_schema"),
+            "non-empty logical_schema must appear in JSON: {json}"
+        );
+
+        // Round-trip: all fields survive.
+        let back = ScanSpec::from_json(&json).unwrap();
+        let fields = &back.logical_schema;
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[0].field_id, 1);
+        assert_eq!(fields[0].name, "id");
+        assert_eq!(fields[0].arrow_type, "int32");
+        assert!(!fields[0].nullable);
+        assert_eq!(fields[1].field_id, 2);
+        assert_eq!(fields[1].name, "rating");
+        assert_eq!(fields[1].arrow_type, "float64");
+        assert!(fields[1].nullable);
+        assert_eq!(fields[2].arrow_type, "utf8");
+        assert_eq!(fields[3].arrow_type, "timestamp_us");
+        assert_eq!(fields[4].arrow_type, "decimal128(18,4)");
+        assert!(!fields[4].nullable);
+
+        // A spec without logical_schema must omit the field from JSON.
+        let row_spec = sample_spec();
+        assert!(row_spec.logical_schema.is_empty());
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("logical_schema"),
+            "empty logical_schema must be absent from JSON: {row_json}"
+        );
+
+        // A legacy payload without the field deserializes to an empty Vec.
+        let legacy_json = r#"{
+            "files": ["s3://w/f0.parquet"],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            },
+            "catalog": {
+                "uri": "http://rest:8181",
+                "warehouse": "wh",
+                "table": "db.t"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.logical_schema.is_empty(),
+            "missing logical_schema must default to empty (backward-compat)"
+        );
     }
 
     /// T8 — ScanSpec threading fields round-trip and default to 1 when absent.

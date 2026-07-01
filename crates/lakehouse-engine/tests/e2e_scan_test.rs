@@ -19,9 +19,10 @@
 mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, PART_CENTRAL_IDS, PART_COL,
-    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
-    SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, seed_events,
+    E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_NEW_COL,
+    EVO_TOTAL_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
+    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
+    seed_events, seed_renamed_column,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -529,6 +530,86 @@ fn scan_unknown_virtual_table_errors() {
         Some("error"),
         "expected an error for unknown virtual table NO_SUCH_TABLE: {resp}"
     );
+}
+
+/// Schema evolution with a renamed column resolves correctly by Iceberg field-id.
+///
+/// Scenario (seeded by `seed_renamed_column`), field-id 2 stable throughout:
+///   - file A: ids 1..=5,  physical parquet column `score`
+///   - catalog rename `score` -> `rating` (field-id 2 preserved)
+///   - file B: ids 6..=10, physical parquet column `rating`
+///
+/// The VS is created with `PARALLELISM_FACTOR = 1` so that on this single-node
+/// cluster the shard count G = clamp(1 * 1, 1, min(file_count, 300)) = 1. Both
+/// files therefore land in ONE shard → one `ScanSpec` → one DataFusion
+/// `ListingTable`. The two divergent physical layouts (`score` vs `rating` for
+/// field-id 2) are handled by the field-id expression adapter, which binds both
+/// files to the current logical name by field-id rather than by physical name.
+///
+/// Expected result: `EVO_TOTAL_ROWS` (10) rows, `rating = 10*id`, no NULLs.
+#[test]
+fn e2e_renamed_column_resolves_by_field_id() {
+    setup_e2e();
+
+    // Seed the dedicated evo table: create + file A (score) + rename + file B (rating).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        seed_renamed_column(&iceberg_catalog_url(), "s3://warehouse/")
+            .await
+            .expect("seed evo (renamed-column) table");
+    });
+
+    let mut conn = exa_conn();
+
+    // A dedicated VS created AFTER evo exists, so the adapter enumerates it
+    // (the shared MY_LAKEHOUSE VS was created before evo and does not see it).
+    // PARALLELISM_FACTOR = 1 forces a single shard (G = 1 on this 1-node cluster),
+    // so both parquet files are scanned together in one ListingTable.
+    let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS EVO_VS CASCADE");
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA EVO_VS
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
+  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
+  SCAN_SCHEMA         = '{SCHEMA_NAME}'
+  PARALLELISM_FACTOR  = '1'
+  ALLOW_HTTP          = 'true'"#
+    ));
+
+    let col = EVO_NEW_COL.to_uppercase();
+    let sql = format!(
+        "SELECT id, {col} FROM EVO_VS.{} ORDER BY id",
+        E2E_EVO_TABLE.to_uppercase()
+    );
+
+    let cols = conn.query_columns(&sql);
+    let ids = &cols[0];
+    let ratings = &cols[1];
+    let row_count = ids.len();
+
+    assert_eq!(
+        row_count, EVO_TOTAL_ROWS,
+        "field-id projection must return all {EVO_TOTAL_ROWS} rows across both \
+         pre- and post-rename files; got {row_count}"
+    );
+
+    for (i, r) in ratings.iter().enumerate() {
+        let id = ids[i]
+            .as_i64()
+            .or_else(|| ids[i].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(-1);
+        let rating = r
+            .as_f64()
+            .expect("rating must not be NULL after field-id projection");
+        assert!(
+            (rating - 10.0 * id as f64).abs() < 1e-6,
+            "row {i}: expected rating = 10 * {id} = {}, got {rating}",
+            10 * id
+        );
+    }
 }
 
 /// Verify the suite panics (not silently passes) when Exasol is unreachable.
