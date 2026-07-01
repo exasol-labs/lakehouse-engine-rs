@@ -17,14 +17,12 @@ STACK="$HERE/../cluster-stack"
 C4DIR="$HERE/../.c4"
 C4="$C4DIR/c4"
 EXASOL_TAG="${EXASOL_IMAGE_TAG:-exasol-2025.2.1}"
-# DB memory is NOT pinned: the database auto-starts at the max allowable RAM (per DB architect). c4's
-# play template already auto-sizes MemSize from each node's real RAM (via `c4 _ calculate-memory`,
-# which leaves headroom for host/COS/UDFs) — but ONLY when CCC_PLAY_DB_MEM_SIZE resolves to empty at
-# play time. Two subtleties (verified against c4 4.31.0): (1) c4's built-in DEFAULT for this param is
-# 32768 MiB, so simply omitting it from ~/.ccc/config is NOT enough — the default wins and pins 32
-# GiB; (2) an empty line *in the config file* is also ignored (default still wins). Only an EMPTY
-# ENVIRONMENT override forces the empty resolution that triggers the auto-size branch. So we never
-# write the param into the config and instead export CCC_PLAY_DB_MEM_SIZE= for the play (see below).
+# DB memory = the MAX ALLOWABLE DB RAM (per DB architect), computed by c4's own formula
+# `c4 _ calculate-memory NODE_MEMORY_MiB` (leaves headroom for host/COS/UDFs), summed over active
+# nodes (CCC_PLAY_DB_MEM_SIZE is the total). We set it explicitly rather than leaving it empty:
+# empty/omitted does NOT trigger auto-sizing on this c4 build — it leaves MemSize=0, which makes the
+# DataVolume setup invalid so the DB never starts (db_start dies in _check_db_version:
+# "Cannot parse version Setup does not seem to have a valid setup.").
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
 cd "$STACK"
@@ -64,7 +62,15 @@ for ip in "${EXT_IPS[@]}"; do
   done
 done
 
-echo "==> Rendering ~/.ccc/config (${#INT_IPS[@]} hosts, reserve=$RESERVE, db_mem=auto/max)" >&2
+# Max allowable DB RAM via c4's own formula: per-node from real node RAM, then × active nodes (total).
+PER_NODE_MIB="$(ssh $SSHOPTS -i "$KEY_FILE" ubuntu@"$NODE1" "awk '/MemTotal/{print int(\$2/1024)}' /proc/meminfo")"
+PER_NODE_DB="$("$C4" _ calculate-memory "$PER_NODE_MIB" 2>/dev/null)"
+ACTIVE_NODES=$(( ${#INT_IPS[@]} - RESERVE )); [ "$ACTIVE_NODES" -ge 1 ] || ACTIVE_NODES=1
+DB_MEM_SIZE=$(( PER_NODE_DB * ACTIVE_NODES ))
+[ "$DB_MEM_SIZE" -ge 1024 ] || { echo "calculate-memory returned '$PER_NODE_DB' for ${PER_NODE_MIB}MiB — bad"; exit 1; }
+echo "==> DB memory: c4 calculate-memory(${PER_NODE_MIB}MiB)=${PER_NODE_DB}MiB/node x ${ACTIVE_NODES} = ${DB_MEM_SIZE}MiB total (max allowable)" >&2
+
+echo "==> Rendering ~/.ccc/config (${#INT_IPS[@]} hosts, reserve=$RESERVE, db_mem=${DB_MEM_SIZE}MiB)" >&2
 mkdir -p "$HOME/.ccc"
 cat >"$HOME/.ccc/config" <<EOF
 CCC_HOST_ADDRS="${INT_IPS[*]}"
@@ -73,18 +79,15 @@ CCC_HOST_DATADISK=/dev/nvme1n1
 CCC_HOST_IMAGE_USER=ubuntu
 CCC_HOST_KEY_PAIR_FILE=$KEY_BASE
 CCC_PLAY_RESERVE_NODES=${RESERVE}
+CCC_PLAY_DB_MEM_SIZE=${DB_MEM_SIZE}
 CCC_PLAY_DB_PASSWORD=${DB_PASS}
 CCC_PLAY_ADMIN_PASSWORD=${ADMIN_PASS}
 CCC_ADMINUI_START_SERVER=true
 CCC_PLAY_WITH_DB=true
 EOF
 
-echo "==> Running c4 host play -T @$EXASOL_TAG (several minutes; DB auto-sizes to max RAM)" >&2
-# Force c4's auto-max memory sizing: an EMPTY env override for CCC_PLAY_DB_MEM_SIZE resolves to empty
-# (unlike an empty config-file line, which the 32768 MiB default overrides). Empty → the play template
-# takes its else branch and sets MemSize from each node's real RAM via `c4 _ calculate-memory`, summed
-# over the active nodes (total). No DB-memory value is set anywhere in this script or the config.
-CCC_PLAY_DB_MEM_SIZE= "$C4" host play -T @"$EXASOL_TAG"
+echo "==> Running c4 host play -T @$EXASOL_TAG (several minutes)" >&2
+"$C4" host play -T @"$EXASOL_TAG"
 
 # Ensure the DB is started (auto_start can lag; explicit start is idempotent once MemSize > 0).
 echo "==> Starting Exasol DB" >&2
