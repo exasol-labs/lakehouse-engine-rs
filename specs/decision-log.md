@@ -1209,3 +1209,58 @@ The adapter issues its own form-encoded `client_credentials` POST (`grant_type=c
 ### Consequences
 
 The adapter is responsible for the OAuth2 client-credentials round-trip on every query where `client_id` + `client_secret` are supplied. Token refresh and re-vending are not implemented (resolve-once-per-query; STS lifetime far exceeds a single query). The `client_secret` and obtained access token must never appear in error messages or SQL output — enforced by `redact_catalog_auth_error`. No new crate dependencies are required (uses `reqwest`, already a dependency).
+
+---
+
+## ADR-046: Field-Id-Based Column Projection via a PhysicalExprAdapter, Not the Iceberg Reader
+
+**Date:** 2026-07-01
+**Plan:** `fix-scan-field-id-projection`
+**Status:** Accepted
+
+### Context
+
+The scan engine bound columns by physical Parquet column name, which diverges from the Iceberg column-projection spec (field-id based). Under a rename, physical `score` and current logical `rating` share field-id 2 but not a name, so binding failed — returning wrong or missing data. The correct fix is to bind by Iceberg field-id. Two mechanisms were evaluated: iceberg-rust's `ArrowReader` / `iceberg-datafusion`, and a custom `PhysicalExprAdapter` installed on the `ListingTable`. The two-Arrow-versions constraint (DataFusion/SDK on arrow/parquet 58; iceberg 0.9.1 on aliased arrow 57) rules out the iceberg-rust reader path, because iceberg types cannot cross into the DataFusion session. DataFusion 54 dictates the `PhysicalExprAdapter` mechanism: `with_schema_adapter_factory` is a deprecated no-op in DataFusion 54.
+
+### Decision
+
+Bind columns by Iceberg field-id inside a custom `FieldIdExprAdapter` installed on the `ListingTable` via `ListingTableConfig::with_expr_adapter_factory`, keeping the whole fix in arrow-58 / DataFusion. The adapter resolves each logical column to its physical Parquet column by matching the logical field's `PARQUET:field_id` against the physical fields' `PARQUET:field_id`, independent of physical name. The Parquet opener applies the adapter per file, so files with divergent physical layouts within one shard each bind correctly.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Custom `FieldIdExprAdapter` + `ListingTableConfig::with_expr_adapter_factory` | ✓ Chosen — only clean path; stays within arrow-58/DataFusion; adapter is applied per file so divergent physical layouts within one shard bind correctly |
+| iceberg-rust `ArrowReader` / `iceberg-datafusion` | ✗ Rejected — iceberg 0.9.1 uses aliased arrow 57; arrow types cannot cross into the DataFusion 54 session (arrow TypeId boundary) |
+| `with_schema_adapter_factory` (deprecated) | ✗ Rejected — deprecated no-op in DataFusion 54; does not apply the adapter |
+
+### Consequences
+
+Field-id projection is correct across Iceberg schema evolution (renamed, dropped, added columns). No new crate dependencies are required: `datafusion_physical_expr_adapter` traits are already available via DataFusion 54, and `parquet::arrow::PARQUET_FIELD_ID_META_KEY` is on the arrow-58 side. The per-file adapter application means a single `ListingTable` over files with divergent physical layouts is handled correctly without pre-reading each file's schema.
+
+---
+
+## ADR-047: Override Resolution Only; Reuse DefaultPhysicalExprAdapter for Everything Else
+
+**Date:** 2026-07-01
+**Plan:** `fix-scan-field-id-projection`
+**Status:** Accepted
+
+### Context
+
+With the `FieldIdExprAdapter` approach selected (ADR-046), the scope of the custom adapter had to be defined. The adapter must handle renamed columns (bind by field-id), but also nullable columns absent from older files (NULL-fill), columns with type divergence (cast), and required columns missing from a file (clean error). Reimplementing all of these behaviors from scratch duplicates the battle-tested `DefaultPhysicalExprAdapter` logic.
+
+### Decision
+
+`FieldIdExprAdapter` overrides only the column-resolution step (field-id-first, with a simple physical-name fallback when a file field carries no embedded `PARQUET:field_id`) and delegates null-fill (nullable column absent from a file → NULL literal), type-diff → cast, and required-missing → clean error to `DefaultPhysicalExprAdapter`. The per-column spec data carried across the UDF boundary is `{field_id, name, arrow_type, nullable}` with no Iceberg `initial-default` (deferred to #27). The `schema.name-mapping.default` table property is also not parsed (deferred to #28).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Override resolution only; delegate null-fill/cast/error to `DefaultPhysicalExprAdapter` | ✓ Chosen — keeps the change minimal and correct; added-nullable NULL-fill and added-required clean-error fall out for free from the default adapter |
+| Reimplement a full custom schema adapter | ✗ Rejected — duplicates battle-tested DataFusion behavior; introduces new code paths for null-fill and cast that could diverge from DataFusion semantics |
+
+### Consequences
+
+The `FieldIdExprAdapter` is a thin wrapper: only the resolution mapping changes. Null-fill, cast, and required-missing-error behavior is inherited from `DefaultPhysicalExprAdapter` and stays in sync with DataFusion upgrades automatically. Out-of-scope behaviors (#27 initial-default fill, #28 name-mapping property) are tracked as separate issues and do not block this change.
