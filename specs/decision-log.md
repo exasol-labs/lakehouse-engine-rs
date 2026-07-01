@@ -1320,3 +1320,57 @@ Read the per-node core count from `std::thread::available_parallelism()` on the 
 ### Consequences
 
 `NR_OF_CORES` auto-detection no longer depends on any SQL session. The `NR_OF_CORES` override contract and its precedence over auto-detection are unchanged (see the plan's decision-log entry [4], not promoted to ADR). The parallelism-factor default formula (`max(NR_OF_CORES × 2, 8)`, ADR-023) is unaffected by this change.
+
+---
+
+## ADR-050: Full Positional Reorder Threading select-list Index Through Grouped-Aggregate Detection
+
+**Date:** 2026-07-01
+**Plan:** `fix-grouped-agg-select-order`
+**Status:** Accepted
+
+### Context
+
+`detect_group_by_aggregates` walked `pushdownRequest.selectList` and split it into two disjoint lists — `group_keys` and `plans` — discarding each item's original select-list index. `build_grouped_aggregate_scan_sql` then assembled the outer merge SELECT unconditionally keys-first (`gk_select.chain(merge_items)`). Exasol validates the outer merge SELECT positionally against `selectListDataTypes`; whenever an aggregate preceded or interleaved with a group key in the original select list, the adapter's keys-first output was transposed relative to it, producing `SQL Error [04000]: ... Data type mismatch in column number N` (issue #33). The bug had three broken sub-cases sharing one root cause: aggregate before a single key, interleaved multi-key GROUP BY, and an expression group key after an aggregate.
+
+### Decision
+
+Extend `detect_group_by_aggregates` to carry each `selectList` item's original index and classification (group-key projection vs aggregate, with which slot). `build_grouped_aggregate_scan_sql` places the already-computed, already-typed group-key cast expressions and merged-aggregate expressions into the outer SELECT / GROUP BY at the ordinal position dictated by that index, for any interleaving. The inner fan-out (EMITS clause and per-shard scan) stays keys-first and unchanged — it is matched only against itself, never against the user's select list.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Full positional reorder threading select-list index through detection | ✓ Chosen — #33's root cause is general column transposition; fixes all three sub-cases (aggregate-before-key, interleaved multi-key, expression-key-after-aggregate) in one change |
+| Narrow patch handling only "aggregate before a single group key" | ✗ Rejected — leaves interleaved multi-key and expression-key-after-aggregate broken; only masks the reported repro |
+
+### Consequences
+
+The outer wrapper SELECT, its cast list, and its GROUP BY list now assemble in the user's `selectList` order for any arrangement of keys and aggregates, matching Exasol's positional `selectListDataTypes` check. The inner fan-out EMITS clause and the scan UDF's per-shard SELECT remain keys-first and unaffected (see ADR-051). A HAVING-over-aggregates rendering gap was discovered during E2E verification and fixed in the same change (HAVING containing an aggregate was silently dropped; now rendered against the merge decomposition, fail-closed to native execution when unrenderable) — not itself promoted to a separate ADR, as it is a direct consequence of the same outer-wrapper assembly path.
+
+---
+
+## ADR-051: Keep the Wire Spec (`ScanSpec` / `AggregatePlan`) and Scan UDF Side Unchanged for Grouped-Aggregate Select-List Ordering
+
+**Date:** 2026-07-01
+**Plan:** `fix-grouped-agg-select-order`
+**Status:** Accepted
+
+### Context
+
+Fixing the outer-wrapper column transposition (ADR-050) raised the question of whether the wire contract between the adapter and the scan UDF — `ScanSpec.group_keys`, `ScanSpec.aggregates`, the inner fan-out EMITS clause, `build_grouped_partial_agg_sql`, and the scan UDF's emit loop — also needed to carry select-list ordering end-to-end. This was independently re-verified (not taken on faith) against `crates/lakehouse-engine/src/scan/mod.rs`.
+
+### Decision
+
+Do not change `ScanSpec.group_keys` / `ScanSpec.aggregates`, the inner fan-out EMITS clause, `build_grouped_partial_agg_sql`, or the scan UDF's emit loop. Confine the fix entirely to the adapter's outer-merge assembly (ADR-050).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Keep the wire spec and scan UDF side keys-first and unchanged | ✓ Chosen — verified `build_grouped_partial_agg_sql` (L390-423) and the emit loop (L344-368) are keys-first on both the DataFusion SELECT and the emit order, matched only against the fan-out EMITS clause and never against the user `selectList` |
+| Add ordering metadata to the wire spec so keys/aggregates interleave end-to-end | ✗ Rejected — the scan side never sees the user's select order; changing the wire shape would be churn with no correctness benefit |
+
+### Consequences
+
+The scan UDF and the wire contract between it and the adapter are untouched by this fix, minimizing the change surface and risk. The inner fan-out and per-shard scan remain self-consistent keys-first structures, matched only against each other.

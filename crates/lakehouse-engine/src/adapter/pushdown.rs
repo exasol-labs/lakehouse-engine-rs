@@ -693,26 +693,73 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<AggregatePlan>> {
     Some(plans)
 }
 
-/// Detect a GROUP BY aggregate pushdown and return the rendered group-key SQL
-/// fragments and the corresponding aggregate plans.
+/// Classification of one `selectList` item in a grouped-aggregate pushdown.
 ///
-/// Returns `Some((group_keys, aggregate_plans))` only when **all** of the
-/// following hold:
+/// Each variant carries the item's original `selectList` ordinal so the outer
+/// wrapper SELECT, its cast list, and its GROUP BY list can be assembled in the
+/// user's `selectList` order for any interleaving of keys and aggregates. Exasol
+/// validates the outer wrapper SELECT positionally against `selectListDataTypes`,
+/// so this order must be preserved end-to-end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupedSelectItem {
+    /// A group-key projection. `group_key_slot` indexes `group_keys` (and the
+    /// scan-side `GK_{slot}` EMITS column); `select_index` is the item's original
+    /// `selectList` ordinal.
+    GroupKey {
+        group_key_slot: usize,
+        select_index: usize,
+    },
+    /// An aggregate. `plan_slot` indexes `plans` (and the merged-aggregate items);
+    /// `select_index` is the item's original `selectList` ordinal.
+    Aggregate {
+        plan_slot: usize,
+        select_index: usize,
+    },
+}
+
+/// The original `selectList` ordinal of a classified item.
+fn select_item_index(item: &GroupedSelectItem) -> usize {
+    match *item {
+        GroupedSelectItem::GroupKey { select_index, .. }
+        | GroupedSelectItem::Aggregate { select_index, .. } => select_index,
+    }
+}
+
+/// Result of detecting a GROUP BY aggregate pushdown.
+///
+/// `group_keys` and `plans` are the disjoint keys-first fan-out lists (unchanged
+/// wire shape). `select_items` is the ordered, per-`selectList`-item
+/// classification that preserves the user's select-list order so the outer
+/// wrapper SELECT can be re-assembled positionally.
+#[derive(Debug, Clone)]
+pub struct GroupedAggregateDetection {
+    /// Rendered DataFusion SQL fragment for each `groupBy` expression, in order.
+    pub group_keys: Vec<String>,
+    /// Aggregate plans in `selectList` appearance order.
+    pub plans: Vec<AggregatePlan>,
+    /// One entry per `selectList` item, in `selectList` order.
+    pub select_items: Vec<GroupedSelectItem>,
+}
+
+/// Detect a GROUP BY aggregate pushdown and return the rendered group-key SQL
+/// fragments, the aggregate plans, and the ordered per-item classification.
+///
+/// Returns `Some(GroupedAggregateDetection)` only when **all** of the following
+/// hold:
 /// - `aggregationType` is exactly `"group_by"`.
 /// - `groupBy` is a non-empty array.
 /// - Every element of `groupBy` renders successfully via `render_expression`
 ///   (any failure → `None` for the whole call).
 /// - Every element of `selectList` is either a `function_aggregate` (contributes
-///   an `AggregatePlan`) or a plain `column` reference (group-key projection —
-///   skipped for aggregate plan building). Any other type → `None`.
+///   an `AggregatePlan`) or a group-key projection — a plain `column` reference
+///   or a scalar expression whose rendered SQL matches one of the group keys.
+///   Any other type → `None`.
 /// - The `selectList` is non-empty.
 /// - No `function_aggregate` item uses `distinct: true`.
 ///
 /// Returns `None` on any unsupported shape; the caller falls back to row
 /// scanning or single-group aggregate detection.
-pub fn detect_group_by_aggregates(
-    pushdown_req: &Json,
-) -> Option<(Vec<String>, Vec<AggregatePlan>)> {
+pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregateDetection> {
     // Must be a GROUP BY aggregate request.
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
         return None;
@@ -733,61 +780,82 @@ pub fn detect_group_by_aggregates(
         }
     }
 
-    // Collect aggregate plans from the select list.
+    // Classify each select-list item, preserving its original ordinal.
     let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
     if list.is_empty() {
         return None;
     }
 
     let mut plans = Vec::new();
-    for item in list {
+    let mut select_items = Vec::with_capacity(list.len());
+    for (select_index, item) in list.iter().enumerate() {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match item_type {
-            "column" => {
-                // Group-key column projection — not an aggregate; skip.
-            }
             "function_aggregate" => {
                 let plan = parse_agg_item(item)?;
+                let plan_slot = plans.len();
                 plans.push(plan);
+                select_items.push(GroupedSelectItem::Aggregate {
+                    plan_slot,
+                    select_index,
+                });
             }
             _ => {
-                // A scalar expression that renders to one of the group keys is a
-                // group-key projection (e.g. SELECT MOD(id,4) ... GROUP BY MOD(id,4)) —
-                // emitted via GK_*, so skip it. Anything else disqualifies the path.
-                match render_expression(item) {
-                    Ok(sql) if group_keys.contains(&sql) => {}
-                    _ => return None,
-                }
+                // A group-key projection: a plain column reference, or a scalar
+                // expression that renders to one of the group keys (e.g.
+                // SELECT MOD(id,4) ... GROUP BY MOD(id,4)) emitted via GK_*.
+                // Match to its group-key slot by rendered SQL. Anything that does
+                // not map to a group key disqualifies the whole path.
+                let group_key_slot = render_expression(item)
+                    .ok()
+                    .and_then(|sql| group_keys.iter().position(|gk| *gk == sql))?;
+                select_items.push(GroupedSelectItem::GroupKey {
+                    group_key_slot,
+                    select_index,
+                });
             }
         }
     }
 
-    Some((group_keys, plans))
+    Some(GroupedAggregateDetection {
+        group_keys,
+        plans,
+        select_items,
+    })
 }
 
 /// Resolve the Exasol-declared type of each group key from `selectListDataTypes`.
 ///
-/// Each group-key expression also appears in `selectList`; the parallel
-/// `selectListDataTypes` array gives its declared result type. Falls back to
-/// `VARCHAR(2000000)` when the type cannot be located.
-fn group_key_exasol_types(pushdown_req: &Json, group_keys: &[String]) -> Vec<String> {
-    let select_list = pushdown_req.get("selectList").and_then(|v| v.as_array());
+/// Each group-key slot is located via the detection classification, which
+/// records the group-key projection's own `selectList` ordinal; the parallel
+/// `selectListDataTypes` array at that ordinal gives its declared result type.
+/// Matching by index (not by comparing rendered SQL strings) keeps the type
+/// correct even when an expression key's `groupBy` and `selectList` renderings
+/// differ in whitespace or casing. Falls back to `VARCHAR(2000000)` when the
+/// type cannot be located.
+fn group_key_exasol_types(
+    pushdown_req: &Json,
+    group_keys: &[String],
+    select_items: &[GroupedSelectItem],
+) -> Vec<String> {
     let declared_types = pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array());
-    group_keys
-        .iter()
-        .map(|key| {
-            select_list
-                .and_then(|list| {
-                    list.iter()
-                        .position(|item| render_expression(item).ok().as_deref() == Some(key))
-                })
-                .and_then(|idx| declared_types.and_then(|d| d.get(idx)))
+    let mut types = vec!["VARCHAR(2000000)".to_string(); group_keys.len()];
+    for item in select_items {
+        if let GroupedSelectItem::GroupKey {
+            group_key_slot,
+            select_index,
+        } = item
+            && let Some(ty) = declared_types
+                .and_then(|d| d.get(*select_index))
                 .map(exasol_type_from_json)
-                .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
-        })
-        .collect()
+            && let Some(slot) = types.get_mut(*group_key_slot)
+        {
+            *slot = ty;
+        }
+    }
+    types
 }
 
 /// Resolve the Exasol-declared type of each aggregate select-list item, in order.
@@ -1083,6 +1151,7 @@ pub fn build_grouped_aggregate_scan_sql(
     group_key_types: &[String],
     aggregates: &[AggregatePlan],
     aggregate_types: &[String],
+    select_items: &[GroupedSelectItem],
     limit: Option<u64>,
     col_types: &[(String, String)],
     udf_name: &str,
@@ -1113,14 +1182,28 @@ pub fn build_grouped_aggregate_scan_sql(
         })
         .collect();
     let merge_items = cast_merge_items(aggregates, aggregate_types);
-    let outer_select: Vec<String> = gk_select
+
+    // Assemble the outer SELECT in the user's selectList order: each classified
+    // item is placed at its original ordinal, interleaving group-key casts and
+    // merged aggregates as the user wrote them. Exasol validates this SELECT's
+    // column types positionally against selectListDataTypes, so keys-first
+    // ordering (the inner fan-out shape) would transpose columns whenever an
+    // aggregate precedes or interleaves with a key.
+    let mut ordered = select_items.to_vec();
+    ordered.sort_by_key(select_item_index);
+    let outer_select: Vec<String> = ordered
         .iter()
-        .chain(merge_items.iter())
-        .cloned()
+        .filter_map(|item| match *item {
+            GroupedSelectItem::GroupKey { group_key_slot, .. } => {
+                gk_select.get(group_key_slot).cloned()
+            }
+            GroupedSelectItem::Aggregate { plan_slot, .. } => merge_items.get(plan_slot).cloned(),
+        })
         .collect();
     let outer_select_str = outer_select.join(", ");
 
-    // Group BY in outer: GK_0, GK_1, ...
+    // Group BY in outer: GK_0, GK_1, ... The set of group-key columns is fixed;
+    // outer GROUP BY order does not affect grouping semantics.
     let outer_group_by: Vec<String> = (0..group_keys.len())
         .map(|i| format!(r#""GK_{i}""#))
         .collect();
@@ -1361,6 +1444,130 @@ fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
         .collect()
 }
 
+/// Render a HAVING predicate for the OUTER merge wrapper.
+///
+/// The outer wrapper's only columns are `GK_*` and `PARTIAL_*` — there is no
+/// source column (e.g. `SCORE`) available there. So each `function_aggregate`
+/// reference in the predicate is rewritten to its merged expression (e.g.
+/// `SUM(score)` → `SUM("PARTIAL_sum_0")`), matched to `plans` by
+/// `AggregatePlan` equality (kind + source column). Non-aggregate leaves
+/// (columns, literals, scalar functions, arithmetic) delegate to
+/// `render_expression`.
+///
+/// Returns `None` if the predicate references an aggregate not among `plans`
+/// (cannot be merged) or contains an unsupported node — the caller then
+/// declines the grouped pushdown rather than emit a wrong or dropped HAVING.
+fn render_having_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
+    if !node.is_object() {
+        return None;
+    }
+    let kind = node.get("type").and_then(|t| t.as_str())?;
+    let child = |key: &str| node.get(key);
+
+    // An aggregate reference: rewrite to its uncast merged expression. Uncast is
+    // correct here — the comparison is against the raw merged numeric value; the
+    // CAST in `cast_merge_items` is only for output-column typing.
+    if kind == "function_aggregate" {
+        let plan = parse_agg_item(node)?;
+        let idx = plans.iter().position(|p| *p == plan)?;
+        return merge_select_items(plans).into_iter().nth(idx);
+    }
+
+    // Boolean / comparison predicate nodes that can appear in a HAVING. Operator
+    // strings and parenthesization mirror `vs-expression`'s renderer so output
+    // matches conventions.
+    match kind {
+        "predicate_and" => render_having_junction(child("expressions"), plans, " AND "),
+        "predicate_or" => render_having_junction(child("expressions"), plans, " OR "),
+        "predicate_not" => {
+            let inner = render_having_operand(child("expression"), plans)?;
+            Some(format!("(NOT {inner})"))
+        }
+        "predicate_equal"
+        | "predicate_notequal"
+        | "predicate_less"
+        | "predicate_lessequal"
+        | "predicate_greater"
+        | "predicate_greaterequal" => {
+            let op = match kind {
+                "predicate_equal" => "=",
+                "predicate_notequal" => "<>",
+                "predicate_less" => "<",
+                "predicate_lessequal" => "<=",
+                "predicate_greater" => ">",
+                "predicate_greaterequal" => ">=",
+                _ => unreachable!(),
+            };
+            let left = render_having_operand(child("left"), plans)?;
+            let right = render_having_operand(child("right"), plans)?;
+            Some(format!("({left} {op} {right})"))
+        }
+        "predicate_between" => {
+            let target = render_having_operand(child("expression"), plans)?;
+            let low = render_having_operand(child("left"), plans)?;
+            let high = render_having_operand(child("right"), plans)?;
+            Some(format!("({target} BETWEEN {low} AND {high})"))
+        }
+        "predicate_is_null" => {
+            let inner = render_having_operand(child("expression"), plans)?;
+            Some(format!("({inner} IS NULL)"))
+        }
+        "predicate_is_not_null" => {
+            let inner = render_having_operand(child("expression"), plans)?;
+            Some(format!("({inner} IS NOT NULL)"))
+        }
+        _ => None,
+    }
+}
+
+/// Render a HAVING operand: a `function_aggregate` rewrites to its merged
+/// expression; any other node (column, literal, scalar function, arithmetic,
+/// or nested predicate) delegates to `render_having_over_merge` — which itself
+/// falls back to `render_expression` for non-predicate, non-aggregate nodes.
+fn render_having_operand(node: Option<&Json>, plans: &[AggregatePlan]) -> Option<String> {
+    let node = node.filter(|n| !n.is_null())?;
+    let kind = node.get("type").and_then(|t| t.as_str())?;
+    match kind {
+        "function_aggregate"
+        | "predicate_and"
+        | "predicate_or"
+        | "predicate_not"
+        | "predicate_equal"
+        | "predicate_notequal"
+        | "predicate_less"
+        | "predicate_lessequal"
+        | "predicate_greater"
+        | "predicate_greaterequal"
+        | "predicate_between"
+        | "predicate_is_null"
+        | "predicate_is_not_null" => render_having_over_merge(node, plans),
+        // Non-aggregate, non-predicate leaf (literal, column, scalar function,
+        // arithmetic): the merge wrapper has no aggregate to rewrite, so render
+        // it exactly as vs-expression would.
+        _ => render_expression(node).ok(),
+    }
+}
+
+/// Render an AND/OR junction over the outer merge wrapper, mirroring
+/// `vs-expression`'s `render_junction`: single child unwrapped, multiple joined
+/// and parenthesized. Any child that fails to render collapses the junction.
+fn render_having_junction(
+    expressions: Option<&Json>,
+    plans: &[AggregatePlan],
+    op: &str,
+) -> Option<String> {
+    let items = expressions?.as_array()?;
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        parts.push(render_having_over_merge(item, plans)?);
+    }
+    match parts.len() {
+        0 => None,
+        1 => parts.into_iter().next(),
+        _ => Some(format!("({})", parts.join(op))),
+    }
+}
+
 /// Build the outer merge SELECT items, each cast to its Exasol-declared result type.
 ///
 /// The merge expression (e.g. `SUM("PARTIAL_count_0")` over DECIMAL(20,0) partials →
@@ -1504,16 +1711,20 @@ pub async fn handle_pushdown(
         _ => SCAN_UDF_NAME.to_string(),
     };
 
-    // Render the HAVING predicate (for grouped aggregate queries).
-    // Applied in the OUTER wrapper only — never in the per-shard scan.
-    // If the predicate cannot be translated, omit it (Exasol post-processes).
-    let having = pushdown_req
-        .get("having")
-        .filter(|h| !h.is_null())
-        .and_then(render_expression_safe);
+    // The raw HAVING node (for grouped aggregate queries). Rendered against the
+    // merge decomposition in the grouped branch below (its aggregates reference
+    // PARTIAL_* columns, not source columns). Kept as the raw node here only for
+    // the presence check: the adapter advertises AGGREGATE_HAVING, so Exasol does
+    // NOT re-apply a HAVING we claim to handle — dropping one yields wrong results.
+    let having_node = pushdown_req.get("having").filter(|h| !h.is_null());
 
     // Detection priority: GROUP BY aggregate → single-group aggregate → row scan.
-    if let Some((group_keys, grouped_agg_plans)) = detect_group_by_aggregates(&pushdown_req) {
+    if let Some(GroupedAggregateDetection {
+        group_keys,
+        plans: grouped_agg_plans,
+        select_items,
+    }) = detect_group_by_aggregates(&pushdown_req)
+    {
         // Validate aggregate column types for the grouped path — same guard as the
         // single-group path below. SUM over a non-numeric column (VARCHAR, DATE, …)
         // would produce an opaque UDF error; normally we fall back to row scan.
@@ -1522,7 +1733,7 @@ pub async fn handle_pushdown(
             // the adapter has advertised AGGREGATE_HAVING, so Exasol will not
             // re-apply a HAVING we claim to handle. Dropping it yields wrong results.
             // Return an error so Exasol executes the query natively.
-            if having.is_some() {
+            if having_node.is_some() {
                 return Err(UdfError::User(
                     "grouped aggregate pushdown declined: HAVING present but aggregate \
                      column type is non-numeric; Exasol will retry natively"
@@ -1531,6 +1742,27 @@ pub async fn handle_pushdown(
             }
             // No HAVING: safe to fall through to single-group / row scan.
         } else {
+            // Render the HAVING against the merge decomposition: each aggregate
+            // reference is rewritten to its merged expression (SUM(score) →
+            // SUM("PARTIAL_sum_0")). Applied in the OUTER wrapper only, never in
+            // the per-shard scan. If a HAVING is present but cannot be rendered
+            // over the merge, decline the grouped pushdown (Err) — silently
+            // dropping it would yield wrong results because Exasol will not
+            // re-apply a HAVING we advertised AGGREGATE_HAVING for.
+            let having = match having_node {
+                Some(node) => match render_having_over_merge(node, &grouped_agg_plans) {
+                    Some(sql) => Some(sql),
+                    None => {
+                        return Err(UdfError::User(
+                            "grouped aggregate pushdown declined: HAVING references an \
+                             aggregate that cannot be merged or an unsupported node; \
+                             Exasol will retry natively"
+                                .into(),
+                        ));
+                    }
+                },
+                None => None,
+            };
             // Grouped aggregate pushdown path.
             let spec_template = ScanSpec {
                 files: vec![],
@@ -1551,7 +1783,7 @@ pub async fn handle_pushdown(
                 memory_pool_fraction,
                 instance_overhead_mb,
             };
-            let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys);
+            let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys, &select_items);
             let aggregate_types = aggregate_exasol_types(&pushdown_req);
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
@@ -1560,6 +1792,7 @@ pub async fn handle_pushdown(
                 &group_key_types,
                 &grouped_agg_plans,
                 &aggregate_types,
+                &select_items,
                 limit,
                 &col_types,
                 &udf_name,
@@ -3427,7 +3660,7 @@ mod tests {
             detected.is_some(),
             "detect_group_by_aggregates must accept the shape: {req}"
         );
-        let (_, agg_plans) = detected.unwrap();
+        let agg_plans = detected.unwrap().plans;
 
         // Validation with VARCHAR col_types must fail — triggering fall-back.
         let col_types = vec![
@@ -3563,6 +3796,42 @@ mod tests {
         })
     }
 
+    /// Like `make_group_by_request`, but also carries `selectListDataTypes` so
+    /// ordering + type-position assertions are possible (positional matching
+    /// against the outer wrapper SELECT and group-key type resolution).
+    fn make_group_by_request_with_types(
+        group_by: serde_json::Value,
+        select_list: serde_json::Value,
+        select_list_data_types: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": group_by,
+            "selectList": select_list,
+            "selectListDataTypes": select_list_data_types,
+        })
+    }
+
+    /// `MOD(<col>, <divisor>)` as a `function_scalar` node — renders to
+    /// `("<COL>" % <divisor>)` via `render_expression`. Used to build the #33
+    /// repro (`SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)`) and its
+    /// interleaved/HAVING variants.
+    fn mod_item(col: &str, divisor: i64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_scalar",
+            "name": "MOD",
+            "arguments": [
+                {"type": "column", "name": col},
+                {"type": "literal_exactnumeric", "value": divisor},
+            ],
+        })
+    }
+
+    /// A DECIMAL `selectListDataTypes` entry, per the `exasol_type_from_json` shape.
+    fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
+        serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
+    }
+
     /// Column reference in GROUP BY renders to a quoted identifier.
     #[test]
     fn detect_group_by_aggregates_column_key() {
@@ -3574,7 +3843,11 @@ mod tests {
             ]),
         );
         let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
-        let (keys, plans) = result;
+        let GroupedAggregateDetection {
+            group_keys: keys,
+            plans,
+            ..
+        } = result;
         assert_eq!(keys.len(), 1, "one group key");
         assert!(
             keys[0].contains("REGION"),
@@ -3600,7 +3873,11 @@ mod tests {
         let result = detect_group_by_aggregates(&req);
         // predicate_equal renders to (STATUS = 'active'), so it should succeed.
         assert!(result.is_some(), "renderable expression key must succeed");
-        let (keys, plans) = result.unwrap();
+        let GroupedAggregateDetection {
+            group_keys: keys,
+            plans,
+            ..
+        } = result.unwrap();
         assert_eq!(keys.len(), 1);
         assert!(keys[0].contains("="), "rendered expression must contain =");
         assert_eq!(plans[0].kind, AggKind::Sum);
@@ -3633,6 +3910,140 @@ mod tests {
         assert!(
             detect_group_by_aggregates(&req).is_none(),
             "non-aggregate non-column in selectList must fall back"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // detect_group_by_aggregates — select-list order preservation (fix-grouped-agg-select-order)
+    // ---------------------------------------------------------------------------
+
+    /// #33 repro: an aggregate placed before the single group key in the
+    /// selectList must classify with `select_index` 0 for the aggregate and 1
+    /// for the group key — the original ordinals, not a keys-first reorder.
+    #[test]
+    fn detect_group_by_aggregates_preserves_select_list_order() {
+        // SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)
+        let req = make_group_by_request(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([agg_item("SUM", Some("SCORE"), false), mod_item("ID", 4)]),
+        );
+        let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(result.group_keys.len(), 1, "one group key");
+        assert_eq!(result.plans.len(), 1, "one aggregate plan");
+        assert_eq!(
+            result.select_items,
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            "classification must preserve original select-list ordinals: {:?}",
+            result.select_items
+        );
+    }
+
+    /// Interleaved multi-key GROUP BY: `SELECT k1, SUM(score), k2 ... GROUP BY k1, k2`.
+    /// Each classified item must carry its own selectList ordinal and the
+    /// correct group-key slot (k1 → slot 0, k2 → slot 1), even though the
+    /// aggregate sits between them in the select list.
+    #[test]
+    fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
+        let req = make_group_by_request(
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                {"type": "column", "name": "YEAR"},
+            ]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                agg_item("SUM", Some("SCORE"), false),
+                {"type": "column", "name": "YEAR"},
+            ]),
+        );
+        let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(result.group_keys.len(), 2, "two group keys");
+        assert_eq!(result.plans.len(), 1, "one aggregate plan");
+        assert_eq!(
+            result.select_items,
+            vec![
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 1,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 1,
+                    select_index: 2,
+                },
+            ],
+            "classification must preserve interleaved ordinals: {:?}",
+            result.select_items
+        );
+    }
+
+    /// Expression group key placed after an aggregate:
+    /// `SELECT COUNT(*), MOD(id,4) ... GROUP BY MOD(id,4)`.
+    #[test]
+    fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
+        let req = make_group_by_request(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([agg_item("COUNT", None, false), mod_item("ID", 4)]),
+        );
+        let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(
+            result.select_items,
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            "expression key after aggregate must classify by original ordinal: {:?}",
+            result.select_items
+        );
+    }
+
+    /// Aggregate-first GROUP BY with HAVING present: HAVING does not change
+    /// selectList classification, but this exercises the same aggregate-first
+    /// shape that flows into the HAVING-present outer-wrapper path.
+    #[test]
+    fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [mod_item("ID", 4)],
+            "selectList": [agg_item("SUM", Some("SCORE"), false), mod_item("ID", 4)],
+            "having": {
+                "type": "predicate_greater",
+                "left": agg_item("SUM", Some("SCORE"), false),
+                "right": {"type": "literal_exactnumeric", "value": 100},
+            },
+        });
+        let result = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(
+            result.select_items,
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            "HAVING presence must not affect selectList classification order: {:?}",
+            result.select_items
         );
     }
 
@@ -3784,6 +4195,24 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Helper: build grouped aggregate scan SQL.
+    /// Keys-first classification: group keys at ordinals 0..m, aggregates after.
+    fn keys_first_select_items(group_keys: usize, aggregates: usize) -> Vec<GroupedSelectItem> {
+        let mut items = Vec::with_capacity(group_keys + aggregates);
+        for slot in 0..group_keys {
+            items.push(GroupedSelectItem::GroupKey {
+                group_key_slot: slot,
+                select_index: slot,
+            });
+        }
+        for slot in 0..aggregates {
+            items.push(GroupedSelectItem::Aggregate {
+                plan_slot: slot,
+                select_index: group_keys + slot,
+            });
+        }
+        items
+    }
+
     fn build_grouped_agg_sql(
         group_keys: Vec<String>,
         agg_plans: Vec<AggregatePlan>,
@@ -3813,6 +4242,7 @@ mod tests {
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
+        let select_items = keys_first_select_items(group_keys.len(), agg_plans.len());
         build_grouped_aggregate_scan_sql(
             &spec_template,
             shards,
@@ -3820,6 +4250,7 @@ mod tests {
             &[],
             &agg_plans,
             &[],
+            &select_items,
             None,
             &col_types,
             SCAN_UDF_NAME,
@@ -3897,6 +4328,7 @@ mod tests {
                 column: None,
             }],
             &[],
+            &keys_first_select_items(1, 1),
             Some(100),
             &col_types,
             SCAN_UDF_NAME,
@@ -3973,6 +4405,503 @@ mod tests {
         assert!(
             outer_group_by_clause.contains("GK_1"),
             "outer GROUP BY must include GK_1: {outer_group_by_clause}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // build_grouped_aggregate_scan_sql — outer SELECT follows selectList order
+    // (fix-grouped-agg-select-order, GitHub issue #33)
+    // ---------------------------------------------------------------------------
+
+    /// Extract the outer wrapper's SELECT list (between the leading `SELECT `
+    /// and the `FROM (` that opens the fan-out subselect), split on the
+    /// top-level commas of each column expression. Aggregate expressions and
+    /// CAST(...) fragments never contain a bare `, ` outside of nested
+    /// parens/quotes for the shapes used in these tests (SUM/COUNT merges and
+    /// CAST("GK_i" AS ...)), so a paren-depth-aware split is sufficient.
+    fn outer_select_items(sql: &str) -> Vec<String> {
+        let from_pos = sql
+            .find(" FROM (")
+            .expect("must have outer FROM (: sql={sql}");
+        let select_str = &sql["SELECT ".len()..from_pos];
+        let mut items = Vec::new();
+        let mut depth = 0i32;
+        let mut current = String::new();
+        for ch in select_str.chars() {
+            match ch {
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth -= 1;
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    items.push(current.trim().to_string());
+                    current = String::new();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            items.push(current.trim().to_string());
+        }
+        items
+    }
+
+    /// Build grouped aggregate scan SQL with explicit (non-keys-first) `select_items`
+    /// and declared group-key types, so ordering + CAST type can be asserted.
+    fn build_grouped_agg_sql_with_select_items(
+        group_keys: Vec<String>,
+        group_key_types: Vec<String>,
+        agg_plans: Vec<AggregatePlan>,
+        aggregate_types: Vec<String>,
+        select_items: Vec<GroupedSelectItem>,
+        having: Option<&str>,
+    ) -> String {
+        let col_types: Vec<(String, String)> = vec![
+            ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
+            ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        ];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(agg_plans.clone()),
+            group_keys: Some(group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &group_keys,
+            &group_key_types,
+            &agg_plans,
+            &aggregate_types,
+            &select_items,
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+            having,
+        )
+    }
+
+    /// #33 repro: `SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)`.
+    /// The outer wrapper SELECT must place the merged SUM at position 0 and
+    /// the CAST'd group key at position 1 — matching the user's selectList
+    /// order, not the inner fan-out's keys-first shape.
+    #[test]
+    fn grouped_wrapper_agg_before_key_ordering() {
+        let sql = build_grouped_agg_sql_with_select_items(
+            vec![r#"("ID" % 4)"#.to_string()],
+            vec!["DECIMAL(9,0)".to_string()],
+            vec![AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("SCORE".into()),
+            }],
+            vec!["DOUBLE PRECISION".to_string()],
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            None,
+        );
+        let items = outer_select_items(&sql);
+        assert_eq!(
+            items.len(),
+            2,
+            "outer SELECT must have exactly 2 items: {items:?}"
+        );
+        assert!(
+            items[0].contains("PARTIAL_sum_0") && items[0].starts_with("CAST(SUM("),
+            "position 0 must be the merged aggregate: {items:?}"
+        );
+        assert!(
+            items[1].starts_with("CAST(\"GK_0\" AS DECIMAL(9,0))"),
+            "position 1 must be the CAST'd group key with its declared type: {items:?}"
+        );
+    }
+
+    /// Interleaved multi-key: `SELECT k1, SUM(score), k2 ... GROUP BY k1, k2`.
+    /// Outer SELECT order must be [key0, aggregate, key1], matching selectList.
+    #[test]
+    fn grouped_wrapper_interleaved_multi_key_ordering() {
+        let sql = build_grouped_agg_sql_with_select_items(
+            vec![r#""REGION""#.to_string(), r#""YEAR""#.to_string()],
+            vec!["VARCHAR(100)".to_string(), "DECIMAL(4,0)".to_string()],
+            vec![AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("SCORE".into()),
+            }],
+            vec!["DOUBLE PRECISION".to_string()],
+            vec![
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 1,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 1,
+                    select_index: 2,
+                },
+            ],
+            None,
+        );
+        let items = outer_select_items(&sql);
+        assert_eq!(
+            items.len(),
+            3,
+            "outer SELECT must have exactly 3 items: {items:?}"
+        );
+        assert!(
+            items[0].starts_with("CAST(\"GK_0\" AS VARCHAR(100))"),
+            "position 0 must be key0's CAST: {items:?}"
+        );
+        assert!(
+            items[1].contains("PARTIAL_sum_0") && items[1].starts_with("CAST(SUM("),
+            "position 1 must be the merged aggregate: {items:?}"
+        );
+        assert!(
+            items[2].starts_with("CAST(\"GK_1\" AS DECIMAL(4,0))"),
+            "position 2 must be key1's CAST: {items:?}"
+        );
+    }
+
+    /// Expression group key after an aggregate: `SELECT COUNT(*), MOD(id,4) ...
+    /// GROUP BY MOD(id,4)`. The key's declared type (DECIMAL, from
+    /// selectListDataTypes at its own select_index) must be preserved — this
+    /// is what stops the silent VARCHAR(2000000) fallback for #33 sub-case 3.
+    #[test]
+    fn grouped_wrapper_expr_key_after_agg_ordering() {
+        let sql = build_grouped_agg_sql_with_select_items(
+            vec![r#"("ID" % 4)"#.to_string()],
+            vec!["DECIMAL(9,0)".to_string()],
+            vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+            }],
+            vec!["DECIMAL(18,0)".to_string()],
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            None,
+        );
+        let items = outer_select_items(&sql);
+        assert_eq!(items.len(), 2, "outer SELECT must have 2 items: {items:?}");
+        assert!(
+            items[0].contains("PARTIAL_count_0") && items[0].starts_with("CAST(SUM("),
+            "position 0 must be the merged COUNT: {items:?}"
+        );
+        assert!(
+            items[1].starts_with("CAST(\"GK_0\" AS DECIMAL(9,0))"),
+            "position 1 must be the CAST'd group key, not a VARCHAR fallback: {items:?}"
+        );
+    }
+
+    /// Aggregate-first GROUP BY with HAVING: `SELECT SUM(score), MOD(id,4) ...
+    /// GROUP BY MOD(id,4) HAVING SUM(score) > n`. Outer SELECT order must still
+    /// follow selectList (aggregate first) and HAVING must be appended after
+    /// GROUP BY, exercising the HAVING-present outer-wrapper path together with
+    /// non-keys-first ordering.
+    #[test]
+    fn grouped_wrapper_agg_first_with_having_ordering() {
+        let sql = build_grouped_agg_sql_with_select_items(
+            vec![r#"("ID" % 4)"#.to_string()],
+            vec!["DECIMAL(9,0)".to_string()],
+            vec![AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("SCORE".into()),
+            }],
+            vec!["DOUBLE PRECISION".to_string()],
+            vec![
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 1,
+                },
+            ],
+            Some(r#"(SUM("PARTIAL_sum_0") > 100)"#),
+        );
+        let having_pos = sql.find("HAVING").expect("must contain HAVING: {sql}");
+        let group_by_pos = sql.find("GROUP BY").expect("must contain GROUP BY: {sql}");
+        assert!(
+            having_pos > group_by_pos,
+            "HAVING must appear after GROUP BY: {sql}"
+        );
+        let select_only = &sql[..group_by_pos];
+        let items = outer_select_items(select_only);
+        assert_eq!(items.len(), 2, "outer SELECT must have 2 items: {items:?}");
+        assert!(
+            items[0].contains("PARTIAL_sum_0") && items[0].starts_with("CAST(SUM("),
+            "position 0 must be the merged aggregate even with HAVING present: {items:?}"
+        );
+        assert!(
+            items[1].starts_with("CAST(\"GK_0\" AS DECIMAL(9,0))"),
+            "position 1 must be the CAST'd group key even with HAVING present: {items:?}"
+        );
+    }
+
+    /// A HAVING `SUM(score) > literal` node built as Exasol sends it (a
+    /// `predicate_greater` whose `left` is a `function_aggregate`) must render
+    /// against the MERGE decomposition: the aggregate reference becomes the
+    /// merged partial expression `SUM("PARTIAL_sum_0")`, NOT the source column
+    /// `SUM("SCORE")` (which does not exist in the outer wrapper). This is the
+    /// #33 HAVING repro (`... GROUP BY MOD(id,4) HAVING SUM(score) > 250`).
+    #[test]
+    fn render_having_over_merge_rewrites_aggregate_to_partial() {
+        let having = serde_json::json!({
+            "type": "predicate_greater",
+            "left": agg_item("SUM", Some("SCORE"), false),
+            "right": {"type": "literal_exactnumeric", "value": 250},
+        });
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("SCORE".into()),
+        }];
+        let rendered = render_having_over_merge(&having, &plans)
+            .expect("HAVING over a known aggregate must render");
+        assert_eq!(
+            rendered, r#"(SUM("PARTIAL_sum_0") > 250)"#,
+            "HAVING must reference the merged partial, not the source column: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#""SCORE""#) && !rendered.contains("SUM(\"SCORE\")"),
+            "HAVING must NOT reference the source column SCORE: {rendered}"
+        );
+    }
+
+    /// The full outer-wrapper SQL for the #33 HAVING repro must carry the merged
+    /// HAVING `SUM("PARTIAL_sum_0") > 250` and must not reference the source
+    /// `SCORE` column in the HAVING clause.
+    #[test]
+    fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([agg_item("SUM", Some("SCORE"), false), mod_item("ID", 4)]),
+            serde_json::json!([
+                {"type": "double"},
+                decimal_type(9, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        let group_key_types =
+            group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+        let aggregate_types = aggregate_exasol_types(&req);
+
+        let having_node = serde_json::json!({
+            "type": "predicate_greater",
+            "left": agg_item("SUM", Some("SCORE"), false),
+            "right": {"type": "literal_exactnumeric", "value": 250},
+        });
+        let having = render_having_over_merge(&having_node, &detection.plans)
+            .expect("HAVING must render over the merge decomposition");
+
+        let col_types: Vec<(String, String)> =
+            vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(detection.plans.clone()),
+            group_keys: Some(detection.group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &detection.group_keys,
+            &group_key_types,
+            &detection.plans,
+            &aggregate_types,
+            &detection.select_items,
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+            Some(&having),
+        );
+        let having_pos = sql.find("HAVING").expect("must contain HAVING");
+        let having_clause = &sql[having_pos..];
+        assert!(
+            having_clause.contains(r#"SUM("PARTIAL_sum_0") > 250"#),
+            "HAVING clause must use the merge expression: {having_clause}"
+        );
+        assert!(
+            !having_clause.contains(r#""SCORE""#) && !having_clause.contains("SUM(\"SCORE\")"),
+            "HAVING clause must NOT reference the source SCORE column: {having_clause}"
+        );
+    }
+
+    /// A HAVING referencing an aggregate that is NOT present among the plans
+    /// (e.g. `COUNT(*)` when only `SUM(score)` was projected) cannot be merged,
+    /// so `render_having_over_merge` returns None — the signal for
+    /// `handle_pushdown` to DECLINE the pushdown rather than drop the HAVING.
+    #[test]
+    fn render_having_over_merge_declines_unknown_aggregate() {
+        let having = serde_json::json!({
+            "type": "predicate_greater",
+            "left": agg_item("COUNT", None, false),
+            "right": {"type": "literal_exactnumeric", "value": 10},
+        });
+        // Only SUM(score) was projected — COUNT(*) has no matching plan.
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("SCORE".into()),
+        }];
+        assert!(
+            render_having_over_merge(&having, &plans).is_none(),
+            "HAVING over an aggregate absent from the plans must not render"
+        );
+    }
+
+    /// End-to-end wiring: `detect_group_by_aggregates`'s classification output
+    /// feeds directly into `build_grouped_aggregate_scan_sql` and the outer
+    /// wrapper SELECT follows the original selectList order (#33 repro, driven
+    /// through both functions together rather than a hand-built select_items).
+    #[test]
+    fn grouped_wrapper_outer_select_follows_select_list_order() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([agg_item("SUM", Some("SCORE"), false), mod_item("ID", 4)]),
+            serde_json::json!([
+                {"type": "double"},
+                decimal_type(9, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        let group_key_types =
+            group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+        let aggregate_types = aggregate_exasol_types(&req);
+
+        let col_types: Vec<(String, String)> =
+            vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(detection.plans.clone()),
+            group_keys: Some(detection.group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            catalog: sample_catalog(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            shards,
+            &detection.group_keys,
+            &group_key_types,
+            &detection.plans,
+            &aggregate_types,
+            &detection.select_items,
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+            None,
+        );
+
+        let items = outer_select_items(&sql);
+        assert_eq!(items.len(), 2, "outer SELECT must have 2 items: {items:?}");
+        assert!(
+            items[0].contains("PARTIAL_sum_0") && items[0].starts_with("CAST(SUM("),
+            "position 0 must be the merged SUM (selectList order): {items:?}"
+        );
+        assert!(
+            items[1].starts_with("CAST(\"GK_0\" AS DECIMAL(9,0))"),
+            "position 1 must be the CAST'd group key with its declared type: {items:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // group_key_exasol_types — index-based resolution, no silent VARCHAR fallback
+    // (fix-grouped-agg-select-order, GitHub issue #33)
+    // ---------------------------------------------------------------------------
+
+    /// An expression group key whose `groupBy` and `selectList` renderings
+    /// differ only by whitespace/casing must still resolve its declared type
+    /// by index (via `select_items`), not by comparing rendered SQL strings —
+    /// which would silently fall back to VARCHAR(2000000) on any drift.
+    #[test]
+    fn group_key_type_resolved_by_index_not_string_match() {
+        // groupBy renders "(\"ID\" % 4)" (see MOD rendering); simulate a
+        // whitespace/casing-drifted selectList rendering by using a
+        // hand-built classification whose select_index points at a
+        // selectListDataTypes slot the rendered-string form would never find.
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [mod_item("ID", 4)],
+            "selectList": [
+                agg_item("SUM", Some("SCORE"), false),
+                mod_item("ID", 4),
+            ],
+            "selectListDataTypes": [
+                {"type": "double"},
+                decimal_type(9, 0),
+            ],
+        });
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+
+        // Sanity: the real detection path already resolves this correctly by
+        // index. Now prove the mechanism is index-based, not string-based, by
+        // building a classification where the rendered groupBy fragment would
+        // NOT string-match the (hypothetically drifted) selectList rendering,
+        // yet the index-based lookup still finds DECIMAL(9,0) because it reads
+        // selectListDataTypes[select_index] directly.
+        let group_keys = vec![r#"("id" % 4)"#.to_string()]; // lowercase drift vs GK render
+        let select_items = detection.select_items.clone();
+        let types = group_key_exasol_types(&req, &group_keys, &select_items);
+
+        assert_eq!(
+            types,
+            vec!["DECIMAL(9,0)".to_string()],
+            "type must resolve via select_index, not via string-matching the (drifted) \
+             rendered group key: {types:?}"
         );
     }
 
@@ -4316,7 +5245,7 @@ mod tests {
             detected.is_some(),
             "test setup: must detect grouped aggregates"
         );
-        let (_, grouped_plans) = detected.unwrap();
+        let grouped_plans = detected.unwrap().plans;
 
         // (b) validate_agg_col_types must fail (SUM over VARCHAR is invalid).
         assert!(
@@ -4451,6 +5380,7 @@ mod tests {
                 column: Some("AMOUNT".into()),
             }],
             &[],
+            &keys_first_select_items(1, 1),
             None,
             &col_types,
             SCAN_UDF_NAME,

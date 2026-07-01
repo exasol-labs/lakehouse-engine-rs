@@ -25,6 +25,7 @@ outer wrapper.
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Grouped aggregate query is detected and translated to a grouped scan spec
 
 * *GIVEN* a virtual schema over an Iceberg table backed by MinIO
@@ -33,47 +34,9 @@ outer wrapper.
 * *THEN* the adapter SHALL recognise the request as a grouped aggregate query and render each GROUP BY expression node to a DataFusion SQL fragment using the VS expression translator
 * *AND* the adapter SHALL build a scan spec carrying both the rendered group-key expressions and the aggregate plans, while retaining for each `selectList` item its original select-list index and its classification as either a group-key projection or an aggregate, so the outer wrapper SELECT can later be assembled in `selectList` order
 * *AND* the adapter MUST NOT push down a grouped aggregate if any group-key expression cannot be translated, falling back to row scanning instead
+<!-- /DELTA:CHANGED -->
 
-### Scenario: Outer wrapper SELECT preserves user select-list order for interleaved keys and aggregates
-
-* *GIVEN* a grouped aggregate pushdown whose `selectList` places one or more aggregates before, after, or between the group-key projections (e.g. `SELECT SUM(score), MOD(id,4)`, or `SELECT k1, SUM(score), k2`, or `SELECT COUNT(*), MOD(id,4)`)
-* *WHEN* the adapter builds the outer wrapper SELECT, its cast list, and its GROUP BY list
-* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key cast expressions and merged-aggregate expressions as required
-* *AND* the Exasol-declared type applied to each group-key cast SHALL be resolved from the `selectListDataTypes` entry at that key's own select-list index, matched by index rather than by comparing rendered SQL strings
-* *AND* the resulting pushdown query SHALL pass Exasol's positional pushdown-column-type check (no "Data type mismatch in column number N" error) for every arrangement of keys and aggregates
-* *AND* the merged per-group result SHALL equal the result of the same query with the group keys listed first (which is already correct)
-
-### Scenario: Grouped scan spec carries group-key rendered SQL fragments
-
-* *GIVEN* a grouped aggregate pushdown request whose GROUP BY clause contains a mix of column references and scalar expressions (e.g., `YEAR(ts_col)`)
-* *WHEN* the adapter builds the scan spec
-* *THEN* the scan spec SHALL carry a `group_keys` field containing the rendered DataFusion SQL fragment for each group-key expression in order
-* *AND* each group-key expression MUST be renderable by the VS expression translator in raising mode
-* *AND* the scan UDF MUST use the same rendered expressions in its per-shard DataFusion GROUP BY clause
-* *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type and CAST rather than silently defaulting to `VARCHAR(2000000)`
-
-### Scenario: Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units
-
-* *GIVEN* a grouped aggregate pushdown over a file list partitioned into G work-unit shards
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL group the per-shard rows on `shard_key` (one group per shard), NOT on `IPROC()`
-* *AND* G SHALL be `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes and multiplex onto each node's core pool
-* *AND* the scan SET UDF SHALL be invoked once per shard with that shard's explicit file subset
-
-### Scenario: LIMIT is NOT pushed into per-shard scan for a grouped query
-
-* *GIVEN* a grouped aggregate query with a LIMIT clause
-* *WHEN* the adapter builds the grouped scan spec
-* *THEN* the scan spec MUST NOT carry the LIMIT value in the per-shard partial scan
-* *AND* the LIMIT SHALL appear only in the outer wrapper SQL that merges partial-aggregate results from all shards
-
-### Scenario: NULL group keys are grouped together consistently
-
-* *GIVEN* a table with rows where the GROUP BY column contains NULL values
-* *WHEN* the grouped aggregate scan runs across one or more shards
-* *THEN* all rows with a NULL value in the GROUP BY column SHALL be aggregated into a single group
-* *AND* this behavior MUST match standard SQL GROUP BY NULL semantics (NULLs are equal for grouping purposes in both DataFusion and Exasol)
-
+<!-- DELTA:CHANGED -->
 ### Scenario: Grouped aggregate wrapper SQL re-groups partial results per user group key
 
 * *GIVEN* a grouped aggregate pushdown fanned out over G shards via `GROUP BY shard_key`
@@ -82,11 +45,26 @@ outer wrapper.
 * *AND* the outer wrapper SQL SHALL GROUP BY the user group-key columns and merge the per-shard partials using the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path
 * *AND* the outer wrapper SELECT list SHALL place each group-key cast expression and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectList`, so the wrapper's result column order and per-column type match Exasol's positional `selectListDataTypes` validation for ANY interleaving of keys and aggregates, while the inner fan-out EMITS clause and the scan UDF's per-shard SELECT MAY remain keys-first (GK_* then PARTIAL_*) because they are matched only against each other
 * *AND* the merged result per group SHALL equal the result of the same grouped aggregate evaluated over all rows on a single node
+<!-- /DELTA:CHANGED -->
 
-### Scenario: Adapter falls back to row scan for unsupported grouped aggregate shape
+<!-- DELTA:NEW -->
+### Scenario: Outer wrapper SELECT preserves user select-list order for interleaved keys and aggregates
 
-* *GIVEN* a pushdown request with `aggregationType: "group_by"` where any select-list item is not a supported aggregate function or a plain group-key column reference
-* *OR* any group-key expression is not translatable by the VS expression translator
-* *WHEN* the adapter processes the request
-* *THEN* the adapter SHALL fall back to row scanning (emitting a row-scan ScanSpec with no aggregates field)
-* *AND* Exasol SHALL apply the aggregate on the returned rows using its own engine
+* *GIVEN* a grouped aggregate pushdown whose `selectList` places one or more aggregates before, after, or between the group-key projections (e.g. `SELECT SUM(score), MOD(id,4)`, or `SELECT k1, SUM(score), k2`, or `SELECT COUNT(*), MOD(id,4)`)
+* *WHEN* the adapter builds the outer wrapper SELECT, its cast list, and its GROUP BY list
+* *THEN* the adapter SHALL emit the outer SELECT items in the exact order the corresponding items appear in `selectList`, interleaving group-key cast expressions and merged-aggregate expressions as required
+* *AND* the Exasol-declared type applied to each group-key cast SHALL be resolved from the `selectListDataTypes` entry at that key's own select-list index, matched by index rather than by comparing rendered SQL strings
+* *AND* the resulting pushdown query SHALL pass Exasol's positional pushdown-column-type check (no "Data type mismatch in column number N" error) for every arrangement of keys and aggregates
+* *AND* the merged per-group result SHALL equal the result of the same query with the group keys listed first (which is already correct)
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:CHANGED -->
+### Scenario: Grouped scan spec carries group-key rendered SQL fragments
+
+* *GIVEN* a grouped aggregate pushdown request whose GROUP BY clause contains a mix of column references and scalar expressions (e.g., `YEAR(ts_col)`)
+* *WHEN* the adapter builds the scan spec
+* *THEN* the scan spec SHALL carry a `group_keys` field containing the rendered DataFusion SQL fragment for each group-key expression in order
+* *AND* each group-key expression MUST be renderable by the VS expression translator in raising mode
+* *AND* the scan UDF MUST use the same rendered expressions in its per-shard DataFusion GROUP BY clause
+* *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type and CAST rather than silently defaulting to `VARCHAR(2000000)`
+<!-- /DELTA:CHANGED -->
