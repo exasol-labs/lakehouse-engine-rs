@@ -306,8 +306,24 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sysctl kernel.apparmor_restrict_unprivileged_userns
 
+      # Two-phase: `docker compose up --wait` doesn't reliably support a
+      # one-shot container (minio-init) in the same wait set as long-running
+      # services — even a clean exit(0) trips it into exit code 1 (confirmed:
+      # every service was healthy, --wait still failed). `docker wait` the
+      # init job to completion first, then --wait only the services that stay
+      # running.
       - name: Start stack (Exasol + MinIO + Iceberg REST)
-        run: docker compose up -d --wait
+        run: |
+          docker compose up -d minio-init
+          # `docker wait` itself always exits 0 (it successfully waited); the
+          # container's actual exit code is its stdout — check it explicitly.
+          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
+          if [ "$INIT_EXIT" != "0" ]; then
+            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
+            docker compose logs minio-init
+            exit 1
+          fi
+          docker compose up -d --wait exasol minio iceberg-rest
 
       # SLC download, BucketFS upload, and VS creation all happen in-process
       # inside the Rust test harness (crates/lakehouse-engine/tests/e2e_scan_test.rs
