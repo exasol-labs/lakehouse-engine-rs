@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Data-gen bootstrap. Installs python+duckdb+pyiceberg, runs gen_load.py against Glue,
-# records status in SSM, then terminates the instance (shutdown -h now + terminate behavior).
+# Data-gen bootstrap. Installs python+duckdb+pyiceberg, runs gen_load.py against Glue, records status
+# in SSM, then terminates the instance ON SUCCESS. On failure it stays up (write FAILED, no shutdown)
+# so you can SSH in and read /var/log/datagen.log.
 set -uo pipefail
 exec > >(tee /var/log/datagen.log) 2>&1
 
@@ -8,21 +9,25 @@ REGION="${region}"
 BUCKET="${bucket}"
 STATUS_PARAM="${done_param}"
 
-put_status() {
-  aws ssm put-parameter --region "$REGION" --name "$STATUS_PARAM" \
-    --type String --overwrite --value "$1" || true
-}
-trap 'put_status "FAILED@$(date -u +%FT%TZ)"; shutdown -h now' ERR
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq python3-pip python3-venv curl unzip
+
+# AWS CLI v2 (Ubuntu 24.04 has no reliable awscli apt package) — needed for the SSM status marker.
+if ! command -v aws >/dev/null 2>&1; then
+  arch="$(uname -m)"; url="https://awscli.amazonaws.com/awscli-exe-linux-$${arch}.zip"
+  curl -fsSL "$url" -o /tmp/awscliv2.zip && (cd /tmp && unzip -q -o awscliv2.zip && ./aws/install)
+fi
+
+put_status() { aws ssm put-parameter --region "$REGION" --name "$STATUS_PARAM" --type String --overwrite --value "$1" || true; }
+# On any error: record FAILED and STAY UP for debugging (do not shutdown -> not terminated).
+trap 'rc=$?; echo "FAILED rc=$rc at line $LINENO"; put_status "FAILED@$(date -u +%FT%TZ)"; exit $rc' ERR
 
 put_status "RUNNING@$(date -u +%FT%TZ)"
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq python3-pip python3-venv awscli
-
 python3 -m venv /opt/gen
 /opt/gen/bin/pip install --quiet --upgrade pip
-/opt/gen/bin/pip install --quiet duckdb pyiceberg[glue,pyarrow] pyarrow boto3
+/opt/gen/bin/pip install --quiet duckdb "pyiceberg[glue,pyarrow]" pyarrow boto3
 
 aws s3 cp "s3://$BUCKET/${script_key}" /opt/gen/gen_load.py --region "$REGION"
 

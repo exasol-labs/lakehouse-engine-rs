@@ -156,6 +156,8 @@ def main():
     args = ap.parse_args()
 
     con = duckdb.connect()
+    # DuckDB needs a home dir to install the tpch extension; $HOME is empty in cloud-init/root context.
+    con.execute(f"SET home_directory='{args.workdir}';")
     con.execute(f"PRAGMA threads={os.cpu_count() or 4};")
     catalog = build_catalog(args)
 
