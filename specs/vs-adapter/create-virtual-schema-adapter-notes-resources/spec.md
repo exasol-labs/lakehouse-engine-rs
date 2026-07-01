@@ -14,6 +14,10 @@ persisting any state between requests.
 * The adapter MUST NOT use `schemaMetadata.properties` for this purpose, as Exasol
   2025.2.1 silently drops adapter-returned properties. The `adapterNotes` channel is
   queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`.
+* The per-node core count `nr_of_cores` resolves via the `NR_OF_CORES` property
+  override, `std::thread::available_parallelism()` auto-detect, or `0` when unknown;
+  it is no longer discovered over a connect-back session (see
+  `vs-adapter/create-virtual-schema-adapter-notes`).
 * The parallelism factor is supplied as a VS/connection property and recorded
   alongside `CLUSTER_NODES` and `NR_OF_CORES`; when absent it defaults to a
   hardware-aware value derived from `NR_OF_CORES`.
@@ -53,7 +57,7 @@ persisting any state between requests.
 ### Scenario: Adapter records the DataFusion target partition count in the virtual-schema adapterNotes
 
 * *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_TARGET_PARTITIONS` connection/VS property
-* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, connect-back auto-detect, or `0` when unknown)
+* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, `std::thread::available_parallelism()` auto-detect, or `0` when unknown)
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, and the threading mode
 * *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_TARGET_PARTITIONS` value when it is a positive integer and otherwise default to `max(nr_of_cores, 1)`
@@ -62,7 +66,7 @@ persisting any state between requests.
 ### Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
 
 * *GIVEN* a `createVirtualSchema` request that may supply a `DATAFUSION_THREADS_PER_UDF` connection/VS property
-* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, connect-back auto-detect, or `0` when unknown)
+* *AND* the per-node core count resolves to `nr_of_cores` (via `NR_OF_CORES` property override, `std::thread::available_parallelism()` auto-detect, or `0` when unknown)
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved DataFusion threads-per-UDF count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, the threading mode, and the DataFusion target partition count
 * *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_THREADS_PER_UDF` value when it is a positive integer and otherwise default to `max(nr_of_cores, 1)`
@@ -70,7 +74,7 @@ persisting any state between requests.
 
 ### Scenario: Recorded node count and parallelism factor drive later work-unit sharding
 
-* *GIVEN* a `createVirtualSchema` request for which `NPROC()` resolves the active node count
+* *GIVEN* a `createVirtualSchema` request for which `UdfContext::node_count()` resolves the active node count
 * *WHEN* the adapter returns the `createVirtualSchema` response
 * *THEN* the `adapterNotes` SHALL carry both the resolved `CLUSTER_NODES` node count and the `PARALLELISM_FACTOR`
 * *AND* both values SHALL be round-tripped back to the adapter at pushdown time so the shard count G can be computed as `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300
