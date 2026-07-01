@@ -17,6 +17,9 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_expr_adapter::{
+    DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
+};
 use datafusion::prelude::SessionConfig;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
@@ -687,16 +690,27 @@ async fn register_files(
         })
         .collect::<Result<_, _>>()?;
 
-    // Resolve the schema from the first file so we know column types.
+    // Prefer the query-time logical schema (with Iceberg field-ids) when the
+    // adapter supplied one: register it as the table schema and install the
+    // field-id expression adapter so column binding is field-id-first (name
+    // fallback) — correct across schema evolution. When it is absent (legacy
+    // specs), fall back to inferring one Arrow schema from the first file.
     let secrets = spec.storage.secret_values();
-    let resolved_schema = listing_options
-        .infer_schema(&ctx.state(), &table_paths[0])
-        .await
-        .map_err(|e| classify_scan_error(e, &secrets))?;
-
-    let config = ListingTableConfig::new_with_multi_paths(table_paths)
-        .with_listing_options(listing_options)
-        .with_schema(resolved_schema);
+    let config = if spec.logical_schema.is_empty() {
+        let resolved_schema = listing_options
+            .infer_schema(&ctx.state(), &table_paths[0])
+            .await
+            .map_err(|e| classify_scan_error(e, &secrets))?;
+        ListingTableConfig::new_with_multi_paths(table_paths)
+            .with_listing_options(listing_options)
+            .with_schema(resolved_schema)
+    } else {
+        let logical_schema = build_logical_arrow_schema(&spec.logical_schema);
+        ListingTableConfig::new_with_multi_paths(table_paths)
+            .with_listing_options(listing_options)
+            .with_schema(logical_schema)
+            .with_expr_adapter_factory(Arc::new(FieldIdExprAdapterFactory))
+    };
 
     let table = ListingTable::try_new(config)
         .map_err(|e| UdfError::User(format!("failed to create listing table: {e}")))?;
@@ -840,6 +854,202 @@ fn build_alias_items(schema: &datafusion::common::DFSchema) -> Vec<String> {
         .collect()
 }
 
+/// Arrow field-metadata key that carries the Iceberg field-id.
+///
+/// Re-exported from the arrow-58 parquet crate so the whole scan crate has one
+/// canonical spelling; the logical-schema builder tags each field with it and
+/// [`rename_physical_to_logical`] reads it off both the logical and physical schemas.
+pub(crate) use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+/// Read the Iceberg field-id off an Arrow field, if present.
+///
+/// Returns `None` when the field carries no `PARQUET:field_id` metadata (an older
+/// writer) or the value is not a parseable `i32`.
+fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|v| v.parse::<i32>().ok())
+}
+
+/// Factory for a field-id-aware [`PhysicalExprAdapter`], installed on the
+/// `ListingTableConfig` via `with_expr_adapter_factory`. The Parquet opener calls
+/// [`Self::create`] once per file, so files with divergent physical layouts each
+/// bind correctly.
+///
+/// It does NOT reimplement schema adaptation. It composes two steps around
+/// [`DefaultPhysicalExprAdapter`]:
+///
+/// 1. Feed the default a physical schema renamed to logical names by field-id
+///    (see [`rename_physical_to_logical`]). The default then resolves each logical
+///    column to the correct physical index and reuses its own behavior for the
+///    rest — nullable-missing → NULL literal, type divergence → cast,
+///    required-missing → error.
+/// 2. Rename the default's OUTPUT columns back to the real physical names (at
+///    their already-correct indices) — see [`FieldIdExprAdapter`].
+///
+/// # Why the output must be renamed back (the E2E `rating`/`score` failure)
+///
+/// The default adapter resolves columns by NAME, so feeding it logical names on
+/// both sides makes it emit `Column`s carrying the LOGICAL name (`rating`). But in
+/// DataFusion 54 the Parquet opener applies the expr adapter to the PROJECTION as
+/// well as the filter, and every downstream consumer of the rewritten projection —
+/// `build_projection_read_plan`, `reassign_expr_columns`, and `make_projector` —
+/// resolves those `Column`s by NAME against the REAL physical file schema
+/// (`score`). A projected `Column("rating")` therefore fails with
+/// `Unable to get field named "rating"`. Renaming the output back to the real
+/// physical name (order is preserved, so the index is already right) makes those
+/// name-based lookups succeed while keeping the field-id binding.
+#[derive(Debug)]
+pub(crate) struct FieldIdExprAdapterFactory;
+
+impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
+    fn create(
+        &self,
+        logical_file_schema: arrow::datatypes::SchemaRef,
+        physical_file_schema: arrow::datatypes::SchemaRef,
+    ) -> datafusion::error::Result<Arc<dyn PhysicalExprAdapter>> {
+        // Delegate to the default adapter over a physical schema whose fields are
+        // renamed to their logical names by field-id. The default then resolves
+        // each logical column to the correct physical INDEX (order is preserved by
+        // the rename) and applies cast / NULL-fill / required-missing-error against
+        // the logical field — the reused behavior.
+        let renamed_physical =
+            rename_physical_to_logical(&logical_file_schema, &physical_file_schema);
+        let inner = DefaultPhysicalExprAdapterFactory
+            .create(logical_file_schema, Arc::clone(&renamed_physical))?;
+        Ok(Arc::new(FieldIdExprAdapter {
+            inner,
+            physical_file_schema,
+        }))
+    }
+}
+
+/// Wraps [`DefaultPhysicalExprAdapter`] so field-id resolution reaches the
+/// projection READ path, not just filter/predicate expressions.
+///
+/// The default adapter resolves columns by NAME. We feed it a physical schema
+/// renamed to logical names (so it binds by field-id and reuses its cast /
+/// NULL-fill / required-missing logic), which makes it emit `Column`s carrying
+/// the LOGICAL name at the correct physical index. But every downstream consumer
+/// in the Parquet opener — `build_projection_read_plan`, `reassign_expr_columns`,
+/// and `make_projector` — resolves those `Column`s by NAME against the REAL
+/// physical file schema (`score`, not `rating`). Left as-is a renamed column
+/// projection fails with `Unable to get field named "rating"`.
+///
+/// So after delegating, we walk the rewritten expression and rename each
+/// resolved `Column` back to the real physical field NAME at its (already
+/// correct) index. Order is preserved by [`rename_physical_to_logical`], so the
+/// column's index still points at the right physical slot; only the name must be
+/// restored so the opener's name-based lookups succeed. NULL-filled columns
+/// become `Literal`s (no `Column` to rename) and pass through untouched.
+#[derive(Debug)]
+struct FieldIdExprAdapter {
+    inner: Arc<dyn PhysicalExprAdapter>,
+    physical_file_schema: arrow::datatypes::SchemaRef,
+}
+
+impl PhysicalExprAdapter for FieldIdExprAdapter {
+    fn rewrite(
+        &self,
+        expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+        use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
+        use datafusion::physical_expr::expressions::Column;
+
+        let rewritten = self.inner.rewrite(expr)?;
+        rewritten
+            .transform_down(|node| {
+                if let Some(column) = node.downcast_ref::<Column>() {
+                    let real_name = self.physical_file_schema.field(column.index()).name();
+                    if real_name != column.name() {
+                        return Ok(Transformed::yes(Arc::new(Column::new(
+                            real_name,
+                            column.index(),
+                        ))));
+                    }
+                }
+                Ok(Transformed::no(node))
+            })
+            .data()
+    }
+}
+
+/// Rename each physical field to the logical name that shares its Iceberg
+/// field-id, preserving field order, type, nullability, and metadata.
+///
+/// Resolution per physical field:
+/// 1. If it carries a `PARQUET:field_id` matching a logical field's id → adopt
+///    that logical field's name (this is the rename/field-id binding).
+/// 2. Otherwise (no field-id, or an id absent from the logical schema) → keep the
+///    physical name unchanged, which makes the default adapter's name lookup act
+///    as the physical-name fallback (and leaves dropped columns unreferenced).
+///
+/// Assumes that post-rename logical names are unique among the referenced physical
+/// fields. Name collisions from drop+rename-into-a-reused-name are out of scope
+/// and belong to the name-mapping work tracked in issue #28.
+fn rename_physical_to_logical(
+    logical: &arrow::datatypes::Schema,
+    physical: &arrow::datatypes::Schema,
+) -> arrow::datatypes::SchemaRef {
+    use std::collections::HashMap;
+
+    let logical_name_by_id: HashMap<i32, &str> = logical
+        .fields()
+        .iter()
+        .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
+        .collect();
+
+    let renamed_fields: Vec<arrow::datatypes::FieldRef> = physical
+        .fields()
+        .iter()
+        .map(|physical_field| {
+            match field_id_of(physical_field).and_then(|id| logical_name_by_id.get(&id)) {
+                Some(&logical_name) if logical_name != physical_field.name() => {
+                    Arc::new(physical_field.as_ref().clone().with_name(logical_name))
+                }
+                _ => Arc::clone(physical_field),
+            }
+        })
+        .collect();
+
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        renamed_fields,
+        physical.metadata().clone(),
+    ))
+}
+
+/// Build the logical Arrow schema from the spec's query-time logical schema.
+///
+/// Each field is tagged with its Iceberg field-id (`PARQUET:field_id`) so
+/// [`FieldIdExprAdapterFactory`] can bind physical file columns to it by id, and
+/// carries the schema's declared nullability (Iceberg `optional`). The Arrow data
+/// type is reconstructed from the compact tag via [`arrow_type_from_tag`].
+fn build_logical_arrow_schema(
+    logical_schema: &[crate::scan::spec::LogicalField],
+) -> arrow::datatypes::SchemaRef {
+    use crate::types::mapping::arrow_type_from_tag;
+    use std::collections::HashMap;
+
+    let fields: Vec<arrow::datatypes::FieldRef> = logical_schema
+        .iter()
+        .map(|lf| {
+            let field = arrow::datatypes::Field::new(
+                &lf.name,
+                arrow_type_from_tag(&lf.arrow_type),
+                lf.nullable,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                lf.field_id.to_string(),
+            )]));
+            Arc::new(field)
+        })
+        .collect();
+
+    Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
 /// Double-quote an identifier (SQL-safe column name).
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -866,6 +1076,7 @@ mod tests {
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -1552,5 +1763,619 @@ mod tests {
             !text_storage.contains("memory exhausted"),
             "non-OOM error must NOT look like a memory error: {text_storage}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // register_files — logical-schema fallback path (task 5.1)
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: scan without a logical schema falls back to first-file inference.
+    ///
+    /// When `spec.logical_schema` is empty (legacy or unset), `register_files`
+    /// must infer the Arrow schema from the first file and register the table
+    /// without installing the field-id adapter. The registered table must be
+    /// queryable and return all rows written to the file.
+    #[tokio::test]
+    async fn register_files_falls_back_without_logical_schema() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        // Write a minimal local Parquet file.
+        let dir =
+            std::env::temp_dir().join(format!("lh_fallback_inference_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("fallback.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, true),
+        ]));
+        {
+            let file = std::fs::File::create(&path).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                    Arc::new(Int64Array::from(vec![Some(10i64), Some(20), None])),
+                ],
+            )
+            .expect("record batch");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        let file_url = url::Url::from_file_path(&path)
+            .expect("absolute path")
+            .to_string();
+
+        // Build a spec with empty logical_schema — the fallback inference path.
+        let mut spec = minimal_spec();
+        spec.files = vec![file_url];
+        spec.logical_schema = Vec::new();
+
+        let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        register_files(&ctx, "scan_target", &spec)
+            .await
+            .expect("register_files must succeed on first-file inference path");
+
+        // The table must be registered and queryable.
+        let table = ctx
+            .table("scan_target")
+            .await
+            .expect("scan_target must be registered after register_files");
+        let schema = table.schema();
+        assert_eq!(
+            schema.fields().len(),
+            2,
+            "inferred schema must have 2 fields; got {:?}",
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Scenario: column projection binds by Iceberg field-id across physical layouts.
+    ///
+    /// Row-level regression for the E2E `e2e_renamed_column_resolves_by_field_id`
+    /// failure: a Parquet file whose PHYSICAL column is `score` (field-id 2) is
+    /// registered through the production `register_files` path against a LOGICAL
+    /// schema that calls field-id 2 `rating`. Selecting `RATING` through the same
+    /// `build_scan_sql` the UDF runs must read the physical `score` values — the
+    /// projected output column must be remapped by field-id on the READ path, not
+    /// looked up by the (non-existent) physical name `rating`.
+    ///
+    /// Before the fix this fails with the exact E2E error
+    /// (`Unable to get field named "rating". Valid fields: ["id", "score"]`)
+    /// because the projected `Column("rating")` is resolved by NAME against the
+    /// real physical file schema `[id, score]`.
+    #[tokio::test]
+    async fn field_id_adapter_reads_renamed_column_rows() {
+        use crate::scan::spec::LogicalField;
+        use arrow::array::{Array, Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use parquet::arrow::ArrowWriter;
+        use std::collections::HashMap;
+
+        // Write a local Parquet file with PHYSICAL fields id (field-id 1) and
+        // score (field-id 2) — the pre-rename layout. score = 10 * id.
+        let dir = std::env::temp_dir().join(format!("lh_fieldid_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("renamed.parquet");
+
+        let physical_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("score", DataType::Float64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let ids: Vec<i64> = (1..=5).collect();
+        let scores: Vec<f64> = ids.iter().map(|i| 10.0 * *i as f64).collect();
+        {
+            let file = std::fs::File::create(&path).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
+            let batch = RecordBatch::try_new(
+                physical_schema,
+                vec![
+                    Arc::new(Int64Array::from(ids.clone())),
+                    Arc::new(Float64Array::from(scores.clone())),
+                ],
+            )
+            .expect("record batch");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        let file_url = url::Url::from_file_path(&path)
+            .expect("absolute path")
+            .to_string();
+
+        // Logical (current) schema: field-id 2 is now `rating`, not `score`.
+        let logical = vec![
+            LogicalField {
+                field_id: 1,
+                name: "id".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+            },
+            LogicalField {
+                field_id: 2,
+                name: "rating".to_string(),
+                arrow_type: "float64".to_string(),
+                nullable: false,
+            },
+        ];
+
+        let mut spec = minimal_spec();
+        spec.files = vec![file_url];
+        spec.logical_schema = logical;
+        // The adapter pushes uppercase current-name projection.
+        spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+
+        // Drive the EXACT production path: register_files + build_scan_sql, then
+        // collect the resulting rows.
+        let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        register_files(&ctx, "scan_target", &spec)
+            .await
+            .expect("register_files must succeed with logical schema");
+        let sql = build_scan_sql(&ctx, "scan_target", &spec)
+            .await
+            .expect("build_scan_sql");
+        let df = ctx.sql(&sql).await.expect("plan scan SQL");
+        let batches = df.collect().await.expect("scan must read renamed column");
+
+        // Assert the RATING output column carries the physical `score` values.
+        let mut got: Vec<(i64, f64)> = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            let rating_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("rating column is Float64");
+            for row in 0..batch.num_rows() {
+                assert!(!rating_col.is_null(row), "rating must not be NULL");
+                got.push((id_col.value(row), rating_col.value(row)));
+            }
+        }
+        got.sort_by_key(|(id, _)| *id);
+
+        let expected: Vec<(i64, f64)> = ids.iter().map(|i| (*i, 10.0 * *i as f64)).collect();
+        assert_eq!(
+            got, expected,
+            "RATING must read the physical `score` values (rating = 10*id)"
+        );
+    }
+
+    /// Scenario: column projection binds by Iceberg field-id across physical layouts.
+    ///
+    /// The multi-file mirror of the E2E: one shard covers a file written BEFORE a
+    /// rename (physical column `score`) and a file written AFTER it (physical column
+    /// `rating`), both carrying field-id 2. A single `ListingTable` over both must
+    /// bind each file's field-id-2 column to the current logical name `rating` — the
+    /// per-file expr adapter is created once per file, so divergent physical layouts
+    /// in the same shard each resolve correctly.
+    #[tokio::test]
+    async fn field_id_adapter_reads_divergent_layouts_across_files() {
+        use crate::scan::spec::LogicalField;
+        use arrow::array::{Array, Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use parquet::arrow::ArrowWriter;
+        use std::collections::HashMap;
+
+        fn id_field() -> Field {
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )]))
+        }
+        fn score_field(physical_name: &str) -> Field {
+            Field::new(physical_name, DataType::Float64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )]))
+        }
+
+        let dir = std::env::temp_dir().join(format!("lh_fieldid_multi_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Write one file per physical layout. score = 10 * id; ids 1..=3 (old
+        // `score`), 4..=6 (new `rating`).
+        let write_file = |name: &str, physical_col: &str, ids: &[i64]| -> String {
+            let schema = Arc::new(Schema::new(vec![id_field(), score_field(physical_col)]));
+            let scores: Vec<f64> = ids.iter().map(|i| 10.0 * *i as f64).collect();
+            let path = dir.join(name);
+            let file = std::fs::File::create(&path).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ids.to_vec())),
+                    Arc::new(Float64Array::from(scores)),
+                ],
+            )
+            .expect("record batch");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+            url::Url::from_file_path(&path)
+                .expect("absolute path")
+                .to_string()
+        };
+        let file_old = write_file("old_score.parquet", "score", &[1, 2, 3]);
+        let file_new = write_file("new_rating.parquet", "rating", &[4, 5, 6]);
+
+        let logical = vec![
+            LogicalField {
+                field_id: 1,
+                name: "id".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+            },
+            LogicalField {
+                field_id: 2,
+                name: "rating".to_string(),
+                arrow_type: "float64".to_string(),
+                nullable: false,
+            },
+        ];
+
+        let mut spec = minimal_spec();
+        spec.files = vec![file_old, file_new];
+        spec.logical_schema = logical;
+        spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+
+        let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        register_files(&ctx, "scan_target", &spec)
+            .await
+            .expect("register_files must succeed");
+        let sql = build_scan_sql(&ctx, "scan_target", &spec)
+            .await
+            .expect("build_scan_sql");
+        let df = ctx.sql(&sql).await.expect("plan scan SQL");
+        let batches = df
+            .collect()
+            .await
+            .expect("scan must read both physical layouts");
+
+        let mut got: Vec<(i64, f64)> = Vec::new();
+        for batch in &batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            let rating_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("rating column is Float64");
+            for row in 0..batch.num_rows() {
+                assert!(!rating_col.is_null(row), "rating must not be NULL");
+                got.push((id_col.value(row), rating_col.value(row)));
+            }
+        }
+        got.sort_by_key(|(id, _)| *id);
+
+        let expected: Vec<(i64, f64)> = (1..=6).map(|i| (i, 10.0 * i as f64)).collect();
+        assert_eq!(
+            got, expected,
+            "both files must resolve field-id 2 to `rating`; rating = 10*id for ids 1..=6"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // FieldIdExprAdapter — column resolution by Iceberg field-id (task 4.1)
+    // ---------------------------------------------------------------------------
+
+    mod field_id_adapter {
+        use super::super::{FieldIdExprAdapterFactory, PARQUET_FIELD_ID_META_KEY};
+        use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+        use datafusion::physical_expr::PhysicalExpr;
+        use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
+        use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
+        use datafusion::scalar::ScalarValue;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        /// A field tagged with its Iceberg field-id (`PARQUET:field_id`).
+        fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
+            Field::new(name, dt, nullable).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )]))
+        }
+
+        /// A field carrying no field-id metadata (older writer).
+        fn field_no_id(name: &str, dt: DataType, nullable: bool) -> Field {
+            Field::new(name, dt, nullable)
+        }
+
+        fn rewrite(
+            logical: SchemaRef,
+            physical: SchemaRef,
+            column: Column,
+        ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
+            let adapter = FieldIdExprAdapterFactory
+                .create(logical, physical)
+                .expect("adapter creation");
+            adapter.rewrite(Arc::new(column))
+        }
+
+        /// A renamed column (physical `score`, logical `rating`, same field-id 2)
+        /// binds to the physical column BY field-id, not by name.
+        #[test]
+        fn resolves_renamed_column_by_field_id() {
+            let logical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]));
+            // Physical file predates the rename: field-id 2 is named `score`, at index 1.
+            let physical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("score", DataType::Int64, true, 2),
+            ]));
+
+            // The planner references the CURRENT logical name `rating`.
+            let result = rewrite(logical, physical, Column::new("rating", 1)).expect("rewrite ok");
+
+            // Types match, so it resolves to a plain physical Column (no cast),
+            // and it must point at physical index 1 (the `score` slot).
+            let col = result
+                .downcast_ref::<Column>()
+                .expect("renamed column resolves to a Column, no cast");
+            assert_eq!(col.index(), 1, "must bind to physical field-id-2 slot");
+        }
+
+        /// A type divergence between the logical and physical field (same field-id)
+        /// is wrapped in a cast (delegated to the default adapter).
+        #[test]
+        fn casts_on_type_divergence_by_field_id() {
+            let logical = Arc::new(Schema::new(vec![field_with_id(
+                "amount",
+                DataType::Int64,
+                true,
+                5,
+            )]));
+            // Same field-id 5 but a narrower physical type, and a different physical name.
+            let physical = Arc::new(Schema::new(vec![field_with_id(
+                "amt",
+                DataType::Int32,
+                true,
+                5,
+            )]));
+
+            let result = rewrite(logical, physical, Column::new("amount", 0)).expect("rewrite ok");
+            let cast = result
+                .downcast_ref::<CastExpr>()
+                .expect("type divergence must produce a cast");
+            let inner = cast
+                .expr()
+                .downcast_ref::<Column>()
+                .expect("cast wraps the resolved physical column");
+            assert_eq!(inner.index(), 0, "cast must wrap the field-id-5 slot");
+        }
+
+        /// A dropped column (present physically with an id absent from the logical
+        /// schema) is simply not referenced by the projection; the adapter leaves
+        /// the remaining physical fields resolvable by their logical names.
+        #[test]
+        fn ignores_dropped_physical_column() {
+            let logical = Arc::new(Schema::new(vec![field_with_id(
+                "id",
+                DataType::Int64,
+                false,
+                1,
+            )]));
+            // Physical file still has an old, since-dropped column (field-id 7).
+            let physical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("legacy", DataType::Utf8, true, 7),
+            ]));
+
+            // The kept logical column `id` still binds correctly.
+            let result = rewrite(logical, physical, Column::new("id", 0)).expect("rewrite ok");
+            let col = result
+                .downcast_ref::<Column>()
+                .expect("kept column resolves to a Column");
+            assert_eq!(col.index(), 0);
+        }
+
+        /// Task 4.2: the logical Arrow schema built from `ScanSpec::logical_schema`
+        /// tags each field with its Iceberg field-id, reconstructs the Arrow type
+        /// from the tag, and preserves the declared nullability.
+        #[test]
+        fn builds_logical_arrow_schema_with_field_ids() {
+            use super::super::{build_logical_arrow_schema, field_id_of};
+            use crate::scan::spec::LogicalField;
+
+            let logical = vec![
+                LogicalField {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    arrow_type: "int64".to_string(),
+                    nullable: false,
+                },
+                LogicalField {
+                    field_id: 2,
+                    name: "rating".to_string(),
+                    arrow_type: "float64".to_string(),
+                    nullable: true,
+                },
+            ];
+
+            let schema = build_logical_arrow_schema(&logical);
+
+            assert_eq!(schema.fields().len(), 2);
+            let id = schema.field(0);
+            assert_eq!(id.name(), "id");
+            assert_eq!(id.data_type(), &DataType::Int64);
+            assert!(!id.is_nullable(), "non-nullable must be preserved");
+            assert_eq!(field_id_of(id), Some(1), "field-id metadata must be tagged");
+
+            let rating = schema.field(1);
+            assert_eq!(rating.name(), "rating");
+            assert_eq!(rating.data_type(), &DataType::Float64);
+            assert!(rating.is_nullable(), "nullable must be preserved");
+            assert_eq!(field_id_of(rating), Some(2));
+        }
+
+        /// Scenario: field-id resolution falls back to physical name when a file
+        /// field carries no embedded field-id.
+        ///
+        /// A file whose fields carry no `PARQUET:field_id` metadata cannot be bound
+        /// by id; the adapter falls through to the physical-name match so the
+        /// column is still resolved correctly.
+        #[test]
+        fn field_id_adapter_falls_back_to_name_without_field_id() {
+            let logical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]));
+            // Physical file carries NO field-ids at all (older writer).
+            let physical = Arc::new(Schema::new(vec![
+                field_no_id("id", DataType::Int64, false),
+                field_no_id("rating", DataType::Int64, true),
+            ]));
+
+            let result = rewrite(logical, physical, Column::new("rating", 1)).expect("rewrite ok");
+            let bound_index = result
+                .downcast_ref::<Column>()
+                .map(Column::index)
+                .or_else(|| {
+                    result
+                        .downcast_ref::<CastExpr>()
+                        .and_then(|c| c.expr().downcast_ref::<Column>())
+                        .map(Column::index)
+                });
+            assert_eq!(
+                bound_index,
+                Some(1),
+                "name fallback must bind to the `rating` slot"
+            );
+        }
+
+        /// Scenario: added nullable column absent from an older file is NULL-filled.
+        ///
+        /// When a column was added to the schema AFTER a file was written, the file
+        /// simply does not contain the field. The adapter delegates to
+        /// `DefaultPhysicalExprAdapter` which returns a NULL literal for nullable
+        /// missing columns rather than erroring.
+        #[test]
+        fn field_id_adapter_null_fills_added_nullable_column() {
+            let logical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("note", DataType::Utf8, true, 9),
+            ]));
+            // Physical file predates the addition: field-id 9 is absent.
+            let physical = Arc::new(Schema::new(vec![field_with_id(
+                "id",
+                DataType::Int64,
+                false,
+                1,
+            )]));
+
+            let result = rewrite(logical, physical, Column::new("note", 1)).expect("rewrite ok");
+            let lit = result
+                .downcast_ref::<Literal>()
+                .expect("added nullable missing column becomes a NULL literal");
+            assert_eq!(*lit.value(), ScalarValue::Utf8(None));
+        }
+
+        /// Scenario: added required column missing from an older file errors cleanly.
+        ///
+        /// A REQUIRED (non-nullable) column that is absent from an older file must
+        /// produce a clean descriptive error — never wrong data or a silent NULL.
+        #[test]
+        fn field_id_adapter_errors_on_missing_required_column() {
+            let logical = Arc::new(Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("mandatory", DataType::Utf8, false, 9),
+            ]));
+            let physical = Arc::new(Schema::new(vec![field_with_id(
+                "id",
+                DataType::Int64,
+                false,
+                1,
+            )]));
+
+            let err = rewrite(logical, physical, Column::new("mandatory", 1))
+                .expect_err("missing required column must error");
+            let text = err.to_string();
+            assert!(
+                text.contains("mandatory") && text.contains("missing"),
+                "error must name the missing required column: {text}"
+            );
+        }
+
+        /// Task 4.3: `build_scan_sql`'s uppercase-alias inner-SELECT wrapper works
+        /// unchanged over a registered logical (current-name) schema — the table
+        /// schema DataFusion sees is the logical one, so aliases and projection
+        /// resolve against the current names.
+        #[tokio::test]
+        async fn build_scan_sql_aliases_over_logical_schema() {
+            use super::super::{build_logical_arrow_schema, build_scan_sql};
+            use crate::scan::spec::LogicalField;
+            use datafusion::datasource::MemTable;
+            use datafusion::execution::context::SessionContext;
+
+            let logical = vec![
+                LogicalField {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    arrow_type: "int64".to_string(),
+                    nullable: false,
+                },
+                LogicalField {
+                    field_id: 2,
+                    name: "rating".to_string(),
+                    arrow_type: "float64".to_string(),
+                    nullable: true,
+                },
+            ];
+            let logical_schema = build_logical_arrow_schema(&logical);
+
+            // Register the logical schema as the table schema (as register_files
+            // does via with_schema), with no rows — build_scan_sql only reads the
+            // advertised schema.
+            let ctx = SessionContext::new();
+            let table = MemTable::try_new(logical_schema.clone(), vec![vec![]]).unwrap();
+            ctx.register_table("scan_target", Arc::new(table)).unwrap();
+
+            let mut spec = super::minimal_spec();
+            spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+            spec.logical_schema = logical;
+
+            let sql = build_scan_sql(&ctx, "scan_target", &spec).await.unwrap();
+
+            // Inner SELECT aliases each current (lowercase) name to its uppercase form.
+            assert!(
+                sql.contains(r#""id" AS "ID""#) && sql.contains(r#""rating" AS "RATING""#),
+                "inner SELECT must alias current names to uppercase: {sql}"
+            );
+            // Outer projection references the uppercase aliases.
+            assert!(
+                sql.contains(r#""ID""#) && sql.contains(r#""RATING""#),
+                "outer projection must use uppercase aliases: {sql}"
+            );
+        }
     }
 }

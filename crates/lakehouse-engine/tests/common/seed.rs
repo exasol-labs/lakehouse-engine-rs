@@ -47,7 +47,10 @@ use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::DefaultFileNameGenerator;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::{
+    Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent, TableRequirement,
+    TableUpdate,
+};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
@@ -932,5 +935,244 @@ async fn write_one_partitioned_file<C: Catalog>(
         .await
         .context("commit regions Iceberg snapshot")?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema-evolution table (evo) — reproduces issue #26 (rename by field-id)
+// ---------------------------------------------------------------------------
+//
+// iceberg-rust 0.9.1 exposes NO schema-evolution API (the `transaction` module
+// has only append/snapshot/sort_order/location/properties/statistics/format
+// actions, and `TableCommit`'s builder is `pub(crate)`). So the rename step is
+// applied out-of-band via a raw Iceberg REST commit (`add-schema` +
+// `set-current-schema`, keeping field-id 2) to the `iceberg-rest-fixture` — a
+// full Java catalog, so it validates and applies the rename exactly as a real
+// catalog would.
+
+/// Table name for the column-rename schema-evolution repro (issue #26).
+pub const E2E_EVO_TABLE: &str = "evo";
+/// Inclusive id range written BEFORE the rename (physical parquet column `score`).
+pub const EVO_PRE_RENAME_IDS: (i64, i64) = (1, 5);
+/// Inclusive id range written AFTER the rename (physical parquet column `rating`).
+pub const EVO_POST_RENAME_IDS: (i64, i64) = (6, 10);
+/// Total rows a spec-compliant, field-id-based reader must return for `evo`.
+pub const EVO_TOTAL_ROWS: usize = 10;
+/// Column name for field-id 2 before the rename.
+pub const EVO_OLD_COL: &str = "score";
+/// Column name for field-id 2 after the rename.
+pub const EVO_NEW_COL: &str = "rating";
+
+/// Seed the `evo` table for schema-evolution testing: a column renamed in the
+/// Iceberg catalog while pre-rename data files keep the old physical column name.
+///
+/// Sequence:
+///   1. create `evo` (id BIGINT, `score` DOUBLE) — schema-id 0, field-id 2 = `score`
+///   2. append file A: ids 1..=5, physical parquet column `score` (field-id 2)
+///   3. REST commit: rename field-id 2 `score` → `rating` (field-id preserved)
+///   4. append file B: ids 6..=10, physical parquet column `rating` (field-id 2)
+///
+/// A field-id-based reader binds both files to the current logical name `rating`
+/// by field-id 2 and returns 10 rows with `rating = 10 * id`, no NULLs.
+///
+/// Not idempotent: drops and recreates `evo` so every run starts from a known
+/// state.
+pub async fn seed_renamed_column(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-evo").await?;
+
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let ident = TableIdent::new(ns.clone(), E2E_EVO_TABLE.to_string());
+
+    // Namespace is created by seed_events_table; tolerate a concurrent create.
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for evo")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    // Drop-and-recreate for a deterministic starting state.
+    if catalog
+        .table_exists(&ident)
+        .await
+        .context("check evo table exists")?
+    {
+        catalog
+            .drop_table(&ident)
+            .await
+            .context("drop existing evo table")?;
+    }
+
+    // 1. Create `evo` with the pre-rename schema (id BIGINT, score DOUBLE).
+    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+    let creation = TableCreation::builder()
+        .name(E2E_EVO_TABLE.to_string())
+        .schema(evo_schema(0, EVO_OLD_COL)?)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    let table = catalog
+        .create_table(&ns, creation)
+        .await
+        .context("create evo table")?;
+
+    // 2. Append file A under the OLD column name (`score`).
+    let (a0, a1) = EVO_PRE_RENAME_IDS;
+    write_one_file_append(
+        &catalog,
+        &table,
+        E2E_EVO_TABLE,
+        [make_evo_batch(a0, a1, EVO_OLD_COL)],
+    )
+    .await
+    .context("append evo file A (pre-rename)")?;
+
+    // 3. Rename field-id 2 `score` → `rating` via a raw REST catalog commit.
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .context("reload evo before rename")?;
+    let current_schema_id = table.metadata().current_schema_id();
+    rest_rename_column(
+        catalog_url,
+        E2E_NAMESPACE,
+        E2E_EVO_TABLE,
+        current_schema_id,
+        evo_schema(current_schema_id + 1, EVO_NEW_COL)?,
+    )
+    .await
+    .context("REST rename score -> rating")?;
+
+    // 4. Append file B under the NEW column name (`rating`).
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .context("reload evo after rename")?;
+    assert_eq!(
+        table
+            .metadata()
+            .current_schema()
+            .field_by_id(2)
+            .map(|f| f.name.as_str()),
+        Some(EVO_NEW_COL),
+        "REST rename did not take effect: field-id 2 is not '{EVO_NEW_COL}'"
+    );
+    let (b0, b1) = EVO_POST_RENAME_IDS;
+    write_one_file_append(
+        &catalog,
+        &table,
+        E2E_EVO_TABLE,
+        [make_evo_batch(b0, b1, EVO_NEW_COL)],
+    )
+    .await
+    .context("append evo file B (post-rename)")?;
+
+    Ok(())
+}
+
+/// Two-field evo schema: field-id 1 = `id` (Long), field-id 2 = the column whose
+/// name is passed as `col2` (Double). The field-id of the second column is fixed at
+/// 2 regardless of its name — that stable id across the rename is the whole point
+/// of the repro.
+fn evo_schema(schema_id: i32, col2: &str) -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, col2, Type::Primitive(PrimitiveType::Double)).into(),
+        ])
+        .build()
+        .context("build evo Iceberg schema")
+}
+
+/// Build an evo RecordBatch for the inclusive id range with the second column
+/// named `col2` (value = 10.0 * id, so post-rename values are distinct/checkable).
+fn make_evo_batch(first_id: i64, last_id: i64, col2: &str) -> RecordBatch {
+    let ids: Vec<i64> = (first_id..=last_id).collect();
+    let vals: Vec<f64> = (first_id..=last_id).map(|i| 10.0 * i as f64).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(col2, DataType::Float64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(Float64Array::from(vals)),
+        ],
+    )
+    .expect("evo RecordBatch construction is infallible")
+}
+
+/// Apply a column rename to an existing table via a raw Iceberg REST commit.
+///
+/// A rename is expressed as `add-schema` (a new schema whose renamed field keeps
+/// its field-id) + `set-current-schema` (`schema-id: -1` = the just-added schema),
+/// guarded by an `assert-current-schema-id` requirement. iceberg-rust 0.9.1 has
+/// no public API to build a `TableCommit`, so we POST the commit body directly.
+async fn rest_rename_column(
+    catalog_url: &str,
+    namespace: &str,
+    table_name: &str,
+    current_schema_id: i32,
+    renamed_schema: IcebergSchema,
+) -> Result<()> {
+    let base = catalog_url.trim_end_matches('/');
+    let client = reqwest::Client::new();
+
+    // The catalog may advertise a routing `prefix` in /v1/config overrides.
+    let prefix = client
+        .get(format!("{base}/v1/config"))
+        .send()
+        .await
+        .context("GET /v1/config")?
+        .text()
+        .await
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v.get("overrides")
+                .and_then(|o| o.get("prefix"))
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+        })
+        .filter(|p| !p.is_empty());
+
+    let mut endpoint = format!("{base}/v1");
+    if let Some(p) = &prefix {
+        endpoint.push('/');
+        endpoint.push_str(p);
+    }
+    endpoint.push_str(&format!("/namespaces/{namespace}/tables/{table_name}"));
+
+    let requirements = vec![TableRequirement::CurrentSchemaIdMatch { current_schema_id }];
+    let updates = vec![
+        TableUpdate::AddSchema {
+            schema: renamed_schema,
+        },
+        TableUpdate::SetCurrentSchema { schema_id: -1 },
+    ];
+    let body = serde_json::json!({
+        "identifier": { "namespace": [namespace], "name": table_name },
+        "requirements": serde_json::to_value(&requirements).context("serialize requirements")?,
+        "updates": serde_json::to_value(&updates).context("serialize updates")?,
+    });
+    let body = serde_json::to_string(&body).context("serialize commit body")?;
+
+    let resp = client
+        .post(&endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .context("POST rename commit to REST catalog")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("REST rename commit failed ({status}): {text}");
+    }
     Ok(())
 }
