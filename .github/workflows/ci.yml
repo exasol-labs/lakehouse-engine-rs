@@ -8,6 +8,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Cancel a superseded run when a PR branch gets a new push (saves CI minutes,
+# avoids two runs racing on the same branch's cache). Never cancel a main-push
+# or tag-push run mid-flight — release() depends on that exact run's e2e job.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
