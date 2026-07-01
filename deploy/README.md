@@ -94,6 +94,44 @@ CIDRs (or `0.0.0.0/0`) to the variable. Inter-node traffic is via a self-referen
 uses a self-signed cert — clients pass `validateservercertificate=0`. Secrets live only in SSM
 SecureString (KMS) and the gitignored `bench/.env`; tfstate password values are marked sensitive.
 
+## Enabling co-workers
+
+Tofu state is **local and gitignored** (`.terraform.lock.hcl` is tracked; `*.tfstate` is not), and
+`cluster-stack` reads the data-stack state via a **filesystem path** (`providers.tf`). So a teammate
+on another machine has no state and cannot `tofu output` — which `cluster-up.sh`/`secrets.sh` need.
+Two paths, by what the teammate actually needs:
+
+**A. Just *run* benchmarks against an existing cluster (e.g. `test1`) — no tofu, no AWS creds.**
+
+1. Allowlist their IP on the cluster SG (default allowlist is only the deploying machine):
+   ```bash
+   cd deploy/cluster-stack
+   tofu apply -var env_name=test1 -var key_pair_name=spot-strata-key \
+     -var 'allowed_cidrs=["<your-ip>/32","<coworker-ip>/32"]'   # or ["0.0.0.0/0"] to open it
+   ```
+2. Send them the gitignored `bench/.env` over a secure channel — it is self-contained (host, ports,
+   Glue `engine-reader` creds, DB + BucketFS passwords). They need neither AWS creds nor the EC2 key.
+3. They `sudo deploy/scripts/install-prereqs.sh` (Docker + `exapump` + make toolchain) and run
+   `make bench` from the repo root.
+
+**B. *Deploy* their own cluster.**
+
+1. Give them a deployer principal — create a second IAM user with the same `iam/deployer-policy.json`
+   (cleaner than sharing one key), then `export AWS_PROFILE=spot-strata-deployer`.
+2. Import their EC2 public key and pass it as `key_pair_name`:
+   `aws ec2 import-key-pair --key-name spot-strata-key-<name> --public-key-material fileb://~/.ssh/<key>.pub`.
+3. **Migrate both stacks to a shared S3 backend** (see below) — the real fix so state and the
+   cross-stack `remote_state` read work off one machine. Without it, only the original deployer's
+   machine can manage the stacks.
+4. They apply **only** `cluster-stack` with their own `env_name` (own workspace = own state), then
+   `cluster-up.sh <env>` → `secrets.sh <env>` → `make bench`. Never re-apply the shared `data-stack`
+   (it holds the loaded data + catalog for everyone).
+
+> **Shared S3 backend (team upgrade).** Add a `backend "s3"` block (bucket + `dynamodb_table` for
+> locking) to both `providers.tf` files and repoint `cluster-stack`'s `terraform_remote_state.data`
+> to `backend = "s3"`. Then any deployer with the deployer profile shares one authoritative state and
+> can manage the same environments. Do this before more than one person deploys.
+
 ## Known seams
 
 - **BucketFS write password** (`cluster-up.sh`): set best-effort via confd. If the confd verb differs
