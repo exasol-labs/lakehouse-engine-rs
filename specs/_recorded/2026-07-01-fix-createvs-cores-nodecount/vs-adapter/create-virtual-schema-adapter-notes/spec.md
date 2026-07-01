@@ -4,6 +4,7 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 
 ## Background
 
+<!-- DELTA:CHANGED -->
 * The active cluster node count is read directly from the UDF handshake metadata
   via `UdfContext::node_count()` (SDK ≥ 0.20.0) and recorded as `CLUSTER_NODES`;
   `node_count()` returns `0` only on a context that does not carry live handshake
@@ -22,6 +23,7 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
   `available_parallelism()` auto-detected core count; an absent, empty, or
   non-positive value falls back to auto-detect; if auto-detect also fails,
   `NR_OF_CORES` is recorded as `0`.
+<!-- /DELTA:CHANGED -->
 * The parallelism factor is supplied as a VS/connection property and recorded
   alongside `CLUSTER_NODES` and `NR_OF_CORES`; when absent it defaults to a
   hardware-aware value derived from `NR_OF_CORES`.
@@ -50,6 +52,7 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Adapter records the cluster node count in the virtual-schema adapterNotes
 
 * *GIVEN* an Exasol session that has installed the VS adapter script
@@ -58,7 +61,9 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * *THEN* the adapter SHALL read the active cluster node count from `UdfContext::node_count()` (the UDF handshake metadata) WITHOUT opening any connect-back session
 * *AND* the adapter SHALL return the resolved node count as a positive-integer `CLUSTER_NODES` entry inside the `createVirtualSchema` response's `adapterNotes` (stringified JSON), which Exasol persists and which is queryable via `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`
 * *AND* the adapter MUST NOT persist the node count anywhere other than that returned `adapterNotes`
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Cluster node count defaults to one when it cannot be determined
 
 * *GIVEN* `UdfContext::node_count()` returns `0` (a context carrying no live handshake node count)
@@ -66,7 +71,9 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * *THEN* the adapter SHALL write `CLUSTER_NODES: 1` into the `adapterNotes` of the `createVirtualSchema` response
 * *AND* the adapter SHALL still return a successful `createVirtualSchema` response describing the mapped table
 * *AND* the resulting single-shard behaviour MUST be identical to the pre-sharding single-node execution path
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Adapter records the per-node core count in the virtual-schema adapterNotes
 
 * *GIVEN* an Exasol session that has installed the VS adapter script and supplies the catalog and storage connection properties
@@ -75,7 +82,9 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * *THEN* the adapter SHALL read the per-node core count from `std::thread::available_parallelism()` on the executing node WITHOUT opening any connect-back session
 * *AND* the adapter SHALL record the resolved positive-integer core count as an `NR_OF_CORES` entry inside the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `CLUSTER_NODES` and `PARALLELISM_FACTOR`
 * *AND* the adapter SHALL write `NR_OF_CORES: 0` and still return a successful `createVirtualSchema` response when `available_parallelism()` cannot determine the core count, persisting the core count nowhere other than that returned `adapterNotes`
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:CHANGED -->
 ### Scenario: NR_OF_CORES VS property overrides the auto-detected core count
 
 * *GIVEN* a `createVirtualSchema` request that supplies an `NR_OF_CORES` connection/VS property set to a positive integer N
@@ -83,10 +92,22 @@ Records cluster configuration and the Exasol-name to Iceberg-identifier map in t
 * *THEN* the adapter SHALL use N as the per-node core count and SHALL NOT read the core count from `std::thread::available_parallelism()`
 * *AND* the adapter SHALL record N as the `NR_OF_CORES` entry in the `createVirtualSchema` response's `adapterNotes` (stringified JSON)
 * *AND* the adapter MUST NOT persist the overridden core count anywhere other than that returned `adapterNotes`
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:CHANGED -->
 ### Scenario: NR_OF_CORES VS property is ignored when absent, empty, or not a positive integer
 
 * *GIVEN* a `createVirtualSchema` request that supplies an `NR_OF_CORES` connection/VS property that is absent, empty, zero, negative, or non-numeric
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL fall back to obtaining the core count via `std::thread::available_parallelism()`, and SHALL write `NR_OF_CORES: 0` when that also cannot determine the core count
 * *AND* the adapter SHALL NOT use the invalid property value as the core count
+<!-- /DELTA:CHANGED -->
+
+<!-- DELTA:REMOVED -->
+### Scenario: CONNECTION_NAME VS property drives connect-back topology discovery
+
+* *GIVEN* a `createVirtualSchema` request that supplies a `CONNECTION_NAME` VS property naming an Exasol CONNECTION object
+* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
+* *THEN* the adapter SHALL NOT open a read-only connect-back session, SHALL NOT issue `SELECT NPROC()` or `SELECT PARAM_VALUE('NR_OF_CORES')`, and SHALL NOT read the `CONNECTION_NAME` property for topology discovery
+* *AND* the cluster topology SHALL instead be sourced from `UdfContext::node_count()` and `std::thread::available_parallelism()` per the scenarios above, leaving the separate `CATALOG_CONNECTION` credential mechanism unaffected
+<!-- /DELTA:REMOVED -->
