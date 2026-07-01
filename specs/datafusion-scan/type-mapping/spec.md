@@ -1,13 +1,13 @@
 # Feature: DataFusion-to-Exasol Type Mapping
 
 Defines the single authoritative mapping from DataFusion/Arrow column types to Exasol
-SQL types, so that every column an Iceberg table exposes is queryable through Exasol.
-Types Exasol supports natively map directly; types Exasol cannot represent (vectors,
-lists, structs, maps, binary, and other complex Arrow types) are serialized to JSON
-strings and surfaced as `VARCHAR`, so result sets always come back in Exasol-compatible
-types. The same mapping governs both the `createVirtualSchema` schema declaration and
-the Arrow→`Value` conversion in the scan, keeping the declared column type and the
-emitted value type in agreement.
+SQL types, and the companion Iceberg-to-Arrow mapping used to build the logical schema
+the scan registers, so that every column an Iceberg table exposes is queryable through
+Exasol. Types Exasol supports natively map directly; types Exasol cannot represent
+(vectors, lists, structs, maps, binary, and out-of-range decimals) are serialized to
+JSON strings and surfaced as `VARCHAR`. The same mapping governs the `createVirtualSchema`
+schema declaration, the Arrow-to-Value conversion in the scan, and the logical schema
+carried into the scan spec, keeping declared and emitted types in agreement.
 
 ## Background
 
@@ -15,10 +15,13 @@ emitted value type in agreement.
   VARCHAR(n≤2,000,000), CHAR(n≤2,000), DATE, TIMESTAMP(p≤9), TIMESTAMP WITH LOCAL TIME
   ZONE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, HASHTYPE. Exasol has
   no array, list, struct, or map type.
-* The mapping is applied in two places that MUST stay consistent: the adapter's
-  `createVirtualSchema` schema declaration (Arrow type → declared Exasol column type)
-  and the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
-  `Value` variant).
+* The mapping is applied in three places that MUST stay consistent: the adapter's
+  `createVirtualSchema` schema declaration (Arrow type → declared Exasol column type),
+  the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
+  `Value` variant), and the logical schema carried into the scan spec (Iceberg type →
+  Arrow `DataType`).
+* Complex Arrow/Iceberg types (list, struct, map, binary) and out-of-range decimals map
+  to a string-family type surfaced as JSON `VARCHAR`.
 * Compatible Arrow types map directly:
 
   | Arrow type | Exasol type | Value variant |
@@ -81,3 +84,11 @@ emitted value type in agreement.
 * *THEN* the declared schema SHALL type the compatible columns by the mapping table and the incompatible columns as `VARCHAR(2000000)`
 * *AND* the scan SHALL emit the compatible columns as their mapped `Value` variants and the incompatible columns as JSON strings
 * *AND* every emitted column value SHALL be of an Exasol-compatible type
+
+### Scenario: Iceberg logical schema maps to Arrow types for scan registration
+
+* *GIVEN* an Iceberg table's current schema whose fields include primitive types (int, long, double, string, boolean, date, timestamp) and complex/out-of-range types (list, struct, map, out-of-range decimal)
+* *WHEN* the adapter derives the logical schema it carries into the scan spec
+* *THEN* each Iceberg field SHALL map to the Arrow `DataType` the scan UDF registers for that column, consistent with the existing Iceberg-to-Exasol mapping (primitive types to their direct Arrow equivalents; complex and out-of-range types to a string-family Arrow type that surfaces as JSON `VARCHAR`)
+* *AND* each mapped field SHALL preserve the source Iceberg field-id and its required/optional nullability
+* *AND* the mapping used for the logical schema SHALL agree with the `createVirtualSchema` schema declaration so the declared Exasol column type and the registered Arrow type stay in agreement

@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "arrow 58.3.0",
