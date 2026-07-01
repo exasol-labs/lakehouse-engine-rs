@@ -54,8 +54,10 @@ echo "==> Waiting for SSH on node 1 ($NODE1)"
 for _ in $(seq 1 30); do $SSH true 2>/dev/null && break; sleep 5; done
 
 echo "==> Copying key + config to node 1, installing c4"
-scp -o StrictHostKeyChecking=no -i "$KEY_FILE" "$KEY_FILE" "ubuntu@$NODE1:/home/ubuntu/$(basename "$KEY_FILE")"
-$SSH "chmod 600 /home/ubuntu/$(basename "$KEY_FILE") && mkdir -p /home/ubuntu/.ccc"
+KEY_BASE="$(basename "$KEY_FILE")"
+$SSH "mkdir -p /home/ubuntu/.ccc"
+scp -o StrictHostKeyChecking=no -i "$KEY_FILE" "$KEY_FILE" "ubuntu@$NODE1:/home/ubuntu/.ccc/$KEY_BASE"
+$SSH "chmod 600 /home/ubuntu/.ccc/$KEY_BASE"
 scp -o StrictHostKeyChecking=no -i "$KEY_FILE" "$CFG" "ubuntu@$NODE1:/home/ubuntu/.ccc/config"
 rm -f "$CFG"
 $SSH 'test -x ./c4 || (wget -q https://x-up.s3.amazonaws.com/releases/c4/linux/x86_64/latest/c4 -O c4 && chmod +x c4)'
