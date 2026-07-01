@@ -4,6 +4,10 @@
 # Serena MCP workspace cache
 .serena/
 
+# IDEs
+.idea
+*.iml
+
 # Local follow-up scratch notes (not tracked)
 next.md
 current-state.md

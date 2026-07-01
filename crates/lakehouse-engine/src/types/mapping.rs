@@ -199,6 +199,108 @@ pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String 
     }
 }
 
+/// Map an Iceberg `PrimitiveType` to an Arrow `DataType`, used for building the
+/// logical Arrow schema carried in `ScanSpec::logical_schema`.
+///
+/// Matches the Exasol mapping in [`iceberg_primitive_to_exasol`]: in-range
+/// Decimal128 maps to `Decimal128(p, s)`, out-of-range Decimal and types with no
+/// Arrow equivalent (Time, Fixed, Binary) map to `Utf8` (surfaced as JSON VARCHAR).
+pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType {
+    use arrow::datatypes::TimeUnit;
+    use iceberg::spec::PrimitiveType::*;
+    match pt {
+        Boolean => DataType::Boolean,
+        Int => DataType::Int32,
+        Long => DataType::Int64,
+        Float => DataType::Float32,
+        Double => DataType::Float64,
+        Decimal { precision, scale } if *precision <= 36 && *scale <= 36 => {
+            DataType::Decimal128(*precision as u8, *scale as i8)
+        }
+        Decimal { .. } => DataType::Utf8,
+        Date => DataType::Date32,
+        Time => DataType::Utf8,
+        Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        TimestampNs => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        Timestamptz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        TimestamptzNs => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        String | Uuid => DataType::Utf8,
+        Fixed(_) | Binary => DataType::Utf8,
+    }
+}
+
+/// Map an Iceberg `Type` to an Arrow `DataType`.
+/// Non-primitive types (List, Struct, Map) → `Utf8` (JSON fallback).
+pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
+    use iceberg::spec::Type;
+    match ty {
+        Type::Primitive(pt) => iceberg_primitive_to_arrow(pt),
+        _ => DataType::Utf8,
+    }
+}
+
+/// Convert an Arrow `DataType` to the compact string tag used in `ScanSpec::logical_schema`.
+///
+/// The tag vocabulary covers every type reachable from [`iceberg_type_to_arrow`]:
+/// - `"bool"`, `"int32"`, `"int64"`, `"float32"`, `"float64"`, `"utf8"`, `"date32"`
+/// - `"timestamp_us"`, `"timestamp_ns"`, `"timestamptz_us"`, `"timestamptz_ns"`
+/// - `"decimal128(p,s)"` for in-range `Decimal128`
+///
+/// Unknown / other types fall back to `"utf8"` (JSON VARCHAR path).
+pub fn arrow_type_to_tag(dt: &DataType) -> String {
+    use arrow::datatypes::TimeUnit;
+    match dt {
+        DataType::Boolean => "bool".to_string(),
+        DataType::Int32 => "int32".to_string(),
+        DataType::Int64 => "int64".to_string(),
+        DataType::Float32 => "float32".to_string(),
+        DataType::Float64 => "float64".to_string(),
+        DataType::Utf8 => "utf8".to_string(),
+        DataType::Date32 => "date32".to_string(),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp_us".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".to_string(),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => "timestamptz_us".to_string(),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".to_string(),
+        DataType::Decimal128(p, s) => format!("decimal128({p},{s})"),
+        _ => "utf8".to_string(),
+    }
+}
+
+/// Parse a compact string tag (from `ScanSpec::logical_schema`) back to an Arrow `DataType`.
+///
+/// Returns `DataType::Utf8` for any unrecognised tag — the JSON VARCHAR fallback.
+pub fn arrow_type_from_tag(tag: &str) -> DataType {
+    use arrow::datatypes::TimeUnit;
+    match tag {
+        "bool" => DataType::Boolean,
+        "int32" => DataType::Int32,
+        "int64" => DataType::Int64,
+        "float32" => DataType::Float32,
+        "float64" => DataType::Float64,
+        "utf8" => DataType::Utf8,
+        "date32" => DataType::Date32,
+        "timestamp_us" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        "timestamp_ns" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "timestamptz_us" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        "timestamptz_ns" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        other => {
+            // Try to parse "decimal128(p,s)"
+            if let Some(inner) = other
+                .strip_prefix("decimal128(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                let mut parts = inner.splitn(2, ',');
+                if let (Some(p_str), Some(s_str)) = (parts.next(), parts.next())
+                    && let (Ok(p), Ok(s)) = (p_str.trim().parse::<u8>(), s_str.trim().parse::<i8>())
+                {
+                    return DataType::Decimal128(p, s);
+                }
+            }
+            DataType::Utf8
+        }
+    }
+}
+
 /// Map an Iceberg `Type` to an Exasol type string.
 /// Non-primitive types (List, Struct, Map) → VARCHAR(2000000) via JSON.
 pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type) -> String {
@@ -484,6 +586,160 @@ mod tests {
         );
         // DECIMAL(p) with no scale defaults to scale 0 → Int32 bin (p=9 ≤ 9).
         assert_eq!(exasol_type_to_arrow("DECIMAL(9)"), Some(DataType::Int32));
+    }
+
+    /// Task 1.2: `iceberg_type_to_arrow` maps all families of Iceberg types to their
+    /// Arrow equivalents. Primitives → direct Arrow types; complex / out-of-range
+    /// types → `DataType::Utf8` (surfaced as JSON VARCHAR).
+    #[test]
+    fn iceberg_type_to_arrow_maps_all_families() {
+        use arrow::datatypes::TimeUnit;
+
+        // Boolean
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Boolean)),
+            DataType::Boolean
+        );
+
+        // Integer primitives
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Int)),
+            DataType::Int32
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Long)),
+            DataType::Int64
+        );
+
+        // Float primitives
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Float)),
+            DataType::Float32
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Double)),
+            DataType::Float64
+        );
+
+        // String / UUID → Utf8
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::String)),
+            DataType::Utf8
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Uuid)),
+            DataType::Utf8
+        );
+
+        // Date
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Date)),
+            DataType::Date32
+        );
+
+        // Timestamp (no tz) — micros
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Timestamp)),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        // TimestampNs (no tz) — nanos
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::TimestampNs)),
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        // Timestamptz — micros, UTC
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Timestamptz)),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        // TimestamptzNs — nanos, UTC
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::TimestamptzNs)),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+
+        // In-range Decimal128 (p ≤ 36 and s ≤ 36)
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+                precision: 18,
+                scale: 4,
+            })),
+            DataType::Decimal128(18, 4)
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+                precision: 36,
+                scale: 36,
+            })),
+            DataType::Decimal128(36, 36)
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+                precision: 36,
+                scale: 0,
+            })),
+            DataType::Decimal128(36, 0)
+        );
+
+        // Out-of-range Decimal → Utf8 (JSON fallback)
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+                precision: 38,
+                scale: 10,
+            })),
+            DataType::Utf8
+        );
+        // scale > 36
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+                precision: 18,
+                scale: 37,
+            })),
+            DataType::Utf8
+        );
+
+        // Time → Utf8 (no Exasol/Arrow equivalent)
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Time)),
+            DataType::Utf8
+        );
+
+        // Binary / Fixed → Utf8
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Binary)),
+            DataType::Utf8
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Fixed(16))),
+            DataType::Utf8
+        );
+
+        // Complex types (List, Struct, Map) → Utf8
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::List(iceberg::spec::ListType {
+                element_field: std::sync::Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "element",
+                    iceberg::spec::Type::Primitive(PrimitiveType::Int)
+                )),
+            })),
+            DataType::Utf8
+        );
+        assert_eq!(
+            iceberg_type_to_arrow(&Type::Map(iceberg::spec::MapType {
+                key_field: std::sync::Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "key",
+                    iceberg::spec::Type::Primitive(PrimitiveType::String)
+                )),
+                value_field: std::sync::Arc::new(iceberg::spec::NestedField::optional(
+                    2,
+                    "value",
+                    iceberg::spec::Type::Primitive(PrimitiveType::Int)
+                )),
+            })),
+            DataType::Utf8
+        );
     }
 
     /// D.5 — one test per mapping category asserting BOTH the declared Exasol type

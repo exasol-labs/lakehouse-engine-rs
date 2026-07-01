@@ -55,6 +55,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         aggregates: None,
         group_keys: None,
         emit_exa_types: Vec::new(),
+        logical_schema: Vec::new(),
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
             region: "us-east-1".into(),
