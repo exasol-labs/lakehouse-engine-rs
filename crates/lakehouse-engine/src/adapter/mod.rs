@@ -33,10 +33,6 @@ const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 // reference the scan UDF schema-qualified, because it executes outside the
 // adapter script's schema context. Optional: unqualified when unset.
 const PROP_SCAN_SCHEMA: &str = "SCAN_SCHEMA";
-// Optional: name of an Exasol CONNECTION object whose credentials are used to
-// open a connect-back session for `SELECT NPROC()`. When absent, CLUSTER_NODES
-// defaults to 1 without error.
-const PROP_CONNECTION_NAME: &str = "CONNECTION_NAME";
 // Key written into the createVirtualSchema response under
 // schemaMetadata.adapterNotes (a stringified JSON object) so that subsequent
 // requests (pushdown, refresh) can read the resolved node count back from
@@ -60,9 +56,8 @@ const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 /// Minimum parallelism factor (floor applied when NR_OF_CORES is 0 or very small).
 const DEFAULT_PARALLELISM_FACTOR: usize = 8;
 // VS property name for the per-node CPU core count override. When set to a
-// positive integer it is used directly and the connect-back `PARAM_VALUE('NR_OF_CORES')`
-// query is skipped; absent, empty, zero, or non-numeric values fall through to
-// the auto-detect path.
+// positive integer it is used directly; absent, empty, zero, or non-numeric
+// values fall through to the `available_parallelism()` auto-detect path.
 const PROP_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property names for DataFusion per-instance thread configuration.
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
@@ -675,88 +670,43 @@ fn resolve_instance_overhead_mb(props: &Json) -> u64 {
 /// Returns `Some(n)` when the property is present, non-empty, and parses to a
 /// `u32` that is ≥ 1. Returns `None` for absent, empty, zero, negative, or
 /// non-numeric values, signalling that the caller should fall back to
-/// auto-detection via `SELECT PARAM_VALUE('NR_OF_CORES')`.
+/// auto-detection via `std::thread::available_parallelism()`.
 fn parse_nr_of_cores_override(props: &Json) -> Option<u32> {
     str_prop(props, PROP_NR_OF_CORES)
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n >= 1)
 }
 
-/// Open a connect-back session and run `SELECT NPROC()` to obtain the active
-/// cluster node count and, unless overridden by the `NR_OF_CORES` VS property,
-/// `SELECT PARAM_VALUE('NR_OF_CORES')` to obtain the per-node CPU core count.
+/// Resolve the cluster topology `(cluster_nodes, nr_of_cores)` entirely
+/// in-process — no SQL round-trip, no connect-back session.
 ///
-/// Returns `(1, 0)` when `CONNECTION_NAME` is absent and `(1, 0)` on any
-/// connect-back failure so `createVirtualSchema` never fails due to an
-/// unreachable or misconfigured connect-back path. A `nr_of_cores` of `0`
-/// signals "unknown"; callers must handle the floor case.
+/// `cluster_nodes` comes from the UDF handshake metadata via
+/// [`UdfContext::node_count`]. A live cluster reports its node count directly
+/// (`1` on a single node); a `0` (stub, test double, or missing handshake) maps
+/// to `1` so `createVirtualSchema` keeps the single-shard fallback behaviour.
 ///
-/// When the `NR_OF_CORES` VS property resolves to a positive integer, it is
-/// used directly as `nr_of_cores` and the `SELECT PARAM_VALUE('NR_OF_CORES')`
-/// query is not issued. The `SELECT NPROC()` cluster-nodes detection always
-/// runs when a connect-back session is available.
+/// `nr_of_cores` comes from the `NR_OF_CORES` VS property override (via
+/// [`parse_nr_of_cores_override`]) when it resolves to a positive integer;
+/// otherwise it is auto-detected from `std::thread::available_parallelism()`.
+/// A `nr_of_cores` of `0` signals "unknown" (auto-detect unavailable); callers
+/// must handle the floor case.
 fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> (u32, u32) {
-    // Check for a property-level override of the core count BEFORE opening the
-    // connect-back session. If present and ≥ 1, we still need NPROC() for the
-    // cluster node count but can skip the PARAM_VALUE cores query.
-    let cores_override = parse_nr_of_cores_override(props);
-
-    let Some(conn_name) = str_prop(props, PROP_CONNECTION_NAME) else {
-        // No connect-back configured: cluster nodes defaults to 1; cores from
-        // override or 0 (unknown).
-        return (1, cores_override.unwrap_or(0));
+    let cluster_nodes = match ctx.node_count() {
+        0 => 1,
+        n => n,
     };
 
-    let result = (|| -> Result<(u32, u32), UdfError> {
-        let conn_obj = ctx.connection(conn_name)?;
-        let mut session = ctx.connect_back(&conn_obj)?;
+    let nr_of_cores = parse_nr_of_cores_override(props).unwrap_or_else(available_parallelism_or_0);
 
-        let nproc_rows = session.query("SELECT NPROC()")?;
-        let nproc_value = nproc_rows
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next());
-        let cluster_nodes = nproc_value_to_count(nproc_value);
-
-        // Only query PARAM_VALUE when no property override was supplied.
-        let nr_of_cores = if let Some(overridden) = cores_override {
-            overridden
-        } else {
-            let cores_rows = session.query("SELECT PARAM_VALUE('NR_OF_CORES')")?;
-            let cores_value = cores_rows
-                .into_iter()
-                .next()
-                .and_then(|row| row.into_iter().next());
-            varchar_value_to_u32(cores_value)
-        };
-
-        Ok((cluster_nodes, nr_of_cores))
-    })();
-    result.unwrap_or((1, 0))
+    (cluster_nodes, nr_of_cores)
 }
 
-/// Convert the first cell of a `SELECT NPROC()` result to a positive node count.
-/// Returns 1 for NULL, zero, negative, or unrecognised value variants.
-fn nproc_value_to_count(value: Option<exasol_udf_sdk::value::Value>) -> u32 {
-    use exasol_udf_sdk::value::Value;
-    let n: i64 = match value {
-        Some(Value::Int32(v)) => v as i64,
-        Some(Value::Int64(v)) => v,
-        Some(Value::Numeric(d)) if d.scale == 0 => i64::try_from(d.unscaled).unwrap_or(0),
-        _ => 0,
-    };
-    if n >= 1 { n as u32 } else { 1 }
-}
-
-/// Convert the first cell of a `SELECT PARAM_VALUE(...)` result (a VARCHAR) to a
-/// `u32`. Returns `0` for NULL, empty, non-numeric, zero, or negative values.
-fn varchar_value_to_u32(value: Option<exasol_udf_sdk::value::Value>) -> u32 {
-    use exasol_udf_sdk::value::Value;
-    let s = match value {
-        Some(Value::String(s)) => s,
-        _ => return 0,
-    };
-    s.trim().parse::<u32>().unwrap_or(0)
+/// Per-node CPU core count from `std::thread::available_parallelism()`, or `0`
+/// when the platform cannot report it. `0` signals "unknown" to callers.
+fn available_parallelism_or_0() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -875,7 +825,8 @@ mod tests {
         assert_eq!(dec["scale"].as_u64().unwrap(), 4);
     }
 
-    // Minimal UdfContext for dispatch tests that need no I/O.
+    // Minimal UdfContext for dispatch tests that need no I/O. Its `node_count()`
+    // uses the trait default (0), exercising the `0 → 1` topology fallback.
     struct NoopCtx;
     impl UdfContext for NoopCtx {
         fn num_columns(&self) -> usize {
@@ -892,35 +843,62 @@ mod tests {
         }
     }
 
+    // Like `NoopCtx` but with a configurable `node_count()`, so tests can drive
+    // both the `0 → default 1` fallback and a `> 1` real-cluster pass-through.
+    struct StubCtx {
+        node_count: u32,
+    }
+    impl UdfContext for StubCtx {
+        fn num_columns(&self) -> usize {
+            0
+        }
+        fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
+            Err(UdfError::Type("none".into()))
+        }
+        fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
+            Ok(())
+        }
+        fn next(&mut self) -> Result<bool, UdfError> {
+            Ok(false)
+        }
+        fn node_count(&self) -> u32 {
+            self.node_count
+        }
+    }
+
     #[test]
-    fn cluster_nodes_defaults_to_one_on_connect_back_failure() {
-        // NoopCtx returns UdfError::Unimplemented for all connect-back methods,
-        // exercising the default-to-1 path without any network I/O.
-        let props = serde_json::json!({
-            PROP_CONNECTION_NAME: "SOME_CONNECTION"
-        });
+    fn cluster_nodes_defaults_to_one_when_node_count_zero() {
+        // A context reporting node_count() == 0 (no live handshake — the trait
+        // default, as on NoopCtx) maps to CLUSTER_NODES == 1.
+        let props = serde_json::json!({});
         let (count, _cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
+        assert_eq!(count, 1u32);
+
+        // The same default holds for a StubCtx explicitly reporting 0.
+        let (count, _cores) = resolve_cluster_nodes(&mut StubCtx { node_count: 0 }, &props);
         assert_eq!(count, 1u32);
     }
 
     #[test]
-    fn cluster_nodes_defaults_to_one_when_no_connection_name() {
+    fn cluster_nodes_passes_through_reported_node_count() {
+        // A live cluster reporting node_count() == N (> 1) is passed through
+        // verbatim to CLUSTER_NODES with no defaulting.
         let props = serde_json::json!({});
-        let (count, cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
-        assert_eq!(count, 1u32);
-        assert_eq!(cores, 0u32);
+        let (count, _cores) = resolve_cluster_nodes(&mut StubCtx { node_count: 4 }, &props);
+        assert_eq!(count, 4u32);
     }
 
     /// Verifies that the createVirtualSchema response JSON carries CLUSTER_NODES
     /// in schemaMetadata.adapterNotes (a JSON *string*, the only channel Exasol
-    /// persists) under the default-1 path (no CONNECTION_NAME).
+    /// persists), driven off the node count reported by the context.
     ///
     /// Exercises the JSON-assembly seam without catalog or network I/O.
     #[test]
     fn create_response_carries_cluster_nodes_property() {
         let props = serde_json::json!({});
-        let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
-        assert_eq!(cluster_nodes, 1u32, "default cluster_nodes must be 1");
+        let (cluster_nodes, nr_of_cores) =
+            resolve_cluster_nodes(&mut StubCtx { node_count: 1 }, &props);
+        assert_eq!(cluster_nodes, 1u32, "stubbed cluster_nodes must be 1");
 
         // Replicate the schema_metadata construction from handle_create_virtual_schema.
         // The request has no pre-existing adapterNotes (clean set path).
@@ -961,7 +939,7 @@ mod tests {
             .unwrap_or_else(|| panic!("adapterNotes.CLUSTER_NODES must be a string: {parsed}"));
         assert_eq!(
             val, "1",
-            "CLUSTER_NODES must be \"1\" on the default path, got \"{val}\""
+            "CLUSTER_NODES must be \"1\" for a single-node context, got \"{val}\""
         );
     }
 
@@ -1179,15 +1157,16 @@ mod tests {
         );
     }
 
-    /// Scenario: NR_OF_CORES defaults to 0 when resolve_cluster_nodes cannot reach
-    /// the database (NoopCtx returns an error for all connect-back calls).
+    /// Scenario: with no NR_OF_CORES override, the core count is auto-detected
+    /// from `std::thread::available_parallelism()` — a positive, host-sourced
+    /// value (not injectable, so we assert positivity rather than an exact count).
     #[test]
-    fn nr_of_cores_defaults_to_zero_when_unavailable() {
-        let props = serde_json::json!({ PROP_CONNECTION_NAME: "SOME_CONNECTION" });
+    fn nr_of_cores_from_available_parallelism_when_unavailable() {
+        let props = serde_json::json!({});
         let (_nodes, nr_of_cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
-        assert_eq!(
-            nr_of_cores, 0u32,
-            "nr_of_cores must default to 0 on connect-back failure"
+        assert!(
+            nr_of_cores >= 1,
+            "nr_of_cores must be auto-detected from available_parallelism() (>= 1), got {nr_of_cores}"
         );
     }
 
@@ -1530,10 +1509,11 @@ mod tests {
     // Tasks 2.1–2.8 — NR_OF_CORES property override and cores-driven defaults.
     // ---------------------------------------------------------------------------
 
-    /// Task 2.1 — NR_OF_CORES VS property ≥ 1 is used directly; the connect-back
-    /// PARAM_VALUE query is not needed (tested via the pure helper).
+    /// Task 2.1 — NR_OF_CORES VS property ≥ 1 is used directly, overriding the
+    /// `available_parallelism()` auto-detect (tested via the pure helper and the
+    /// override-wins path).
     #[test]
-    fn nr_of_cores_property_overrides_connect_back() {
+    fn nr_of_cores_property_overrides_auto_detect() {
         // A positive integer property must parse to Some(n).
         let props_4 = serde_json::json!({ PROP_NR_OF_CORES: "4" });
         assert_eq!(
@@ -1549,17 +1529,19 @@ mod tests {
             "NR_OF_CORES=1 (minimum valid) must return Some(1)"
         );
 
-        // When override is present, resolve_cluster_nodes with no CONNECTION_NAME
-        // returns the override directly without connect-back.
-        let (nodes, cores) =
-            resolve_cluster_nodes(&mut NoopCtx, &serde_json::json!({ PROP_NR_OF_CORES: "8" }));
-        assert_eq!(nodes, 1u32, "default cluster nodes when no CONNECTION_NAME");
+        // When the override is present, resolve_cluster_nodes returns it directly
+        // instead of auto-detecting; the node count comes from ctx.node_count().
+        let (nodes, cores) = resolve_cluster_nodes(
+            &mut StubCtx { node_count: 3 },
+            &serde_json::json!({ PROP_NR_OF_CORES: "8" }),
+        );
+        assert_eq!(nodes, 3u32, "cluster nodes come from ctx.node_count()");
         assert_eq!(cores, 8u32, "NR_OF_CORES override must be returned");
     }
 
     /// Task 2.2 — NR_OF_CORES absent, empty, zero, or negative falls back to
-    /// auto-detect (tested via the pure helper returning None, and the connect-back
-    /// fallback returning 0 on NoopCtx failure).
+    /// auto-detect (tested via the pure helper returning None, and the
+    /// `available_parallelism()` fallback returning a positive count).
     #[test]
     fn nr_of_cores_property_falls_back_to_auto_detect() {
         // Absent → None.
@@ -1597,13 +1579,15 @@ mod tests {
             "NR_OF_CORES=bad must return None"
         );
 
-        // With CONNECTION_NAME but no override: connect-back fails (NoopCtx) → (1, 0).
-        let (nodes, cores) = resolve_cluster_nodes(
-            &mut NoopCtx,
-            &serde_json::json!({ PROP_CONNECTION_NAME: "SOME_CONNECTION" }),
-        );
+        // With no override, resolve_cluster_nodes auto-detects the core count from
+        // available_parallelism() (positive, host-sourced) and defaults the node
+        // count to 1 when node_count() is 0.
+        let (nodes, cores) = resolve_cluster_nodes(&mut NoopCtx, &serde_json::json!({}));
         assert_eq!(nodes, 1u32);
-        assert_eq!(cores, 0u32, "connect-back failure must yield nr_of_cores=0");
+        assert!(
+            cores >= 1,
+            "no override must fall back to available_parallelism() (>= 1), got {cores}"
+        );
     }
 
     /// Task 2.3 — Explicit DATAFUSION_TARGET_PARTITIONS wins over cores-driven default.
