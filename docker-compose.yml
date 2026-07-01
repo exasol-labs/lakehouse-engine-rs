@@ -41,7 +41,13 @@ services:
       mc mb --ignore-existing local/warehouse &&
       echo 'bucket ready'
       "
-    restart: on-failure
+    # "no" (was on-failure): this is a one-shot job, not a long-running
+    # service — it either succeeds or it doesn't, there's nothing to restart.
+    # (`docker compose up --wait` doesn't reliably support one-shot containers
+    # regardless of restart policy — see the CI workflow's two-phase bring-up
+    # for the actual fix: `docker wait` this container instead of including it
+    # in the --wait set.)
+    restart: "no"
     networks:
       - lakehouse
 
