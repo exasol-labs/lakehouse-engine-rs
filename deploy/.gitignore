@@ -1,0 +1,17 @@
+# OpenTofu working dirs + state (lock files .terraform.lock.hcl ARE tracked)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# python
+**/__pycache__/
+*.pyc
+
+# local c4 binary cache
+.c4/
+
+# c4-downloaded Exasol package tarballs
+exasol-*.tar.gz
