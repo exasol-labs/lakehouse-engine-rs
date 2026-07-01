@@ -22,6 +22,10 @@ Config comes from a gitignored `bench/.env` (copy `bench/.env.example`).
   `EXASOL_*` / `BUCKETFS_WRITE_PASS` in `.env`. **You must pre-load TPC-H into
   the Glue namespace yourself** — remote mode does not load data.
 
+To stand up a remote AWS cluster + catalog (and to enable co-workers), see
+[`../deploy/README.md`](../deploy/README.md); `deploy/scripts/secrets.sh <env>`
+generates the `bench/.env` for a deployed cluster.
+
 ## What it does
 
 1. Builds the working-tree `.so` and uploads it + the SLC to BucketFS.
@@ -40,6 +44,23 @@ Each run writes a timestamped report to `bench/reports/` (gitignored).
 the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
 (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the
 `GROUP BY shard_key` fan-out. See `../CLAUDE.md` for the engine memory/fan-out model.
+
+## Companion scripts
+
+- **`import_ceiling.sh`** (remote only) — the VS path vs Exasol's **native
+  `IMPORT FROM PARQUET`** reader over the *same* lineitem files, as a goal
+  ceiling. Two comparisons: **scan-only** (`COUNT(*)` over both — full read, ~no
+  output, so the delta is UDF-layer overhead) and **data-intensive**
+  (full-materialization into a real table: native `IMPORT INTO` vs the VS
+  `CREATE TABLE AS SELECT *` emit path, 3× each, both landing identical rows).
+  Reads the lineitem file list from the newest `reports/bench-report-*.txt`, so
+  run `make bench` first. Writes to `bench/reports/` (or a path you pass as `$1`).
+  ```bash
+  make bench                                    # produces the report it harvests
+  ./bench/import_ceiling.sh bench/reports/import-ceiling-$(date +%Y%m%d-%H%M%S).txt
+  ```
+- **`sweep.sh`** — sweeps the DataFusion threading knobs (`BENCH_DF_*`) across
+  `run.sh` invocations to find the best parallelism config.
 
 ## Synthetic micro-benchmarks (no cluster, no DB)
 
