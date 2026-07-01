@@ -12,6 +12,9 @@ pushdown against a local Exasol Docker container.
 * All DSN/connection strings MUST include `validateservercertificate=0`.
 * The file-pruning E2E seeds a partitioned Iceberg table whose data files are distributed
   across partition values, so a partition-column predicate can prune whole files.
+* See `packaging/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately
+  place an aggregate before, between, or after the group keys in the `selectList` — the
+  arrangement every case in this spec avoids.
 
 ## Scenarios
 
