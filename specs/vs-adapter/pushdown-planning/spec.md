@@ -1,24 +1,12 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan for a single involved table: it derives the scanned Iceberg table from `involvedTables[0].name` via the create-time `TABLE_MAP`, resolves that table's Iceberg data-file list once (signing catalog requests with AWS SigV4 and applying vended S3 credentials when enabled), captures projection, filter, LIMIT, and any supported aggregate, and emits the SQL that drives the DataFusion scan SET UDF over exactly those files. At file-resolution time the adapter additionally translates the soundly-translatable conjuncts of the WHERE predicate into an `iceberg::expr::Predicate` so `plan_files` prunes data files before any S3 I/O; DataFusion always applies the full filter as the sole source of row-level correctness. File-pruning-specific scenarios are in `vs-adapter/pushdown-file-pruning`.
+Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files.
 
 ## Background
 
-Each pushdown request concerns exactly one virtual table — Exasol issues a separate single-table pushdown per table, including for JOINs (which are not advertised; Exasol joins the per-table result sets itself). The `TABLE_MAP` recorded in `schemaMetadata.adapterNotes` at create time is handed back in `schemaMetadataInfo.adapterNotes` and maps each Exasol table name to its original-cased Iceberg identifier.
-
-* The adapter receives a `pushdown` request carrying the projection, filter, and
-  aggregate specification from Exasol.
-* Catalog and storage credentials are resolved from the CONNECTION object, not plain
-  properties. See `vs-adapter/connection-credentials`.
-* The adapter resolves the Iceberg snapshot and file list exactly once per query.
-* The shard count G is `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped
-  to the file count, per the `parallelism/work-unit-sharding` feature; the scan-driving
-  SQL groups on `shard_key`, never on `IPROC()`.
-* Credentials MUST NOT appear in any returned SQL or error message.
-* A predicate or group-key expression the adapter cannot translate is omitted from the
-  scan spec; Exasol keeps it as a correctness backstop.
-* SigV4 signing and credential vending scenarios are in
-  `vs-adapter/pushdown-planning-cloud-credentials`.
+* The data-file list and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
+* The logical schema carried into the scan spec identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
+* Credentials MUST NOT appear in any returned SQL string or error message.
 
 ## Scenarios
 
@@ -36,8 +24,8 @@ Each pushdown request concerns exactly one virtual table — Exasol issues a sep
 * *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL determine the target Iceberg table from `involvedTables[0].name` via the `TABLE_MAP` and resolve that table's Iceberg snapshot and data-file list exactly once
-* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the scan SET UDF and passes the resolved data-file list as an explicit argument
+* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot and data-file list exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
+* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the scan SET UDF and passes both the resolved data-file list AND the logical schema as explicit arguments in the scan spec
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself
 
 ### Scenario: Projection is pushed into the scan-driving query
@@ -45,6 +33,7 @@ Each pushdown request concerns exactly one virtual table — Exasol issues a sep
 * *GIVEN* a query that selects only some of the table's columns
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF
+* *AND* the projected column names SHALL be the current Iceberg logical names carried in the scan spec's logical schema, so the UDF's registered table exposes them and the field-id adapter maps each to the correct physical column per file
 * *AND* the UDF's declared EMITS column list SHALL match the projected columns in order and type
 
 ### Scenario: Filter predicate is pushed into the scan spec
