@@ -66,6 +66,10 @@ jobs:
   build-so:
     name: Build release .so (Docker)
     runs-on: ubuntu-latest
+    # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
+    # release build). 60 min is a safety backstop against a genuine hang, not
+    # a tight budget.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -80,6 +84,13 @@ jobs:
 
       - name: Build liblakehouse_engine.so
         run: make cross-musl-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
+
+      # `docker run` writes into the bind-mounted registry as root (the
+      # container's default user), so actions/cache's post-job tar (running as
+      # the runner user) can't read those files back out — observed as
+      # "Cannot open: Permission denied" / cache save failing silently.
+      - name: Fix Docker-side cargo registry ownership
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry"
 
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v4
@@ -189,6 +200,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-so, lint, unit-tests, licenses]
     timeout-minutes: 30
+    env:
+      # Standard GitHub-hosted runners have 2 vCPUs; docker-compose.yml's
+      # exasol service default (4) exceeds what Docker will accept ("range of
+      # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
+      LH_EXASOL_CPUS: "2"
     steps:
       - uses: actions/checkout@v4
 
