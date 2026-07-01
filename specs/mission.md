@@ -58,7 +58,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 |------|------------|
 | Virtual Schema (VS) | Exasol adapter that makes an external data source queryable as a schema; here a thin stateless translation + planning layer |
 | Pushdown | Exasol delegating projection / filter / limit / aggregation to the VS so it executes at the source |
-| IPROC / NPROC | `IPROC()` = node number, `NPROC()` = active node count. `NPROC()` is captured once at `createVirtualSchema` to size the shard count; sharding does NOT group on `IPROC()` (that would cap parallelism at the node count) |
+| IPROC / NPROC | `IPROC()` = node number, `NPROC()` = active node count. The shard-count node number is captured once at `createVirtualSchema` from `UdfContext::node_count()` (the UDF handshake), not from `NPROC()` over connect-back; sharding does NOT group on `IPROC()` (that would cap parallelism at the node count) |
 | Work-unit shard | One of G oversubscribed scan units (G = node_count × parallelism_factor, capped 300); each is its own `shard_key` group multiplexed onto a node's per-node VM pool (sized to `NR_OF_CORES`) |
 | DataFusion runtime | A node-local vectorized query engine instance created inside a UDF for the lifetime of one query |
 | Partial result | Per-node output (raw rows or node-local aggregate) merged by Exasol into the final result |
