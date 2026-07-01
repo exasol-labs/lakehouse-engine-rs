@@ -10,13 +10,14 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 
 * The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
 * The UDF MUST register only its assigned files and MUST NOT discover additional files.
+* When the scan spec carries a logical Iceberg schema, column projection binds by Iceberg field-id (with a physical-name fallback) so results are correct across schema evolution; when it does not, the UDF falls back to first-file schema inference and physical-name binding.
 * On the raw-row path the UDF emits each Arrow `RecordBatch` via the SDK's Arrow-IPC
   emit path (`EmitBatch`, behind the `emit-arrow` feature), which serializes the batch
   to Arrow IPC bytes internally — only IPC bytes cross the `.so` boundary, never typed
   Arrow objects, and no `Vec<Value>` intermediate is built per batch.
 * DataFusion execution is bounded; a memory bound that cannot spill MUST surface as a
   clean error, never an OOM VM crash.
-* Credentials MUST NOT appear in any error message.
+* Error messages MUST NOT contain storage access keys, secret keys, or session tokens.
 * The raw-row scan pipeline is throughput-sensitive: needless physical-plan stages
   (a `RepartitionExec`, a `CoalescePartitionsExec`, a global `SortExec`, or a global
   aggregate) on the single-shard raw-scan path add CPU and latency without changing
@@ -37,15 +38,18 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
   (ungrouped COUNT/SUM/MIN/MAX/AVG).
 * See `datafusion-scan/scan-execution-grouped-agg` for grouped partial-aggregate
   memory, spill, and group-key scenarios.
+* See `datafusion-scan/scan-execution-field-id-projection` for field-id-based column
+  binding, physical-name fallback, null-fill for added nullable columns, and the
+  backward-compatible first-file-inference fallback.
 
 ## Scenarios
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan spec listing specific Iceberg Parquet files in MinIO
+* *GIVEN* a scan spec listing specific Iceberg Parquet files in MinIO, carrying the logical Iceberg schema (each entry a `{field_id, name, arrow_type, nullable}` tuple derived once by the adapter)
 * *AND* a projection naming a subset of columns
 * *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL create a DataFusion session and register only the assigned files
+* *THEN* the UDF SHALL create a DataFusion session and register only the assigned files as one `ListingTable` whose declared schema is the logical Iceberg schema (each field carrying its `PARQUET:field_id` metadata), NOT a schema inferred from the first file
 * *AND* the UDF MUST NOT resolve or discover any additional files from the catalog
 * *AND* the UDF SHALL emit one output row per scanned source row containing only the projected columns
 
@@ -117,3 +121,4 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 * *THEN* the physical plan SHALL NOT contain a `RepartitionExec`, a `CoalescePartitionsExec`, a global `SortExec`, or a global aggregate stage on the raw-row path
 * *AND* the plan SHALL be the lean pipeline `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec` feeding the incremental emit, so no stage redistributes or re-buffers rows beyond what projection, filter, and batch coalescing require
 * *AND* the emitted rows SHALL be identical to those the unpruned, un-optimized plan would produce
+
