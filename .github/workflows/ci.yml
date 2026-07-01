@@ -76,21 +76,29 @@ jobs:
       # UDF_CARGO_VOL defaults to a *named* Docker volume in the Makefile
       # (fine on a persistent dev machine); override it to a host path here so
       # actions/cache can persist the Docker-side cargo registry across runs.
-      - name: Cache Docker-side cargo registry
+      # Also cache target/ itself (compiled artifacts) — caching only the
+      # registry saves download time but not compile time, since the .so's
+      # own target/ dir is otherwise empty on every fresh checkout. Cargo's
+      # fingerprint check falls back to content hashes (not just mtimes) when
+      # deciding what's stale, so it tolerates checkout resetting mtimes.
+      - name: Cache Docker-side cargo registry and target/
         uses: actions/cache@v4
         with:
-          path: ~/.cargo-docker-registry
+          path: |
+            ~/.cargo-docker-registry
+            target/
           key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build liblakehouse_engine.so
         run: make cross-musl-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
 
-      # `docker run` writes into the bind-mounted registry as root (the
-      # container's default user), so actions/cache's post-job tar (running as
-      # the runner user) can't read those files back out — observed as
-      # "Cannot open: Permission denied" / cache save failing silently.
-      - name: Fix Docker-side cargo registry ownership
-        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry"
+      # `docker run` writes into both the bind-mounted registry and target/ as
+      # root (the container's default user), so actions/cache's post-job tar
+      # (running as the runner user) can't read those files back out —
+      # observed as "Cannot open: Permission denied" / cache save failing
+      # silently.
+      - name: Fix Docker-side build output ownership
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
 
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v4
