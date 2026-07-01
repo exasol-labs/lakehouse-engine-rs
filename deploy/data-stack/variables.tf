@@ -109,3 +109,8 @@ variable "data_classification" {
   type    = string
   default = "internal"
 }
+variable "created_date" {
+  type        = string
+  default     = ""
+  description = "exa:CreatedDate (YYYY-MM-DD); empty omits the tag. Kept plan-known to avoid tags_all churn."
+}
