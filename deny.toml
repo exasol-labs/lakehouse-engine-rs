@@ -16,6 +16,22 @@ ignore = [
     # shipped liblakehouse_engine.so, so the timing-sidechannel exposure this
     # advisory describes does not apply to the distributed artifact.
     { id = "RUSTSEC-2023-0071", reason = "Dev-dependency only (E2E test harness), not shipped in liblakehouse_engine.so" },
+
+    # quick-xml DoS pair (CPU-quadratic attribute check; unbounded NsReader
+    # namespace-decl allocation), fixed in quick-xml >=0.41.0. Blocked: three
+    # different transitive paths pull three different quick-xml versions, and
+    # none of their direct dependents allow >=0.41.0 yet under semver caret
+    # pins — reqsign 0.16.5 requires "^0.37", opendal 0.55.0 requires "^0.38",
+    # object_store 0.13.2 requires "^0.39.0" (all via iceberg-storage-opendal /
+    # datafusion). Exploitation requires a malicious response from the
+    # configured S3-compatible storage or Iceberg/Glue REST catalog endpoint —
+    # an operator-configured trust boundary, not arbitrary untrusted input —
+    # which narrows the practical attack surface versus the advisories'
+    # "unauthenticated remote attacker" framing (aimed at services parsing
+    # third-party-published XML, e.g. RPKI RRDP feeds). Re-evaluate when
+    # reqsign/opendal/object_store bump their quick-xml requirement.
+    { id = "RUSTSEC-2026-0194", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
+    { id = "RUSTSEC-2026-0195", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
 ]
 
 [licenses]
