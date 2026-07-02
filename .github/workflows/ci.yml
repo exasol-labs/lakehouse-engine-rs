@@ -56,13 +56,24 @@ jobs:
       # small instead of ballooning with the full DataFusion/Arrow/Iceberg
       # --all-targets debug tree (the bloat that filled the runner disk and
       # ENOSPC-killed lint/unit-tests). It also keys on rustc + Cargo.lock
-      # automatically. This job is the SOLE writer of the `workspace` cache;
-      # the fan-out jobs restore it read-only (save-if: false) so they don't
-      # each race to save a multi-GB copy.
+      # automatically. This job is the SOLE writer of the shared cache; the
+      # fan-out jobs restore it read-only (save-if: false) so they don't each
+      # race to save a copy.
+      #
+      # `cargo build` produces full .rlib codegen — a SUPERSET of what clippy
+      # (.rmeta only) and `cargo test` (.rlib, to link the test binary) each
+      # need — so this writer's cache serves every reader. The `-rlib` suffix
+      # deliberately BUSTS an earlier immutable cache written under `workspace`:
+      # in the brief window when lint was also a writer, clippy won the save
+      # race and stored a .rmeta-only cache. GitHub cache keys are immutable, so
+      # this warm build kept restoring that check-only cache as a "full match"
+      # and skipped its own save — leaving unit-tests to recompile the entire
+      # dep tree (~17 min) for the .rlib it couldn't find. Bumping the key
+      # forces a fresh save of the real .rlib cache. Bump again if it recurs.
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: workspace
+          shared-key: workspace-rlib
 
       # The workspace has no default-members (see Cargo.toml) so `cargo build`
       # alone is a no-op by design; --workspace is required to actually
@@ -167,7 +178,7 @@ jobs:
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: workspace
+          shared-key: workspace-rlib
           save-if: "false"
 
       - name: Check formatting
@@ -195,7 +206,7 @@ jobs:
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: workspace
+          shared-key: workspace-rlib
           save-if: "false"
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
@@ -269,7 +280,7 @@ jobs:
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: workspace
+          shared-key: workspace-rlib
           save-if: "false"
 
       # The standard runner's / has too little free space for the Exasol image
