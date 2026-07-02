@@ -5,7 +5,10 @@
 # Performance
 
 Optimizations, live-cluster numbers, and tuning headroom. Numbers from the last recorded
-benchmark (`specs/_recorded/2026-06-27-change-engine-throughput/`).
+benchmark (`specs/_recorded/2026-06-27-change-engine-throughput/`) plus a larger-scale,
+not-yet-recorded validation run (`bench/reports/bench-report-20260701-123648.txt`,
+`bench/reports/import-ceiling-20260701-124836.txt`) — see
+[Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) below.
 
 ## Optimizations delivered
 
@@ -70,6 +73,44 @@ Memory stayed bounded across the sweep — no OOM, no VM crash.
 
 Reproduce: `bench/run.sh`, `bench/sweep.sh` ([`bench/README.md`](../bench/README.md)).
 
+## Larger-scale validation (180M-row lineitem, 60 files)
+
+A 2026-07-01 run against the full TPC-H `lineitem` table — **60 Parquet files, 179,998,372
+rows** on Glue (`eu-west-1`), SLC lc-rs 0.19.1, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` — ~30×
+the row count of the 20-file sample above. Not yet formally recorded as a spec benchmark; raw
+output in `bench/reports/bench-report-20260701-123648.txt` and
+`bench/reports/import-ceiling-20260701-124836.txt`.
+
+| Query | Result | Time |
+|---|---|---|
+| Q1 (wiring check) | 25 rows | 2.12 s |
+| Q2 (3-way join) | 179,998,372 rows joined | 22.17 s |
+| Q3 (filter + GROUP BY) | 5 groups | 20.54 s |
+| Q4 (lineitem pricing summary) | 4 groups | 28.51 s |
+
+**Native `IMPORT` vs. VS, same 60 files (avg of 3 runs each):**
+
+| Path | Avg time |
+|---|---|
+| Native `IMPORT` — `COUNT(*)` ceiling over all 60 files | ~28.8 s |
+| VS — `SELECT COUNT(*)` (metadata pushdown) | ~1.3 s |
+| Native `IMPORT INTO` (full load, 180M rows materialized) | **~80.4 s** |
+| VS — `CREATE TABLE AS SELECT *` (full emit, 180M rows) | **~151 s** |
+
+Metadata-only `COUNT(*)` still favors the VS path by ~20× (answered from Iceberg/row-group
+stats, no row materialization). But **full materialization flips the earlier finding**: native
+`IMPORT INTO` is ~1.9× faster than the VS full-emit CTAS at this scale, unlike the small-scale
+run where the VS aggregate path was competitive with native IMPORT.
+
+> **Open confound, not yet isolated:** this run's `adapterNotes` recorded `CLUSTER_NODES=1`
+> despite explicit `NR_OF_CORES=8` / `PARALLELISM_FACTOR=8` — the pre-0.20.1
+> `ctx.node_count()==0` handshake bug (tracked in #43, fixed by the SDK bump in
+> `add-scan-connection-concurrency`). If this cluster has more than one node, shard count `G`
+> was computed as `1 × 8` instead of `node_count × 8`, starving the full-scan/emit path of
+> cluster parallelism — which could fully or partly explain the 151 s vs. 80 s gap rather than
+> it being a genuine emit-path bottleneck. **Re-run this exact 60-file benchmark after the
+> 0.20.1 bump lands** before concluding anything about the emit path itself.
+
 ## Tuning levers & outlook
 
 The engine controls these regardless of where storage lives — apply them first:
@@ -91,4 +132,7 @@ Future engine work (deferred, evidence-gated):
 - **Decode-emit overlap buffer** — gate-failed here (emit ≈ 2 ms, nothing to overlap); revisit
   for an emit-bound workload (wide `SELECT *`).
 - **Emit-path Arrow cast** — `BIGINT` (Int64 → Decimal128) coercion is 50–200× slower than
-  zero-copy types; worth optimizing only if a workload proves emit-bound.
+  zero-copy types; worth optimizing only if a workload proves emit-bound. The 180M-row full-emit
+  CTAS above (`SELECT *` = a wide, emit-heavy workload) is the first candidate — but re-run it
+  post-0.20.1 first (see caveat above) to rule out under-sharding before attributing the gap to
+  the emit path.

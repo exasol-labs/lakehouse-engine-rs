@@ -1,0 +1,27 @@
+# Third-Party Licenses
+
+The `liblakehouse_engine.so` binary distributed in this release statically links
+the open-source crates listed below. Their licenses and copyright notices are
+reproduced verbatim, as required for binary redistribution.
+
+Generated with `cargo about generate`.
+
+## Summary
+
+{{#each overview}}
+- {{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}
