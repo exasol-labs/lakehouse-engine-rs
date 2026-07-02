@@ -1,6 +1,8 @@
-/// DataFusion scan SET UDF — reads a ScanSpec from the input row, builds a
-/// DataFusion SessionContext, registers ONLY the assigned files over MinIO,
-/// applies projection/filter/limit, and streams rows back via ctx.emit.
+/// DataFusion scan SET UDF — reconstitutes a ScanSpec from its TWO input
+/// arguments (the shard-invariant common blob at column 0, serialized once per
+/// fan-out, and the per-shard files JSON array at column 1), builds a DataFusion
+/// SessionContext, registers ONLY the assigned files over MinIO, applies
+/// projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
 pub mod diagnostics;
 pub mod emit;
@@ -114,10 +116,32 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .set_bool("datafusion.execution.parquet.pushdown_filters", true)
 }
 
+/// Reconstitute the full `ScanSpec` from the two scan-UDF input arguments.
+///
+/// Column 0 is the shard-invariant common blob JSON (serialized ONCE per
+/// fan-out); column 1 is the per-shard files JSON array. Either argument being
+/// SQL NULL is a user error — the adapter always supplies both. Reconstitution
+/// goes through [`ScanSpec::from_parts_json`], whose errors NEVER echo the raw
+/// inputs (the common blob carries credentials).
+///
+/// Exposed so a host integration test can drive the exact production two-argument
+/// reconstitution against a fake `UdfContext` (no S3), then feed the resulting
+/// spec to [`run_raw_scan_with_session`].
+pub fn read_scan_spec(ctx: &dyn UdfContext) -> Result<ScanSpec, UdfError> {
+    let common_json = ctx
+        .get_string(0)?
+        .ok_or_else(|| UdfError::User("scan common input is NULL".into()))?;
+    let files_json = ctx
+        .get_string(1)?
+        .ok_or_else(|| UdfError::User("scan files input is NULL".into()))?;
+    ScanSpec::from_parts_json(common_json, files_json).map_err(UdfError::User)
+}
+
 /// Entry point for the LAKEHOUSE_SCAN SET UDF.
 ///
-/// Reads the scan spec from the first input column (VARCHAR JSON), builds a
-/// DataFusion session, scans the assigned files, and emits rows.
+/// Reconstitutes the scan spec from the two input columns (the common blob at
+/// column 0 and the per-shard files JSON at column 1), builds a DataFusion
+/// session, scans the assigned files, and emits rows.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // Advance to the first (and only) input row.
     let has_row = ctx.next()?;
@@ -126,13 +150,10 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
         return Ok(());
     }
 
-    let spec_json = ctx
-        .get_string(0)?
-        .ok_or_else(|| UdfError::User("scan spec input is NULL".into()))?;
-
-    // Parse spec BEFORE building the runtime: the runtime kind depends on
-    // spec.df_threads_per_udf, so we must deserialize first.
-    let spec = ScanSpec::from_json(spec_json).map_err(UdfError::User)?;
+    // Reconstitute the spec from the two arguments BEFORE building the runtime:
+    // the runtime kind depends on spec.df_threads_per_udf, so we must
+    // deserialize first. NULL in either argument is a user error.
+    let spec = read_scan_spec(ctx)?;
 
     // Build the Tokio runtime according to the spec's thread configuration.
     // A fresh runtime per call is correct for a stateless disposable UDF.
@@ -1059,7 +1080,7 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
-    use crate::scan::spec::{AggKind, AggregatePlan, CatalogProps, StorageProps};
+    use crate::scan::spec::{AggKind, AggregatePlan, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
 
     // ---------------------------------------------------------------------------
@@ -1085,11 +1106,6 @@ mod tests {
                 session_token: None,
                 allow_http: true,
                 path_style: true,
-            },
-            catalog: CatalogProps {
-                uri: "http://localhost:8181".into(),
-                warehouse: "wh".into(),
-                table: "db.tbl".into(),
             },
             df_target_partitions: 1,
             df_batch_size: 8192,

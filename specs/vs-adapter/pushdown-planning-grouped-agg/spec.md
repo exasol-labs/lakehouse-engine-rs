@@ -3,9 +3,10 @@
 Extends `vs-adapter/pushdown-planning` with the GROUP BY aggregate detection and
 scan-driving SQL generation scenarios. When Exasol delegates a `GROUP BY` aggregate
 query, the adapter detects the shape, renders group-key expressions via the VS
-expression translator, builds a grouped scan spec, and generates fan-out SQL that
-runs DataFusion GROUP BY inside each shard invocation and merges the partials in an
-outer wrapper.
+expression translator, builds a grouped common scan spec, and generates fan-out SQL
+that runs DataFusion GROUP BY inside each shard invocation and merges the partials in
+an outer wrapper. The grouped common spec is serialized once (shared by all shards)
+and carries no LIMIT.
 
 ## Background
 
@@ -17,11 +18,15 @@ outer wrapper.
   GROUP BY inside each shard invocation, emitting per-user-group partials with
   group-key values as plain columns (GK_0..GK_{n-1}); the outer wrapper re-groups on
   those columns and merges the partials.
-* LIMIT is never pushed into the per-shard grouped scan; it appears only in the outer
+* LIMIT is never pushed into the per-shard grouped scan; the shared common spec is
+  built with no LIMIT, so no shard observes one — it appears only in the outer
   wrapper.
 * Exasol validates the outer wrapper SELECT's column types positionally against
   `selectListDataTypes`, so the wrapper SELECT must list its items in the user's
   `selectList` order.
+* The grouped scan-driving SQL serializes the shard-invariant common spec once and
+  carries only each shard's file subset per `VALUES` row, exactly as the row-scan
+  fan-out.
 
 ## Scenarios
 
@@ -58,13 +63,14 @@ outer wrapper.
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the generated SQL SHALL group the per-shard rows on `shard_key` (one group per shard), NOT on `IPROC()`
 * *AND* G SHALL be `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes and multiplex onto each node's core pool
-* *AND* the scan SET UDF SHALL be invoked once per shard with that shard's explicit file subset
+* *AND* the scan SET UDF SHALL be invoked once per shard with the shard-invariant common spec serialized once as its first argument and that shard's file subset as its second argument
 
 ### Scenario: LIMIT is NOT pushed into per-shard scan for a grouped query
 
 * *GIVEN* a grouped aggregate query with a LIMIT clause
 * *WHEN* the adapter builds the grouped scan spec
-* *THEN* the scan spec MUST NOT carry the LIMIT value in the per-shard partial scan
+* *THEN* the shard-invariant common spec MUST NOT carry the LIMIT value, so no per-shard partial scan observes a LIMIT
+* *AND* because the common spec is shared by every shard, the LIMIT-exclusion invariant SHALL hold for every shard by construction (the LIMIT is stripped from the single common spec, not per shard)
 * *AND* the LIMIT SHALL appear only in the outer wrapper SQL that merges partial-aggregate results from all shards
 
 ### Scenario: NULL group keys are grouped together consistently
