@@ -1374,3 +1374,33 @@ Do not change `ScanSpec.group_keys` / `ScanSpec.aggregates`, the inner fan-out E
 ### Consequences
 
 The scan UDF and the wire contract between it and the adapter are untouched by this fix, minimizing the change surface and risk. The inner fan-out and per-shard scan remain self-consistent keys-first structures, matched only against each other.
+
+---
+
+## ADR-052: Two-Argument `LAKEHOUSE_SCAN(common, files)` — Shard-Invariant Spec Emitted Once, Per-Shard Files Only in `VALUES`
+
+**Date:** 2026-07-02
+**Plan:** `fix-scan-spec-shard-dedup`
+**Status:** Accepted
+
+### Context
+
+`build_fan_out_inner_with_spec` serialized the full `ScanSpec` — credentials, projection, filter, aggregates, group_keys, logical_schema, emit_exa_types, and all `df_*`/memory tuning knobs — into every shard's single-argument `LAKEHOUSE_SCAN(spec VARCHAR(2000000))` invocation. Only `files` varies between shards; on a wide fan-out (G capped at 300 per the sharding model) the shard-invariant payload was repeated up to ~300 times in one generated statement, risking Exasol statement-size limits and multiplying the credential surface (issue #25). A full field audit (recorded in the plan) additionally found `ScanSpec.catalog: CatalogProps` had no production scan-UDF reader — only tests referenced it; all catalog interaction happens adapter-side before the UDF runs.
+
+### Decision
+
+Split `LAKEHOUSE_SCAN` into a two-argument signature: `LAKEHOUSE_SCAN(common VARCHAR, files VARCHAR)`. The adapter serializes the shard-invariant common spec exactly once as a SELECT-list literal shared by every shard, and places only each shard's file-URI JSON in the `VALUES` rows; `run_scan` reads both arguments and reconstitutes a `ScanSpec` via `ScanSpec::from_parts(common, files)`. Only `Value::String` still crosses the `.so` boundary. Drop `ScanSpec.catalog: CatalogProps` entirely — `ScanSpec` no longer carries a catalog `uri`/`warehouse`/`table` block; the `CatalogProps` type itself stays, still used adapter-side. The field audit's result: `files` is the sole per-shard field, `catalog` is dropped, and every remaining field (`projection`, `filter`, `limit`, `aggregates`, `group_keys`, `emit_exa_types`, `logical_schema`, `storage`, and the `df_*`/memory tuning knobs) is invariant and belongs in the common blob. For grouped queries the common blob is built once with `limit = None`, structurally guaranteeing the "LIMIT never in per-shard partial" invariant (the per-shard LIMIT-strip closure is removed as redundant). No single-argument backward-compatibility path is kept: the `.so`, SLC, and adapter deploy together and the scan SET SCRIPT DDL is recreated per deployment, so no in-flight spec crosses a version boundary.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Two-argument UDF: invariant common literal (emitted once) + per-shard files | ✓ Chosen — collapses the ~300× repetition to one common literal per statement; multi-arg UDFs need no new infrastructure (`exasol-udf-macros` 0.20.0 `input(a: T, b: T, ...)`) and only `Value::String` crosses the boundary |
+| Connect-back to fetch credentials at scan time | ✗ Rejected — connect-back was deliberately removed from this project by issue #32 / ADR-048; do not reintroduce it |
+| Stage the common spec as a BucketFS file referenced by all shards | ✗ Rejected — adds state/staging to a stateless, disposable UDF |
+| Keep the single-argument form | ✗ Rejected — that is the bug being fixed |
+| Keep `ScanSpec.catalog: CatalogProps` for symmetry / future use | ✗ Rejected — YAGNI; no production scan-UDF reader, and it is a credential-adjacent field that should not sit on the UDF-boundary payload |
+
+### Consequences
+
+The generated fan-out statement carries the shard-invariant payload — including credentials, projection, filter, aggregates, and tuning knobs — exactly once instead of once per shard, shrinking statement size and the credential surface on wide fan-outs. `ScanSpec` carries no catalog block at all, strengthening the existing "catalog auth never in any scan spec" guarantee. The scan SET SCRIPT DDL and every direct invocation move to the two-argument signature; there is no dual-read path, so the `.so`/SLC/adapter must deploy together (already true for this stateless, disposable UDF).

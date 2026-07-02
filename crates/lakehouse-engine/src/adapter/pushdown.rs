@@ -1052,13 +1052,14 @@ fn build_row_scan_sql(
         .join(", ");
 
     if shards.len() == 1 {
-        let mut shard_spec = spec_template.clone();
-        shard_spec.files = shards.into_iter().next().unwrap_or_default();
-        let spec_literal = sql_string_literal(&shard_spec.to_json());
+        let files = shards.into_iter().next().unwrap_or_default();
+        let common_literal = sql_string_literal(&spec_template.to_common_json());
+        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
         let mut sql = format!(
-            "SELECT * FROM (SELECT {udf}({spec}) EMITS ({emits}))",
+            "SELECT * FROM (SELECT {udf}({common}, {files}) EMITS ({emits}))",
             udf = udf_name,
-            spec = spec_literal,
+            common = common_literal,
+            files = files_literal,
             emits = emits,
         );
         if let Some(n) = limit {
@@ -1093,13 +1094,14 @@ fn build_aggregate_scan_sql(
     let merge_select = cast_merge_items(aggregates, aggregate_types).join(", ");
 
     let fan_out = if shards.len() == 1 {
-        let mut shard_spec = spec_template.clone();
-        shard_spec.files = shards.into_iter().next().unwrap_or_default();
-        let spec_literal = sql_string_literal(&shard_spec.to_json());
+        let files = shards.into_iter().next().unwrap_or_default();
+        let common_literal = sql_string_literal(&spec_template.to_common_json());
+        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
         format!(
-            "SELECT {udf}({spec}) EMITS ({emits})",
+            "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
-            spec = spec_literal,
+            common = common_literal,
+            files = files_literal,
             emits = emits,
         )
     } else {
@@ -1209,25 +1211,25 @@ pub fn build_grouped_aggregate_scan_sql(
         .collect();
     let outer_group_by_str = outer_group_by.join(", ");
 
-    // Build the inner fan-out.  Each shard spec must NOT carry a LIMIT (partial
-    // groups from different shards must all be emitted and merged by the outer wrapper).
+    // Build the inner fan-out. The common blob is shared by ALL shards, so build it
+    // ONCE with `limit = None`: this structurally guarantees the "LIMIT never in a
+    // per-shard partial" invariant (partial groups from every shard must be emitted
+    // and merged by the outer wrapper). There is no per-shard spec left to strip.
+    let mut common_template = spec_template.clone();
+    common_template.limit = None;
     let fan_out = if shards.len() == 1 {
-        let mut shard_spec = spec_template.clone();
-        shard_spec.files = shards.into_iter().next().unwrap_or_default();
-        shard_spec.limit = None; // No LIMIT inside shard spec for grouped queries.
-        let spec_literal = sql_string_literal(&shard_spec.to_json());
+        let files = shards.into_iter().next().unwrap_or_default();
+        let common_literal = sql_string_literal(&common_template.to_common_json());
+        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
         format!(
-            "SELECT {udf}({spec}) EMITS ({emits})",
+            "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
-            spec = spec_literal,
+            common = common_literal,
+            files = files_literal,
             emits = emits,
         )
     } else {
-        build_fan_out_inner_with_spec(spec_template, &shards, &emits, udf_name, |spec| {
-            let mut s = spec.clone();
-            s.limit = None; // No LIMIT inside shard spec for grouped queries.
-            s.to_json()
-        })
+        build_fan_out_inner(&common_template, &shards, &emits, udf_name)
     };
 
     let mut sql =
@@ -1590,44 +1592,38 @@ fn cast_merge_items(aggregates: &[AggregatePlan], aggregate_types: &[String]) ->
 ///
 /// Uses `GROUP BY shard_key` (NOT `IPROC()`) so work units spread round-robin
 /// across nodes (G ≤ 300) and multiplex onto each node's core pool.
-/// Callers wrap it in `SELECT * FROM (...)` for row scans or an outer merge
-/// aggregation for aggregate pushdown.
+///
+/// The shard-INVARIANT common blob (credentials, projection, filter, aggregates,
+/// tuning knobs) is serialized ONCE via `to_common_json()` as the UDF's first
+/// argument literal; only the per-shard files list varies across the `VALUES`
+/// rows (arg 1). Because the common blob is emitted once instead of per shard, the
+/// credential/tuning payload no longer repeats up to ~300 times in one statement.
+///
+/// Callers wrap the result in `SELECT * FROM (...)` for row scans or an outer merge
+/// aggregation for aggregate pushdown. Callers that must exclude the LIMIT from the
+/// shard scan (grouped aggregates) pass a `spec_template` whose `limit` is already
+/// `None`, so the shared common blob carries no LIMIT for every shard by construction.
 pub fn build_fan_out_inner(
     spec_template: &ScanSpec,
     shards: &[Vec<String>],
     emits: &str,
     udf_name: &str,
 ) -> String {
-    build_fan_out_inner_with_spec(spec_template, shards, emits, udf_name, |spec| {
-        spec.to_json()
-    })
-}
-
-/// Core shard fan-out builder with a configurable spec serializer.
-///
-/// The `spec_to_json` closure lets grouped callers strip the LIMIT from each
-/// per-shard spec without affecting the row-scan / single-group path.
-fn build_fan_out_inner_with_spec(
-    spec_template: &ScanSpec,
-    shards: &[Vec<String>],
-    emits: &str,
-    udf_name: &str,
-    spec_to_json: impl Fn(&ScanSpec) -> String,
-) -> String {
+    // Serialize the shard-invariant common blob exactly once.
+    let common_literal = sql_string_literal(&spec_template.to_common_json());
     let values: Vec<String> = shards
         .iter()
         .enumerate()
         .map(|(i, files)| {
-            let mut shard_spec = spec_template.clone();
-            shard_spec.files = files.clone();
-            let lit = sql_string_literal(&spec_to_json(&shard_spec));
-            format!("({i},{lit})")
+            let files_literal = sql_string_literal(&ScanSpec::files_json(files));
+            format!("({i},{files_literal})")
         })
         .collect();
     let values_list = values.join(",");
     format!(
-        "SELECT {udf}(spec) EMITS ({emits}) FROM (VALUES {values}) AS shards(shard_key, spec) GROUP BY shard_key",
+        "SELECT {udf}({common}, files) EMITS ({emits}) FROM (VALUES {values}) AS shards(shard_key, files) GROUP BY shard_key",
         udf = udf_name,
+        common = common_literal,
         emits = emits,
         values = values_list,
     )
@@ -1776,7 +1772,6 @@ pub async fn handle_pushdown(
                 emit_exa_types: Vec::new(),
                 logical_schema: logical_schema.clone(),
                 storage: storage.clone(),
-                catalog: catalog.clone(),
                 df_target_partitions,
                 df_batch_size,
                 df_threads_per_udf,
@@ -1822,7 +1817,6 @@ pub async fn handle_pushdown(
         emit_exa_types: proj_types.clone(),
         logical_schema,
         storage: storage.clone(),
-        catalog: catalog.clone(),
         df_target_partitions,
         df_batch_size,
         df_threads_per_udf,
@@ -2543,7 +2537,7 @@ fn redact_catalog_error(msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::spec::{CatalogProps, StorageProps};
+    use crate::scan::spec::StorageProps;
     use vs_expression::render_df_filter_safe;
 
     // ---------------------------------------------------------------------------
@@ -2600,14 +2594,6 @@ mod tests {
         }
     }
 
-    fn sample_catalog() -> CatalogProps {
-        CatalogProps {
-            uri: "http://iceberg-rest:8181".into(),
-            warehouse: "warehouse".into(),
-            table: "db.events".into(),
-        }
-    }
-
     /// Assemble the scan-driving SQL from a known file list + spec — the same
     /// logic `handle_pushdown` runs after `resolve_file_list`.
     /// Uses `cluster_nodes=1` (single-shard / legacy shape).
@@ -2646,7 +2632,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -2666,6 +2651,17 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
         )
+    }
+
+    /// The UDF's first-argument literal (the shard-invariant common blob), extracted
+    /// as the substring between the first two single quotes. Valid for the test
+    /// fixtures here, whose common JSON contains no embedded single quote (JSON uses
+    /// double quotes; the rendered filters used in these tests carry none).
+    fn common_arg_literal(sql: &str) -> &str {
+        let start = sql.find('\'').expect("SQL must contain a literal") + 1;
+        let rest = &sql[start..];
+        let end = rest.find('\'').expect("common literal must be closed");
+        &rest[..end]
     }
 
     // ---------------------------------------------------------------------------
@@ -2714,7 +2710,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn pushdown_carries_projection() {
+    fn projection_in_common_arg_emits_match() {
         let sql = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["A".into(), "B".into()],
@@ -2733,11 +2729,16 @@ mod tests {
             "EMITS must carry col B: {sql}"
         );
 
-        // The spec JSON must carry the projection field.
-        // (It's embedded as a SQL string literal in the body.)
+        // The projection lives in the common (arg 0) blob, not the per-shard files arg.
+        let common = common_arg_literal(&sql);
         assert!(
-            sql.contains(r#""A""#) || sql.contains(r#"\"A\""#),
-            "spec JSON must include projected column A: {sql}"
+            common.contains(r#""projection":["A","B"]"#),
+            "common arg must carry the projection in order: {common}"
+        );
+        // The per-shard files arg must not carry projection metadata.
+        assert!(
+            !sql.contains(r#""files""#),
+            "no ScanSpec files key must appear (files travel as a bare JSON array): {sql}"
         );
     }
 
@@ -2810,7 +2811,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn pushdown_carries_limit() {
+    fn row_scan_limit_in_common_arg() {
         let sql = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["ID".into()],
@@ -2825,11 +2826,11 @@ mod tests {
             "outer SQL must carry LIMIT for correctness backstop: {sql}"
         );
 
-        // The spec JSON (embedded in the literal) must carry limit = 42.
-        // The JSON will have "limit":42 somewhere in the literal.
+        // For a row scan the LIMIT is retained in the common (arg 0) blob.
+        let common = common_arg_literal(&sql);
         assert!(
-            sql.contains(r#""limit":42"#) || sql.contains("limit"),
-            "spec JSON must carry the limit: {sql}"
+            common.contains(r#""limit":42"#),
+            "row-scan common arg must carry limit=42: {common}"
         );
     }
 
@@ -3103,7 +3104,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -3158,11 +3158,11 @@ mod tests {
     // Fan-out SQL shape — multi-shard GROUP BY shard_key, single-shard equivalence
     // ---------------------------------------------------------------------------
 
-    /// Multi-shard SQL fans out via GROUP BY shard_key (not IPROC()): SQL contains
-    /// GROUP BY shard_key, invokes the scan UDF, and carries each shard's distinct
-    /// files as separate spec literals.
+    /// Multi-shard fan-out serializes the shard-INVARIANT common blob EXACTLY ONCE
+    /// (as the UDF's first argument literal) and carries only the per-shard files
+    /// list in each `VALUES` row — no credential/tuning payload repeats per shard.
     #[test]
-    fn multi_shard_sql_fans_via_shard_key_group_by() {
+    fn fan_out_serializes_common_once_files_per_shard() {
         let files = vec![
             "s3://warehouse/shard0/part-000.parquet".into(),
             "s3://warehouse/shard1/part-001.parquet".into(),
@@ -3184,43 +3184,52 @@ mod tests {
             "multi-shard SQL must NOT contain IPROC(): {sql}"
         );
         assert!(
-            sql.contains("GROUP BY"),
-            "multi-shard SQL must contain GROUP BY: {sql}"
-        );
-        assert!(
-            sql.contains("shard_key"),
-            "multi-shard SQL must use shard_key: {sql}"
+            sql.contains("GROUP BY shard_key"),
+            "multi-shard SQL must GROUP BY shard_key: {sql}"
         );
 
-        // Must invoke the scan UDF.
+        // The VALUES table exposes the per-shard files column (arg 1), not a full spec.
         assert!(
-            sql.contains(SCAN_UDF_NAME),
+            sql.contains("AS shards(shard_key, files)"),
+            "fan-out must alias the VALUES table as shards(shard_key, files): {sql}"
+        );
+        // The UDF is called with two args: the common literal, then the files column.
+        assert!(
+            sql.contains(&format!("{SCAN_UDF_NAME}(")),
             "multi-shard SQL must invoke the scan UDF: {sql}"
         );
-
-        // Each file must appear in the SQL (in distinct spec literals).
         assert!(
-            sql.contains("part-000.parquet"),
-            "shard 0 file must be in SQL: {sql}"
-        );
-        assert!(
-            sql.contains("part-001.parquet"),
-            "shard 1 file must be in SQL: {sql}"
-        );
-        assert!(
-            sql.contains("part-002.parquet"),
-            "shard 2 file must be in SQL: {sql}"
+            sql.contains(", files) EMITS ("),
+            "UDF must take the per-shard files column as its second argument: {sql}"
         );
 
-        // The two files must appear in separate spec literals (not in the same one).
-        // A spec literal is a JSON object; each file should appear in its own VALUES row.
-        // Assert that the string "part-000.parquet" and "part-001.parquet" are NOT
-        // both inside the same spec literal by checking they land in different VALUES entries.
-        // Rough check: the VALUES clause contains exactly 3 entries separated by ),(.
+        // The shard-invariant common blob must appear EXACTLY ONCE. The storage
+        // endpoint and the tuning knobs live only in the common blob, so counting
+        // them proves the credential/tuning payload is not repeated per shard.
+        assert_eq!(
+            sql.matches("http://minio:9000").count(),
+            1,
+            "storage endpoint (common blob) must appear exactly once, not per shard: {sql}"
+        );
+        assert_eq!(
+            sql.matches("memory_pool_fraction").count(),
+            1,
+            "tuning payload (common blob) must appear exactly once, not per shard: {sql}"
+        );
+
+        // Each shard's file appears EXACTLY ONCE, in its own VALUES row.
+        for file in ["part-000.parquet", "part-001.parquet", "part-002.parquet"] {
+            assert_eq!(
+                sql.matches(file).count(),
+                1,
+                "file {file} must appear exactly once (in one VALUES row): {sql}"
+            );
+        }
+
+        // Exactly 3 VALUES entries (one files literal per shard).
         let values_start = sql.find("VALUES").expect("must have VALUES");
         let group_by_start = sql.find("GROUP BY").expect("must have GROUP BY");
         let values_section = &sql[values_start..group_by_start];
-        // Count VALUES entries: each is (N,'...')
         let entry_count = values_section.matches("),(").count() + 1;
         assert_eq!(
             entry_count, 3,
@@ -3250,7 +3259,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -3382,7 +3390,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -3425,7 +3432,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -3727,11 +3733,11 @@ mod tests {
         );
     }
 
-    /// Single-shard SQL shape matches the expected SELECT * FROM (SELECT …) wrapper.
-    /// Given CLUSTER_NODES=1: the generated SQL does NOT contain IPROC/VALUES/GROUP BY
-    /// and matches the `SELECT * FROM (SELECT {udf}(...) EMITS (...))` form.
+    /// Single-shard SQL uses the two-argument form `{udf}('<common>', '<files>')`:
+    /// the common blob and the whole-file-list literal each appear exactly once, and
+    /// the SQL keeps the `SELECT * FROM (SELECT …)` wrapper with no fan-out markers.
     #[test]
-    fn single_shard_sql_matches_legacy_shape() {
+    fn single_shard_two_arg_common_and_files_once() {
         let files = vec![
             "s3://warehouse/db/events/part-00000.parquet".into(),
             "s3://warehouse/db/events/part-00001.parquet".into(),
@@ -3759,7 +3765,7 @@ mod tests {
             "single-shard SQL must not contain GROUP BY: {sql}"
         );
 
-        // Must match the legacy shape.
+        // Must keep the SELECT * FROM (SELECT …) wrapper and invoke the scan UDF.
         assert!(
             sql.starts_with("SELECT * FROM (SELECT "),
             "must start with SELECT * FROM (SELECT ...: {sql}"
@@ -3770,14 +3776,29 @@ mod tests {
             "must invoke the scan UDF: {sql}"
         );
 
-        // Must carry both files (they go into a single spec literal).
-        assert!(
-            sql.contains("part-00000.parquet"),
-            "must carry file 0: {sql}"
+        // The common blob is serialized ONCE (endpoint + tuning knob appear once each).
+        assert_eq!(
+            sql.matches("http://minio:9000").count(),
+            1,
+            "common blob (storage endpoint) must appear exactly once: {sql}"
         );
-        assert!(
-            sql.contains("part-00001.parquet"),
-            "must carry file 1: {sql}"
+        assert_eq!(
+            sql.matches("memory_pool_fraction").count(),
+            1,
+            "common blob (tuning payload) must appear exactly once: {sql}"
+        );
+
+        // Both files are carried once, together in the single files-list literal
+        // (arg 1), which is a JSON array — not repeated across per-shard rows.
+        assert_eq!(
+            sql.matches("part-00000.parquet").count(),
+            1,
+            "must carry file 0 exactly once: {sql}"
+        );
+        assert_eq!(
+            sql.matches("part-00001.parquet").count(),
+            1,
+            "must carry file 1 exactly once: {sql}"
         );
     }
 
@@ -4107,7 +4128,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4154,7 +4174,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4233,7 +4252,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4258,9 +4276,11 @@ mod tests {
         )
     }
 
-    /// Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units.
+    /// Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units,
+    /// serializing the common blob once and one files literal per shard.
     #[test]
-    fn grouped_scan_sql_groups_by_shard_key() {
+    fn grouped_fan_out_common_once_files_per_shard() {
+        // Two distinct files, forced onto two shards (2 nodes × factor 1).
         let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
         let g = shard_count(2, 1, files.len());
         let sql = build_grouped_agg_sql(
@@ -4277,23 +4297,40 @@ mod tests {
             "grouped SQL must NOT contain IPROC(): {sql}"
         );
         assert!(
-            sql.contains("GROUP BY"),
-            "grouped SQL must contain GROUP BY: {sql}"
+            sql.contains("GROUP BY shard_key"),
+            "grouped SQL inner must GROUP BY shard_key: {sql}"
         );
         assert!(
-            sql.contains("shard_key"),
-            "grouped SQL inner must use shard_key: {sql}"
+            sql.contains("AS shards(shard_key, files)"),
+            "grouped fan-out must alias the VALUES table as shards(shard_key, files): {sql}"
         );
-        assert!(
-            sql.contains("VALUES"),
-            "grouped SQL must use VALUES fan-out: {sql}"
+
+        // Common blob (credentials + tuning) serialized once, not per shard.
+        assert_eq!(
+            sql.matches("http://minio:9000").count(),
+            1,
+            "grouped common blob (endpoint) must appear exactly once: {sql}"
         );
+        assert_eq!(
+            sql.matches("memory_pool_fraction").count(),
+            1,
+            "grouped common blob (tuning payload) must appear exactly once: {sql}"
+        );
+
+        // Each shard's file appears exactly once, in its own VALUES row.
+        for file in ["f0.parquet", "f1.parquet"] {
+            assert_eq!(
+                sql.matches(file).count(),
+                1,
+                "grouped shard file {file} must appear exactly once: {sql}"
+            );
+        }
     }
 
-    /// LIMIT is NOT pushed into per-shard scan for a grouped query.
-    /// The per-shard spec JSON must not carry "limit"; the outer wrapper may have LIMIT.
+    /// LIMIT is NOT pushed into the shard scan for a grouped query. The shared common
+    /// blob (arg 0) must not carry "limit"; only the outer wrapper may apply LIMIT.
     #[test]
-    fn grouped_scan_sql_has_no_per_shard_limit() {
+    fn grouped_common_blob_has_no_limit() {
         let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
         let g = shard_count(1, 1, files.len());
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
@@ -4310,7 +4347,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4334,21 +4370,18 @@ mod tests {
             SCAN_UDF_NAME,
             None,
         );
-        // The per-shard spec JSON must NOT carry "limit" — extract the embedded JSON literal
-        // (everything between the first ' and the matching ') and verify "limit" is absent.
-        // The SQL form is: SELECT UDF('...json...') EMITS (...)  or VALUES entry.
-        // Easiest: extract the embedded spec from between single-quotes.
-        let spec_start = sql.find('\'').expect("spec literal must start with '") + 1;
-        let spec_end = sql[spec_start..]
-            .find("') EMITS")
-            .unwrap_or(sql[spec_start..].find('\'').unwrap());
-        let spec_json = &sql[spec_start..spec_start + spec_end];
+        // The shared common blob (arg 0) is built once with limit = None, so it must
+        // NOT carry a "limit" key — this is the structural LIMIT-exclusion invariant.
+        let common = common_arg_literal(&sql);
         assert!(
-            !spec_json.contains("\"limit\""),
-            "per-shard spec must NOT carry limit: {spec_json}"
+            !common.contains("\"limit\""),
+            "grouped common blob must NOT carry limit: {common}"
         );
-        // The outer SQL may contain LIMIT (that's fine — it's the outer wrapper limit).
-        // Just confirm no "limit" key in the per-shard spec JSON.
+        // The outer wrapper may still apply the final LIMIT.
+        assert!(
+            sql.contains("LIMIT 100"),
+            "outer wrapper should still apply the final LIMIT: {sql}"
+        );
     }
 
     /// Grouped aggregate wrapper SQL re-groups partial results per user group key.
@@ -4474,7 +4507,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4738,7 +4770,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4824,7 +4855,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -4926,7 +4956,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -5358,7 +5387,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -5858,7 +5886,7 @@ mod tests {
     ///
     /// Both coexist: Iceberg prunes files; DataFusion enforces row correctness.
     #[test]
-    fn pushdown_carries_filter_and_iceberg_prune() {
+    fn filter_in_common_arg() {
         use crate::adapter::iceberg_predicate::to_iceberg_predicate;
         use iceberg::spec::{NestedField, Schema, Type};
         use std::sync::Arc;
@@ -5894,7 +5922,7 @@ mod tests {
             "translatable filter must produce an Iceberg predicate"
         );
 
-        // Confirm the DataFusion string survives into the spec literal.
+        // Confirm the DataFusion string survives into the common (arg 0) blob.
         let sql = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["ID".into()],
@@ -5902,9 +5930,10 @@ mod tests {
             df_filter,
             None,
         );
+        let common = common_arg_literal(&sql);
         assert!(
-            sql.contains("42"),
-            "filter value must survive into spec literal: {sql}"
+            common.contains("\"filter\"") && common.contains("42"),
+            "filter must be pushed into the common arg: {common}"
         );
     }
 
@@ -6183,14 +6212,15 @@ mod tests {
         }
     }
 
-    /// Scenario: Catalog auth props are never placed in any scan spec.
+    /// Scenario: Catalog auth props — and the whole catalog block — are never placed
+    /// in any scan spec.
     ///
     /// The UDF-boundary secret invariant: auth lives on `ConnectionCreds` and is
     /// consumed only in the planning-layer catalog build. A `ScanSpec` (serialized
-    /// for the UDF boundary) must carry none of the auth field NAMES nor any auth
-    /// VALUE — the scan UDF never calls the catalog.
+    /// for the UDF boundary) must carry no catalog block at all, none of the auth
+    /// field NAMES, nor any auth VALUE — the scan UDF never calls the catalog.
     #[test]
-    fn scan_spec_carries_no_catalog_auth_props() {
+    fn scan_spec_carries_no_catalog_block() {
         // Distinctive sentinels: any of these surfacing in the serialized spec is a leak.
         const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_VALUE";
         const SECRET_SENTINEL: &str = "CLIENT_SECRET_SENTINEL_VALUE";
@@ -6209,7 +6239,6 @@ mod tests {
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             logical_schema: Vec::new(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -6218,6 +6247,18 @@ mod tests {
         };
 
         let json = spec.to_json();
+
+        // The dropped `catalog` block must not appear in the full spec nor the
+        // shard-invariant common blob (the scan UDF never touches the catalog).
+        assert!(
+            !json.contains("catalog"),
+            "ScanSpec JSON must not carry a catalog block: {json}"
+        );
+        assert!(
+            !spec.to_common_json().contains("catalog"),
+            "common blob must not carry a catalog block: {}",
+            spec.to_common_json()
+        );
 
         // No auth field NAMES (planning-layer concepts) in the serialized spec.
         for field in [
@@ -6795,7 +6836,6 @@ mod tests {
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
             logical_schema: Vec::new(),
             storage: vended_storage,
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -7138,7 +7178,7 @@ mod tests {
     /// tag, and nullable flag for each field. This covers: required field (nullable=false),
     /// optional field (nullable=true), and multiple Iceberg type families.
     #[test]
-    fn pushdown_spec_carries_logical_schema_field_ids() {
+    fn pushdown_carries_logical_schema_in_common_arg() {
         use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
         use std::sync::Arc;
 
@@ -7219,7 +7259,6 @@ mod tests {
             emit_exa_types: Vec::new(),
             logical_schema: logical.clone(),
             storage: sample_storage(),
-            catalog: sample_catalog(),
             df_target_partitions: 1,
             df_batch_size: 8192,
             df_threads_per_udf: 1,
@@ -7235,5 +7274,14 @@ mod tests {
         );
         assert_eq!(back.logical_schema[0], logical[0]);
         assert_eq!(back.logical_schema[3], logical[3]);
+
+        // The logical schema is a shard-invariant field, so it must be carried in the
+        // common (arg 0) blob — the scan UDF reads it identically for every shard.
+        let common_json = spec.to_common_json();
+        let common_back = crate::scan::spec::CommonScanSpec::from_json(&common_json).unwrap();
+        assert_eq!(
+            common_back.logical_schema, logical,
+            "logical_schema must be carried in the common arg"
+        );
     }
 }

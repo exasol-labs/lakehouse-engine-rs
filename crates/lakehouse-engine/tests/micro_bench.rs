@@ -41,7 +41,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use lakehouse_engine::scan::emit::coerce_batch_to_exa_types;
-use lakehouse_engine::scan::spec::{CatalogProps, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 
@@ -309,11 +309,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
             session_token: None,
             allow_http: true,
             path_style: true,
-        },
-        catalog: CatalogProps {
-            uri: "http://localhost:8181".into(),
-            warehouse: "wh".into(),
-            table: "db.lineitem".into(),
         },
         df_target_partitions: 1,
         df_batch_size: 8192,
