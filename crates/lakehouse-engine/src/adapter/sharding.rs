@@ -7,8 +7,11 @@
 ///    never skipped and land in the currently lightest shard).
 /// 3. Greedily assign each file to the shard with the smallest cumulative byte total.
 ///
-/// Returns `Vec<Vec<String>>` (paths only, no sizes). Empty input → empty `Vec`.
-pub fn partition_files_by_bytes(files: Vec<(String, u64)>, n: usize) -> Vec<Vec<String>> {
+/// Returns `Vec<Vec<(String, u64)>>` — each shard carries its `(path, size_bytes)`
+/// entries (the original input size, with 0-byte files reported as `0`; the
+/// 0→1 treatment applies only to balancing, not to the emitted size). Empty
+/// input → empty `Vec`.
+pub fn partition_files_by_bytes(files: Vec<(String, u64)>, n: usize) -> Vec<Vec<(String, u64)>> {
     if files.is_empty() {
         return vec![];
     }
@@ -23,8 +26,9 @@ pub fn partition_files_by_bytes(files: Vec<(String, u64)>, n: usize) -> Vec<Vec<
         eb.cmp(&ea)
     });
 
-    // Each entry: (file_paths, cumulative_bytes).
-    let mut shards: Vec<(Vec<String>, u64)> = (0..shard_count).map(|_| (vec![], 0u64)).collect();
+    // Each entry: (file_entries, cumulative_bytes).
+    let mut shards: Vec<(Vec<(String, u64)>, u64)> =
+        (0..shard_count).map(|_| (vec![], 0u64)).collect();
 
     for (path, size) in sorted {
         let effective_size = if size == 0 { 1 } else { size };
@@ -34,11 +38,11 @@ pub fn partition_files_by_bytes(files: Vec<(String, u64)>, n: usize) -> Vec<Vec<
             .enumerate()
             .min_by_key(|(_, (_, bytes))| *bytes)
             .expect("shards is non-empty");
-        shards[lightest_idx].0.push(path);
+        shards[lightest_idx].0.push((path, size));
         shards[lightest_idx].1 += effective_size;
     }
 
-    shards.into_iter().map(|(paths, _)| paths).collect()
+    shards.into_iter().map(|(entries, _)| entries).collect()
 }
 
 #[cfg(test)]
@@ -80,7 +84,11 @@ mod tests {
 
         let shard_bytes: Vec<u64> = shards
             .iter()
-            .map(|s| s.iter().map(|f: &String| sizes_map[f.as_str()]).sum())
+            .map(|s| {
+                s.iter()
+                    .map(|(p, _): &(String, u64)| sizes_map[p.as_str()])
+                    .sum()
+            })
             .collect();
 
         let max_bytes = *shard_bytes.iter().max().unwrap();
@@ -100,7 +108,7 @@ mod tests {
             .collect();
         let shards = partition_files_by_bytes(files.clone(), 4);
 
-        let all_files: Vec<String> = shards.iter().flatten().cloned().collect();
+        let all_files: Vec<String> = shards.iter().flatten().map(|(p, _)| p.clone()).collect();
         let unique: HashSet<&String> = all_files.iter().collect();
 
         assert_eq!(unique.len(), all_files.len(), "duplicate files in shards");
@@ -122,7 +130,7 @@ mod tests {
         ];
         let shards = partition_files_by_bytes(files.clone(), 2);
 
-        let all_files: Vec<String> = shards.iter().flatten().cloned().collect();
+        let all_files: Vec<String> = shards.iter().flatten().map(|(p, _)| p.clone()).collect();
         // All 4 files must appear.
         assert_eq!(all_files.len(), 4, "a zero-size file was dropped");
 
@@ -157,5 +165,36 @@ mod tests {
                 "each shard must contain exactly one file"
             );
         }
+    }
+
+    /// Scenario: Each shard entry carries `(path, size)` and the size matches the
+    /// original input size for that path — including a 0-byte file, whose reported
+    /// size stays `0` (the 0→1 rule affects only balancing, not the emitted size).
+    #[test]
+    fn partition_by_bytes_propagates_size_into_shards() {
+        let files: Vec<(String, u64)> = vec![
+            ("a.parquet".into(), 100),
+            ("b.parquet".into(), 200),
+            ("c.parquet".into(), 300),
+            ("zero.parquet".into(), 0),
+        ];
+        let expected: std::collections::HashMap<String, u64> = files.iter().cloned().collect();
+
+        let shards = partition_files_by_bytes(files, 2);
+
+        let mut seen: HashSet<String> = HashSet::new();
+        for shard in &shards {
+            for (path, size) in shard {
+                assert_eq!(
+                    *size, expected[path],
+                    "size for {path} does not match the input size"
+                );
+                assert!(
+                    seen.insert(path.clone()),
+                    "duplicate path {path} across shards"
+                );
+            }
+        }
+        assert_eq!(seen.len(), expected.len(), "not all files covered");
     }
 }

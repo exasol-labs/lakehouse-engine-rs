@@ -140,6 +140,15 @@ pub struct LogicalField {
 /// any error message produced by `from_json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommonScanSpec {
+    /// The Iceberg table's root location (`table.metadata().location()`), used
+    /// to reconstruct absolute file paths from per-shard relative paths.
+    ///
+    /// An empty string (the default) means every per-shard file path is already
+    /// absolute — either a legacy payload that predates this field, or a file
+    /// that does not live under the table root.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub table_root: String,
+
     /// Projected columns in order. Empty means "all columns" (no projection push).
     pub projection: Vec<String>,
 
@@ -210,8 +219,14 @@ impl CommonScanSpec {
     /// credentials).
     pub fn from_json(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| {
-            // Do not echo `s` — it contains credentials.
-            format!("scan common spec deserialization failed: {e}")
+            // Do not echo `s` — it contains credentials. Build the message from the
+            // serde error's structural fields only; its Display can quote the input.
+            format!(
+                "scan common spec deserialization failed ({:?} at line {}, column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            )
         })
     }
 }
@@ -219,9 +234,21 @@ impl CommonScanSpec {
 /// The scan specification passed from the adapter to the scan SET UDF.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanSpec {
-    /// Explicit list of Parquet file URIs (S3 or s3a) assigned to this scan.
-    /// The scan UDF registers ONLY these files — no catalog discovery.
-    pub files: Vec<String>,
+    /// The Iceberg table's root location (`table.metadata().location()`), used
+    /// to reconstruct absolute file paths from per-shard relative paths.
+    ///
+    /// An empty string (the default) means every entry in `files` is already
+    /// absolute — either a legacy payload that predates this field, or a file
+    /// that does not live under the table root.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub table_root: String,
+
+    /// Explicit list of assigned Parquet files as `(path, byte_size)` pairs.
+    /// `path` is relative to `table_root` when non-empty and the file lives
+    /// under it, otherwise an absolute URI (S3 or s3a). The scan UDF registers
+    /// ONLY these files — no catalog discovery — and uses `byte_size` to build
+    /// each file's `ObjectMeta` without an object-store HEAD.
+    pub files: Vec<(String, u64)>,
 
     /// Projected columns in order. Empty means "all columns" (no projection push).
     pub projection: Vec<String>,
@@ -333,12 +360,18 @@ fn default_instance_overhead_mb() -> u64 {
     200
 }
 
+/// Built-in fallback connection-concurrency budget: used both as the serde
+/// default for [`CommonScanSpec::s3_max_connections`] / [`ScanSpec::s3_max_connections`]
+/// when the field is absent from JSON, and by the adapter's AUTO derivation
+/// (`resolve_s3_max_connections`) when `nr_of_cores` is `0` (unknown). Defined
+/// here rather than in `adapter` so `scan::spec` — the lower-level module the
+/// adapter already depends on — has no reverse dependency on `adapter`.
+pub(crate) const DEFAULT_S3_MAX_CONNECTIONS: usize = 16;
+
 /// Conservative built-in default for [`CommonScanSpec::s3_max_connections`] /
 /// [`ScanSpec::s3_max_connections`] when the field is absent from JSON.
-/// Shares the same value as the adapter's AUTO-fallback default so "the
-/// default budget" is one number across the round-trip.
 fn default_s3_max_connections() -> usize {
-    crate::adapter::DEFAULT_S3_MAX_CONNECTIONS
+    DEFAULT_S3_MAX_CONNECTIONS
 }
 
 impl ScanSpec {
@@ -352,14 +385,21 @@ impl ScanSpec {
     /// Returns an error that does NOT include any credential values.
     pub fn from_json(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| {
-            // Do not echo `s` — it contains credentials.
-            format!("scan spec deserialization failed: {e}")
+            // Do not echo `s` — it contains credentials. Build the message from the
+            // serde error's structural fields only; its Display can quote the input.
+            format!(
+                "scan spec deserialization failed ({:?} at line {}, column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            )
         })
     }
 
     /// Extract the shard-invariant portion of this spec (everything except `files`).
     pub fn to_common(&self) -> CommonScanSpec {
         CommonScanSpec {
+            table_root: self.table_root.clone(),
             projection: self.projection.clone(),
             filter: self.filter.clone(),
             limit: self.limit,
@@ -387,8 +427,9 @@ impl ScanSpec {
     /// Reconstitute a full `ScanSpec` from a shard-invariant common spec and a
     /// per-shard files list. This is the SOLE way to reattach `files`, which makes
     /// `files` the only per-shard field by construction.
-    pub fn from_parts(common: CommonScanSpec, files: Vec<String>) -> Self {
+    pub fn from_parts(common: CommonScanSpec, files: Vec<(String, u64)>) -> Self {
         Self {
+            table_root: common.table_root,
             files,
             projection: common.projection,
             filter: common.filter,
@@ -418,18 +459,26 @@ impl ScanSpec {
     }
 
     /// Serialize a per-shard files list to the JSON array carried in the UDF's
-    /// second argument. Paired with `files_from_json`.
-    pub fn files_json(files: &[String]) -> String {
+    /// second argument. Each entry is a compact `[path, size]` 2-tuple. Paired
+    /// with `files_from_json`.
+    pub fn files_json(files: &[(String, u64)]) -> String {
         serde_json::to_string(files).expect("files list serialization is infallible")
     }
 
     /// Deserialize a per-shard files list from the UDF's second argument.
     ///
     /// Returns an error that does NOT include the raw input.
-    pub fn files_from_json(s: &str) -> Result<Vec<String>, String> {
+    pub fn files_from_json(s: &str) -> Result<Vec<(String, u64)>, String> {
         serde_json::from_str(s).map_err(|e| {
-            // Do not echo `s`.
-            format!("scan files deserialization failed: {e}")
+            // Do not echo `s`. A data error (e.g. a bare-string entry where a
+            // [path, size] tuple is expected) can quote the input in `e`'s Display,
+            // so build the message from structural fields only.
+            format!(
+                "scan files deserialization failed ({:?} at line {}, column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            )
         })
     }
 }
@@ -440,9 +489,10 @@ mod tests {
 
     fn sample_spec() -> ScanSpec {
         ScanSpec {
+            table_root: "s3://warehouse/db/table".into(),
             files: vec![
-                "s3://warehouse/db/table/data/part-00000.parquet".into(),
-                "s3://warehouse/db/table/data/part-00001.parquet".into(),
+                ("data/part-00000.parquet".into(), 1024),
+                ("data/part-00001.parquet".into(), 2048),
             ],
             projection: vec!["id".into(), "name".into()],
             filter: Some("(\"ID\" > 10)".into()),
@@ -481,9 +531,25 @@ mod tests {
         // The JSON must be valid UTF-8 string (Value::String is a Rust String).
         let _value_string: String = json.clone(); // satisfies Value::String ownership model.
 
+        // The wire form is a compact array of `[path, size]` 2-tuples.
+        assert!(
+            json.contains(
+                r#""files":[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#
+            ),
+            "files must serialize as compact [path,size] 2-tuples: {json}"
+        );
+
         // Deserialize back: must equal original.
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(back.files.len(), 2);
+        assert_eq!(
+            back.files,
+            vec![
+                ("data/part-00000.parquet".to_string(), 1024),
+                ("data/part-00001.parquet".to_string(), 2048),
+            ]
+        );
+        assert_eq!(back.table_root, "s3://warehouse/db/table");
         assert_eq!(back.projection, vec!["id", "name"]);
         assert_eq!(back.filter.as_deref(), Some("(\"ID\" > 10)"));
         assert_eq!(back.limit, Some(100));
@@ -555,7 +621,7 @@ mod tests {
 
         // Legacy payload without the field deserializes to an empty Vec.
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -746,7 +812,7 @@ mod tests {
 
         // A legacy payload without the field deserializes to an empty Vec.
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -798,7 +864,7 @@ mod tests {
 
         // 3. A legacy payload without these fields deserializes with both defaulting to 1.
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -843,7 +909,7 @@ mod tests {
 
         // 3. A legacy payload without df_batch_size deserializes to 8192.
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -883,7 +949,7 @@ mod tests {
 
         // 2. Legacy payload without these fields → defaults 0.6 / 200.
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -929,8 +995,9 @@ mod tests {
         );
 
         // 3. A legacy payload without the field deserializes to the built-in default.
+        // `files` uses the current compact [path, size] 2-tuple wire form (ADR-053).
         let legacy_json = r#"{
-            "files": ["s3://w/f0.parquet"],
+            "files": [["s3://w/f0.parquet", 123]],
             "projection": [],
             "storage": {
                 "endpoint": "http://minio:9000",
@@ -980,10 +1047,12 @@ mod tests {
         );
     }
 
-    /// Task 1.3(a): the common blob serializes WITHOUT `files`, and reconstituting
-    /// via `from_parts` (through JSON) yields a spec equal to the pre-split spec.
+    /// Task 1.3(a): the common blob serializes WITHOUT `files` but WITH
+    /// `table_root` (carried once, shard-invariant); the per-shard files list
+    /// serializes as compact `[path, size]` 2-tuples; and reconstituting via
+    /// `from_parts` (through JSON) yields a spec equal to the pre-split spec.
     #[test]
-    fn from_parts_reconstitutes_equal_spec() {
+    fn from_parts_reconstitutes_files_tuples_and_table_root() {
         let original = sample_spec();
 
         // Split into the shard-invariant common blob + the per-shard files list.
@@ -995,19 +1064,40 @@ mod tests {
             !common_json.contains("\"files\""),
             "common blob must not contain a files key: {common_json}"
         );
-        // Nor may any file URI value leak into the common blob.
+        // Nor may any file path value leak into the common blob.
         assert!(
             !common_json.contains("part-00000.parquet"),
-            "common blob must not carry any file URI: {common_json}"
+            "common blob must not carry any file path: {common_json}"
+        );
+        // The common blob DOES carry table_root, once.
+        assert!(
+            common_json.contains(r#""table_root":"s3://warehouse/db/table""#),
+            "common blob must carry table_root: {common_json}"
+        );
+
+        // The per-shard files list is a compact array of [path, size] 2-tuples.
+        assert_eq!(
+            files_json,
+            r#"[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#
         );
 
         // The common blob round-trips on its own.
         let common_back = CommonScanSpec::from_json(&common_json).unwrap();
         assert_eq!(common_back, original.to_common());
+        assert_eq!(common_back.table_root, "s3://warehouse/db/table");
 
-        // from_parts_json reconstitutes a spec equal to the pre-split original.
+        // from_parts_json reconstitutes a spec equal to the pre-split original,
+        // with table_root reattached from the common blob and files as tuples.
         let reconstituted = ScanSpec::from_parts_json(&common_json, &files_json).unwrap();
         assert_eq!(reconstituted, original);
+        assert_eq!(reconstituted.table_root, "s3://warehouse/db/table");
+        assert_eq!(
+            reconstituted.files,
+            vec![
+                ("data/part-00000.parquet".to_string(), 1024),
+                ("data/part-00001.parquet".to_string(), 2048),
+            ]
+        );
 
         // The struct-level from_parts is equivalent to the JSON round-trip.
         let via_struct = ScanSpec::from_parts(original.to_common(), original.files.clone());
@@ -1045,6 +1135,80 @@ mod tests {
         let combined = ScanSpec::from_parts_json(garbled_common, "[]").unwrap_err();
         assert!(!combined.contains("SECRET"));
         assert!(!combined.contains("TOPSECRET"));
+    }
+
+    /// Task 1.3(d): `table_root` round-trips through JSON, and a legacy payload
+    /// that predates the field (no `table_root` key) deserializes with it
+    /// defaulting to the empty string — the documented "treat every path as
+    /// absolute" case.
+    #[test]
+    fn legacy_empty_root_treats_paths_as_absolute() {
+        // Explicit table_root survives serialize -> deserialize on both spec kinds.
+        let spec = sample_spec();
+        assert_eq!(spec.table_root, "s3://warehouse/db/table");
+        let json = spec.to_json();
+        assert!(
+            json.contains(r#""table_root":"s3://warehouse/db/table""#),
+            "non-empty table_root must appear in JSON: {json}"
+        );
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(back.table_root, "s3://warehouse/db/table");
+
+        let common = spec.to_common();
+        let common_json = common.to_json();
+        assert!(
+            common_json.contains(r#""table_root":"s3://warehouse/db/table""#),
+            "non-empty table_root must appear in the common blob: {common_json}"
+        );
+
+        // An empty table_root is omitted from serialized JSON (skip_serializing_if).
+        let mut rootless = sample_spec();
+        rootless.table_root = String::new();
+        let rootless_json = rootless.to_json();
+        assert!(
+            !rootless_json.contains("table_root"),
+            "empty table_root must be absent from JSON: {rootless_json}"
+        );
+
+        // A legacy full-spec payload without table_root deserializes to empty
+        // (all file paths in `files` are then absolute, per field semantics).
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.table_root, "",
+            "missing table_root must default to empty (backward-compat; paths are absolute)"
+        );
+        assert_eq!(legacy.files, vec![("s3://w/f0.parquet".to_string(), 100)]);
+
+        // Same for the common blob in isolation.
+        let legacy_common_json = r#"{
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
+        assert_eq!(
+            legacy_common.table_root, "",
+            "missing table_root must default to empty on the common blob (backward-compat)"
+        );
+
+        // from_parts reattaches the empty table_root onto the reconstituted spec.
+        let reconstituted =
+            ScanSpec::from_parts(legacy_common, vec![("s3://w/f0.parquet".to_string(), 100)]);
+        assert_eq!(reconstituted.table_root, "");
     }
 
     /// Task 1.3(c): `catalog` no longer appears in any serialized JSON.

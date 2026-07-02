@@ -126,8 +126,12 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
 }
 
 fn scan_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: None,
         limit: None,

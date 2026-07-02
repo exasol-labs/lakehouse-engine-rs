@@ -15,6 +15,7 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::{handle_pushdown, list_namespace_tables, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
+use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageProps;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
@@ -110,11 +111,6 @@ const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 /// an OS thread, the connection budget can be a small multiple of the thread budget rather than
 /// a 1:1 mirror. `4` keeps enough requests in flight to hide S3 latency while staying bounded.
 const S3_CONNECTIONS_PER_THREAD: usize = 4;
-/// Built-in fallback connection-concurrency budget used when `nr_of_cores` is `0` (unknown), so
-/// the AUTO derivation cannot size from node capacity. A conservative fixed value in the native
-/// importer's low-double-digit `MaxConnections` range — enough concurrency to keep the fetch
-/// path from serializing, without unbounded pooling on an unsized node.
-pub(crate) const DEFAULT_S3_MAX_CONNECTIONS: usize = 16;
 // adapterNotes key for the Exasol-name → Iceberg-identifier map persisted at create time.
 const NOTE_TABLE_MAP: &str = "TABLE_MAP";
 
