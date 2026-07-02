@@ -55,6 +55,67 @@ GitHub issues: https://github.com/exasol-labs/lakehouse-engine-rs/issues/47 (thi
 - **ADR note:** Codifies the project rule — new benchmark evidence that is confounded by an in-flight fix is incorporated as rationale + a named post-fix re-gate task + evidence-gated deferred-work docs, never as immediate scope expansion, until the confound is isolated.
 - **Promotes to ADR:** yes
 
+## Validation addendum (2026-07-02): sweep methodology, hypothesis verdict, re-gate outcome
+
+Live validation of Tasks 3.1 (sweep) and 3.2 (180M re-gate) against benchmark cluster **test1**
+(2-node Exasol, AWS Glue `eu-west-1`, SLC lc-rs **0.20.1**, `NR_OF_CORES=8`, 60-file / 179,998,372-row
+`lineitem` = 5.398 GB Parquet). Raw logs under `bench/reports/` and the run's scratch outputs.
+
+### Lever-1 premise confirmed: `CLUSTER_NODES` now real
+
+Post-0.20.1, `adapterNotes` reports **`CLUSTER_NODES=2`** (was the buggy `1`). At the default
+`PARALLELISM_FACTOR=8` this makes `G = 2 × 8 = 16` shards (was `1 × 8 = 8`). This single fix cut Q4
+(full-`lineitem` scan) from **28.5 s → 20.5 s** with no knob change. (Also surfaced and fixed a stale
+`bench/run.sh` DDL bug: the scan SET SCRIPT was still declared single-arg `(spec …)` while the
+current adapter emits the two-arg `(common, files)` pushdown — corrected to match `e2e_scan_test.rs`.)
+
+### Methodology
+
+`bench/sweep.sh` extended to drive `PARALLELISM_FACTOR` + `DATAFUSION_THREADING_MODE` +
+`S3_MAX_CONNECTIONS` per config row; `bench/run.sh` `.env` sourcing fixed so caller-exported
+`BENCH_*` overrides win over `.env` defaults (previously `.env`'s `BENCH_PARALLELISM_FACTOR=8`
+silently clobbered the sweep's `PARALLELISM_FACTOR=1` — first sweep pass was invalid; re-run after
+fix). Each config verified against the resolved `adapterNotes` before trusting its timings. Native
+ceiling via `bench/import_ceiling.sh`.
+
+### Hypothesis verdict — all three levers refuted
+
+| Lever | Config | Result | Verdict |
+|---|---|---|---|
+| 1 — #shards = #nodes | `PARALLELISM_FACTOR=1` → `G=2` | Q4 63.7 s vs. 20.5 s at `G=16` (**3.1× slower**); Q2/Q3 ~2× slower | **Refuted** |
+| 2 — one AUTO instance/node | `PARALLELISM_FACTOR=1` + AUTO (8 threads/8 parts) | same losing shape; intra-instance threading ≠ inter-instance sharding | **Refuted** |
+| 3 — max S3 connections | sweep 4→128 at both shard shapes | Q4 varied **< 2 %** (`PF=8`: 20.1–20.4 s; `PF=1`: 63.7–64.4 s) | **Refuted** |
+
+**Best config = the shipped default** (`PARALLELISM_FACTOR=8`, `G=16`, threading AUTO/FIXED,
+`S3_MAX_CONNECTIONS` AUTO). No swept knob beat it. The genuine improvement was the 0.20.1
+`CLUSTER_NODES` correctness fix, not any new tuning value. `S3_MAX_CONNECTIONS` is correctly wired
+(end-to-end verified via `adapterNotes`) but is not the throughput limiter on this deployment — the
+S3 read is network-distance bound (~0.176 GB/s native ceiling; the ~1 GB/s mission target is a
+deployment/co-location property, not reachable here). No aggregate-query regression: Q1–Q4 at the
+winning `PF=8` shape are all ≤ their prior times.
+
+### Task 3.2 re-gate outcome — emit gap persists, but is NOT under-sharding
+
+The exact 60-file / 180M-row materialization could **not** be reproduced: the shared cluster's
+**10 GiB raw-size license** is exceeded by a single 180M-row `lineitem` table (≈ 24 GiB raw), so any
+full materialization is rejected. Re-measured at reduced scale (≈ 30–33 M rows, same files, corrected
+`CLUSTER_NODES=2`): native `IMPORT INTO` **2.07 M rows/s** vs. VS `CREATE TABLE AS SELECT *`
+**1.19 M rows/s** = **~1.74×** (pre-fix full-scale was ~1.88×). The VS full-emit throughput
+(1.19 M rows/s) is *identical* to the pre-fix full-scale run — **doubling `G` (8→16) did not move it**,
+so the emit gap is bottlenecked downstream of sharding. Confound from Design Decision [5] is resolved:
+the 1.9× gap was **not** primarily under-sharding.
+
+### Emit-path optimization decision — NOT pursued (evidence-gated, per ADR-055)
+
+Column-isolation on the real workload (33 M rows, 4 columns per class): Int64→`Decimal128(20,0)`
+coercion **4.63 M rows/s** vs. zero-copy `Decimal128(15,2)` **5.89 M rows/s** vs. `Utf8`
+**6.82 M rows/s**. The coercion is the slowest class but only **~1.27×** slower — contributing
+~5–6 % of full-emit time (eliminating it moves the native gap only ~1.74× → ~1.65×), nowhere near the
+synthetic micro-bench's 50–200×. The gap is dominated by general per-row Arrow→`Value` conversion and
+synchronous `MT_EMIT` round-trips. **No emit-path code was written** — the micro-bench figure does not
+reproduce as a real-workload bottleneck; the deferred item is downgraded to "revisit only if a future
+profile isolates a coercion-dominated workload" rather than an actionable optimization.
+
 ## Review Findings
 
 <!-- Populated by speq-implement after code review. -->

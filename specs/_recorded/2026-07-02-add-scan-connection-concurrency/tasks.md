@@ -17,6 +17,6 @@
 - [x] 2.8 Docs: docs/tuning.md new knob, docs/performance.md native-IMPORT parity goal + pre-0.20.1 node-count caveat
 
 ## Phase 3: Verification (Group E)
-- [ ] 3.1 Benchmark sweep.sh: few-big-shards + high S3_MAX_CONNECTIONS row vs native IMPORT (validation, not spec)
-- [ ] 3.2 Re-gate 180M-row full-emit gap after Task 2.1 lands (validation, not spec)
+- [x] 3.1 Benchmark sweep.sh: few-big-shards + high S3_MAX_CONNECTIONS row vs native IMPORT (validation, not spec) — hypothesis refuted; see decision-log validation addendum
+- [x] 3.2 Re-gate 180M-row full-emit gap after Task 2.1 lands (validation, not spec) — gap persists ~1.74x but NOT under-sharding; emit-path opt not pursued
 - [x] 3.3 Gate: cargo test, cargo clippy --all-targets, cargo fmt
