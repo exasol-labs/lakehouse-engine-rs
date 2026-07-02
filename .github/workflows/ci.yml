@@ -35,6 +35,14 @@ jobs:
     name: Build (warm cache)
     runs-on: ubuntu-latest
     steps:
+      # ubuntu-latest ships only ~21 GB free on /; a cached target/ restore plus
+      # a full debug `--all-targets` build of the DataFusion/Arrow/AWS/Iceberg
+      # tree can fill it, and ld then dies with SIGBUS (signal 7) when it can't
+      # extend an mmap'd object/output file. Reclaim ~12 GB of preinstalled SDKs
+      # we never use before building.
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
       - uses: actions/checkout@v4
 
       - name: Install Rust 1.92
