@@ -905,6 +905,78 @@ fn multi_shard_row_query_matches_single_shard() {
     }
 }
 
+/// A multi-file scan through the VS returns correct rows end-to-end with the
+/// reshaped `(path, size)` + `table_root` payload: the adapter resolves the file
+/// list once, byte-balances it into shards carrying `(relative-or-absolute path,
+/// byte-size)` entries under a table root serialized once in the common blob, and
+/// each fanned-out UDF reconstructs the absolute URIs and registers ONLY its
+/// assigned files. Proving every file across every shard is scanned exactly once
+/// (no gaps, no duplicates) with fully correct column values exercises the new
+/// payload through the real fan-out.
+///
+/// The generated fan-out SQL shape — table root carried ONCE in the common
+/// literal and per-shard `[[path, size], ...]` literals — is asserted host-side
+/// (no DB) by the pushdown unit test
+/// `fan_out_carries_root_once_and_path_size_tuples_per_shard`.
+#[test]
+fn scan_registers_assigned_files_with_path_size_payload() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Full projection over the whole (multi-file) table. Seeded rows: id 1..20,
+    // name carries the zero-padded id, score = 5.0 * id.
+    let sql = format!("SELECT id, name, score FROM {} ORDER BY id", vs_table());
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (id, name, score): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "multi-file fan-out must return all 20 rows with no gaps/duplicates: got {}",
+        cols[0].len()
+    );
+
+    let ids: Vec<i64> = cols[0]
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or_else(|| panic!("id is not an integer: {v:?}"))
+        })
+        .collect();
+
+    for (pos, &id) in ids.iter().enumerate() {
+        let expected = (pos + 1) as i64;
+        assert_eq!(
+            id, expected,
+            "id at position {pos} must be {expected}, got {id} (a file was missed or double-scanned)"
+        );
+
+        // score = 5.0 * id — proves the data (not just the row count) is correct
+        // for the file this row came from.
+        let score = cols[2][pos]
+            .as_f64()
+            .unwrap_or_else(|| panic!("score not f64: {:?}", cols[2][pos]));
+        assert!(
+            (score - 5.0 * expected as f64).abs() < 1e-9,
+            "score for id {expected} must be {}, got {score}",
+            5.0 * expected as f64
+        );
+
+        // name carries the zero-padded id.
+        let name = cols[1][pos]
+            .as_str()
+            .unwrap_or_else(|| panic!("name not string: {:?}", cols[1][pos]));
+        assert!(
+            name.contains(&format!("{expected:02}")),
+            "name '{name}' does not carry expected id {expected}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 5 — GROUP BY E2E tests
 //
