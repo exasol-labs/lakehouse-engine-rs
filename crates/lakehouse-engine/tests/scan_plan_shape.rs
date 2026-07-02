@@ -17,7 +17,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::scan::spec::{CatalogProps, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 
@@ -64,11 +64,6 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
             session_token: None,
             allow_http: true,
             path_style: true,
-        },
-        catalog: CatalogProps {
-            uri: "http://localhost:8181".into(),
-            warehouse: "wh".into(),
-            table: "db.tbl".into(),
         },
         df_target_partitions: 1,
         df_batch_size: 8192,

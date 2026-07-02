@@ -157,8 +157,10 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
+    // Scan SET script input: two VARCHAR columns — arg0 is the common ScanSpec
+    // blob, arg1 is the per-shard files JSON list (mirrors e2e_scan_test.rs).
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(spec VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#

@@ -22,7 +22,7 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
-use lakehouse_engine::scan::spec::{CatalogProps, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -143,11 +143,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
             session_token: None,
             allow_http: true,
             path_style: true,
-        },
-        catalog: CatalogProps {
-            uri: "http://localhost:8181".into(),
-            warehouse: "wh".into(),
-            table: "db.tbl".into(),
         },
         df_target_partitions: 1,
         df_batch_size: 64,
