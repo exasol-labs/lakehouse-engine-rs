@@ -216,6 +216,75 @@ native; only the *full raw-emit* path trails native's bulk loader (~1.74×, see 
 
 Reproduce: `bench/sweep.sh` (shard/connection sweep) + `bench/import_ceiling.sh` (native ceiling).
 
+### Emit-path batch-size & connection sweep (2026-07-02, post-0.20.1)
+
+The `S3_MAX_CONNECTIONS` sweep above tested the *aggregate* Q4 (few rows over the wire). This
+pass isolates the two remaining untested emit-path levers on the **raw full-emit** workload — the
+same reduced-scale `CREATE TABLE AS SELECT *` filtered to `L_ORDERKEY < 33007128` (33,006,459
+rows, same 60 files, `CLUSTER_NODES=2`, `PARALLELISM_FACTOR=8` ⇒ `G=16`, threading AUTO) that the
+re-gate above used, against the same native `IMPORT INTO` ceiling of **2.07 M rows/s** (best of 2
+passes per config; VS reset + `FLUSH STATISTICS` between runs for the 10 GiB license).
+
+**Lever A — `DATAFUSION_BATCH_SIZE` (raw-emit round-trip count).** The emit loop
+(`scan/emit.rs::emit_stream`) fetches one DataFusion `RecordBatch`, calls `ctx.emit_batch` once,
+drops it, and fetches the next — so batch size sets the rows per `MT_EMIT` and therefore the
+round-trip count (≈ 4,030 round-trips cluster-wide at 8192, ≈ 252 at 131072, a **16× reduction**).
+
+| `DATAFUSION_BATCH_SIZE` | round-trips (approx) | VS raw-emit rows/s | gap vs native |
+|---|---|---|---|
+| **8192 (default)** | ~4,030 | 1,222,009 | 1.70× |
+| 32768 | ~1,007 | 1,278,824 | 1.62× |
+| **65536 (best)** | ~504 | 1,306,669 | 1.59× |
+| 131072 | ~252 | 1,272,416 | 1.63× |
+
+⇒ **Round-trip count is a minor cost, not the bottleneck.** A 16× reduction in `MT_EMIT`
+round-trips bought only **~7 %** throughput (1.22 M → 1.31 M rows/s), plateauing at 32k–65k and
+falling back slightly at 131k. The gap stays **~1.6×**; larger batches do **not** close it. This
+directly **refines the earlier attribution** — the residual emit gap is *not* dominated by the
+`MT_EMIT` round-trip **count** (if it were, 16× fewer would have moved it far more than 7 %). What
+scales with the workload is the **per-row cost**: Arrow→`Value` row materialization plus the
+DB-side ingest of each emitted row, both proportional to row count regardless of how rows are
+batched. The synchronous send/ack **per-round-trip latency** is real but its aggregate is small
+because the count is already low relative to 33 M rows.
+
+**Lever B — `S3_MAX_CONNECTIONS` on the raw-emit path.** Prior work refuted this knob on Q4
+(aggregate). Re-tested here specifically on the raw-emit path (30 M+ rows streamed via `MT_EMIT`),
+in case a wider fetch pipeline keeps more decoded batches ready to emit and hides emit-wait, at the
+winning `DATAFUSION_BATCH_SIZE=65536`:
+
+| `S3_MAX_CONNECTIONS` | VS raw-emit rows/s | gap vs native |
+|---|---|---|
+| AUTO (resolved 4) | 1,309,261 | 1.58× |
+| 8 | 1,310,820 | 1.58× |
+| 32 | 1,297,934 | 1.60× |
+| 64 | 1,311,341 | 1.58× |
+| 128 | 1,315,522 | 1.58× |
+
+⇒ **Refuted on the emit path too** — a **~1.4 %** spread across AUTO→128, gap fixed at ~1.58×. The
+emit path is no more fetch-concurrency-bound than the aggregate path was; the wider pipeline does
+not hide emit-wait here.
+
+**Aggregate-path regression check** (Q1–Q4, `DATAFUSION_BATCH_SIZE` 8192 vs. 65536): 65536 is **not
+a regression** — Q1 1.94→1.96 s (flat), Q2 18.53→17.03 s (−8 %), Q3 15.75→15.30 s (−3 %), Q4
+20.35→18.71 s (−8 %). Larger batches marginally help the aggregate/join path (fewer per-batch
+overheads), and every timing stays within the prior sweep's recorded ranges.
+
+**Verdict:** neither round-trip count (batch size) nor S3 fetch concurrency moves the ~1.6× raw-emit
+gap. Combined with the earlier findings that doubling `G` (8→16) did nothing and the Int64→Decimal
+coercion is only ~1.27× (~5–6 % of emit time), the residual gap is an **architectural floor**: the
+VS materializes each row (Arrow→`Value`) and streams it through the UDF emit protocol for the DB to
+ingest row-wise, whereas native `IMPORT INTO` uses Exasol's own bulk Parquet loader writing directly
+into columnar storage — bypassing UDF row-materialization and the emit protocol entirely. No tunable
+knob crosses that boundary. Per the evidence-gated convention (ADR-055), **no shipped-crate change
+was made**: `DATAFUSION_BATCH_SIZE=65536` is documented as an operator tuning hint for emit-bound /
+wide `SELECT *` workloads (~7 % emit gain, no aggregate regression, memory-safe on an 8-core /
+4 GiB-per-instance node), but the shipped default stays **8192** (matches DataFusion's own default;
+keeps the per-batch decode working set — and out-of-pool RSS — small for memory-constrained
+deployments, where the ~7 % is not worth an 8× larger in-flight batch).
+
+Reproduce: `bench/batch_size_sweep.sh` (batch-size emit sweep) + `bench/emit_s3conn_sweep.sh`
+(connections on the emit path) + `bench/batch_size_aggcheck.sh` (Q1–Q4 regression check).
+
 Future engine work (deferred, evidence-gated):
 
 - **I/O-aware `AUTO` threading** — `AUTO` stays the safe CPU/memory-bound default; a future
@@ -231,8 +300,11 @@ Future engine work (deferred, evidence-gated):
   zero-copy `Decimal128(15,2)` columns and **6.82 M rows/s** for four `Utf8` columns — the
   coercion is the slowest column class but only **~1.27×** slower, contributing **~5–6 %** of
   the full 16-column emit time. Eliminating it would move the native-vs-VS full-emit gap only
-  from ~1.74× to ~1.65×. The gap is dominated by general per-row Arrow→`Value` conversion and the
-  synchronous `MT_EMIT` request/reply round-trips, **not** the Int64 coercion. Per the project's
-  evidence-gated convention (ADR-055), no emit-path coercion code was written — the micro-bench
-  figure is not a real-workload bottleneck. Revisit only if a future profile isolates a workload
-  where the coercion dominates.
+  from ~1.74× to ~1.65×. The gap is dominated by general per-row Arrow→`Value` conversion, **not**
+  the Int64 coercion. Per the project's evidence-gated convention (ADR-055), no emit-path coercion
+  code was written — the micro-bench figure is not a real-workload bottleneck. Revisit only if a
+  future profile isolates a workload where the coercion dominates.
+  (**Refinement, 2026-07-02:** the `DATAFUSION_BATCH_SIZE` sweep above shows the `MT_EMIT`
+  round-trip *count* is **not** a co-dominant factor — a 16× reduction in round-trips moved
+  throughput only ~7 %. The dominant residual cost is per-*row* work (Arrow→`Value` materialization
+  + DB-side row ingest), which scales with row count independent of batching.)
