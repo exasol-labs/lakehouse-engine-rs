@@ -1,13 +1,13 @@
-/// Scan specification that crosses the UDF argument boundary.
-///
-/// The adapter serializes this to a single JSON string passed as one VARCHAR
-/// argument to the scan SET UDF. The scan UDF deserializes it from the input
-/// `Value::String` via `ctx.get(0)`.
-///
-/// # ponytail: single-JSON-arg design — one VARCHAR column carries the whole spec.
-/// Split into typed columns only if a size limit bites.
-///
-/// Credentials (`access_key`, `secret_key`) MUST NEVER appear in any error message.
+//! Scan specification types that cross the UDF argument boundary.
+//!
+//! The adapter splits the spec across TWO VARCHAR UDF arguments: the
+//! shard-invariant [`CommonScanSpec`] serialized ONCE per fan-out (argument 0)
+//! and the per-shard files JSON array (argument 1). The scan UDF reads both via
+//! `ctx.get_string(0)` / `ctx.get_string(1)` and reconstitutes a [`ScanSpec`]
+//! through [`ScanSpec::from_parts_json`]. Because [`CommonScanSpec`] has no
+//! `files` field, "files is the only per-shard field" is a type-level guarantee.
+//!
+//! Credentials (`access_key`, `secret_key`) MUST NEVER appear in any error message.
 use serde::{Deserialize, Serialize};
 
 /// The kind of aggregate function to compute node-locally as a partial result.
@@ -50,7 +50,7 @@ pub struct AggregatePlan {
 
 /// Storage connection properties (S3-compatible / MinIO).
 /// Fields are plain Strings so serde handles them uniformly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageProps {
     pub endpoint: String,
     pub region: String,
@@ -125,8 +125,94 @@ pub struct LogicalField {
     pub nullable: bool,
 }
 
+/// The shard-INVARIANT portion of a scan specification.
+///
+/// Holds every field the scan UDF reads that is identical across all shards of a
+/// single query fan-out — i.e. everything EXCEPT the per-shard `files` list (and
+/// excluding the adapter-side-only `catalog`). The adapter serializes this ONCE
+/// as the first UDF argument; only the per-shard files list varies per invocation.
+///
+/// Because this struct structurally has no `files` field, "files is the only
+/// per-shard field" is a type-level guarantee: the common blob can never carry a
+/// stray `files` value.
+///
+/// Credentials (`storage.access_key`, `storage.secret_key`) MUST NEVER appear in
+/// any error message produced by `from_json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommonScanSpec {
+    /// Projected columns in order. Empty means "all columns" (no projection push).
+    pub projection: Vec<String>,
+
+    /// DataFusion SQL WHERE predicate fragment, already translated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+
+    /// Row limit. None means no LIMIT pushdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+
+    /// Ordered list of aggregate functions to compute as node-local partial results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregates: Option<Vec<AggregatePlan>>,
+
+    /// Rendered DataFusion SQL fragments for each GROUP BY key, in order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_keys: Option<Vec<String>>,
+
+    /// Declared Exasol EMITS type string for each output column.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emit_exa_types: Vec<String>,
+
+    /// Full logical schema of the Iceberg table at query time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logical_schema: Vec<LogicalField>,
+
+    pub storage: StorageProps,
+
+    /// DataFusion `target_partitions` for this scan instance.
+    #[serde(default = "default_one_usize")]
+    pub df_target_partitions: usize,
+
+    /// DataFusion `batch_size` (rows per Arrow RecordBatch) for this scan instance.
+    #[serde(default = "default_batch_size")]
+    pub df_batch_size: usize,
+
+    /// Number of Tokio worker threads for the scan runtime.
+    #[serde(default = "default_one_usize")]
+    pub df_threads_per_udf: usize,
+
+    /// Fraction of the net per-instance budget given to the DataFusion memory pool.
+    #[serde(default = "default_memory_pool_fraction")]
+    pub memory_pool_fraction: f64,
+
+    /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance limit.
+    #[serde(default = "default_instance_overhead_mb")]
+    pub instance_overhead_mb: u64,
+}
+
+impl CommonScanSpec {
+    /// Serialize the shard-invariant common blob to a JSON string.
+    ///
+    /// The output never contains a `files` key (structurally impossible) nor a
+    /// `catalog` key.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("CommonScanSpec serialization is infallible")
+    }
+
+    /// Deserialize a common blob from a JSON string received from `ctx.get(0)`.
+    ///
+    /// Returns an error that does NOT include the raw input (which carries
+    /// credentials).
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        serde_json::from_str(s).map_err(|e| {
+            // Do not echo `s` — it contains credentials.
+            format!("scan common spec deserialization failed: {e}")
+        })
+    }
+}
+
 /// The scan specification passed from the adapter to the scan SET UDF.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanSpec {
     /// Explicit list of Parquet file URIs (S3 or s3a) assigned to this scan.
     /// The scan UDF registers ONLY these files — no catalog discovery.
@@ -182,7 +268,6 @@ pub struct ScanSpec {
     pub logical_schema: Vec<LogicalField>,
 
     pub storage: StorageProps,
-    pub catalog: CatalogProps,
 
     /// DataFusion `target_partitions` for this scan instance.
     /// Controls the number of logical partitions DataFusion creates internally.
@@ -241,12 +326,87 @@ impl ScanSpec {
         serde_json::to_string(self).expect("ScanSpec serialization is infallible")
     }
 
-    /// Deserialize from a JSON string received from `ctx.get(0)`.
+    /// Deserialize a whole `ScanSpec` from JSON; used by tests and as the
+    /// pre-split equivalence baseline (production reconstitutes via `from_parts_json`).
     /// Returns an error that does NOT include any credential values.
     pub fn from_json(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| {
             // Do not echo `s` — it contains credentials.
             format!("scan spec deserialization failed: {e}")
+        })
+    }
+
+    /// Extract the shard-invariant portion of this spec (everything except `files`).
+    pub fn to_common(&self) -> CommonScanSpec {
+        CommonScanSpec {
+            projection: self.projection.clone(),
+            filter: self.filter.clone(),
+            limit: self.limit,
+            aggregates: self.aggregates.clone(),
+            group_keys: self.group_keys.clone(),
+            emit_exa_types: self.emit_exa_types.clone(),
+            logical_schema: self.logical_schema.clone(),
+            storage: self.storage.clone(),
+            df_target_partitions: self.df_target_partitions,
+            df_batch_size: self.df_batch_size,
+            df_threads_per_udf: self.df_threads_per_udf,
+            memory_pool_fraction: self.memory_pool_fraction,
+            instance_overhead_mb: self.instance_overhead_mb,
+        }
+    }
+
+    /// Serialize the shard-invariant common blob once (the UDF's first argument).
+    ///
+    /// The output never contains a `files` key nor a `catalog` key.
+    pub fn to_common_json(&self) -> String {
+        self.to_common().to_json()
+    }
+
+    /// Reconstitute a full `ScanSpec` from a shard-invariant common spec and a
+    /// per-shard files list. This is the SOLE way to reattach `files`, which makes
+    /// `files` the only per-shard field by construction.
+    pub fn from_parts(common: CommonScanSpec, files: Vec<String>) -> Self {
+        Self {
+            files,
+            projection: common.projection,
+            filter: common.filter,
+            limit: common.limit,
+            aggregates: common.aggregates,
+            group_keys: common.group_keys,
+            emit_exa_types: common.emit_exa_types,
+            logical_schema: common.logical_schema,
+            storage: common.storage,
+            df_target_partitions: common.df_target_partitions,
+            df_batch_size: common.df_batch_size,
+            df_threads_per_udf: common.df_threads_per_udf,
+            memory_pool_fraction: common.memory_pool_fraction,
+            instance_overhead_mb: common.instance_overhead_mb,
+        }
+    }
+
+    /// Reconstitute a full `ScanSpec` from the two UDF arguments: the common blob
+    /// JSON (`ctx.get(0)`) and the per-shard files JSON (`ctx.get(1)`).
+    ///
+    /// Errors NEVER include the raw inputs (the common blob carries credentials).
+    pub fn from_parts_json(common_json: &str, files_json: &str) -> Result<Self, String> {
+        let common = CommonScanSpec::from_json(common_json)?;
+        let files = Self::files_from_json(files_json)?;
+        Ok(Self::from_parts(common, files))
+    }
+
+    /// Serialize a per-shard files list to the JSON array carried in the UDF's
+    /// second argument. Paired with `files_from_json`.
+    pub fn files_json(files: &[String]) -> String {
+        serde_json::to_string(files).expect("files list serialization is infallible")
+    }
+
+    /// Deserialize a per-shard files list from the UDF's second argument.
+    ///
+    /// Returns an error that does NOT include the raw input.
+    pub fn files_from_json(s: &str) -> Result<Vec<String>, String> {
+        serde_json::from_str(s).map_err(|e| {
+            // Do not echo `s`.
+            format!("scan files deserialization failed: {e}")
         })
     }
 }
@@ -276,11 +436,6 @@ mod tests {
                 session_token: None,
                 allow_http: true,
                 path_style: true,
-            },
-            catalog: CatalogProps {
-                uri: "http://iceberg-rest:8181".into(),
-                warehouse: "warehouse".into(),
-                table: "db.table".into(),
             },
             df_target_partitions: 1,
             df_batch_size: 8192,
@@ -315,8 +470,6 @@ mod tests {
         assert_eq!(back.storage.secret_key, "minioadmin");
         assert!(back.storage.path_style);
         assert!(back.storage.allow_http);
-        assert_eq!(back.catalog.table, "db.table");
-        assert_eq!(back.catalog.uri, "http://iceberg-rest:8181");
     }
 
     #[test]
@@ -385,11 +538,6 @@ mod tests {
                 "region": "us-east-1",
                 "access_key": "k",
                 "secret_key": "s"
-            },
-            "catalog": {
-                "uri": "http://rest:8181",
-                "warehouse": "wh",
-                "table": "db.t"
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
@@ -581,11 +729,6 @@ mod tests {
                 "region": "us-east-1",
                 "access_key": "k",
                 "secret_key": "s"
-            },
-            "catalog": {
-                "uri": "http://rest:8181",
-                "warehouse": "wh",
-                "table": "db.t"
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
@@ -638,11 +781,6 @@ mod tests {
                 "region": "us-east-1",
                 "access_key": "k",
                 "secret_key": "s"
-            },
-            "catalog": {
-                "uri": "http://rest:8181",
-                "warehouse": "wh",
-                "table": "db.t"
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
@@ -688,11 +826,6 @@ mod tests {
                 "region": "us-east-1",
                 "access_key": "k",
                 "secret_key": "s"
-            },
-            "catalog": {
-                "uri": "http://rest:8181",
-                "warehouse": "wh",
-                "table": "db.t"
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
@@ -733,11 +866,6 @@ mod tests {
                 "region": "us-east-1",
                 "access_key": "k",
                 "secret_key": "s"
-            },
-            "catalog": {
-                "uri": "http://rest:8181",
-                "warehouse": "wh",
-                "table": "db.t"
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
@@ -748,6 +876,89 @@ mod tests {
         assert_eq!(
             legacy.instance_overhead_mb, 200,
             "missing instance_overhead_mb must default to 200 (backward-compat)"
+        );
+    }
+
+    /// Task 1.3(a): the common blob serializes WITHOUT `files`, and reconstituting
+    /// via `from_parts` (through JSON) yields a spec equal to the pre-split spec.
+    #[test]
+    fn from_parts_reconstitutes_equal_spec() {
+        let original = sample_spec();
+
+        // Split into the shard-invariant common blob + the per-shard files list.
+        let common_json = original.to_common_json();
+        let files_json = ScanSpec::files_json(&original.files);
+
+        // The common blob must NOT carry the per-shard files list (type-level guarantee).
+        assert!(
+            !common_json.contains("\"files\""),
+            "common blob must not contain a files key: {common_json}"
+        );
+        // Nor may any file URI value leak into the common blob.
+        assert!(
+            !common_json.contains("part-00000.parquet"),
+            "common blob must not carry any file URI: {common_json}"
+        );
+
+        // The common blob round-trips on its own.
+        let common_back = CommonScanSpec::from_json(&common_json).unwrap();
+        assert_eq!(common_back, original.to_common());
+
+        // from_parts_json reconstitutes a spec equal to the pre-split original.
+        let reconstituted = ScanSpec::from_parts_json(&common_json, &files_json).unwrap();
+        assert_eq!(reconstituted, original);
+
+        // The struct-level from_parts is equivalent to the JSON round-trip.
+        let via_struct = ScanSpec::from_parts(original.to_common(), original.files.clone());
+        assert_eq!(via_struct, original);
+    }
+
+    /// Task 1.3(b): malformed common OR files JSON produces errors that never echo
+    /// the raw input (which carries credentials).
+    #[test]
+    fn malformed_common_or_files_json_does_not_leak_credentials() {
+        // Malformed common blob carrying credential-shaped values.
+        let garbled_common =
+            r#"{"storage": {"access_key": "SECRET", "secret_key": "TOPSECRET"}, incomplete"#;
+        let err = CommonScanSpec::from_json(garbled_common).unwrap_err();
+        assert!(
+            !err.contains("SECRET"),
+            "common error leaked a secret: {err}"
+        );
+        assert!(
+            !err.contains("TOPSECRET"),
+            "common error leaked a secret: {err}"
+        );
+        assert!(err.contains("scan common spec deserialization failed"));
+
+        // Malformed files argument.
+        let garbled_files = r#"["s3://w/SECRETFILE.parquet", incomplete"#;
+        let files_err = ScanSpec::files_from_json(garbled_files).unwrap_err();
+        assert!(
+            !files_err.contains("SECRETFILE"),
+            "files error leaked input: {files_err}"
+        );
+        assert!(files_err.contains("scan files deserialization failed"));
+
+        // from_parts_json surfaces the common-arg error without leaking either input.
+        let combined = ScanSpec::from_parts_json(garbled_common, "[]").unwrap_err();
+        assert!(!combined.contains("SECRET"));
+        assert!(!combined.contains("TOPSECRET"));
+    }
+
+    /// Task 1.3(c): `catalog` no longer appears in any serialized JSON.
+    #[test]
+    fn catalog_absent_from_all_serialized_json() {
+        let spec = sample_spec();
+        assert!(
+            !spec.to_json().contains("catalog"),
+            "full spec JSON must not contain a catalog key: {}",
+            spec.to_json()
+        );
+        assert!(
+            !spec.to_common_json().contains("catalog"),
+            "common blob JSON must not contain a catalog key: {}",
+            spec.to_common_json()
         );
     }
 }
