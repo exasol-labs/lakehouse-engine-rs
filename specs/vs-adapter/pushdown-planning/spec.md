@@ -1,12 +1,13 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files. The scan-driving SQL passes the shard-invariant parts (projection, filter, LIMIT, logical schema, credentials) once as the UDF's common argument and each shard's file subset as the per-shard argument.
+Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files. The scan-driving SQL passes the shard-invariant parts (projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once as the UDF's common argument and each shard's per-file `(path, size)` subset as the per-shard argument. See `vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute path encoding rules.
 
 ## Background
 
-* The data-file list and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
+* The data-file list, each file's byte size (from the Iceberg manifest), and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
 * The logical schema carried into the common scan-spec argument identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
-* The scan-driving SQL serializes the shard-invariant common spec once (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs) and carries only each shard's file subset per shard.
+* The scan-driving SQL serializes the shard-invariant common spec once (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) and carries only each shard's per-file `(path, size)` subset per shard.
+* Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 
 ## Scenarios
@@ -25,9 +26,9 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 * *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot and data-file list exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
-* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the scan SET UDF, carrying the logical schema in the shard-invariant common spec argument (serialized once) and the resolved data-file list as the per-shard files argument
-* *AND* the adapter MUST NOT require the scan UDF to discover files itself
+* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
+* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the scan SET UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec argument (each serialized once) and the resolved data-file list as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
+* *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
 
 ### Scenario: Projection is pushed into the scan-driving query
 
