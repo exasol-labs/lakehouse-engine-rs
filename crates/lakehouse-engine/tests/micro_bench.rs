@@ -292,8 +292,12 @@ fn write_lineitem_parquet(path: &std::path::Path, n: usize) -> (String, u64) {
 }
 
 fn scan_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: Vec::new(),
         filter: None,
         limit: None,
@@ -323,7 +327,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
 async fn drain_scan(file_url: &str) -> (u64, u64) {
     let spec = scan_spec(file_url.to_string());
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    ctx.register_parquet("scan_target", &spec.files[0], Default::default())
+    ctx.register_parquet("scan_target", &spec.files[0].0, Default::default())
         .await
         .expect("register parquet");
     let plan = build_raw_scan_physical_plan(&ctx, &spec)

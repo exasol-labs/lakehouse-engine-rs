@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 license.workspace = true
 
@@ -28,6 +28,9 @@ parquet    = { workspace = true }
 datafusion = { workspace = true }
 
 object_store = { workspace = true }
+# Required to implement object_store's `#[async_trait]` `ObjectStore` trait for the
+# spec-size HEAD wrapper. Already resolved transitively via object_store/datafusion.
+async-trait = "0.1"
 
 iceberg              = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
