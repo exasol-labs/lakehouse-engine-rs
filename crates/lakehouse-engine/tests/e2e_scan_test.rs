@@ -193,12 +193,15 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
     ));
 
     // Scan SET script — RUST SET SCRIPT.
-    // Input: one VARCHAR column (the ScanSpec JSON). The output columns are
-    // dynamic: declared with the placeholder EMITS (...) here and supplied
-    // concretely by the adapter's pushdown SQL (`... EMITS (col TYPE, ...)`).
+    // Input: two VARCHAR columns — arg0 is the common ScanSpec blob (shared
+    // across all shards, serialized once via `ScanSpec::to_common_json()`),
+    // arg1 is the per-shard files JSON list (via `ScanSpec::files_json()`).
+    // The output columns are dynamic: declared with the placeholder EMITS (...)
+    // here and supplied concretely by the adapter's pushdown SQL
+    // (`... EMITS (col TYPE, ...)`).
     // No %main — the SLC selects __exa_udf_entry_LAKEHOUSE_SCAN by script name.
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(spec VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#

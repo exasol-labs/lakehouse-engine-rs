@@ -49,18 +49,19 @@ fn lakehouse_adapter(_ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 
 /// DataFusion scan SET UDF.
 ///
-/// Input: one VARCHAR column carrying the serialized ScanSpec JSON.
+/// Input: two VARCHAR columns — the shard-invariant common blob JSON (arg 0)
+/// serialized ONCE per fan-out, and the per-shard files JSON array (arg 1).
 /// Emits: the projected columns declared in the adapter's EMITS clause.
 ///
 /// The `emits(...)` annotation is omitted because the actual EMITS are
 /// declared dynamically in the SQL string the adapter returns from pushdown —
 /// Exasol injects the EMITS at script execution time from the SQL. The macro
 /// records a null pointer for `annotated_output_schema`, which the runtime
-/// accepts. The `input(spec: String)` annotation documents the input contract
-/// without restricting the dynamic EMITS.
+/// accepts. The `input(common: String, files: String)` annotation documents the
+/// two-argument input contract without restricting the dynamic EMITS.
 ///
 /// The exported symbol is `__exa_udf_entry_LAKEHOUSE_SCAN`.
-#[exasol_udf(name = "LAKEHOUSE_SCAN", input(spec: String))]
+#[exasol_udf(name = "LAKEHOUSE_SCAN", input(common: String, files: String))]
 fn lakehouse_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     scan::run_scan(ctx)
 }
