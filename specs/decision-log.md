@@ -1404,3 +1404,116 @@ Split `LAKEHOUSE_SCAN` into a two-argument signature: `LAKEHOUSE_SCAN(common VAR
 ### Consequences
 
 The generated fan-out statement carries the shard-invariant payload — including credentials, projection, filter, aggregates, and tuning knobs — exactly once instead of once per shard, shrinking statement size and the credential surface on wide fan-outs. `ScanSpec` carries no catalog block at all, strengthening the existing "catalog auth never in any scan spec" guarantee. The scan SET SCRIPT DDL and every direct invocation move to the two-argument signature; there is no dual-read path, so the `.so`/SLC/adapter must deploy together (already true for this stateless, disposable UDF).
+
+---
+
+## ADR-053: Compact 2-Tuple `(path, size)` Per-Shard File Encoding
+
+**Date:** 2026-07-02
+**Plan:** `change-scan-spec-files-payload`
+**Status:** Accepted
+
+### Context
+
+`ScanSpec.files` carried bare absolute file-URI strings (`Vec<String>`). Each generated pushdown SQL statement repeated the same ~40–70-char table-location prefix once per file across a fan-out capped at 300 shards (issue #45), and because only the path travelled, the scan UDF's `ListingTable` had to issue a per-file object-store `HEAD` to recover the byte size the adapter had already resolved from the Iceberg manifest and then discarded in `partition_files_by_bytes` (issue #29).
+
+### Decision
+
+Change `ScanSpec.files` from `Vec<String>` to `Vec<(String, u64)>`; the JSON wire form is a compact array of `[path, size]` pairs — exactly what serde produces for the tuple, with no custom (de)serializer. `files_json`/`files_from_json` and `partition_files_by_bytes` are retyped end-to-end to carry the pair instead of the bare path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Compact 2-tuple `[path, size]` array | ✓ Chosen — minimal bytes, serde-native for a `Vec<(String,u64)>`, positional pairing cannot desynchronize |
+| Struct-per-file objects `[{"path":...,"size":...}]` | ✗ Rejected — self-describing but roughly 3× the bytes per entry on a payload this repeats across up to 300 shards |
+| Parallel arrays `{paths:[...],sizes:[...]}` | ✗ Rejected — compact but easy to desynchronize (a path and its size can drift apart) and awkward to shard |
+
+### Consequences
+
+Every per-shard file entry now carries its byte size alongside its path at no meaningful cost in wire size. `partition_files_by_bytes` must propagate the tuple through sharding rather than dropping the size after using it to balance shards. There is no dual-format decoder for the old bare-string shape (see ADR-056): the adapter that writes a spec and the UDF that reads it ship in the same `.so`.
+
+---
+
+## ADR-054: Carry the Iceberg Table Root Once in the Common Spec; Emit Paths Relative
+
+**Date:** 2026-07-02
+**Plan:** `change-scan-spec-files-payload`
+**Status:** Accepted
+
+### Context
+
+Every per-shard file path repeated the full Iceberg table-location prefix (`table.metadata().location()`), even though that prefix is identical for every file in the query and is already resolved once at the same seam that vends the table's storage credentials (issue #45). Carrying it per file is pure duplicated overhead on a fan-out that can reach 300 shards.
+
+### Decision
+
+Add `table_root: String` (`#[serde(default)]`, empty ⇒ all-absolute) to `CommonScanSpec` and `ScanSpec`. The adapter threads the already-resolved `result.metadata.location()` out of `resolve_file_list` into the spec builder. Because the root is shard-invariant, it is serialized exactly ONCE in the common blob, never per shard. See ADR-055 for the strip/reconstruct rule this enables.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `table_root` field in the common (shard-invariant) blob | ✓ Chosen — the root is already computed at the resolve-once seam as the vended-credential anchor, so forwarding it is free; shard-invariant data belongs in the common blob per the two-argument split (ADR-052) |
+| Repeat the full absolute prefix on every file path | ✗ Rejected — this is the status-quo bug (#45) |
+| A separate BucketFS-staged prefix table | ✗ Rejected — adds persisted state to a stateless, disposable UDF |
+
+### Consequences
+
+The common spec grows by one string field, serialized once per query regardless of shard count. Every per-shard path can now be emitted relative to this root (ADR-055), which is where the actual byte savings materialize. A legacy or root-less spec (empty `table_root`) degrades safely to "treat every path as absolute."
+
+---
+
+## ADR-055: Strip-If-Prefix / Absolute-Passthrough Path Reconstruction
+
+**Date:** 2026-07-02
+**Plan:** `change-scan-spec-files-payload`
+**Status:** Accepted
+
+### Context
+
+Iceberg data-file paths are NOT guaranteed to live under `table.metadata().location()` — `write.data.path`, `write.object-storage.enabled` hash injection, and migrated/Databricks layouts can place files elsewhere. Given the table root is now carried once (ADR-054), the adapter needs a rule for when it is safe to strip that root from a file path, and the UDF needs the symmetric rule for reconstructing the absolute path.
+
+### Decision
+
+In the adapter, strip `table_root` from a file path ONLY when `path.starts_with(table_root)` AND the match falls on a real path-segment boundary (the root ends with `/`, or the remainder begins with `/`) — otherwise the path is stored absolute and unchanged. This boundary check (found during code review, R.1) prevents a sibling-prefix false match, e.g. root `s3://bucket/tbl` must not strip from a file under `s3://bucket/tbl-other/...`. In the UDF's `register_files`, reconstruct symmetrically: an entry containing `://` is absolute and parses as-is; a relative entry is joined onto `table_root` (trailing `/` normalized) before `ListingTableUrl::parse`. A shard MAY mix relative and absolute entries. Regression-tested by `sibling_prefix_paths_are_not_relativized`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Strip only on a real path-segment-boundary prefix match; else keep absolute | ✓ Chosen — captures the common-case byte win while staying correct for `write.data.path`, object-storage hash injection, migrated/Databricks layouts, and sibling-prefix false matches |
+| Assume all data files live under `metadata.location()`; always strip / always join | ✗ Rejected — simpler but INCORRECT: Iceberg does not guarantee this |
+
+### Consequences
+
+Path stripping is conditional and reversible: the reconstructed absolute path always equals the original resolved data-file URI. A per-shard payload may legitimately mix relative and absolute entries within the same query. The path-segment-boundary refinement (beyond plain `starts_with`) was added during implementation code review and is covered by its own regression test rather than being a purely design-time decision.
+
+---
+
+## ADR-056: Supply File Sizes via a Spec-Backed `ObjectStore` `head()` Wrapper, Keeping `ListingTable` + Field-ID Adapter
+
+**Date:** 2026-07-02
+**Plan:** `change-scan-spec-files-payload`
+**Status:** Accepted
+
+### Context
+
+With each per-shard file's byte size now available from the spec (ADR-053), the scan UDF no longer needs to issue a per-file object-store `HEAD` to discover it (issue #29) — but the registration path (`ListingTableConfig::new_with_multi_paths(...).with_expr_adapter_factory(FieldIdExprAdapterFactory)`) must keep working, since field-id-based column projection depends on `ListingTable`. Confirmed against DataFusion 54.0.0 + object_store 0.13.2 source: for an exact-file (non-collection) URL, `ListingTableUrl::list_prefixed_files` calls `store.head(&path)` per path and does NOT cache that branch (only the collection/`list` branch uses `list_with_cache`), so an override there is consulted on every query and issues no network HEAD. `last_modified` is not read for scan correctness — ParquetExec reads by known size via `get`/`get_range`; the only consumer of `last_modified` is the optional `FileStatisticsCache`, irrelevant to a per-query disposable UDF.
+
+**Implementation deviation confirmed during coding:** in `object_store` 0.13.2, `head` is NOT itself an `ObjectStore` trait method — it is the auto-implemented `ObjectStoreExt` blanket method that dispatches to `get_opts(GetOptions { head: true, .. })`. The no-HEAD wrapper therefore overrides `get_opts` (short-circuiting the `head: true` case with the spec-backed `ObjectMeta` and delegating every other case to the inner store) rather than overriding a `head()` method directly. This still suppresses the network HEAD exactly as designed, because `store.head(&path)` calls `get_opts` internally. The crate manifest also gained an `async-trait` dependency, required to implement object_store's `#[async_trait] ObjectStore` trait for the wrapper.
+
+### Decision
+
+Keep the existing `ListingTable` + `with_expr_adapter_factory(FieldIdExprAdapterFactory)` wiring. Wrap the registered `AmazonS3` store in a thin `ObjectStore` that intercepts the `head: true` `get_opts` case to return an `ObjectMeta` built from the spec's known size (`last_modified = chrono::Utc.timestamp_nanos(0)`, `e_tag = None`, `version = None`), delegating every other call to the inner store. Register the wrapper in the session `RuntimeEnv`'s `ObjectStoreRegistry` under the same `ObjectStoreUrl`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Spec-backed `ObjectStore` wrapper (overriding the `get_opts`/`head:true` path), keeping `ListingTable` | ✓ Chosen — additive; leaves the entire existing registration and field-id projection path untouched; verified not cached so it is consulted on every query |
+| `PartitionedFile::new(path, size)` + `FileScanConfigBuilder::with_expr_adapter(...)` | Kept as documented fallback, not chosen as primary — VIABLE (the builder exposes the same `PhysicalExprAdapterFactory` trait, so field-id projection is retained) but replaces `ListingTable` wholesale, a much larger change |
+| Leave the per-file HEAD in place | ✗ Rejected — this is the bug (#29) |
+
+### Consequences
+
+The scan UDF issues no per-file object-store `HEAD` before scanning; `scan-execution-field-id-projection` scenarios keep passing unchanged because the wrapper is purely additive. The wrapper's correctness rests on the object_store 0.13.2 `head`-is-`ObjectStoreExt`-over-`get_opts` behavior confirmed during implementation, not on a literal `head()` trait method — a future object_store upgrade that changes this dispatch would need to be re-verified against this ADR.
