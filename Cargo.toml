@@ -10,6 +10,9 @@ members = ["crates/lakehouse-engine", "crates/vs-expression"]
 # individual crates must be addressed with `-p`.
 resolver = "2"
 
+[workspace.package]
+license = "MIT"
+
 [workspace.dependencies]
 # Shared single-version pins. Member crates reference these with
 # `{ workspace = true }`, optionally adding per-crate features.
