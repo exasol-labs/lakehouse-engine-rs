@@ -10,6 +10,17 @@ not-yet-recorded validation run (`bench/reports/bench-report-20260701-123648.txt
 `bench/reports/import-ceiling-20260701-124836.txt`) — see
 [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) below.
 
+> **Benchmark caveat — pre-0.20.1 node-count bug:** every benchmark below that predates the
+> `exasol-udf-sdk`/`exasol-udf-macros` `0.20.1` bump (`add-scan-connection-concurrency`, closes
+> #43) ran on live clusters where `ctx.node_count()` always returned `0` at
+> `createVirtualSchema` time; `resolve_cluster_nodes` maps that to `1`. Any such run whose
+> `adapterNotes` recorded `CLUSTER_NODES=1` on what was actually a multi-node cluster therefore
+> silently computed shard count as `G = 1 × parallelism_factor` instead of
+> `G = node_count × parallelism_factor` — collapsing cluster-wide sharding to single-node
+> sharding. Single-node timings are unaffected; multi-node scaling claims recorded before the
+> fix should be treated with suspicion. Full detail:
+> `specs/_plans/add-scan-connection-concurrency/decision-log.md` (Design Decisions [1] and [5]).
+
 ## Optimizations delivered
 
 - **Parquet predicate pushdown** (`datafusion.execution.parquet.pushdown_filters`) — filters
@@ -22,8 +33,26 @@ not-yet-recorded validation run (`bench/reports/bench-report-20260701-123648.txt
   projection fuse into the data source.
 - **Configurable per-instance threading** — `DATAFUSION_THREADING_MODE` (`AUTO`/`FIXED`),
   tunable without recompiling. See [Tuning](tuning.md).
+- **Configurable object-store connection concurrency** — `S3_MAX_CONNECTIONS` sizes the
+  per-instance S3 HTTP connection pool, oversubscribed relative to CPU threads on IO-bound
+  scans. See [Tuning](tuning.md#s3_max_connections) and
+  [Native `IMPORT` parity goal](#native-import-parity-goal) below.
 - **Projection + partial-aggregate pushdown** — only projected columns are read; aggregates
   ship one partial row per group instead of raw rows.
+
+## Native `IMPORT` parity goal
+
+`S3_MAX_CONNECTIONS` targets closing the gap this doc measures below: native
+`IMPORT FROM PARQUET` exposes an explicit `MaxConnections` knob for per-instance object-store
+fetch concurrency, while the engine previously left that axis entirely to library defaults.
+This knob is deliberately orthogonal to the two existing levers — `PARALLELISM_FACTOR` controls
+*how many shards* run, `DATAFUSION_THREADING_MODE` controls *how many CPU threads* decode a
+shard, and `S3_MAX_CONNECTIONS` controls *how many S3 fetches* a shard's threads can keep in
+flight while they wait on the network. Raising it is the next lever toward approaching native
+`IMPORT` throughput on IO-bound scans (the common case per the phase telemetry below —
+`import ≫ emit`), layered on top of threading and sharding rather than replacing them. See
+`specs/_plans/add-scan-connection-concurrency/decision-log.md` (Design Decisions [2]-[4]) for
+the knob's design rationale, and Task 3.1 (benchmark sweep) for the validating measurement.
 
 ## Current benchmark results
 
@@ -109,7 +138,9 @@ run where the VS aggregate path was competitive with native IMPORT.
 > was computed as `1 × 8` instead of `node_count × 8`, starving the full-scan/emit path of
 > cluster parallelism — which could fully or partly explain the 151 s vs. 80 s gap rather than
 > it being a genuine emit-path bottleneck. **Re-run this exact 60-file benchmark after the
-> 0.20.1 bump lands** before concluding anything about the emit path itself.
+> 0.20.1 bump lands** before concluding anything about the emit path itself. See
+> `specs/_plans/add-scan-connection-concurrency/decision-log.md` (Design Decision [5]) and
+> plan Task 3.2 for the tracked re-gate.
 
 ## Tuning levers & outlook
 

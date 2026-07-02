@@ -28,6 +28,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use exasol_udf_sdk::value::Value;
 use futures::StreamExt;
+use object_store::ClientOptions;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
@@ -614,7 +615,7 @@ fn build_session_context(
 
     // Register the MinIO object store for the S3 URL scheme.
     let bucket = extract_bucket(spec)?;
-    let s3 = build_s3_store(&spec.storage, &bucket)?;
+    let s3 = build_s3_store(&spec.storage, &bucket, spec.s3_max_connections)?;
     let store_url = Url::parse(&format!("s3://{bucket}"))
         .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
     ctx.runtime_env()
@@ -623,16 +624,46 @@ fn build_session_context(
     Ok(ctx)
 }
 
-/// Build an AmazonS3 (MinIO-compatible) object store from StorageProps.
-fn build_s3_store(
+/// HTTP client options that bound the object store's warm connection pool to the
+/// resolved connection-concurrency budget.
+///
+/// `object_store` 0.13.2 exposes no hard "max concurrent requests" ceiling — the
+/// reqwest/hyper backend never caps in-flight connections. `pool_max_idle_per_host`
+/// is the closest available knob: it bounds how many established connections the
+/// pool keeps warm (idle, reusable) per host, whose reqwest default is unbounded.
+/// This is the axis that maps to "how many concurrent fetches from S3 the instance
+/// keeps warm", independent of the DataFusion CPU thread/partition budget. Clamped
+/// to at least 1 so the ceiling is never zero.
+///
+/// Exposed (`pub`) so a host integration test can assert, via this exact
+/// production seam, that a `ScanSpec`'s resolved `s3_max_connections` budget
+/// reaches the object store's HTTP client options.
+pub fn client_options_for(budget: usize) -> ClientOptions {
+    ClientOptions::new().with_pool_max_idle_per_host(budget.max(1))
+}
+
+/// Build an AmazonS3 (MinIO-compatible) object store from StorageProps, sizing the
+/// HTTP connection pool to the resolved `s3_max_connections` budget.
+///
+/// Exposed (`pub`) so a host integration test can drive the exact production
+/// object store construction path and confirm the connection budget is applied
+/// end to end, without requiring a live S3/MinIO endpoint (construction is pure
+/// builder logic; it performs no network I/O).
+pub fn build_s3_store(
     storage: &crate::scan::spec::StorageProps,
     bucket: &str,
+    s3_max_connections: usize,
 ) -> Result<impl ObjectStore, UdfError> {
+    // `with_client_options` REPLACES the builder's whole `ClientOptions` (it does
+    // not merge), so it must run before `with_allow_http`, which layers onto
+    // whatever `ClientOptions` is already set. Reversing this order silently
+    // drops `allow_http`, breaking plain-HTTP endpoints like MinIO.
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region(&storage.region)
         .with_access_key_id(&storage.access_key)
         .with_secret_access_key(&storage.secret_key)
+        .with_client_options(client_options_for(s3_max_connections))
         .with_allow_http(storage.allow_http);
 
     // Path-style stores (MinIO and other S3-compatibles) need the explicit endpoint
@@ -1082,6 +1113,7 @@ mod tests {
     use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
     use crate::scan::spec::{AggKind, AggregatePlan, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
+    use object_store::ClientConfigKey;
 
     // ---------------------------------------------------------------------------
     // build_session_context memory pool sizing — seam tests for task 1.3
@@ -1112,6 +1144,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         }
     }
 
@@ -1173,6 +1206,33 @@ mod tests {
         assert!(
             expected > MIN_POOL_FLOOR_BYTES as usize,
             "expected budget must exceed the floor"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // client_options_for — object-store connection-concurrency seam (task 2.5)
+    // ---------------------------------------------------------------------------
+
+    /// The resolved connection budget is carried onto the object store's HTTP
+    /// client options as the warm-connection-pool ceiling per host.
+    #[test]
+    fn client_options_carry_connection_budget() {
+        let opts = client_options_for(32);
+        assert_eq!(
+            opts.get_config_value(&ClientConfigKey::PoolMaxIdlePerHost),
+            Some("32".to_string()),
+            "client options must carry the resolved connection budget as pool_max_idle_per_host"
+        );
+    }
+
+    /// A zero budget clamps to at least 1 so the pool ceiling is never zero/negative.
+    #[test]
+    fn client_options_clamp_budget_to_at_least_one() {
+        let opts = client_options_for(0);
+        assert_eq!(
+            opts.get_config_value(&ClientConfigKey::PoolMaxIdlePerHost),
+            Some("1".to_string()),
+            "a zero budget must clamp to at least 1"
         );
     }
 

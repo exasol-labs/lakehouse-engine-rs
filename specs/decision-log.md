@@ -1404,3 +1404,87 @@ Split `LAKEHOUSE_SCAN` into a two-argument signature: `LAKEHOUSE_SCAN(common VAR
 ### Consequences
 
 The generated fan-out statement carries the shard-invariant payload — including credentials, projection, filter, aggregates, and tuning knobs — exactly once instead of once per shard, shrinking statement size and the credential surface on wide fan-outs. `ScanSpec` carries no catalog block at all, strengthening the existing "catalog auth never in any scan spec" guarantee. The scan SET SCRIPT DDL and every direct invocation move to the two-argument signature; there is no dual-read path, so the `.so`/SLC/adapter must deploy together (already true for this stateless, disposable UDF).
+
+---
+
+## ADR-053: One `S3_MAX_CONNECTIONS` Knob, Not a Dual Per-File/Per-Node Pair
+
+**Date:** 2026-07-02
+**Plan:** `add-scan-connection-concurrency`
+**Status:** Accepted
+
+### Context
+
+The native Exasol `IMPORT FROM PARQUET` importer exposes a dual concurrency model: `MaxConnections` (parallel reads within a file) plus `MaxConcurrentReads` (files in parallel per node). The scan UDF's object-store connection concurrency had no operator-facing knob at all — `build_s3_store` built `AmazonS3Builder` with zero HTTP client tuning, leaving fetch concurrency entirely to defaults and to DataFusion's `target_partitions` file-group splitting. The operator hypothesis driving this plan was a single lever: "max file connections per node to saturate network/IO."
+
+### Decision
+
+Expose a single operator VS property `S3_MAX_CONNECTIONS` (mirroring the native importer's `MaxConnections` vocabulary) rather than mirroring the native importer's full dual model.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Single `S3_MAX_CONNECTIONS` knob | ✓ Chosen — covers the stated single-lever hypothesis; avoids unproven complexity |
+| Two properties mirroring `MaxConnections` + `MaxConcurrentReads` | ✗ Rejected — a second axis is unproven complexity; defer until a benchmark shows one knob is insufficient |
+
+### Consequences
+
+Establishes the project convention that new tuning axes ship as one operator knob until a benchmark proves a second is needed (YAGNI). The knob follows the exact `PARALLELISM_FACTOR` property → `adapterNotes` → shard-invariant common-spec round-trip precedent, so the scan UDF stays resolution-agnostic.
+
+---
+
+## ADR-054: Apply the Connection Budget via `object_store` `ClientOptions`, Not DataFusion `target_partitions`
+
+**Date:** 2026-07-02
+**Plan:** `add-scan-connection-concurrency`
+**Status:** Accepted
+
+### Context
+
+Object-store connection concurrency (how many concurrent HTTP connections to S3 a scan instance keeps warm) is a distinct throughput axis from CPU decode/compute concurrency, which the existing DataFusion thread/partition budget (`datafusion-scan/scan-execution-threading`) already governs. The resolved `S3_MAX_CONNECTIONS` budget needed a concrete mechanism to reach the object store's HTTP client.
+
+### Decision
+
+Size the budget onto the S3 client through `AmazonS3Builder::with_client_options(ClientOptions)` (`object_store` 0.13.2, method confirmed present), targeting the HTTP connection pool.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `AmazonS3Builder::with_client_options(ClientOptions)` | ✓ Chosen — the object-store HTTP client pool is what genuinely maps to "concurrent fetches from S3 per UDF instance" |
+| DataFusion `target_partitions` file-group splitting | ✗ Rejected — that is the CPU/threading axis, already a separate knob |
+| `datafusion.execution.meta_fetch_concurrency` | ✗ Rejected — only affects schema/stats reads, not data-scan throughput |
+
+### Consequences
+
+Records that object-store connection concurrency is a first-class tuning axis distinct from the DataFusion thread/partition budget. The budget applies uniformly on both the raw-row scan path and the partial-aggregate path, since both decode Parquet fetched over the same object store.
+
+---
+
+## ADR-055: Confounded Benchmark Evidence Is Incorporated as Rationale Plus a Named Re-Gate Task, Never Immediate Scope Expansion
+
+**Date:** 2026-07-02
+**Plan:** `add-scan-connection-concurrency`
+**Status:** Accepted
+
+### Context
+
+A 2026-07-01 180M-row / 60-file full-`lineitem` benchmark found native `IMPORT INTO` (~80.4 s) outperforming the VS full-emit `CREATE TABLE AS SELECT *` (~151 s) by ~1.9× — a full raw-row emit workload, differently shaped from the original aggregate-path benchmark. That run recorded the confounded `CLUSTER_NODES=1`, the pre-0.20.1 `ctx.node_count()==0` handshake bug this same plan's dependency bump (Task 1) fixes. It was therefore unknown whether the 151 s/80.4 s gap was under-sharding (would close on the dep bump) or a genuine emit-path bottleneck (e.g. `Int64→Decimal128` coercion).
+
+### Decision
+
+Fold the new evidence into the plan as reinforcing rationale for the existing deliverables, add one named validation task (re-run the 60-file comparison after the dependency bump lands) to isolate the confound, and document the emit-path coercion optimization as evidence-gated deferred work. Do not expand code scope to build the emit-path optimization now.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Rationale + named re-gate task + evidence-gated deferred-work doc | ✓ Chosen — isolates the confound before committing to new scope |
+| Expand this plan to build the emit-path optimization immediately | ✗ Rejected — YAGNI; no confirmed emit-bound root cause, only a confounded measurement |
+| Ignore the new evidence | ✗ Rejected — it materially reshapes the rationale and surfaces a real open question |
+
+### Consequences
+
+Codifies the project rule: new benchmark evidence confounded by an in-flight fix is incorporated as rationale plus a named post-fix re-gate task and evidence-gated deferred-work docs, never as immediate scope expansion, until the confound is isolated.
+
