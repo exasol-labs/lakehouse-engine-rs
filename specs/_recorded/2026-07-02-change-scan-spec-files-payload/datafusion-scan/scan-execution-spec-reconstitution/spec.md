@@ -21,6 +21,7 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Scan reconstitutes the ScanSpec from the common and per-shard arguments
 
 * *GIVEN* a scan invocation whose first argument is a common-spec JSON blob carrying every shard-invariant field (including the Iceberg table root) and whose second argument is a JSON array of `[path, size]` 2-tuples
@@ -29,10 +30,13 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the merge SHALL store each file entry's path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration (see `datafusion-scan/scan-execution`)
 * *AND* a parse failure on either argument SHALL surface an error that identifies scan-spec deserialization failure and MUST NOT contain any storage access key, secret key, or session token
 * *AND* the reconstituted `ScanSpec` MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:NEW -->
 ### Scenario: A file-list argument that predates the size and relative-path encoding still reconstitutes
 
 * *GIVEN* a scan invocation whose common-spec JSON carries no table root (an empty or absent root) and whose second argument holds file entries
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL deserialize the file list, treating a missing table root as "all paths are absolute" so no path is joined onto a root
 * *AND* the resulting `ScanSpec` SHALL be usable by the shared scan path unchanged, because the same `.so` produces and consumes the spec within one deploy (there is no cross-version wire-compatibility requirement)
+<!-- /DELTA:NEW -->

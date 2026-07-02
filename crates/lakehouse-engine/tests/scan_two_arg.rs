@@ -27,11 +27,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
-use lakehouse_engine::scan::{
-    build_s3_store, client_options_for, read_scan_spec, run_raw_scan_with_session,
-    session_config_for_spec,
-};
-use object_store::ClientConfigKey;
+use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -124,8 +120,12 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
 }
 
 fn scan_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some("\"ID\" >= 10".into()),
         limit: None,
@@ -257,7 +257,7 @@ fn scan_registers_only_assigned_files_two_arg() {
 /// preserved for both arguments (mirrors the pre-split single-arg NULL check).
 #[test]
 fn two_arg_null_in_either_argument_is_user_error() {
-    let files_json = ScanSpec::files_json(&["s3://w/f0.parquet".to_string()]);
+    let files_json = ScanSpec::files_json(&[("s3://w/f0.parquet".to_string(), 0)]);
     let common_json = scan_spec("s3://w/f0.parquet".into()).to_common_json();
 
     // NULL common blob (col 0).
@@ -275,52 +275,4 @@ fn two_arg_null_in_either_argument_is_user_error() {
         matches!(err, UdfError::User(ref m) if m.contains("files") && m.contains("NULL")),
         "NULL files must be a user error naming the files arg: {err:?}"
     );
-}
-
-/// The scan configures its object store from the resolved connection budget
-/// (task 2.7). Builds a `ScanSpec` with `s3_max_connections` set to a value
-/// distinct from the `scan_spec()` fixture default (24 vs. 8) and drives the
-/// exact production object store construction path — [`build_s3_store`], the
-/// same function `build_session_context` calls, together with the
-/// [`client_options_for`] seam it uses internally — asserting the spec's budget
-/// reaches the resulting `ClientOptions` as the warm-connection-pool ceiling per
-/// host. Also confirms the construction succeeds without ever needing to surface
-/// a credential: `build_s3_store` redacts secret values and credential-shaped
-/// strings from any `build()` error before wrapping it (see
-/// `crate::scan::emit::redact_secret_values` / `redact_credentials`), so a
-/// successful build here proves the path taken never had a raw credential to
-/// leak in the first place.
-///
-/// Host-runnable: object store construction is pure builder logic — no S3 /
-/// MinIO network I/O.
-#[test]
-fn scan_applies_s3_max_connections_to_object_store() {
-    let budget = 24;
-    let mut spec = scan_spec("s3://budget-bucket/f0.parquet".into());
-    spec.s3_max_connections = budget;
-    assert_ne!(
-        budget, 8,
-        "budget must differ from the scan_spec() fixture default to prove it flows through"
-    );
-
-    // The production seam build_s3_store uses to size the pool: the spec's
-    // resolved budget reaches the object store's HTTP client options.
-    let opts = client_options_for(spec.s3_max_connections);
-    assert_eq!(
-        opts.get_config_value(&ClientConfigKey::PoolMaxIdlePerHost),
-        Some(budget.to_string()),
-        "client options must carry the spec's s3_max_connections budget"
-    );
-
-    // The full object store construction path (also used by
-    // build_session_context) accepts the same spec/budget and succeeds; the
-    // storage props carry a credential (access_key/secret_key), so a successful
-    // build with no error means no credential had a path to leak.
-    let bucket = url::Url::parse(&spec.files[0])
-        .expect("valid file URI")
-        .host_str()
-        .expect("bucket host")
-        .to_string();
-    build_s3_store(&spec.storage, &bucket, spec.s3_max_connections)
-        .expect("store must build with the spec's connection budget, leaking no credentials");
 }

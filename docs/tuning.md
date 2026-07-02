@@ -43,12 +43,13 @@ scan. See [Performance](performance.md#thread-sweep-nr_of_cores--4).
 ### `S3_MAX_CONNECTIONS`
 
 Sizes the object store's HTTP client connection pool for the scan instance — how many
-concurrent byte-range fetches a single UDF invocation can keep in flight against S3. This is
-the IO/network-concurrency axis: it says nothing about how many shards run (`PARALLELISM_FACTOR`)
-or how many CPU threads decode them (`DATAFUSION_THREADING_MODE`) — it governs how many requests
-are in flight while those threads wait on the network. All three axes are orthogonal and
-combine: shard count × per-instance threads × per-instance connections is the full concurrency
-picture of a scan.
+connections to S3 the client keeps warm (idle, reusable) per host, via
+`pool_max_idle_per_host`. `object_store` 0.13.2 has no hard cap on in-flight request
+concurrency; this knob only bounds how many established connections stay open for reuse
+rather than being torn down and re-negotiated, so it is a best-effort lever on connection
+reuse, not a guaranteed ceiling on concurrent fetches. It says nothing about how many shards
+run (`PARALLELISM_FACTOR`) or how many CPU threads decode them (`DATAFUSION_THREADING_MODE`) —
+those remain separate, orthogonal axes.
 
 - **Explicit value** — a positive integer is used verbatim (FIXED-like), e.g.
   `S3_MAX_CONNECTIONS='64'`.
@@ -68,11 +69,12 @@ Applied via the object store's HTTP client, not DataFusion: `AmazonS3Builder::wi
 sets `ClientOptions::with_pool_max_idle_per_host(budget)` on the S3 client. It does **not**
 touch DataFusion's `target_partitions` — that remains the threading knob's job.
 
-**When to tune it:** if [telemetry](#interpret) shows a scan is import-bound (`import ≫ emit`)
-and threads are already maxed per [Performance](performance.md#thread-sweep-nr_of_cores--4),
-raising `S3_MAX_CONNECTIONS` lets more byte-range fetches overlap per instance — the next lever
-to pull toward native `IMPORT FROM PARQUET` throughput on IO-bound scans. See
-[Performance](performance.md#native-import-parity-goal) for the goal this knob targets.
+**When to tune it:** a live-cluster sweep (2026-07-02, `S3_MAX_CONNECTIONS` from `AUTO` up to
+128, on both the aggregate and raw full-emit paths) found it moved throughput by **< 2%** —
+this cluster's bottleneck was not connection-pool warmth. It remains a legitimate knob to try
+on a deployment with a different network profile (e.g. genuinely connection-churn-bound rather
+than latency-bound), but do not expect it to be the lever that closes a native-`IMPORT` gap. See
+[Performance](performance.md#native-import-parity-goal) for the full sweep results.
 
 ## Telemetry
 
