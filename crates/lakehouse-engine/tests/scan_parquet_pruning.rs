@@ -65,8 +65,12 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
 /// Build a ScanSpec for a single local file with a filter that excludes most
 /// row groups (id range 0..1000, predicate keeps only 200..=399).
 fn pruning_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
         limit: None,
