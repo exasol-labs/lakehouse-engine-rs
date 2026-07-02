@@ -1006,7 +1006,7 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 #[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql(
     spec_template: &ScanSpec,
-    shards: Vec<Vec<String>>,
+    shards: &[Vec<(String, u64)>],
     proj_cols: &[String],
     proj_types: &[String],
     limit: Option<u64>,
@@ -1038,7 +1038,7 @@ pub fn build_scan_driving_sql(
 /// Build the row-scan SQL (no aggregates).
 fn build_row_scan_sql(
     spec_template: &ScanSpec,
-    shards: Vec<Vec<String>>,
+    shards: &[Vec<(String, u64)>],
     proj_cols: &[String],
     proj_types: &[String],
     limit: Option<u64>,
@@ -1052,9 +1052,9 @@ fn build_row_scan_sql(
         .join(", ");
 
     if shards.len() == 1 {
-        let files = shards.into_iter().next().unwrap_or_default();
+        let files = &shards[0];
         let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
+        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
         let mut sql = format!(
             "SELECT * FROM (SELECT {udf}({common}, {files}) EMITS ({emits}))",
             udf = udf_name,
@@ -1067,7 +1067,7 @@ fn build_row_scan_sql(
         }
         sql
     } else {
-        let inner = build_fan_out_inner(spec_template, &shards, &emits, udf_name);
+        let inner = build_fan_out_inner(spec_template, shards, &emits, udf_name);
         let mut sql = format!("SELECT * FROM ({inner})");
         if let Some(n) = limit {
             sql.push_str(&format!(" LIMIT {n}"));
@@ -1083,7 +1083,7 @@ fn build_row_scan_sql(
 /// exact column names.
 fn build_aggregate_scan_sql(
     spec_template: &ScanSpec,
-    shards: Vec<Vec<String>>,
+    shards: &[Vec<(String, u64)>],
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
     aggregate_types: &[String],
@@ -1094,9 +1094,9 @@ fn build_aggregate_scan_sql(
     let merge_select = cast_merge_items(aggregates, aggregate_types).join(", ");
 
     let fan_out = if shards.len() == 1 {
-        let files = shards.into_iter().next().unwrap_or_default();
+        let files = &shards[0];
         let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
+        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
         format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
@@ -1105,7 +1105,7 @@ fn build_aggregate_scan_sql(
             emits = emits,
         )
     } else {
-        build_fan_out_inner(spec_template, &shards, &emits, udf_name)
+        build_fan_out_inner(spec_template, shards, &emits, udf_name)
     };
 
     format!("SELECT {merge_select} FROM ({fan_out})")
@@ -1148,7 +1148,7 @@ fn build_aggregate_scan_sql(
 #[allow(clippy::too_many_arguments)]
 pub fn build_grouped_aggregate_scan_sql(
     spec_template: &ScanSpec,
-    shards: Vec<Vec<String>>,
+    shards: &[Vec<(String, u64)>],
     group_keys: &[String],
     group_key_types: &[String],
     aggregates: &[AggregatePlan],
@@ -1218,9 +1218,9 @@ pub fn build_grouped_aggregate_scan_sql(
     let mut common_template = spec_template.clone();
     common_template.limit = None;
     let fan_out = if shards.len() == 1 {
-        let files = shards.into_iter().next().unwrap_or_default();
+        let files = &shards[0];
         let common_literal = sql_string_literal(&common_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(&files));
+        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
         format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
@@ -1229,7 +1229,7 @@ pub fn build_grouped_aggregate_scan_sql(
             emits = emits,
         )
     } else {
-        build_fan_out_inner(&common_template, &shards, &emits, udf_name)
+        build_fan_out_inner(&common_template, shards, &emits, udf_name)
     };
 
     let mut sql =
@@ -1605,7 +1605,7 @@ fn cast_merge_items(aggregates: &[AggregatePlan], aggregate_types: &[String]) ->
 /// `None`, so the shared common blob carries no LIMIT for every shard by construction.
 pub fn build_fan_out_inner(
     spec_template: &ScanSpec,
-    shards: &[Vec<String>],
+    shards: &[Vec<(String, u64)>],
     emits: &str,
     udf_name: &str,
 ) -> String {
@@ -1627,6 +1627,48 @@ pub fn build_fan_out_inner(
         emits = emits,
         values = values_list,
     )
+}
+
+/// Emit a file path relative to `table_root` when the file lives under it,
+/// otherwise pass the absolute path through unchanged.
+///
+/// Stripping happens ONLY at a real path-segment boundary: the root must be a
+/// prefix AND either end with `/` or be followed by a `/` in the path. A path that
+/// merely shares the root as a bare string prefix (e.g. `<root>-archive/...`,
+/// `<root>2/...`) or one exactly equal to the root does NOT match, so it stays
+/// absolute — this keeps the round-trip with the scan UDF's single-`/` join lossless
+/// and avoids emitting an empty relative entry. After a boundary match the root
+/// prefix and then a single leading `/` are stripped, so the relative path has no
+/// leading slash. An empty `table_root` (legacy / no resolved root) always yields an
+/// absolute path.
+fn relativize_path_to_root(path: &str, table_root: &str) -> String {
+    let at_segment_boundary = !table_root.is_empty()
+        && path.starts_with(table_root)
+        && (table_root.ends_with('/') || path[table_root.len()..].starts_with('/'));
+    if at_segment_boundary {
+        let rest = &path[table_root.len()..];
+        rest.strip_prefix('/').unwrap_or(rest).to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Strip `table_root` from every under-root file path in each shard (see
+/// [`relativize_path_to_root`]) while preserving byte sizes and shard membership.
+/// Paths not under the root stay absolute.
+fn relativize_shards_to_root(
+    shards: Vec<Vec<(String, u64)>>,
+    table_root: &str,
+) -> Vec<Vec<(String, u64)>> {
+    shards
+        .into_iter()
+        .map(|shard| {
+            shard
+                .into_iter()
+                .map(|(path, size)| (relativize_path_to_root(&path, table_root), size))
+                .collect()
+        })
+        .collect()
 }
 
 /// Resolve the Iceberg snapshot + file list and build pushdown SQL.
@@ -1684,7 +1726,7 @@ pub async fn handle_pushdown(
     // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
     // filter_json_raw is forwarded for Iceberg-level file pruning; ScanSpec.filter
     // (DataFusion SQL string) is set separately above and left completely unchanged.
-    let (files, effective_storage, logical_schema) =
+    let (files, effective_storage, logical_schema, table_root) =
         resolve_file_list(catalog_uri, catalog, storage, creds, filter_json_raw).await?;
     let storage = &effective_storage;
 
@@ -1696,6 +1738,11 @@ pub async fn handle_pushdown(
     // partition files into G byte-balanced work-unit shards (GROUP BY shard_key fan-out).
     let g = shard_count(cluster_nodes, parallelism_factor, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+    // Emit each under-root file path relative to `table_root` (carried once in the
+    // common blob) so the per-shard payload stops repeating the table-location
+    // prefix. Sizes and shard membership are unchanged; paths not under the root
+    // stay absolute. The scan UDF rejoins relative paths onto `table_root`.
+    let shards = relativize_shards_to_root(shards, &table_root);
 
     // The scan UDF must be schema-qualified: the pushdown query executes
     // outside the adapter script's schema, so an unqualified name would not
@@ -1761,6 +1808,7 @@ pub async fn handle_pushdown(
             };
             // Grouped aggregate pushdown path.
             let spec_template = ScanSpec {
+                table_root: table_root.clone(),
                 files: vec![],
                 projection: proj_cols.clone(),
                 filter,
@@ -1782,7 +1830,7 @@ pub async fn handle_pushdown(
             let aggregate_types = aggregate_exasol_types(&pushdown_req);
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
-                shards,
+                &shards,
                 &group_keys,
                 &group_key_types,
                 &grouped_agg_plans,
@@ -1804,6 +1852,7 @@ pub async fn handle_pushdown(
         detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
 
     let spec_template = ScanSpec {
+        table_root,
         files: vec![], // replaced per shard in build_scan_driving_sql
         projection: proj_cols.clone(),
         filter,
@@ -1827,7 +1876,7 @@ pub async fn handle_pushdown(
     let aggregate_types = aggregate_exasol_types(&pushdown_req);
     let sql = build_scan_driving_sql(
         &spec_template,
-        shards,
+        &shards,
         &proj_cols,
         &proj_types,
         limit,
@@ -1885,7 +1934,7 @@ pub async fn resolve_file_list(
     storage: &StorageProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
-) -> Result<(Vec<(String, u64)>, StorageProps, Vec<LogicalField>), UdfError> {
+) -> Result<(Vec<(String, u64)>, StorageProps, Vec<LogicalField>, String), UdfError> {
     // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
     // catalog-auth mode applies, then derive the effective storage gated SOLELY on
     // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
@@ -1899,6 +1948,10 @@ pub async fn resolve_file_list(
     // (also an S3 URI) when absent. The catalog REST URI is an HTTPS endpoint and
     // can never match an S3 prefix — do NOT use it here.
     let table_s3_location = result.metadata.location();
+    // Own the table root before `result.metadata` is moved into the table builder
+    // below. Returned so the adapter can carry it once in the common blob and emit
+    // per-shard file paths relative to it (empty ⇒ every path stays absolute).
+    let table_root = table_s3_location.to_string();
     let anchor: &str = if !table_s3_location.is_empty() {
         table_s3_location
     } else {
@@ -1941,7 +1994,7 @@ pub async fn resolve_file_list(
     let logical_schema = build_logical_schema(table.metadata().current_schema());
 
     let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
-    Ok((files, effective_storage, logical_schema))
+    Ok((files, effective_storage, logical_schema, table_root))
 }
 
 /// Drive the iceberg scan and collect the data-file paths with their sizes.
@@ -2623,6 +2676,7 @@ mod tests {
             .zip(proj_types.iter().cloned())
             .collect();
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: proj_cols.clone(),
             filter,
@@ -2643,7 +2697,7 @@ mod tests {
             crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &proj_cols,
             &proj_types,
             limit,
@@ -2662,6 +2716,270 @@ mod tests {
         let rest = &sql[start..];
         let end = rest.find('\'').expect("common literal must be closed");
         &rest[..end]
+    }
+
+    /// Build row-scan SQL the way `handle_pushdown` does for a resolved
+    /// `(path, size)` file list under `table_root`: partition into shards,
+    /// relativize under-root paths, then build. Exercises the SAME production
+    /// stripping (`relativize_shards_to_root`) that runs in `handle_pushdown`, so
+    /// the emitted per-shard paths match production exactly.
+    fn build_row_sql_with_root(
+        files: Vec<(String, u64)>,
+        table_root: &str,
+        proj_cols: Vec<String>,
+        proj_types: Vec<String>,
+        cluster_nodes: usize,
+    ) -> String {
+        let col_types: Vec<(String, String)> = proj_cols
+            .iter()
+            .cloned()
+            .zip(proj_types.iter().cloned())
+            .collect();
+        let spec_template = ScanSpec {
+            table_root: table_root.to_string(),
+            files: vec![],
+            projection: proj_cols.clone(),
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: proj_types.clone(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+        };
+        let g = shard_count(cluster_nodes, 1, files.len());
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let shards = relativize_shards_to_root(shards, table_root);
+        build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &proj_cols,
+            &proj_types,
+            None,
+            &col_types,
+            &[],
+            SCAN_UDF_NAME,
+        )
+    }
+
+    /// Pushdown carries the table root ONCE in the common blob and per-shard file
+    /// sizes travel into the shard payloads (verification scenario, CHANGED).
+    #[test]
+    fn pushdown_carries_table_root_and_sizes_in_common_and_shards() {
+        let root = "s3://warehouse/db/events";
+        let files = vec![
+            (format!("{root}/part-00000.parquet"), 1024u64),
+            (format!("{root}/part-00001.parquet"), 2048u64),
+        ];
+        // Two nodes → two shards (one file each) so a genuine fan-out is emitted.
+        let sql = build_row_sql_with_root(
+            files,
+            root,
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            2,
+        );
+
+        // The table root is carried in the shard-invariant common blob.
+        let common = common_arg_literal(&sql);
+        assert!(
+            common.contains(&format!(r#""table_root":"{root}""#)),
+            "common blob must carry table_root once: {common}"
+        );
+
+        // Each per-shard payload carries its file's byte size as a [path,size] tuple.
+        assert!(
+            sql.contains(r#"[["part-00000.parquet",1024]]"#),
+            "shard payload must carry relative path + size for file 0: {sql}"
+        );
+        assert!(
+            sql.contains(r#"[["part-00001.parquet",2048]]"#),
+            "shard payload must carry relative path + size for file 1: {sql}"
+        );
+    }
+
+    /// The table root is stripped from every under-root path and appears EXACTLY
+    /// ONCE (in the common literal), NEVER in a per-shard VALUES literal (NEW).
+    #[test]
+    fn table_root_stripped_from_under_root_paths_and_carried_once() {
+        let root = "s3://warehouse/db/events";
+        let files = vec![
+            (format!("{root}/part-00000.parquet"), 1024u64),
+            (format!("{root}/part-00001.parquet"), 2048u64),
+        ];
+        let sql = build_row_sql_with_root(
+            files,
+            root,
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            2,
+        );
+
+        // The root string occurs exactly once in the whole statement: in the common
+        // blob's table_root. Stripped relative paths never repeat the prefix.
+        assert_eq!(
+            sql.matches(root).count(),
+            1,
+            "table root must appear exactly once (common blob only), never per shard: {sql}"
+        );
+        // That single occurrence lives in the common literal.
+        assert!(
+            common_arg_literal(&sql).contains(root),
+            "the sole table-root occurrence must be in the common blob: {sql}"
+        );
+        // The per-shard VALUES section (everything after the common literal) carries
+        // only relative paths.
+        assert!(
+            sql.contains("part-00000.parquet") && sql.contains("part-00001.parquet"),
+            "shards must carry the relative file names: {sql}"
+        );
+    }
+
+    /// A data-file path NOT under the table root is carried as a full absolute URI
+    /// (NEW).
+    #[test]
+    fn path_not_under_root_stays_absolute() {
+        let root = "s3://warehouse/db/events";
+        let outside = "s3://other-bucket/external/f.parquet";
+        let files = vec![
+            (format!("{root}/part-00000.parquet"), 1024u64),
+            (outside.to_string(), 2048u64),
+        ];
+        let sql = build_row_sql_with_root(
+            files,
+            root,
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            2,
+        );
+
+        // The under-root file is emitted relative.
+        assert!(
+            sql.contains(r#"["part-00000.parquet",1024]"#),
+            "under-root path must be relativized: {sql}"
+        );
+        // The not-under-root file keeps its full absolute URI, with its size.
+        assert!(
+            sql.contains(&format!(r#"["{outside}",2048]"#)),
+            "path outside the table root must stay absolute: {sql}"
+        );
+        // The table root is still carried exactly once (the absolute outside path
+        // does not contain the root prefix).
+        assert_eq!(
+            sql.matches(root).count(),
+            1,
+            "table root must appear exactly once even with an out-of-root file: {sql}"
+        );
+    }
+
+    /// Mirror of the scan UDF's `reconstruct_abs_uri` join rule, so the round-trip
+    /// invariant can be asserted here without a cross-crate dependency: an entry that
+    /// already carries a scheme (`"://"`) is absolute and returned unchanged; any
+    /// other entry is joined onto the root with exactly one `/`.
+    fn reconstruct_abs_uri_mirror(entry_path: &str, table_root: &str) -> String {
+        if entry_path.contains("://") {
+            return entry_path.to_string();
+        }
+        let root = table_root.strip_suffix('/').unwrap_or(table_root);
+        let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
+        format!("{root}/{rel}")
+    }
+
+    /// A path that shares the table root only as a bare STRING prefix (no `/`
+    /// segment boundary) must NOT be relativized: stripping it and rejoining with a
+    /// single `/` corrupts the URI (finding R.1). Only true under-root paths are
+    /// stripped; everything else stays absolute and round-trips to itself.
+    #[test]
+    fn sibling_prefix_paths_are_not_relativized() {
+        let root = "s3://w/db/events";
+
+        // A genuine under-root path IS relativized (existing behavior preserved).
+        let under = format!("{root}/data/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&under, root),
+            "data/f.parquet",
+            "under-root path must be relativized"
+        );
+
+        // Sibling directories that share the root as a bare prefix but break at no
+        // `/` boundary stay ABSOLUTE (not stripped).
+        let archive = format!("{root}-archive/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&archive, root),
+            archive,
+            "sibling '-archive' path must stay absolute"
+        );
+        let sibling2 = format!("{root}2/data/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&sibling2, root),
+            sibling2,
+            "sibling '2' path must stay absolute"
+        );
+
+        // A path exactly equal to the root stays absolute (no empty entry).
+        assert_eq!(
+            relativize_path_to_root(root, root),
+            root,
+            "path equal to the root must stay absolute, not become an empty entry"
+        );
+
+        // Every case round-trips back to the original absolute path through the
+        // scan UDF's reconstruct rule.
+        for original in [&under, &archive, &sibling2, &root.to_string()] {
+            let emitted = relativize_path_to_root(original, root);
+            assert_eq!(
+                reconstruct_abs_uri_mirror(&emitted, root),
+                *original,
+                "round-trip must be identity for {original}"
+            );
+        }
+    }
+
+    /// Multi-shard fan-out carries the root once in the common literal and each
+    /// per-shard literal is a `[[path,size],...]` tuple array (CHANGED).
+    #[test]
+    fn fan_out_carries_root_once_and_path_size_tuples_per_shard() {
+        let root = "s3://warehouse/db/events";
+        let files = vec![
+            (format!("{root}/part-00000.parquet"), 1024u64),
+            (format!("{root}/part-00001.parquet"), 2048u64),
+        ];
+        let sql = build_row_sql_with_root(
+            files,
+            root,
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            2,
+        );
+
+        // Fan-out shape: GROUP BY shard_key over a VALUES table, never IPROC().
+        assert!(
+            !sql.contains("IPROC()"),
+            "fan-out must not use IPROC(): {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY shard_key") && sql.contains("AS shards(shard_key, files)"),
+            "fan-out must GROUP BY shard_key over the VALUES table: {sql}"
+        );
+
+        // Root carried once (common blob), not repeated per shard.
+        assert_eq!(
+            sql.matches(root).count(),
+            1,
+            "root must be serialized once in the common blob: {sql}"
+        );
+
+        // Each per-shard files literal is a JSON array of [path,size] 2-tuples.
+        assert!(
+            sql.contains(r#"[["part-00000.parquet",1024]]"#)
+                && sql.contains(r#"[["part-00001.parquet",2048]]"#),
+            "each shard literal must be a [[path,size],...] tuple array: {sql}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -3086,6 +3404,7 @@ mod tests {
     fn aggregate_query_builds_partial_agg_spec() {
         // Build a spec_template as handle_pushdown would.
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec!["AMOUNT".into()],
             filter: Some("(\"REGION\" = 'EU')".into()),
@@ -3112,11 +3431,11 @@ mod tests {
         };
 
         // Build single-shard SQL and decode the embedded spec literal.
-        let shards = vec![vec!["s3://warehouse/f.parquet".into()]];
+        let shards = vec![vec![("s3://warehouse/f.parquet".to_string(), 1u64)]];
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
         let sql = build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &["AMOUNT".to_string()],
             &["DOUBLE PRECISION".to_string()],
             None,
@@ -3131,7 +3450,7 @@ mod tests {
         let spec_json = {
             // Reconstruct the shard spec as the builder would.
             let mut s = spec_template.clone();
-            s.files = vec!["s3://warehouse/f.parquet".into()];
+            s.files = vec![("s3://warehouse/f.parquet".into(), 1)];
             s.to_json()
         };
         let parsed = ScanSpec::from_json(&spec_json).expect("spec must parse");
@@ -3250,6 +3569,7 @@ mod tests {
         cluster_nodes: usize,
     ) -> String {
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -3270,7 +3590,7 @@ mod tests {
             crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &[],
             &[],
             None,
@@ -3381,6 +3701,7 @@ mod tests {
             column: Some("SCORE".into()),
         }];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -3396,12 +3717,12 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
+        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
         let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
         let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
         let sql = build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &[],
             &[],
             None,
@@ -3423,6 +3744,7 @@ mod tests {
             column: Some("SCORE".into()),
         }];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -3438,10 +3760,10 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://warehouse/f0.parquet".into()]];
+        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
         let sql = build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &[],
             &[],
             None,
@@ -4092,8 +4414,8 @@ mod tests {
         for (i, shard) in shards.iter().enumerate() {
             assert!(!shard.is_empty(), "shard {i} must not be empty");
         }
-        // All files covered exactly once.
-        let all: Vec<String> = shards.iter().flatten().cloned().collect();
+        // All files covered exactly once (compare by path; sizes travel alongside).
+        let all: Vec<String> = shards.iter().flatten().map(|(p, _)| p.clone()).collect();
         let unique: HashSet<&String> = all.iter().collect();
         assert_eq!(
             unique.len(),
@@ -4119,6 +4441,7 @@ mod tests {
             .collect();
         let g = shard_count(3, 1, files.len());
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec!["ID".into()],
             filter: None,
@@ -4137,7 +4460,7 @@ mod tests {
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &["ID".to_string()],
             &["DECIMAL(20,0)".to_string()],
             None,
@@ -4165,6 +4488,7 @@ mod tests {
         let files = vec![("s3://warehouse/f0.parquet".to_string(), 500u64)];
         let g = shard_count(1, 1, files.len());
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec!["ID".into()],
             filter: None,
@@ -4183,7 +4507,7 @@ mod tests {
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
             &spec_template,
-            shards,
+            &shards,
             &["ID".to_string()],
             &["DECIMAL(20,0)".to_string()],
             None,
@@ -4243,6 +4567,7 @@ mod tests {
             ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
         ];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -4263,7 +4588,7 @@ mod tests {
         let select_items = keys_first_select_items(group_keys.len(), agg_plans.len());
         build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &group_keys,
             &[],
             &agg_plans,
@@ -4335,6 +4660,7 @@ mod tests {
         let g = shard_count(1, 1, files.len());
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -4356,7 +4682,7 @@ mod tests {
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &["\"REGION\"".to_string()],
             &[],
             &[AggregatePlan {
@@ -4498,6 +4824,7 @@ mod tests {
             ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
         ];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -4513,10 +4840,10 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &group_keys,
             &group_key_types,
             &agg_plans,
@@ -4761,6 +5088,7 @@ mod tests {
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -4776,10 +5104,10 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &detection.group_keys,
             &group_key_types,
             &detection.plans,
@@ -4846,6 +5174,7 @@ mod tests {
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,
@@ -4861,10 +5190,10 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://wh/f0.parquet".to_string()]];
+        let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &detection.group_keys,
             &group_key_types,
             &detection.plans,
@@ -4944,7 +5273,8 @@ mod tests {
     fn grouped_scan_spec_carries_group_keys() {
         let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
         let spec = ScanSpec {
-            files: vec!["s3://w/f0.parquet".into()],
+            table_root: String::new(),
+            files: vec![("s3://w/f0.parquet".into(), 1)],
             projection: vec![],
             filter: None,
             limit: None,
@@ -5375,6 +5705,7 @@ mod tests {
         // Build a grouped aggregate SQL with a HAVING predicate.
         let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
         let spec_template = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec!["REGION".into(), "AMOUNT".into()],
             filter: None,
@@ -5393,14 +5724,14 @@ mod tests {
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
         };
-        let shards = vec![vec!["s3://wh/f.parquet".into()]];
+        let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
         let col_types = vec![
             ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
             ("AMOUNT".to_string(), "DOUBLE PRECISION".to_string()),
         ];
         let sql = build_grouped_aggregate_scan_sql(
             &spec_template,
-            shards,
+            &shards,
             &[r#""REGION""#.to_string()],
             &[],
             &[AggregatePlan {
@@ -6230,7 +6561,8 @@ mod tests {
         // Build a spec exactly as handle_pushdown does — auth creds exist but are
         // NEVER threaded into ScanSpec (it has no auth fields by construction).
         let spec = ScanSpec {
-            files: vec!["s3://warehouse/db/events/part-00000.parquet".into()],
+            table_root: String::new(),
+            files: vec![("s3://warehouse/db/events/part-00000.parquet".into(), 1)],
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
@@ -6827,7 +7159,8 @@ mod tests {
         };
 
         let spec = ScanSpec {
-            files: vec!["s3://warehouse/db/events/part-00000.parquet".into()],
+            table_root: String::new(),
+            files: vec![("s3://warehouse/db/events/part-00000.parquet".into(), 1)],
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
@@ -7250,6 +7583,7 @@ mod tests {
 
         // Verify round-trip through ScanSpec: logical_schema survives JSON serde.
         let spec = ScanSpec {
+            table_root: String::new(),
             files: vec![],
             projection: vec![],
             filter: None,

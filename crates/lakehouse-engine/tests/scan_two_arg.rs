@@ -120,8 +120,12 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
 }
 
 fn scan_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some("\"ID\" >= 10".into()),
         limit: None,
@@ -252,7 +256,7 @@ fn scan_registers_only_assigned_files_two_arg() {
 /// preserved for both arguments (mirrors the pre-split single-arg NULL check).
 #[test]
 fn two_arg_null_in_either_argument_is_user_error() {
-    let files_json = ScanSpec::files_json(&["s3://w/f0.parquet".to_string()]);
+    let files_json = ScanSpec::files_json(&[("s3://w/f0.parquet".to_string(), 0)]);
     let common_json = scan_spec("s3://w/f0.parquet".into()).to_common_json();
 
     // NULL common blob (col 0).

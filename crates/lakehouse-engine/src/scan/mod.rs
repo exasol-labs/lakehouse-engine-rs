@@ -14,6 +14,8 @@ use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
+use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -28,8 +30,14 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use exasol_udf_sdk::value::Value;
 use futures::StreamExt;
-use object_store::ObjectStore;
+use futures::stream::BoxStream;
 use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectStorePath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
@@ -612,15 +620,156 @@ fn build_session_context(
 
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
-    // Register the MinIO object store for the S3 URL scheme.
+    // Register the MinIO object store for the S3 URL scheme, wrapped so that
+    // per-file HEAD requests are answered from the caller-supplied sizes in the
+    // spec instead of issuing an object-store HEAD over the network.
     let bucket = extract_bucket(spec)?;
     let s3 = build_s3_store(&spec.storage, &bucket)?;
+    let sizes = build_spec_size_index(spec)?;
+    let sized_store = SpecSizedObjectStore::new(Arc::new(s3), sizes);
     let store_url = Url::parse(&format!("s3://{bucket}"))
         .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
     ctx.runtime_env()
-        .register_object_store(&store_url, Arc::new(s3));
+        .register_object_store(&store_url, Arc::new(sized_store));
 
     Ok(ctx)
+}
+
+/// Reconstruct the absolute file URI for a per-shard `(path, _)` entry.
+///
+/// An entry that already contains a scheme (`"://"`) is absolute and returned
+/// unchanged. Otherwise it is relative to `table_root` and joined onto it with
+/// exactly one `/` separator (a trailing `/` on the root and a leading `/` on the
+/// entry are both trimmed first, so the separator is neither doubled nor dropped).
+fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
+    if entry_path.contains("://") {
+        return entry_path.to_string();
+    }
+    let root = table_root.strip_suffix('/').unwrap_or(table_root);
+    let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
+    format!("{root}/{rel}")
+}
+
+/// Build the map of caller-known file sizes keyed by the object-store [`Path`]
+/// the store observes in `head` — i.e. the `ListingTableUrl` prefix DataFusion
+/// passes for an exact-file (non-collection) URL. Keying by that prefix is what
+/// lets [`SpecSizedObjectStore`] satisfy each per-file metadata lookup from the
+/// spec without a network round-trip.
+///
+/// [`Path`]: object_store::path::Path
+fn build_spec_size_index(spec: &ScanSpec) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
+    let mut sizes = HashMap::with_capacity(spec.files.len());
+    for (path, size) in &spec.files {
+        let abs = reconstruct_abs_uri(path, &spec.table_root);
+        let url = ListingTableUrl::parse(&abs)
+            .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))?;
+        sizes.insert(url.prefix().clone(), *size);
+    }
+    Ok(sizes)
+}
+
+/// An [`ObjectStore`] decorator that answers per-file metadata (`head`) from a
+/// caller-supplied size index instead of the network, delegating every other
+/// operation to the wrapped store.
+///
+/// DataFusion resolves an exact-file `ListingTableUrl` by calling `head` on the
+/// store, which (object_store 0.13.2) dispatches through the `ObjectStoreExt`
+/// blanket to `get_opts(location, GetOptions { head: true, .. })`. So the HEAD is
+/// intercepted here in `get_opts`: when `head` is set and the location is present
+/// in the index, a synthetic [`ObjectMeta`] built from the spec size is returned
+/// with no I/O. Data reads (`head == false`) and all non-`get_opts` operations
+/// fall through to the inner store unchanged.
+#[derive(Debug)]
+struct SpecSizedObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    sizes: HashMap<ObjectStorePath, u64>,
+}
+
+impl SpecSizedObjectStore {
+    fn new(inner: Arc<dyn ObjectStore>, sizes: HashMap<ObjectStorePath, u64>) -> Self {
+        Self { inner, sizes }
+    }
+}
+
+impl std::fmt::Display for SpecSizedObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SpecSizedObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for SpecSizedObjectStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectStorePath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectStorePath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if options.head
+            && let Some(&size) = self.sizes.get(location)
+        {
+            let meta = ObjectMeta {
+                location: location.clone(),
+                last_modified: Utc.timestamp_nanos(0),
+                size,
+                e_tag: None,
+                version: None,
+            };
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(futures::stream::empty().boxed()),
+                meta,
+                range: 0..0,
+                attributes: object_store::Attributes::default(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectStorePath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectStorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }
 
 /// Build an AmazonS3 (MinIO-compatible) object store from StorageProps.
@@ -661,16 +810,22 @@ fn build_s3_store(
     })
 }
 
-/// Extract the S3 bucket name from the first file URI in the spec.
+/// Extract the S3 bucket name from the first file in the spec.
+///
+/// The first entry may now be relative to `table_root`, so it is reconstructed
+/// into its absolute URI first (a `://`-bearing entry passes through unchanged);
+/// the bucket is then the host of that absolute URI. For the all-absolute case
+/// (empty `table_root`) reconstruction is a no-op, so behavior is unchanged.
 fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
-    let first = spec
+    let (first, _size) = spec
         .files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
-    let url = Url::parse(first).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
+    let abs = reconstruct_abs_uri(first, &spec.table_root);
+    let url = Url::parse(&abs).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
     url.host_str()
         .map(|h| h.to_string())
-        .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {first}")))
+        .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {abs}")))
 }
 
 /// Build the DataFrame: register files as a ListingTable, then apply
@@ -705,9 +860,10 @@ async fn register_files(
     let table_paths: Vec<ListingTableUrl> = spec
         .files
         .iter()
-        .map(|f| {
-            ListingTableUrl::parse(f)
-                .map_err(|e| UdfError::User(format!("invalid listing URL '{f}': {e}")))
+        .map(|(path, _size)| {
+            let abs = reconstruct_abs_uri(path, &spec.table_root);
+            ListingTableUrl::parse(&abs)
+                .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))
         })
         .collect::<Result<_, _>>()?;
 
@@ -1090,7 +1246,8 @@ mod tests {
     /// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
     fn minimal_spec() -> ScanSpec {
         ScanSpec {
-            files: vec!["s3://test-bucket/data/part-0.parquet".into()],
+            table_root: String::new(),
+            files: vec![("s3://test-bucket/data/part-0.parquet".into(), 1024)],
             projection: vec![],
             filter: None,
             limit: None,
@@ -1173,6 +1330,145 @@ mod tests {
         assert!(
             expected > MIN_POOL_FLOOR_BYTES as usize,
             "expected budget must exceed the floor"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Absolute-URI reconstruction, size-index keying, bucket extraction, and the
+    // spec-size HEAD wrapper (Group D: tasks 4.1–4.3)
+    // ---------------------------------------------------------------------------
+
+    /// 4.1: a `://`-bearing entry is absolute and passes through unchanged.
+    #[test]
+    fn reconstruct_absolute_entry_passes_through() {
+        assert_eq!(
+            reconstruct_abs_uri(
+                "s3://bucket/db/table/data/f.parquet",
+                "s3://bucket/db/table"
+            ),
+            "s3://bucket/db/table/data/f.parquet"
+        );
+        // Passthrough holds even against an empty root.
+        assert_eq!(
+            reconstruct_abs_uri("s3://other/x.parquet", ""),
+            "s3://other/x.parquet"
+        );
+    }
+
+    /// 4.1: a relative entry joins onto the root with exactly one separator,
+    /// regardless of a trailing `/` on the root or a leading `/` on the entry.
+    #[test]
+    fn reconstruct_relative_entry_normalizes_single_separator() {
+        let expected = "s3://bucket/db/table/data/f.parquet";
+        // Neither side carries the separator.
+        assert_eq!(
+            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table"),
+            expected
+        );
+        // Trailing slash on the root only.
+        assert_eq!(
+            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table/"),
+            expected
+        );
+        // Leading slash on the entry only.
+        assert_eq!(
+            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table"),
+            expected
+        );
+        // Both sides carry the separator — still not doubled.
+        assert_eq!(
+            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table/"),
+            expected
+        );
+    }
+
+    /// 4.2: the size index is keyed by the object-store `Path` DataFusion passes
+    /// to `head` for an exact-file URL — i.e. the `ListingTableUrl` prefix. A
+    /// relative entry keys under the reconstructed path; an absolute entry keys
+    /// under its own path.
+    #[test]
+    fn size_index_keys_by_listing_url_prefix() {
+        let mut spec = minimal_spec();
+        spec.table_root = "s3://bucket/db/table".into();
+        spec.files = vec![
+            ("data/rel.parquet".into(), 111),
+            ("s3://bucket/db/table/data/abs.parquet".into(), 222),
+        ];
+        let index = build_spec_size_index(&spec).expect("index must build");
+
+        let rel_key = ObjectStorePath::from("db/table/data/rel.parquet");
+        let abs_key = ObjectStorePath::from("db/table/data/abs.parquet");
+        assert_eq!(index.get(&rel_key), Some(&111));
+        assert_eq!(index.get(&abs_key), Some(&222));
+
+        // The keys equal what an exact-file ListingTableUrl reports as its prefix
+        // (the value DataFusion 54 hands to head()).
+        let rel_url = ListingTableUrl::parse("s3://bucket/db/table/data/rel.parquet").unwrap();
+        assert_eq!(rel_url.prefix(), &rel_key);
+    }
+
+    /// 4.3: the bucket is derived from the reconstructed absolute URI of the
+    /// first file — for a relative first entry it comes via the table root, for
+    /// an absolute-only spec (empty root) behavior is unchanged.
+    #[test]
+    fn extract_bucket_handles_relative_and_absolute_first_entry() {
+        // Relative first entry: bucket comes from the table root.
+        let mut rel = minimal_spec();
+        rel.table_root = "s3://warehouse/db/table".into();
+        rel.files = vec![("data/part-0.parquet".into(), 1)];
+        assert_eq!(extract_bucket(&rel).unwrap(), "warehouse");
+
+        // Absolute first entry, empty root (legacy): unchanged behavior.
+        let mut abs = minimal_spec();
+        abs.table_root = String::new();
+        abs.files = vec![("s3://legacy-bucket/data/part-0.parquet".into(), 1)];
+        assert_eq!(extract_bucket(&abs).unwrap(), "legacy-bucket");
+    }
+
+    /// 4.2: the wrapper answers a HEAD (`get_opts` with `head`) from the size
+    /// index with no I/O, and falls through to the inner store for an unknown
+    /// path and for data reads.
+    #[tokio::test]
+    async fn sized_store_serves_head_from_index_and_delegates_otherwise() {
+        use object_store::ObjectStoreExt;
+        use object_store::memory::InMemory;
+
+        // An empty in-memory store: any real head/get is a NotFound, so a
+        // successful head can only have come from the size index.
+        let inner = Arc::new(InMemory::new());
+        let known = ObjectStorePath::from("db/table/data/f.parquet");
+        let mut sizes = HashMap::new();
+        sizes.insert(known.clone(), 4096u64);
+        let store = SpecSizedObjectStore::new(inner, sizes);
+
+        // Known path: metadata is synthesized from the spec size.
+        let meta = store
+            .head(&known)
+            .await
+            .expect("head of a known path must be served from the index");
+        assert_eq!(meta.size, 4096);
+        assert_eq!(meta.location, known);
+        assert!(meta.e_tag.is_none());
+        assert!(meta.version.is_none());
+
+        // Unknown path: head falls through to the inner store (NotFound).
+        let unknown = ObjectStorePath::from("db/table/data/missing.parquet");
+        assert!(
+            matches!(
+                store.head(&unknown).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "an unindexed path must delegate to the inner store"
+        );
+
+        // Data read (head == false) of the known path also delegates — the
+        // synthetic metadata must never satisfy an actual byte read.
+        assert!(
+            matches!(
+                store.get(&known).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "a data read must delegate to the inner store, not the size index"
         );
     }
 
@@ -1830,8 +2126,10 @@ mod tests {
             .to_string();
 
         // Build a spec with empty logical_schema — the fallback inference path.
+        // Absolute file:// entry (empty table_root) exercises the passthrough
+        // reconstruction branch; the size is unused for the local-FS store.
         let mut spec = minimal_spec();
-        spec.files = vec![file_url];
+        spec.files = vec![(file_url, 0)];
         spec.logical_schema = Vec::new();
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -1935,7 +2233,7 @@ mod tests {
         ];
 
         let mut spec = minimal_spec();
-        spec.files = vec![file_url];
+        spec.files = vec![(file_url, 0)];
         spec.logical_schema = logical;
         // The adapter pushes uppercase current-name projection.
         spec.projection = vec!["ID".to_string(), "RATING".to_string()];
@@ -2055,7 +2353,7 @@ mod tests {
         ];
 
         let mut spec = minimal_spec();
-        spec.files = vec![file_old, file_new];
+        spec.files = vec![(file_old, 0), (file_new, 0)];
         spec.logical_schema = logical;
         spec.projection = vec!["ID".to_string(), "RATING".to_string()];
 
