@@ -116,6 +116,60 @@ synchronous `MT_EMIT` round-trips. **No emit-path code was written** — the mic
 reproduce as a real-workload bottleneck; the deferred item is downgraded to "revisit only if a future
 profile isolates a coercion-dominated workload" rather than an actionable optimization.
 
+## Validation addendum 2 (2026-07-02): emit-path batch-size & connection sweep
+
+Follow-up to the re-gate above, isolating the two emit-path levers the prior pass left untested,
+on the **same** reduced-scale raw-emit workload (`CREATE TABLE AS SELECT * FROM TPCH.LINEITEM WHERE
+L_ORDERKEY < 33007128` = 33,006,459 rows; 60-file `lineitem`; cluster **test1**, `CLUSTER_NODES=2`,
+`PARALLELISM_FACTOR=8` ⇒ `G=16`, threading AUTO; native `IMPORT INTO` ceiling **2.07 M rows/s** from
+the re-gate, reused since the row-set is unchanged). Best of 2 passes/config; VS recreated per config
+(property resolved at `createVirtualSchema`, verified via `adapterNotes`); `FLUSH STATISTICS` between
+runs for the 10 GiB license.
+
+**Methodology note (honesty):** the first attempt ran two sweep instances concurrently against the
+same VS + `BENCH.LI_BS` table — they clobbered each other's batch-size setting and contended for the
+cluster, producing two mutually-contradictory datasets (0.89–1.32 M rows/s for the *same* config).
+Both were discarded. The authoritative numbers below are from a single sequential foreground run with
+nothing else touching the cluster.
+
+### Lever A — `DATAFUSION_BATCH_SIZE` (raw-emit `MT_EMIT` round-trip count): refuted as the bottleneck
+
+| batch size | ~round-trips | VS rows/s | gap |
+|---|---|---|---|
+| 8192 (default) | ~4,030 | 1,222,009 | 1.70× |
+| 32768 | ~1,007 | 1,278,824 | 1.62× |
+| 65536 (best) | ~504 | 1,306,669 | 1.59× |
+| 131072 | ~252 | 1,272,416 | 1.63× |
+
+A **16× reduction** in `MT_EMIT` round-trips (8192→131072) bought only **~7 %** throughput, plateauing
+at 32k–65k. The gap stays ~1.6×. **Refines** the re-gate's attribution: the round-trip *count* is a
+minor cost, not co-dominant with per-row conversion — if it were, 16× fewer would have moved far more
+than 7 %. The residual gap is dominated by per-*row* work (Arrow→`Value` materialization + DB-side row
+ingest), which scales with row count regardless of batching.
+
+### Lever B — `S3_MAX_CONNECTIONS` on the raw-emit path (bs=65536): refuted (as on Q4)
+
+AUTO(=4) 1,309,261 / 8: 1,310,820 / 32: 1,297,934 / 64: 1,311,341 / 128: 1,315,522 rows/s — a **~1.4 %**
+spread, gap fixed at ~1.58×. A wider fetch pipeline does not hide emit-wait; the emit path is no more
+fetch-concurrency-bound than the aggregate path was.
+
+### Aggregate-path regression check (Q1–Q4, bs 8192 vs 65536): no regression
+
+Q1 1.94→1.96 s, Q2 18.53→17.03 s (−8 %), Q3 15.75→15.30 s (−3 %), Q4 20.35→18.71 s (−8 %). 65536
+marginally *helps* the aggregate/join path; all within the prior sweep's ranges.
+
+### Decision — NOT pursued (evidence-gated, per ADR-055): shipped default stays 8192
+
+Neither lever closes the ~1.6× raw-emit gap; it is an architectural floor (UDF per-row
+materialization + emit protocol vs. native `IMPORT`'s bulk columnar loader), not a tunable. No
+shipped-crate change was made. `DATAFUSION_BATCH_SIZE=65536` is documented as an operator hint for
+emit-bound / wide `SELECT *` workloads (~7 % emit gain, no aggregate regression, memory-safe here),
+but the default remains **8192** — it matches DataFusion's own default and keeps the per-batch decode
+working set (out-of-pool RSS) small for memory-constrained deployments, where ~7 % does not justify an
+8× larger in-flight batch. Bench scaffolding added (not spec deltas): `bench/batch_size_sweep.sh`,
+`bench/emit_s3conn_sweep.sh`, `bench/batch_size_aggcheck.sh`, and a `BENCH_DF_BATCH_SIZE` knob in
+`bench/run.sh` (selftest extended, still passing).
+
 ## Review Findings
 
 <!-- Populated by speq-implement after code review. -->

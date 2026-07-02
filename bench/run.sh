@@ -52,6 +52,10 @@ build_vs_extra_props() {
     props="${props}$(printf "\n  DATAFUSION_THREADS_PER_UDF  = '%s'" "${BENCH_DF_THREADS_PER_UDF}")"
   [ -n "${BENCH_DF_TARGET_PARTITIONS:-}" ] && \
     props="${props}$(printf "\n  DATAFUSION_TARGET_PARTITIONS = '%s'" "${BENCH_DF_TARGET_PARTITIONS}")"
+  # Batch-size knob (raw-emit round-trip sweep): append DATAFUSION_BATCH_SIZE only
+  # when set, so the default run AUTO-uses 8192 and the offline selftest stays unchanged.
+  [ -n "${BENCH_DF_BATCH_SIZE:-}" ] && \
+    props="${props}$(printf "\n  DATAFUSION_BATCH_SIZE       = '%s'" "${BENCH_DF_BATCH_SIZE}")"
   # Connection-concurrency knob (Task 9): append S3_MAX_CONNECTIONS only when set,
   # so the default run AUTO-derives it and the offline selftest stays unchanged.
   [ -n "${BENCH_S3_MAX_CONNECTIONS:-}" ] && \
@@ -99,6 +103,11 @@ if [ "${1:-}" = "selftest" ]; then
   s3_props="$(BENCH_S3_MAX_CONNECTIONS=64 build_vs_extra_props false 8 1)"
   case "$s3_props" in *"PARALLELISM_FACTOR"*"'1'"*"S3_MAX_CONNECTIONS"*"'64'"*) ;; \
     *) echo "FAIL: S3_MAX_CONNECTIONS append shape: $s3_props"; exit 1;; esac
+  # DATAFUSION_BATCH_SIZE is appended only when the env knob is set (default run omits it).
+  case "$remote_props" in *"DATAFUSION_BATCH_SIZE"*) echo "FAIL: DATAFUSION_BATCH_SIZE must be absent when unset: $remote_props"; exit 1;; esac
+  bs_props="$(BENCH_DF_BATCH_SIZE=131072 build_vs_extra_props false 8 8)"
+  case "$bs_props" in *"PARALLELISM_FACTOR"*"'8'"*"DATAFUSION_BATCH_SIZE"*"'131072'"*) ;; \
+    *) echo "FAIL: DATAFUSION_BATCH_SIZE append shape: $bs_props"; exit 1;; esac
   echo "selftest OK"; exit 0
 fi
 
