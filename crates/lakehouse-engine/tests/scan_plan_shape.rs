@@ -47,8 +47,12 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
 }
 
 fn single_partition_spec(file_url: String) -> ScanSpec {
+    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
+        .map(|m| m.len())
+        .unwrap_or(0);
     ScanSpec {
-        files: vec![file_url],
+        table_root: String::new(),
+        files: vec![(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some(r#""ID" >= 10"#.into()),
         limit: None,
@@ -82,7 +86,7 @@ async fn raw_scan_plan_has_no_repartition_stage() {
     let spec = single_partition_spec(file_url);
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    ctx.register_parquet("scan_target", &spec.files[0], Default::default())
+    ctx.register_parquet("scan_target", &spec.files[0].0, Default::default())
         .await
         .expect("register local parquet");
 
@@ -144,7 +148,7 @@ async fn raw_scan_plan_has_no_repartition_stage() {
         .set_bool("datafusion.execution.parquet.pushdown_filters", false);
     let baseline_ctx = SessionContext::new_with_config(baseline_config);
     baseline_ctx
-        .register_parquet("scan_target", &spec.files[0], Default::default())
+        .register_parquet("scan_target", &spec.files[0].0, Default::default())
         .await
         .expect("register baseline parquet");
     let rows_baseline = collect_rows(&baseline_ctx, &spec).await;
