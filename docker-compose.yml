@@ -30,7 +30,8 @@ services:
         ipv4_address: 10.84.0.10
 
   minio-init:
-    image: minio/mc:latest
+    # Pinned (was :latest) — same rationale as the iceberg-rest-fixture pin below.
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
@@ -40,12 +41,20 @@ services:
       mc mb --ignore-existing local/warehouse &&
       echo 'bucket ready'
       "
-    restart: on-failure
+    # "no" (was on-failure): this is a one-shot job, not a long-running
+    # service — it either succeeds or it doesn't, there's nothing to restart.
+    # (`docker compose up --wait` doesn't reliably support one-shot containers
+    # regardless of restart policy — see the CI workflow's two-phase bring-up
+    # for the actual fix: `docker wait` this container instead of including it
+    # in the --wait set.)
+    restart: "no"
     networks:
       - lakehouse
 
   iceberg-rest:
-    image: apache/iceberg-rest-fixture:latest
+    # Pinned (was :latest) — an unpinned tag on a core E2E dependency is a
+    # silent-CI-break risk; 1.10.1 is Apache Iceberg's current stable release.
+    image: apache/iceberg-rest-fixture:1.10.1
     depends_on:
       minio:
         condition: service_healthy
@@ -75,7 +84,11 @@ services:
     # Give Exasol multiple CPUs so the scan UDF's shard fan-out + DataFusion
     # threading have cores to run on (the live-smoke test exercises this).
     cpus: "${LH_EXASOL_CPUS:-4}"
-    shm_size: "1g"
+    # 2g (was 1g): the UDF script VM needs far more than Docker's 64 MB
+    # default once it actually spawns a UDF sandbox — which this stack's E2E
+    # suite does (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), unlike sibling stacks
+    # that only run the DB uncapped without exercising the sandbox.
+    shm_size: "2g"
     environment:
       EXA_DB_MEM_SIZE: "${EXASOL_DB_MEM_SIZE:-4 GiB}"
       EXA_SYS_PASSWORD: "${EXASOL_SYS_PASSWORD:-exasol}"
