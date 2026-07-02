@@ -4,12 +4,17 @@ A disposable Rust SET UDF that, for one query, builds a DataFusion session, regi
 exactly the Iceberg/Parquet data files assigned to its shard, sizes its DataFusion
 `RuntimeEnv` memory pool from the per-instance memory limit reported in UDF metadata,
 applies the pushed-down projection, filter, and LIMIT, and streams the matching rows
-back as Arrow IPC batches. It holds no state and discovers no files of its own.
+back as Arrow IPC batches. It holds no state and discovers no files of its own. The
+UDF receives its scan spec as TWO VARCHAR arguments — a shard-invariant common spec
+serialized once for the whole fan-out, and a per-shard file-URI list — which it merges
+back into one `ScanSpec` at entry.
 
 ## Background
 
-* The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
+* The scan UDF receives two VARCHAR JSON arguments: `common` (shard-invariant: projection, filter, limit, aggregates, group keys, logical schema, EMITS types, storage credentials, and tuning knobs) and `files` (this shard's assigned file URIs). It merges them into one `ScanSpec` before running; see `datafusion-scan/scan-execution-spec-reconstitution` for the reconstitution and malformed-input scenarios.
 * The UDF MUST register only its assigned files and MUST NOT discover additional files.
+* `ScanSpec` carries no catalog identifier block — the scan UDF never contacts the catalog.
+* Only `Value::String` types cross the `.so` boundary; both arguments are VARCHAR JSON.
 * When the scan spec carries a logical Iceberg schema, column projection binds by Iceberg field-id (with a physical-name fallback) so results are correct across schema evolution; when it does not, the UDF falls back to first-file schema inference and physical-name binding.
 * On the raw-row path the UDF emits each Arrow `RecordBatch` via the SDK's Arrow-IPC
   emit path (`EmitBatch`, behind the `emit-arrow` feature), which serializes the batch
@@ -41,16 +46,18 @@ back as Arrow IPC batches. It holds no state and discovers no files of its own.
 * See `datafusion-scan/scan-execution-field-id-projection` for field-id-based column
   binding, physical-name fallback, null-fill for added nullable columns, and the
   backward-compatible first-file-inference fallback.
+* See `datafusion-scan/scan-execution-spec-reconstitution` for the two-argument
+  common/per-shard merge, malformed-input handling, and the no-catalog-block guarantee.
 
 ## Scenarios
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan spec listing specific Iceberg Parquet files in MinIO, carrying the logical Iceberg schema (each entry a `{field_id, name, arrow_type, nullable}` tuple derived once by the adapter)
+* *GIVEN* a scan invocation receiving TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical Iceberg schema, projection, filter, limit, storage credentials, and tuning knobs) and a per-shard files argument listing specific Iceberg Parquet files in MinIO
 * *AND* a projection naming a subset of columns
-* *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL create a DataFusion session and register only the assigned files as one `ListingTable` whose declared schema is the logical Iceberg schema (each field carrying its `PARQUET:field_id` metadata), NOT a schema inferred from the first file
-* *AND* the UDF MUST NOT resolve or discover any additional files from the catalog
+* *WHEN* the scan UDF runs for that invocation
+* *THEN* the UDF SHALL read the common spec from the first input argument and the file-URI list from the second, and reconstitute a single `ScanSpec` whose `files` come from the second argument and whose every other field comes from the first (only `Value::String` crossing the `.so` boundary — both arguments are VARCHAR JSON)
+* *AND* the UDF SHALL create a DataFusion session and register ONLY the files from the second argument as one `scan_target` whose declared schema is the logical Iceberg schema (each field carrying its `field_id` metadata), NOT a schema inferred from the first file, and MUST NOT resolve or discover any additional files from the catalog
 * *AND* the UDF SHALL emit one output row per scanned source row containing only the projected columns
 
 ### Scenario: Filter predicate restricts the emitted rows
