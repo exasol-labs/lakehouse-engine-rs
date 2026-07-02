@@ -43,23 +43,26 @@ jobs:
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+      # Swatinem/rust-cache (not raw actions/cache) because it PRUNES target/
+      # before saving: it strips this workspace's own crate artifacts +
+      # incremental data and keeps only dependency builds, so the cache stays
+      # small instead of ballooning with the full DataFusion/Arrow/Iceberg
+      # --all-targets debug tree (the bloat that filled the runner disk and
+      # ENOSPC-killed lint/unit-tests). It also keys on rustc + Cargo.lock
+      # automatically. This job is the SOLE writer of the `workspace` cache;
+      # the fan-out jobs restore it read-only (save-if: false) so they don't
+      # each race to save a multi-GB copy.
+      - name: Cache cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: workspace
 
       # The workspace has no default-members (see Cargo.toml) so `cargo build`
       # alone is a no-op by design; --workspace is required to actually
@@ -79,8 +82,20 @@ jobs:
     # a tight budget.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
+      # cached target/ restore can exhaust the ~21 GB default runner disk — the
+      # same ENOSPC class that killed lint/unit-tests. Reclaim ~12 GB up front.
+      # (Latent until now because CI has only hit the warm path; a Cargo.lock
+      # bump forces the cold path.)
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
+      - uses: actions/checkout@v7
+
+      # This build runs INSIDE rust:1.92-bookworm with its cargo home at
+      # /usr/local/cargo, so Swatinem/rust-cache (host-side, prunes via the host
+      # cargo) can't manage it — we stay on actions/cache.
+      #
       # UDF_CARGO_VOL defaults to a *named* Docker volume in the Makefile
       # (fine on a persistent dev machine); override it to a host path here so
       # actions/cache can persist the Docker-side cargo registry across runs.
@@ -89,13 +104,20 @@ jobs:
       # own target/ dir is otherwise empty on every fresh checkout. Cargo's
       # fingerprint check falls back to content hashes (not just mtimes) when
       # deciding what's stale, so it tolerates checkout resetting mtimes.
+      #
+      # restore-keys is what keeps a Cargo.lock bump from triggering a full
+      # ~33-min cold build: on a lockfile change the exact key misses, but the
+      # `docker-cargo-` prefix restores the most recent prior cache, so cargo
+      # recompiles only the changed crates instead of the whole dep graph.
       - name: Cache Docker-side cargo registry and target/
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo-docker-registry
             target/
           key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            docker-cargo-
 
       - name: Build liblakehouse_engine.so
         run: make cross-musl-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
@@ -109,7 +131,7 @@ jobs:
         run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
 
       - name: Upload liblakehouse_engine.so
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lakehouse-engine-so
           path: target/release/liblakehouse_engine.so
@@ -120,10 +142,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build]
     steps:
-      - uses: actions/checkout@v4
+      # Same rationale as the build job: reclaim ~12 GB before restoring the
+      # shared cache and compiling on top of it, so clippy's --all-targets pass
+      # doesn't ENOSPC on the ~21 GB default runner disk.
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
         with:
           components: clippy, rustfmt
 
@@ -134,16 +162,13 @@ jobs:
       - name: Ensure rustfmt/clippy available on 1.92
         run: rustup component add rustfmt clippy --toolchain 1.92
 
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+      # Restore the pruned cache the build job saved (same shared-key); read
+      # only — save-if:false so this job never writes its own copy.
+      - name: Restore cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: workspace
+          save-if: "false"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -156,21 +181,22 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build]
     steps:
-      - uses: actions/checkout@v4
+      # Reclaim disk before restoring the shared cache + compiling the test
+      # binaries, matching build/lint/e2e (avoids the ENOSPC that killed this
+      # job).
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
 
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+      - name: Restore cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: workspace
+          save-if: "false"
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
       # never touches a live stack.
@@ -181,13 +207,13 @@ jobs:
     name: License Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -197,7 +223,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-deny@0.19.9
 
@@ -222,30 +248,29 @@ jobs:
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Downloaded after checkout, so its mtime is newer than the checked-out
       # sources — the Makefile's mtime-based `test-e2e → cross-musl-udf-build`
       # dependency then sees the artifact as up to date and skips rebuilding.
       - name: Download liblakehouse_engine.so
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lakehouse-engine-so
           path: target/release/
 
       - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
 
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+      # Read-only restore of the shared workspace cache to warm the host debug
+      # build of the e2e test binary. save-if:false so this job doesn't prune
+      # target/ (which would delete the .so downloaded into target/release/
+      # above) and doesn't save a redundant copy.
+      - name: Restore cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: workspace
+          save-if: "false"
 
       # The standard runner's / has too little free space for the Exasol image
       # + its cached tarball + MinIO/Iceberg-REST images + the DB's /exa data.
@@ -259,7 +284,7 @@ jobs:
           echo "--- after cleanup ---"; df -h /
 
       - name: Cache Exasol DB image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/[redacted].tar
           key: [redacted]-${{ env.EXASOL_IMAGE_TAG }}
@@ -276,7 +301,7 @@ jobs:
           fi
 
       - name: Cache MinIO image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/minio.tar
           key: minio-${{ env.MINIO_IMAGE_TAG }}
@@ -293,7 +318,7 @@ jobs:
           fi
 
       - name: Cache Iceberg REST fixture image
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /tmp/iceberg-rest.tar
           key: iceberg-rest-fixture-${{ env.ICEBERG_REST_IMAGE_TAG }}
@@ -367,7 +392,7 @@ jobs:
 
       - name: Upload Exasol logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: exa-logs
           path: exa-logs/
@@ -386,7 +411,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -451,17 +476,17 @@ jobs:
 
       - name: Download liblakehouse_engine.so
         if: steps.gate.outputs.release == 'true'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lakehouse-engine-so
 
       - name: Install Rust 1.92
         if: steps.gate.outputs.release == 'true'
-        uses: dtolnay/rust-toolchain@1.92
+        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
 
       - name: Install cargo-about
         if: steps.gate.outputs.release == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-about@0.9.0
 
@@ -486,7 +511,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.gate.outputs.release == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
