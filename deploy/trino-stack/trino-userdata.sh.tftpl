@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Trino bootstrap: installs Docker, writes a single-node Trino config (coordinator + worker in one
+# JVM — this is a benchmark box, not production), points the Iceberg connector at the SAME Glue
+# Iceberg REST catalog + S3 warehouse the lakehouse engine and Athena already query, and runs the
+# pinned Trino image. AWS creds come from the instance profile (IMDS) — no static keys on the box.
+set -uo pipefail
+exec > >(tee /var/log/trino-userdata.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq docker.io
+systemctl enable --now docker
+
+mkdir -p /opt/trino/etc/catalog /opt/trino/data
+
+cat >/opt/trino/etc/node.properties <<EOF
+node.environment=benchmark
+node.data-dir=/data/trino
+EOF
+
+cat >/opt/trino/etc/jvm.config <<'EOF'
+-server
+-Xmx8G
+-XX:+UseG1GC
+-XX:G1HeapRegionSize=32M
+-XX:+ExplicitGCInvokesConcurrent
+-XX:+ExitOnOutOfMemoryError
+-Djdk.attach.allowAttachSelf=true
+EOF
+
+cat >/opt/trino/etc/config.properties <<'EOF'
+coordinator=true
+node-scheduler.include-coordinator=true
+http-server.http.port=8080
+discovery.uri=http://localhost:8080
+EOF
+
+# Glue's Iceberg REST endpoint requires SigV4 signing (same as the lakehouse engine's own catalog
+# connection); Trino's Iceberg REST connector reads AWS creds/region via the default AWS SDK
+# credential/region chain, which the container's AWS_REGION env var + the instance profile supply.
+cat >/opt/trino/etc/catalog/iceberg.properties <<EOF
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=${glue_uri}
+iceberg.rest-catalog.warehouse=${glue_wh}
+iceberg.rest-catalog.security=SIGV4
+iceberg.rest-catalog.signing-name=glue
+iceberg.rest-catalog.vended-credentials-enabled=false
+fs.native-s3.enabled=true
+s3.region=${region}
+EOF
+
+docker run -d --name trino --restart unless-stopped \
+  --network host \
+  -e AWS_REGION=${region} \
+  -v /opt/trino/etc:/etc/trino \
+  -v /opt/trino/data:/data/trino \
+  ${trino_image}
+
+echo "==> Trino container started; waiting for /v1/info"
+for _ in $(seq 1 60); do curl -sf http://localhost:8080/v1/info >/dev/null && break; sleep 5; done
+echo "==> done"

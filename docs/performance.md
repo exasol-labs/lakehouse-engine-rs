@@ -162,6 +162,36 @@ run where the VS aggregate path was competitive with native IMPORT.
 > `specs/_recorded/2026-07-02-add-scan-connection-concurrency/decision-log.md` (Design Decision
 > [5] + the 2026-07-02 validation addendum) for the full methodology and verdict.
 
+## Competitive engine comparison
+
+**Status: methodology only — no results recorded yet.** Run `bench/compare_all.sh` against a
+live cluster and fill in the table below; do not fabricate numbers here.
+
+Beyond the native `IMPORT` ceiling above, the same TPC-H tables and the same four queries
+(`bench/run.sh` Q1-Q4, lines ~321-349) are run through the lakehouse engines people put next to a
+lakehouse today, all reading the SAME Glue Iceberg REST catalog + S3 data:
+
+- **AWS Athena** (`bench/athena_compare.sh`) — serverless, no infra to stand up; timed via the
+  Athena API's `Statistics.EngineExecutionTimeInMillis` (engine time only, excludes queue wait).
+- **Trino** (`bench/trino_compare.sh`) — a single ephemeral EC2 node
+  (`deploy/trino-stack/`, `deploy/scripts/trino-up.sh`/`trino-down.sh`), wall-clock timed via the
+  Trino CLI. Opt-in and torn down explicitly — see the cost/teardown callout in
+  [`deploy/README.md`](../deploy/README.md).
+- **Spark** (`bench/spark_compare.sh`) — AWS EMR Serverless (`deploy/data-stack`'s
+  `enable_emr_serverless` toggle, off by default), billed only while a job runs. Timed from
+  `elapsed:` lines the submitted job prints to its driver log.
+
+`bench/compare_all.sh` runs all of the above (skipping Trino/Spark cleanly if not provisioned)
+and aggregates every engine's timings into one report with a summary table.
+
+| Engine | Q1 | Q2 | Q3 | Q4 | Notes |
+|---|---|---|---|---|---|
+| lakehouse-engine-rs | TBD | TBD | TBD | TBD | `bench/compare_all.sh` |
+| Native `IMPORT` | — | — | — | TBD | scan-only ceiling, see above |
+| AWS Athena | TBD | TBD | TBD | TBD | |
+| Trino | TBD | TBD | TBD | TBD | |
+| Spark (EMR Serverless) | TBD | TBD | TBD | TBD | includes EMR Serverless cold-start |
+
 ## Tuning levers & outlook
 
 The engine controls these regardless of where storage lives — apply them first:

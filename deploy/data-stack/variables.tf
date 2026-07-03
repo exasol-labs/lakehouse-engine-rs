@@ -80,6 +80,25 @@ variable "perf_db_name" {
   default = "perf"
 }
 
+# --- Spark benchmark (EMR Serverless, opt-in) ------------------------------
+variable "enable_emr_serverless" {
+  type        = bool
+  default     = false
+  description = "When true, create the EMR Serverless Spark application (billed only while a job runs; nothing when idle). Off by default: nothing shall be started unless used."
+}
+
+variable "emr_serverless_idle_timeout_minutes" {
+  type        = number
+  default     = 15
+  description = "Auto-stop idle timeout — even a forgotten 'started' application costs nothing beyond this window."
+}
+
+variable "emr_serverless_max_capacity" {
+  type        = number
+  default     = 4
+  description = "Max vCPU for the application's driver+executors (memory scales as 4x this, in GB)."
+}
+
 # --- exa:* tag values -------------------------------------------------------
 variable "department" {
   type    = string
