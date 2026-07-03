@@ -313,7 +313,16 @@ run_query() {
   local name="$1" q="$2" t0 t1
   { echo; echo "### ${name}"; } | tee -a "$REPORT"
   t0=$(date +%s.%N)
-  sqlf "$q" | tee -a "$REPORT"
+  # `if !` guards the pipeline from set -e (same pattern as check_count/pushdown_check below) —
+  # a genuinely failing query (e.g. an engine limitation the query is designed to probe) must not
+  # abort the rest of the queries/pushdown checks. FAILED still fails the overall run at the end.
+  if ! sqlf "$q" | tee -a "$REPORT"; then
+    t1=$(date +%s.%N)
+    echo "  FAILED" | tee -a "$REPORT"
+    printf 'elapsed: %ss (FAILED)\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
+    FAILED=1
+    return
+  fi
   t1=$(date +%s.%N)
   printf 'elapsed: %ss\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
 }
