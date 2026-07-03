@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Q1-Q4 TPC-H benchmark driver for the EMR Serverless "Spark" side of the competitive engine
+"""Q1-Q9b TPC-H benchmark driver for the EMR Serverless "Spark" side of the competitive engine
 comparison (bench/spark_compare.sh). Reads the SAME Glue-cataloged S3 data as the lakehouse
-engine, Athena, and Trino, and runs the same query set (see bench/run.sh lines ~321-349 for the
-canonical Exasol dialect this is translated from).
+engine, Athena, and Trino, and runs the same query set (see bench/run.sh for the canonical Exasol
+dialect this is translated from).
 
 Uses Spark's Iceberg GlueCatalog implementation (talks to AWS Glue directly via the AWS SDK, the
 same "native Glue" pattern used for Trino's iceberg.catalog.type=glue — Glue IS the catalog here,
@@ -43,6 +43,37 @@ QUERIES = [
                COUNT(*) AS count_order
         FROM glue.tpch.lineitem WHERE l_shipdate <= DATE '1998-09-01'
         GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+    """),
+    # Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL
+    # (dialect-adjusted) in bench/run.sh, bench/athena_compare.sh, bench/trino_compare.sh.
+    ("q5", """
+        SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
+        FROM glue.tpch.orders o JOIN glue.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+        GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority
+    """),
+    ("q6", """
+        SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty,
+               SUM(l_extendedprice) AS sum_base_price, AVG(l_discount) AS avg_disc,
+               COUNT(*) AS count_order
+        FROM glue.tpch.lineitem
+        GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
+    """),
+    ("q7", """
+        SELECT COUNT(*) FROM (
+            SELECT l_orderkey, COUNT(*) AS cnt FROM glue.tpch.lineitem GROUP BY l_orderkey
+        ) t
+    """),
+    ("q8", "SELECT COUNT(*) FROM glue.tpch.lineitem WHERE l_shipdate = DATE '1995-06-15'"),
+    ("q9a", "SELECT SUM(l_quantity) FROM glue.tpch.lineitem"),
+    ("q9b", """
+        SELECT COUNT(*),
+               SUM(l_orderkey), SUM(l_partkey), SUM(l_suppkey), SUM(l_linenumber),
+               SUM(l_quantity), SUM(l_extendedprice), SUM(l_discount), SUM(l_tax),
+               COUNT(DISTINCT l_returnflag), COUNT(DISTINCT l_linestatus),
+               MIN(l_shipdate), MAX(l_commitdate), MIN(l_receiptdate),
+               COUNT(DISTINCT l_shipinstruct), COUNT(DISTINCT l_shipmode),
+               SUM(length(l_comment))
+        FROM glue.tpch.lineitem
     """),
 ]
 
