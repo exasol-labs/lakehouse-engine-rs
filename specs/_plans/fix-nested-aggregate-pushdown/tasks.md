@@ -16,7 +16,7 @@ duplicate-key tables).
 - [x] 3. Implement the behavioral fix (family (a): preserve GROUP BY for literal-only selectList). [expert]
 
 ## Phase 2: Implementation (Group D)
-- [ ] 4. Host unit test for the composed-request guard.
+- [x] 4. Host unit test for the composed-request guard.
 - [ ] 5. E2E regression test for the Q7 nested-aggregate shape (include duplicate-key case: `GROUP BY MOD(id,4)` expecting 4, not just the unique-id `events` case).
 
 ## Phase 3: Verification (Group E)

@@ -4404,22 +4404,36 @@ mod tests {
         );
     }
 
-    /// Issue #52 (scratch TDD guard; Task 4 adds the official version).
-    /// The "count the groups" pushdown shape Exasol emits for
-    /// `SELECT COUNT(*) FROM (SELECT id, COUNT(*) ... GROUP BY id)`:
-    /// a real `groupBy` but a `selectList` of only a `literal_null` placeholder.
+    /// Issue #52 regression guard (decision-log entry [4]): the exact composed
+    /// `pushdownRequest` Exasol emits for
+    /// `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM EVENTS GROUP BY id) t`
+    /// — a real `groupBy` but a `selectList` of only a `literal_null` placeholder
+    /// (Exasol's "count the groups" rewrite: the outer query needs only the
+    /// per-group row count, not the inner values). Fed verbatim (including the
+    /// `from`/`type`/`columnNr`/`tableName` fields the detection path ignores,
+    /// to prove they don't perturb parsing) from the spike's captured JSON.
+    ///
     /// Detection must preserve the GROUP BY (return `Some` with real group keys
-    /// and NO aggregate plan), so the scan emits one row per distinct group and
-    /// the outer wrapper never references a phantom `"NULL"` column.
+    /// and NO aggregate plan) instead of falling back to a row scan — a row-scan
+    /// fallback returns one row per source row, not per group, which is only
+    /// accidentally correct when the group column happens to be unique (see
+    /// decision-log entry [4]'s caveat). The rendered scan SQL must never
+    /// reference a phantom `"NULL"` column identifier and must retain a real
+    /// `GROUP BY` clause.
     #[test]
-    fn detect_group_by_literal_null_selectlist_preserves_grouping() {
-        let req = make_group_by_request_with_types(
-            serde_json::json!([{"type": "column", "name": "ID"}]),
-            serde_json::json!([{"type": "literal_null"}]),
-            serde_json::json!([{"type": "boolean"}]),
-        );
+    fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "from": { "name": "EVENTS", "type": "table" },
+            "groupBy": [
+                { "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" }
+            ],
+            "selectList": [ { "type": "literal_null" } ],
+            "selectListDataTypes": [ { "type": "BOOLEAN" } ],
+            "type": "select"
+        });
         let result = detect_group_by_aggregates(&req)
-            .expect("literal-only selectList must preserve GROUP BY");
+            .expect("composed literal-only selectList must preserve GROUP BY, not fall back to row scan");
         assert_eq!(result.group_keys.len(), 1, "one group key from groupBy");
         assert!(
             result.group_keys[0].contains("ID"),
