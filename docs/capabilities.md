@@ -53,7 +53,7 @@ Partial aggregate per shard → merged by Exasol.
 | Single-group | `AGGREGATE_SINGLE_GROUP`, `FN_AGG_COUNT`, `FN_AGG_COUNT_STAR`, `FN_AGG_SUM`, `FN_AGG_MIN`, `FN_AGG_MAX` | `SELECT SUM(amt) FROM t` |
 | Average | `FN_AGG_AVG` | `SELECT AVG(amt)` |
 | Statistical | `FN_AGG_STDDEV`, `FN_AGG_STDDEV_POP`, `FN_AGG_STDDEV_SAMP`, `FN_AGG_VARIANCE`, `FN_AGG_VAR_POP`, `FN_AGG_VAR_SAMP` | `SELECT STDDEV(x)` |
-| Group by | `AGGREGATE_GROUP_BY_COLUMN`, `AGGREGATE_GROUP_BY_EXPRESSION` | `SELECT k, SUM(v) GROUP BY k` |
+| Group by | `AGGREGATE_GROUP_BY_COLUMN`, `AGGREGATE_GROUP_BY_EXPRESSION`, `AGGREGATE_GROUP_BY_TUPLE` | `SELECT k1, k2, SUM(v) GROUP BY k1, k2` |
 | Having | `AGGREGATE_HAVING` | `... HAVING SUM(v) > 100` |
 
 `COUNT` emits partial sum/count and `AVG` emits sum + count (not an average); statistical aggregates emit sufficient stats (n, Σx, Σx²). Exasol combines them into the final result.
@@ -68,4 +68,4 @@ Not pushed to the scan — Exasol computes these on the returned partial results
 | `ORDER BY` | `... ORDER BY ts` | Exasol sorts the final result |
 | `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `COUNT(DISTINCT u)` | Not decomposable into partial/merge — Exasol computes on returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
-| `AGGREGATE_GROUP_BY_TUPLE`, geospatial, session fns | — | Exasol-side / unsupported |
+| Geospatial, session fns | — | Exasol-side / unsupported |

@@ -1007,6 +1007,62 @@ fn parse_int(v: &serde_json::Value) -> i64 {
         .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
+/// Runs `EXPLAIN VIRTUAL` for a GROUP BY query and asserts the pushed SQL
+/// evidences a grouped partial-aggregate pushdown — not the raw row-scan
+/// fallback that Exasol would otherwise aggregate itself.
+///
+/// The real, shard-count-independent evidence of grouped pushdown is the
+/// `group_keys` field inside the `LAKEHOUSE_SCAN` scan spec: the grouped
+/// partial-aggregate path emits `"group_keys":[...]` (and the `PARTIAL_`
+/// aggregate-column prefix), while the raw-scan fallback emits neither.
+///
+/// `GROUP BY shard_key` is deliberately NOT used as the discriminator: that
+/// inner fan-out only appears when the scan spreads over MULTIPLE shards. When
+/// a WHERE filter prunes the file list to a SINGLE file/shard, grouped
+/// pushdown still occurs — it emits `... SUM("PARTIAL_...") ... GROUP BY
+/// "GK_0", "GK_1"` with no `GROUP BY shard_key` — so asserting on it would
+/// false-negative any legitimately pushed-down, single-shard grouped query.
+///
+/// Asserts: the pushed SQL contains `group_keys` and the `PARTIAL_` partial-
+/// aggregate column prefix (grouped pushdown occurred), contains no `IPROC()`
+/// (legacy, non-oversubscribed sharding), and is not a raw `SELECT * FROM
+/// (SELECT ...)` row-scan wrapper (which would mean the multi-key GROUP BY
+/// silently fell back instead of being pushed down as partial aggregation).
+fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
+    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
+    let resp = conn.execute(&explain_sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+
+    // Flatten all returned text fragments into one string for pattern checks.
+    let pushed_sql: String = cols
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        pushed_sql.contains("group_keys"),
+        "EXPLAIN VIRTUAL output must contain 'group_keys' in the scan spec \
+         (grouped partial-aggregate pushdown occurred), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("PARTIAL_"),
+        "EXPLAIN VIRTUAL output must contain the 'PARTIAL_' partial-aggregate \
+         column prefix (grouped pushdown occurred), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("IPROC()"),
+        "EXPLAIN VIRTUAL output must NOT contain 'IPROC()' (legacy sharding), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM (SELECT"),
+        "EXPLAIN VIRTUAL output must not be a raw row-scan fallback \
+         ('SELECT * FROM (SELECT ...)'), got:\n{pushed_sql}"
+    );
+}
+
 /// GROUP BY returns correct per-group COUNT(*) and SUM(score).
 ///
 /// Key: MOD(id, 4) — four equal-sized groups (5 rows each).
@@ -1076,6 +1132,12 @@ fn test_group_by_multi_key_with_filter() {
          GROUP BY MOD(id, 4), MOD(id, 2)",
         vs_table()
     );
+
+    // Pushdown-occurred assertion: multi-key GROUP BY (with a WHERE filter)
+    // must be pushed down as shard-key fan-out partial aggregation, not the
+    // raw row-scan fallback.
+    assert_group_by_pushed_down(&mut conn, &sql);
+
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
     assert_eq!(cols[0].len(), 4, "expected 4 distinct groups: {cols:?}");
@@ -1433,6 +1495,12 @@ fn test_group_by_interleaved_multi_key() {
         "SELECT MOD(id, 4), SUM(score), MOD(id, 2) FROM {} GROUP BY MOD(id, 4), MOD(id, 2)",
         vs_table()
     );
+
+    // Pushdown-occurred assertion: interleaved multi-key GROUP BY must be
+    // pushed down as shard-key fan-out partial aggregation, not the raw
+    // row-scan fallback.
+    assert_group_by_pushed_down(&mut conn, &sql);
+
     let cols = conn.query_columns(&sql);
     assert_eq!(
         cols.len(),
@@ -1586,6 +1654,251 @@ fn test_group_by_agg_first_with_having() {
         assert!(
             sum > 250.0,
             "group key {key}: SUM(score) must satisfy HAVING > 250.0, got {sum}"
+        );
+    }
+}
+
+/// Expression-valued multi-key tuple GROUP BY — every key element is itself an
+/// expression (not a bare column): `MOD(id, 4)` and `UPPER(name)`. Verifies
+/// correct per-group counts, that each key's declared type survives instead of
+/// falling back to the VARCHAR(2000000) default, and that the GROUP BY is
+/// pushed down as a grouped partial aggregation.
+///
+/// The two keys are deliberately of DIFFERENT types — key 0 is `MOD(id, 4)`
+/// (DECIMAL) and key 1 is `UPPER(name)` (VARCHAR) — so this test genuinely
+/// exercises per-index, mixed-type independence: a bug that shared one key's
+/// type across both indices would surface here as a wrong column type.
+///
+/// The seeded `name` values (`event-01` … `event-20`) are unique, so each
+/// (`MOD(id,4)`, `UPPER(name)`) pair identifies exactly one row: 20 groups, one
+/// row each. Grouping by `MOD(id, 4)` first buckets the ids, and `UPPER(name)`
+/// (`EVENT-NN`) then distinguishes every row within a bucket.
+#[test]
+fn test_group_by_expr_multi_key_tuple() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), UPPER(name), COUNT(*) \
+         FROM {} GROUP BY MOD(id, 4), UPPER(name)",
+        vs_table()
+    );
+
+    // Pushdown-occurred assertion: expression-valued multi-key GROUP BY must
+    // be pushed down as grouped partial aggregation.
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+
+    // Per-index, mixed-type independence: key 0 (`MOD(id, 4)`) carries DECIMAL
+    // and key 1 (`UPPER(name)`) carries VARCHAR — each key's declared type
+    // survives independently, neither collapsing to the other's type nor to a
+    // fallback.
+    for (i, label, expected_type) in [(0, "MOD(id, 4)", "DECIMAL"), (1, "UPPER(name)", "VARCHAR")] {
+        let column_type = result_set["columns"][i]["dataType"]["type"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected dataType.type for column {i}: {result_set:?}"));
+        assert_eq!(
+            column_type, expected_type,
+            "{label} group key (column {i}) must carry {expected_type} type: {result_set:?}"
+        );
+    }
+
+    let cols = conn.fetch_result_columns(result_set);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (key1, key2, count): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "expected 20 groups (one per unique name): {cols:?}"
+    );
+
+    // Sort (key1, key2, count) triples so the test is robust to row ordering.
+    let mut rows: Vec<(i64, String, i64)> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .zip(cols[2].iter())
+        .map(|((k1, k2), c)| {
+            let name = k2
+                .as_str()
+                .unwrap_or_else(|| panic!("expected string UPPER(name) value, got: {k2:?}"))
+                .to_string();
+            (parse_int(k1), name, parse_int(c))
+        })
+        .collect();
+    rows.sort();
+
+    let expected: Vec<(i64, String, i64)> = [
+        (0i64, "EVENT-04"),
+        (0, "EVENT-08"),
+        (0, "EVENT-12"),
+        (0, "EVENT-16"),
+        (0, "EVENT-20"),
+        (1, "EVENT-01"),
+        (1, "EVENT-05"),
+        (1, "EVENT-09"),
+        (1, "EVENT-13"),
+        (1, "EVENT-17"),
+        (2, "EVENT-02"),
+        (2, "EVENT-06"),
+        (2, "EVENT-10"),
+        (2, "EVENT-14"),
+        (2, "EVENT-18"),
+        (3, "EVENT-03"),
+        (3, "EVENT-07"),
+        (3, "EVENT-11"),
+        (3, "EVENT-15"),
+        (3, "EVENT-19"),
+    ]
+    .iter()
+    .map(|(k, n)| (*k, n.to_string(), 1i64))
+    .collect();
+    assert_eq!(
+        rows, expected,
+        "grouped (MOD(id,4), UPPER(name)) rows must match the expected per-name groups"
+    );
+
+    let total: i64 = rows.iter().map(|(_, _, c)| *c).sum();
+    assert_eq!(
+        total, 20,
+        "total COUNT(*) across all groups must be 20, got {total}"
+    );
+}
+
+/// Multi-key GROUP BY combined with HAVING and LIMIT — both must apply only in
+/// the outer merge wrapper (never per-shard), so the LIMIT caps the number of
+/// *groups* returned, not rows scanned per shard.
+///
+/// Keys: `MOD(id, 4)` × `MOD(id, 3)` (12 groups; `SUM(score)` per group).
+/// Groups satisfying `HAVING SUM(score) > 100.0`:
+///   (0,2)=140.0  (1,2)=110.0  (2,0)=120.0  (3,1)=130.0
+/// `LIMIT 2` must cap the result to exactly 2 of these 4 qualifying groups.
+#[test]
+fn test_group_by_multi_key_having_limit() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), MOD(id, 3), SUM(score) FROM {} \
+         GROUP BY MOD(id, 4), MOD(id, 3) HAVING SUM(score) > 100.0 LIMIT 2",
+        vs_table()
+    );
+
+    // Pushdown-occurred assertion: multi-key GROUP BY with HAVING and LIMIT
+    // must be pushed down as shard-key fan-out partial aggregation, not the
+    // raw row-scan fallback (HAVING/LIMIT results are correct either way).
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (key1, key2, sum): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "LIMIT 2 must cap the result to exactly 2 groups: {cols:?}"
+    );
+
+    // Every returned group must both satisfy HAVING and match one of the
+    // known-qualifying (key1, key2) -> sum pairs (not just an arbitrary
+    // over-threshold value).
+    let qualifying: [((i64, i64), f64); 4] = [
+        ((0, 2), 140.0),
+        ((1, 2), 110.0),
+        ((2, 0), 120.0),
+        ((3, 1), 130.0),
+    ];
+
+    for (i, ((k1_raw, k2_raw), sum_raw)) in
+        cols[0].iter().zip(&cols[1]).zip(&cols[2]).enumerate()
+    {
+        let k1 = parse_int(k1_raw);
+        let k2 = parse_int(k2_raw);
+        let sum = parse_numeric(sum_raw);
+
+        assert!(
+            sum > 100.0,
+            "row {i}: SUM(score) must satisfy HAVING > 100.0, got {sum} for key ({k1}, {k2})"
+        );
+
+        let expected_sum = qualifying
+            .iter()
+            .find(|((qk1, qk2), _)| *qk1 == k1 && *qk2 == k2)
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| {
+                panic!("row {i}: key ({k1}, {k2}) is not one of the known qualifying groups")
+            });
+        assert!(
+            (sum - expected_sum).abs() < 0.01,
+            "row {i}: key ({k1}, {k2}) must have SUM(score) = {expected_sum}, got {sum}"
+        );
+    }
+}
+
+/// High-cardinality multi-key GROUP BY completes under the bounded memory
+/// pool — a tuple key (`id`, `MOD(id, 2)`) exercises the same near-unique key
+/// space as the single-key spill test, but through the multi-key GK_0/GK_1
+/// path, proving the bounded-pool/spill backstop is not single-key-only.
+///
+/// 20 distinct (id, MOD(id,2)) groups, each with exactly one row.
+#[test]
+fn test_high_cardinality_multi_key_group_by_spill() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, MOD(id, 2), COUNT(*) FROM {} GROUP BY id, MOD(id, 2) ORDER BY id",
+        vs_table()
+    );
+
+    // Pushdown-occurred assertion: even the high-cardinality multi-key case
+    // must go through shard-key fan-out partial aggregation.
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (id, MOD(id,2), count): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "GROUP BY id, MOD(id,2) must return 20 groups, got {}",
+        cols[0].len()
+    );
+
+    // Every group must have exactly one row (id is unique).
+    for (i, v) in cols[2].iter().enumerate() {
+        let count = parse_int(v);
+        assert_eq!(
+            count,
+            1,
+            "group at position {i} (id={}): COUNT(*) must be 1, got {count}",
+            parse_int(&cols[0][i])
+        );
+    }
+
+    // IDs must be 1..20 in order, and MOD(id,2) must be consistent with id.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let mods: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    for (pos, (&id, &m)) in ids.iter().zip(mods.iter()).enumerate() {
+        let expected_id = (pos + 1) as i64;
+        assert_eq!(
+            id, expected_id,
+            "id at position {pos} must be {expected_id}, got {id}"
+        );
+        assert_eq!(
+            m,
+            id % 2,
+            "MOD(id,2) at position {pos} (id={id}) must be {}, got {m}",
+            id % 2
         );
     }
 }
