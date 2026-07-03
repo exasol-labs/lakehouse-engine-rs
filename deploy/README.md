@@ -87,8 +87,9 @@ this section covers standing up the Trino/Spark compute they need.
 ### Trino (ephemeral, opt-in)
 
 A new OpenTofu stack, `deploy/trino-stack/`, mirroring `cluster-stack/`: a single EC2 node running
-Trino in Docker, its Iceberg connector pointed at the same Glue REST catalog + S3 bucket via an
-instance-profile role (no static keys).
+Trino in Docker, its Iceberg connector using `iceberg.catalog.type=glue` (talks to the Glue Data
+Catalog directly via the AWS SDK, not the REST endpoint the lakehouse engine uses) against the
+same S3 bucket, authenticated via an instance-profile role (no static keys).
 
 ```bash
 cd deploy/trino-stack && tofu init
@@ -191,6 +192,13 @@ Two paths, by what the teammate actually needs:
   default credential chain.
 - **Glue interface VPC endpoint** is off (paid); the free S3 gateway endpoint is on. Add it if Glue
   API latency matters.
+- **EMR Serverless teardown needs a manual stop first** — `tofu apply -var
+  enable_emr_serverless=false` (or `=true` to resize `maximumCapacity`) fails with
+  `ValidationException: Application ... must be in [CREATED, STOPPED]` if the app auto-started for
+  a job and hasn't hit its idle timeout yet. Run `aws emr-serverless stop-application
+  --application-id <id>` (poll `get-application` for `STOPPED`) before re-applying. Found
+  live-verifying — the app costs nothing while `STARTED`-but-idle, so this only blocks the
+  Terraform operation, not billing.
 
 ## Files
 

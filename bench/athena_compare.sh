@@ -8,9 +8,15 @@
 # trino_compare.sh and deploy/scripts/spark_queries.py; keep all three in sync if you edit one.
 #
 #   AWS_PROFILE=spot-strata-deployer ATHENA_WORKGROUP=spot-strata-test1-athena ./athena_compare.sh
-set -euo pipefail
+# No -e: run_timed must survive a failing query and report it as FAILED rather than aborting the
+# whole comparison — same convention as bench/import_ceiling.sh.
+set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] && { set -a; . bench/.env; set +a; }
+# bench/.env's AWS_ACCESS_KEY_ID/SECRET are the scoped engine-reader creds (Glue+S3 read only,
+# for the Exasol CONNECTION) — they have no athena:* permissions. Unset them so the `aws` CLI
+# falls back to AWS_PROFILE / the default credential chain (the operator's own broader identity).
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 : "${ATHENA_WORKGROUP:?set ATHENA_WORKGROUP (deploy/data-stack: tofu output athena_workgroup)}"
 ATHENA_DATABASE="${ATHENA_DATABASE:-tpch}"

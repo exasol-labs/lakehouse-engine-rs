@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Q1-Q4 TPC-H benchmark driver for the EMR Serverless "Spark" side of the competitive engine
-comparison (bench/spark_compare.sh). Reads the SAME Glue Iceberg REST catalog + S3 data as the
-lakehouse engine, Athena, and Trino, and runs the same query set (see bench/run.sh lines ~321-349
-for the canonical Exasol dialect this is translated from).
+comparison (bench/spark_compare.sh). Reads the SAME Glue-cataloged S3 data as the lakehouse
+engine, Athena, and Trino, and runs the same query set (see bench/run.sh lines ~321-349 for the
+canonical Exasol dialect this is translated from).
 
-Configures Spark's Iceberg REST catalog with SigV4 signing against Glue (same auth model as the
-lakehouse engine's own catalog connection). Credentials come from the EMR Serverless job execution
-role — no static keys.
+Uses Spark's Iceberg GlueCatalog implementation (talks to AWS Glue directly via the AWS SDK, the
+same "native Glue" pattern used for Trino's iceberg.catalog.type=glue — Glue IS the catalog here,
+not a generic REST endpoint, so no REST/SigV4 config is needed). Requires
+`--conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar` on the job submission
+(EMR Serverless has no internet egress by default, so `spark.jars.packages`, which fetches from
+Maven Central via Ivy, times out — found live-verifying against a real EMR Serverless run).
+Credentials come from the EMR Serverless job execution role — no static keys.
 
-  spark-submit spark_queries.py <glue_uri> <glue_warehouse> <region>
+  spark-submit spark_queries.py <warehouse_s3_uri>
 """
 import sys
 import time
@@ -44,18 +48,16 @@ QUERIES = [
 
 
 def main():
-    glue_uri, glue_warehouse, region = sys.argv[1], sys.argv[2], sys.argv[3]
+    warehouse_s3_uri = sys.argv[1]
 
     spark = (
         SparkSession.builder.appName("lakehouse-engine-competitive-bench")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.glue", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.glue.type", "rest")
-        .config("spark.sql.catalog.glue.uri", glue_uri)
-        .config("spark.sql.catalog.glue.warehouse", glue_warehouse)
-        .config("spark.sql.catalog.glue.rest.sigv4-enabled", "true")
-        .config("spark.sql.catalog.glue.rest.signing-region", region)
-        .config("spark.sql.catalog.glue.rest.signing-name", "glue")
+        .config("spark.sql.catalog.glue.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+        .config("spark.sql.catalog.glue.warehouse", warehouse_s3_uri)
+        .config("spark.hadoop.hive.metastore.client.factory.class",
+                "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory")
         .getOrCreate()
     )
 
