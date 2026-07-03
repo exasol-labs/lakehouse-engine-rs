@@ -1709,3 +1709,85 @@ Extend `detect_group_by_aggregates`'s non-aggregate `selectList` arm to recogniz
 ### Consequences
 
 `GROUP BY`-pushdown requests whose `selectList` is a lone constant/literal placeholder (the "count the groups" optimizer rewrite) now drive the grouped scan and return correct per-group-cardinality results instead of crashing. The regression test additionally covers a duplicate-key group column (not just the unique-key seeded `events.id`) to discriminate the correct grouped fix from the unsafe row-scan fallback, since both incidentally return the same count on unique-key data.
+
+---
+
+## ADR-064: Expression Aggregate Arguments Carried on a New `arg_expr` Field, Rendered via `render_expression`
+
+**Date:** 2026-07-03
+**Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
+**Status:** Accepted
+
+### Context
+
+`SUM(LENGTH(L_COMMENT))`-shaped aggregates could not be pushed down because `AggregatePlan`'s argument capture only accepted a bare column reference, forcing a fall back to a full raw row-scan that ships every projected column to Exasol. The `crates/vs-expression` translator's `render_expression` mechanism already renders arbitrary DataFusion SQL fragments for GROUP BY keys via `detect_group_by_aggregates`, so the same mechanism could extend to aggregate arguments. Two carrier options existed: overload the existing `column: Option<String>` field to also hold rendered SQL, or add a new field alongside it.
+
+### Decision
+
+Add `AggregatePlan.arg_expr: Option<String>` holding the rendered DataFusion SQL fragment, keeping `column: Option<String>` for the bare-column fast path. The scan side uses `arg_expr` verbatim (no `quote_ident`); partial/merge column types for an expression-argument aggregate come from the aggregate's declared type in the parallel top-level `selectListDataTypes` array instead of a source-column type lookup. Applies to `SUM`/`MIN`/`MAX`/`AVG`/`COUNT(col)`; `COUNT(*)` has no argument and is unaffected. An argument the translator cannot render soundly causes the adapter to fall back to row scanning rather than emit an incorrect partial/merge plan.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| New `arg_expr: Option<String>` field alongside `column` | ✓ Chosen — backward-compatible serde; the bare-column fast path (and its exact source-column type lookup) is untouched; the translator remains the single source of expression-rendering truth, mirroring GROUP BY keys |
+| Overload `column` to also carry rendered SQL | ✗ Rejected — bare-column `MIN`/`MAX` partials rely on the exact source-column Exasol type looked up by name; overloading would break that lookup and the existing JSON round-trip |
+
+### Consequences
+
+Aggregate pushdown now decomposes `COUNT(expr)`/`SUM(expr)`/`MIN(expr)`/`MAX(expr)`/`AVG(expr)` over any translator-renderable scalar expression into the same shard-associative partial/merge plan as their bare-column forms, instead of forcing a full row-scan fallback. Partial/merge typing for these aggregates is sourced from `selectListDataTypes` rather than a column lookup, which is a new typing path that must stay in sync with the declared select-list types.
+
+---
+
+## ADR-065: COUNT(DISTINCT) Merged by a Scalar UDF Fed via LISTAGG of Per-Shard JSON Arrays
+
+**Date:** 2026-07-03
+**Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
+**Status:** Accepted
+
+### Context
+
+`COUNT(DISTINCT col)` over the whole table (no GROUP BY) previously fell back to a full raw row-scan. Decomposing it across shards requires each shard to compute its local distinct value set and the wrapper to union those sets without shipping raw rows or crossing the `.so` boundary with an Arrow type, and without building bespoke SQL rewriting (an explicit mission non-goal).
+
+### Decision
+
+Add a new `AggKind::CountDistinct`. Per shard, compute the LOCAL distinct value set via `array_agg(DISTINCT col)` inside the existing DataFusion scan, excluding NULLs, and serialize it to a JSON array VARCHAR — one partial value per shard, preserving the one-row-per-shard partial wire shape. Merge in the outer wrapper SQL via a new scalar entry point `LAKEHOUSE_DISTINCT_MERGE_COUNT`, fed the shard partials joined with Exasol's native `LISTAGG` into a JSON array-of-arrays string, mixed into the same merge SELECT as the SUM/MIN/MAX partials as an ordinary scalar call. The merge UDF parses the array-of-arrays, unions the elements into a set, and returns its cardinality.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Scalar merge UDF fed via `LISTAGG` of per-shard JSON arrays | ✓ Chosen — preserves the one-row-per-shard partial wire shape; only a JSON string crosses the `.so` boundary; the array-of-arrays framing lets JSON escaping handle separator/quote hazards |
+| A SET merge UDF with its own grouping protocol | ✗ Rejected — reintroduces a grouping protocol the design explicitly wanted to avoid and complicates queries with multiple `COUNT(DISTINCT)` columns |
+| Bespoke SQL string-splitting or `CONNECT BY` hierarchical rewrite | ✗ Rejected — an explicit non-goal (complex query rewrites) |
+
+### Consequences
+
+Single-group `COUNT(DISTINCT col)` is now pushed down instead of falling back to a row scan, via a third scalar entry point (`LAKEHOUSE_DISTINCT_MERGE_COUNT`) added to the same `.so` (see also the packaging spec delta). Grouped `COUNT(DISTINCT)` (inside a GROUP BY) remains out of scope and continues to fall back to row scanning. The design introduces a new merge-time dependency on `LISTAGG`'s output size ceiling, which interacts with the per-shard safety cap (ADR-066).
+
+---
+
+## ADR-066: Execution-Time Per-Shard Safety Cap for COUNT(DISTINCT), With a Clean Error on Overflow
+
+**Date:** 2026-07-03
+**Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
+**Status:** Accepted
+
+### Context
+
+Once `COUNT(DISTINCT col)` is advertised and pushed down (ADR-065), a high-cardinality column (e.g. an order-key-like column) could otherwise accumulate an unbounded per-shard distinct set, risking memory exhaustion or a serialized JSON value exceeding the `VARCHAR(2000000)` wire limit. The mission's bounded-execution stance requires a clean `ResourcesExhausted`-style error over an OOM crash. Iceberg NDV (number-distinct-values) statistics are not reliably available, so a plan-time decline based on NDV was not a dependable primary mechanism.
+
+### Decision
+
+Enforce a mandatory per-shard execution-time safety cap: 100,000 distinct elements AND 1,048,576 bytes (1 MiB) serialized, whichever trips first. On overflow, the scan UDF aborts that shard with a clean bounded-resource error naming the offending column and the cap exceeded, rather than emitting a truncated (silently wrong) distinct set or continuing to accumulate until the process runs out of memory. No plan-time NDV-based decline is implemented as a primary mechanism.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Execution-time per-shard cap (element count + serialized bytes) → clean error | ✓ Chosen — safer default given unreliable Iceberg NDV stats; bounds both pre-serialization memory/CPU and the wire value size with headroom under `VARCHAR(2000000)` |
+| Plan-time NDV-based decline to row scan | ✗ Rejected as primary — Iceberg NDV stats are not reliably available; may be considered as a future secondary optimization |
+
+### Consequences
+
+A standalone high-cardinality `COUNT(DISTINCT col)` that previously fell to a (slow but correct) row scan now, once `FN_AGG_COUNT_DISTINCT` is advertised, gets pushed down and may fail the cap with a clean error instead of completing via row scan — an accepted behavioural regression for that specific shape, consistent with the mission's bounded-execution stance. The merge side is separately bounded by `LISTAGG`'s output ceiling. The target use case (low-cardinality dimension columns) is unaffected.
