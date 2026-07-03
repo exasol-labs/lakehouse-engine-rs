@@ -165,10 +165,18 @@ run where the VS aggregate path was competitive with native IMPORT.
 ## Competitive engine comparison
 
 **Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, `r8i.2xlarge` × 2,
-180M-row `lineitem`, 60 files, same Glue catalog + S3 data for every engine below). Latest pass is
-a single fresh full re-run across all four engines with the extended Q1-Q9b query set (below);
-Trino now defaults to a 2-node `r8i.2xlarge` cluster matching `test1` (was a single `r6i.xlarge` in
-the first round — see [Infrastructure comparison](#infrastructure-comparison)).
+180M-row `lineitem`, 60 files, same Glue catalog + S3 data for every engine below). The four-engine
+pass below is a single fresh full re-run across all four engines with the extended Q1-Q9b query
+set; Trino now defaults to a 2-node `r8i.2xlarge` cluster matching `test1` (was a single
+`r6i.xlarge` in the first round — see [Infrastructure comparison](#infrastructure-comparison)).
+
+> **lakehouse-engine-rs column re-run, same day (2026-07-03, later pass):** the `lakehouse-engine-rs`
+> column below was re-measured against `test1` after two fixes landed
+> ([#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52), the Q7 nested-aggregate
+> crash, and [#53](https://github.com/exasol-labs/lakehouse-engine-rs/issues/53), multi-column
+> `GROUP BY` pushdown). Athena/Trino/Spark were **not** re-tested — nothing changed on those
+> engines or their infra since the pass above, so their columns are carried over unchanged. Raw
+> report: `bench/reports/bench-report-20260703-183717.txt`.
 
 Beyond the native `IMPORT` ceiling above, the same TPC-H tables are queried through the lakehouse
 engines people put next to a lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
@@ -200,20 +208,43 @@ pricing summary). Q5-Q9b were added to probe specific pushdown strengths/weaknes
 | Q9a | Narrow projection — `SUM` over one column, full scan |
 | Q9b | Wide projection — aggregates touching all 16 `lineitem` columns, full scan |
 
-### Results (2026-07-03, single fresh pass, all four engines)
+### Results (2026-07-03; lakehouse-engine-rs column re-measured post-#52/#53, other engines unchanged)
 
 | Query | lakehouse-engine-rs | AWS Athena | Trino (2-node) | Spark (EMR Serverless) |
 |---|---|---|---|---|
-| Q1 (wiring) | **1.79 s** | 1.87 s | 7.05 s | 16.80 s |
-| Q2 (3-way join) | 16.90 s | **2.54 s** | 12.19 s | 43.59 s |
-| Q3 (filter+groupby) | 14.48 s | **2.99 s** | 8.37 s | 31.51 s |
-| Q4 (pricing summary) | 19.17 s | **3.19 s** | 5.56 s | 21.46 s |
-| Q5 (Q3, no filter) | 18.23 s | **2.50 s** | 10.25 s | 38.07 s |
-| Q6 (Q4, no filter) | 19.25 s | **2.71 s** | 4.98 s | 18.77 s |
-| Q7 (high-card. GROUP BY) | **FAILED** (bug, see below) | **1.62 s** | 5.20 s | 12.84 s |
-| Q8 (selective filter) | 1.51 s | **0.93 s** | 4.25 s | 5.62 s |
-| Q9a (narrow projection) | **2.18 s** | 2.39 s | 3.78 s | 5.64 s |
-| Q9b (wide projection) | 67.08 s | 44.98 s | **15.19 s** | 59.19 s |
+| Q1 (wiring) | 1.90 s | **1.87 s** | 7.05 s | 16.80 s |
+| Q2 (3-way join) | 17.75 s | **2.54 s** | 12.19 s | 43.59 s |
+| Q3 (filter+groupby) | 15.18 s | **2.99 s** | 8.37 s | 31.51 s |
+| Q4 (pricing summary) | 4.69 s | **3.19 s** | 5.56 s | 21.46 s |
+| Q5 (Q3, no filter) | 18.90 s | **2.50 s** | 10.25 s | 38.07 s |
+| Q6 (Q4, no filter) | 3.58 s | **2.71 s** | 4.98 s | 18.77 s |
+| Q7 (high-card. GROUP BY) | 5.95 s (fixed, see below) | **1.62 s** | 5.20 s | 12.84 s |
+| Q8 (selective filter) | 2.26 s | **0.93 s** | 4.25 s | 5.62 s |
+| Q9a (narrow projection) | **2.12 s** | 2.39 s | 3.78 s | 5.64 s |
+| Q9b (wide projection) | 67.27 s | 44.98 s | **15.19 s** | 59.19 s |
+
+**What moved since the previous pass (lakehouse-engine-rs only):**
+
+- **Q7 no longer fails.** [#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52) fixed
+  the nested-aggregate-over-`GROUP BY` crash (see [Bugs found](#bugs-found-and-fixed-during-first-live-verification-2026-07-03)
+  below); the query now returns the correct answer (45,000,000 distinct `L_ORDERKEY` groups) in
+  5.95 s — competitive with Trino (5.20 s) and clearly ahead of Spark (12.84 s), though still behind
+  Athena (1.62 s).
+- **Q4 and Q6 dropped ~4-5×** (19.17 s → 4.69 s, and 19.25 s → 3.58 s) — **not** from the nested-
+  aggregate fix, but from [#53](https://github.com/exasol-labs/lakehouse-engine-rs/issues/53)
+  (merged into this branch from `main` concurrently), which advertises
+  `AGGREGATE_GROUP_BY_TUPLE`. Both queries `GROUP BY L_RETURNFLAG, L_LINESTATUS` — a two-column
+  key that previously fell back to an un-pushed row scan (Exasol aggregating every raw row itself)
+  because the capability was excluded; it's now pushed down as node-local partial aggregation.
+  Confirmed via `getCapabilities` in the raw report. Both queries now **beat Trino** (Q4: 4.69 s vs.
+  5.56 s; Q6: 3.58 s vs. 4.98 s), a first for any GROUP BY query in this comparison.
+- **Q1 and Q8 shifted slightly against lakehouse-engine-rs** (Q1: 1.79 s → 1.90 s, flipping the win
+  to Athena by 0.03 s; Q8: 1.51 s → 2.26 s). Neither query's code path was touched by #52 or #53
+  (Q1 is a small-table join, Q8 a single-predicate filter); treated as run-to-run cluster/network
+  variance — not re-tested further since it doesn't change any engine's ranking beyond the
+  single-query Q1 flip.
+- **Q2, Q3, Q5, Q9a, Q9b are flat** (within a few percent) — unaffected by either fix, as expected
+  (single-key/joined/ungrouped shapes, or Q9a/Q9b's non-grouped full scans).
 
 Native `IMPORT` (goal ceiling, not a competing "engine" — no Q5-Q9b equivalent, unaffected by this
 round): scan-only `COUNT(*)` ~28.8–30.9 s vs. the VS's metadata-pushdown ~0.8–2.0 s; full
@@ -221,28 +252,35 @@ materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS `CREATE TABLE AS SELE
 ~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files)
 above).
 
-**Reading these numbers**:
+**Reading these numbers** (updated for the post-#52/#53 lakehouse-engine-rs re-run above):
 
-- **Athena wins 7 of the 10 queries outright** (everything except Q1, Q9a, and Q9b) — it's the
-  cleanest comparison point (zero infra-sizing decisions) and clearly the most consistent
-  performer across small/medium queries.
+- **Athena wins 8 of the 10 queries outright** (everything except Q9a; Q1 flipped to Athena this
+  pass by 0.03 s, within run-to-run noise) — it's the cleanest comparison point (zero infra-sizing
+  decisions) and clearly the most consistent performer across small/medium queries.
 - **Trino wins decisively on Q9b** (15.19 s vs. everyone else's 45-67 s) — the wide-projection
-  full scan is where matching `test1`'s hardware pays off most clearly. It's competitive but not
-  fastest on the other heavy scans (Q2, Q5): faster than lakehouse-engine-rs and Spark, but Athena
-  still wins on raw time.
-- **lakehouse-engine-rs wins Q1 and Q9a** (small/single-column queries — competitive when its
-  pushdown paths apply cleanly and the result is tiny), but is consistently the slowest on
-  unfiltered/wide-scan queries (Q5, Q6, Q9b) — the per-row Arrow→Value emit-path overhead
-  documented earlier in this doc compounds most visibly exactly where no pushdown can shrink the
-  work. Even on Q8 (its best-case selective-filter scenario) it trails Athena (1.51 s vs. 0.93 s).
-- **Q7 is a genuine bug, not a slowness finding**: `SELECT COUNT(*) FROM (SELECT L_ORDERKEY,
-  COUNT(*) FROM lineitem GROUP BY L_ORDERKEY) t` fails outright against lakehouse-engine-rs —
+  full scan is where matching `test1`'s hardware pays off most clearly. It no longer wins any other
+  query outright now that lakehouse-engine-rs's two-column `GROUP BY` queries (Q4, Q6) beat it —
+  see below.
+- **lakehouse-engine-rs wins Q9a** (a narrow single-column full scan — competitive when its
+  pushdown paths apply cleanly and the result is tiny). It's still slowest of the four on the
+  unfiltered/wide-scan queries without a matching pushdown (Q2, Q3, Q5, Q9b) — the per-row
+  Arrow→Value emit-path overhead documented earlier in this doc compounds most visibly exactly
+  where no pushdown can shrink the work.
+- **Q4 and Q6 are the headline change this pass**: both dropped ~4-5× (19 s → 4.69 s / 3.58 s)
+  once [#53](https://github.com/exasol-labs/lakehouse-engine-rs/issues/53) started advertising
+  `AGGREGATE_GROUP_BY_TUPLE`, letting their two-column `GROUP BY L_RETURNFLAG, L_LINESTATUS`
+  push down as partial aggregation instead of falling back to a raw row scan. Both now **beat
+  Trino** (Q4: 4.69 s vs. 5.56 s; Q6: 3.58 s vs. 4.98 s) — the first GROUP BY queries in this
+  comparison where lakehouse-engine-rs beats anything but Spark.
+- **Q7 was a genuine bug, now fixed**: `SELECT COUNT(*) FROM (SELECT L_ORDERKEY, COUNT(*) FROM
+  lineitem GROUP BY L_ORDERKEY) t` used to fail outright against lakehouse-engine-rs —
   `DataFusion SQL error: Schema error: No field named "NULL"` — while Athena, Trino, and Spark all
-  handle the identical nested-aggregate query in 1.6-12.8 s. Filed as
-  [#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52): the adapter's
-  aggregate-pushdown translation appears to substitute a literal `NULL` where a field reference is
-  expected when composing an outer `COUNT(*)` (no underlying column) over an already-pushed-down
-  inner `GROUP BY`.
+  handled the identical nested-aggregate query. Root cause and fix:
+  [#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52) — Exasol rewrites an outer
+  `COUNT(*)` over an already-grouped sub-select into a single flat pushdown request whose
+  `selectList` is a bare literal placeholder (its own "count the groups" optimization); the
+  adapter mis-rendered that literal as a projection column instead of preserving the `GROUP BY`.
+  Now returns the correct 45,000,000-group count in 5.95 s.
 - **Spark is consistently the slowest** across nearly every query — expected, given the numbers
   include EMR Serverless's per-job executor allocation on top of query time, not just the query
   itself.
