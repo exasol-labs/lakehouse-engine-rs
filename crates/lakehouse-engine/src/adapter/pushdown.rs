@@ -776,6 +776,31 @@ fn constant_projection_sql(pushdown_req: &Json, select_index: usize, rendered: &
     }
 }
 
+/// `selectList` item types that render to a bare literal value rather than a
+/// source column or a translatable scan-side expression.
+///
+/// Shared by `detect_group_by_aggregates` (classifies these as
+/// `GroupedSelectItem::Constant`, per its doc comment above) and
+/// `extract_projection` (routes these to the full-row fallback) so the two
+/// call sites can never drift apart again (issue #52: `literal_bool` was
+/// missing from one of the two copy-pasted lists).
+const LITERAL_SELECTLIST_TYPES: &[&str] = &[
+    "literal_null",
+    "literal_bool",
+    "literal_string",
+    "literal_exactnumeric",
+    "literal_double",
+    "literal_date",
+    "literal_timestamp",
+    "literal_timestamp_utc",
+];
+
+/// Whether a `selectList` item's `type` is a bare literal (see
+/// `LITERAL_SELECTLIST_TYPES`).
+fn is_literal_selectlist_item(item_type: &str) -> bool {
+    LITERAL_SELECTLIST_TYPES.contains(&item_type)
+}
+
 /// Detect a GROUP BY aggregate pushdown and return the rendered group-key SQL
 /// fragments, the aggregate plans, and the ordered per-item classification.
 ///
@@ -835,23 +860,10 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                     select_index,
                 });
             }
-            "literal_null"
-            | "literal_string"
-            | "literal_exactnumeric"
-            | "literal_double"
-            | "literal_date"
-            | "literal_timestamp"
-            | "literal_timestamp_utc" => {
+            t if is_literal_selectlist_item(t) => {
                 // A bare literal is a constant projection, not a group-key
-                // reference: Exasol's "count the groups" rewrite replaces the
-                // inner selectList with a placeholder (a `literal_null`) when the
-                // outer query needs only the row-per-group shape. It contributes
-                // no aggregate; classifying it as a Constant keeps the GROUP BY
-                // (so the scan emits one row per distinct group) instead of
-                // aborting to a row scan that would return one row per source row.
-                // Render the literal's actual value and cast it to the declared
-                // Exasol type so the outer wrapper returns a correctly-typed
-                // value — never the rendered literal reused as a column name.
+                // reference — see the `Constant` variant's doc comment above
+                // for the "count the groups" rationale.
                 let rendered = render_expression(item).ok()?;
                 let projection = constant_projection_sql(pushdown_req, select_index, &rendered);
                 select_items.push(GroupedSelectItem::Constant {
@@ -2523,13 +2535,7 @@ fn extract_projection(
                         names.push(name);
                         types.push(ty);
                     }
-                    "literal_null"
-                    | "literal_string"
-                    | "literal_exactnumeric"
-                    | "literal_double"
-                    | "literal_date"
-                    | "literal_timestamp"
-                    | "literal_timestamp_utc" => {
+                    t if is_literal_selectlist_item(t) => {
                         // A bare literal is NOT a projectable source column. Its
                         // rendered SQL (e.g. `NULL`, `'x'`, `5`) is an expression,
                         // never a column identifier — pushing it into the row-scan
@@ -4432,8 +4438,9 @@ mod tests {
             "selectListDataTypes": [ { "type": "BOOLEAN" } ],
             "type": "select"
         });
-        let result = detect_group_by_aggregates(&req)
-            .expect("composed literal-only selectList must preserve GROUP BY, not fall back to row scan");
+        let result = detect_group_by_aggregates(&req).expect(
+            "composed literal-only selectList must preserve GROUP BY, not fall back to row scan",
+        );
         assert_eq!(result.group_keys.len(), 1, "one group key from groupBy");
         assert!(
             result.group_keys[0].contains("ID"),
@@ -4503,6 +4510,48 @@ mod tests {
         assert!(
             sql.contains("SELECT CAST(NULL AS BOOLEAN) FROM"),
             "outer wrapper must project the type-cast constant placeholder: {sql}"
+        );
+    }
+
+    /// Code-review follow-up on issue #52: `literal_bool` was missing from the
+    /// literal-type set used to classify grouped `selectList` constants (only
+    /// `literal_null` and six other literal kinds were listed, and the
+    /// renderer in `vs-expression` supports `literal_bool` — see
+    /// `render_expression`). A boolean literal placeholder in a grouped
+    /// selectList (e.g. `SELECT k, TRUE AS flag, COUNT(*) FROM t GROUP BY k`)
+    /// used to fall through to the group-key-matching `_` arm, fail to match
+    /// any group key, and abort the ENTIRE grouped-aggregate detection to
+    /// `None` — exactly the bug class the `literal_null` case guards against,
+    /// just for `literal_bool`. `LITERAL_SELECTLIST_TYPES` closes this gap.
+    #[test]
+    fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                {"type": "literal_bool", "value": true},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([
+                decimal_type(20, 0),
+                serde_json::json!({"type": "boolean"}),
+                decimal_type(20, 0),
+            ]),
+        );
+        let result = detect_group_by_aggregates(&req).expect(
+            "a literal_bool selectList item must classify as Constant, not abort detection to None",
+        );
+        assert!(
+            matches!(
+                result.select_items[1],
+                GroupedSelectItem::Constant {
+                    select_index: 1,
+                    ..
+                }
+            ),
+            "the literal_bool item must classify as a Constant, not fall through \
+             to the group-key arm: {:?}",
+            result.select_items
         );
     }
 

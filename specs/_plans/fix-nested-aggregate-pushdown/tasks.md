@@ -19,5 +19,8 @@ duplicate-key tables).
 - [x] 4. Host unit test for the composed-request guard.
 - [x] 5. E2E regression test for the Q7 nested-aggregate shape (include duplicate-key case: `GROUP BY MOD(id,4)` expecting 4, not just the unique-id `events` case).
 
+## Phase 4: Code review fixes
+- [x] 5b. Fix code-review findings: add missing `literal_bool` to the two literal-type match arms in `pushdown.rs` (detect_group_by_aggregates ~838-844, extract_projection ~2526-2532); dedupe the copy-pasted literal-type list into one shared helper/const so the two arms can't drift again.
+
 ## Phase 3: Verification (Group E)
 - [ ] 6. Verification gate (cargo test, clippy, fmt, cross-musl-udf-build, test-e2e).
