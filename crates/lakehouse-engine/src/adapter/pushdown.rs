@@ -4244,6 +4244,19 @@ mod tests {
         })
     }
 
+    /// `UPPER(<col>)` as a `function_scalar` node — renders to `upper("<COL>")`
+    /// via `render_expression`. Used to build all-expression multi-key GROUP BY
+    /// tuples where every element (not just some) is an expression.
+    fn upper_item(col: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_scalar",
+            "name": "UPPER",
+            "arguments": [
+                {"type": "column", "name": col},
+            ],
+        })
+    }
+
     /// A DECIMAL `selectListDataTypes` entry, per the `exasol_type_from_json` shape.
     fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
         serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
@@ -4461,6 +4474,123 @@ mod tests {
             ],
             "HAVING presence must not affect selectList classification order: {:?}",
             result.select_items
+        );
+    }
+
+    /// All-expression multi-key GROUP BY: `SELECT MOD(id,4), UPPER(name), COUNT(*)
+    /// ... GROUP BY MOD(id,4), UPPER(name)`. Every tuple element is an expression
+    /// (none a plain column) and must still be detected, each rendered on its own,
+    /// and each element must appear rendered individually (not merged/collapsed)
+    /// in the SQL built from the detection. If one element of the tuple is
+    /// untranslatable, the whole detection must fall back to `None` (full
+    /// raw-scan fallback), not a partial/degraded pushdown.
+    #[test]
+    fn detect_group_by_all_expression_multi_key() {
+        let req = make_group_by_request(
+            serde_json::json!([mod_item("ID", 4), upper_item("NAME")]),
+            serde_json::json!([
+                mod_item("ID", 4),
+                upper_item("NAME"),
+                agg_item("COUNT", None, false),
+            ]),
+        );
+        let result =
+            detect_group_by_aggregates(&req).expect("all-expression multi-key must detect");
+        assert_eq!(result.group_keys.len(), 2, "two expression group keys");
+        assert!(
+            result.group_keys[0].contains('%') && result.group_keys[0].contains('4'),
+            "key 0 must render the MOD expression: {:?}",
+            result.group_keys
+        );
+        assert!(
+            result.group_keys[1].to_lowercase().contains("upper"),
+            "key 1 must render the UPPER expression: {:?}",
+            result.group_keys
+        );
+        assert_eq!(result.plans.len(), 1, "one aggregate plan");
+        assert_eq!(
+            result.select_items,
+            vec![
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 0,
+                    select_index: 0,
+                },
+                GroupedSelectItem::GroupKey {
+                    group_key_slot: 1,
+                    select_index: 1,
+                },
+                GroupedSelectItem::Aggregate {
+                    plan_slot: 0,
+                    select_index: 2,
+                },
+            ],
+            "each expression key must classify to its own slot: {:?}",
+            result.select_items
+        );
+
+        // Each element must be rendered per-element (not merged) in the built SQL:
+        // the per-shard scan spec's common blob carries both rendered fragments
+        // verbatim, embedded in the SQL literal that drives the UDF call.
+        let col_types: Vec<(String, String)> = vec![];
+        let group_key_types = vec!["VARCHAR(2000000)".to_string(); 2];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let spec_template = ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(result.plans.clone()),
+            group_keys: Some(result.group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        };
+        let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &result.group_keys,
+            &group_key_types,
+            &result.plans,
+            &aggregate_types,
+            &result.select_items,
+            None,
+            &col_types,
+            SCAN_UDF_NAME,
+            None,
+        );
+        assert!(
+            sql.contains("% 4"),
+            "built SQL must carry the MOD key rendered on its own: {sql}"
+        );
+        assert!(
+            sql.to_lowercase().contains("upper("),
+            "built SQL must carry the UPPER key rendered on its own: {sql}"
+        );
+        assert!(
+            sql.contains(r#""GK_0""#) && sql.contains(r#""GK_1""#),
+            "built SQL must emit both group-key slots: {sql}"
+        );
+
+        // One untranslatable element in the tuple must collapse detection to None.
+        let bad_req = make_group_by_request(
+            serde_json::json!([mod_item("ID", 4), {"type": "fn_custom_unsupported", "name": "MYSTERY"}]),
+            serde_json::json!([
+                mod_item("ID", 4),
+                {"type": "fn_custom_unsupported", "name": "MYSTERY"},
+                agg_item("COUNT", None, false),
+            ]),
+        );
+        assert!(
+            detect_group_by_aggregates(&bad_req).is_none(),
+            "one untranslatable tuple element must force full fallback to None"
         );
     }
 
@@ -5298,6 +5428,125 @@ mod tests {
         );
     }
 
+    /// Multi-key grouped SQL build with HAVING and LIMIT: `SELECT REGION,
+    /// SUM(score), MOD(id,4) ... GROUP BY REGION, MOD(id,4) HAVING SUM(score) >
+    /// 100 LIMIT 2`. HAVING and LIMIT must be placed ONLY in the outer wrapper —
+    /// never in the per-shard partial scan, which must emit every partial group
+    /// from every shard for the outer wrapper to merge and filter correctly.
+    #[test]
+    fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                mod_item("ID", 4),
+            ]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                agg_item("SUM", Some("SCORE"), false),
+                mod_item("ID", 4),
+            ]),
+            serde_json::json!([
+                {"type": "varchar", "size": 100},
+                {"type": "double"},
+                decimal_type(9, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(detection.group_keys.len(), 2, "two group keys");
+        let group_key_types =
+            group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+        let aggregate_types = aggregate_exasol_types(&req);
+
+        let having_node = serde_json::json!({
+            "type": "predicate_greater",
+            "left": agg_item("SUM", Some("SCORE"), false),
+            "right": {"type": "literal_exactnumeric", "value": 100},
+        });
+        let having = render_having_over_merge(&having_node, &detection.plans)
+            .expect("HAVING must render over the merge decomposition");
+
+        let col_types: Vec<(String, String)> =
+            vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            aggregates: Some(detection.plans.clone()),
+            group_keys: Some(detection.group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        };
+        // Multiple shards so the inner scan is a real `GROUP BY shard_key` fan-out,
+        // not the single-shard direct-call shortcut.
+        let shards = vec![
+            vec![("s3://wh/f0.parquet".to_string(), 1u64)],
+            vec![("s3://wh/f1.parquet".to_string(), 1u64)],
+        ];
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &detection.group_keys,
+            &group_key_types,
+            &detection.plans,
+            &aggregate_types,
+            &detection.select_items,
+            Some(2),
+            &col_types,
+            SCAN_UDF_NAME,
+            Some(&having),
+        );
+
+        // The per-shard partial scan ends at "GROUP BY shard_key"; everything up to
+        // and including that point must carry neither HAVING nor LIMIT.
+        let shard_group_end = sql
+            .find("GROUP BY shard_key")
+            .map(|i| i + "GROUP BY shard_key".len())
+            .unwrap_or_else(|| panic!("must contain the inner per-shard fan-out: {sql}"));
+        let inner_part = &sql[..shard_group_end];
+        assert!(
+            !inner_part.contains("HAVING"),
+            "HAVING must not appear in the per-shard partial scan: {inner_part}"
+        );
+        assert!(
+            !inner_part.contains("LIMIT"),
+            "LIMIT must not appear in the per-shard partial scan: {inner_part}"
+        );
+
+        // Everything after the per-shard scan is the outer wrapper: it must carry
+        // its own multi-key GROUP BY, then HAVING, then LIMIT, in that order.
+        let outer_part = &sql[shard_group_end..];
+        let outer_group_by_pos = outer_part
+            .find("GROUP BY")
+            .unwrap_or_else(|| panic!("outer wrapper must have its own GROUP BY: {outer_part}"));
+        assert!(
+            outer_part.contains(r#""GK_0""#) && outer_part.contains(r#""GK_1""#),
+            "outer GROUP BY must reference both group-key slots: {outer_part}"
+        );
+        let having_pos = outer_part
+            .find("HAVING")
+            .unwrap_or_else(|| panic!("HAVING must appear in the outer wrapper: {outer_part}"));
+        let limit_pos = outer_part
+            .find("LIMIT 2")
+            .unwrap_or_else(|| panic!("LIMIT must appear in the outer wrapper: {outer_part}"));
+        assert!(
+            outer_group_by_pos < having_pos,
+            "outer GROUP BY must precede HAVING: {outer_part}"
+        );
+        assert!(
+            having_pos < limit_pos,
+            "HAVING must precede LIMIT in the outer wrapper: {outer_part}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // group_key_exasol_types — index-based resolution, no silent VARCHAR fallback
     // (fix-grouped-agg-select-order, GitHub issue #33)
@@ -5342,6 +5591,46 @@ mod tests {
             vec!["DECIMAL(9,0)".to_string()],
             "type must resolve via select_index, not via string-matching the (drifted) \
              rendered group key: {types:?}"
+        );
+    }
+
+    /// Mixed-type multi-key GROUP BY: `SELECT REGION, MOD(id,4), COUNT(*) ...
+    /// GROUP BY REGION, MOD(id,4)`. `REGION` is a plain column declared VARCHAR;
+    /// `MOD(id,4)` is an expression declared DECIMAL. Each `GK_{i}` must resolve
+    /// its own declared type by its own `selectList` index — a shared/defaulted
+    /// VARCHAR for both would silently lose the DECIMAL key's real type.
+    #[test]
+    fn group_key_types_multi_key_mixed_types() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                mod_item("ID", 4),
+            ]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                mod_item("ID", 4),
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([
+                {"type": "varchar", "size": 100},
+                decimal_type(9, 0),
+                decimal_type(18, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(detection.group_keys.len(), 2, "two group keys");
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(types.len(), 2, "one declared type per group key");
+        assert_eq!(
+            types[0], "VARCHAR(100)",
+            "the REGION key must resolve its own VARCHAR type, at its own select index: {types:?}"
+        );
+        assert_eq!(
+            types[1], "DECIMAL(9,0)",
+            "the MOD(id,4) key must resolve its own DECIMAL type, not a shared/defaulted \
+             VARCHAR: {types:?}"
         );
     }
 
