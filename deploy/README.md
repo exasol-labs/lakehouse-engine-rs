@@ -86,22 +86,28 @@ this section covers standing up the Trino/Spark compute they need.
 
 ### Trino (ephemeral, opt-in)
 
-A new OpenTofu stack, `deploy/trino-stack/`, mirroring `cluster-stack/`: a single EC2 node running
-Trino in Docker, its Iceberg connector using `iceberg.catalog.type=glue` (talks to the Glue Data
-Catalog directly via the AWS SDK, not the REST endpoint the lakehouse engine uses) against the
-same S3 bucket, authenticated via an instance-profile role (no static keys).
+A new OpenTofu stack, `deploy/trino-stack/`, mirroring `cluster-stack/`: a real coordinator +
+worker cluster running Trino in Docker, sized by `instance_type`/`node_count`
+(default `r8i.2xlarge` × 2 — matching an Exasol `test1` node's type and the cluster's node
+count, so Trino and lakehouse-engine-rs run on identical hardware). Its Iceberg connector uses
+`iceberg.catalog.type=glue` (talks to the Glue Data Catalog directly via the AWS SDK, not the
+REST endpoint the lakehouse engine uses) against the same S3 bucket, authenticated via an
+instance-profile role (no static keys). The coordinator also runs worker tasks
+(`node-scheduler.include-coordinator=true`), mirroring Exasol's every-node-executes model.
 
 ```bash
 cd deploy/trino-stack && tofu init
-../scripts/trino-up.sh myenv         # tofu apply + wait for Trino to answer /v1/info
-export TRINO_HOST=<printed ip>
+../scripts/trino-up.sh myenv    # tofu apply + wait for the coordinator + all workers to join
+export TRINO_HOST=<printed coordinator ip>
 cd ../.. && bench/trino_compare.sh
-../scripts/trino-down.sh myenv       # deploy/scripts/, from repo root: deploy/scripts/trino-down.sh myenv
+../scripts/trino-down.sh myenv  # deploy/scripts/, from repo root: deploy/scripts/trino-down.sh myenv
 ```
 
-> **Cost / teardown: this EC2 node bills while it exists.** It is created ONLY by an explicit
-> `trino-up.sh` run — nothing else applies this stack — and must be torn down explicitly with
-> `trino-down.sh <env>` when you're done benchmarking. There is no auto-stop.
+> **Cost / teardown: these EC2 nodes bill while they exist — and `r8i.2xlarge` × 2 costs
+> meaningfully more than a single small box.** They are created ONLY by an explicit `trino-up.sh`
+> run — nothing else applies this stack — and MUST be torn down immediately after the benchmark
+> run with `trino-down.sh <env>`. There is no auto-stop. Verify via `aws ec2 describe-instances`
+> that both nodes actually terminated before considering a run done.
 
 ### Spark / EMR Serverless (pay-per-job, opt-in)
 
@@ -209,7 +215,7 @@ deploy/
     # + EMR Serverless application (enable_emr_serverless, opt-in) for the Spark comparison
   cluster-stack/{providers,variables,main,outputs}.tf
   trino-stack/{providers,variables,main,outputs}.tf  trino-userdata.sh.tftpl
-    # ephemeral single-node Trino for the competitive comparison (opt-in)
+    # ephemeral Trino cluster (coordinator + workers) for the competitive comparison (opt-in)
   scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh,
            trino-up.sh, trino-down.sh, spark_queries.py}
 ```

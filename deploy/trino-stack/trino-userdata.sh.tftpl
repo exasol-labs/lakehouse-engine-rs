@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Trino bootstrap: installs Docker, writes a single-node Trino config (coordinator + worker in one
-# JVM — this is a benchmark box, not production), points the Iceberg connector at the SAME Glue
-# catalog + S3 warehouse the lakehouse engine and Athena already query, and runs the pinned Trino
-# image. AWS creds come from the instance profile (IMDS) — no static keys on the box.
+# Trino bootstrap: installs Docker, writes a per-role Trino config (this node is either the
+# coordinator or a worker — see is_coordinator/discovery_uri, rendered per-instance by main.tf),
+# points the Iceberg connector at the SAME Glue catalog + S3 warehouse the lakehouse engine and
+# Athena already query, and runs the pinned Trino image. AWS creds come from the instance profile
+# (IMDS) — no static keys on the box.
 set -uo pipefail
 exec > >(tee /var/log/trino-userdata.log) 2>&1
 
@@ -21,13 +22,14 @@ node.environment=benchmark
 node.data-dir=/data/trino
 EOF
 
-# r6i.xlarge = 30 GiB RAM; 24G heap leaves headroom for the OS/JVM overhead outside -Xmx. The
-# 3-way customer-orders-lineitem join (Q2) over 180M lineitem rows OOMs Trino's default per-node
-# query memory limit on a single node — found live-verifying against test1 (180M-row lineitem) —
-# so query.max-memory-per-node is raised to fit under the bumped heap.
+# r8i.2xlarge = 8 vCPU / 64 GiB RAM, matching an Exasol test1 node — 48G heap leaves headroom for
+# OS/JVM overhead outside -Xmx (same ~80%-of-RAM ratio used for the prior single-node r6i.xlarge
+# run). query.max-memory-per-node caps one node's contribution to a query; query.max-memory is the
+# CLUSTER-WIDE budget across all ${node_count} nodes, so a query can use the whole cluster, not
+# just one node (the single-node run had these equal since there was only one node).
 cat >/opt/trino/etc/jvm.config <<'EOF'
 -server
--Xmx24G
+-Xmx48G
 -XX:+UseG1GC
 -XX:G1HeapRegionSize=32M
 -XX:+ExplicitGCInvokesConcurrent
@@ -35,14 +37,14 @@ cat >/opt/trino/etc/jvm.config <<'EOF'
 -Djdk.attach.allowAttachSelf=true
 EOF
 
-cat >/opt/trino/etc/config.properties <<'EOF'
-coordinator=true
-node-scheduler.include-coordinator=true
+cat >/opt/trino/etc/config.properties <<EOF
+coordinator=${is_coordinator}
+node-scheduler.include-coordinator=${is_coordinator}
 http-server.http.port=8080
-discovery.uri=http://localhost:8080
-query.max-memory-per-node=18GB
-query.max-memory=18GB
-memory.heap-headroom-per-node=4GB
+discovery.uri=${discovery_uri}
+query.max-memory-per-node=40GB
+query.max-memory=${40 * node_count}GB
+memory.heap-headroom-per-node=8GB
 EOF
 
 # Glue IS the catalog here (not a generic REST endpoint), so iceberg.catalog.type=glue talks to it

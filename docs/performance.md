@@ -167,7 +167,9 @@ run where the VS aggregate path was competitive with native IMPORT.
 **Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, 180M-row `lineitem`,
 60 files, same Glue catalog + S3 data for every engine below). Run individually per
 `bench/README.md`, not yet via a single `bench/compare_all.sh` pass (each engine was run/tuned
-separately during first-time live verification — see bug list below).
+separately during first-time live verification — see bug list below). Trino was re-run the same
+day after resizing from a single small node to a 2-node cluster matching `test1`'s hardware — see
+[Infrastructure comparison](#infrastructure-comparison) below.
 
 Beyond the native `IMPORT` ceiling above, the same TPC-H tables and the same four queries
 (`bench/run.sh` Q1-Q4, lines ~321-349) are run through the lakehouse engines people put next to a
@@ -188,22 +190,50 @@ and aggregates every engine's timings into one report with a summary table.
 
 | Engine | Q1 (wiring) | Q2 (3-way join) | Q3 (filter+groupby) | Q4 (pricing summary) | Notes |
 |---|---|---|---|---|---|
-| **lakehouse-engine-rs** | **1.97 s** | **18.30 s** | **15.67 s** | **19.80 s** | `make bench`, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` |
-| AWS Athena | 1.54 s | 3.22 s | 1.79 s | 2.81 s | Engine execution time (excludes queue wait); managed, no infra sizing |
-| Trino | 8.13 s | 35.48 s | 20.29 s | 13.24 s | Single `r6i.xlarge` node (4 vCPU/32 GB), no cluster fan-out — smallest apples-to-apples box, not tuned for scale |
-| Spark (EMR Serverless) | 15.77 s | 43.97 s | 32.51 s | 22.80 s | Cold-started application (16 vCPU/64 GB max capacity); includes per-job executor allocation, not just query time |
+| **lakehouse-engine-rs** | **1.97 s** | 18.30 s | 15.67 s | **19.80 s** | `make bench`, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` — 2026-07-03 |
+| AWS Athena | 1.54 s | 3.22 s | 1.79 s | 2.81 s | Engine execution time (excludes queue wait); managed, no infra sizing — 2026-07-03 |
+| **Trino** | 7.49 s | **15.74 s** | **9.04 s** | 5.61 s | 2-node cluster, `r8i.2xlarge` × 2 (**resized to match test1**, was a single `r6i.xlarge`) — 2026-07-03, run 1 |
+| Spark (EMR Serverless) | 15.77 s | 43.97 s | 32.51 s | 22.80 s | Cold-started application (16 vCPU/64 GB max capacity); includes per-job executor allocation, not just query time — 2026-07-03 |
 
 Native `IMPORT` (goal ceiling, not a competing "engine"): scan-only `COUNT(*)` ~28.8–30.9 s vs. the
 VS's metadata-pushdown ~0.8–2.0 s; full materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS
 `CREATE TABLE AS SELECT *` ~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) above — same numbers, this run reproduced them).
 
-**Reading these numbers**: this is a first apples-to-apples pass, not a tuned bake-off — Athena is
-fully managed/no sizing choice, Trino ran on the smallest reasonable single node (no multi-node
-fan-out, unlike the 2-node Exasol cluster), and the EMR Serverless numbers include a per-job
-executor-allocation delay that a long-running cluster wouldn't pay. lakehouse-engine-rs comes out
-fastest on the two heaviest queries (Q2, Q3) despite running on modest 2-node hardware, and within
-range of Athena (the only other engine with zero infra-sizing decisions) on all four. Re-run with
-matched hardware/sizing before drawing stronger conclusions.
+**Reading these numbers**: Trino's first-round numbers (single `r6i.xlarge`, 4 vCPU/32 GB) weren't
+a fair comparison — a quarter of the hardware lakehouse-engine-rs runs on. Resized to a real 2-node
+`r8i.2xlarge` cluster (matching `test1` node-for-node — see
+[Infrastructure comparison](#infrastructure-comparison) below), Trino's Q2 dropped from 35.48 s to
+**15.74 s** (2.25×) and Q3 from 20.29 s to **9.04 s** (2.24×) — now faster than lakehouse-engine-rs
+on the two heaviest queries. Athena remains fully managed with no sizing knob at all (see below);
+the EMR Serverless numbers still include a per-job executor-allocation delay a long-running cluster
+wouldn't pay. Bold marks each query's fastest engine.
+
+### Infrastructure comparison
+
+Athena has **no equivalent sizing control** to match here: the standard Athena SQL engine (what
+`bench/athena_compare.sh` exercises via `StartQueryExecution`) is fully serverless — AWS
+auto-scales compute per query with no user-facing vCPU, RAM, or node-count knob. (*Athena for
+Apache Spark* has a configurable Data Processing Unit count, but that's a different, session-based
+execution mode — using it would change what's being measured, not just how big it is.) Athena is
+included because it's what a customer actually gets, not because it's size-matched.
+
+Trino and lakehouse-engine-rs, as of this round, run on identical VM shape and count:
+
+| | Instance type | Nodes | vCPU (total) | RAM (total) |
+|---|---|---|---|---|
+| Exasol `test1` (runs lakehouse-engine-rs) | `r8i.2xlarge` | 2 | 16 | 128 GB |
+| Trino | `r8i.2xlarge` | 2 | 16 | 128 GB |
+| AWS Athena | fully managed — no sizing control | n/a | n/a | n/a |
+
+Same hardware, different consumption model, though: lakehouse-engine-rs doesn't get a dedicated
+box — it shares each Exasol node with the DB engine itself. Live-checked on `test1`: the Exasol DB
+is configured for **97.05 GiB total across both nodes** (`MemSize` in `EXAConf`, ≈48.5 GiB/node out
+of each node's 64 GiB nameplate RAM — the rest is OS/COS/UDF headroom via `c4`'s memory-sizing
+formula), and the UDF's own DataFusion pool is a further fraction of whatever per-instance memory
+limit the script metadata reports, fanned out via `PARALLELISM_FACTOR`/`NR_OF_CORES`. Trino, by
+contrast, dedicates the whole node to query execution with a directly-configured 48 GB JVM heap
+per node. "Same VM shape and count" is the fairest comparison available, but it isn't "identical
+resources actually available to the query engine."
 
 ### Bugs found and fixed during first live verification (2026-07-03)
 
@@ -253,6 +283,28 @@ ten real bugs — none were visible from code review or `tofu validate` alone:
     "Known seams".
 
 All fixes are on `feat/competitive-engine-benchmark` (PR #51).
+
+### Bugs found resizing Trino to a 2-node cluster (2026-07-03, second round)
+
+Converting `deploy/trino-stack/` from a single node to a real coordinator + worker cluster
+surfaced two more, both live-only:
+
+11. **A worker referencing the coordinator's `private_ip` from within the same `count`-based
+    `aws_instance` resource is a self-cycle for index 0** — Terraform's dependency graph sees the
+    static reference `aws_instance.trino[0]` inside the resource's own config and treats every
+    instance in that `count`, including index 0 itself, as depending on index 0 (a
+    `ternary`-conditioned expression doesn't change this — the graph is built from the referenced
+    addresses, not evaluated branches). Caught at `tofu validate`/`plan` time, not live, but
+    worth recording: split into separate `aws_instance.trino_coordinator` (singular) and
+    `aws_instance.trino_worker` (`count = node_count - 1`) resources instead — a worker
+    referencing a *different* resource's attribute is a normal, acyclic dependency.
+12. **Trino's `/v1/node` endpoint needs an `X-Trino-User` header** even with no authentication
+    configured (`curl -sf` alone gets `Basic authentication or X-Trino-User ... must be sent`),
+    **and it doesn't list the coordinator itself** — only nodes reached via the
+    announcement/discovery protocol. `trino-up.sh`'s readiness check was waiting on the wrong
+    count (`node_count`, unreachable since the coordinator never appears) with the wrong request
+    (no header, always failing). Fixed to add the header and wait on `node_count - 1` (workers
+    only) — the coordinator's own liveness is separately confirmed via `/v1/info`.
 
 ## Tuning levers & outlook
 
