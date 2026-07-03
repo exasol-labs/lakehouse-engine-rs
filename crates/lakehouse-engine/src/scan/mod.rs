@@ -14,6 +14,7 @@ use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
 use crate::types::mapping::needs_json_fallback;
+use arrow::array::{Array, ListArray};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
@@ -292,18 +293,11 @@ async fn run_partial_aggregate(
 
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
-    // for a well-formed aggregate), emit a row of NULLs.
-    let row = if let Some(batch) = batches.first() {
-        if batch.num_rows() > 0 {
-            // Convert the single row from the batch.
-            (0..batch.num_columns())
-                .map(|col_idx| arrow_value_at(batch.column(col_idx), 0))
-                .collect::<Vec<_>>()
-        } else {
-            emit_null_partial_row(aggregates)
-        }
-    } else {
-        emit_null_partial_row(aggregates)
+    // for a well-formed aggregate), emit a row of NULLs. CountDistinct columns are
+    // serialized from their Arrow List cell to a JSON-array VARCHAR in Rust.
+    let row = match batches.first() {
+        Some(batch) if batch.num_rows() > 0 => partial_row_from_batch(aggregates, batch)?,
+        _ => emit_null_partial_row(aggregates),
     };
 
     ctx.emit(&row)?;
@@ -482,6 +476,9 @@ fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::va
         match plan.kind {
             AggKind::Count | AggKind::CountCol => row.push(Value::Int64(0)),
             AggKind::Sum | AggKind::Min | AggKind::Max => row.push(Value::Null),
+            // An empty shard contributes NO distinct values: emit an empty JSON
+            // array (not NULL, not 0) so the scalar merge UDF unions it cleanly.
+            AggKind::CountDistinct => row.push(Value::String("[]".to_string())),
             AggKind::Avg => {
                 row.push(Value::Null); // partial_avg_sum
                 row.push(Value::Int64(0)); // partial_avg_cnt
@@ -552,6 +549,20 @@ pub fn build_partial_agg_sql_filtered(
     sql
 }
 
+/// Render the DataFusion SQL argument for an aggregate plan entry.
+///
+/// When the plan carries a rendered expression argument (`arg_expr`, produced by
+/// the adapter via `vs_expression::render_expression` — e.g. `LENGTH("L_COMMENT")`)
+/// it is substituted VERBATIM as raw SQL text; it is already a fully-rendered
+/// DataFusion fragment, so it is NOT re-quoted or re-escaped as an identifier.
+/// Otherwise the bare column name is emitted as a quoted identifier.
+fn agg_arg_sql(plan: &AggregatePlan) -> String {
+    match plan.arg_expr.as_deref() {
+        Some(expr) => expr.to_string(),
+        None => quote_ident(plan.column.as_deref().unwrap_or("")),
+    }
+}
+
 /// Produce the SELECT list items for one aggregate plan entry at index `i`.
 fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
     match plan.kind {
@@ -559,30 +570,35 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
             vec![format!(r#"COUNT(*) AS "PARTIAL_count_{i}""#)]
         }
         AggKind::CountCol => {
-            let col = plan.column.as_deref().unwrap_or("");
-            vec![format!(
-                r#"COUNT({}) AS "PARTIAL_count_{i}""#,
-                quote_ident(col)
-            )]
+            let arg = agg_arg_sql(plan);
+            vec![format!(r#"COUNT({arg}) AS "PARTIAL_count_{i}""#)]
         }
         AggKind::Sum => {
-            let col = plan.column.as_deref().unwrap_or("");
-            vec![format!(r#"SUM({}) AS "PARTIAL_sum_{i}""#, quote_ident(col))]
+            let arg = agg_arg_sql(plan);
+            vec![format!(r#"SUM({arg}) AS "PARTIAL_sum_{i}""#)]
         }
         AggKind::Min => {
-            let col = plan.column.as_deref().unwrap_or("");
-            vec![format!(r#"MIN({}) AS "PARTIAL_min_{i}""#, quote_ident(col))]
+            let arg = agg_arg_sql(plan);
+            vec![format!(r#"MIN({arg}) AS "PARTIAL_min_{i}""#)]
         }
         AggKind::Max => {
-            let col = plan.column.as_deref().unwrap_or("");
-            vec![format!(r#"MAX({}) AS "PARTIAL_max_{i}""#, quote_ident(col))]
+            let arg = agg_arg_sql(plan);
+            vec![format!(r#"MAX({arg}) AS "PARTIAL_max_{i}""#)]
         }
         AggKind::Avg => {
-            let col = plan.column.as_deref().unwrap_or("");
+            let arg = agg_arg_sql(plan);
             vec![
-                format!(r#"SUM({}) AS "PARTIAL_avg_sum_{i}""#, quote_ident(col)),
-                format!(r#"COUNT({}) AS "PARTIAL_avg_cnt_{i}""#, quote_ident(col)),
+                format!(r#"SUM({arg}) AS "PARTIAL_avg_sum_{i}""#),
+                format!(r#"COUNT({arg}) AS "PARTIAL_avg_cnt_{i}""#),
             ]
+        }
+        // Single-group COUNT(DISTINCT): emit the shard's LOCAL distinct set as one
+        // Arrow List cell. NULLs are excluded downstream in Rust during JSON
+        // serialization (`distinct_list_to_json`), so the merged count matches
+        // single-node `COUNT(DISTINCT)` semantics (which never count NULL).
+        AggKind::CountDistinct => {
+            let arg = agg_arg_sql(plan);
+            vec![format!(r#"array_agg(DISTINCT {arg}) AS "PARTIAL_cd_{i}""#)]
         }
         // STDDEV/VARIANCE family: emit (cnt, sum, sum_sq) sufficient statistics.
         // COUNT(col) excludes NULLs, matching single-node semantics.
@@ -596,6 +612,176 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
             ]
         }
     }
+}
+
+/// Per-shard cap on the number of distinct elements a single `COUNT(DISTINCT)`
+/// local set may hold before the scan aborts. Bounds pre-serialization
+/// memory/CPU for a single shard (see the plan's Requirements table).
+const MAX_DISTINCT_ELEMENTS_PER_SHARD: usize = 100_000;
+
+/// Per-shard cap on the serialized-byte size of a single `COUNT(DISTINCT)` local
+/// set's JSON array (1 MiB). Kept well below the `VARCHAR(2000000)` wire limit so
+/// the array-of-arrays LISTAGG wrapper the merge UDF consumes still fits.
+const MAX_DISTINCT_BYTES_PER_SHARD: usize = 1_048_576;
+
+/// Which per-shard `COUNT(DISTINCT)` safety cap was exceeded.
+enum DistinctCap {
+    Elements,
+    Bytes,
+}
+
+/// Build the clean bounded-resource error for an exceeded `COUNT(DISTINCT)` cap.
+///
+/// The message names the offending column and the cap that tripped, mirroring the
+/// engine's `ResourcesExhausted` bounded-execution convention. `label` is the
+/// aggregate argument (a bare column name or a rendered DataFusion expression) —
+/// never a credential value, so the message is credential-free by construction.
+fn distinct_cap_error(label: &str, cap: DistinctCap) -> UdfError {
+    let detail = match cap {
+        DistinctCap::Elements => format!(
+            "distinct-element count exceeded the per-shard cap of {MAX_DISTINCT_ELEMENTS_PER_SHARD}"
+        ),
+        DistinctCap::Bytes => format!(
+            "serialized size exceeded the per-shard cap of {MAX_DISTINCT_BYTES_PER_SHARD} bytes"
+        ),
+    };
+    UdfError::User(format!(
+        "scan failed: memory exhausted (ResourcesExhausted): COUNT(DISTINCT {label}) \
+         local set for this shard {detail}; the query cannot be completed within the \
+         per-shard safety bound"
+    ))
+}
+
+/// Map one SDK [`Value`] to its canonical `serde_json::Value` token for the
+/// per-shard distinct set. All shards run identical DataFusion over the same
+/// column type, so the representation is stable across shards and the scalar
+/// merge UDF can union tokens by value. Decimal / date / timestamp use their
+/// lossless string form; NULL is never reached (callers skip null elements).
+fn distinct_value_to_json(v: Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(b),
+        Value::Int32(n) => J::Number(n.into()),
+        Value::Int64(n) => J::Number(n.into()),
+        Value::Double(f) => serde_json::Number::from_f64(f)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        Value::Numeric(d) => J::String(d.to_string()),
+        Value::Date(nd) => J::String(nd.to_string()),
+        Value::Timestamp(ndt) => J::String(ndt.to_string()),
+        Value::String(s) => J::String(s),
+    }
+}
+
+/// Serialize one shard's local distinct set (the element values of a single
+/// `array_agg(DISTINCT)` List cell) to a JSON array string.
+///
+/// - NULL elements are SKIPPED: `COUNT(DISTINCT)` never counts NULL, so the
+///   merged cardinality matches single-node semantics.
+/// - Elements are converted to canonical JSON tokens IN RUST — no Arrow type
+///   crosses the `.so` boundary; only the returned `String` does.
+/// - The per-shard safety cap is enforced WHILE building: the count and running
+///   serialized byte length are checked as each element is appended, aborting
+///   with [`distinct_cap_error`] the moment either threshold is exceeded. The
+///   partial set is never truncated (a truncated set would produce a wrong
+///   merged count).
+fn distinct_list_to_json(values: &dyn Array, label: &str) -> Result<String, UdfError> {
+    let mut tokens: Vec<String> = Vec::new();
+    // Account for the enclosing '[' and ']'.
+    let mut running_bytes: usize = 2;
+    for i in 0..values.len() {
+        if values.is_null(i) {
+            continue;
+        }
+        // Adding this element would exceed the element cap → abort (no truncation).
+        if tokens.len() + 1 > MAX_DISTINCT_ELEMENTS_PER_SHARD {
+            return Err(distinct_cap_error(label, DistinctCap::Elements));
+        }
+        let token = serde_json::to_string(&distinct_value_to_json(arrow_value_at(values, i)))
+            .map_err(|e| {
+                UdfError::User(format!(
+                    "scan failed: could not serialize a COUNT(DISTINCT {label}) value: {e}"
+                ))
+            })?;
+        // +1 for the comma separator preceding every element after the first.
+        let separator = usize::from(!tokens.is_empty());
+        running_bytes = running_bytes.saturating_add(token.len() + separator);
+        if running_bytes > MAX_DISTINCT_BYTES_PER_SHARD {
+            return Err(distinct_cap_error(label, DistinctCap::Bytes));
+        }
+        tokens.push(token);
+    }
+    Ok(format!("[{}]", tokens.join(",")))
+}
+
+/// Serialize the `COUNT(DISTINCT)` List cell at `row` to its JSON array partial
+/// value. A NULL cell (an empty group — `array_agg` over zero rows returns NULL)
+/// becomes the empty array `"[]"`, so the merge treats the shard as contributing
+/// no distinct values.
+fn distinct_cell_to_json(col: &dyn Array, row: usize, label: &str) -> Result<String, UdfError> {
+    if col.is_null(row) {
+        return Ok("[]".to_string());
+    }
+    let list = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        UdfError::User(
+            "COUNT(DISTINCT) partial column is not an Arrow List as expected".to_string(),
+        )
+    })?;
+    let elements = list.value(row);
+    distinct_list_to_json(elements.as_ref(), label)
+}
+
+/// A human-readable, credential-free label for an aggregate's argument, used in
+/// safety-cap error messages (the bare column name, or the rendered expression).
+fn agg_label(plan: &AggregatePlan) -> String {
+    plan.column
+        .as_deref()
+        .map(str::to_string)
+        .or_else(|| plan.arg_expr.clone())
+        .unwrap_or_default()
+}
+
+/// Convert the single-group partial-aggregate result row (row 0 of `batch`) into
+/// the ordered `Value` row emitted for this shard.
+///
+/// Walks `aggregates` in the COLUMN CONTRACT order, consuming the exact number of
+/// batch columns each aggregate produced in [`partial_select_items`]. Every
+/// aggregate except `CountDistinct` converts each of its columns straight through
+/// [`arrow_value_at`]; `CountDistinct`'s single Arrow List column is serialized to
+/// its JSON-array `VARCHAR` partial value in Rust (Arrow never crosses the `.so`
+/// boundary).
+fn partial_row_from_batch(
+    aggregates: &[AggregatePlan],
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<Vec<Value>, UdfError> {
+    let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
+    let mut col = 0usize;
+    for plan in aggregates {
+        match plan.kind {
+            AggKind::CountDistinct => {
+                let json = distinct_cell_to_json(batch.column(col).as_ref(), 0, &agg_label(plan))?;
+                row.push(Value::String(json));
+                col += 1;
+            }
+            AggKind::Avg => {
+                row.push(arrow_value_at(batch.column(col), 0));
+                row.push(arrow_value_at(batch.column(col + 1), 0));
+                col += 2;
+            }
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
+                row.push(arrow_value_at(batch.column(col), 0));
+                row.push(arrow_value_at(batch.column(col + 1), 0));
+                row.push(arrow_value_at(batch.column(col + 2), 0));
+                col += 3;
+            }
+            _ => {
+                row.push(arrow_value_at(batch.column(col), 0));
+                col += 1;
+            }
+        }
+    }
+    Ok(row)
 }
 
 /// Build a DataFusion SessionContext with the MinIO object store registered.
@@ -1546,18 +1732,22 @@ mod tests {
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Min,
                 column: Some("TS".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Max,
                 column: Some("TS".into()),
+                arg_expr: None,
             },
         ]
     }
@@ -1582,6 +1772,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::CountCol,
             column: Some("ID".into()),
+            arg_expr: None,
         }];
         let sql = build_partial_agg_sql(&plans, "aliased");
         assert!(
@@ -1628,6 +1819,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Avg,
             column: Some("SCORE".into()),
+            arg_expr: None,
         }];
         let sql = build_partial_agg_sql(&plans, "aliased");
         // Must NOT emit an AVG() function.
@@ -1655,14 +1847,17 @@ mod tests {
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Avg,
                 column: Some("SCORE".into()),
+                arg_expr: None,
             },
         ];
         let sql = build_partial_agg_sql(&plans, "aliased");
@@ -1687,6 +1882,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Count,
             column: None,
+            arg_expr: None,
         }];
         let sql = build_partial_agg_sql_filtered(&plans, "aliased", Some("\"ID\" > 5"));
         assert!(
@@ -1705,12 +1901,218 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Count,
             column: None,
+            arg_expr: None,
         }];
         let sql = build_partial_agg_sql(&plans, "aliased");
         assert!(
             !sql.contains("WHERE"),
             "no filter must produce no WHERE: {sql}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 4.1 / 4.2 — expression-argument aggregates and COUNT(DISTINCT) rendering
+    // ---------------------------------------------------------------------------
+
+    /// A partial aggregate over a rendered scalar expression argument substitutes
+    /// that fragment VERBATIM as the DataFusion function argument — it is NOT
+    /// re-quoted as an identifier — while a bare-column plan is unchanged.
+    #[test]
+    fn partial_sql_uses_rendered_expression_argument() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: None,
+                arg_expr: Some(r#"LENGTH("L_COMMENT")"#.into()),
+            },
+            AggregatePlan {
+                kind: AggKind::Avg,
+                column: None,
+                arg_expr: Some(r#"("A" + "B")"#.into()),
+            },
+            // A bare-column plan alongside the expression ones stays quoted-identifier.
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+        ];
+        let sql = build_partial_agg_sql(&plans, "aliased");
+
+        // Expression argument is substituted raw (no identifier quoting of the whole expr).
+        assert!(
+            sql.contains(r#"SUM(LENGTH("L_COMMENT")) AS "PARTIAL_sum_0""#),
+            "SUM over an expression must render the expression verbatim: {sql}"
+        );
+        // The rendered expression must NOT be wrapped as a single quoted identifier.
+        assert!(
+            !sql.contains(r#"SUM("LENGTH("#),
+            "expression argument must not be re-quoted as an identifier: {sql}"
+        );
+        // AVG over an expression emits the sum/count pair over the same fragment.
+        assert!(
+            sql.contains(r#"SUM(("A" + "B")) AS "PARTIAL_avg_sum_1""#)
+                && sql.contains(r#"COUNT(("A" + "B")) AS "PARTIAL_avg_cnt_1""#),
+            "AVG over an expression must decompose over the rendered fragment: {sql}"
+        );
+        // The bare-column plan is unchanged.
+        assert!(
+            sql.contains(r#"SUM("AMOUNT") AS "PARTIAL_sum_2""#),
+            "bare-column aggregate must remain quoted-identifier: {sql}"
+        );
+    }
+
+    /// COUNT(DISTINCT) renders an `array_agg(DISTINCT ...)` partial column, over a
+    /// bare quoted column by default and over the rendered expression when present.
+    #[test]
+    fn partial_sql_count_distinct_uses_array_agg_distinct() {
+        let bare = vec![AggregatePlan {
+            kind: AggKind::CountDistinct,
+            column: Some("L_SHIPMODE".into()),
+            arg_expr: None,
+        }];
+        let sql = build_partial_agg_sql(&bare, "aliased");
+        assert!(
+            sql.contains(r#"array_agg(DISTINCT "L_SHIPMODE") AS "PARTIAL_cd_0""#),
+            "COUNT(DISTINCT col) must render array_agg(DISTINCT \"col\"): {sql}"
+        );
+
+        let expr = vec![AggregatePlan {
+            kind: AggKind::CountDistinct,
+            column: None,
+            arg_expr: Some(r#"UPPER("L_SHIPMODE")"#.into()),
+        }];
+        let sql2 = build_partial_agg_sql(&expr, "aliased");
+        assert!(
+            sql2.contains(r#"array_agg(DISTINCT UPPER("L_SHIPMODE")) AS "PARTIAL_cd_0""#),
+            "COUNT(DISTINCT expr) must render array_agg over the verbatim expression: {sql2}"
+        );
+    }
+
+    /// The shard's local distinct set is serialized to a JSON array string with
+    /// NULLs excluded; an empty/NULL list cell serializes to `[]`; and numeric
+    /// distinct values serialize as JSON numbers. No Arrow type leaves the boundary.
+    #[test]
+    fn count_distinct_partial_emits_json_array_null_excluded() {
+        use arrow::array::{Int64Builder, ListBuilder, StringBuilder};
+
+        // One list cell holding a shard's local distinct string set, incl. a NULL.
+        let mut lb = ListBuilder::new(StringBuilder::new());
+        lb.values().append_value("F");
+        lb.values().append_value("N");
+        lb.values().append_null();
+        lb.append(true);
+        let list = lb.finish();
+        let json = distinct_cell_to_json(&list, 0, "L_LINESTATUS").expect("serialize");
+        assert_eq!(
+            json, r#"["F","N"]"#,
+            "distinct set must be a JSON array with NULLs excluded"
+        );
+
+        // A NULL list cell (empty group: array_agg over zero rows returns NULL) → [].
+        let mut empty_lb = ListBuilder::new(StringBuilder::new());
+        empty_lb.append(false); // null list row
+        let empty_list = empty_lb.finish();
+        let empty_json = distinct_cell_to_json(&empty_list, 0, "L_LINESTATUS").expect("serialize");
+        assert_eq!(empty_json, "[]", "NULL list cell must serialize to []");
+
+        // Numeric distinct values serialize as JSON numbers (stable across shards).
+        let mut nb = ListBuilder::new(Int64Builder::new());
+        nb.values().append_value(3);
+        nb.values().append_value(1);
+        nb.values().append_value(2);
+        nb.append(true);
+        let num_list = nb.finish();
+        let num_json = distinct_cell_to_json(&num_list, 0, "L_LINENUMBER").expect("serialize");
+        assert_eq!(
+            num_json, "[3,1,2]",
+            "numeric distinct set must be JSON numbers"
+        );
+    }
+
+    /// The empty-shard fallback row emits `[]` for a CountDistinct aggregate — not
+    /// NULL and not 0 — so it merges cleanly with other shards' non-empty sets.
+    #[test]
+    fn count_distinct_empty_shard_emits_empty_json_array() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::CountDistinct,
+                column: Some("L_SHIPMODE".into()),
+                arg_expr: None,
+            },
+        ];
+        let row = emit_null_partial_row(&plans);
+        assert_eq!(row.len(), 2, "one partial value per aggregate");
+        assert_eq!(row[0], Value::Null, "SUM empty shard is NULL");
+        assert_eq!(
+            row[1],
+            Value::String("[]".to_string()),
+            "CountDistinct empty shard must emit an empty JSON array"
+        );
+    }
+
+    /// The per-shard safety cap aborts with a clean bounded-resource error naming
+    /// the offending column and the cap that tripped — never truncating the set and
+    /// never leaking a credential. Both the element-count and byte-size caps trip.
+    #[test]
+    fn distinct_set_cap_returns_clean_error_no_credentials() {
+        use arrow::array::{ListBuilder, StringBuilder};
+
+        // 1. Element-count cap: many tiny distinct values (bytes stay well under 1 MiB,
+        //    so the element cap trips first).
+        let mut lb = ListBuilder::new(StringBuilder::new());
+        for i in 0..(MAX_DISTINCT_ELEMENTS_PER_SHARD + 1) {
+            lb.values().append_value(format!("v{i}"));
+        }
+        lb.append(true);
+        let list = lb.finish();
+        let err = distinct_cell_to_json(&list, 0, "L_ORDERKEY")
+            .expect_err("exceeding the element cap must error");
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains("ResourcesExhausted"),
+            "cap error must follow the bounded-resource convention: {msg}"
+        );
+        assert!(
+            msg.contains("L_ORDERKEY") && msg.contains("distinct-element count"),
+            "cap error must name the column and the element cap: {msg}"
+        );
+
+        // 2. Byte-size cap: a few very large distinct values (< element cap, so the
+        //    byte cap trips first).
+        let big = "x".repeat(300_000);
+        let mut lb2 = ListBuilder::new(StringBuilder::new());
+        for _ in 0..5 {
+            lb2.values().append_value(&big);
+        }
+        lb2.append(true);
+        let list2 = lb2.finish();
+        let err2 = distinct_cell_to_json(&list2, 0, "L_COMMENT")
+            .expect_err("exceeding the byte cap must error");
+        let msg2 = match err2 {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg2.contains("serialized size exceeded") && msg2.contains("L_COMMENT"),
+            "byte-cap error must name the column and the byte cap: {msg2}"
+        );
+
+        // Neither message leaks a credential-shaped token.
+        for m in [&msg, &msg2] {
+            assert!(
+                !m.contains("access_key") && !m.contains("secret_key") && !m.contains("minioadmin"),
+                "cap error must not contain any credential: {m}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1723,6 +2125,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Count,
             column: None,
+            arg_expr: None,
         }];
         let sql =
             build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
@@ -1746,10 +2149,12 @@ mod tests {
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
+                arg_expr: None,
             },
         ];
         let sql = build_grouped_partial_agg_sql(
@@ -1784,6 +2189,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Count,
             column: None,
+            arg_expr: None,
         }];
         let sql =
             build_grouped_partial_agg_sql(&[r#""REGION""#.to_string()], &plans, "aliased", None);
@@ -1800,6 +2206,7 @@ mod tests {
         let plans = vec![AggregatePlan {
             kind: AggKind::Sum,
             column: Some("AMOUNT".into()),
+            arg_expr: None,
         }];
         let expr_key = r#"YEAR("ORDER_DATE")"#.to_string();
         let sql =
@@ -1835,6 +2242,7 @@ mod tests {
             let plans = vec![AggregatePlan {
                 kind: kind.clone(),
                 column: Some("SCORE".into()),
+                arg_expr: None,
             }];
             let sql = build_partial_agg_sql(&plans, "aliased");
             assert!(
@@ -1874,6 +2282,7 @@ mod tests {
             let plans = vec![AggregatePlan {
                 kind: kind.clone(),
                 column: Some("X".into()),
+                arg_expr: None,
             }];
             let row = emit_null_partial_row(&plans);
             assert_eq!(row.len(), 3, "{kind:?} fallback row must have 3 values");
@@ -2054,10 +2463,12 @@ mod tests {
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::VarPop,
                 column: Some("X".into()),
+                arg_expr: None,
             },
         ];
         let sql = build_partial_agg_sql(&plans, "aliased");

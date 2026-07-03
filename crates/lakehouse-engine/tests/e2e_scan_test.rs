@@ -9,7 +9,8 @@
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
 //! 2. Install SLC 0.20.1 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
-//! 3. Create the LAKEHOUSE_ADAPTER script and LAKEHOUSE_SCAN script.
+//! 3. Create the LAKEHOUSE_ADAPTER script, the LAKEHOUSE_SCAN SET script, and
+//!    the LAKEHOUSE_DISTINCT_MERGE_COUNT scalar merge script (all from the same .so).
 //! 4. Create the LHVS Virtual Schema over the seeded table.
 //!
 //! The VS properties carry UDF-internal URLs (docker-network names) for the
@@ -22,7 +23,7 @@ use common::seed::{
     E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_NEW_COL,
     EVO_TOTAL_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
     PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    seed_events, seed_renamed_column,
+    SEED_TOTAL_ROWS, seed_events, seed_renamed_column,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -47,6 +48,9 @@ const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
 const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
+/// Scalar merge UDF for single-group COUNT(DISTINCT): third entry point in the
+/// same .so, created in the scan schema alongside the adapter and scan scripts.
+const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
 /// BucketFS path for the .so (as PUT target).
 const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the .so as referenced in %udf_object (without leading /).
@@ -206,6 +210,21 @@ EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
+
+    // Scalar distinct-merge script — RUST SCALAR SCRIPT, third entry point in
+    // the SAME .so. Created in {SCHEMA_NAME} (the scan schema) so the pushdown
+    // wrapper SQL can reference it schema-qualified, exactly like the SET script.
+    // Input: one VARCHAR — the JSON array-of-arrays of per-shard local distinct
+    // sets (built by the wrapper via `'[' || LISTAGG(partial, ',') || ']'`).
+    // Returns: the global distinct cardinality as DECIMAL(20,0) (covers full u64).
+    // No %main — the SLC selects __exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT
+    // by script name.
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}(partials VARCHAR(2000000))
+RETURNS DECIMAL(20,0) AS
+%udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
 }
 
 /// Create the Virtual Schema pointing at the seeded Iceberg table.
@@ -249,6 +268,26 @@ fn vs_labels_table() -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Packaging: the scalar distinct-merge script runs from the SAME uploaded .so
+/// as the adapter and scan scripts (no second artifact). Feeding it a JSON
+/// array-of-arrays of per-shard local distinct sets returns the unioned,
+/// deduplicated cardinality — here {F,N} ∪ {N,O} = {F,N,O} = 3.
+#[test]
+fn distinct_merge_scalar_script_runs_from_same_so() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let count = conn.query_scalar_i64(&format!(
+        r#"SELECT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}('[["F","N"],["N","O"]]')"#
+    ));
+
+    assert_eq!(
+        count, 3,
+        "scalar distinct-merge script from the shared .so must union per-shard \
+         sets and dedup (expected 3 distinct values, got {count})"
+    );
+}
 
 /// The E2E projection + filter + LIMIT query returns the correct projected,
 /// filtered, capped rows.
@@ -749,6 +788,67 @@ fn partial_avg_emits_sum_count_pair() {
     assert!(
         (avg_filtered - 60.0).abs() < 0.001,
         "filtered AVG(score) must be 60.0, got {avg_filtered}"
+    );
+}
+
+/// Runs `EXPLAIN VIRTUAL` for a single-group (no GROUP BY) aggregate query and
+/// asserts the pushed SQL evidences single-group aggregate pushdown — an
+/// `aggregates` field in the scan spec — rather than a raw row-scan fallback
+/// that would ship every projected column to Exasol for it to aggregate itself.
+///
+/// Mirrors [`assert_group_by_pushed_down`]'s pattern for the single-group
+/// (non-GROUP-BY) aggregate path: `aggregates` (not `group_keys`) is this
+/// path's discriminating field, since single-group partial aggregation also
+/// emits `PARTIAL_` columns but never a `group_keys` array.
+fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
+    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
+    let resp = conn.execute(&explain_sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+
+    let pushed_sql: String = cols
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        pushed_sql.contains("aggregates"),
+        "EXPLAIN VIRTUAL output must contain an 'aggregates' field in the scan \
+         spec (single-group aggregate pushdown occurred), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM (SELECT"),
+        "EXPLAIN VIRTUAL output must not be a raw row-scan fallback \
+         ('SELECT * FROM (SELECT ...)'), got:\n{pushed_sql}"
+    );
+}
+
+/// `SUM(LENGTH(col))` — an aggregate over a scalar expression argument, not a
+/// bare column — is pushed down as node-local partial aggregation instead of
+/// falling back to a raw row-scan.
+///
+/// `name` = "event-NN" for every seeded row (fixed 8-character format), so
+/// `SUM(LENGTH(name))` over all `SEED_TOTAL_ROWS` rows is `8 * SEED_TOTAL_ROWS`.
+#[test]
+fn sum_length_expression_argument_pushed_down() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT SUM(LENGTH(name)) FROM {}", vs_table());
+    assert_single_group_aggregate_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected 1 row: {cols:?}");
+
+    let total = parse_numeric(&cols[0][0]);
+    let expected = 8.0 * SEED_TOTAL_ROWS as f64;
+    assert!(
+        (total - expected).abs() < 0.001,
+        "SUM(LENGTH(name)) must be {expected} (name is always 8 chars, \
+         {SEED_TOTAL_ROWS} rows), got {total}"
     );
 }
 

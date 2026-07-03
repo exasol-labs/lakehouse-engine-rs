@@ -1,10 +1,11 @@
-//! Packaging integration test: the single built `.so` exports BOTH UDF entry
-//! point symbols (the VS adapter and the DataFusion scan SET UDF).
+//! Packaging integration test: the single built `.so` exports all THREE UDF
+//! entry point symbols (the VS adapter, the DataFusion scan SET UDF, and the
+//! scalar distinct-merge UDF).
 //!
 //! Covers packaging/single-so-two-entry-points scenario:
-//! "One crate exports both the adapter and the scan entry points" — the `.so`
-//! SHALL export both the adapter entry-point symbol and the scan entry-point
-//! symbol.
+//! "One crate exports both the adapter and the scan entry points" (extended to
+//! three) — the `.so` SHALL export the adapter entry-point symbol, the scan
+//! entry-point symbol, and the scalar distinct-merge entry-point symbol.
 //!
 //! Gated under `exasol-e2e` because it inspects the containerized release
 //! artifact, which `make test-e2e` guarantees is freshly built (it depends on
@@ -26,7 +27,7 @@ fn so_path() -> PathBuf {
 }
 
 #[test]
-fn so_exports_both_entry_symbols() {
+fn so_exports_adapter_scan_and_distinct_merge_symbols() {
     let so = so_path();
     assert!(
         so.exists(),
@@ -54,5 +55,10 @@ fn so_exports_both_entry_symbols() {
     assert!(
         symbols.contains("__exa_udf_entry_LAKEHOUSE_SCAN"),
         "the .so must export the scan entry symbol __exa_udf_entry_LAKEHOUSE_SCAN"
+    );
+    assert!(
+        symbols.contains("__exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"),
+        "the .so must export the scalar distinct-merge entry symbol \
+         __exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"
     );
 }
