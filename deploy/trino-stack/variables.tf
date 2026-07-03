@@ -11,8 +11,14 @@ variable "env_name" {
 
 variable "instance_type" {
   type        = string
-  default     = "r6i.xlarge"
-  description = "Single Trino node (coordinator+worker in one JVM) — a benchmark box, not production."
+  default     = "r8i.2xlarge"
+  description = "Matches an Exasol test1 node's instance type (8 vCPU/64 GB), so Trino and lakehouse-engine-rs run on identical hardware."
+}
+
+variable "node_count" {
+  type        = number
+  default     = 2
+  description = "Matches Exasol test1's node count. Node 0 is the coordinator (also runs worker tasks, mirroring Exasol's every-node-executes model); the rest are workers."
 }
 
 variable "trino_image_tag" {
