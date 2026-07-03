@@ -17,10 +17,16 @@ ENDPOINT="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
 REPORT="${1:-/tmp/lh-import-ceiling.txt}"
 : > "$REPORT"
 
-# lineitem data files from the newest resolved scan spec (full s3:// URLs).
+# lineitem data files from the newest resolved scan spec. Since the scan-spec-files-payload
+# change, the report embeds a table_root ("s3://bucket/.../lineitem") and per-file paths
+# RELATIVE to it ("data/<file>.parquet") rather than full per-file s3:// URLs, so reconstruct
+# them by joining the two (both are still there, just no longer pre-joined).
 SRC_REPORT="$(ls -t bench/reports/bench-report-*.txt | head -1)"
-mapfile -t URLS < <(grep -oE "s3://[^\"]*/lineitem/data/[^\"]*\.parquet" "$SRC_REPORT" | sort -u)
-[ "${#URLS[@]}" -gt 0 ] || { echo "ERROR: no lineitem files in ${SRC_REPORT:-<none>} (run make bench first)"; exit 1; }
+TABLE_ROOT="$(grep -oE 's3://[^"]*/lineitem' "$SRC_REPORT" | sort -u | head -1)"
+[ -n "$TABLE_ROOT" ] || { echo "ERROR: no lineitem table_root in ${SRC_REPORT:-<none>} (run make bench first)"; exit 1; }
+mapfile -t RELFILES < <(grep -oE 'data/[0-9a-f-]+\.parquet' "$SRC_REPORT" | sort -u)
+[ "${#RELFILES[@]}" -gt 0 ] || { echo "ERROR: no lineitem parquet files in ${SRC_REPORT}"; exit 1; }
+mapfile -t URLS < <(for f in "${RELFILES[@]}"; do printf '%s/%s\n' "$TABLE_ROOT" "$f"; done)
 # Bucket is DERIVED from the resolved paths, never hardcoded: the VS reads these exact
 # URLs, so IMPORT must target the same bucket or HeadObject ACCESS_DENIEs on a stale one.
 BUCKET="$(printf '%s' "${URLS[0]}" | sed -E 's#^s3://([^/]+)/.*#\1#')"
