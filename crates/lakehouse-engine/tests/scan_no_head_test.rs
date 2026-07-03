@@ -266,6 +266,7 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
         df_threads_per_udf: 1,
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
+        s3_max_connections: 8,
     }
 }
 

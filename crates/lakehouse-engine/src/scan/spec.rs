@@ -197,6 +197,11 @@ pub struct CommonScanSpec {
     /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance limit.
     #[serde(default = "default_instance_overhead_mb")]
     pub instance_overhead_mb: u64,
+
+    /// Connection-concurrency budget for the scan's S3-compatible object store
+    /// (number of concurrent connections held warm per host).
+    #[serde(default = "default_s3_max_connections")]
+    pub s3_max_connections: usize,
 }
 
 impl CommonScanSpec {
@@ -329,6 +334,14 @@ pub struct ScanSpec {
     /// deserialize to 200 (backward-compatible).
     #[serde(default = "default_instance_overhead_mb")]
     pub instance_overhead_mb: u64,
+
+    /// Connection-concurrency budget for the scan's S3-compatible object store:
+    /// the number of concurrent connections held warm per host, independent of
+    /// the CPU thread/partition budget (`df_target_partitions`/`df_threads_per_udf`).
+    /// Old specs that lack this field deserialize to a conservative built-in
+    /// default (backward-compatible), clamped to at least 1.
+    #[serde(default = "default_s3_max_connections")]
+    pub s3_max_connections: usize,
 }
 
 fn default_one_usize() -> usize {
@@ -345,6 +358,20 @@ fn default_memory_pool_fraction() -> f64 {
 
 fn default_instance_overhead_mb() -> u64 {
     200
+}
+
+/// Built-in fallback connection-concurrency budget: used both as the serde
+/// default for [`CommonScanSpec::s3_max_connections`] / [`ScanSpec::s3_max_connections`]
+/// when the field is absent from JSON, and by the adapter's AUTO derivation
+/// (`resolve_s3_max_connections`) when `nr_of_cores` is `0` (unknown). Defined
+/// here rather than in `adapter` so `scan::spec` — the lower-level module the
+/// adapter already depends on — has no reverse dependency on `adapter`.
+pub(crate) const DEFAULT_S3_MAX_CONNECTIONS: usize = 16;
+
+/// Conservative built-in default for [`CommonScanSpec::s3_max_connections`] /
+/// [`ScanSpec::s3_max_connections`] when the field is absent from JSON.
+fn default_s3_max_connections() -> usize {
+    DEFAULT_S3_MAX_CONNECTIONS
 }
 
 impl ScanSpec {
@@ -386,6 +413,7 @@ impl ScanSpec {
             df_threads_per_udf: self.df_threads_per_udf,
             memory_pool_fraction: self.memory_pool_fraction,
             instance_overhead_mb: self.instance_overhead_mb,
+            s3_max_connections: self.s3_max_connections,
         }
     }
 
@@ -416,6 +444,7 @@ impl ScanSpec {
             df_threads_per_udf: common.df_threads_per_udf,
             memory_pool_fraction: common.memory_pool_fraction,
             instance_overhead_mb: common.instance_overhead_mb,
+            s3_max_connections: common.s3_max_connections,
         }
     }
 
@@ -486,6 +515,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         }
     }
 
@@ -936,6 +966,84 @@ mod tests {
         assert_eq!(
             legacy.instance_overhead_mb, 200,
             "missing instance_overhead_mb must default to 200 (backward-compat)"
+        );
+    }
+
+    /// Task 2.2: s3_max_connections round-trips through JSON and defaults to a
+    /// conservative built-in budget (clamped to at least 1) when absent.
+    ///
+    /// Verifies that:
+    /// 1. An explicit value survives serialize → deserialize.
+    /// 2. A legacy JSON payload lacking the field deserializes to the built-in
+    ///    default (backward-compatible).
+    #[test]
+    fn s3_max_connections_round_trips_and_defaults() {
+        // 1. Explicit non-default value round-trips.
+        let mut spec = sample_spec();
+        spec.s3_max_connections = 32;
+        let json = spec.to_json();
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.s3_max_connections, 32,
+            "s3_max_connections must survive round-trip"
+        );
+
+        // 2. The field is present in the serialized JSON.
+        assert!(
+            json.contains("s3_max_connections"),
+            "serialized JSON must carry s3_max_connections: {json}"
+        );
+
+        // 3. A legacy payload without the field deserializes to the built-in default.
+        // `files` uses the current compact [path, size] 2-tuple wire form (ADR-053).
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 123]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(
+            legacy.s3_max_connections,
+            default_s3_max_connections(),
+            "missing s3_max_connections must default to the built-in budget (backward-compat)"
+        );
+        assert!(
+            legacy.s3_max_connections >= 1,
+            "default s3_max_connections must be clamped to at least 1"
+        );
+
+        // 4. The default also applies to CommonScanSpec (shard-invariant blob).
+        let legacy_common_json = r#"{
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
+        assert_eq!(
+            legacy_common.s3_max_connections,
+            default_s3_max_connections(),
+            "missing s3_max_connections must default on CommonScanSpec too (backward-compat)"
+        );
+
+        // 5. The value threads through the split (to_common) / merge (from_parts) impls.
+        let split = spec.to_common();
+        assert_eq!(
+            split.s3_max_connections, 32,
+            "to_common must carry s3_max_connections through the split"
+        );
+        let merged = ScanSpec::from_parts(split, spec.files.clone());
+        assert_eq!(
+            merged.s3_max_connections, 32,
+            "from_parts must carry s3_max_connections through the merge"
         );
     }
 

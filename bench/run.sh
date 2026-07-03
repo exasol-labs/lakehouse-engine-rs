@@ -52,6 +52,14 @@ build_vs_extra_props() {
     props="${props}$(printf "\n  DATAFUSION_THREADS_PER_UDF  = '%s'" "${BENCH_DF_THREADS_PER_UDF}")"
   [ -n "${BENCH_DF_TARGET_PARTITIONS:-}" ] && \
     props="${props}$(printf "\n  DATAFUSION_TARGET_PARTITIONS = '%s'" "${BENCH_DF_TARGET_PARTITIONS}")"
+  # Batch-size knob (raw-emit round-trip sweep): append DATAFUSION_BATCH_SIZE only
+  # when set, so the default run AUTO-uses 8192 and the offline selftest stays unchanged.
+  [ -n "${BENCH_DF_BATCH_SIZE:-}" ] && \
+    props="${props}$(printf "\n  DATAFUSION_BATCH_SIZE       = '%s'" "${BENCH_DF_BATCH_SIZE}")"
+  # Connection-concurrency knob (Task 9): append S3_MAX_CONNECTIONS only when set,
+  # so the default run AUTO-derives it and the offline selftest stays unchanged.
+  [ -n "${BENCH_S3_MAX_CONNECTIONS:-}" ] && \
+    props="${props}$(printf "\n  S3_MAX_CONNECTIONS  = '%s'" "${BENCH_S3_MAX_CONNECTIONS}")"
   printf '%s' "${props}"
 }
 
@@ -90,11 +98,29 @@ if [ "${1:-}" = "selftest" ]; then
   case "$remote_props" in *"ALLOW_HTTP"*) echo "FAIL: remote vs_extra_props must not contain ALLOW_HTTP: $remote_props"; exit 1;; esac
   case "$remote_props" in *"NR_OF_CORES"*"'8'"*"PARALLELISM_FACTOR"*"'8'"*) ;; \
     *) echo "FAIL: remote vs_extra_props shape: $remote_props"; exit 1;; esac
+  # S3_MAX_CONNECTIONS is appended only when the env knob is set (default run omits it).
+  case "$remote_props" in *"S3_MAX_CONNECTIONS"*) echo "FAIL: S3_MAX_CONNECTIONS must be absent when unset: $remote_props"; exit 1;; esac
+  s3_props="$(BENCH_S3_MAX_CONNECTIONS=64 build_vs_extra_props false 8 1)"
+  case "$s3_props" in *"PARALLELISM_FACTOR"*"'1'"*"S3_MAX_CONNECTIONS"*"'64'"*) ;; \
+    *) echo "FAIL: S3_MAX_CONNECTIONS append shape: $s3_props"; exit 1;; esac
+  # DATAFUSION_BATCH_SIZE is appended only when the env knob is set (default run omits it).
+  case "$remote_props" in *"DATAFUSION_BATCH_SIZE"*) echo "FAIL: DATAFUSION_BATCH_SIZE must be absent when unset: $remote_props"; exit 1;; esac
+  bs_props="$(BENCH_DF_BATCH_SIZE=131072 build_vs_extra_props false 8 8)"
+  case "$bs_props" in *"PARALLELISM_FACTOR"*"'8'"*"DATAFUSION_BATCH_SIZE"*"'131072'"*) ;; \
+    *) echo "FAIL: DATAFUSION_BATCH_SIZE append shape: $bs_props"; exit 1;; esac
   echo "selftest OK"; exit 0
 fi
 
 # ---- config ------------------------------------------------------------------
-[ -f "$SCRIPT_DIR/.env" ] && { set -a; . "$SCRIPT_DIR/.env"; set +a; }   # .env optional (required vars validated per mode)
+# .env is optional (required vars validated per mode). It supplies DEFAULTS: a
+# caller-exported BENCH_*/LAKEHOUSE_* value must WIN over .env, otherwise sweep.sh
+# cannot override a knob that .env also sets (e.g. BENCH_PARALLELISM_FACTOR). So
+# snapshot the caller's sweep overrides, source .env, then re-apply the snapshot.
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  _env_overrides="$(export -p | grep -E ' (BENCH_|LAKEHOUSE_)[A-Za-z0-9_]+=' || true)"
+  set -a; . "$SCRIPT_DIR/.env"; set +a
+  [ -n "$_env_overrides" ] && eval "$_env_overrides"
+fi
 
 TARGET="${BENCH_TARGET:-docker}"
 EXA_PORT="${LH_EXASOL_PORT:-28563}"
@@ -225,7 +251,7 @@ sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
-sql "CREATE OR REPLACE RUST SET SCRIPT ${SCHEMA}.${SCAN}(spec VARCHAR(2000000))
+sql "CREATE OR REPLACE RUST SET SCRIPT ${SCHEMA}.${SCAN}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
