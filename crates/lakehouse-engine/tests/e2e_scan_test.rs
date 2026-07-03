@@ -1989,3 +1989,76 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression: nested aggregate over a grouped sub-select (issue #52).
+//
+// Exasol rewrites `COUNT(*) FROM (SELECT k, COUNT(*) FROM t GROUP BY k) sub`
+// into a single flat pushdown request: `aggregationType: "group_by"` with a
+// literal-only `selectList` (a `literal_null` "count the groups" placeholder,
+// since the outer query needs neither the group key nor the inner COUNT(*)
+// value). Before the fix, the adapter rendered that literal placeholder as a
+// bare `NULL` projection column, producing scan SQL that referenced a
+// phantom `"NULL"` identifier and crashing with `F-UDF-CL-RUST-9001: ...
+// Schema error: No field named "NULL"`. The fix (pushdown.rs
+// `detect_group_by_aggregates`) preserves the GROUP BY so the scan still
+// returns one row per distinct group; Exasol's outer COUNT(*) then counts
+// those group rows correctly.
+// ---------------------------------------------------------------------------
+
+/// End-to-end nested aggregate over a grouped sub-select returns the correct
+/// outer count — including the duplicate-key case that discriminates a
+/// correct grouped-scan fix from an unsafe row-scan fallback.
+///
+/// `events.id` is unique, so `GROUP BY id` alone cannot tell a correct fix
+/// apart from a fallback that returns one row per source row (both
+/// coincidentally yield 20 on this table). `GROUP BY MOD(id, 4)` is the
+/// discriminating case: 20 seeded rows (id 0..19) fall into exactly 4
+/// distinct `MOD(id, 4)` buckets, so the outer `COUNT(*)` must be 4. A
+/// row-scan fallback would instead return the raw row count (20).
+#[test]
+fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Duplicate-key case — the actual regression guard. Must be 4 (distinct
+    // MOD(id, 4) groups), NOT 20 (which a row-scan fallback would wrongly
+    // return since it doesn't re-group).
+    let sql_duplicate_keys = format!(
+        "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql_duplicate_keys);
+    assert_eq!(
+        cols.len(),
+        1,
+        "nested COUNT(*) must return one column: {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "nested COUNT(*) must return one row: {cols:?}"
+    );
+    let distinct_group_count = parse_int(&cols[0][0]);
+    assert_eq!(
+        distinct_group_count, 4,
+        "COUNT(*) over (GROUP BY MOD(id,4)) sub-select must be 4 (distinct groups), \
+         got {distinct_group_count} — 20 would indicate an unsafe row-scan fallback \
+         instead of a correctly preserved grouped scan"
+    );
+
+    // Unique-key smoke case from the plan (kept as an additional assertion,
+    // not a substitute for the duplicate-key case above): every id is
+    // distinct, so the outer COUNT(*) over `GROUP BY id` must equal 20.
+    let sql_unique_key = format!(
+        "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
+        vs_table()
+    );
+    let cols_unique = conn.query_columns(&sql_unique_key);
+    let unique_group_count = parse_int(&cols_unique[0][0]);
+    assert_eq!(
+        unique_group_count, 20,
+        "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
+         got {unique_group_count}"
+    );
+}
