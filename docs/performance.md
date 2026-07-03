@@ -192,7 +192,7 @@ and aggregates every engine's timings into one report with a summary table.
 |---|---|---|---|---|---|
 | **lakehouse-engine-rs** | **1.97 s** | 18.30 s | 15.67 s | **19.80 s** | `make bench`, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` — 2026-07-03 |
 | AWS Athena | 1.54 s | 3.22 s | 1.79 s | 2.81 s | Engine execution time (excludes queue wait); managed, no infra sizing — 2026-07-03 |
-| **Trino** | 7.49 s | **15.74 s** | **9.04 s** | 5.61 s | 2-node cluster, `r8i.2xlarge` × 2 (**resized to match test1**, was a single `r6i.xlarge`) — 2026-07-03, run 1 |
+| **Trino** | 7.4 s | **13.2–15.7 s** | **9.0 s** | 5.6 s | 2-node cluster, `r8i.2xlarge` × 2 (**resized to match test1**, was a single `r6i.xlarge`) — 2026-07-03, 2 runs |
 | Spark (EMR Serverless) | 15.77 s | 43.97 s | 32.51 s | 22.80 s | Cold-started application (16 vCPU/64 GB max capacity); includes per-job executor allocation, not just query time — 2026-07-03 |
 
 Native `IMPORT` (goal ceiling, not a competing "engine"): scan-only `COUNT(*)` ~28.8–30.9 s vs. the
@@ -203,10 +203,25 @@ VS's metadata-pushdown ~0.8–2.0 s; full materialization native `IMPORT INTO` ~
 a fair comparison — a quarter of the hardware lakehouse-engine-rs runs on. Resized to a real 2-node
 `r8i.2xlarge` cluster (matching `test1` node-for-node — see
 [Infrastructure comparison](#infrastructure-comparison) below), Trino's Q2 dropped from 35.48 s to
-**15.74 s** (2.25×) and Q3 from 20.29 s to **9.04 s** (2.24×) — now faster than lakehouse-engine-rs
-on the two heaviest queries. Athena remains fully managed with no sizing knob at all (see below);
-the EMR Serverless numbers still include a per-job executor-allocation delay a long-running cluster
-wouldn't pay. Bold marks each query's fastest engine.
+**13.2–15.7 s** (2.3–2.7×) and Q3 from 20.29 s to **9.0 s** (2.2×) — now faster than
+lakehouse-engine-rs on the two heaviest queries. Athena remains fully managed with no sizing knob
+at all (see below); the EMR Serverless numbers still include a per-job executor-allocation delay a
+long-running cluster wouldn't pay. Bold marks each query's fastest engine.
+
+**Reproducibility**: run twice on fresh clusters (each stood up, benchmarked, and torn down
+independently — `verify2` then `verify3`) to check the resized numbers weren't a fluke:
+
+| Query | Run 1 | Run 2 | Spread |
+|---|---|---|---|
+| Q1 | 7.49 s | 7.38 s | 1.5% |
+| Q2 | 15.74 s | 13.16 s | 16.4% |
+| Q3 | 9.04 s | 9.00 s | 0.4% |
+| Q4 | 5.61 s | 5.68 s | 1.2% |
+
+Q1/Q3/Q4 are tight; Q2 (the heaviest query, the 3-way join) shows the most run-to-run variance —
+plausibly cold caches or a noisy neighbor on the shared EC2 host, expected on a benchmark run on
+general-purpose cloud instances rather than dedicated hardware. The conclusion is unaffected
+either way: both runs have Trino beating lakehouse-engine-rs on Q2 and Q3 with matched hardware.
 
 ### Infrastructure comparison
 
