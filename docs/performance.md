@@ -164,20 +164,18 @@ run where the VS aggregate path was competitive with native IMPORT.
 
 ## Competitive engine comparison
 
-**Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, 180M-row `lineitem`,
-60 files, same Glue catalog + S3 data for every engine below). Run individually per
-`bench/README.md`, not yet via a single `bench/compare_all.sh` pass (each engine was run/tuned
-separately during first-time live verification — see bug list below). Trino was re-run the same
-day after resizing from a single small node to a 2-node cluster matching `test1`'s hardware — see
-[Infrastructure comparison](#infrastructure-comparison) below.
+**Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, `r8i.2xlarge` × 2,
+180M-row `lineitem`, 60 files, same Glue catalog + S3 data for every engine below). Latest pass is
+a single fresh full re-run across all four engines with the extended Q1-Q9b query set (below);
+Trino now defaults to a 2-node `r8i.2xlarge` cluster matching `test1` (was a single `r6i.xlarge` in
+the first round — see [Infrastructure comparison](#infrastructure-comparison)).
 
-Beyond the native `IMPORT` ceiling above, the same TPC-H tables and the same four queries
-(`bench/run.sh` Q1-Q4, lines ~321-349) are run through the lakehouse engines people put next to a
-lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
+Beyond the native `IMPORT` ceiling above, the same TPC-H tables are queried through the lakehouse
+engines people put next to a lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
 
 - **AWS Athena** (`bench/athena_compare.sh`) — serverless, no infra to stand up; timed via the
   Athena API's `Statistics.EngineExecutionTimeInMillis` (engine time only, excludes queue wait).
-- **Trino** (`bench/trino_compare.sh`) — a single ephemeral EC2 node
+- **Trino** (`bench/trino_compare.sh`) — an ephemeral 2-node cluster by default
   (`deploy/trino-stack/`, `deploy/scripts/trino-up.sh`/`trino-down.sh`), wall-clock timed via the
   Trino CLI. Opt-in and torn down explicitly — see the cost/teardown callout in
   [`deploy/README.md`](../deploy/README.md).
@@ -188,40 +186,72 @@ lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
 `bench/compare_all.sh` runs all of the above (skipping Trino/Spark cleanly if not provisioned)
 and aggregates every engine's timings into one report with a summary table.
 
-| Engine | Q1 (wiring) | Q2 (3-way join) | Q3 (filter+groupby) | Q4 (pricing summary) | Notes |
-|---|---|---|---|---|---|
-| **lakehouse-engine-rs** | **1.97 s** | 18.30 s | 15.67 s | **19.80 s** | `make bench`, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` — 2026-07-03 |
-| AWS Athena | 1.54 s | 3.22 s | 1.79 s | 2.81 s | Engine execution time (excludes queue wait); managed, no infra sizing — 2026-07-03 |
-| **Trino** | 7.4 s | **13.2–15.7 s** | **9.0 s** | 5.6 s | 2-node cluster, `r8i.2xlarge` × 2 (**resized to match test1**, was a single `r6i.xlarge`) — 2026-07-03, 2 runs |
-| Spark (EMR Serverless) | 15.77 s | 43.97 s | 32.51 s | 22.80 s | Cold-started application (16 vCPU/64 GB max capacity); includes per-job executor allocation, not just query time — 2026-07-03 |
+### Query set
 
-Native `IMPORT` (goal ceiling, not a competing "engine"): scan-only `COUNT(*)` ~28.8–30.9 s vs. the
-VS's metadata-pushdown ~0.8–2.0 s; full materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS
-`CREATE TABLE AS SELECT *` ~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) above — same numbers, this run reproduced them).
+Q1-Q4 are the original TPC-H-shaped set (wiring check, 3-way join, filtered JOIN+GROUP-BY,
+pricing summary). Q5-Q9b were added to probe specific pushdown strengths/weaknesses:
 
-**Reading these numbers**: Trino's first-round numbers (single `r6i.xlarge`, 4 vCPU/32 GB) weren't
-a fair comparison — a quarter of the hardware lakehouse-engine-rs runs on. Resized to a real 2-node
-`r8i.2xlarge` cluster (matching `test1` node-for-node — see
-[Infrastructure comparison](#infrastructure-comparison) below), Trino's Q2 dropped from 35.48 s to
-**13.2–15.7 s** (2.3–2.7×) and Q3 from 20.29 s to **9.0 s** (2.2×) — now faster than
-lakehouse-engine-rs on the two heaviest queries. Athena remains fully managed with no sizing knob
-at all (see below); the EMR Serverless numbers still include a per-job executor-allocation delay a
-long-running cluster wouldn't pay. Bold marks each query's fastest engine.
+| Query | What it tests |
+|---|---|
+| Q5 | Q3 with the `WHERE` dropped — unfiltered JOIN + GROUP BY |
+| Q6 | Q4 with the `WHERE` dropped — unfiltered pricing summary |
+| Q7 | High-cardinality `GROUP BY L_ORDERKEY` (~45M distinct groups, vs. Q3/Q4's 4-5) |
+| Q8 | Single-day filter (`L_SHIPDATE = DATE '1995-06-15'`, <0.05% of rows) — selective-pushdown/pruning |
+| Q9a | Narrow projection — `SUM` over one column, full scan |
+| Q9b | Wide projection — aggregates touching all 16 `lineitem` columns, full scan |
 
-**Reproducibility**: run twice on fresh clusters (each stood up, benchmarked, and torn down
-independently — `verify2` then `verify3`) to check the resized numbers weren't a fluke:
+### Results (2026-07-03, single fresh pass, all four engines)
 
-| Query | Run 1 | Run 2 | Spread |
-|---|---|---|---|
-| Q1 | 7.49 s | 7.38 s | 1.5% |
-| Q2 | 15.74 s | 13.16 s | 16.4% |
-| Q3 | 9.04 s | 9.00 s | 0.4% |
-| Q4 | 5.61 s | 5.68 s | 1.2% |
+| Query | lakehouse-engine-rs | AWS Athena | Trino (2-node) | Spark (EMR Serverless) |
+|---|---|---|---|---|
+| Q1 (wiring) | **1.79 s** | 1.87 s | 7.05 s | 16.80 s |
+| Q2 (3-way join) | 16.90 s | **2.54 s** | 12.19 s | 43.59 s |
+| Q3 (filter+groupby) | 14.48 s | **2.99 s** | 8.37 s | 31.51 s |
+| Q4 (pricing summary) | 19.17 s | **3.19 s** | 5.56 s | 21.46 s |
+| Q5 (Q3, no filter) | 18.23 s | **2.50 s** | 10.25 s | 38.07 s |
+| Q6 (Q4, no filter) | 19.25 s | **2.71 s** | 4.98 s | 18.77 s |
+| Q7 (high-card. GROUP BY) | **FAILED** (bug, see below) | **1.62 s** | 5.20 s | 12.84 s |
+| Q8 (selective filter) | 1.51 s | **0.93 s** | 4.25 s | 5.62 s |
+| Q9a (narrow projection) | **2.18 s** | 2.39 s | 3.78 s | 5.64 s |
+| Q9b (wide projection) | 67.08 s | 44.98 s | **15.19 s** | 59.19 s |
 
-Q1/Q3/Q4 are tight; Q2 (the heaviest query, the 3-way join) shows the most run-to-run variance —
-plausibly cold caches or a noisy neighbor on the shared EC2 host, expected on a benchmark run on
-general-purpose cloud instances rather than dedicated hardware. The conclusion is unaffected
-either way: both runs have Trino beating lakehouse-engine-rs on Q2 and Q3 with matched hardware.
+Native `IMPORT` (goal ceiling, not a competing "engine" — no Q5-Q9b equivalent, unaffected by this
+round): scan-only `COUNT(*)` ~28.8–30.9 s vs. the VS's metadata-pushdown ~0.8–2.0 s; full
+materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS `CREATE TABLE AS SELECT *`
+~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files)
+above).
+
+**Reading these numbers**:
+
+- **Athena wins 7 of the 10 queries outright** (everything except Q1, Q9a, and Q9b) — it's the
+  cleanest comparison point (zero infra-sizing decisions) and clearly the most consistent
+  performer across small/medium queries.
+- **Trino wins decisively on Q9b** (15.19 s vs. everyone else's 45-67 s) — the wide-projection
+  full scan is where matching `test1`'s hardware pays off most clearly. It's competitive but not
+  fastest on the other heavy scans (Q2, Q5): faster than lakehouse-engine-rs and Spark, but Athena
+  still wins on raw time.
+- **lakehouse-engine-rs wins Q1 and Q9a** (small/single-column queries — competitive when its
+  pushdown paths apply cleanly and the result is tiny), but is consistently the slowest on
+  unfiltered/wide-scan queries (Q5, Q6, Q9b) — the per-row Arrow→Value emit-path overhead
+  documented earlier in this doc compounds most visibly exactly where no pushdown can shrink the
+  work. Even on Q8 (its best-case selective-filter scenario) it trails Athena (1.51 s vs. 0.93 s).
+- **Q7 is a genuine bug, not a slowness finding**: `SELECT COUNT(*) FROM (SELECT L_ORDERKEY,
+  COUNT(*) FROM lineitem GROUP BY L_ORDERKEY) t` fails outright against lakehouse-engine-rs —
+  `DataFusion SQL error: Schema error: No field named "NULL"` — while Athena, Trino, and Spark all
+  handle the identical nested-aggregate query in 1.6-12.8 s. Filed as
+  [#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52): the adapter's
+  aggregate-pushdown translation appears to substitute a literal `NULL` where a field reference is
+  expected when composing an outer `COUNT(*)` (no underlying column) over an already-pushed-down
+  inner `GROUP BY`.
+- **Spark is consistently the slowest** across nearly every query — expected, given the numbers
+  include EMR Serverless's per-job executor allocation on top of query time, not just the query
+  itself.
+
+**Reproducibility (earlier check, Q1-Q4 only, first Trino-resize round)**: run twice on
+independent fresh Trino clusters — Q1/Q3/Q4 were tight (<2% spread), Q2 (the heaviest query then)
+showed the most run-to-run variance (15.74 s → 13.16 s, ~16%), plausibly cold caches or a noisy
+neighbor on shared cloud hardware. Not repeated for the full Q1-Q9b set this round; treat single-
+digit-percent differences between engines as noise-level rather than a hard ranking.
 
 ### Infrastructure comparison
 
