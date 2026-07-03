@@ -12,8 +12,13 @@ and carries no LIMIT.
 
 * A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a
   non-empty `groupBy` array and a select list of supported aggregate functions.
+* The `groupBy` array MAY contain one, two, or more elements; the detection and
+  scan-driving SQL builder treat the group-key list as arbitrary-length (emitting
+  `GK_0..GK_{n-1}`) and impose no cap of one key.
 * Group-key expressions are rendered by `vs_expression::render_expression` (raising
-  mode); any failure causes the adapter to fall back to row scanning.
+  mode); any failure on ANY element causes the adapter to fall back to row scanning.
+* Each group-key element is rendered independently, so a multi-key GROUP BY MAY mix
+  plain column references and scalar expressions in any combination.
 * The inner `GROUP BY shard_key` parallelizes the scan; DataFusion performs the user
   GROUP BY inside each shard invocation, emitting per-user-group partials with
   group-key values as plain columns (GK_0..GK_{n-1}); the outer wrapper re-groups on
