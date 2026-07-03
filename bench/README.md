@@ -66,7 +66,7 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
 
 Beyond the native-`IMPORT` ceiling above, the same TPC-H tables/queries can be run through the
 lakehouse engines people put next to a lakehouse: AWS Athena, Trino, and Spark. All three read the
-SAME Glue Iceberg REST catalog + S3 data as `remote` mode above. Manually invoked, not CI — same
+SAME Glue Iceberg catalog + S3 data as `remote` mode above. Manually invoked, not CI — same
 convention as the rest of `bench/`.
 
 - **`athena_compare.sh`** — no new infra (the Athena workgroup already exists in
