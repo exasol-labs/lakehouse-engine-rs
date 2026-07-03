@@ -10,6 +10,17 @@ not-yet-recorded validation run (`bench/reports/bench-report-20260701-123648.txt
 `bench/reports/import-ceiling-20260701-124836.txt`) — see
 [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) below.
 
+> **Benchmark caveat — pre-0.20.1 node-count bug:** every benchmark below that predates the
+> `exasol-udf-sdk`/`exasol-udf-macros` `0.20.1` bump (`add-scan-connection-concurrency`, closes
+> #43) ran on live clusters where `ctx.node_count()` always returned `0` at
+> `createVirtualSchema` time; `resolve_cluster_nodes` maps that to `1`. Any such run whose
+> `adapterNotes` recorded `CLUSTER_NODES=1` on what was actually a multi-node cluster therefore
+> silently computed shard count as `G = 1 × parallelism_factor` instead of
+> `G = node_count × parallelism_factor` — collapsing cluster-wide sharding to single-node
+> sharding. Single-node timings are unaffected; multi-node scaling claims recorded before the
+> fix should be treated with suspicion. Full detail:
+> `specs/_recorded/2026-07-02-add-scan-connection-concurrency/decision-log.md` (Design Decisions [1] and [5]).
+
 ## Optimizations delivered
 
 - **Parquet predicate pushdown** (`datafusion.execution.parquet.pushdown_filters`) — filters
@@ -22,8 +33,33 @@ not-yet-recorded validation run (`bench/reports/bench-report-20260701-123648.txt
   projection fuse into the data source.
 - **Configurable per-instance threading** — `DATAFUSION_THREADING_MODE` (`AUTO`/`FIXED`),
   tunable without recompiling. See [Tuning](tuning.md).
+- **Configurable object-store connection concurrency** — `S3_MAX_CONNECTIONS` sizes the
+  per-instance S3 HTTP connection pool, oversubscribed relative to CPU threads on IO-bound
+  scans. See [Tuning](tuning.md#s3_max_connections) and
+  [Native `IMPORT` parity goal](#native-import-parity-goal) below.
 - **Projection + partial-aggregate pushdown** — only projected columns are read; aggregates
   ship one partial row per group instead of raw rows.
+
+## Native `IMPORT` parity goal
+
+`S3_MAX_CONNECTIONS` targets closing the gap this doc measures below: native
+`IMPORT FROM PARQUET` exposes an explicit `MaxConnections` knob for per-instance object-store
+fetch concurrency, while the engine previously left that axis entirely to library defaults.
+This knob is deliberately orthogonal to the two existing levers — `PARALLELISM_FACTOR` controls
+*how many shards* run, `DATAFUSION_THREADING_MODE` controls *how many CPU threads* decode a
+shard, and `S3_MAX_CONNECTIONS` controls *how many S3 fetches* a shard's threads can keep in
+flight while they wait on the network. Raising it is the next lever toward approaching native
+`IMPORT` throughput on IO-bound scans (the common case per the phase telemetry below —
+`import ≫ emit`), layered on top of threading and sharding rather than replacing them. See
+`specs/_recorded/2026-07-02-add-scan-connection-concurrency/decision-log.md` (Design Decisions [2]-[4]) for
+the knob's design rationale, and Task 3.1 (benchmark sweep) for the validating measurement.
+
+> **Sweep outcome (2026-07-02):** the validating sweep found `S3_MAX_CONNECTIONS` had **no
+> measurable effect** on full-scan throughput on the tested 2-node cluster (< 2 % across 4→128,
+> at either shard shape) — the object-store connection pool was not the limiter there; the S3
+> read itself is network-distance bound (~0.17 GB/s). The knob is correctly wired and remains a
+> supported lever for genuinely connection-starved deployments, but it did not close the gap
+> here. Full results in [Connection-concurrency & shard-shape sweep](#connection-concurrency--shard-shape-sweep-2026-07-02-post-0201).
 
 ## Current benchmark results
 
@@ -102,14 +138,29 @@ stats, no row materialization). But **full materialization flips the earlier fin
 `IMPORT INTO` is ~1.9× faster than the VS full-emit CTAS at this scale, unlike the small-scale
 run where the VS aggregate path was competitive with native IMPORT.
 
-> **Open confound, not yet isolated:** this run's `adapterNotes` recorded `CLUSTER_NODES=1`
-> despite explicit `NR_OF_CORES=8` / `PARALLELISM_FACTOR=8` — the pre-0.20.1
-> `ctx.node_count()==0` handshake bug (tracked in #43, fixed by the SDK bump in
-> `add-scan-connection-concurrency`). If this cluster has more than one node, shard count `G`
-> was computed as `1 × 8` instead of `node_count × 8`, starving the full-scan/emit path of
-> cluster parallelism — which could fully or partly explain the 151 s vs. 80 s gap rather than
-> it being a genuine emit-path bottleneck. **Re-run this exact 60-file benchmark after the
-> 0.20.1 bump lands** before concluding anything about the emit path itself.
+> **Confound resolved (re-gate, 2026-07-02, post-0.20.1):** the run above recorded
+> `CLUSTER_NODES=1` despite `NR_OF_CORES=8` / `PARALLELISM_FACTOR=8` — the pre-0.20.1
+> `ctx.node_count()==0` handshake bug (#43). After the 0.20.1 bump landed, the same cluster's
+> `adapterNotes` now reports the **real `CLUSTER_NODES=2`**, so at the default
+> `PARALLELISM_FACTOR=8` the shard count is `G = 2 × 8 = 16` (was `1 × 8 = 8`). Re-gate outcome:
+>
+> - **Scan/aggregate path improved.** Q4 (full-`lineitem` pricing summary) dropped from **28.5 s
+>   → 20.5 s** (≈ −28 %) purely from the corrected shard count — no knob change.
+> - **Full-emit gap persists and is *not* under-sharding.** The exact 60-file / 180M-row
+>   materialization re-run could not be reproduced (the shared cluster's 10 GiB raw-size license
+>   is exceeded by a single 180M-row `lineitem` table ≈ 24 GiB raw), so the emit path was
+>   re-measured at reduced scale (≈ 30–33 M rows, same files, corrected `CLUSTER_NODES=2`):
+>   native `IMPORT INTO` **2.07 M rows/s** vs. VS `CREATE TABLE AS SELECT *` **1.19 M rows/s** —
+>   a **~1.74×** gap, essentially unchanged from the pre-fix **~1.88×**. Decisively, the VS
+>   full-emit throughput (**1.19 M rows/s**) is *identical* to the pre-fix full-scale run
+>   (180M / 151 s = 1.19 M rows/s): **doubling `G` (8 → 16) did not move full-emit throughput at
+>   all**, so the emit gap is bottlenecked *downstream* of sharding, not by cluster parallelism.
+>
+> The confound is therefore resolved: the 1.9× emit gap was **not** primarily under-sharding.
+> See the emit-path isolation under [Tuning levers & outlook](#tuning-levers--outlook) for why
+> it is also **not** primarily the `Int64→Decimal128` coercion, and
+> `specs/_recorded/2026-07-02-add-scan-connection-concurrency/decision-log.md` (Design Decision
+> [5] + the 2026-07-02 validation addendum) for the full methodology and verdict.
 
 ## Tuning levers & outlook
 
@@ -124,6 +175,116 @@ The engine controls these regardless of where storage lives — apply them first
 
 See [Tuning](tuning.md) for ranges and defaults.
 
+### Connection-concurrency & shard-shape sweep (2026-07-02, post-0.20.1)
+
+A sweep on the 2-node cluster (`CLUSTER_NODES=2` confirmed in `adapterNotes`), 60-file / 180M-row
+`lineitem`, tested the hypothesis that *serial / under-concurrent fetching* — not the engine —
+caps throughput, via three levers: (1) `PARALLELISM_FACTOR=1` (one shard per node), (2)
+`DATAFUSION_THREADING_MODE=AUTO` (that single instance gets all the node's cores), and (3) a
+swept `S3_MAX_CONNECTIONS`. **All three levers were refuted; the shipped default wins.**
+
+| Config (all `CLUSTER_NODES=2`) | shards `G` | Q4 full scan | Q2 join | Q3 grp |
+|---|---|---|---|---|
+| **Default `PARALLELISM_FACTOR=8`, `S3_MAX_CONNECTIONS` AUTO (=4)** | **16** | **20.5 s** | 18.7 s | 16.0 s |
+| `PARALLELISM_FACTOR=8`, `S3_MAX_CONNECTIONS` = 16 / 32 / 64 | 16 | 20.1 / 20.1 / 20.4 s | 17.8 s | 15.6–16.3 s |
+| `PARALLELISM_FACTOR=1`, AUTO threads, `S3_MAX_CONNECTIONS` AUTO (=32) | 2 | 63.7 s | 30.2 s | 34.1 s |
+| `PARALLELISM_FACTOR=1`, AUTO threads, `S3_MAX_CONNECTIONS` = 64 / 128 | 2 | 63.9 / 64.4 s | 29.8–30.1 s | 33.4–33.7 s |
+
+- **Lever 1 (fewer, bigger shards) — refuted.** One shard per node (`G=2`) is **~3.1× slower** on
+  the full-scan Q4 (63.7 s vs. 20.5 s) and ~2× slower on Q2/Q3. Inter-instance oversubscription
+  (`G=16`, multiplexed onto each node's core pool) decisively beats a single big instance per node
+  — DataFusion's intra-instance threading does not substitute for it.
+- **Lever 2 (one AUTO instance/node) — refuted** (coupled with lever 1): AUTO correctly gave the
+  single instance 8 threads / 8 partitions, yet the shape was still ~3× worse.
+- **Lever 3 (`S3_MAX_CONNECTIONS`) — refuted.** Sweeping it changed Q4 by **< 2 %** at *either*
+  shard shape (`PARALLELISM_FACTOR=8`: 20.1–20.4 s across 4→64; `PARALLELISM_FACTOR=1`:
+  63.7–64.4 s across 32→128). The object-store HTTP connection pool is not the throughput limiter
+  on this deployment. The knob remains a supported, correctly-wired lever (verified end-to-end via
+  `adapterNotes`), just not the one that helps here.
+- **The real win was the 0.20.1 `CLUSTER_NODES` fix**, not a new knob: correcting the node count
+  from the buggy `1` to the real `2` doubled `G` at the default `PARALLELISM_FACTOR=8` (8 → 16),
+  which is what cut Q4 from ~28.5 s to ~20.5 s.
+
+**Native-`IMPORT` comparison (same 60 files, 5.40 GB / 180M rows, S3 in `eu-west-1`):** native
+`IMPORT FROM PARQUET` `COUNT(*)` (full read) ≈ **30.6 s (0.176 GB/s)**; the VS scan/aggregate path
+(Q4, with projection + predicate + Iceberg pruning) is **faster** at 20.5 s; VS metadata
+`COUNT(*)` ≈ 1.6 s. The mission's ~1 GB/s target is **not reachable on this cluster** — the S3
+read ceiling here is ~0.17 GB/s (storage network distance, a deployment property, consistent with
+the earlier different-VPC caveat), not an engine limit. The durable engine wins are the sharding
+correctness and pushdown, which already make the *scan* path competitive with (or faster than)
+native; only the *full raw-emit* path trails native's bulk loader (~1.74×, see re-gate above).
+
+Reproduce: `bench/sweep.sh` (shard/connection sweep) + `bench/import_ceiling.sh` (native ceiling).
+
+### Emit-path batch-size & connection sweep (2026-07-02, post-0.20.1)
+
+The `S3_MAX_CONNECTIONS` sweep above tested the *aggregate* Q4 (few rows over the wire). This
+pass isolates the two remaining untested emit-path levers on the **raw full-emit** workload — the
+same reduced-scale `CREATE TABLE AS SELECT *` filtered to `L_ORDERKEY < 33007128` (33,006,459
+rows, same 60 files, `CLUSTER_NODES=2`, `PARALLELISM_FACTOR=8` ⇒ `G=16`, threading AUTO) that the
+re-gate above used, against the same native `IMPORT INTO` ceiling of **2.07 M rows/s** (best of 2
+passes per config; VS reset + `FLUSH STATISTICS` between runs for the 10 GiB license).
+
+**Lever A — `DATAFUSION_BATCH_SIZE` (raw-emit round-trip count).** The emit loop
+(`scan/emit.rs::emit_stream`) fetches one DataFusion `RecordBatch`, calls `ctx.emit_batch` once,
+drops it, and fetches the next — so batch size sets the rows per `MT_EMIT` and therefore the
+round-trip count (≈ 4,030 round-trips cluster-wide at 8192, ≈ 252 at 131072, a **16× reduction**).
+
+| `DATAFUSION_BATCH_SIZE` | round-trips (approx) | VS raw-emit rows/s | gap vs native |
+|---|---|---|---|
+| **8192 (default)** | ~4,030 | 1,222,009 | 1.70× |
+| 32768 | ~1,007 | 1,278,824 | 1.62× |
+| **65536 (best)** | ~504 | 1,306,669 | 1.59× |
+| 131072 | ~252 | 1,272,416 | 1.63× |
+
+⇒ **Round-trip count is a minor cost, not the bottleneck.** A 16× reduction in `MT_EMIT`
+round-trips bought only **~7 %** throughput (1.22 M → 1.31 M rows/s), plateauing at 32k–65k and
+falling back slightly at 131k. The gap stays **~1.6×**; larger batches do **not** close it. This
+directly **refines the earlier attribution** — the residual emit gap is *not* dominated by the
+`MT_EMIT` round-trip **count** (if it were, 16× fewer would have moved it far more than 7 %). What
+scales with the workload is the **per-row cost**: Arrow→`Value` row materialization plus the
+DB-side ingest of each emitted row, both proportional to row count regardless of how rows are
+batched. The synchronous send/ack **per-round-trip latency** is real but its aggregate is small
+because the count is already low relative to 33 M rows.
+
+**Lever B — `S3_MAX_CONNECTIONS` on the raw-emit path.** Prior work refuted this knob on Q4
+(aggregate). Re-tested here specifically on the raw-emit path (30 M+ rows streamed via `MT_EMIT`),
+in case a wider fetch pipeline keeps more decoded batches ready to emit and hides emit-wait, at the
+winning `DATAFUSION_BATCH_SIZE=65536`:
+
+| `S3_MAX_CONNECTIONS` | VS raw-emit rows/s | gap vs native |
+|---|---|---|
+| AUTO (resolved 4) | 1,309,261 | 1.58× |
+| 8 | 1,310,820 | 1.58× |
+| 32 | 1,297,934 | 1.60× |
+| 64 | 1,311,341 | 1.58× |
+| 128 | 1,315,522 | 1.58× |
+
+⇒ **Refuted on the emit path too** — a **~1.4 %** spread across AUTO→128, gap fixed at ~1.58×. The
+emit path is no more fetch-concurrency-bound than the aggregate path was; the wider pipeline does
+not hide emit-wait here.
+
+**Aggregate-path regression check** (Q1–Q4, `DATAFUSION_BATCH_SIZE` 8192 vs. 65536): 65536 is **not
+a regression** — Q1 1.94→1.96 s (flat), Q2 18.53→17.03 s (−8 %), Q3 15.75→15.30 s (−3 %), Q4
+20.35→18.71 s (−8 %). Larger batches marginally help the aggregate/join path (fewer per-batch
+overheads), and every timing stays within the prior sweep's recorded ranges.
+
+**Verdict:** neither round-trip count (batch size) nor S3 fetch concurrency moves the ~1.6× raw-emit
+gap. Combined with the earlier findings that doubling `G` (8→16) did nothing and the Int64→Decimal
+coercion is only ~1.27× (~5–6 % of emit time), the residual gap is an **architectural floor**: the
+VS materializes each row (Arrow→`Value`) and streams it through the UDF emit protocol for the DB to
+ingest row-wise, whereas native `IMPORT INTO` uses Exasol's own bulk Parquet loader writing directly
+into columnar storage — bypassing UDF row-materialization and the emit protocol entirely. No tunable
+knob crosses that boundary. Per the evidence-gated convention (ADR-055), **no shipped-crate change
+was made**: `DATAFUSION_BATCH_SIZE=65536` is documented as an operator tuning hint for emit-bound /
+wide `SELECT *` workloads (~7 % emit gain, no aggregate regression, memory-safe on an 8-core /
+4 GiB-per-instance node), but the shipped default stays **8192** (matches DataFusion's own default;
+keeps the per-batch decode working set — and out-of-pool RSS — small for memory-constrained
+deployments, where the ~7 % is not worth an 8× larger in-flight batch).
+
+Reproduce: `bench/batch_size_sweep.sh` (batch-size emit sweep) + `bench/emit_s3conn_sweep.sh`
+(connections on the emit path) + `bench/batch_size_aggcheck.sh` (Q1–Q4 regression check).
+
 Future engine work (deferred, evidence-gated):
 
 - **I/O-aware `AUTO` threading** — `AUTO` stays the safe CPU/memory-bound default; a future
@@ -131,8 +292,19 @@ Future engine work (deferred, evidence-gated):
   the manual `FIXED` lever).
 - **Decode-emit overlap buffer** — gate-failed here (emit ≈ 2 ms, nothing to overlap); revisit
   for an emit-bound workload (wide `SELECT *`).
-- **Emit-path Arrow cast** — `BIGINT` (Int64 → Decimal128) coercion is 50–200× slower than
-  zero-copy types; worth optimizing only if a workload proves emit-bound. The 180M-row full-emit
-  CTAS above (`SELECT *` = a wide, emit-heavy workload) is the first candidate — but re-run it
-  post-0.20.1 first (see caveat above) to rule out under-sharding before attributing the gap to
-  the emit path.
+- **Emit-path Arrow cast** — **evaluated 2026-07-02 and NOT pursued.** The `BIGINT`
+  (Int64 → Decimal128) coercion measured 50–200× slower than zero-copy types *in a synthetic
+  micro-bench*, but a column-isolation experiment on the real `lineitem` full-emit workload
+  (33 M rows, four columns per class, corrected `CLUSTER_NODES=2`) does **not** reproduce that:
+  the four Int64→Decimal columns emit at **4.63 M rows/s** vs. **5.89 M rows/s** for four
+  zero-copy `Decimal128(15,2)` columns and **6.82 M rows/s** for four `Utf8` columns — the
+  coercion is the slowest column class but only **~1.27×** slower, contributing **~5–6 %** of
+  the full 16-column emit time. Eliminating it would move the native-vs-VS full-emit gap only
+  from ~1.74× to ~1.65×. The gap is dominated by general per-row Arrow→`Value` conversion, **not**
+  the Int64 coercion. Per the project's evidence-gated convention (ADR-055), no emit-path coercion
+  code was written — the micro-bench figure is not a real-workload bottleneck. Revisit only if a
+  future profile isolates a workload where the coercion dominates.
+  (**Refinement, 2026-07-02:** the `DATAFUSION_BATCH_SIZE` sweep above shows the `MT_EMIT`
+  round-trip *count* is **not** a co-dominant factor — a 16× reduction in round-trips moved
+  throughput only ~7 %. The dominant residual cost is per-*row* work (Arrow→`Value` materialization
+  + DB-side row ingest), which scales with row count independent of batching.)

@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 license.workspace = true
 
@@ -18,8 +18,8 @@ exasol-e2e = []
 cloud-e2e = []
 
 [dependencies]
-exasol-udf-sdk    = { version = "0.20.0", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.20.0" }
+exasol-udf-sdk    = { version = "0.20.1", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.20.1" }
 
 vs-expression = { path = "../vs-expression" }
 

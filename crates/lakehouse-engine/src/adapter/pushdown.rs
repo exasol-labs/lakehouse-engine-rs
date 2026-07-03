@@ -1704,6 +1704,7 @@ pub async fn handle_pushdown(
     df_threads_per_udf: usize,
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
+    s3_max_connections: usize,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
@@ -1825,6 +1826,7 @@ pub async fn handle_pushdown(
                 df_threads_per_udf,
                 memory_pool_fraction,
                 instance_overhead_mb,
+                s3_max_connections,
             };
             let group_key_types = group_key_exasol_types(&pushdown_req, &group_keys, &select_items);
             let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -1871,6 +1873,7 @@ pub async fn handle_pushdown(
         df_threads_per_udf,
         memory_pool_fraction,
         instance_overhead_mb,
+        s3_max_connections,
     };
 
     let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -2691,6 +2694,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards =
@@ -2751,6 +2755,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let g = shard_count(cluster_nodes, 1, files.len());
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
@@ -3428,6 +3433,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
 
         // Build single-shard SQL and decode the embedded spec literal.
@@ -3556,6 +3562,71 @@ mod tests {
         );
     }
 
+    /// The connection-concurrency budget (`s3_max_connections`) is a shard-INVARIANT
+    /// tuning field — like `df_threads_per_udf` and `memory_pool_fraction` — so it must
+    /// travel in the common blob (the UDF's first argument), serialized exactly once,
+    /// never duplicated per shard and never silently dropped from the fan-out SQL.
+    #[test]
+    fn common_spec_carries_s3_max_connections_exactly_once() {
+        let files = vec![
+            "s3://warehouse/shard0/part-000.parquet".into(),
+            "s3://warehouse/shard1/part-001.parquet".into(),
+            "s3://warehouse/shard2/part-002.parquet".into(),
+        ];
+        // A distinctive, non-default value so it cannot be confused with the
+        // built-in default (8) or any other numeric field in the spec.
+        let distinctive_s3_max_connections = 37;
+        let spec_template = ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec!["ID".into()],
+            filter: None,
+            limit: None,
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: distinctive_s3_max_connections,
+        };
+
+        // Confirm the value round-trips through the shard-invariant common split
+        // that `handle_pushdown` uses to build the fan-out (`ScanSpec::to_common`).
+        let common = spec_template.to_common();
+        assert_eq!(
+            common.s3_max_connections, distinctive_s3_max_connections,
+            "s3_max_connections must carry from ScanSpec into CommonScanSpec"
+        );
+
+        // cluster_nodes=3 forces 3 shards (one file each) — the same multi-shard
+        // fan-out shape `handle_pushdown` builds via `build_scan_driving_sql`.
+        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, 3);
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &["ID".to_string()],
+            &["DECIMAL(20,0)".to_string()],
+            None,
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+        );
+
+        let needle = format!("\"s3_max_connections\":{distinctive_s3_max_connections}");
+        assert_eq!(
+            sql.matches(&needle).count(),
+            1,
+            "s3_max_connections must appear exactly once, in the shard-invariant \
+             common blob, not per shard and not dropped: {sql}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Aggregate merge wrapper SQL — outer SELECT reconstructing partial results
     // ---------------------------------------------------------------------------
@@ -3584,6 +3655,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards =
@@ -3716,6 +3788,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
         let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
@@ -3759,6 +3832,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
         let sql = build_scan_driving_sql(
@@ -4456,6 +4530,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
@@ -4503,6 +4578,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_scan_driving_sql(
@@ -4582,6 +4658,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
         let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
@@ -4678,6 +4755,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_grouped_aggregate_scan_sql(
@@ -4839,6 +4917,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         build_grouped_aggregate_scan_sql(
@@ -5103,6 +5182,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
@@ -5189,6 +5269,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
@@ -5291,6 +5372,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).expect("must round-trip");
@@ -5723,6 +5805,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
         let col_types = vec![
@@ -6576,6 +6659,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
 
         let json = spec.to_json();
@@ -7174,6 +7258,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
 
         let json = spec.to_json();
@@ -7598,6 +7683,7 @@ mod tests {
             df_threads_per_udf: 1,
             memory_pool_fraction: 0.6,
             instance_overhead_mb: 200,
+            s3_max_connections: 8,
         };
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).unwrap();

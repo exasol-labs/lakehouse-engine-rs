@@ -15,6 +15,7 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::{handle_pushdown, list_namespace_tables, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
+use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageProps;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
@@ -95,6 +96,21 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 /// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
 /// applying the pool fraction.
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
+// VS/connection property and adapterNotes key for the object-store connection-concurrency
+// budget (mirrors the native `IMPORT FROM PARQUET` `MaxConnections` vocabulary). An explicit
+// positive integer pins the per-instance budget (FIXED-like); absent/empty/zero/invalid
+// triggers the AUTO derivation in `resolve_s3_max_connections`.
+const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
+const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
+/// AUTO-mode oversubscription multiplier: concurrent object-store connections per DataFusion
+/// decode thread. S3 fetches are latency-bound (each byte-range GET spends most of its wall
+/// clock waiting on a network round-trip), so a decode thread that fetched one range at a time
+/// would leave the NIC idle between requests. By Little's law the concurrency needed to fill a
+/// pipe is `bandwidth × latency`, which for S3-class latency and NIC bandwidth is several
+/// in-flight requests per thread — and since an idle pooled TCP connection is far cheaper than
+/// an OS thread, the connection budget can be a small multiple of the thread budget rather than
+/// a 1:1 mirror. `4` keeps enough requests in flight to hide S3 latency while staying bounded.
+const S3_CONNECTIONS_PER_THREAD: usize = 4;
 // adapterNotes key for the Exasol-name → Iceberg-identifier map persisted at create time.
 const NOTE_TABLE_MAP: &str = "TABLE_MAP";
 
@@ -190,6 +206,10 @@ fn handle_create_virtual_schema(
     let df_batch_size = resolve_df_batch_size(&props);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
+    // Same un-clamped `parallelism_factor` used as `udf_instances_per_node` above:
+    // the conservative maximal per-node fan-out keeps the AUTO connection budget
+    // from oversubscribing a node even at the configured shard-fan-out ceiling.
+    let s3_max_connections = resolve_s3_max_connections(&props, nr_of_cores, parallelism_factor);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -245,6 +265,7 @@ fn handle_create_virtual_schema(
         df_batch_size,
         memory_pool_fraction,
         instance_overhead_mb,
+        s3_max_connections,
         &table_map,
     );
 
@@ -304,6 +325,10 @@ async fn handle_pushdown_request(
     let instance_overhead_mb = adapter_note(request, NOTE_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB);
+    let s3_max_connections = adapter_note(request, NOTE_S3_MAX_CONNECTIONS)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_S3_MAX_CONNECTIONS);
 
     // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
@@ -322,6 +347,7 @@ async fn handle_pushdown_request(
         df_threads_per_udf,
         memory_pool_fraction,
         instance_overhead_mb,
+        s3_max_connections,
         creds,
     )
     .await
@@ -452,9 +478,10 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
 /// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
 /// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
-/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, and TABLE_MAP (a nested JSON
-/// object mapping Exasol table names to original-cased Iceberg identifiers).
-/// Any pre-existing notes on the request are preserved (merge, not clobber).
+/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS, and TABLE_MAP
+/// (a nested JSON object mapping Exasol table names to original-cased Iceberg
+/// identifiers). Any pre-existing notes on the request are preserved (merge,
+/// not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
@@ -469,6 +496,7 @@ fn build_adapter_notes(
     df_batch_size: usize,
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
+    s3_max_connections: usize,
     table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
@@ -507,6 +535,10 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_INSTANCE_OVERHEAD_MB.to_string(),
         Json::String(instance_overhead_mb.to_string()),
+    );
+    notes.insert(
+        NOTE_S3_MAX_CONNECTIONS.to_string(),
+        Json::String(s3_max_connections.to_string()),
     );
     // TABLE_MAP: nested JSON object within the notes string.
     let map_obj: serde_json::Map<String, Json> = table_map
@@ -629,6 +661,62 @@ fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| (nr_of_cores as usize).max(1))
+}
+
+/// Resolve the `S3_MAX_CONNECTIONS` object-store connection-concurrency budget.
+///
+/// Explicit-wins-else-AUTO (Design Decision [3]), a single knob with no separate
+/// MODE property (connection concurrency is one field, unlike the coupled
+/// partition/thread pair behind `DATAFUSION_THREADING_MODE`):
+///
+/// * An explicit positive-integer `S3_MAX_CONNECTIONS` property is used verbatim
+///   (FIXED-like) — same `str_prop → parse → filter(>=1)` shape as
+///   `resolve_df_threads_per_udf`.
+/// * Absent/empty/zero/invalid triggers an AUTO derivation from `nr_of_cores` and
+///   the per-node UDF-instance share. When `nr_of_cores == 0` (unknown) it falls
+///   back to `DEFAULT_S3_MAX_CONNECTIONS`, mirroring the `0`-cores handling across
+///   the adapter.
+///
+/// # AUTO formula
+///
+/// `per_instance_threads × S3_CONNECTIONS_PER_THREAD`, where `per_instance_threads`
+/// is exactly the AUTO thread budget from [`auto_threads_per_udf`] (reused here so
+/// the two knobs stay in lockstep and share the same `0`-instances handling).
+///
+/// The connection budget is a *multiple* of the thread budget, not a 1:1 mirror,
+/// because S3 data fetching is latency-bound rather than CPU-bound: a decode thread
+/// spends most of a byte-range GET waiting on a network round-trip, so keeping
+/// `S3_CONNECTIONS_PER_THREAD` requests in flight per thread hides that latency and
+/// keeps the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency).
+/// Idle pooled TCP connections are cheap relative to OS threads, so oversubscribing
+/// the IO axis relative to the CPU axis is the correct asymmetry for approaching the
+/// native `IMPORT FROM PARQUET` throughput ceiling.
+///
+/// This yields a clean invariant: because `per_instance_threads ≈ nr_of_cores /
+/// instances`, the *aggregate* per-node connection budget
+/// (`instances × per_instance_threads × mult`) is ≈ `nr_of_cores × mult` regardless
+/// of how the node is sharded into instances — so the node-wide fetch concurrency
+/// tracks node capacity and lands in the native importer's low-double-digit
+/// `MaxConnections` range (e.g. 8 cores, one instance → 8 × 4 = 32; 8 cores, eight
+/// single-thread instances → 8 × (1 × 4) = 32 aggregate).
+fn resolve_s3_max_connections(
+    props: &Json,
+    nr_of_cores: u32,
+    udf_instances_per_node: usize,
+) -> usize {
+    if let Some(explicit) = str_prop(props, PROP_S3_MAX_CONNECTIONS)
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+    {
+        return explicit;
+    }
+
+    if nr_of_cores == 0 {
+        return DEFAULT_S3_MAX_CONNECTIONS;
+    }
+
+    let per_instance_threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
+    (per_instance_threads * S3_CONNECTIONS_PER_THREAD).max(1)
 }
 
 /// Read and validate the DATAFUSION_BATCH_SIZE VS property.
@@ -914,6 +1002,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let schema_metadata = serde_json::json!({
@@ -961,6 +1050,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1022,6 +1112,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1061,6 +1152,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1106,6 +1198,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1146,6 +1239,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1256,6 +1350,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1308,6 +1403,7 @@ mod tests {
             val,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1358,6 +1454,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1485,6 +1582,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             0.5,
             256,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1716,6 +1814,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1823,6 +1922,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1861,6 +1961,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1898,6 +1999,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &[("T".to_string(), "ns.t".to_string())],
         );
         let parsed: serde_json::Value =
@@ -1943,6 +2045,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             table_map,
         );
         let notes_str = notes.as_str().unwrap().to_string();
@@ -2079,6 +2182,7 @@ mod tests {
             DEFAULT_DF_BATCH_SIZE,
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -2105,6 +2209,103 @@ mod tests {
             parsed[NOTE_CLUSTER_NODES].as_str(),
             Some("3"),
             "CLUSTER_NODES must be preserved after build_adapter_notes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // S3_MAX_CONNECTIONS resolution (Task 2.3 / Scenario Coverage rows 3–5)
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: FIXED value overrides the AUTO derivation at createVirtualSchema.
+    ///
+    /// An explicit positive-integer property is used verbatim regardless of the
+    /// node capacity that AUTO would otherwise derive a different budget from.
+    #[test]
+    fn resolve_s3_max_connections_fixed_value_wins() {
+        let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" });
+        // Cores/instances would AUTO-derive 8 * 4 = 32; the explicit value must win.
+        assert_eq!(
+            resolve_s3_max_connections(&props, 8, 1),
+            64,
+            "explicit S3_MAX_CONNECTIONS must be used verbatim"
+        );
+        // Independent of node capacity (even the unknown-cores path).
+        assert_eq!(
+            resolve_s3_max_connections(&props, 0, 4),
+            64,
+            "explicit value wins even when cores are unknown"
+        );
+    }
+
+    /// Scenario: AUTO derivation sizes the per-instance budget from node capacity.
+    ///
+    /// With no explicit property the budget is `per_instance_threads * mult`, and
+    /// the aggregate per-node budget (`instances * per_instance`) tracks
+    /// `nr_of_cores * mult` regardless of the instance/thread split.
+    #[test]
+    fn resolve_s3_max_connections_auto_scales_with_cores() {
+        let absent = serde_json::json!({});
+
+        // One instance on an 8-core node: 8 threads * 4 = 32 connections.
+        assert_eq!(
+            resolve_s3_max_connections(&absent, 8, 1),
+            8 * S3_CONNECTIONS_PER_THREAD,
+            "single instance gets the whole node's core count * multiplier"
+        );
+
+        // Eight single-thread instances on the same node: 1 thread * 4 = 4 each,
+        // and the aggregate (8 * 4 = 32) matches the one-instance case above.
+        let per_instance = resolve_s3_max_connections(&absent, 8, 8);
+        assert_eq!(
+            per_instance, S3_CONNECTIONS_PER_THREAD,
+            "each of eight instances gets one thread's worth of connections"
+        );
+        assert_eq!(
+            8 * per_instance,
+            8 * S3_CONNECTIONS_PER_THREAD,
+            "aggregate per-node budget is invariant across the instance/thread split"
+        );
+
+        // A larger node scales the budget up.
+        assert_eq!(
+            resolve_s3_max_connections(&absent, 16, 1),
+            16 * S3_CONNECTIONS_PER_THREAD,
+            "budget scales with core count"
+        );
+
+        // Empty / zero / invalid property strings all fall through to AUTO.
+        for bad in ["", "0", "not-a-number", "-4"] {
+            let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: bad });
+            assert_eq!(
+                resolve_s3_max_connections(&props, 8, 1),
+                8 * S3_CONNECTIONS_PER_THREAD,
+                "invalid property {bad:?} must AUTO-derive, not pin a bad value"
+            );
+        }
+
+        // Never collapses below 1 (more instances than cores → 1 thread each).
+        assert!(
+            resolve_s3_max_connections(&absent, 2, 8) >= 1,
+            "AUTO budget must never collapse below 1"
+        );
+    }
+
+    /// Scenario: AUTO derivation falls back to the default budget when the core
+    /// count is unknown (the `0` sentinel), rather than producing a zero/negative
+    /// budget.
+    #[test]
+    fn resolve_s3_max_connections_auto_zero_cores_defaults() {
+        let absent = serde_json::json!({});
+        assert_eq!(
+            resolve_s3_max_connections(&absent, 0, 1),
+            DEFAULT_S3_MAX_CONNECTIONS,
+            "unknown cores (0) must fall back to the built-in default"
+        );
+        // Instance share is irrelevant once cores are unknown.
+        assert_eq!(
+            resolve_s3_max_connections(&absent, 0, 8),
+            DEFAULT_S3_MAX_CONNECTIONS,
+            "0-cores fallback ignores the instance share"
         );
     }
 }
