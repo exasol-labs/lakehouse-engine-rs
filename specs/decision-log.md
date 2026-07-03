@@ -1654,3 +1654,58 @@ Treat the capability flip as requiring a verification spike across the detection
 ### Consequences
 
 The multi-key grouped-aggregate path is proven correct (ordering, per-key types, HAVING/LIMIT, spill behavior) before being exposed to Exasol, at the cost of a wider verification/test-authoring scope than a bare capability-flag change.
+
+---
+
+## ADR-062: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
+
+**Date:** 2026-07-03
+**Plan:** `fix-nested-aggregate-pushdown`
+**Status:** Accepted
+
+### Context
+
+Issue #52 reported a crash on `SELECT COUNT(*) FROM (SELECT L_ORDERKEY, COUNT(*) AS cnt FROM t GROUP BY L_ORDERKEY) t2` — an outer aggregate over an inner grouped-aggregate sub-select. `specs/mission.md` lists "Join pushdown, complex query rewrites" as explicitly out of scope, so any fix had to avoid growing pushdown surface area into general subquery/nested-aggregate composition.
+
+### Decision
+
+Bound the fix to making this specific SQL shape correct-or-safe (correct composed pushdown, or fall back to a non-pushed row-scan) rather than building general multi-level nested-aggregate/subquery pushdown composition as a new adapter capability.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Bounded fix: correct-or-safe for this shape only | ✓ Chosen — matches mission's exclusion of complex query rewrites; lower-risk than growing pushdown surface area |
+| Add general subquery-pushdown composition as a new capability | ✗ Rejected — out of scope per mission; unbounded scope growth for a single reported defect |
+
+### Consequences
+
+The adapter gains a targeted guard/fix for the constant-projection-over-`GROUP BY` shape (see ADR-063) without adding a general subquery-composition capability. Other nested/subquery shapes not matching this pattern continue to rely on the existing fallback-to-row-scan behavior, which remains within mission scope.
+
+---
+
+## ADR-063: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
+
+**Date:** 2026-07-03
+**Plan:** `fix-nested-aggregate-pushdown`
+**Status:** Accepted
+
+### Context
+
+Empirical capture against the local Exasol Docker + MinIO + Iceberg REST stack showed Exasol does not send a nested `from`/sub-select for `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM t GROUP BY id) t2`. Instead it sends one flat `pushdownRequest` with `aggregationType: "group_by"`, a real `groupBy: [ID]`, and a `selectList` containing a single `literal_null` placeholder (the optimizer's "count the groups" rewrite, since neither `id` nor the inner `cnt` is needed by the outer query). `detect_group_by_aggregates` (`crates/lakehouse-engine/src/adapter/pushdown.rs:762`) rejected this shape because the placeholder's rendered SQL (`NULL`) matched no group key, falling through to the row-scan path's `extract_projection`, which pushed the rendered literal `NULL` in as a bare projection/`EMITS` column identifier — a phantom column DataFusion rejects (`Schema error: No field named "NULL"`). The row-scan fallback alternative was rejected as unsafe: it returns one row per source row, not per group, which is only accidentally correct when the group key happens to be unique (e.g. the seeded `events.id`) and silently wrong on any table with duplicate group-key values (e.g. TPC-H `LINEITEM.L_ORDERKEY`, the shape in issue #52).
+
+### Decision
+
+Extend `detect_group_by_aggregates`'s non-aggregate `selectList` arm to recognize a pure-literal placeholder item (e.g. `literal_null`) as a "count the groups" constant projection, driving the existing grouped-scan builder with an empty aggregate-plan list instead of forcing it through the group-key-match path (which requires the rendered item to equal a group key). This preserves one-row-per-distinct-group output, which is what Exasol's outer `COUNT(*)` needs to count correctly, for any group-key cardinality. As defence-in-depth, `extract_projection`'s literal-item arm no longer pushes a rendered literal such as `NULL` as a bare projection/`EMITS` column name on the row-scan path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| (a) Correct-parsing: treat the literal placeholder as a constant group-count projection and keep driving the grouped scan | ✓ Chosen — correct for all group-key cardinalities; the defect is a translatable-expression-used-as-column-identifier bug, not a malformed request |
+| (b) Tighten the guard so the row-scan fallback engages | ✗ Rejected as unsafe — returns raw row count, not distinct-group count, on any table with duplicate group-key values; only accidentally correct on unique-key data |
+| Return an error to force native retry | ✗ Rejected — a VS has no native data path, so this just fails a query that Athena/Trino/Spark all answer correctly |
+
+### Consequences
+
+`GROUP BY`-pushdown requests whose `selectList` is a lone constant/literal placeholder (the "count the groups" optimizer rewrite) now drive the grouped scan and return correct per-group-cardinality results instead of crashing. The regression test additionally covers a duplicate-key group column (not just the unique-key seeded `events.id`) to discriminate the correct grouped fix from the unsafe row-scan fallback, since both incidentally return the same count on unique-key data.
