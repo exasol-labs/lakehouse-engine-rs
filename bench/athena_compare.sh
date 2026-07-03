@@ -3,9 +3,9 @@
 # TPC-H tables. NOT a spec feature — manually invoked, like the rest of bench/. No new infra: the
 # Athena workgroup already exists in deploy/data-stack (`tofu output athena_workgroup`).
 #
-# Query text is the Presto/Trino dialect of bench/run.sh's Q1-Q4 (lines ~321-349) — table names
-# lowercase (Glue/DuckDB dbgen writes lowercase TPC-H columns/tables). Reused verbatim by
-# trino_compare.sh and deploy/scripts/spark_queries.py; keep all three in sync if you edit one.
+# Query text is the Presto/Trino dialect of bench/run.sh's Q1-Q9b — table names lowercase
+# (Glue/DuckDB dbgen writes lowercase TPC-H columns/tables). Reused verbatim by trino_compare.sh
+# and deploy/scripts/spark_queries.py; keep all three in sync if you edit one.
 #
 #   AWS_PROFILE=spot-strata-deployer ATHENA_WORKGROUP=spot-strata-test1-athena ./athena_compare.sh
 # No -e: run_timed must survive a failing query and report it as FAILED rather than aborting the
@@ -43,6 +43,32 @@ Q4="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extende
 FROM lineitem WHERE l_shipdate <= DATE '1998-09-01'
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
+# Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL (dialect-
+# adjusted) in bench/run.sh, bench/trino_compare.sh, deploy/scripts/spark_queries.py.
+Q5="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
+FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey
+GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
+
+Q6="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
+       AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
+FROM lineitem
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
+
+Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM lineitem GROUP BY l_orderkey) t"
+
+Q8="SELECT COUNT(*) FROM lineitem WHERE l_shipdate = DATE '1995-06-15'"
+
+Q9A="SELECT SUM(l_quantity) FROM lineitem"
+
+Q9B="SELECT COUNT(*),
+       SUM(l_orderkey), SUM(l_partkey), SUM(l_suppkey), SUM(l_linenumber),
+       SUM(l_quantity), SUM(l_extendedprice), SUM(l_discount), SUM(l_tax),
+       COUNT(DISTINCT l_returnflag), COUNT(DISTINCT l_linestatus),
+       MIN(l_shipdate), MAX(l_commitdate), MIN(l_receiptdate),
+       COUNT(DISTINCT l_shipinstruct), COUNT(DISTINCT l_shipmode),
+       SUM(length(l_comment))
+FROM lineitem"
+
 run_timed() {  # name sql
   local name="$1" sql="$2" qid status ms el
   qid="$(aws athena start-query-execution \
@@ -72,4 +98,10 @@ run_timed "q1" "$Q1"
 run_timed "q2" "$Q2"
 run_timed "q3" "$Q3"
 run_timed "q4" "$Q4"
+run_timed "q5" "$Q5"
+run_timed "q6" "$Q6"
+run_timed "q7" "$Q7"
+run_timed "q8" "$Q8"
+run_timed "q9a" "$Q9A"
+run_timed "q9b" "$Q9B"
 echo "Done. Report: $REPORT"

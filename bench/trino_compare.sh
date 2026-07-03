@@ -43,6 +43,32 @@ Q4="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extende
 FROM iceberg.tpch.lineitem WHERE l_shipdate <= DATE '1998-09-01'
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
+# Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL (dialect-
+# adjusted) in bench/run.sh, bench/athena_compare.sh, deploy/scripts/spark_queries.py.
+Q5="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
+FROM iceberg.tpch.orders o JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
+
+Q6="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
+       AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
+FROM iceberg.tpch.lineitem
+GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
+
+Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM iceberg.tpch.lineitem GROUP BY l_orderkey) t"
+
+Q8="SELECT COUNT(*) FROM iceberg.tpch.lineitem WHERE l_shipdate = DATE '1995-06-15'"
+
+Q9A="SELECT SUM(l_quantity) FROM iceberg.tpch.lineitem"
+
+Q9B="SELECT COUNT(*),
+       SUM(l_orderkey), SUM(l_partkey), SUM(l_suppkey), SUM(l_linenumber),
+       SUM(l_quantity), SUM(l_extendedprice), SUM(l_discount), SUM(l_tax),
+       COUNT(DISTINCT l_returnflag), COUNT(DISTINCT l_linestatus),
+       MIN(l_shipdate), MAX(l_commitdate), MIN(l_receiptdate),
+       COUNT(DISTINCT l_shipinstruct), COUNT(DISTINCT l_shipmode),
+       SUM(length(l_comment))
+FROM iceberg.tpch.lineitem"
+
 trino_exec() {
   docker run --rm "$TRINO_IMAGE" trino --server "http://${TRINO_HOST}:${TRINO_PORT}" \
     --catalog iceberg --schema tpch --output-format CSV --execute "$1"
@@ -66,4 +92,10 @@ run_timed "q1" "$Q1"
 run_timed "q2" "$Q2"
 run_timed "q3" "$Q3"
 run_timed "q4" "$Q4"
+run_timed "q5" "$Q5"
+run_timed "q6" "$Q6"
+run_timed "q7" "$Q7"
+run_timed "q8" "$Q8"
+run_timed "q9a" "$Q9A"
+run_timed "q9b" "$Q9B"
 echo "Done. Report: $REPORT"
