@@ -20,32 +20,7 @@ can merge into the final query result.
 
 ## Scenarios
 
-### Scenario: Scan computes a node-local partial aggregate instead of raw rows
-
-* *GIVEN* a scan spec carrying partial-aggregate instructions and the files assigned to this shard
-* *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL register only its assigned files and apply any pushed-down filter
-* *AND* the UDF SHALL compute the requested aggregates over its assigned files locally in DataFusion
-* *AND* the UDF SHALL emit a single partial-result row carrying the per-shard partial aggregate values rather than the scanned rows
-* *AND* no Arrow type SHALL cross the `.so` boundary
-
-### Scenario: Partial COUNT, SUM, MIN, and MAX are emitted in their merge-ready form
-
-* *GIVEN* a scan spec requesting any of partial `COUNT`, `SUM`, `MIN`, or `MAX`
-* *WHEN* the scan UDF computes its shard's partial aggregate
-* *THEN* a partial `COUNT` SHALL be the count of matching rows in this shard, emitted as a value the wrapper can sum
-* *AND* a partial `SUM` SHALL be the sum over this shard's matching rows, emitted as a value the wrapper can sum
-* *AND* partial `MIN` and `MAX` SHALL be this shard's minimum and maximum, emitted as values the wrapper can re-`MIN`/`MAX`
-* *AND* an empty shard SHALL emit a partial `COUNT` of zero and a NULL partial `SUM`/`MIN`/`MAX` that the wrapper's merge ignores
-
-### Scenario: AVG is emitted as a partial sum and partial count pair
-
-* *GIVEN* a scan spec requesting partial `AVG(col)`
-* *WHEN* the scan UDF computes its shard's partial aggregate
-* *THEN* the UDF SHALL emit a `(partial_sum, partial_count)` pair for that column
-* *AND* the UDF MUST NOT emit a per-shard average
-* *AND* the partial count SHALL exclude rows where the target column is NULL so the merged average matches single-node `AVG` semantics
-
+<!-- DELTA:NEW -->
 ### Scenario: Partial aggregate over an expression argument is computed from the rendered expression
 
 * *GIVEN* a scan spec whose aggregate plan carries a rendered DataFusion SQL expression as an aggregate argument (e.g. `LENGTH("L_COMMENT")`) rather than a bare column name
@@ -69,3 +44,4 @@ can merge into the final query result.
 * *THEN* the UDF SHALL stop and return a clean bounded-resource error identifying the offending column and the cap that was exceeded, consistent with the engine's `ResourcesExhausted` bounded-execution convention
 * *AND* the UDF MUST NOT emit a truncated distinct set (which would produce a wrong merged count)
 * *AND* the error message MUST NOT contain any credential value
+<!-- /DELTA:NEW -->
