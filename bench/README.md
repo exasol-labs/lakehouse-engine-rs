@@ -72,10 +72,12 @@ convention as the rest of `bench/`.
 - **`athena_compare.sh`** — no new infra (the Athena workgroup already exists in
   `deploy/data-stack`). `ATHENA_WORKGROUP=$(cd deploy/data-stack && tofu output -raw
   athena_workgroup) ./athena_compare.sh`.
-- **`trino_compare.sh`** — requires an ephemeral Trino node stood up first:
-  `deploy/scripts/trino-up.sh <env>` → `export TRINO_HOST=<printed ip>` → `./trino_compare.sh`.
-  **Tear it down when done**: `deploy/scripts/trino-down.sh <env>` (it costs money while running).
-  See the "Trino (ephemeral, opt-in)" section in [`../deploy/README.md`](../deploy/README.md).
+- **`trino_compare.sh`** — requires an ephemeral Trino cluster stood up first (coordinator +
+  workers, sized to match Exasol test1 by default — `r8i.2xlarge` × 2):
+  `deploy/scripts/trino-up.sh <env>` → `export TRINO_HOST=<printed coordinator ip>` →
+  `./trino_compare.sh`. **Tear it down immediately after**: `deploy/scripts/trino-down.sh <env>`
+  (it costs meaningfully more while running than a single small box would). See the "Trino
+  (ephemeral, opt-in)" section in [`../deploy/README.md`](../deploy/README.md).
 - **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var
   enable_emr_serverless=true` first (off by default). Export `EMR_SERVERLESS_APP_ID` /
   `EMR_SERVERLESS_ROLE_ARN` / `SPARK_SCRIPT_S3_URI` / `SPARK_LOG_S3_URI` from `tofu output`, plus

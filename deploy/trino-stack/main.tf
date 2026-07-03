@@ -1,7 +1,8 @@
-# Single ephemeral Trino node, benchmarked against the SAME Glue Iceberg REST catalog + S3 data as
-# the lakehouse engine and Athena. Cost-safety: this stack is applied/destroyed explicitly per
-# benchmark run (deploy/scripts/trino-up.sh / trino-down.sh) — never touched by data-stack or
-# cluster-stack applies, so nothing here runs unless someone asks for it.
+# Ephemeral Trino cluster (coordinator + workers, node_count matching Exasol test1), benchmarked
+# against the SAME Glue catalog + S3 data as the lakehouse engine and Athena. Cost-safety: this
+# stack is applied/destroyed explicitly per benchmark run (deploy/scripts/trino-up.sh /
+# trino-down.sh) — never touched by data-stack or cluster-stack applies, so nothing here runs
+# unless someone asks for it.
 locals {
   prefix     = "spot-strata-${var.env_name}-trino"
   vpc_id     = data.terraform_remote_state.data.outputs.vpc_id
@@ -44,6 +45,16 @@ resource "aws_security_group_rule" "ingress" {
   cidr_blocks       = local.effective_cidrs
   security_group_id = aws_security_group.trino.id
   description       = "port ${each.value} from allowlist"
+}
+
+resource "aws_security_group_rule" "internode" {
+  type              = "ingress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  self              = true
+  security_group_id = aws_security_group.trino.id
+  description       = "inter-node all traffic (coordinator/worker discovery and queries)"
 }
 
 resource "aws_security_group_rule" "egress" {
@@ -108,8 +119,13 @@ resource "aws_iam_instance_profile" "trino" {
   role = aws_iam_role.trino.name
 }
 
-# --- Trino node --------------------------------------------------------------
-resource "aws_instance" "trino" {
+# --- Trino cluster: separate coordinator + worker resources (mirrors Exasol's every-node-executes
+# model — the coordinator also runs worker tasks). Split into two resource blocks rather than one
+# count-based resource: a worker referencing the coordinator's private_ip is a normal, acyclic
+# dependency, but the SAME reference from within a single count-based aws_instance.trino resource
+# would make index 0 statically depend on itself (Terraform's dependency graph doesn't evaluate
+# the count.index==0 ternary before building the graph) — a real cycle error at plan time.
+resource "aws_instance" "trino_coordinator" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   subnet_id                   = local.subnet_id
@@ -124,10 +140,44 @@ resource "aws_instance" "trino" {
     delete_on_termination = true
   }
 
+  # The coordinator's own discovery.uri is localhost — it hosts the discovery service itself, so
+  # this is a plan-time-known literal with no dependency on any other resource.
   user_data = templatefile("${path.module}/trino-userdata.sh.tftpl", {
-    trino_image = var.trino_image_tag
-    region      = var.region
+    trino_image    = var.trino_image_tag
+    region         = var.region
+    is_coordinator = true
+    discovery_uri  = "http://localhost:8080"
+    node_count     = var.node_count
   })
 
-  tags = { Name = local.prefix }
+  tags = { Name = "${local.prefix}-n11" }
+}
+
+resource "aws_instance" "trino_worker" {
+  count                       = var.node_count - 1
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  subnet_id                   = local.subnet_id
+  vpc_security_group_ids      = [aws_security_group.trino.id]
+  key_name                    = var.key_pair_name
+  iam_instance_profile        = aws_iam_instance_profile.trino.name
+  associate_public_ip_address = true
+
+  root_block_device {
+    volume_size           = 50
+    volume_type           = "gp3"
+    delete_on_termination = true
+  }
+
+  # Points at the coordinator's private IP — a normal cross-resource dependency, so OpenTofu
+  # creates the coordinator first and resolves its private IP before rendering worker user-data.
+  user_data = templatefile("${path.module}/trino-userdata.sh.tftpl", {
+    trino_image    = var.trino_image_tag
+    region         = var.region
+    is_coordinator = false
+    discovery_uri  = "http://${aws_instance.trino_coordinator.private_ip}:8080"
+    node_count     = var.node_count
+  })
+
+  tags = { Name = "${local.prefix}-n1${count.index + 2}" }
 }

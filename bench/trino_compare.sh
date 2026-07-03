@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Competitive engine comparison: Trino vs the lakehouse engine, over the SAME Glue Iceberg TPC-H
 # tables. NOT a spec feature — manually invoked, like the rest of bench/. Requires an ephemeral
-# Trino node stood up via `deploy/scripts/trino-up.sh <env>` first — this script NEVER
+# Trino cluster stood up via `deploy/scripts/trino-up.sh <env>` first — this script NEVER
 # auto-provisions (cost-safety: nothing shall be started unless used).
 #
 # Query text matches bench/athena_compare.sh verbatim (both Presto-derived, identical SQL) —
 # translated from bench/run.sh's Q1-Q4 (lines ~321-349). Keep both in sync if you edit one.
 #
-#   TRINO_HOST=<ip> ./trino_compare.sh
+#   TRINO_HOST=<coordinator-ip> ./trino_compare.sh   # only the coordinator accepts client queries
 # No -e: run_timed must survive a failing query (OOM, syntax error, ...) and report it as FAILED
 # rather than aborting the whole comparison — same convention as bench/import_ceiling.sh.
 set -uo pipefail
