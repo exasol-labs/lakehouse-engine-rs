@@ -74,6 +74,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         df_threads_per_udf: 1,
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
+        s3_max_connections: 8,
     }
 }
 

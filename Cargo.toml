@@ -46,7 +46,7 @@ iceberg-storage-opendal = { version = "0.9.1", default-features = false, feature
 # points; full feature set available behind the exasol-e2e feature.
 tokio = { version = "1", features = ["rt", "macros"] }
 
-exasol-udf-sdk = { version = "0.20.0", features = ["emit-arrow"] }
+exasol-udf-sdk = { version = "0.20.1", features = ["emit-arrow"] }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
