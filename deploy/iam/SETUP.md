@@ -63,3 +63,17 @@ aws sts get-caller-identity      # must return the spot-strata-deployer ARN
 Keep `AWS_PROFILE=spot-strata-deployer` exported (or pass `--profile`) for all `tofu` and script
 runs. The account ID and region from `get-caller-identity` are what you'll set as the stack's
 `aws_account_id` / `region` variables.
+
+## Updating the policy (e.g. for EMR Serverless / Spark benchmarking)
+
+This policy is bootstrapped once and lives outside Terraform's management, so a later change to
+`deployer-policy.json` (e.g. the `EmrServerlessForSparkBenchmark` statement, added for
+`bench/spark_compare.sh`) needs a one-time manual bump. The deployer already has
+`iam:CreatePolicyVersion` on its own policy, so it can self-apply:
+
+```bash
+POLICY_ARN=$(aws iam list-policies --query \
+  "Policies[?PolicyName=='spot-strata-deployer-policy'].Arn" --output text)
+aws iam create-policy-version --policy-arn "$POLICY_ARN" \
+  --policy-document file://deploy/iam/deployer-policy.json --set-as-default
+```

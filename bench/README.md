@@ -62,6 +62,39 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
 - **`sweep.sh`** — sweeps the DataFusion threading knobs (`BENCH_DF_*`) across
   `run.sh` invocations to find the best parallelism config.
 
+## Competitive engine comparison (Athena / Trino / Spark)
+
+Beyond the native-`IMPORT` ceiling above, the same TPC-H tables/queries can be run through the
+lakehouse engines people put next to a lakehouse: AWS Athena, Trino, and Spark. All three read the
+SAME Glue Iceberg REST catalog + S3 data as `remote` mode above. Manually invoked, not CI — same
+convention as the rest of `bench/`.
+
+- **`athena_compare.sh`** — no new infra (the Athena workgroup already exists in
+  `deploy/data-stack`). `ATHENA_WORKGROUP=$(cd deploy/data-stack && tofu output -raw
+  athena_workgroup) ./athena_compare.sh`.
+- **`trino_compare.sh`** — requires an ephemeral Trino node stood up first:
+  `deploy/scripts/trino-up.sh <env>` → `export TRINO_HOST=<printed ip>` → `./trino_compare.sh`.
+  **Tear it down when done**: `deploy/scripts/trino-down.sh <env>` (it costs money while running).
+  See the "Trino (ephemeral, opt-in)" section in [`../deploy/README.md`](../deploy/README.md).
+- **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var
+  enable_emr_serverless=true` first (off by default). Export `EMR_SERVERLESS_APP_ID` /
+  `EMR_SERVERLESS_ROLE_ARN` / `SPARK_SCRIPT_S3_URI` / `SPARK_LOG_S3_URI` from `tofu output`, plus
+  `GLUE_CATALOG_URI` / `GLUE_WAREHOUSE` / `AWS_REGION` (already in `bench/.env` for `remote` mode).
+  EMR Serverless is billed only while a job runs — see the "Spark / EMR Serverless" section in
+  [`../deploy/README.md`](../deploy/README.md).
+- **`compare_all.sh`** — runs `make bench` + `import_ceiling.sh` + `athena_compare.sh`, then
+  `trino_compare.sh` / `spark_compare.sh` only if their env vars are set (clean `SKIP` otherwise —
+  it never auto-provisions). Writes one aggregated `bench/reports/compare-<ts>.txt`.
+
+**The `TIMING` line convention**: every compare script appends lines of the exact form
+`TIMING <engine> <query-name> <seconds>` to its own report. `compare_all.sh` does nothing
+engine-specific beyond `grep`-ing `^TIMING ` across the reports it produced into one aligned
+table — no CSV/JSON, no dashboard, hand-curate the interesting numbers into
+[`../docs/performance.md`](../docs/performance.md) afterward, same as every other bench result.
+
+Query text (Presto/Trino/Spark dialect, identical across all three) is duplicated inline in each
+script, translated from `run.sh`'s Q1-Q4 (lines ~321-349) — keep all three in sync if you edit one.
+
 ## Synthetic micro-benchmarks (no cluster, no DB)
 
 Two host-runnable micro-benchmarks isolate the two halves of the per-instance
