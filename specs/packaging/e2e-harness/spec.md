@@ -86,3 +86,12 @@ pushdown against a local Exasol Docker container.
 * *THEN* the returned rows SHALL exactly match the seeded source rows satisfying the predicate, and SHALL be identical to the same query run with Iceberg pruning unable to apply (predicate forced untranslatable)
 * *AND* where the harness can observe it (Iceberg `plan_files` output during file resolution), the resolved file list SHALL contain fewer files than the unpruned snapshot file count
 * *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+
+### Scenario: End-to-end nested aggregate over a grouped sub-select returns the correct outer count
+
+* *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed and a seeded Iceberg table backed by MinIO
+* *AND* a nested-aggregate query matching `bench/run.sh` Q7's shape — an outer `COUNT(*)` over an inner high-cardinality grouped aggregate, e.g. `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {vs_table} GROUP BY id) t`
+* *WHEN* the query is executed against the virtual schema
+* *THEN* the query MUST succeed without a `DataFusion SQL error: Schema error: No field named ...` (or any other planning-time pushdown-SQL-generation error) surfaced from the scan UDF
+* *AND* the returned outer `COUNT(*)` MUST equal the number of distinct inner group-key values in the seeded data (equivalently, the single-node DataFusion result for the same nested query)
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
