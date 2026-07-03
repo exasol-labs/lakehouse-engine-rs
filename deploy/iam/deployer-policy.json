@@ -23,6 +23,23 @@
       "Resource": "*"
     },
     {
+      "Sid": "EmrServerlessForSparkBenchmark",
+      "Effect": "Allow",
+      "Action": [
+        "emr-serverless:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EmrServerlessServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "arn:aws:iam::*:role/aws-service-role/ops.emr-serverless.amazonaws.com/AWSServiceRoleForAmazonEMRServerless*",
+      "Condition": {
+        "StringLike": { "iam:AWSServiceName": "ops.emr-serverless.amazonaws.com" }
+      }
+    },
+    {
       "Sid": "KmsForSsmSecureString",
       "Effect": "Allow",
       "Action": [

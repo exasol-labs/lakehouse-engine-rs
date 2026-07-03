@@ -313,7 +313,16 @@ run_query() {
   local name="$1" q="$2" t0 t1
   { echo; echo "### ${name}"; } | tee -a "$REPORT"
   t0=$(date +%s.%N)
-  sqlf "$q" | tee -a "$REPORT"
+  # `if !` guards the pipeline from set -e (same pattern as check_count/pushdown_check below) —
+  # a genuinely failing query (e.g. an engine limitation the query is designed to probe) must not
+  # abort the rest of the queries/pushdown checks. FAILED still fails the overall run at the end.
+  if ! sqlf "$q" | tee -a "$REPORT"; then
+    t1=$(date +%s.%N)
+    echo "  FAILED" | tee -a "$REPORT"
+    printf 'elapsed: %ss (FAILED)\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
+    FAILED=1
+    return
+  fi
   t1=$(date +%s.%N)
   printf 'elapsed: %ss\n' "$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")" | tee -a "$REPORT"
 }
@@ -347,6 +356,43 @@ run_query "Q4 lineitem pricing summary (TPC-H Q1 shape; multi-file -> parallel s
  WHERE L_SHIPDATE <= DATE '1998-09-01'
  GROUP BY L_RETURNFLAG, L_LINESTATUS
  ORDER BY L_RETURNFLAG, L_LINESTATUS"
+
+# ---- Q5-Q9b: added to probe specific pushdown strengths/weaknesses beyond Q1-Q4 -------------
+# (competitive-comparison follow-up). Identical SQL (dialect-adjusted) in bench/athena_compare.sh,
+# bench/trino_compare.sh, deploy/scripts/spark_queries.py — keep all four in sync if you edit one.
+
+run_query "Q5 orders x lineitem GROUP BY, no filter (Q3 minus WHERE)" \
+"SELECT o.O_ORDERPRIORITY, COUNT(*) AS cnt, SUM(l.L_EXTENDEDPRICE) AS revenue
+ FROM ${VS}.ORDERS o
+ JOIN ${VS}.LINEITEM l ON o.O_ORDERKEY = l.L_ORDERKEY
+ GROUP BY o.O_ORDERPRIORITY
+ ORDER BY o.O_ORDERPRIORITY"
+
+run_query "Q6 lineitem pricing summary, no filter (Q4 minus WHERE)" \
+"SELECT L_RETURNFLAG, L_LINESTATUS, SUM(L_QUANTITY) AS sum_qty, SUM(L_EXTENDEDPRICE) AS sum_base_price,
+        AVG(L_DISCOUNT) AS avg_disc, COUNT(*) AS count_order
+ FROM ${VS}.LINEITEM
+ GROUP BY L_RETURNFLAG, L_LINESTATUS
+ ORDER BY L_RETURNFLAG, L_LINESTATUS"
+
+run_query "Q7 high-cardinality GROUP BY (~45M distinct L_ORDERKEY groups)" \
+"SELECT COUNT(*) FROM (SELECT L_ORDERKEY, COUNT(*) AS cnt FROM ${VS}.LINEITEM GROUP BY L_ORDERKEY) t"
+
+run_query "Q8 highly selective filter (single ship-date, <0.05% of rows)" \
+"SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPDATE = DATE '1995-06-15'"
+
+run_query "Q9a narrow projection (single-column full scan)" \
+"SELECT SUM(L_QUANTITY) FROM ${VS}.LINEITEM"
+
+run_query "Q9b wide projection (all 16 lineitem columns, full scan)" \
+"SELECT COUNT(*),
+        SUM(L_ORDERKEY), SUM(L_PARTKEY), SUM(L_SUPPKEY), SUM(L_LINENUMBER),
+        SUM(L_QUANTITY), SUM(L_EXTENDEDPRICE), SUM(L_DISCOUNT), SUM(L_TAX),
+        COUNT(DISTINCT L_RETURNFLAG), COUNT(DISTINCT L_LINESTATUS),
+        MIN(L_SHIPDATE), MAX(L_COMMITDATE), MIN(L_RECEIPTDATE),
+        COUNT(DISTINCT L_SHIPINSTRUCT), COUNT(DISTINCT L_SHIPMODE),
+        SUM(LENGTH(L_COMMENT))
+ FROM ${VS}.LINEITEM"
 
 # ---- pushdown analysis: confirm projection/filter/limit + shard fan-out ------
 # EXPLAIN VIRTUAL is introspection (not a timed query): it prints the scan spec the

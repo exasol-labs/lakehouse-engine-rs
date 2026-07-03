@@ -162,6 +162,195 @@ run where the VS aggregate path was competitive with native IMPORT.
 > `specs/_recorded/2026-07-02-add-scan-connection-concurrency/decision-log.md` (Design Decision
 > [5] + the 2026-07-02 validation addendum) for the full methodology and verdict.
 
+## Competitive engine comparison
+
+**Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, `r8i.2xlarge` × 2,
+180M-row `lineitem`, 60 files, same Glue catalog + S3 data for every engine below). Latest pass is
+a single fresh full re-run across all four engines with the extended Q1-Q9b query set (below);
+Trino now defaults to a 2-node `r8i.2xlarge` cluster matching `test1` (was a single `r6i.xlarge` in
+the first round — see [Infrastructure comparison](#infrastructure-comparison)).
+
+Beyond the native `IMPORT` ceiling above, the same TPC-H tables are queried through the lakehouse
+engines people put next to a lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
+
+- **AWS Athena** (`bench/athena_compare.sh`) — serverless, no infra to stand up; timed via the
+  Athena API's `Statistics.EngineExecutionTimeInMillis` (engine time only, excludes queue wait).
+- **Trino** (`bench/trino_compare.sh`) — an ephemeral 2-node cluster by default
+  (`deploy/trino-stack/`, `deploy/scripts/trino-up.sh`/`trino-down.sh`), wall-clock timed via the
+  Trino CLI. Opt-in and torn down explicitly — see the cost/teardown callout in
+  [`deploy/README.md`](../deploy/README.md).
+- **Spark** (`bench/spark_compare.sh`) — AWS EMR Serverless (`deploy/data-stack`'s
+  `enable_emr_serverless` toggle, off by default), billed only while a job runs. Timed from
+  `elapsed:` lines the submitted job prints to its driver log.
+
+`bench/compare_all.sh` runs all of the above (skipping Trino/Spark cleanly if not provisioned)
+and aggregates every engine's timings into one report with a summary table.
+
+### Query set
+
+Q1-Q4 are the original TPC-H-shaped set (wiring check, 3-way join, filtered JOIN+GROUP-BY,
+pricing summary). Q5-Q9b were added to probe specific pushdown strengths/weaknesses:
+
+| Query | What it tests |
+|---|---|
+| Q5 | Q3 with the `WHERE` dropped — unfiltered JOIN + GROUP BY |
+| Q6 | Q4 with the `WHERE` dropped — unfiltered pricing summary |
+| Q7 | High-cardinality `GROUP BY L_ORDERKEY` (~45M distinct groups, vs. Q3/Q4's 4-5) |
+| Q8 | Single-day filter (`L_SHIPDATE = DATE '1995-06-15'`, <0.05% of rows) — selective-pushdown/pruning |
+| Q9a | Narrow projection — `SUM` over one column, full scan |
+| Q9b | Wide projection — aggregates touching all 16 `lineitem` columns, full scan |
+
+### Results (2026-07-03, single fresh pass, all four engines)
+
+| Query | lakehouse-engine-rs | AWS Athena | Trino (2-node) | Spark (EMR Serverless) |
+|---|---|---|---|---|
+| Q1 (wiring) | **1.79 s** | 1.87 s | 7.05 s | 16.80 s |
+| Q2 (3-way join) | 16.90 s | **2.54 s** | 12.19 s | 43.59 s |
+| Q3 (filter+groupby) | 14.48 s | **2.99 s** | 8.37 s | 31.51 s |
+| Q4 (pricing summary) | 19.17 s | **3.19 s** | 5.56 s | 21.46 s |
+| Q5 (Q3, no filter) | 18.23 s | **2.50 s** | 10.25 s | 38.07 s |
+| Q6 (Q4, no filter) | 19.25 s | **2.71 s** | 4.98 s | 18.77 s |
+| Q7 (high-card. GROUP BY) | **FAILED** (bug, see below) | **1.62 s** | 5.20 s | 12.84 s |
+| Q8 (selective filter) | 1.51 s | **0.93 s** | 4.25 s | 5.62 s |
+| Q9a (narrow projection) | **2.18 s** | 2.39 s | 3.78 s | 5.64 s |
+| Q9b (wide projection) | 67.08 s | 44.98 s | **15.19 s** | 59.19 s |
+
+Native `IMPORT` (goal ceiling, not a competing "engine" — no Q5-Q9b equivalent, unaffected by this
+round): scan-only `COUNT(*)` ~28.8–30.9 s vs. the VS's metadata-pushdown ~0.8–2.0 s; full
+materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS `CREATE TABLE AS SELECT *`
+~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files)
+above).
+
+**Reading these numbers**:
+
+- **Athena wins 7 of the 10 queries outright** (everything except Q1, Q9a, and Q9b) — it's the
+  cleanest comparison point (zero infra-sizing decisions) and clearly the most consistent
+  performer across small/medium queries.
+- **Trino wins decisively on Q9b** (15.19 s vs. everyone else's 45-67 s) — the wide-projection
+  full scan is where matching `test1`'s hardware pays off most clearly. It's competitive but not
+  fastest on the other heavy scans (Q2, Q5): faster than lakehouse-engine-rs and Spark, but Athena
+  still wins on raw time.
+- **lakehouse-engine-rs wins Q1 and Q9a** (small/single-column queries — competitive when its
+  pushdown paths apply cleanly and the result is tiny), but is consistently the slowest on
+  unfiltered/wide-scan queries (Q5, Q6, Q9b) — the per-row Arrow→Value emit-path overhead
+  documented earlier in this doc compounds most visibly exactly where no pushdown can shrink the
+  work. Even on Q8 (its best-case selective-filter scenario) it trails Athena (1.51 s vs. 0.93 s).
+- **Q7 is a genuine bug, not a slowness finding**: `SELECT COUNT(*) FROM (SELECT L_ORDERKEY,
+  COUNT(*) FROM lineitem GROUP BY L_ORDERKEY) t` fails outright against lakehouse-engine-rs —
+  `DataFusion SQL error: Schema error: No field named "NULL"` — while Athena, Trino, and Spark all
+  handle the identical nested-aggregate query in 1.6-12.8 s. Filed as
+  [#52](https://github.com/exasol-labs/lakehouse-engine-rs/issues/52): the adapter's
+  aggregate-pushdown translation appears to substitute a literal `NULL` where a field reference is
+  expected when composing an outer `COUNT(*)` (no underlying column) over an already-pushed-down
+  inner `GROUP BY`.
+- **Spark is consistently the slowest** across nearly every query — expected, given the numbers
+  include EMR Serverless's per-job executor allocation on top of query time, not just the query
+  itself.
+
+**Reproducibility (earlier check, Q1-Q4 only, first Trino-resize round)**: run twice on
+independent fresh Trino clusters — Q1/Q3/Q4 were tight (<2% spread), Q2 (the heaviest query then)
+showed the most run-to-run variance (15.74 s → 13.16 s, ~16%), plausibly cold caches or a noisy
+neighbor on shared cloud hardware. Not repeated for the full Q1-Q9b set this round; treat single-
+digit-percent differences between engines as noise-level rather than a hard ranking.
+
+### Infrastructure comparison
+
+Athena has **no equivalent sizing control** to match here: the standard Athena SQL engine (what
+`bench/athena_compare.sh` exercises via `StartQueryExecution`) is fully serverless — AWS
+auto-scales compute per query with no user-facing vCPU, RAM, or node-count knob. (*Athena for
+Apache Spark* has a configurable Data Processing Unit count, but that's a different, session-based
+execution mode — using it would change what's being measured, not just how big it is.) Athena is
+included because it's what a customer actually gets, not because it's size-matched.
+
+Trino and lakehouse-engine-rs, as of this round, run on identical VM shape and count:
+
+| | Instance type | Nodes | vCPU (total) | RAM (total) |
+|---|---|---|---|---|
+| Exasol `test1` (runs lakehouse-engine-rs) | `r8i.2xlarge` | 2 | 16 | 128 GB |
+| Trino | `r8i.2xlarge` | 2 | 16 | 128 GB |
+| AWS Athena | fully managed — no sizing control | n/a | n/a | n/a |
+
+Same hardware, different consumption model, though: lakehouse-engine-rs doesn't get a dedicated
+box — it shares each Exasol node with the DB engine itself. Live-checked on `test1`: the Exasol DB
+is configured for **97.05 GiB total across both nodes** (`MemSize` in `EXAConf`, ≈48.5 GiB/node out
+of each node's 64 GiB nameplate RAM — the rest is OS/COS/UDF headroom via `c4`'s memory-sizing
+formula), and the UDF's own DataFusion pool is a further fraction of whatever per-instance memory
+limit the script metadata reports, fanned out via `PARALLELISM_FACTOR`/`NR_OF_CORES`. Trino, by
+contrast, dedicates the whole node to query execution with a directly-configured 48 GB JVM heap
+per node. "Same VM shape and count" is the fairest comparison available, but it isn't "identical
+resources actually available to the query engine."
+
+### Bugs found and fixed during first live verification (2026-07-03)
+
+Standing up the Athena/Trino/Spark comparison against a real cluster for the first time surfaced
+ten real bugs — none were visible from code review or `tofu validate` alone:
+
+1. **`bench/.env`'s `BENCH_SLC_VERSION` was stale** (`0.19.1`) vs. the crate's actual
+   `exasol-udf-sdk` (`0.20.1`) — `make bench` failed with `F-UDF-CL-RUST-9001: Fingerprint
+   mismatch`. Worked around with `BENCH_SLC_VERSION=0.20.1`; `secrets.sh`/`run.sh` defaults should
+   be bumped to track the crate's pinned SDK version going forward.
+2. **`import_ceiling.sh`'s file-harvest regex** assumed full per-file `s3://` URLs, but the
+   scan-spec-files-payload change (#48) made the report embed a `table_root` + paths *relative* to
+   it. Fixed in `bench/import_ceiling.sh` to reconstruct full URLs from both parts.
+3. **`bench/.env`'s engine-reader AWS creds clobbered `AWS_PROFILE`** in `athena_compare.sh` /
+   `spark_compare.sh` — sourcing `.env` exports `AWS_ACCESS_KEY_ID`/`SECRET` for the Glue/S3-only
+   `engine-reader` user (needed by the Exasol CONNECTION), which then shadows the operator's own
+   broader identity for `aws` CLI calls, causing `AccessDeniedException` on Athena/EMR Serverless
+   APIs. Fixed by unsetting those three vars right after sourcing `.env` in both scripts.
+4. **Trino data-dir permission**: the official `trinodb/trino` image runs as uid/gid 1000, but the
+   bind-mounted host directory was root-owned → `Permission denied: '/data/trino/var'` on startup.
+   Fixed in `trino-userdata.sh.tftpl` with `chown -R 1000:1000`.
+5. **Trino's Iceberg REST catalog config was invalid** — `iceberg.rest-catalog.security=SIGV4`
+   doesn't exist in Trino 465 (`IcebergRestCatalogConfig$Security` only has `NONE`/`OAUTH2`,
+   confirmed via `javap` on the connector jar). Switched to `iceberg.catalog.type=glue` (native AWS
+   Glue Data Catalog integration — no REST/SigV4 config needed at all, and it uses the same
+   instance-profile credential chain already in place).
+6. **Trino JVM heap too small**: the default `-Xmx8G` OOM'd on Q2's 3-way join over 180M lineitem
+   rows (`Query exceeded per-node memory limit of 2.40GB`). Bumped to `-Xmx24G` +
+   `query.max-memory-per-node=18GB` for the `r6i.xlarge` (30 GiB RAM) node.
+7. **`set -euo pipefail` in the three new compare scripts** aborted the whole run on a single
+   failing query instead of reporting `FAILED` and continuing (a `var=$(cmd)` assignment under
+   `-e` exits immediately on a nonzero `cmd`, before the script's own `rc=$?` check runs). Dropped
+   `-e` to match `bench/import_ceiling.sh`'s existing, deliberate convention.
+8. **EMR Serverless application creation needs `iam:CreateServiceLinkedRole`** for
+   `AWSServiceRoleForAmazonEMRServerless` — not covered by `emr-serverless:*` (a separate IAM
+   action namespace). Added a scoped statement to `deploy/iam/deployer-policy.json`.
+9. **EMR Serverless has no internet egress by default** — `spark.jars.packages` (Maven Central via
+   Ivy) timed out resolving `iceberg-spark-runtime-3.5_2.12`. Switched to the release's *locally
+   bundled* jar (`/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar`) and Spark's Iceberg
+   `GlueCatalog` impl (`catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog`) — the same
+   "talk to Glue directly, not via REST" pattern as the Trino fix above.
+10. **`emr_serverless_max_capacity` default (4 vCPU/16 GB) was too small even for one executor** —
+    every job failed with `ApplicationMaxCapacityExceededException`, zero executors ever allocated
+    (the driver alone consumes most of a 4 vCPU/16 GB ceiling). Bumped the default to 16 vCPU/64 GB
+    in `deploy/data-stack/variables.tf`. Also found: updating `maximumCapacity` (or deleting the
+    application) requires the app to be `STOPPED` first — documented in `deploy/README.md`'s
+    "Known seams".
+
+All fixes are on `feat/competitive-engine-benchmark` (PR #51).
+
+### Bugs found resizing Trino to a 2-node cluster (2026-07-03, second round)
+
+Converting `deploy/trino-stack/` from a single node to a real coordinator + worker cluster
+surfaced two more, both live-only:
+
+11. **A worker referencing the coordinator's `private_ip` from within the same `count`-based
+    `aws_instance` resource is a self-cycle for index 0** — Terraform's dependency graph sees the
+    static reference `aws_instance.trino[0]` inside the resource's own config and treats every
+    instance in that `count`, including index 0 itself, as depending on index 0 (a
+    `ternary`-conditioned expression doesn't change this — the graph is built from the referenced
+    addresses, not evaluated branches). Caught at `tofu validate`/`plan` time, not live, but
+    worth recording: split into separate `aws_instance.trino_coordinator` (singular) and
+    `aws_instance.trino_worker` (`count = node_count - 1`) resources instead — a worker
+    referencing a *different* resource's attribute is a normal, acyclic dependency.
+12. **Trino's `/v1/node` endpoint needs an `X-Trino-User` header** even with no authentication
+    configured (`curl -sf` alone gets `Basic authentication or X-Trino-User ... must be sent`),
+    **and it doesn't list the coordinator itself** — only nodes reached via the
+    announcement/discovery protocol. `trino-up.sh`'s readiness check was waiting on the wrong
+    count (`node_count`, unreachable since the coordinator never appears) with the wrong request
+    (no header, always failing). Fixed to add the header and wait on `node_count - 1` (workers
+    only) — the coordinator's own liveness is separately confirmed via `/v1/info`.
+
 ## Tuning levers & outlook
 
 The engine controls these regardless of where storage lives — apply them first:

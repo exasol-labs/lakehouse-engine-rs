@@ -292,3 +292,94 @@ resource "aws_instance" "datagen" {
 
   tags = { Name = "${local.prefix}-datagen" }
 }
+
+# --- Spark benchmark (EMR Serverless application, opt-in) -------------------
+# Gated by enable_emr_serverless (default false): the application resource itself is billed only
+# while a job runs (no idle EC2/EBS to reserve or leak), so it's kept as a persistent-but-free
+# catalog-adjacent resource here rather than a separate ephemeral stack — but still off by default
+# so nothing exists unless explicitly opted in.
+resource "aws_iam_role" "emr_serverless_job" {
+  count = var.enable_emr_serverless ? 1 : 0
+  name  = "${local.prefix}-emr-serverless-job-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "emr-serverless.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = { Name = "${local.prefix}-emr-serverless-job-role" }
+}
+
+resource "aws_iam_role_policy" "emr_serverless_job" {
+  count = var.enable_emr_serverless ? 1 : 0
+  name  = "${local.prefix}-emr-serverless-job-read"
+  role  = aws_iam_role.emr_serverless_job[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "GlueRead"
+        Effect = "Allow"
+        Action = [
+          "glue:GetCatalog",
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:GetPartition",
+          "glue:GetPartitions"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid      = "S3ReadWarehouse"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
+        Resource = [aws_s3_bucket.warehouse.arn, "${aws_s3_bucket.warehouse.arn}/*"]
+      },
+      {
+        Sid      = "S3Logs"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetObject"]
+        Resource = ["${aws_s3_bucket.warehouse.arn}/spark-logs/*"]
+      },
+      {
+        Sid      = "S3ScriptRead"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["${aws_s3_bucket.warehouse.arn}/scripts/*"]
+      }
+    ]
+  })
+}
+
+resource "aws_emrserverless_application" "spark" {
+  count         = var.enable_emr_serverless ? 1 : 0
+  name          = "${local.prefix}-spark"
+  release_label = "emr-7.1.0"
+  type          = "SPARK"
+
+  auto_start_configuration {
+    enabled = true
+  }
+  auto_stop_configuration {
+    enabled              = true
+    idle_timeout_minutes = var.emr_serverless_idle_timeout_minutes
+  }
+  maximum_capacity {
+    cpu    = "${var.emr_serverless_max_capacity}vCPU"
+    memory = "${var.emr_serverless_max_capacity * 4}GB"
+  }
+
+  tags = { Name = "${local.prefix}-spark" }
+}
+
+resource "aws_s3_object" "spark_queries" {
+  count  = var.enable_emr_serverless ? 1 : 0
+  bucket = aws_s3_bucket.warehouse.id
+  key    = "scripts/spark_queries.py"
+  source = "${path.module}/../scripts/spark_queries.py"
+  etag   = filemd5("${path.module}/../scripts/spark_queries.py")
+}
