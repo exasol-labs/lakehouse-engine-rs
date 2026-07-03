@@ -75,10 +75,66 @@ cd ../..        # repo root
 make bench       # builds .so, installs SLC + .so to BucketFS, runs Q1–Q4, writes bench/reports/
 ```
 
-Athena benchmark (same catalog): run queries against the `tpch` / `perf` databases in the
-`spot-strata-data-athena` workgroup, e.g. `SELECT count(*) FROM tpch.lineitem`.
+Athena benchmark (same catalog): `bench/athena_compare.sh` runs the Q1-Q4 set against the
+`spot-strata-<env>-athena` workgroup automatically (see `bench/README.md`); no infra to stand up.
 
-## 4. Tear down
+## 4. Competitive comparison (Athena / Trino / Spark, opt-in)
+
+Runs the same TPC-H tables/queries through the engines people put next to a lakehouse. See
+`bench/README.md`'s "Competitive engine comparison" section for the compare scripts themselves —
+this section covers standing up the Trino/Spark compute they need.
+
+### Trino (ephemeral, opt-in)
+
+A new OpenTofu stack, `deploy/trino-stack/`, mirroring `cluster-stack/`: a real coordinator +
+worker cluster running Trino in Docker, sized by `instance_type`/`node_count`
+(default `r8i.2xlarge` × 2 — matching an Exasol `test1` node's type and the cluster's node
+count, so Trino and lakehouse-engine-rs run on identical hardware). Its Iceberg connector uses
+`iceberg.catalog.type=glue` (talks to the Glue Data Catalog directly via the AWS SDK, not the
+REST endpoint the lakehouse engine uses) against the same S3 bucket, authenticated via an
+instance-profile role (no static keys). The coordinator also runs worker tasks
+(`node-scheduler.include-coordinator=true`), mirroring Exasol's every-node-executes model.
+
+```bash
+cd deploy/trino-stack && tofu init
+../scripts/trino-up.sh myenv    # tofu apply + wait for the coordinator + all workers to join
+export TRINO_HOST=<printed coordinator ip>
+cd ../.. && bench/trino_compare.sh
+../scripts/trino-down.sh myenv  # deploy/scripts/, from repo root: deploy/scripts/trino-down.sh myenv
+```
+
+> **Cost / teardown: these EC2 nodes bill while they exist — and `r8i.2xlarge` × 2 costs
+> meaningfully more than a single small box.** They are created ONLY by an explicit `trino-up.sh`
+> run — nothing else applies this stack — and MUST be torn down immediately after the benchmark
+> run with `trino-down.sh <env>`. There is no auto-stop. Verify via `aws ec2 describe-instances`
+> that both nodes actually terminated before considering a run done.
+
+### Spark / EMR Serverless (pay-per-job, opt-in)
+
+Rather than a persistent/ephemeral Spark cluster, Spark runs via **AWS EMR Serverless**: an
+application resource that costs nothing at rest and auto-stops after an idle job (no explicit
+teardown to forget). Added to `deploy/data-stack` behind a toggle, off by default:
+
+```bash
+cd deploy/data-stack
+tofu apply -var enable_emr_serverless=true    # creates the (idle, $0) EMR Serverless application
+
+export EMR_SERVERLESS_APP_ID=$(tofu output -raw emr_serverless_app_id)
+export EMR_SERVERLESS_ROLE_ARN=$(tofu output -raw emr_serverless_job_role_arn)
+export SPARK_SCRIPT_S3_URI=$(tofu output -raw spark_script_s3_uri)
+export SPARK_LOG_S3_URI=$(tofu output -raw emr_serverless_log_uri)
+cd ../.. && bench/spark_compare.sh
+```
+
+> **Cost / teardown: the application itself is free while idle** (billed only for vCPU/memory
+> while a job runs; `auto_stop_configuration` stops it after 15 idle minutes even if you forget).
+> To remove it entirely: `tofu apply -var enable_emr_serverless=false` in `data-stack`.
+
+> **One-time prerequisite:** the `spot-strata-deployer` policy needs an added `emr-serverless:*`
+> statement (already in `deploy/iam/deployer-policy.json` as of this PR) — bump the live policy
+> version once per account: see "Updating the policy" in `deploy/iam/SETUP.md`.
+
+## 5. Tear down
 
 ```bash
 cd deploy/cluster-stack && ../scripts/cluster-down.sh myenv   # destroy cluster, keep data
@@ -142,6 +198,13 @@ Two paths, by what the teammate actually needs:
   default credential chain.
 - **Glue interface VPC endpoint** is off (paid); the free S3 gateway endpoint is on. Add it if Glue
   API latency matters.
+- **EMR Serverless teardown needs a manual stop first** — `tofu apply -var
+  enable_emr_serverless=false` (or `=true` to resize `maximumCapacity`) fails with
+  `ValidationException: Application ... must be in [CREATED, STOPPED]` if the app auto-started for
+  a job and hasn't hit its idle timeout yet. Run `aws emr-serverless stop-application
+  --application-id <id>` (poll `get-application` for `STOPPED`) before re-applying. Found
+  live-verifying — the app costs nothing while `STARTED`-but-idle, so this only blocks the
+  Terraform operation, not billing.
 
 ## Files
 
@@ -149,6 +212,10 @@ Two paths, by what the teammate actually needs:
 deploy/
   iam/{deployer-policy.json, SETUP.md}
   data-stack/{providers,variables,main,outputs}.tf  datagen-userdata.sh.tftpl
+    # + EMR Serverless application (enable_emr_serverless, opt-in) for the Spark comparison
   cluster-stack/{providers,variables,main,outputs}.tf
-  scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh}
+  trino-stack/{providers,variables,main,outputs}.tf  trino-userdata.sh.tftpl
+    # ephemeral Trino cluster (coordinator + workers) for the competitive comparison (opt-in)
+  scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh,
+           trino-up.sh, trino-down.sh, spark_queries.py}
 ```
