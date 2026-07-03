@@ -107,10 +107,16 @@ impl ExaConn {
     }
 
     /// Execute SQL and return first column of first row as i64.
+    ///
+    /// A `DECIMAL` result comes back as a JSON string (e.g. `"3"`), not a JSON
+    /// number, so fall back to parsing a string — same tolerant approach as
+    /// `parse_int` in the E2E test files.
     pub fn query_scalar_i64(&mut self, sql: &str) -> i64 {
         let resp = self.execute(sql);
-        resp["responseData"]["results"][0]["resultSet"]["data"][0][0]
+        let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
+        value
             .as_i64()
+            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
             .unwrap_or_else(|| panic!("expected i64 scalar from:\n{sql}\n\nResponse: {resp}"))
     }
 
