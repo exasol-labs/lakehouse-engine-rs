@@ -23,6 +23,14 @@
       "Resource": "*"
     },
     {
+      "Sid": "EmrServerlessForSparkBenchmark",
+      "Effect": "Allow",
+      "Action": [
+        "emr-serverless:*"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "KmsForSsmSecureString",
       "Effect": "Allow",
       "Action": [

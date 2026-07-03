@@ -75,10 +75,59 @@ cd ../..        # repo root
 make bench       # builds .so, installs SLC + .so to BucketFS, runs Q1–Q4, writes bench/reports/
 ```
 
-Athena benchmark (same catalog): run queries against the `tpch` / `perf` databases in the
-`spot-strata-data-athena` workgroup, e.g. `SELECT count(*) FROM tpch.lineitem`.
+Athena benchmark (same catalog): `bench/athena_compare.sh` runs the Q1-Q4 set against the
+`spot-strata-<env>-athena` workgroup automatically (see `bench/README.md`); no infra to stand up.
 
-## 4. Tear down
+## 4. Competitive comparison (Athena / Trino / Spark, opt-in)
+
+Runs the same TPC-H tables/queries through the engines people put next to a lakehouse. See
+`bench/README.md`'s "Competitive engine comparison" section for the compare scripts themselves —
+this section covers standing up the Trino/Spark compute they need.
+
+### Trino (ephemeral, opt-in)
+
+A new OpenTofu stack, `deploy/trino-stack/`, mirroring `cluster-stack/`: a single EC2 node running
+Trino in Docker, its Iceberg connector pointed at the same Glue REST catalog + S3 bucket via an
+instance-profile role (no static keys).
+
+```bash
+cd deploy/trino-stack && tofu init
+../scripts/trino-up.sh myenv         # tofu apply + wait for Trino to answer /v1/info
+export TRINO_HOST=<printed ip>
+cd ../.. && bench/trino_compare.sh
+../scripts/trino-down.sh myenv       # deploy/scripts/, from repo root: deploy/scripts/trino-down.sh myenv
+```
+
+> **Cost / teardown: this EC2 node bills while it exists.** It is created ONLY by an explicit
+> `trino-up.sh` run — nothing else applies this stack — and must be torn down explicitly with
+> `trino-down.sh <env>` when you're done benchmarking. There is no auto-stop.
+
+### Spark / EMR Serverless (pay-per-job, opt-in)
+
+Rather than a persistent/ephemeral Spark cluster, Spark runs via **AWS EMR Serverless**: an
+application resource that costs nothing at rest and auto-stops after an idle job (no explicit
+teardown to forget). Added to `deploy/data-stack` behind a toggle, off by default:
+
+```bash
+cd deploy/data-stack
+tofu apply -var enable_emr_serverless=true    # creates the (idle, $0) EMR Serverless application
+
+export EMR_SERVERLESS_APP_ID=$(tofu output -raw emr_serverless_app_id)
+export EMR_SERVERLESS_ROLE_ARN=$(tofu output -raw emr_serverless_job_role_arn)
+export SPARK_SCRIPT_S3_URI=$(tofu output -raw spark_script_s3_uri)
+export SPARK_LOG_S3_URI=$(tofu output -raw emr_serverless_log_uri)
+cd ../.. && bench/spark_compare.sh
+```
+
+> **Cost / teardown: the application itself is free while idle** (billed only for vCPU/memory
+> while a job runs; `auto_stop_configuration` stops it after 15 idle minutes even if you forget).
+> To remove it entirely: `tofu apply -var enable_emr_serverless=false` in `data-stack`.
+
+> **One-time prerequisite:** the `spot-strata-deployer` policy needs an added `emr-serverless:*`
+> statement (already in `deploy/iam/deployer-policy.json` as of this PR) — bump the live policy
+> version once per account: see "Updating the policy" in `deploy/iam/SETUP.md`.
+
+## 5. Tear down
 
 ```bash
 cd deploy/cluster-stack && ../scripts/cluster-down.sh myenv   # destroy cluster, keep data
@@ -149,6 +198,10 @@ Two paths, by what the teammate actually needs:
 deploy/
   iam/{deployer-policy.json, SETUP.md}
   data-stack/{providers,variables,main,outputs}.tf  datagen-userdata.sh.tftpl
+    # + EMR Serverless application (enable_emr_serverless, opt-in) for the Spark comparison
   cluster-stack/{providers,variables,main,outputs}.tf
-  scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh}
+  trino-stack/{providers,variables,main,outputs}.tf  trino-userdata.sh.tftpl
+    # ephemeral single-node Trino for the competitive comparison (opt-in)
+  scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh,
+           trino-up.sh, trino-down.sh, spark_queries.py}
 ```

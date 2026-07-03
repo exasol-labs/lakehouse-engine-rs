@@ -58,3 +58,21 @@ output "datagen_public_ip" {
   value       = var.run_data_gen ? aws_instance.datagen[0].public_ip : null
   description = "SSH here to tail /var/log/datagen.log while loading (key_pair_name required)."
 }
+
+output "emr_serverless_app_id" {
+  value       = var.enable_emr_serverless ? aws_emrserverless_application.spark[0].id : null
+  description = "null unless enable_emr_serverless=true — bench/spark_compare.sh no-ops without it."
+}
+
+output "emr_serverless_job_role_arn" {
+  value = var.enable_emr_serverless ? aws_iam_role.emr_serverless_job[0].arn : null
+}
+
+output "emr_serverless_log_uri" {
+  value       = var.enable_emr_serverless ? "s3://${aws_s3_bucket.warehouse.bucket}/spark-logs" : null
+  description = "EMR Serverless job driver logs land under <this>/applications/<app-id>/jobs/<job-run-id>/SPARK_DRIVER/."
+}
+
+output "spark_script_s3_uri" {
+  value = var.enable_emr_serverless ? "s3://${aws_s3_bucket.warehouse.bucket}/${aws_s3_object.spark_queries[0].key}" : null
+}
