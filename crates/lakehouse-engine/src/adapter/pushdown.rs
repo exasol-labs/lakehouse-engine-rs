@@ -700,7 +700,7 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<AggregatePlan>> {
 /// user's `selectList` order for any interleaving of keys and aggregates. Exasol
 /// validates the outer wrapper SELECT positionally against `selectListDataTypes`,
 /// so this order must be preserved end-to-end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupedSelectItem {
     /// A group-key projection. `group_key_slot` indexes `group_keys` (and the
     /// scan-side `GK_{slot}` EMITS column); `select_index` is the item's original
@@ -715,13 +715,26 @@ pub enum GroupedSelectItem {
         plan_slot: usize,
         select_index: usize,
     },
+    /// A constant/literal projection placeholder (Exasol's "count the groups"
+    /// rewrite: a `selectList` composed only of a `literal_null` when the outer
+    /// query needs the row-per-group shape but not the inner values). It
+    /// contributes NO aggregate plan, so the grouped scan emits one row per
+    /// distinct group. `projection` is the ready-to-emit outer-wrapper SELECT
+    /// expression (the rendered literal, cast to its declared Exasol type — e.g.
+    /// `CAST(NULL AS BOOLEAN)`), never a bare literal reused as a column
+    /// identifier. `select_index` is the item's original `selectList` ordinal.
+    Constant {
+        select_index: usize,
+        projection: String,
+    },
 }
 
 /// The original `selectList` ordinal of a classified item.
 fn select_item_index(item: &GroupedSelectItem) -> usize {
-    match *item {
+    match item {
         GroupedSelectItem::GroupKey { select_index, .. }
-        | GroupedSelectItem::Aggregate { select_index, .. } => select_index,
+        | GroupedSelectItem::Aggregate { select_index, .. }
+        | GroupedSelectItem::Constant { select_index, .. } => *select_index,
     }
 }
 
@@ -739,6 +752,53 @@ pub struct GroupedAggregateDetection {
     pub plans: Vec<AggregatePlan>,
     /// One entry per `selectList` item, in `selectList` order.
     pub select_items: Vec<GroupedSelectItem>,
+}
+
+/// Build the outer-wrapper SELECT expression for a constant/literal `selectList`
+/// item, cast to the Exasol type Exasol declared for that ordinal.
+///
+/// `rendered` is the literal already rendered to SQL (e.g. `NULL`, `'x'`, `5`).
+/// The result is placed in the outer wrapper SELECT (`SELECT <expr> FROM (...)
+/// GROUP BY GK_*`), so it must be a self-contained expression, never a column
+/// reference. Casting to the declared type keeps the pushdown output column type
+/// matching what Exasol validates positionally against `selectListDataTypes`
+/// (mirrors the group-key and aggregate cast discipline); the cast is skipped for
+/// the `VARCHAR(2000000)` default, matching `group_key_exasol_types`.
+fn constant_projection_sql(pushdown_req: &Json, select_index: usize, rendered: &str) -> String {
+    let declared = pushdown_req
+        .get("selectListDataTypes")
+        .and_then(|v| v.as_array())
+        .and_then(|d| d.get(select_index))
+        .map(exasol_type_from_json);
+    match declared {
+        Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({rendered} AS {ty})"),
+        _ => rendered.to_string(),
+    }
+}
+
+/// `selectList` item types that render to a bare literal value rather than a
+/// source column or a translatable scan-side expression.
+///
+/// Shared by `detect_group_by_aggregates` (classifies these as
+/// `GroupedSelectItem::Constant`, per its doc comment above) and
+/// `extract_projection` (routes these to the full-row fallback) so the two
+/// call sites can never drift apart again (issue #52: `literal_bool` was
+/// missing from one of the two copy-pasted lists).
+const LITERAL_SELECTLIST_TYPES: &[&str] = &[
+    "literal_null",
+    "literal_bool",
+    "literal_string",
+    "literal_exactnumeric",
+    "literal_double",
+    "literal_date",
+    "literal_timestamp",
+    "literal_timestamp_utc",
+];
+
+/// Whether a `selectList` item's `type` is a bare literal (see
+/// `LITERAL_SELECTLIST_TYPES`).
+fn is_literal_selectlist_item(item_type: &str) -> bool {
+    LITERAL_SELECTLIST_TYPES.contains(&item_type)
 }
 
 /// Detect a GROUP BY aggregate pushdown and return the rendered group-key SQL
@@ -798,6 +858,17 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                 select_items.push(GroupedSelectItem::Aggregate {
                     plan_slot,
                     select_index,
+                });
+            }
+            t if is_literal_selectlist_item(t) => {
+                // A bare literal is a constant projection, not a group-key
+                // reference — see the `Constant` variant's doc comment above
+                // for the "count the groups" rationale.
+                let rendered = render_expression(item).ok()?;
+                let projection = constant_projection_sql(pushdown_req, select_index, &rendered);
+                select_items.push(GroupedSelectItem::Constant {
+                    select_index,
+                    projection,
                 });
             }
             _ => {
@@ -1195,11 +1266,15 @@ pub fn build_grouped_aggregate_scan_sql(
     ordered.sort_by_key(select_item_index);
     let outer_select: Vec<String> = ordered
         .iter()
-        .filter_map(|item| match *item {
+        .filter_map(|item| match item {
             GroupedSelectItem::GroupKey { group_key_slot, .. } => {
-                gk_select.get(group_key_slot).cloned()
+                gk_select.get(*group_key_slot).cloned()
             }
-            GroupedSelectItem::Aggregate { plan_slot, .. } => merge_items.get(plan_slot).cloned(),
+            GroupedSelectItem::Aggregate { plan_slot, .. } => merge_items.get(*plan_slot).cloned(),
+            // A constant placeholder projects its own pre-rendered, type-cast
+            // expression (e.g. `CAST(NULL AS BOOLEAN)`); one row survives per
+            // distinct group via the outer `GROUP BY GK_*`.
+            GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
         })
         .collect();
     let outer_select_str = outer_select.join(", ");
@@ -2460,6 +2535,18 @@ fn extract_projection(
                         names.push(name);
                         types.push(ty);
                     }
+                    t if is_literal_selectlist_item(t) => {
+                        // A bare literal is NOT a projectable source column. Its
+                        // rendered SQL (e.g. `NULL`, `'x'`, `5`) is an expression,
+                        // never a column identifier — pushing it into the row-scan
+                        // projection would later be quoted as a phantom EMITS column
+                        // name (`"NULL"`) that DataFusion rejects (issue #52). The
+                        // grouped "count the groups" shape is handled correctly in
+                        // detect_group_by_aggregates; this is the row-scan backstop:
+                        // fall back to the full base row so Exasol post-processes the
+                        // literal projection itself.
+                        needs_full_fallback = true;
+                    }
                     "function_scalar"
                     | "predicate_equal"
                     | "predicate_less"
@@ -2467,14 +2554,7 @@ fn extract_projection(
                     | "predicate_like"
                     | "predicate_and"
                     | "predicate_or"
-                    | "predicate_not"
-                    | "literal_string"
-                    | "literal_exactnumeric"
-                    | "literal_double"
-                    | "literal_null"
-                    | "literal_date"
-                    | "literal_timestamp"
-                    | "literal_timestamp_utc" => {
+                    | "predicate_not" => {
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
@@ -4340,6 +4420,151 @@ mod tests {
         assert!(
             detect_group_by_aggregates(&req).is_none(),
             "non-aggregate non-column in selectList must fall back"
+        );
+    }
+
+    /// Issue #52 regression guard (decision-log entry [4]): the exact composed
+    /// `pushdownRequest` Exasol emits for
+    /// `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM EVENTS GROUP BY id) t`
+    /// — a real `groupBy` but a `selectList` of only a `literal_null` placeholder
+    /// (Exasol's "count the groups" rewrite: the outer query needs only the
+    /// per-group row count, not the inner values). Fed verbatim (including the
+    /// `from`/`type`/`columnNr`/`tableName` fields the detection path ignores,
+    /// to prove they don't perturb parsing) from the spike's captured JSON.
+    ///
+    /// Detection must preserve the GROUP BY (return `Some` with real group keys
+    /// and NO aggregate plan) instead of falling back to a row scan — a row-scan
+    /// fallback returns one row per source row, not per group, which is only
+    /// accidentally correct when the group column happens to be unique (see
+    /// decision-log entry [4]'s caveat). The rendered scan SQL must never
+    /// reference a phantom `"NULL"` column identifier and must retain a real
+    /// `GROUP BY` clause.
+    #[test]
+    fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "from": { "name": "EVENTS", "type": "table" },
+            "groupBy": [
+                { "columnNr": 0, "name": "ID", "tableName": "EVENTS", "type": "column" }
+            ],
+            "selectList": [ { "type": "literal_null" } ],
+            "selectListDataTypes": [ { "type": "BOOLEAN" } ],
+            "type": "select"
+        });
+        let result = detect_group_by_aggregates(&req).expect(
+            "composed literal-only selectList must preserve GROUP BY, not fall back to row scan",
+        );
+        assert_eq!(result.group_keys.len(), 1, "one group key from groupBy");
+        assert!(
+            result.group_keys[0].contains("ID"),
+            "group key must reference ID: {:?}",
+            result.group_keys[0]
+        );
+        assert!(
+            result.plans.is_empty(),
+            "a literal placeholder contributes no aggregate plan"
+        );
+        assert!(
+            matches!(
+                result.select_items.as_slice(),
+                [GroupedSelectItem::Constant {
+                    select_index: 0,
+                    ..
+                }]
+            ),
+            "the literal_null item must classify as a Constant: {:?}",
+            result.select_items
+        );
+
+        // The generated grouped scan SQL must group by GK_0 and must never
+        // reference a phantom "NULL" column identifier.
+        let group_key_types =
+            group_key_exasol_types(&req, &result.group_keys, &result.select_items);
+        let sql = build_grouped_aggregate_scan_sql(
+            &ScanSpec {
+                table_root: String::new(),
+                files: vec![],
+                projection: vec![],
+                filter: None,
+                limit: None,
+                aggregates: Some(result.plans.clone()),
+                group_keys: Some(result.group_keys.clone()),
+                emit_exa_types: Vec::new(),
+                logical_schema: Vec::new(),
+                storage: sample_storage(),
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            },
+            &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
+            &result.group_keys,
+            &group_key_types,
+            &result.plans,
+            &[],
+            &result.select_items,
+            None,
+            &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+            SCAN_UDF_NAME,
+            None,
+        );
+        assert!(
+            !sql.contains(r#""NULL""#),
+            "grouped scan SQL must not reference a phantom \"NULL\" identifier: {sql}"
+        );
+        assert!(
+            sql.contains(r#"GROUP BY "GK_0""#),
+            "outer wrapper must group by GK_0 to yield one row per distinct group: {sql}"
+        );
+        // The constant placeholder projects a typed literal (declared BOOLEAN),
+        // not an empty select list and not a bare-literal column reference.
+        assert!(
+            sql.contains("SELECT CAST(NULL AS BOOLEAN) FROM"),
+            "outer wrapper must project the type-cast constant placeholder: {sql}"
+        );
+    }
+
+    /// Code-review follow-up on issue #52: `literal_bool` was missing from the
+    /// literal-type set used to classify grouped `selectList` constants (only
+    /// `literal_null` and six other literal kinds were listed, and the
+    /// renderer in `vs-expression` supports `literal_bool` — see
+    /// `render_expression`). A boolean literal placeholder in a grouped
+    /// selectList (e.g. `SELECT k, TRUE AS flag, COUNT(*) FROM t GROUP BY k`)
+    /// used to fall through to the group-key-matching `_` arm, fail to match
+    /// any group key, and abort the ENTIRE grouped-aggregate detection to
+    /// `None` — exactly the bug class the `literal_null` case guards against,
+    /// just for `literal_bool`. `LITERAL_SELECTLIST_TYPES` closes this gap.
+    #[test]
+    fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                {"type": "literal_bool", "value": true},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([
+                decimal_type(20, 0),
+                serde_json::json!({"type": "boolean"}),
+                decimal_type(20, 0),
+            ]),
+        );
+        let result = detect_group_by_aggregates(&req).expect(
+            "a literal_bool selectList item must classify as Constant, not abort detection to None",
+        );
+        assert!(
+            matches!(
+                result.select_items[1],
+                GroupedSelectItem::Constant {
+                    select_index: 1,
+                    ..
+                }
+            ),
+            "the literal_bool item must classify as a Constant, not fall through \
+             to the group-key arm: {:?}",
+            result.select_items
         );
     }
 
