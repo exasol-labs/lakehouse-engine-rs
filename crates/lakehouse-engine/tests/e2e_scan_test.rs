@@ -1815,9 +1815,7 @@ fn test_group_by_multi_key_having_limit() {
         ((3, 1), 130.0),
     ];
 
-    for (i, ((k1_raw, k2_raw), sum_raw)) in
-        cols[0].iter().zip(&cols[1]).zip(&cols[2]).enumerate()
-    {
+    for (i, ((k1_raw, k2_raw), sum_raw)) in cols[0].iter().zip(&cols[1]).zip(&cols[2]).enumerate() {
         let k1 = parse_int(k1_raw);
         let k2 = parse_int(k2_raw);
         let sum = parse_numeric(sum_raw);
