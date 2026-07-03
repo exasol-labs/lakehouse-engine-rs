@@ -13,7 +13,7 @@ duplicate-key tables).
 - [x] 2. Root-cause write-up + fix-family selection (formalize against decision-log entry [4]).
 
 ## Phase 2: Implementation (Group C)
-- [ ] 3. Implement the behavioral fix (family (a): preserve GROUP BY for literal-only selectList). [expert]
+- [x] 3. Implement the behavioral fix (family (a): preserve GROUP BY for literal-only selectList). [expert]
 
 ## Phase 2: Implementation (Group D)
 - [ ] 4. Host unit test for the composed-request guard.
