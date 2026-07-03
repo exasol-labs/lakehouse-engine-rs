@@ -155,6 +155,95 @@ case-sensitive quoted column identifier, finds no such field, and raises
 
 - **Promotes to ADR:** yes
 
+### [4a] Formalized edit spec for fix family (a) (Task 2, 2026-07-03)
+
+Re-verified entry [4]'s line references directly against the current tree on
+`fix/nested-aggregate-pushdown-spike` (unchanged since the spike; no drift).
+This entry turns the recommendation into an actionable, unambiguous edit spec
+for Task 3.
+
+- **Selected fix family: (a) correct-parsing.** Confirmed, not re-derived — see
+  entry [4] for the full root-cause trace. Family (b) (tighten the guard to
+  fall back to row-scan) is **explicitly rejected**: it returns one row per
+  **source row**, not per group. It is only accidentally correct on the seeded
+  `events` table because `id` is unique there (20 rows = 20 groups); on any
+  table with duplicate group-key values (e.g. TPC-H `LINEITEM.L_ORDERKEY`, the
+  shape in issue #52, or `GROUP BY MOD(id,4)` over `events`) it silently
+  returns the raw row count instead of the distinct-group count — a wrong
+  `COUNT(*)` with no error raised. Exasol has already committed to the
+  group-by pushdown capability for this request and will not re-group the
+  VS's row-scan output itself, so the VS is the only place grouping can be
+  preserved.
+
+- **Primary edit target: `detect_group_by_aggregates`,
+  `crates/lakehouse-engine/src/adapter/pushdown.rs`, non-aggregate arm at
+  lines 803-816** (verified current — unchanged from entry [4]'s estimate;
+  full function starts at line 762). Concretely, the `_ => { ... }` arm
+  (803-816) currently requires every non-aggregate `selectList` item to
+  render to SQL matching one of the rendered `group_keys` (line 809-811:
+  `render_expression(item).ok().and_then(|sql| group_keys.iter().position(|gk| *gk == sql))?`);
+  a `literal_null` item renders to bare `NULL`, matches no group key, and the
+  `?` aborts detection for the whole request with `None`.
+
+  **Edit shape:** before (or as a first branch of) that group-key-match
+  check, special-case `item_type == "literal_null"` (and, for robustness,
+  any other bare-literal select-list item that carries no column/aggregate
+  identity — a "count the groups" constant placeholder) as a **third
+  `GroupedSelectItem` case** (e.g. `GroupedSelectItem::Constant { select_index
+  }`, alongside the existing `Aggregate` and `GroupKey` variants) rather than
+  forcing it through the group-key-match path. This item contributes **no**
+  `AggregatePlan` to `plans` (so `plans` may end up empty — a request with
+  *only* a literal placeholder and no real aggregate is exactly the "count
+  the groups" shape) and does not require `render_expression` to match a
+  group key. The rest of `detect_group_by_aggregates` (the `groupBy` array
+  processing at lines 767-780, the `Some(GroupedAggregateDetection { ... })`
+  return at the end) is unchanged and continues to drive the existing
+  grouped-scan builder, which already groups by `group_keys` and renders one
+  row per group — with an empty `plans` list this yields exactly one row per
+  distinct group, which is what Exasol's outer `COUNT(*)` needs to count
+  correctly. (Downstream consumers of `GroupedAggregateDetection` —
+  `select_items` renderers in `pushdown.rs` / `scan/mod.rs` — will need a
+  render arm for the new `Constant` variant analogous to the existing
+  `GroupKey`/`Aggregate` arms, e.g. project the first group key or a literal
+  `0`/`NULL` placeholder column; exact projection choice is an implementation
+  detail for Task 3 as long as it is a real, schema-present column or a
+  literal Exasol accepts in an `EMITS` clause, i.e. NOT the bare rendered
+  `NULL` expression string reused as a column identifier.)
+
+- **Defence-in-depth guard: `extract_projection`,
+  `crates/lakehouse-engine/src/adapter/pushdown.rs`, literal-item match arm at
+  lines 2463-2477 (the `"literal_null"` case is listed at line 2474), row-scan
+  projection push at line 2481.** Verified current — unchanged from entry
+  [4]'s estimate; `extract_projection` itself starts at line 2376. Confirmed:
+  on this path, `render_expression_safe(e)` (line 2479) can return
+  `Some("NULL")` for a `literal_null` item, and line 2481
+  (`names.push(sql_frag)`) unconditionally pushes that rendered *expression
+  string* into `names`, which is later used both as a bare row-scan
+  projection column name and as the `EMITS` identifier
+  (`scan/mod.rs:998-1013` quotes it via `quote_ident`). This is exactly the
+  `"NULL"` phantom-identifier defect from entry [4], reachable independently
+  of the primary fix whenever a `literal_null` (or a rendered expression that
+  is not a real column) survives to the row-scan fallback branch — e.g. a
+  future request shape that reaches `extract_projection` without first being
+  caught by the primary fix above. **Recommended hardening:** treat
+  `"literal_null"` (and any other pure-literal type in this match arm whose
+  rendered SQL cannot plausibly be a column identifier) as a case that sets
+  `needs_full_fallback = true` (mirroring the existing `_ => { needs_full_fallback
+  = true }` arm at lines 2493-2496) instead of pushing the rendered literal
+  into `names` as a column name. This is a backstop, not the primary fix — it
+  prevents a future *row-scan* path from re-introducing the same phantom-
+  identifier crash; it does not by itself restore correct grouped `COUNT(*)`
+  semantics, which requires the primary edit above.
+
+- **Scope confirmation:** no changes required in `adapter/mod.rs` (its flat
+  `involvedTables[0].name` / top-level `selectList`/`groupBy`/`filter` reads
+  are already correct per entry [1] — there is no nested-subquery request to
+  parse) or in `scan/mod.rs::build_scan_sql` (it correctly renders whatever
+  `ScanSpec` it is given; the defect is entirely in how `pushdown.rs` builds
+  that `ScanSpec` from the captured request).
+
+- **Promotes to ADR:** no (elaborates entry [4], which already promotes to ADR)
+
 ### [5] Local-Docker E2E is the required repro/verification environment
 
 - **Decision:** Reproduce and verify entirely on the local Exasol Docker + Iceberg/MinIO E2E stack; no live-cluster re-verification step by default.
