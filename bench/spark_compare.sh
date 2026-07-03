@@ -9,10 +9,17 @@
 # prints "elapsed: <name> <secs>s" per query to its driver stdout log, which this script scrapes.
 #
 #   EMR_SERVERLESS_APP_ID=... EMR_SERVERLESS_ROLE_ARN=... SPARK_SCRIPT_S3_URI=... \
-#   SPARK_LOG_S3_URI=... AWS_REGION=... ./spark_compare.sh
-set -euo pipefail
+#   SPARK_LOG_S3_URI=... ./spark_compare.sh
+# No -e for the same reason as athena_compare.sh/trino_compare.sh: a failing AWS CLI call must be
+# caught by its own error handling below, not abort the script — required vars are still guarded
+# by the `:` checks above, which DO need to hard-stop, so keep pipefail but drop -e.
+set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] && { set -a; . bench/.env; set +a; }
+# bench/.env's AWS_ACCESS_KEY_ID/SECRET are the scoped engine-reader creds (Glue+S3 read only,
+# for the Exasol CONNECTION) — they have no emr-serverless:* permissions. Unset them so the `aws`
+# CLI falls back to AWS_PROFILE / the default credential chain (the operator's own broader identity).
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 if [ -z "${EMR_SERVERLESS_APP_ID:-}" ]; then
   echo "SKIP: EMR_SERVERLESS_APP_ID not set (apply data-stack with -var enable_emr_serverless=true first)"
@@ -21,16 +28,19 @@ fi
 : "${EMR_SERVERLESS_ROLE_ARN:?set EMR_SERVERLESS_ROLE_ARN (tofu output emr_serverless_job_role_arn)}"
 : "${SPARK_SCRIPT_S3_URI:?set SPARK_SCRIPT_S3_URI (tofu output spark_script_s3_uri)}"
 : "${SPARK_LOG_S3_URI:?set SPARK_LOG_S3_URI (tofu output emr_serverless_log_uri)}"
-: "${GLUE_CATALOG_URI:?set GLUE_CATALOG_URI}"
-: "${GLUE_WAREHOUSE:?set GLUE_WAREHOUSE}"
-: "${AWS_REGION:?set AWS_REGION}"
+# The Iceberg GlueCatalog impl just needs the S3 root Glue tables live under — derived from the
+# script's own bucket, never hardcoded, same "derive don't hardcode" convention as import_ceiling.sh.
+WAREHOUSE_S3_URI="s3://$(printf '%s' "$SPARK_SCRIPT_S3_URI" | sed -E 's#^s3://([^/]+)/.*#\1#')/"
 
 REPORT="${1:-bench/reports/spark-compare-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
 
+# EMR Serverless jobs have no internet egress by default, so spark.jars.packages (Maven-central
+# fetch via Ivy) times out — found live-verifying. Use the release's LOCALLY bundled Iceberg jar
+# instead (per AWS docs: /usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar).
 JOB_DRIVER=$(cat <<EOF
-{"sparkSubmit":{"entryPoint":"${SPARK_SCRIPT_S3_URI}","entryPointArguments":["${GLUE_CATALOG_URI}","${GLUE_WAREHOUSE}","${AWS_REGION}"],"sparkSubmitParameters":"--conf spark.executor.cores=2 --conf spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"}}
+{"sparkSubmit":{"entryPoint":"${SPARK_SCRIPT_S3_URI}","entryPointArguments":["${WAREHOUSE_S3_URI}"],"sparkSubmitParameters":"--conf spark.executor.cores=2 --conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"}}
 EOF
 )
 CONFIG_OVERRIDES=$(cat <<EOF

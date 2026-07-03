@@ -8,8 +8,6 @@ locals {
   subnet_id  = data.terraform_remote_state.data.outputs.subnet_id
   bucket     = data.terraform_remote_state.data.outputs.bucket
   bucket_arn = "arn:aws:s3:::${local.bucket}"
-  glue_uri   = data.terraform_remote_state.data.outputs.glue_uri
-  glue_wh    = data.terraform_remote_state.data.outputs.glue_warehouse
 
   # Ingress allowlist: explicit var, else this machine's public IP /32 (resolved at apply).
   my_ip_cidr      = "${chomp(data.http.my_ip.response_body)}/32"
@@ -128,8 +126,6 @@ resource "aws_instance" "trino" {
 
   user_data = templatefile("${path.module}/trino-userdata.sh.tftpl", {
     trino_image = var.trino_image_tag
-    glue_uri    = local.glue_uri
-    glue_wh     = local.glue_wh
     region      = var.region
   })
 

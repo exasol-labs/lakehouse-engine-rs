@@ -95,8 +95,8 @@ variable "emr_serverless_idle_timeout_minutes" {
 
 variable "emr_serverless_max_capacity" {
   type        = number
-  default     = 4
-  description = "Max vCPU for the application's driver+executors (memory scales as 4x this, in GB)."
+  default     = 16
+  description = "Max vCPU for the application's driver+executors COMBINED (memory scales as 4x this, in GB). Found live-verifying: the default must cover the driver's own allocation (~2 vCPU/8 GB) plus at least one executor, or every job fails with ApplicationMaxCapacityExceededException and zero executors are ever allocated — 4 (the original default) was too small even for a single minimal executor."
 }
 
 # --- exa:* tag values -------------------------------------------------------

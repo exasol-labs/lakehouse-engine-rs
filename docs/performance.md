@@ -164,12 +164,14 @@ run where the VS aggregate path was competitive with native IMPORT.
 
 ## Competitive engine comparison
 
-**Status: methodology only — no results recorded yet.** Run `bench/compare_all.sh` against a
-live cluster and fill in the table below; do not fabricate numbers here.
+**Status: live-verified 2026-07-03 against `test1`** (2-node Exasol cluster, 180M-row `lineitem`,
+60 files, same Glue catalog + S3 data for every engine below). Run individually per
+`bench/README.md`, not yet via a single `bench/compare_all.sh` pass (each engine was run/tuned
+separately during first-time live verification — see bug list below).
 
 Beyond the native `IMPORT` ceiling above, the same TPC-H tables and the same four queries
 (`bench/run.sh` Q1-Q4, lines ~321-349) are run through the lakehouse engines people put next to a
-lakehouse today, all reading the SAME Glue Iceberg REST catalog + S3 data:
+lakehouse today, all reading the SAME Glue Iceberg catalog + S3 data:
 
 - **AWS Athena** (`bench/athena_compare.sh`) — serverless, no infra to stand up; timed via the
   Athena API's `Statistics.EngineExecutionTimeInMillis` (engine time only, excludes queue wait).
@@ -184,13 +186,73 @@ lakehouse today, all reading the SAME Glue Iceberg REST catalog + S3 data:
 `bench/compare_all.sh` runs all of the above (skipping Trino/Spark cleanly if not provisioned)
 and aggregates every engine's timings into one report with a summary table.
 
-| Engine | Q1 | Q2 | Q3 | Q4 | Notes |
+| Engine | Q1 (wiring) | Q2 (3-way join) | Q3 (filter+groupby) | Q4 (pricing summary) | Notes |
 |---|---|---|---|---|---|
-| lakehouse-engine-rs | TBD | TBD | TBD | TBD | `bench/compare_all.sh` |
-| Native `IMPORT` | — | — | — | TBD | scan-only ceiling, see above |
-| AWS Athena | TBD | TBD | TBD | TBD | |
-| Trino | TBD | TBD | TBD | TBD | |
-| Spark (EMR Serverless) | TBD | TBD | TBD | TBD | includes EMR Serverless cold-start |
+| **lakehouse-engine-rs** | **1.97 s** | **18.30 s** | **15.67 s** | **19.80 s** | `make bench`, `NR_OF_CORES=8`, `PARALLELISM_FACTOR=8` |
+| AWS Athena | 1.54 s | 3.22 s | 1.79 s | 2.81 s | Engine execution time (excludes queue wait); managed, no infra sizing |
+| Trino | 8.13 s | 35.48 s | 20.29 s | 13.24 s | Single `r6i.xlarge` node (4 vCPU/32 GB), no cluster fan-out — smallest apples-to-apples box, not tuned for scale |
+| Spark (EMR Serverless) | 15.77 s | 43.97 s | 32.51 s | 22.80 s | Cold-started application (16 vCPU/64 GB max capacity); includes per-job executor allocation, not just query time |
+
+Native `IMPORT` (goal ceiling, not a competing "engine"): scan-only `COUNT(*)` ~28.8–30.9 s vs. the
+VS's metadata-pushdown ~0.8–2.0 s; full materialization native `IMPORT INTO` ~80.4–81.0 s vs. VS
+`CREATE TABLE AS SELECT *` ~124.5–125.2 s (see [Larger-scale validation](#larger-scale-validation-180m-row-lineitem-60-files) above — same numbers, this run reproduced them).
+
+**Reading these numbers**: this is a first apples-to-apples pass, not a tuned bake-off — Athena is
+fully managed/no sizing choice, Trino ran on the smallest reasonable single node (no multi-node
+fan-out, unlike the 2-node Exasol cluster), and the EMR Serverless numbers include a per-job
+executor-allocation delay that a long-running cluster wouldn't pay. lakehouse-engine-rs comes out
+fastest on the two heaviest queries (Q2, Q3) despite running on modest 2-node hardware, and within
+range of Athena (the only other engine with zero infra-sizing decisions) on all four. Re-run with
+matched hardware/sizing before drawing stronger conclusions.
+
+### Bugs found and fixed during first live verification (2026-07-03)
+
+Standing up the Athena/Trino/Spark comparison against a real cluster for the first time surfaced
+ten real bugs — none were visible from code review or `tofu validate` alone:
+
+1. **`bench/.env`'s `BENCH_SLC_VERSION` was stale** (`0.19.1`) vs. the crate's actual
+   `exasol-udf-sdk` (`0.20.1`) — `make bench` failed with `F-UDF-CL-RUST-9001: Fingerprint
+   mismatch`. Worked around with `BENCH_SLC_VERSION=0.20.1`; `secrets.sh`/`run.sh` defaults should
+   be bumped to track the crate's pinned SDK version going forward.
+2. **`import_ceiling.sh`'s file-harvest regex** assumed full per-file `s3://` URLs, but the
+   scan-spec-files-payload change (#48) made the report embed a `table_root` + paths *relative* to
+   it. Fixed in `bench/import_ceiling.sh` to reconstruct full URLs from both parts.
+3. **`bench/.env`'s engine-reader AWS creds clobbered `AWS_PROFILE`** in `athena_compare.sh` /
+   `spark_compare.sh` — sourcing `.env` exports `AWS_ACCESS_KEY_ID`/`SECRET` for the Glue/S3-only
+   `engine-reader` user (needed by the Exasol CONNECTION), which then shadows the operator's own
+   broader identity for `aws` CLI calls, causing `AccessDeniedException` on Athena/EMR Serverless
+   APIs. Fixed by unsetting those three vars right after sourcing `.env` in both scripts.
+4. **Trino data-dir permission**: the official `trinodb/trino` image runs as uid/gid 1000, but the
+   bind-mounted host directory was root-owned → `Permission denied: '/data/trino/var'` on startup.
+   Fixed in `trino-userdata.sh.tftpl` with `chown -R 1000:1000`.
+5. **Trino's Iceberg REST catalog config was invalid** — `iceberg.rest-catalog.security=SIGV4`
+   doesn't exist in Trino 465 (`IcebergRestCatalogConfig$Security` only has `NONE`/`OAUTH2`,
+   confirmed via `javap` on the connector jar). Switched to `iceberg.catalog.type=glue` (native AWS
+   Glue Data Catalog integration — no REST/SigV4 config needed at all, and it uses the same
+   instance-profile credential chain already in place).
+6. **Trino JVM heap too small**: the default `-Xmx8G` OOM'd on Q2's 3-way join over 180M lineitem
+   rows (`Query exceeded per-node memory limit of 2.40GB`). Bumped to `-Xmx24G` +
+   `query.max-memory-per-node=18GB` for the `r6i.xlarge` (30 GiB RAM) node.
+7. **`set -euo pipefail` in the three new compare scripts** aborted the whole run on a single
+   failing query instead of reporting `FAILED` and continuing (a `var=$(cmd)` assignment under
+   `-e` exits immediately on a nonzero `cmd`, before the script's own `rc=$?` check runs). Dropped
+   `-e` to match `bench/import_ceiling.sh`'s existing, deliberate convention.
+8. **EMR Serverless application creation needs `iam:CreateServiceLinkedRole`** for
+   `AWSServiceRoleForAmazonEMRServerless` — not covered by `emr-serverless:*` (a separate IAM
+   action namespace). Added a scoped statement to `deploy/iam/deployer-policy.json`.
+9. **EMR Serverless has no internet egress by default** — `spark.jars.packages` (Maven Central via
+   Ivy) timed out resolving `iceberg-spark-runtime-3.5_2.12`. Switched to the release's *locally
+   bundled* jar (`/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar`) and Spark's Iceberg
+   `GlueCatalog` impl (`catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog`) — the same
+   "talk to Glue directly, not via REST" pattern as the Trino fix above.
+10. **`emr_serverless_max_capacity` default (4 vCPU/16 GB) was too small even for one executor** —
+    every job failed with `ApplicationMaxCapacityExceededException`, zero executors ever allocated
+    (the driver alone consumes most of a 4 vCPU/16 GB ceiling). Bumped the default to 16 vCPU/64 GB
+    in `deploy/data-stack/variables.tf`. Also found: updating `maximumCapacity` (or deleting the
+    application) requires the app to be `STOPPED` first — documented in `deploy/README.md`'s
+    "Known seams".
+
+All fixes are on `feat/competitive-engine-benchmark` (PR #51).
 
 ## Tuning levers & outlook
 

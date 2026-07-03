@@ -8,7 +8,9 @@
 # translated from bench/run.sh's Q1-Q4 (lines ~321-349). Keep both in sync if you edit one.
 #
 #   TRINO_HOST=<ip> ./trino_compare.sh
-set -euo pipefail
+# No -e: run_timed must survive a failing query (OOM, syntax error, ...) and report it as FAILED
+# rather than aborting the whole comparison — same convention as bench/import_ceiling.sh.
+set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] && { set -a; . bench/.env; set +a; }
 
