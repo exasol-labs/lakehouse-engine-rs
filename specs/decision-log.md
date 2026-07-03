@@ -1603,7 +1603,61 @@ Codifies the project rule: new benchmark evidence confounded by an in-flight fix
 
 ---
 
-## ADR-060: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
+## ADR-060: Advertise `AGGREGATE_GROUP_BY_TUPLE`, Reversing the Prior Exclusion
+
+**Date:** 2026-07-03
+**Plan:** `fix-multi-column-group-by-pushdown`
+**Status:** Accepted
+
+### Context
+
+The adapter's grouped-aggregate detection, per-key type resolution, and scan-driving SQL builder already handle an arbitrary number of group keys, but `AGGREGATE_GROUP_BY_TUPLE` was excluded from `CAPABILITIES` (per ADR/decision [4] in the 2026-06-22 `add-group-by-and-sql-comprehension` decision log). With the capability absent, Exasol never sends a multi-key GROUP BY as a pushdown request; instead it falls back to a raw row scan that Exasol aggregates itself, shipping every raw row over the network and defeating the reduction in network transfer that grouped pushdown exists to provide (issue #53).
+
+### Decision
+
+Add `AGGREGATE_GROUP_BY_TUPLE` to `CAPABILITIES` so Exasol sends multi-key GROUP BY queries as pushdown requests, reversing the prior exclusion.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Advertise `AGGREGATE_GROUP_BY_TUPLE` | ✓ Chosen — the multi-key detection and SQL-building path already exists; the capability flag was the only thing gating it |
+| Keep it excluded | ✗ Rejected — multi-column GROUP BY is extremely common; the raw-scan fallback defeats the purpose of grouped pushdown |
+
+### Consequences
+
+A GROUP BY over two or more keys is now pushed down as node-local partial aggregation rather than falling back to a raw row scan, at the cost of the multi-key path needing to be proven correct end-to-end (see ADR-061).
+
+---
+
+## ADR-061: Verify the N-Key Grouped Pushdown Path Before Trusting the Capability Flag
+
+**Date:** 2026-07-03
+**Plan:** `fix-multi-column-group-by-pushdown`
+**Status:** Accepted
+
+### Context
+
+Issue #53 explicitly noted that the N≥2 group-key path "has not been verified end-to-end," because Exasol never sent a multi-key pushdown request while `AGGREGATE_GROUP_BY_TUPLE` was absent. Advertising the capability (ADR-060) without first verifying `detect_group_by_aggregates`, `group_key_exasol_types`, and `build_grouped_aggregate_scan_sql` against a real multi-key request risked shipping latent defects — group-key ordering, per-key type resolution, and HAVING/LIMIT interaction were all unproven for N≥2 keys.
+
+### Decision
+
+Treat the capability flip as requiring a verification spike across the detection, per-key type-resolution, and scan-SQL-building code paths, budgeting for real bug fixes rather than assuming a one-line flag change would suffice, and add end-to-end test coverage (including EXPLAIN-based pushdown-occurred assertions) for expression-valued group keys, interleaved key/aggregate ordering, HAVING + LIMIT combined with multi-key grouping, and high-cardinality/spill behavior of the node-local partial aggregate.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Verification spike + full E2E coverage before shipping the flag | ✓ Chosen — proves the multi-key path actually works rather than assuming it does |
+| Ship the flag alone | ✗ Rejected — issue #53 explicitly flagged the N≥2 path as unverified; shipping it blind risks latent multi-key defects |
+
+### Consequences
+
+The multi-key grouped-aggregate path is proven correct (ordering, per-key types, HAVING/LIMIT, spill behavior) before being exposed to Exasol, at the cost of a wider verification/test-authoring scope than a bare capability-flag change.
+
+---
+
+## ADR-062: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
 
 **Date:** 2026-07-03
 **Plan:** `fix-nested-aggregate-pushdown`
@@ -1626,11 +1680,11 @@ Bound the fix to making this specific SQL shape correct-or-safe (correct compose
 
 ### Consequences
 
-The adapter gains a targeted guard/fix for the constant-projection-over-`GROUP BY` shape (see ADR-061) without adding a general subquery-composition capability. Other nested/subquery shapes not matching this pattern continue to rely on the existing fallback-to-row-scan behavior, which remains within mission scope.
+The adapter gains a targeted guard/fix for the constant-projection-over-`GROUP BY` shape (see ADR-063) without adding a general subquery-composition capability. Other nested/subquery shapes not matching this pattern continue to rely on the existing fallback-to-row-scan behavior, which remains within mission scope.
 
 ---
 
-## ADR-061: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
+## ADR-063: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
 
 **Date:** 2026-07-03
 **Plan:** `fix-nested-aggregate-pushdown`
