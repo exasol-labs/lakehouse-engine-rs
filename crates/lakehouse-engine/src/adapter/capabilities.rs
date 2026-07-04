@@ -1,6 +1,7 @@
 /// Virtual Schema capabilities for the Lakehouse VS adapter.
 ///
-/// Reports projection, filter predicates, LIMIT, and single-group aggregate pushdown.
+/// Reports projection, filter predicates, LIMIT, ORDER BY (bare column keys), and
+/// single-group aggregate pushdown.
 use serde_json::{Value as Json, json};
 
 /// The set of capabilities this VS adapter advertises to Exasol.
@@ -40,6 +41,14 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_PRED_REGEXP_LIKE",
     // LIMIT pushdown
     "LIMIT",
+    // ORDER BY pushdown: bare-column sort keys only (add-topn-pushdown).
+    // ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET stay unadvertised — no backing path.
+    "ORDER_BY_COLUMN",
+    // Arithmetic binary-operator functions (issue #59, task 1.2)
+    "FN_ADD",
+    "FN_SUB",
+    "FN_MULT",
+    "FN_FLOAT_DIV",
     // Math scalar functions
     "FN_ABS",
     "FN_ACOS",
@@ -256,6 +265,14 @@ mod tests {
             );
         }
 
+        // --- task 1.2: arithmetic binary-operator functions ---
+        for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
+            assert!(
+                cap_strs.contains(name),
+                "{name} must be advertised: {cap_strs:?}"
+            );
+        }
+
         // --- task 1.3: math scalar functions ---
         for name in &[
             "FN_ABS",
@@ -400,11 +417,19 @@ mod tests {
             !has_listagg,
             "LISTAGG/GROUP_CONCAT must not be advertised: {cap_strs:?}"
         );
-        let has_order_by = cap_strs.iter().any(|c| c.starts_with("ORDER_BY"));
+        // ORDER_BY_COLUMN is now advertised (add-topn-pushdown): a bare-column sort
+        // key backs the per-shard bounded top-N + Exasol-side merge. Expression sort
+        // keys and OFFSET remain unadvertised — no backing path exists for either.
         assert!(
-            !has_order_by,
-            "ORDER_BY* must not be advertised: {cap_strs:?}"
+            cap_strs.contains(&"ORDER_BY_COLUMN"),
+            "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
         );
+        for name in &["ORDER_BY_EXPRESSION", "LIMIT_WITH_OFFSET"] {
+            assert!(
+                !cap_strs.contains(name),
+                "{name} must NOT be advertised: {cap_strs:?}"
+            );
+        }
         let has_join = cap_strs
             .iter()
             .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
@@ -460,6 +485,14 @@ mod tests {
         let resp = get_capabilities_response();
         let caps = resp["capabilities"].as_array().unwrap();
         let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        // Arithmetic binary-operator functions must be advertised.
+        for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
+            assert!(
+                cap_strs.contains(name),
+                "{name} must be advertised: {cap_strs:?}"
+            );
+        }
 
         // Supported single-group aggregate capabilities must be advertised.
         for name in &[

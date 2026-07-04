@@ -74,6 +74,7 @@ fn pruning_spec(file_url: String) -> ScanSpec {
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
         limit: None,
+        order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
         emit_exa_types: Vec::new(),

@@ -337,16 +337,18 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             let args = value("arguments").and_then(|a| a.as_array());
 
             match fn_name.as_str() {
-                // Arithmetic operators and CAST are translated but not yet advertised as
-                // capabilities — Exasol pushes them implicitly as part of expression trees
-                // for advertised scalar functions.
-                // ponytail: arithmetic/cast capability advertisement is future scope; keep
-                // these arms so expression trees that contain them translate correctly.
-                "ADD" | "SUB" | "MUL" | "FLOAT_DIV" => {
+                // Arithmetic binary operators. The `function_scalar` node name Exasol
+                // emits equals the advertised capability name with `FN_` stripped
+                // (verified live via FN_MOD; see decision-log entry [7]). These four
+                // must stay in lockstep with capabilities.rs's FN_ADD / FN_SUB /
+                // FN_MULT / FN_FLOAT_DIV — in particular multiplication is `MULT`
+                // (from FN_MULT), NOT `MUL`. CAST (below) is still translated but not
+                // advertised as a capability.
+                "ADD" | "SUB" | "MULT" | "FLOAT_DIV" => {
                     let op = match fn_name.as_str() {
                         "ADD" => "+",
                         "SUB" => "-",
-                        "MUL" => "*",
+                        "MULT" => "*",
                         "FLOAT_DIV" => "/",
                         _ => unreachable!(),
                     };
@@ -1029,15 +1031,102 @@ mod tests {
 
     #[test]
     fn renders_arithmetic_mul() {
+        // Exasol emits the multiplication node as "MULT" (from capability FN_MULT),
+        // not "MUL" — verified via the FN_-strip convention in decision-log [7].
         let expr = json!({
             "type": "function_scalar",
-            "name": "MUL",
+            "name": "MULT",
             "arguments": [
                 {"type": "column", "name": "a"},
                 {"type": "literal_exactnumeric", "value": 2}
             ]
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"("A" * 2)"#);
+    }
+
+    /// Regression guard: the legacy node name "MUL" must NOT be recognized. Exasol
+    /// never emits it (the capability is FN_MULT → node "MULT"); if the match arm
+    /// ever regresses back to "MUL", the advertised set and the translator would
+    /// silently diverge and multiplication pushdown would fall back to a row scan.
+    #[test]
+    fn legacy_mul_name_is_not_recognized() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "MUL",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "the obsolete \"MUL\" node name must not translate; Exasol emits \"MULT\""
+        );
+    }
+
+    /// Two-column binary arithmetic (both operands are column references), the exact
+    /// NQ1 shape `L_EXTENDEDPRICE * L_DISCOUNT`. This is what unblocks the two-column
+    /// SUM(col * col) pushdown once FN_MULT is advertised (capabilities.rs, task 1.2):
+    /// the expression-argument aggregate path renders this fragment for the scan SQL.
+    #[test]
+    fn renders_two_column_arithmetic_product() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [
+                {"type": "column", "name": "l_extendedprice"},
+                {"type": "column", "name": "l_discount"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"("L_EXTENDEDPRICE" * "L_DISCOUNT")"#
+        );
+    }
+
+    /// Lockstep guard (translator side): the arithmetic binary-operator node names the
+    /// translator recognizes must correspond 1:1 to the arithmetic capabilities
+    /// advertised in `crates/lakehouse-engine/src/adapter/capabilities.rs`
+    /// (`FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`) — each capability name with the
+    /// `FN_` prefix stripped. If capabilities advertises an operator the translator
+    /// doesn't render (or renders a name that isn't advertised), Exasol either declines
+    /// the pushdown (silent row-scan fallback, no speedup) or the fragment never reaches
+    /// a live query. Both operands are columns to exercise the two-column shape.
+    ///
+    /// The advertised capability strings live in a different crate; the authoritative
+    /// cross-crate assertion (reading `CAPABILITIES` and driving `render_expression`)
+    /// is deferred until task 1.2 populates the const — see decision-log deferred note.
+    /// This table is the translator-side half kept in sync by construction.
+    #[test]
+    fn arithmetic_operator_set_matches_advertised_capabilities() {
+        // (capability name, node name = capability minus FN_, rendered operator)
+        let arithmetic = [
+            ("FN_ADD", "ADD", "+"),
+            ("FN_SUB", "SUB", "-"),
+            ("FN_MULT", "MULT", "*"),
+            ("FN_FLOAT_DIV", "FLOAT_DIV", "/"),
+        ];
+        for (cap, node, op) in arithmetic {
+            // node name must be the capability with the FN_ prefix removed
+            assert_eq!(
+                node,
+                cap.strip_prefix("FN_").unwrap(),
+                "node name must equal capability {cap} minus FN_ prefix"
+            );
+            let expr = json!({
+                "type": "function_scalar",
+                "name": node,
+                "arguments": [
+                    {"type": "column", "name": "l_extendedprice"},
+                    {"type": "column", "name": "l_discount"}
+                ]
+            });
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!(r#"("L_EXTENDEDPRICE" {op} "L_DISCOUNT")"#),
+                "translator must render advertised capability {cap} (node {node})"
+            );
+        }
     }
 
     #[test]

@@ -31,10 +31,12 @@ generates the `bench/.env` for a deployed cluster.
 1. Builds the working-tree `.so` and uploads it + the SLC to BucketFS.
 2. Creates the schema, scripts, catalog connection, and `TPCH` virtual schema.
 3. **Wiring** (docker): per-table row counts (`REGION`=5, `NATION`=25, rest >0).
-4. **Timed queries** (Q1-Q9b): TPC-H-shaped JOIN / filter / GROUP-BY / pricing-summary
+4. **Timed queries** (Q1-Q9b, NQ1-NQ5): TPC-H-shaped JOIN / filter / GROUP-BY / pricing-summary
    SELECTs, plus Q5-Q9b (added to probe specific pushdown strengths/weaknesses: no-filter
    JOIN+GROUP-BY, a ~45M-group high-cardinality GROUP BY, a highly selective single-day
-   filter, and narrow-vs-wide column projection) — wall-clock is the perf signal.
+   filter, and narrow-vs-wide column projection) and NQ1-NQ5 (arithmetic aggregate pushdown,
+   LIKE/IN filters, a 4-way join, ORDER BY+LIMIT, and GROUP BY+HAVING) — wall-clock is the
+   perf signal.
 5. **Pushdown checks** (`EXPLAIN VIRTUAL`): asserts `shard_key` fan-out, `LIMIT`,
    `filter`, and projection actually reach the scan spec.
 
@@ -63,6 +65,11 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
   ```
 - **`sweep.sh`** — sweeps the DataFusion threading knobs (`BENCH_DF_*`) across
   `run.sh` invocations to find the best parallelism config.
+- **`parallelism_sweep.sh`** — sweeps `BENCH_PARALLELISM_FACTOR` (8/16/24) across
+  `run.sh` invocations, capturing Q2/Q3/Q5 (raw-emit-heavy joins) and Q9b (non-join
+  regression check). Tests whether oversubscribing shards beyond 1/core hides
+  the synchronous per-shard `MT_EMIT` ack latency — see
+  `specs/_plans/add-arithmetic-aggregate-pushdown-and-benchmark-suite/decision-log.md`.
 
 ## Competitive engine comparison (Athena / Trino / Spark)
 
@@ -97,7 +104,7 @@ table — no CSV/JSON, no dashboard, hand-curate the interesting numbers into
 [`../docs/performance.md`](../docs/performance.md) afterward, same as every other bench result.
 
 Query text (Presto/Trino/Spark dialect, identical across all three) is duplicated inline in each
-script, translated from `run.sh`'s Q1-Q9b — keep all three in sync if you edit one.
+script, translated from `run.sh`'s Q1-Q9b and NQ1-NQ5 — keep all four in sync if you edit one.
 
 ## Synthetic micro-benchmarks (no cluster, no DB)
 
