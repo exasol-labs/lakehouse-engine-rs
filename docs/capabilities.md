@@ -50,13 +50,13 @@ Partial aggregate per shard → merged by Exasol.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
-| Single-group | `AGGREGATE_SINGLE_GROUP`, `FN_AGG_COUNT`, `FN_AGG_COUNT_STAR`, `FN_AGG_SUM`, `FN_AGG_MIN`, `FN_AGG_MAX` | `SELECT SUM(amt) FROM t` |
+| Single-group | `AGGREGATE_SINGLE_GROUP`, `FN_AGG_COUNT`, `FN_AGG_COUNT_STAR`, `FN_AGG_SUM`, `FN_AGG_MIN`, `FN_AGG_MAX`, `FN_AGG_COUNT_DISTINCT` | `SELECT SUM(LENGTH(c)), COUNT(DISTINCT u) FROM t` |
 | Average | `FN_AGG_AVG` | `SELECT AVG(amt)` |
 | Statistical | `FN_AGG_STDDEV`, `FN_AGG_STDDEV_POP`, `FN_AGG_STDDEV_SAMP`, `FN_AGG_VARIANCE`, `FN_AGG_VAR_POP`, `FN_AGG_VAR_SAMP` | `SELECT STDDEV(x)` |
 | Group by | `AGGREGATE_GROUP_BY_COLUMN`, `AGGREGATE_GROUP_BY_EXPRESSION`, `AGGREGATE_GROUP_BY_TUPLE` | `SELECT k1, k2, SUM(v) GROUP BY k1, k2` |
 | Having | `AGGREGATE_HAVING` | `... HAVING SUM(v) > 100` |
 
-`COUNT` emits partial sum/count and `AVG` emits sum + count (not an average); statistical aggregates emit sufficient stats (n, Σx, Σx²). Exasol combines them into the final result.
+Aggregate arguments may be a column or a scalar expression (e.g. `SUM(LENGTH(c))`). `COUNT` emits partial sum/count and `AVG` emits sum + count (not an average); statistical aggregates emit sufficient stats (n, Σx, Σx²); single-group `COUNT(DISTINCT col|expr)` emits a per-shard local distinct set (JSON), merged by a scalar UDF. Exasol combines them into the final result.
 
 ## Handled by Exasol 🤝
 
@@ -66,6 +66,6 @@ Not pushed to the scan — Exasol computes these on the returned partial results
 |---|---|---|
 | JOIN (`JOIN_TYPE_*`, `JOIN_CONDITION_*`) | `FROM a JOIN b ON a.id = b.id` | Usable via multi-table VS: Exasol pushes down each table, then joins the result sets |
 | `ORDER BY` | `... ORDER BY ts` | Exasol sorts the final result |
-| `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `COUNT(DISTINCT u)` | Not decomposable into partial/merge — Exasol computes on returned rows |
+| Grouped `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `SELECT k, COUNT(DISTINCT u) FROM t GROUP BY k` | Not decomposable into partial/merge — Exasol computes on returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
 | Geospatial, session fns | — | Exasol-side / unsupported |
