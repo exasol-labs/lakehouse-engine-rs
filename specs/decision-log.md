@@ -1791,3 +1791,313 @@ Enforce a mandatory per-shard execution-time safety cap: 100,000 distinct elemen
 ### Consequences
 
 A standalone high-cardinality `COUNT(DISTINCT col)` that previously fell to a (slow but correct) row scan now, once `FN_AGG_COUNT_DISTINCT` is advertised, gets pushed down and may fail the cap with a clean error instead of completing via row scan — an accepted behavioural regression for that specific shape, consistent with the mission's bounded-execution stance. The merge side is separately bounded by `LISTAGG`'s output ceiling. The target use case (low-cardinality dimension columns) is unaffected.
+
+---
+
+## ADR-067: Two-Column Arithmetic Aggregate Gap Is Fixed by Capability Advertisement, Not New Machinery
+
+**Date:** 2026-07-04
+**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
+**Status:** Accepted
+
+### Context
+
+`SUM(l_extendedprice * l_discount)` (a non-join TPC-H Q6 shape) fell back to a full raw row-scan of both operand columns even though the expression-argument SUM partial/merge machinery (`arg_column_or_expr`, `col_type_for`, `sum_emit_type`) already existed. Reading the code showed the actual blocker: `capabilities.rs` advertised `FN_MOD` but none of the arithmetic binary-operator capabilities, so Exasol's optimizer never constructed a scalar-function pushdown node for `+`/`-`/`*`/`/` at all — it silently requested the raw operand columns instead.
+
+### Decision
+
+Fix the gap by advertising `FN_ADD`/`FN_SUB`/`FN_MULT`/`FN_FLOAT_DIV` and reconciling the translator's operator-name matching, reusing the existing expression-argument SUM partial/merge machinery unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Advertise the missing arithmetic capabilities and reconcile operator names | ✓ Chosen — the downstream decomposition path already exists; the blocker was purely in what the adapter advertises, so this is the smallest sound change |
+| Build a dedicated two-column-product decomposition path | ✗ Rejected — redundant new subsystem; `AggKind::Sum` + `arg_expr` already covers a two-column arithmetic argument |
+| Assume the translator lacked binary-arithmetic support and build it | ✗ Rejected — reading `crates/vs-expression` showed `ADD`/`SUB`/`MUL`/`FLOAT_DIV` were already rendered; the gap was advertisement, not translation |
+
+### Consequences
+
+`SUM(col_a OP col_b)` for `OP ∈ {*, +, -, /}` now decomposes into the shard-associative partial/merge plan instead of a raw two-column row-scan fallback. Advertising the operators globally (not scoped to SUM arguments) also enables arithmetic in filter/select-list/group-key positions, since Exasol's capability model has no position-scoped advertisement — accepted as a safe, net-positive side effect because untranslatable nodes still fall back correctness-safely.
+
+---
+
+## ADR-068: Arithmetic Operator-Name Reconciliation Is a Hard Live-Verification Gate, Not an Assumption
+
+**Date:** 2026-07-04
+**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
+**Status:** Accepted
+
+### Context
+
+The `crates/vs-expression` translator matched multiplication as `"MUL"`, based on hand-crafted unit-test JSON — never exercised live, because the capability was unadvertised. Exasol's actual capability/name vocabulary uses `FN_MULT`. Shipping the advertise-and-decompose fix on the unverified `"MUL"` assumption risked advertising `FN_MULT` while the translator declined the resulting `"MULT"` node, silently degrading to row-scan fallback with no speedup (correct but pointless).
+
+### Decision
+
+Made live capture of the exact Exasol `function_scalar` name for `+`/`-`/`*`/`/` a hard gate on the capability/translator change (task 1.1), and require the capability set and the translator's matched-name set to stay in lockstep (enforced by a dedicated test).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Verify live before coding, keep capability set and translator names in lockstep | ✓ Chosen — the whole perf win hinges on the translator recognizing what Exasol actually sends |
+| Trust the existing `"MUL"` unit tests / spec | ✗ Rejected — those tests used hand-crafted JSON never exercised against a live advertised capability, so the assumed name was unverified and plausibly wrong |
+
+### Consequences
+
+Live capture (decision-log finding [7]) was structurally unsatisfiable in the literal "observe the node" sense (Exasol won't emit an unadvertised node), so verification proceeded via the already-advertised `FN_MOD` naming convention (`FN_<X>` → node name `"<X>"`) plus a native-SQL DECIMAL-inference probe — equally strong evidence without a speculative capability deploy. This confirmed `"MUL"` was wrong and pinned the fix to `"MULT"`, with `ADD`/`SUB`/`FLOAT_DIV` already correct.
+
+---
+
+## ADR-069: Parallelism-Factor Sweep Is Evidence-Gated; a Validated No-Op Is an Acceptable Outcome
+
+**Date:** 2026-07-04
+**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
+**Status:** Accepted
+
+### Context
+
+A prior diagnostic flagged a possible 10-30% gain from increasing `BENCH_PARALLELISM_FACTOR` (oversubscription hides emit-ack stall), but marked it UNVERIFIED — plausible only if the workload is emit-ack-latency-bound, zero if CPU-decode-bound. `bench/.env` pins the factor at 8, below the code's own `max(cores*2,8)=16` default. Changing a parallelism default without evidence risks regressing non-join queries.
+
+### Decision
+
+Ship the sweep (factor 8/16/24 vs Q2/Q3/Q5 + a Q9b regression check) as an explicit validation task that precedes any default change; only change `bench/.env` / `resolve_parallelism_factor` if the evidence shows a real, repeatable improvement without a Q9b regression, and record the finding either way.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Evidence-gated sweep with a no-op as an acceptable result | ✓ Chosen — avoids shipping a speculative default change that could regress non-join queries |
+| Hardcode `BENCH_PARALLELISM_FACTOR=16` (or change the code default) now | ✗ Rejected — the 10-30% gain was explicitly unverified and the workload's bottleneck (emit-ack vs CPU-decode) was unknown |
+
+### Consequences
+
+The sweep (`bench/parallelism_sweep.sh`), run twice against the live test1 cluster, found pf16 flat (within run-to-run noise, no consistent direction) and pf24 a real, repeatable regression (Q3 and Q9b both worse in both runs) — over-oversubscription adds scheduling overhead that outweighs any stall-hiding benefit. `bench/.env`'s factor of 8 and the code's `resolve_parallelism_factor` default were left unchanged; ruling out this optimization on solid evidence is treated as a valid, durable result, with the sweep tooling itself the lasting artifact.
+
+---
+
+## ADR-070: Raw-Scan Projection Gets an Explicit `ProjectionItem` Tag Instead of a Syntactic Heuristic
+
+**Date:** 2026-07-04
+**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
+**Status:** Accepted
+
+### Context
+
+`extract_projection` pushed both bare column names and rendered scalar-expression fragments into the same `Vec<String>` (`spec.projection`). `build_scan_sql` then treated every entry as a bare identifier, wrapping a rendered expression fragment like `("SCORE" * 2)` in `quote_ident(...)` and producing a phantom column name — reproduced live as `e2e_selectlist_expression_pushdown` failing with `F-UDF-CL-RUST-9001 ... No field named "(""SCORE"" * 2)"`. The two projection-item kinds were structurally indistinguishable downstream, the same "column vs. rendered expression looks like a string either way" problem `AggregatePlan`'s `column`/`arg_expr` split already solves for aggregates.
+
+### Decision
+
+Change `ScanSpec.projection` / `CommonScanSpec.projection` from `Vec<String>` to `Vec<ProjectionItem>`, a `#[serde(untagged)]` enum with `Column(String)` and `Expr { expr: String }`, tagged at the point `extract_projection` already knows the distinction. `build_scan_sql` matches the variant: `Column` keeps its existing CAST-for-JSON-fallback + `quote_ident` behavior; `Expr` is spliced verbatim, exactly like `spec.filter` and `agg_arg_sql`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Explicit `ProjectionItem` tag (`Column`/`Expr`), mirroring `AggregatePlan` | ✓ Chosen — the distinction is already known upstream; tagging it there is the same established pattern as `column`/`arg_expr` |
+| Syntactic heuristic in `build_scan_sql` (contains `(`/quote/operator → expression) | ✗ Rejected — fragile; an exotic quoted Exasol column name would be misclassified |
+| "Is it a field in the Arrow schema?" as the discriminator | ✗ Rejected — implicit, and silently changes the defensive path for a bare column absent from the schema |
+| A parallel `Vec<bool>` / `Vec<Option<String>>` alongside the string vec | ✗ Rejected — positional-alignment fragility, worse than a single tagged type |
+
+### Consequences
+
+`#[serde(untagged)]` keeps the wire format for the common all-columns case byte-for-byte unchanged (a `Column` still serializes as a bare JSON string), and `From<&str>`/`From<String>`/`PartialEq<&str>` keep existing call sites and assertions compiling unchanged — only the row-scan test helpers, `build_scan_driving_sql` call sites, and `extract_projection`-output assertions needed edits. The `column`/`arg_expr`/`ProjectionItem` pattern (never overload one string field for both a bare identifier and rendered SQL) is now the established convention for anything crossing the adapter→scan spec boundary.
+
+---
+
+## ADR-071: Close the NQ4 Top-N Loss by Advertising ORDER_BY_COLUMN + a Partial/Merge Top-N
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+NQ4 (`SELECT L_ORDERKEY, L_EXTENDEDPRICE FROM lineitem ORDER BY L_EXTENDEDPRICE DESC LIMIT 20`) lost to Trino 12.03s vs 4.71s on TPC-H sf=30 test1 because the adapter advertises no `ORDER_BY*` capability, so Exasol never delegates the ordering and the adapter raw-emits the whole table for Exasol to sort. The join-pushdown non-goal does not apply here — it is a non-join, single-table loss, and the standing directive (carried over from the sibling arithmetic-pushdown plan) is to optimize legitimately-fixable non-join losses.
+
+### Decision
+
+Advertise `ORDER_BY_COLUMN` and push `ORDER BY <bare projected col(s)> LIMIT n` down as a per-shard bounded top-N (each shard runs its own `ORDER BY … LIMIT n`) merged by an Exasol-side outer `ORDER BY … LIMIT n`, reusing the SHAPE of the existing aggregate partial/merge machinery rather than its aggregate-specific code.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Advertise `ORDER_BY_COLUMN` + per-shard bounded top-N + outer merge | ✓ Chosen — the blocker is purely the unadvertised capability; this is the smallest sound change and mirrors the just-shipped aggregate partial/merge shape |
+| Leave it as a raw scan and accept the loss | ✗ Rejected — a non-join, single-table query squarely within the standing "optimize where legitimately possible" directive |
+| Change file-sharding to co-locate top rows | ✗ Rejected — violates the sharding-architecture non-goal |
+| Build a general ORDER BY pushdown (expression keys, offset, ordered aggregates) | ✗ Rejected as over-scope — column top-N covers the target and the common shape |
+
+### Consequences
+
+NQ4 now flips from lakehouse-engine-rs's largest competitive loss to a win: 12.03s → 2.13s (5.65x), also beating Trino's 4.71s. The new path is a new partial/merge variant sitting alongside the aggregate path, not a new architecture.
+
+---
+
+## ADR-072: Whether the Top-N Change Is Pure Optimization or Also a Latent Correctness Fix Is Gated on Live Capture
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+Reading the code alone shows `extract_limit` unconditionally reads `pushdownRequest.limit.numElements` and the row-scan branch pushes that limit to every shard via the common spec with no ORDER-BY-awareness — so IF Exasol ever sent a bare `limit` alongside an unpushed `order_by` today, the adapter would silently truncate to an arbitrary per-shard subset. Whether this ever happens in practice is unknown from the code alone.
+
+### Decision
+
+Make a live `EXPLAIN VIRTUAL` capture of the NQ4 shape against test1 (task A1) a hard gate, before writing any code, to determine whether Exasol pushes a bare `limit` for an ORDER BY query it can't also delegate today.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Live-capture gate before coding | ✓ Chosen — the sibling plan's methodology is live-capture-first, and the cost of assuming wrong is a silent correctness bug |
+| Infer "safe" from the correct-but-slow captured NQ4 result and skip verification | ✗ Rejected — the code path shows a real theoretical truncation risk that must be verified, not assumed |
+
+### Consequences
+
+A1 confirmed Exasol structurally withholds `limit` whenever the accompanying `order_by` can't also be delegated — today's code path can never exercise the truncation danger, so this plan is pure optimization, not a bugfix. The defensive invariant (ADR-074) is adopted anyway, because advertising `ORDER_BY_COLUMN` is exactly what starts putting `order_by` + `limit` together in future requests.
+
+---
+
+## ADR-073: Advertise ORDER_BY_COLUMN Only; ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET Stay Absent
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+The NQ4 target and the common top-N shape are both served by column sort keys with no OFFSET. Advertising expression ordering and/or an OFFSET would add rendering and bounded-sort-with-skip complexity with no evidenced need.
+
+### Decision
+
+Advertise only `ORDER_BY_COLUMN`. Keep `ORDER_BY_EXPRESSION` and `LIMIT_WITH_OFFSET` unadvertised so Exasol structurally never pushes an expression sort key or an OFFSET the adapter has no path for.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `ORDER_BY_COLUMN` only | ✓ Chosen — matches the codebase's "advertise only what the backing path supports" discipline; makes unsupported shapes structurally impossible in the request rather than something to defensively decline at runtime |
+| Also advertise `ORDER_BY_EXPRESSION` and/or `LIMIT_WITH_OFFSET` | ✗ Rejected — no evidenced need, adds complexity |
+
+### Consequences
+
+The capability surface stays exactly as wide as the backing implementation. Unprojected/expression sort keys and OFFSET queries simply never appear in the request shape the adapter must handle.
+
+---
+
+## ADR-074: Never Push a Bare Per-Shard LIMIT Ahead of a Global Sort
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+Once `ORDER_BY_COLUMN` is advertised, Exasol will send `order_by` + `limit` together for ordered queries. A bare per-shard limit pushed ahead of a global sort would let each shard return an arbitrary (not top-ranked) subset, silently truncating the true top-N for any ORDER BY shape the adapter does not match as a top-N.
+
+### Decision
+
+Emit the per-shard row limit ONLY alongside the matching per-shard `ORDER BY` (the matched top-N shape). For any ORDER-BY-carrying request the adapter does not match as a top-N, withhold the per-shard limit and leave row selection to the Exasol-side ordering.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Per-shard limit gated on a matching per-shard sort | ✓ Chosen — the invariant that makes advertising the capability safe across every shape, not just the optimized one |
+| Keep pushing the per-shard limit whenever a `limit` is present (today's row-scan behavior) | ✗ Rejected — becomes unsafe the moment `order_by` can accompany a `limit` |
+
+### Consequences
+
+Asserted directly as a spec scenario and a unit test (`order_by_present_without_topn_match_withholds_per_shard_limit`). During implementation (B5), a related but distinct gap was found live: an ORDER BY over an unprojected column combined with LIMIT returns wrong (unsorted, untruncated) results because Exasol does not always re-apply its own backstop ordering once it has delegated both clauses together — tracked as a known residual, not a regression, since the old behavior was fail-silent and the new one fails loud.
+
+---
+
+## ADR-075: Returned SQL for the Matched Top-N Is Self-Contained, Not Dependent on an Exasol Re-Sort Backstop
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+The pre-existing model for `LIMIT`/`HAVING` relies on Exasol re-applying the clause it pushed as a correctness backstop. For the top-N path, depending on "does Exasol re-sort?" is an avoidable class of risk, and the outer wrapper already exists for the shard fan-out.
+
+### Decision
+
+The matched top-N path returns an outer `SELECT <proj> FROM (<fan-out>) ORDER BY <keys> LIMIT n` that fully specifies the final ordering itself, rather than relying on Exasol to re-apply the pushed `ORDER BY`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Self-contained outer `ORDER BY … LIMIT n` | ✓ Chosen — removes the matched path's dependence on Exasol's re-sort behavior; the outer wrapper already exists so adding the ordering is cheap |
+| Rely on the Exasol backstop, as `LIMIT`/`HAVING` do | Kept as the safety net for the UNmatched decline shapes only, not for the matched path |
+
+### Consequences
+
+Live verification (C1) confirmed the outer merge SQL renders its own final `ORDER BY … LIMIT` independent of Exasol. During implementation (B5), the unmatched/decline shapes were found to need the same defensive treatment for the grouped-aggregate path, which had never rendered an `ORDER BY` at all and relied entirely on an Exasol backstop that does not always apply — fixed by rendering an explicit final `ORDER BY`/`LIMIT` on every path that can receive an `order_by`-carrying request.
+
+---
+
+## ADR-076: Direction and NULL Placement Must Be Rendered Identically Per-Shard and in the Merge
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+The distributed top-N is exact only if the per-shard bounded sort and the Exasol-side merge sort induce the identical ranking. If the scan UDF's default NULL placement differs from Exasol's, the per-shard cut and the merge disagree near NULLs and the top-N silently diverges from single-node results.
+
+### Decision
+
+Render an explicit `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST` on BOTH the per-shard `ORDER BY` (scan UDF) and the outer merge `ORDER BY` (adapter), using the direction/NULL semantics captured live from Exasol's wire shape (`isAscending`, `nullsLast`), rather than relying on either engine's default NULL ordering.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Explicit direction + NULL placement on both sides | ✓ Chosen — the one subtle correctness detail where a silent default mismatch would corrupt ranking near NULLs |
+| Render only direction, let NULL ordering default on each side | ✗ Rejected — if DataFusion's and Exasol's defaults differ, per-shard and merge disagree on ranking |
+
+### Consequences
+
+Covered by a dedicated NULL-placement unit test (`ordered_scan_sql_preserves_desc_and_null_placement`) and verified live against test1 (C1: outer merge rendered `ORDER BY "L_EXTENDEDPRICE" DESC NULLS FIRST LIMIT 20`, matching the per-shard spec).
+
+---
+
+## ADR-077: Decline the Top-N Shape When a Sort Key Column Needs the JSON-Fallback VARCHAR Cast
+
+**Date:** 2026-07-04
+**Plan:** `add-topn-pushdown`
+
+**Status:** Accepted
+
+### Context
+
+Discovered during implementation (B3b/B4): for a sort key column whose Arrow type needs the JSON-fallback VARCHAR cast (List/Struct/out-of-range-Decimal/etc.), the per-shard `ORDER BY` binds against the real native value in the FROM-clause row source, but the emitted, projected value is a JSON string. Exasol's outer merge only ever sees that emitted JSON string and re-ranks it lexicographically — so per-shard and merge would disagree on ranking and silently corrupt the global top-N, even though each shard's own local top-N stays internally correct. Not triggered by NQ4 (`L_EXTENDEDPRICE` is a plain in-range DECIMAL), but a ship-blocking gap for any future ordered-top-N over a fallback-typed column.
+
+### Decision
+
+`detect_topn` resolves each sort key column's Arrow type from the resolved logical schema and declines the whole ordered-top-N shape (falling back to the safe raw-scan path) whenever that type needs the JSON fallback cast, or when the column is absent from the logical schema.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Decline the top-N shape for JSON-fallback-typed sort keys | ✓ Chosen — always correctness-safe; worst case a rare shape falls back to the raw scan |
+| Emit the sort key uncast and cast only a duplicate projection column | ✗ Rejected — needs extra trailing EMITS columns dropped by the outer SELECT, disproportionate to a shape no evidenced query hits |
+| Sort the merge on the pre-cast value | ✗ Rejected — impossible; Exasol only ever receives the emitted representation |
+
+### Consequences
+
+Covered by a unit test (`json_fallback_typed_sort_key_declines_topn`). The guard is evaluated on the same type info the scan path already uses for its own `needs_json_fallback` cast decision, so it becomes fully load-bearing the moment the logical-schema tag vocabulary is enriched to preserve richer types beyond the current out-of-range-Decimal case.

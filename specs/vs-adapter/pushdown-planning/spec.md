@@ -48,11 +48,12 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 
 ### Scenario: LIMIT is pushed into the scan spec
 
-* *GIVEN* a query with a LIMIT clause
+* *GIVEN* a query with a LIMIT clause and NO `order_by` that governs which rows are selected
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the shard-invariant common spec passed to the UDF SHALL carry the row limit
 * *AND* because the common spec is shared by every shard, each row-scan shard invocation SHALL observe the same limit
 * *AND* the generated SQL MAY also retain the LIMIT at the Exasol level as a correctness backstop
+* *AND* when the request DOES carry an `order_by`, the per-shard row limit SHALL be governed by `vs-adapter/pushdown-planning-topn` (pushed only alongside the matching per-shard `ORDER BY`), never as a bare per-shard `LIMIT` ahead of a global sort
 
 ### Scenario: Adapter advertises aggregate pushdown for supported functions
 
