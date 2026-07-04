@@ -22,6 +22,7 @@ cd "$SCRIPT_DIR/.."
 SCHEMA=LHVS
 ADAPTER=LAKEHOUSE_ADAPTER
 SCAN=LAKEHOUSE_SCAN
+MERGE=LAKEHOUSE_DISTINCT_MERGE_COUNT
 CONN=LAKEHOUSE_CATALOG_CREDS
 VS=TPCH
 # NB: BucketFS-path / SLC / skip-upload settings are env-overridable, so they are
@@ -256,6 +257,14 @@ EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
+# Scalar distinct-merge script — third entry point in the same .so, created in
+# ${SCHEMA} so the pushdown wrapper SQL resolves it schema-qualified like the SET
+# script. Unions per-shard COUNT(DISTINCT) local sets and returns the cardinality.
+sql "CREATE OR REPLACE RUST SCALAR SCRIPT ${SCHEMA}.${MERGE}(partials VARCHAR(2000000))
+RETURNS DECIMAL(20,0) AS
+%udf_object ${SO_UDF_OBJECT}
+%udf_debug_level ${UDF_DEBUG_LEVEL}
+/"
 sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' IDENTIFIED BY '${CONN_PW}'"
 sql "DROP VIRTUAL SCHEMA IF EXISTS ${VS} CASCADE" || true
 sql "CREATE VIRTUAL SCHEMA ${VS}
@@ -432,6 +441,22 @@ pushdown_check "filter + GROUP BY agg" \
 pushdown_check "filter (IN / OR / comparison)" \
   "SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPMODE IN ('AIR','RAIL') AND (L_RETURNFLAG = 'R' OR L_QUANTITY > 45)" \
   "filter" "AIR"
+# Q9b: mixed expression-argument aggregate (SUM(LENGTH(...))) + single-group COUNT(DISTINCT)
+# (add-count-distinct-and-expression-aggregate-pushdown, issue #56). Before this feature, either
+# shape alone collapsed detect_aggregates to a full 16-column raw row-scan fallback — no
+# "aggregates" field at all, just a raw LAKEHOUSE_SCAN(...) EMITS (16 columns). Both shapes must
+# now decompose into a real partial-aggregate scan: "aggregates" present, a "countdistinct" kind
+# for the COUNT(DISTINCT ...) columns, and "arg_expr" for the SUM(LENGTH(L_COMMENT)) argument.
+pushdown_check "Q9b mixed expression + COUNT(DISTINCT) aggregate pushdown" \
+  "SELECT COUNT(*),
+          SUM(L_ORDERKEY), SUM(L_PARTKEY), SUM(L_SUPPKEY), SUM(L_LINENUMBER),
+          SUM(L_QUANTITY), SUM(L_EXTENDEDPRICE), SUM(L_DISCOUNT), SUM(L_TAX),
+          COUNT(DISTINCT L_RETURNFLAG), COUNT(DISTINCT L_LINESTATUS),
+          MIN(L_SHIPDATE), MAX(L_COMMITDATE), MIN(L_RECEIPTDATE),
+          COUNT(DISTINCT L_SHIPINSTRUCT), COUNT(DISTINCT L_SHIPMODE),
+          SUM(LENGTH(L_COMMENT))
+   FROM ${VS}.LINEITEM" \
+  "aggregates" "countdistinct" "arg_expr"
 
 # ---- remote-only best-effort PROFILE dump ------------------------------------
 if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then

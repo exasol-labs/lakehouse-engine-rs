@@ -1107,6 +1107,212 @@ fn make_evo_batch(first_id: i64, last_id: i64, col2: &str) -> RecordBatch {
     .expect("evo RecordBatch construction is infallible")
 }
 
+// ---------------------------------------------------------------------------
+// COUNT(DISTINCT) / expression-aggregate E2E probe tables
+// ---------------------------------------------------------------------------
+//
+// Used only by `tests/e2e_count_distinct_test.rs`; not part of `seed_events`
+// so the other E2E test binaries (which call `seed_events` in their own
+// setup) do not pay the extra seeding cost.
+
+/// Table name for the multi-shard `COUNT(DISTINCT)` + expression-aggregate probe.
+pub const E2E_DISTINCT_TABLE: &str = "distinct_probe";
+/// Nullable low-cardinality column on `distinct_probe`.
+pub const DISTINCT_CATEGORY_COL: &str = "category";
+/// Non-null low-cardinality column on `distinct_probe`, independent of `category`.
+pub const DISTINCT_REGION_COL: &str = "region";
+/// Variable-length string column on `distinct_probe` (length == id).
+pub const DISTINCT_COMMENT_COL: &str = "comment";
+/// Total rows seeded into `distinct_probe`, across TWO data files (ids 1..=10,
+/// 11..=20) so `COUNT(DISTINCT)` pushdown must merge per-shard local sets.
+pub const DISTINCT_PROBE_TOTAL_ROWS: usize = 20;
+/// Distinct non-NULL `category` values across both shards: {"A","B","C"}.
+/// "A" appears in BOTH shards (ids 3,6,9 in file 1; 12,15,18 in file 2),
+/// proving the merge dedupes across shards rather than summing per-shard
+/// counts. 7 rows have a NULL category (must not be counted).
+pub const DISTINCT_CATEGORY_COUNT: i64 = 3;
+/// Distinct `region` values (no NULLs): {"north","central","south","east"}.
+pub const DISTINCT_REGION_COUNT: i64 = 4;
+/// `SUM(LENGTH(comment))` over all 20 rows; comment length == id, so the sum
+/// is 1 + 2 + ... + 20 = 210.
+pub const DISTINCT_COMMENT_LENGTH_SUM: i64 = 210;
+
+/// Table name for the single-shard high-cardinality `COUNT(DISTINCT)` safety-cap probe.
+pub const E2E_HIGH_CARD_TABLE: &str = "high_card_probe";
+/// High-cardinality column on `high_card_probe`.
+pub const HIGH_CARD_COL: &str = "token";
+/// Row count, written as a SINGLE data file (one shard), chosen so the
+/// per-shard local distinct set deterministically exceeds
+/// `MAX_DISTINCT_BYTES_PER_SHARD` (1 MiB in `scan/mod.rs`) well before
+/// `MAX_DISTINCT_ELEMENTS_PER_SHARD` (100,000): 12,000 unique 100-byte
+/// tokens serialize to > 1.2 MB of JSON, comfortably past the 1 MiB cap.
+pub const HIGH_CARD_ROWS: usize = 12_000;
+
+/// Seed the `distinct_probe` table (`id`, `category`, `region`, `comment`)
+/// into the `e2e_lakehouse` namespace across TWO data files. Idempotent.
+pub async fn seed_distinct_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-distinct").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for distinct_probe")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(
+                2,
+                DISTINCT_CATEGORY_COL,
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+            NestedField::required(
+                3,
+                DISTINCT_REGION_COL,
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+            NestedField::required(
+                4,
+                DISTINCT_COMMENT_COL,
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+        ])
+        .build()
+        .context("build distinct_probe Iceberg schema")?;
+
+    let file1 = vec![make_distinct_probe_batch(1, 10)];
+    let file2 = vec![make_distinct_probe_batch(11, 20)];
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_DISTINCT_TABLE,
+        iceberg_schema,
+        vec![file1, file2],
+    )
+    .await
+    .context("seed distinct_probe table")?;
+    Ok(())
+}
+
+/// `category` for one id: non-NULL values are {"A","B"} on ids 1..=10 and
+/// {"A","C"} on ids 11..=20, so "A" is the value shared across both shards.
+fn category_for(id: i64) -> Option<String> {
+    if id <= 10 {
+        match id % 3 {
+            1 => Some("B".to_string()),
+            0 => Some("A".to_string()),
+            _ => None,
+        }
+    } else {
+        match id % 3 {
+            0 => Some("A".to_string()),
+            1 => Some("C".to_string()),
+            _ => None,
+        }
+    }
+}
+
+/// `region` for one id: cycles through all 4 values every 4 ids, no NULLs.
+fn region_for(id: i64) -> &'static str {
+    match id % 4 {
+        0 => "north",
+        1 => "central",
+        2 => "south",
+        _ => "east",
+    }
+}
+
+fn make_distinct_probe_batch(first_id: i64, last_id: i64) -> RecordBatch {
+    let ids: Vec<i64> = (first_id..=last_id).collect();
+    let categories: Vec<Option<String>> = ids.iter().map(|&id| category_for(id)).collect();
+    let regions: Vec<&str> = ids.iter().map(|&id| region_for(id)).collect();
+    // comment length == id, so SUM(LENGTH(comment)) is a non-trivial, easily
+    // hand-checked value (1 + 2 + ... + 20).
+    let comments: Vec<String> = ids.iter().map(|&id| "x".repeat(id as usize)).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(DISTINCT_CATEGORY_COL, DataType::Utf8, true),
+        Field::new(DISTINCT_REGION_COL, DataType::Utf8, false),
+        Field::new(DISTINCT_COMMENT_COL, DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(categories)),
+            Arc::new(StringArray::from(regions)),
+            Arc::new(StringArray::from(comments)),
+        ],
+    )
+    .expect("distinct_probe RecordBatch construction is infallible")
+}
+
+/// Seed the `high_card_probe` table (`id`, `token`) as a SINGLE data file (one
+/// shard) with `HIGH_CARD_ROWS` unique 100-byte `token` values. Idempotent.
+pub async fn seed_high_card_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-highcard").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for high_card_probe")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, HIGH_CARD_COL, Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build high_card_probe Iceberg schema")?;
+
+    let batch = make_high_card_batch(HIGH_CARD_ROWS);
+    create_and_append(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_HIGH_CARD_TABLE,
+        iceberg_schema,
+        [batch],
+    )
+    .await
+    .context("seed high_card_probe table")?;
+    Ok(())
+}
+
+/// One data file's worth of unique, fixed-length (100-byte) `token` values,
+/// zero-padded so every row's serialized JSON element contributes the same
+/// byte count and the safety-cap trip point stays deterministic.
+fn make_high_card_batch(rows: usize) -> RecordBatch {
+    let ids: Vec<i64> = (1..=rows as i64).collect();
+    let tokens: Vec<String> = ids.iter().map(|&id| format!("{id:0>100}")).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(HIGH_CARD_COL, DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(tokens)),
+        ],
+    )
+    .expect("high_card_probe RecordBatch construction is infallible")
+}
+
 /// Apply a column rename to an existing table via a raw Iceberg REST commit.
 ///
 /// A rename is expressed as `add-schema` (a new schema whose renamed field keeps

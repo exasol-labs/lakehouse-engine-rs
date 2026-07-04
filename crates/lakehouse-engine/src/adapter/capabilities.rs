@@ -120,6 +120,10 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_AGG_MIN",
     "FN_AGG_MAX",
     "FN_AGG_AVG",
+    // Single-group COUNT(DISTINCT col): decomposed into per-shard local distinct
+    // sets, merged by a scalar merge UDF. A COUNT(DISTINCT ...) inside a GROUP BY
+    // request still falls back to row scanning (see pushdown.rs group-by detection).
+    "FN_AGG_COUNT_DISTINCT",
     // Statistical aggregates (decomposed via sufficient statistics)
     "FN_AGG_STDDEV",
     "FN_AGG_STDDEV_POP",
@@ -210,10 +214,13 @@ mod tests {
             detection.plans
         );
 
-        // COUNT(DISTINCT) and join pushdown remain genuinely unsupported.
+        // Single-group COUNT(DISTINCT) is now advertised (issue #56); grouped
+        // COUNT(DISTINCT) still falls back to row scanning via
+        // `pushdown::detect_group_by_aggregates` rejecting `distinct:true`. Join
+        // pushdown remains genuinely unsupported.
         assert!(
-            !cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
-            "FN_AGG_COUNT_DISTINCT must not be advertised"
+            cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
+            "FN_AGG_COUNT_DISTINCT must be advertised: {cap_strs:?}"
         );
         let has_join = cap_strs
             .iter()
@@ -233,7 +240,7 @@ mod tests {
         let caps = resp["capabilities"].as_array().unwrap();
         let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
 
-        // --- additions (incl. AGGREGATE_GROUP_BY_TUPLE, issue #53) ---
+        // --- additions (incl. AGGREGATE_GROUP_BY_TUPLE, issue #53; FN_AGG_COUNT_DISTINCT, issue #56) ---
         for name in &[
             "FN_PRED_LIKE_ESCAPE",
             "FN_PRED_REGEXP_LIKE",
@@ -241,6 +248,7 @@ mod tests {
             "SELECTLIST_EXPRESSIONS",
             "AGGREGATE_HAVING",
             "AGGREGATE_GROUP_BY_TUPLE",
+            "FN_AGG_COUNT_DISTINCT",
         ] {
             assert!(
                 cap_strs.contains(name),
@@ -376,21 +384,15 @@ mod tests {
         }
 
         // Non-decomposable / non-supported aggregates must not appear.
-        for name in &[
-            "FN_AGG_MEDIAN",
-            "FN_AGG_APPROXIMATE_COUNT_DISTINCT",
-            "FN_AGG_COUNT_DISTINCT",
-        ] {
+        // FN_AGG_COUNT_DISTINCT is decomposable (single-group only, issue #56) and
+        // is asserted present above; it is intentionally excluded from this
+        // must-not-appear list.
+        for name in &["FN_AGG_MEDIAN", "FN_AGG_APPROXIMATE_COUNT_DISTINCT"] {
             assert!(
                 !cap_strs.contains(name),
                 "{name} must NOT be advertised: {cap_strs:?}"
             );
         }
-        let has_distinct_agg = cap_strs.iter().any(|c| c.ends_with("_DISTINCT"));
-        assert!(
-            !has_distinct_agg,
-            "*_DISTINCT aggregates must not be advertised: {cap_strs:?}"
-        );
         let has_listagg = cap_strs
             .iter()
             .any(|c| c.contains("LISTAGG") || c.contains("GROUP_CONCAT"));
@@ -468,6 +470,7 @@ mod tests {
             "FN_AGG_MIN",
             "FN_AGG_MAX",
             "FN_AGG_AVG",
+            "FN_AGG_COUNT_DISTINCT",
         ] {
             assert!(
                 cap_strs.contains(name),
@@ -513,10 +516,6 @@ mod tests {
         );
 
         // Unsupported capabilities must NOT be advertised.
-        assert!(
-            !cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
-            "FN_AGG_COUNT_DISTINCT must not be advertised"
-        );
         let has_join = cap_strs
             .iter()
             .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
@@ -526,5 +525,29 @@ mod tests {
         assert!(cap_strs.contains(&"SELECTLIST_PROJECTION"));
         assert!(cap_strs.contains(&"FILTER_EXPRESSIONS"));
         assert!(cap_strs.contains(&"LIMIT"));
+    }
+
+    /// Scenario: Adapter advertises `FN_AGG_COUNT_DISTINCT` for single-group
+    /// `COUNT(DISTINCT col)` pushdown (issue #56).
+    ///
+    /// A `COUNT(DISTINCT ...)` inside a GROUP BY request still falls back to row
+    /// scanning via `pushdown::detect_group_by_aggregates` rejecting
+    /// `distinct:true`; that behavior is covered separately in
+    /// `adapter::pushdown`'s `grouped_count_distinct_falls_back_to_row_scan`. This
+    /// test only guards the capability advertisement.
+    #[test]
+    fn capabilities_advertise_count_distinct() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        assert!(
+            cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
+            "FN_AGG_COUNT_DISTINCT must be advertised: {cap_strs:?}"
+        );
+        assert!(
+            cap_strs.contains(&"AGGREGATE_SINGLE_GROUP"),
+            "single-group COUNT(DISTINCT) requires AGGREGATE_SINGLE_GROUP: {cap_strs:?}"
+        );
     }
 }
