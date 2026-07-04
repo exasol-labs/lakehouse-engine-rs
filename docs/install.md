@@ -166,7 +166,6 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 | `DATAFUSION_THREADS_PER_UDF` | no | DataFusion worker threads per UDF instance |
 | `MEMORY_POOL_FRACTION` | no | Fraction of the per-instance memory limit given to the DataFusion pool |
 | `INSTANCE_OVERHEAD_MB` | no | Reserved non-pool overhead per instance, in MB |
-| `CONNECTION_NAME` | no | Connect-back CONNECTION used to capture the cluster node count |
 
 ## 7. Query
 

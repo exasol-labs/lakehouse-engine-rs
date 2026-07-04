@@ -86,10 +86,12 @@ finishes early — no node sits idle waiting on a slow shard.
 | Column projection — scan only projected columns | Validate returned columns vs. the EMITS list |
 | Filter predicates — Iceberg file pruning + row-group/page skipping + full row-level filter | Re-check only predicates the VS couldn't translate |
 | `LIMIT` — stop the scan early per shard | Re-apply `LIMIT` as a cross-shard backstop |
-| Partial aggregate — node-local `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, and per-group partials for `GROUP BY` | Merge partials: `SUM` of counts/sums, `MIN`/`MAX` of extrema, `SUM(sum)/SUM(count)` for `AVG`, re-group on the user keys |
-| — | `ORDER BY`, `HAVING` final pass, `COUNT(DISTINCT)`/`MEDIAN`/`LISTAGG`, joins across virtual tables |
+| Partial aggregate — node-local `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` over a column or scalar expression, per-group partials for `GROUP BY`, and single-group `COUNT(DISTINCT)` as a per-shard local distinct set | Merge partials: `SUM` of counts/sums, `MIN`/`MAX` of extrema, `SUM(sum)/SUM(count)` for `AVG`, re-group on the user keys; a scalar UDF unions `COUNT(DISTINCT)` sets |
+| — | `ORDER BY`, `HAVING` final pass, grouped `COUNT(DISTINCT)`/`MEDIAN`/`LISTAGG`, joins across virtual tables |
 
 Aggregates decompose into partial/merge so each node ships one partial row per group, not raw
-rows — minimizing transfer. Non-decomposable ones (`COUNT(DISTINCT)`, `MEDIAN`, `LISTAGG`) run
-in Exasol on returned rows. Joins aren't pushed: Exasol scans each table independently, then
+rows — minimizing transfer. Single-group `COUNT(DISTINCT)` decomposes too: each shard emits its
+local distinct set (JSON-encoded), merged by a dedicated scalar UDF. Grouped `COUNT(DISTINCT)`,
+`MEDIAN`, and `LISTAGG` remain non-decomposable and run in Exasol on returned rows. Joins aren't
+pushed: Exasol scans each table independently, then
 joins the result sets. Full list: [Capabilities](capabilities.md).

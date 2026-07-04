@@ -20,7 +20,6 @@ All are `CREATE VIRTUAL SCHEMA` properties unless noted, resolved once at
 | `ICEBERG_NAMESPACE` | yes | — | Iceberg namespace; every table in it is exposed as a virtual table. |
 | `SCAN_SCHEMA` | yes | — | Schema holding the `LAKEHOUSE_SCAN` SET script. |
 | `ALLOW_HTTP` | no | `false` | `'true'` permits plain-HTTP catalog/S3 (e.g. local MinIO). |
-| `CONNECTION_NAME` | no | — | Connect-back CONNECTION used to capture `NPROC()` (node count). Absent ⇒ node count defaults to 1. |
 | `NR_OF_CORES` | no | auto-detected (else 0) | Per-node core count; drives the parallelism factor and thread budget. Override only if auto-detection is wrong. |
 | `PARALLELISM_FACTOR` | no | `max(NR_OF_CORES × 2, 8)` | Shard oversubscription multiplier. `G = node_count × factor`, capped 300. |
 | `DATAFUSION_THREADING_MODE` | no | `AUTO` | `AUTO` derives a non-oversubscribing per-instance thread budget; `FIXED` uses the two properties below verbatim. |
@@ -38,7 +37,7 @@ per-instance limit is reported as 0 (unknown), a conservative default budget is 
 **Quick recommendation:** for read-bound remote scans, set
 `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<NR_OF_CORES>'`,
 `DATAFUSION_TARGET_PARTITIONS='<NR_OF_CORES>'` — ~39 % faster than the `AUTO` default on a full
-scan. See [Performance](performance.md#thread-sweep-nr_of_cores--4).
+scan. See [Performance](performance.md).
 
 ### `S3_MAX_CONNECTIONS`
 
@@ -74,7 +73,7 @@ touch DataFusion's `target_partitions` — that remains the threading knob's job
 this cluster's bottleneck was not connection-pool warmth. It remains a legitimate knob to try
 on a deployment with a different network profile (e.g. genuinely connection-churn-bound rather
 than latency-bound), but do not expect it to be the lever that closes a native-`IMPORT` gap. See
-[Performance](performance.md#native-import-parity-goal) for the full sweep results.
+[Performance](performance.md).
 
 ## Telemetry
 
