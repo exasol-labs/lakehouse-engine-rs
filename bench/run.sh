@@ -403,6 +403,40 @@ run_query "Q9b wide projection (all 16 lineitem columns, full scan)" \
         SUM(LENGTH(L_COMMENT))
  FROM ${VS}.LINEITEM"
 
+# ---- NQ1-NQ5: added to close the arithmetic-aggregate-pushdown gap + probe LIKE/IN filters,
+# ORDER BY+LIMIT, a 4-way join, and GROUP BY+HAVING (add-arithmetic-aggregate-pushdown-and-
+# benchmark-suite). Identical SQL (dialect-adjusted) in bench/athena_compare.sh,
+# bench/trino_compare.sh, deploy/scripts/spark_queries.py — keep all four in sync if you edit one.
+
+run_query "NQ1 revenue query (TPC-H Q6 shape; arithmetic aggregate pushdown target)" \
+"SELECT SUM(L_EXTENDEDPRICE * L_DISCOUNT) AS revenue
+ FROM ${VS}.LINEITEM
+ WHERE L_SHIPDATE >= DATE '1994-01-01' AND L_SHIPDATE < DATE '1995-01-01'
+   AND L_DISCOUNT BETWEEN 0.05 AND 0.07 AND L_QUANTITY < 24"
+
+run_query "NQ2 LIKE + IN filter (comment pattern match)" \
+"SELECT COUNT(*) FROM ${VS}.LINEITEM
+ WHERE L_SHIPMODE IN ('AIR','REG AIR') AND L_COMMENT LIKE '%late%'"
+
+run_query "NQ3 part x partsupp x supplier x nation (4-way join + filter)" \
+"SELECT COUNT(*) AS cnt, SUM(ps.PS_SUPPLYCOST) AS total_cost
+ FROM ${VS}.PART p
+ JOIN ${VS}.PARTSUPP ps ON p.P_PARTKEY = ps.PS_PARTKEY
+ JOIN ${VS}.SUPPLIER s ON ps.PS_SUPPKEY = s.S_SUPPKEY
+ JOIN ${VS}.NATION n ON s.S_NATIONKEY = n.N_NATIONKEY
+ WHERE p.P_SIZE = 15 AND p.P_TYPE LIKE '%BRASS%' AND n.N_NAME = 'GERMANY'"
+
+run_query "NQ4 top-N by price (ORDER BY + LIMIT)" \
+"SELECT L_ORDERKEY, L_EXTENDEDPRICE FROM ${VS}.LINEITEM
+ ORDER BY L_EXTENDEDPRICE DESC LIMIT 20"
+
+run_query "NQ5 orders GROUP BY + HAVING (high-cardinality group filter)" \
+"SELECT O_ORDERPRIORITY, O_ORDERSTATUS, COUNT(*) AS cnt, AVG(O_TOTALPRICE) AS avg_price
+ FROM ${VS}.ORDERS
+ GROUP BY O_ORDERPRIORITY, O_ORDERSTATUS
+ HAVING COUNT(*) > 1000000
+ ORDER BY O_ORDERPRIORITY, O_ORDERSTATUS"
+
 # ---- pushdown analysis: confirm projection/filter/limit + shard fan-out ------
 # EXPLAIN VIRTUAL is introspection (not a timed query): it prints the scan spec the
 # adapter generates. Assert the expected elements are actually pushed into the scan.
@@ -457,6 +491,29 @@ pushdown_check "Q9b mixed expression + COUNT(DISTINCT) aggregate pushdown" \
           SUM(LENGTH(L_COMMENT))
    FROM ${VS}.LINEITEM" \
   "aggregates" "countdistinct" "arg_expr"
+# NQ1: SUM over a two-column binary-arithmetic argument (add-arithmetic-aggregate-pushdown-and-
+# benchmark-suite, Group A). Before that feature lands this collapses to a raw 2-column row-scan
+# fallback (no "aggregates"/"arg_expr" in the scan spec) — this check documents the TARGET
+# behavior and is expected to FAIL until Group A (capability advertisement + operator-name
+# reconciliation + expression-argument SUM type derivation) merges. Do not weaken it to pass early.
+pushdown_check "NQ1 arithmetic aggregate pushdown (SUM(L_EXTENDEDPRICE * L_DISCOUNT))" \
+  "SELECT SUM(L_EXTENDEDPRICE * L_DISCOUNT) AS revenue FROM ${VS}.LINEITEM
+   WHERE L_SHIPDATE >= DATE '1994-01-01' AND L_SHIPDATE < DATE '1995-01-01'
+     AND L_DISCOUNT BETWEEN 0.05 AND 0.07 AND L_QUANTITY < 24" \
+  "aggregates" "arg_expr"
+# NQ2: LIKE + IN predicates reach the scan spec's filter.
+pushdown_check "NQ2 LIKE + IN filter pushdown" \
+  "SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPMODE IN ('AIR','REG AIR') AND L_COMMENT LIKE '%late%'" \
+  "filter" "LIKE" "REG AIR"
+# NQ4: ORDER BY + LIMIT pushed as a per-shard bounded top-N + Exasol-side merge
+# (add-topn-pushdown). Before that feature this collapses to a bare, unlimited
+# 2-column raw scan (no "order_by" key, no "limit" in the common spec) — Exasol
+# sorts/limits the whole table itself. After the feature the pushed common spec
+# carries an "order_by" key AND a "limit", and the outer merge SQL also renders
+# its own final "ORDER BY ... LIMIT" (self-contained per decision [5]).
+pushdown_check "NQ4 top-N (ORDER BY + LIMIT) pushdown" \
+  "SELECT L_ORDERKEY, L_EXTENDEDPRICE FROM ${VS}.LINEITEM ORDER BY L_EXTENDEDPRICE DESC LIMIT 20" \
+  "order_by" "LIMIT"
 
 # ---- remote-only best-effort PROFILE dump ------------------------------------
 if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then

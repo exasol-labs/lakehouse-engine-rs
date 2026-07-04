@@ -852,6 +852,287 @@ fn sum_length_expression_argument_pushed_down() {
     );
 }
 
+/// Runs `EXPLAIN VIRTUAL` for a query and returns the pushed SQL text (the
+/// `LAKEHOUSE_SCAN` scan-spec JSON embedded in the plan), for callers that need
+/// to inspect it for more than the single `aggregates`-field check that
+/// [`assert_single_group_aggregate_pushed_down`] performs (e.g. also asserting
+/// `arg_expr` is present, or that `aggregates` is absent for a fallback check).
+fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
+    let resp = conn.execute(&explain_sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+    cols.iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `SUM(id * score)` — a SUM over a two-column binary-arithmetic argument
+/// (the NQ1 / TPC-H Q6 shape: `SUM(L_EXTENDEDPRICE * L_DISCOUNT)` with a
+/// date-range + BETWEEN + comparison filter) — is pushed down as a decomposed
+/// node-local partial/merge aggregate (`aggregates` + `arg_expr` in the scan
+/// spec), and the merged result across shards matches the value a single,
+/// undecomposed full-table scan would compute.
+///
+/// The `events` table is seeded across TWO Iceberg data files (ids 1..=10,
+/// 11..=20; see `common/seed.rs`), so this filter range is chosen to
+/// deliberately straddle both shards — proving the per-shard partial SUM of
+/// the product, merged back together, is not just plan-shape-correct but
+/// numerically correct across a shard boundary.
+///
+/// Filter shape mirrors NQ1 (`bench/run.sh`): a date range on `event_date`
+/// (mirrors `L_SHIPDATE`), a `BETWEEN` on `score` (mirrors `L_DISCOUNT`, which
+/// is also a product operand — same as NQ1), and a `<=` comparison on `id`
+/// (mirrors `L_QUANTITY <`).
+///
+/// Seeded data: `score = 5.0 * id`. `event_date >= '2024-01-05' AND
+/// event_date < '2024-01-15'` selects ids 5..=14; `score BETWEEN 30.0 AND
+/// 60.0` narrows to ids 6..=12; `id <= 12` is redundant (shape parity with
+/// NQ1's extra predicate). The "single-node" ground truth for `SUM(id *
+/// score)` over ids 6..=12 is `SUM(5 * id^2)` for id in 6..=12 = `5 * (36 +
+/// 49 + 64 + 81 + 100 + 121 + 144)` = `5 * 595` = `2975.0` — computed here as
+/// a closed form, i.e. exactly what a single, undecomposed scan of all
+/// matching rows would sum to, with no partial/merge step involved.
+#[test]
+fn sum_two_column_product_pushes_down_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUM(id * score) AS revenue FROM {} \
+         WHERE event_date >= DATE '2024-01-05' AND event_date < DATE '2024-01-15' \
+           AND score BETWEEN 30.0 AND 60.0 AND id <= 12",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("aggregates"),
+        "SUM(id * score) must push down as an 'aggregates' plan (two-column \
+         arithmetic aggregate pushdown), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("arg_expr"),
+        "SUM(id * score) must carry the rendered product in 'arg_expr' (not a \
+         bare source column), proving the SUM is decomposed rather than \
+         falling back to a raw two-column row scan, got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM (SELECT"),
+        "SUM(id * score) must not fall back to a raw row-scan \
+         ('SELECT * FROM (SELECT ...)'), got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected 1 row: {cols:?}");
+
+    let revenue = parse_numeric(&cols[0][0]);
+    let expected = 2975.0;
+    assert!(
+        (revenue - expected).abs() < 0.001,
+        "SUM(id * score) over ids 6..=12 must be {expected} (matching a \
+         single, undecomposed full-scan evaluation), got {revenue}"
+    );
+}
+
+/// Regression check: an aggregate argument the VS expression translator
+/// genuinely cannot render must still decline aggregate pushdown and fall
+/// back to row scanning — proving the new arithmetic-pushdown capability
+/// (`FN_ADD`/`FN_SUB`/`FN_MULT`/`FN_FLOAT_DIV`) did not accidentally widen
+/// what counts as "translatable" in a way that breaks this safety net.
+///
+/// `BIT_AND` is a real Exasol scalar function (bitwise AND over two numeric
+/// values, see Exasol SQL reference) with no `vs-expression` translation arm
+/// — `render_expression_inner`'s `function_scalar` match falls through to its
+/// `other => Err("unsupported scalar function: ...")` arm, so `SUM(BIT_AND(id,
+/// 7))`'s argument cannot be rendered and the whole aggregate declines
+/// pushdown (`arg_column_or_expr` returns `None`).
+///
+/// The row-scan fallback must still compute the correct answer: seeded
+/// `id` runs 1..=20, so `id & 7` cycles `1,2,3,4,5,6,7,0` twice (ids 1..=8,
+/// 9..=16, each summing to 28) plus a partial cycle for ids 17..=20
+/// (`1+2+3+4` = 10), for a total of `28 + 28 + 10` = `66`.
+#[test]
+fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT SUM(BIT_AND(id, 7)) FROM {}", vs_table());
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed_sql.contains("aggregates"),
+        "SUM(BIT_AND(id, 7)) has an untranslatable argument (BIT_AND has no \
+         vs-expression translation arm) and must decline aggregate pushdown \
+         (no 'aggregates' field in the scan spec), got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected 1 row: {cols:?}");
+
+    let sum = parse_int(&cols[0][0]);
+    assert_eq!(
+        sum, 66,
+        "SUM(BIT_AND(id, 7)) computed by Exasol over the row-scan fallback \
+         must be 66, got {sum}"
+    );
+}
+
+/// `ORDER BY score DESC LIMIT 12` — a bare, projected sort column with a LIMIT
+/// (the NQ4 / TPC-H top-N shape: `ORDER BY L_EXTENDEDPRICE DESC LIMIT 20`) — is
+/// pushed down as a decomposed per-shard bounded top-N plus an Exasol-side
+/// merge (`order_by` in the scan spec, `ORDER BY … LIMIT` in both the per-shard
+/// and outer merge SQL), and the merged result matches what a single, full
+/// scan + sort + limit would produce.
+///
+/// The `events` table is seeded across TWO Iceberg data files (ids 1..=10,
+/// 11..=20; see `common/seed.rs`). `LIMIT 12` is chosen deliberately so the
+/// top-12 by score DESC (ids 20..=9) straddles BOTH files — ids 9 and 10 come
+/// from the first file, ids 11..=20 from the second — proving the per-shard
+/// bounded top-N, merged back together, is not just plan-shape-correct but
+/// also correct across a real shard boundary (not merely a single shard's own
+/// local top-N happening to be the global answer).
+///
+/// Seeded data: `score = 5.0 * id` for id in 1..=20, so score is strictly
+/// increasing in id — the top-12 by score DESC is exactly ids 20,19,...,9, in
+/// that descending order, with score = 5.0 * id for each row.
+#[test]
+fn ordered_topn_pushes_down_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, score FROM {} ORDER BY score DESC LIMIT 12",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    // `EXPLAIN VIRTUAL`'s output also echoes Exasol's incoming `pushdownRequest`,
+    // whose `orderBy` element carries a literal `"order_by_element"` type tag —
+    // that string is present for ANY ORDER-BY-carrying query, matched or not, so
+    // a bare `contains("order_by")` would be a false positive here. The precise,
+    // field-shaped marker `"order_by":` only appears in the ADAPTER'S OWN emitted
+    // scan-spec JSON (`"order_by":[{"column":"SCORE",...}]`), which is present
+    // only when `detect_topn` actually matched.
+    assert!(
+        pushed_sql.contains("\"order_by\":"),
+        "ORDER BY score DESC LIMIT 12 over a projected column must push down \
+         as an 'order_by' top-N plan in the scan spec, got:\n{pushed_sql}"
+    );
+    // The outer merge ORDER BY is self-contained (decision [5]): spliced directly
+    // after the shard fan-out's closing paren, not left to an Exasol backstop.
+    assert!(
+        pushed_sql.contains("GROUP BY shard_key) ORDER BY"),
+        "pushed SQL must carry a self-contained outer ORDER BY immediately \
+         after the shard fan-out, got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("LIMIT 12"),
+        "pushed SQL must carry a LIMIT 12 clause bounding the top-N (not an \
+         unlimited raw scan), got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        12,
+        "expected exactly 12 rows from LIMIT 12: {cols:?}"
+    );
+
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let scores: Vec<f64> = cols[1].iter().map(parse_numeric).collect();
+
+    let expected_ids: Vec<i64> = (9..=20).rev().collect();
+    assert_eq!(
+        ids, expected_ids,
+        "top-12 ids by score DESC must be {expected_ids:?} (matching a \
+         single, undecomposed full scan + sort + limit), got {ids:?}"
+    );
+    for (i, &id) in ids.iter().enumerate() {
+        let expected_score = 5.0 * id as f64;
+        assert!(
+            (scores[i] - expected_score).abs() < 1e-9,
+            "row {i}: score for id {id} must be {expected_score}, got {}",
+            scores[i]
+        );
+    }
+}
+
+/// Regression check: `ORDER BY score DESC` with NO `LIMIT` must decline the
+/// ordered-top-N pushdown — `detect_topn` requires a `limit` to be present
+/// (decision: the shape is "single table, no GROUP BY/aggregates/HAVING,
+/// limit present with no offset, ...") — and fall back to the pre-existing
+/// plan, relying on Exasol's own backstop `ORDER BY` for correctness. This
+/// proves the new top-N capability did not silently widen what counts as
+/// "matched" in a way that breaks the existing, unchanged fallback behavior
+/// for a plain (unbounded) sort.
+///
+/// Confirmed live (see below) that this decline shape IS safe today: when
+/// Exasol's pushdown request carries `orderBy` but no `limit` at all (because
+/// the query has no LIMIT), Exasol keeps its own top-level `ORDER BY` operator
+/// and re-sorts the adapter's returned (unsorted) rows itself — unlike the
+/// `orderBy` + `limit`-together case, where Exasol fully delegates both to the
+/// returned SQL and does not re-apply either if the adapter declines. (That
+/// latter shape — `ORDER BY <unprojected column> LIMIT n` — was verified live
+/// during this task to return WRONG, unsorted/unbounded results today because
+/// the withheld-limit fallback assumes an Exasol backstop that does not
+/// actually run once `ORDER_BY_COLUMN` is advertised; see the decision log /
+/// review notes for `add-topn-pushdown` B5 — this is a real gap in B3/B3b's
+/// "withhold the limit, Exasol re-applies" invariant, tracked separately from
+/// this regression test, which intentionally exercises a shape that IS safe.)
+///
+/// Same seeded data as the match case: the fallback's answer must still be
+/// every id, fully sorted by score DESC (20,19,...,1).
+#[test]
+fn order_by_without_limit_falls_back_correctly() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT id, score FROM {} ORDER BY score DESC", vs_table());
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    // Use the precise field-shaped marker (see the comment in
+    // `ordered_topn_pushes_down_matches_single_node`): a bare `contains("order_by")`
+    // would false-positive on Exasol's echoed `pushdownRequest.orderBy[].type ==
+    // "order_by_element"`, which is present for ANY ORDER-BY query regardless of
+    // whether the adapter's own scan spec ends up carrying an `order_by` field.
+    assert!(
+        !pushed_sql.contains("\"order_by\":"),
+        "ORDER BY with no LIMIT must decline the ordered-top-N pushdown \
+         (no 'order_by' field in the scan spec; a limit is required to \
+         match), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("\"limit\":"),
+        "ORDER BY with no LIMIT must not synthesize a limit in the scan \
+         spec, got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        20,
+        "no LIMIT means all 20 rows must be returned: {cols:?}"
+    );
+
+    // Exasol must re-apply the ORDER BY itself (the adapter's returned SQL
+    // carries no ORDER BY when the shape is unmatched) — all 20 ids in
+    // descending score order.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let expected_ids: Vec<i64> = (1..=20).rev().collect();
+    assert_eq!(
+        ids, expected_ids,
+        "ORDER BY score DESC (no LIMIT, fallback path) must return all ids \
+         in descending order {expected_ids:?}, got {ids:?}"
+    );
+}
+
 /// After createVirtualSchema the CLUSTER_NODES count is recorded in the schema's
 /// adapterNotes and is >= 1.
 ///

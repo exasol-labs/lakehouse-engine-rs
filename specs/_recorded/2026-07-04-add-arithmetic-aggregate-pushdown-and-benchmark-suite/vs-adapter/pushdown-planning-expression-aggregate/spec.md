@@ -55,6 +55,7 @@ column to Exasol.
 * *THEN* the adapter SHALL produce the identical partial EMITS clause, per-shard partial SQL, and outer merge SELECT it produced before expression-argument support was added
 * *AND* the merged result SHALL equal the same aggregate evaluated over all rows on a single node
 
+<!-- DELTA:NEW -->
 ### Scenario: SUM over a two-column binary-arithmetic argument is pushed down
 
 * *GIVEN* a virtual schema over an Iceberg table backed by MinIO
@@ -72,3 +73,4 @@ column to Exasol.
 * *THEN* the adapter SHALL derive the partial column's Exasol type from the SUM item's declared result type in `selectListDataTypes` at that select-list ordinal — never from either source column's type
 * *AND* when that declared result type is a DECIMAL the adapter SHALL widen the partial column to `DECIMAL(36,s)` (preserving scale `s`, capping precision at Exasol's maximum 36) so per-shard partial sums of the product do not overflow mid-merge
 * *AND* the derived partial and merge types SHALL remain within Exasol's `DECIMAL(p<=36, s<=36)` limits
+<!-- /DELTA:NEW -->

@@ -1,6 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, LogicalField, ScanSpec, StorageProps,
+    AggKind, AggregatePlan, CatalogProps, LogicalField, ProjectionItem, ScanSpec, SortKey,
+    StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -1174,7 +1175,7 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 pub fn build_scan_driving_sql(
     spec_template: &ScanSpec,
     shards: &[Vec<(String, u64)>],
-    proj_cols: &[String],
+    proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
     col_types: &[(String, String)],
@@ -1205,10 +1206,22 @@ pub fn build_scan_driving_sql(
 }
 
 /// Build the row-scan SQL (no aggregates).
+///
+/// ## Ordered top-N
+///
+/// When `spec_template.order_by` is non-empty the query is a matched ordered
+/// top-N: the outer wrapper carries `ORDER BY <keys> LIMIT n` so the returned SQL
+/// is self-contained (it does not depend on Exasol re-applying the ordering). Each
+/// shard's common blob carries the SAME `order_by` keys (and `limit`), which the
+/// scan UDF renders as a per-shard bounded `ORDER BY … LIMIT n` (a DataFusion
+/// TopK). The outer merge `ORDER BY` and the per-shard `ORDER BY` render through
+/// the one shared [`render_order_by_clause`] seam, so they agree on direction and
+/// NULL placement — the correctness-critical invariant. `order_by` is empty for
+/// plain (unordered) row scans, leaving that path byte-identical to before.
 fn build_row_scan_sql(
     spec_template: &ScanSpec,
     shards: &[Vec<(String, u64)>],
-    proj_cols: &[String],
+    proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
     udf_name: &str,
@@ -1216,33 +1229,41 @@ fn build_row_scan_sql(
     let emits = proj_cols
         .iter()
         .zip(proj_types.iter())
-        .map(|(name, ty)| format!("{} {}", quote_ident(name), ty))
+        .map(|(item, ty)| format!("{} {}", quote_ident(item.emit_name()), ty))
         .collect::<Vec<_>>()
         .join(", ");
 
-    if shards.len() == 1 {
+    // Outer merge ORDER BY, rendered once (empty when not a matched top-N). SQL
+    // requires ORDER BY before LIMIT, so it is appended ahead of the LIMIT clause.
+    let order_by = if spec_template.order_by.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ORDER BY {}",
+            render_order_by_clause(&spec_template.order_by)
+        )
+    };
+
+    let inner = if shards.len() == 1 {
         let files = &shards[0];
         let common_literal = sql_string_literal(&spec_template.to_common_json());
         let files_literal = sql_string_literal(&ScanSpec::files_json(files));
-        let mut sql = format!(
-            "SELECT * FROM (SELECT {udf}({common}, {files}) EMITS ({emits}))",
+        format!(
+            "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
             common = common_literal,
             files = files_literal,
             emits = emits,
-        );
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
-        sql
+        )
     } else {
-        let inner = build_fan_out_inner(spec_template, shards, &emits, udf_name);
-        let mut sql = format!("SELECT * FROM ({inner})");
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
-        sql
+        build_fan_out_inner(spec_template, shards, &emits, udf_name)
+    };
+
+    let mut sql = format!("SELECT * FROM ({inner}){order_by}");
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
     }
+    sql
 }
 
 /// Build the aggregate scan SQL: fan-out EMITS partial columns, outer merge aggregates them.
@@ -1313,8 +1334,80 @@ fn build_aggregate_scan_sql(
 ///
 /// LIMIT is never pushed into a shard spec for grouped queries (shard emits all
 /// partial groups; the outer wrapper applies the final LIMIT when needed).
-// ponytail: 8 args is one over the lint threshold; grouping into a struct would
-// add boilerplate for a function called in only two places. Suppress the lint.
+/// Build the explicit final `ORDER BY` element list for a grouped-aggregate merge.
+///
+/// Once `ORDER_BY_COLUMN` is advertised Exasol delegates the ORDER BY and no longer
+/// re-sorts the grouped rows the adapter returns (add-topn-pushdown B6), so the merge
+/// SQL must sort itself. The outer wrapper's output columns are the stringified
+/// `GK_*` staging columns re-cast to their declared types and the merged aggregates —
+/// NOT the source column names — so each sort key is rendered as a POSITIONAL output
+/// ordinal (`ORDER BY 1 ...`). The ordinal references the type-cast output expression
+/// (e.g. `CAST("GK_0" AS DECIMAL(20,0))`), so it sorts on the native value, never the
+/// lexicographic VARCHAR `GK_*` staging column (a plain `ORDER BY "GK_0"` would sort
+/// `1,10,11,2,…`, corrupting a numeric order).
+///
+/// Each bare-column sort key must map to a group key (a bare-column `ORDER BY` in a
+/// GROUP BY query is only legal on a grouped column). It is matched to its group-key
+/// slot exactly as `detect_group_by_aggregates` matches select items (rendered-SQL
+/// equality), then to that group key's `selectList` ordinal (its output position,
+/// since the outer SELECT is assembled in `selectList` order with no gaps). Returns
+/// `None` when there is no `orderBy`, and the caller declines the pushdown when a key
+/// is present but cannot be resolved to a grouped output column — a shape SQL forbids.
+fn build_grouped_order_by_clause(
+    pushdown_req: &Json,
+    group_keys: &[String],
+    select_items: &[GroupedSelectItem],
+) -> Option<GroupedOrderBy> {
+    let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
+    if elements.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(elements.len());
+    for element in elements {
+        let key = match parse_sort_key_element(element) {
+            Some(k) => k,
+            None => return Some(GroupedOrderBy::Unresolvable),
+        };
+        let rendered = match element
+            .get("expression")
+            .and_then(|e| render_expression(e).ok())
+        {
+            Some(r) => r,
+            None => return Some(GroupedOrderBy::Unresolvable),
+        };
+        let slot = match group_keys.iter().position(|gk| *gk == rendered) {
+            Some(s) => s,
+            None => return Some(GroupedOrderBy::Unresolvable),
+        };
+        // Output position of this group key = its selectList ordinal (1-based for SQL).
+        let select_index = select_items.iter().find_map(|it| match it {
+            GroupedSelectItem::GroupKey {
+                group_key_slot,
+                select_index,
+            } if *group_key_slot == slot => Some(*select_index),
+            _ => None,
+        });
+        match select_index {
+            Some(idx) => parts.push(key.render_ordered(&(idx + 1).to_string())),
+            None => return Some(GroupedOrderBy::Unresolvable),
+        }
+    }
+    Some(GroupedOrderBy::Clause(parts.join(", ")))
+}
+
+/// Outcome of resolving a grouped-aggregate merge `ORDER BY` (see
+/// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key that
+/// cannot be mapped to a grouped output column — the caller declines the pushdown
+/// (native retry) rather than emitting a merge that silently drops the ordering.
+#[derive(Debug, PartialEq, Eq)]
+enum GroupedOrderBy {
+    Clause(String),
+    Unresolvable,
+}
+
+// ponytail: well over the lint threshold now, but the function is called in only
+// two places and every argument is a distinct, already-resolved plan input (no
+// natural sub-grouping) — a params struct would just rename the boilerplate.
 #[allow(clippy::too_many_arguments)]
 pub fn build_grouped_aggregate_scan_sql(
     spec_template: &ScanSpec,
@@ -1329,6 +1422,7 @@ pub fn build_grouped_aggregate_scan_sql(
     udf_name: &str,
     merge_udf_name: &str,
     having: Option<&str>,
+    order_by: Option<&str>,
 ) -> String {
     // Build EMITS: GK_* columns first, then PARTIAL_* columns.
     let gk_emits: Vec<String> = (0..group_keys.len())
@@ -1414,6 +1508,14 @@ pub fn build_grouped_aggregate_scan_sql(
     if let Some(h) = having.filter(|h| !h.is_empty()) {
         sql.push_str(" HAVING ");
         sql.push_str(h);
+    }
+
+    // Explicit merge ORDER BY (add-topn-pushdown B6): SQL requires it after HAVING
+    // and before LIMIT. Rendered as positional output ordinals so it sorts the
+    // type-cast output, not the lexicographic VARCHAR GK_* staging columns.
+    if let Some(ob) = order_by.filter(|s| !s.is_empty()) {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(ob);
     }
 
     if let Some(n) = limit {
@@ -1963,6 +2065,12 @@ pub async fn handle_pushdown(
 
     let limit = extract_limit(&pushdown_req);
 
+    // Whether Exasol pushed an ORDER BY. Drives the anti-wrong-truncation guard
+    // (decision [4]): a limit is withheld from every ORDER-BY-carrying request the
+    // adapter does not match as a bounded top-N, so a bare per-shard/outer LIMIT is
+    // never emitted ahead of an ordering the adapter did not itself render.
+    let has_order_by = order_by_present(&pushdown_req);
+
     let col_types = extract_all_column_types(request);
 
     // Resolve file list exactly once. The returned `effective_storage` carries
@@ -2062,13 +2170,40 @@ pub async fn handle_pushdown(
                 }
                 None => None,
             };
-            // Grouped aggregate pushdown path.
+            // Grouped aggregate pushdown path. Once ORDER_BY_COLUMN is advertised,
+            // Exasol delegates any ORDER BY on the grouped output and NO LONGER
+            // re-sorts the rows the adapter returns (add-topn-pushdown B6), so the
+            // merge SQL must render its own explicit final ORDER BY over the grouped
+            // output columns. Resolve it now: a pushed sort key that cannot be mapped
+            // to a grouped output column is a shape SQL forbids — decline the pushdown
+            // (native retry) rather than emit an unsorted merge.
+            let grouped_order_by =
+                match build_grouped_order_by_clause(&pushdown_req, &group_keys, &select_items) {
+                    Some(GroupedOrderBy::Clause(clause)) => Some(clause),
+                    Some(GroupedOrderBy::Unresolvable) => {
+                        return Err(UdfError::User(
+                            "grouped aggregate pushdown declined: ORDER BY references a \
+                         column that is not a grouped output column; Exasol will \
+                         retry natively"
+                                .into(),
+                        ));
+                    }
+                    None => None,
+                };
+            // With the ordering now rendered explicitly, the outer LIMIT is a true
+            // global top-N over the merged groups, so it is safe to apply. When there
+            // is no ORDER BY it stays a plain grouped LIMIT (unchanged). The per-shard
+            // partial scan still never carries a LIMIT (the fan-out common blob is
+            // rebuilt with `limit = None`), preserving the anti-wrong-truncation
+            // invariant (decision [4]).
+            let grouped_limit = limit;
             let spec_template = ScanSpec {
                 table_root: table_root.clone(),
                 files: vec![],
                 projection: proj_cols.clone(),
                 filter,
-                limit,
+                limit: grouped_limit,
+                order_by: Vec::new(),
                 aggregates: Some(grouped_agg_plans.clone()),
                 group_keys: Some(group_keys.clone()),
                 // Aggregate scans emit via the freely-coercing Value path, not the
@@ -2093,11 +2228,12 @@ pub async fn handle_pushdown(
                 &grouped_agg_plans,
                 &aggregate_types,
                 &select_items,
-                limit,
+                grouped_limit,
                 &col_types,
                 &udf_name,
                 &merge_udf_name,
                 having.as_deref(),
+                grouped_order_by.as_deref(),
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         } // end else (validate_agg_col_types passed)
@@ -2109,12 +2245,34 @@ pub async fn handle_pushdown(
     let aggregates =
         detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
 
+    // Ordered top-N applies ONLY to the pure row-scan path (no aggregates). On a
+    // match the sort keys are carried into the common blob (per-shard bounded sort)
+    // and the outer wrapper renders `ORDER BY … LIMIT n`.
+    let topn = if aggregates.is_none() {
+        detect_topn(request, &pushdown_req, &proj_cols, &logical_schema)
+    } else {
+        None
+    };
+    let order_by = topn.unwrap_or_default();
+
+    // Withhold the limit when an ORDER BY is present but the shape is not a matched
+    // top-N (`order_by` empty): never a bare per-shard/outer LIMIT ahead of an
+    // ordering the adapter did not render (decision [4]). A matched top-N keeps the
+    // limit (bounded per-shard sort + outer merge limit); a plain LIMIT-only query
+    // (no ORDER BY) is unchanged.
+    let effective_limit = if has_order_by && order_by.is_empty() {
+        None
+    } else {
+        limit
+    };
+
     let spec_template = ScanSpec {
         table_root,
         files: vec![], // replaced per shard in build_scan_driving_sql
         projection: proj_cols.clone(),
         filter,
-        limit,
+        limit: effective_limit,
+        order_by,
         aggregates,
         group_keys: None,
         // Row-scan EMITS types, positionally aligned with `proj_cols`. The scan
@@ -2138,12 +2296,42 @@ pub async fn handle_pushdown(
         &shards,
         &proj_cols,
         &proj_types,
-        limit,
+        effective_limit,
         &col_types,
         &aggregate_types,
         &udf_name,
         &merge_udf_name,
     );
+
+    // Row-scan DECLINE path (add-topn-pushdown B6): an ORDER BY was pushed but the
+    // shape did not match the bounded top-N (`order_by` empty) — e.g. a sort key
+    // that is unprojected or JSON-fallback-typed, or a bare ORDER BY with no LIMIT.
+    // Once ORDER_BY_COLUMN is advertised Exasol delegates the ordering and NO LONGER
+    // re-applies its own backstop sort/limit on the returned rows, so the adapter
+    // reproduces that former backstop as self-contained SQL: wrap the unbounded
+    // fan-out in a global ORDER BY (plus the original LIMIT, if any). The per-shard
+    // common blob still carries no sort keys and no LIMIT (anti-wrong-truncation
+    // invariant, decision [4]); this is the unoptimized correctness restoration, not
+    // the bounded per-shard top-N.
+    let declined_order_by =
+        has_order_by && spec_template.order_by.is_empty() && spec_template.aggregates.is_none();
+    let sql = if declined_order_by {
+        let keys = parse_order_by_keys(&pushdown_req);
+        if keys.is_empty() {
+            sql
+        } else {
+            let mut wrapped = format!(
+                "SELECT * FROM ({sql}) ORDER BY {}",
+                render_order_by_clause(&keys)
+            );
+            if let Some(n) = limit {
+                wrapped.push_str(&format!(" LIMIT {n}"));
+            }
+            wrapped
+        }
+    } else {
+        sql
+    };
 
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
@@ -2633,7 +2821,7 @@ fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
 fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
-) -> Result<(Vec<String>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
     let involved = request
         .get("involvedTables")
         .and_then(|v| v.as_array())
@@ -2673,18 +2861,26 @@ fn extract_projection(
 
     let first_col_name = all_cols.first().map(|(n, _)| n.clone()).unwrap_or_default();
 
+    // Every column of the base row, each as a bare column reference. Used by the
+    // no-select-list, unknown-node, and untranslatable-item fallbacks so Exasol
+    // has the full row to post-process the query itself.
+    let full_row = || -> (Vec<ProjectionItem>, Vec<String>) {
+        let names = all_cols
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        let types = all_cols.iter().map(|(_, t)| t.clone()).collect();
+        (names, types)
+    };
+
     let select_list = pushdown_req.get("selectList");
-    let (proj_names, proj_types): (Vec<String>, Vec<String>) = match select_list {
-        None | Some(Json::Null) => {
-            let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
-            let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
-            (names, types)
-        }
+    let (proj_names, proj_types): (Vec<ProjectionItem>, Vec<String>) = match select_list {
+        None | Some(Json::Null) => full_row(),
         Some(Json::Array(list)) if list.is_empty() => {
             // Empty select list — project the first column only.
             let name = first_col_name;
             let ty = type_by_upper(&name);
-            (vec![name], vec![ty])
+            (vec![ProjectionItem::Column(name)], vec![ty])
         }
         Some(Json::Array(list)) => {
             // Exasol declares the result type of each selectList item in a parallel
@@ -2714,7 +2910,7 @@ fn extract_projection(
                             .map(|s| s.to_uppercase())
                             .unwrap_or_else(|| first_col_name.clone());
                         let ty = type_by_upper(&name);
-                        names.push(name);
+                        names.push(ProjectionItem::Column(name));
                         types.push(ty);
                     }
                     t if is_literal_selectlist_item(t) => {
@@ -2740,7 +2936,7 @@ fn extract_projection(
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
-                                names.push(sql_frag);
+                                names.push(ProjectionItem::Expr { expr: sql_frag });
                                 let ty = declared_type
                                     .clone()
                                     .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
@@ -2759,28 +2955,22 @@ fn extract_projection(
                 }
             }
             if needs_full_fallback {
-                let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
-                let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
-                (names, types)
+                full_row()
             } else {
                 (names, types)
             }
         }
-        _ => {
-            let names: Vec<String> = all_cols.iter().map(|(n, _)| n.clone()).collect();
-            let types: Vec<String> = all_cols.iter().map(|(_, t)| t.clone()).collect();
-            (names, types)
-        }
+        _ => full_row(),
     };
 
     // Defensive backstop: duplicate EMITS column names are always invalid in Exasol,
-    // regardless of which path produced the projection. Dedup by name, keeping the
-    // first occurrence and its type.
+    // regardless of which path produced the projection. Dedup by the positional EMITS
+    // name, keeping the first occurrence and its type.
     let mut seen = std::collections::HashSet::new();
     let mut deduped_names = Vec::with_capacity(proj_names.len());
     let mut deduped_types = Vec::with_capacity(proj_types.len());
     for (name, ty) in proj_names.into_iter().zip(proj_types) {
-        if seen.insert(name.clone()) {
+        if seen.insert(name.emit_name().to_string()) {
             deduped_names.push(name);
             deduped_types.push(ty);
         }
@@ -2797,12 +2987,192 @@ fn extract_limit(pushdown_req: &Json) -> Option<u64> {
         .and_then(|n| n.as_u64())
 }
 
+/// Whether the pushdown request carries a non-empty `orderBy` array.
+///
+/// Exasol sends `orderBy` only when the adapter advertises an `ORDER_BY_*`
+/// capability AND the query has an ORDER BY it can delegate; it withholds `limit`
+/// entirely when it cannot delegate the ordering (verified live — decision log A1).
+/// So this flag is the trigger for the anti-wrong-truncation guard (decision [4]):
+/// when an `orderBy` is present but the request is not a matched ordered top-N, the
+/// per-shard AND outer `LIMIT` are withheld and Exasol re-applies both clauses.
+fn order_by_present(pushdown_req: &Json) -> bool {
+    pushdown_req
+        .get("orderBy")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Parse ONE `orderBy` element into a bare-column [`SortKey`].
+///
+/// Returns `None` when the element is not a bare `column` node (only
+/// `ORDER_BY_COLUMN` is advertised, so Exasol only ever sends bare-column sort
+/// keys — anything else is an unexpected shape) or when its `isAscending` /
+/// `nullsLast` flags are absent. The column name is uppercased to match the
+/// adapter's canonical identifier casing. This is the SINGLE per-element parser
+/// shared by [`detect_topn`] (which adds projection + JSON-fallback gates on top)
+/// and [`parse_order_by_keys`] (the ungated backstop-restoration parse).
+fn parse_sort_key_element(element: &Json) -> Option<SortKey> {
+    let expr = element.get("expression")?;
+    if expr.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return None;
+    }
+    let column = expr
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_uppercase())?;
+    let ascending = element.get("isAscending").and_then(|b| b.as_bool())?;
+    let nulls_last = element.get("nullsLast").and_then(|b| b.as_bool())?;
+    Some(SortKey {
+        column,
+        ascending,
+        nulls_last,
+    })
+}
+
+/// Parse every `orderBy` element into [`SortKey`]s WITHOUT the top-N match gates
+/// (projection membership, JSON-fallback type). Used to render the self-contained
+/// final `ORDER BY` on the DECLINE / non-matched paths: once `ORDER_BY_COLUMN` is
+/// advertised Exasol delegates the ordering and NO LONGER re-applies its own
+/// backstop sort, so the adapter must reproduce that global sort in the SQL it
+/// returns even for shapes it does not optimize (add-topn-pushdown B6). An element
+/// that fails to parse as a bare column is skipped defensively.
+fn parse_order_by_keys(pushdown_req: &Json) -> Vec<SortKey> {
+    pushdown_req
+        .get("orderBy")
+        .and_then(|v| v.as_array())
+        .map(|elements| elements.iter().filter_map(parse_sort_key_element).collect())
+        .unwrap_or_default()
+}
+
+/// Detect the ordered-top-N shape and parse its sort keys.
+///
+/// Returns `Some(keys)` only when EVERY guard holds, so the caller may push the
+/// keys as a per-shard bounded sort plus an outer merge `ORDER BY … LIMIT n`:
+/// - exactly one involved table (no join),
+/// - not a GROUP BY aggregate request (`aggregationType != "group_by"` and no
+///   non-empty `groupBy`),
+/// - no `having`,
+/// - `limit` present with no `offset` (`LIMIT_WITH_OFFSET` is unadvertised, so an
+///   offset should never appear — declined defensively if it does),
+/// - a non-empty `orderBy` in which EVERY element is a bare `column` node whose
+///   uppercased name is one of the projected columns (`ProjectionItem::Column`),
+/// - EVERY sort key column resolves to an Arrow type that does NOT require the
+///   JSON-fallback VARCHAR cast (`needs_json_fallback` is false for its
+///   `LogicalField.arrow_type`).
+///
+/// The JSON-fallback guard is a correctness requirement, not an optimization: for a
+/// fallback-typed column the per-shard scan emits `CAST(col AS VARCHAR)` (a JSON
+/// string) but its `ORDER BY col` sorts by the column's REAL native value (the cast
+/// lives only in the SELECT list, not the FROM-clause row source the ORDER BY binds
+/// against). Exasol's outer merge sees ONLY the emitted JSON string, so it re-ranks
+/// lexicographically — a representation the per-shard sort never used. Per-shard and
+/// merge would disagree on ranking and silently corrupt the global top-N. Declining
+/// falls back to the safe raw-scan path (Exasol re-applies ORDER BY/LIMIT).
+/// (The tag vocabulary collapses List/Struct/Binary/etc to `utf8`, so the reachable
+/// fallback tag today is an out-of-range `decimal128(p>36,…)`; the guard is the
+/// correct seam regardless and stays correct if the tag vocabulary is enriched.)
+///
+/// A sort key column absent from `logical_schema` declines defensively (rather than
+/// assuming a safe type) — it should never happen, since the key is already required
+/// to be a projected column.
+///
+/// Any deviation returns `None` — the caller then withholds the limit (never a
+/// bare per-shard/outer LIMIT ahead of an ordering the adapter did not render) and
+/// falls back to the pre-existing plan, leaving row selection to Exasol.
+///
+/// Only ever called on the pure row-scan path (no aggregates); the GROUP BY and
+/// aggregate guards below make it self-contained and independently testable.
+fn detect_topn(
+    request: &Json,
+    pushdown_req: &Json,
+    proj_cols: &[ProjectionItem],
+    logical_schema: &[LogicalField],
+) -> Option<Vec<SortKey>> {
+    // A top-N needs a bound. Limit must be present with no offset.
+    extract_limit(pushdown_req)?;
+    if pushdown_req
+        .get("limit")
+        .and_then(|l| l.get("offset"))
+        .is_some()
+    {
+        return None;
+    }
+
+    // Reject GROUP BY / grouped-aggregate shapes: ordered top-N over aggregated or
+    // grouped results is out of scope (mission non-goal).
+    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by") {
+        return None;
+    }
+    if pushdown_req
+        .get("groupBy")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return None;
+    }
+
+    // Reject HAVING (only meaningful with grouping; a defensive belt with the above).
+    if pushdown_req
+        .get("having")
+        .filter(|h| !h.is_null())
+        .is_some()
+    {
+        return None;
+    }
+
+    // Single involved table only — a multi-table (join) shape declines.
+    let table_count = request
+        .get("involvedTables")
+        .and_then(|v| v.as_array())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    if table_count != 1 {
+        return None;
+    }
+
+    // Parse each sort key: it must be a bare `column` node that is also projected.
+    let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
+    if elements.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(elements.len());
+    for element in elements {
+        // Bare-column shape + direction/NULL flags (shared parser); a missing flag
+        // or a non-column node is an unexpected shape → decline.
+        let key = parse_sort_key_element(element)?;
+        // The sort key must be one of the projected columns (per the plan's scope:
+        // sort on already-emitted columns, no extra machinery). An expression
+        // projection (`ProjectionItem::Expr`) is never a bare-column sort target.
+        let projected = proj_cols
+            .iter()
+            .any(|p| matches!(p, ProjectionItem::Column(c) if *c == key.column));
+        if !projected {
+            return None;
+        }
+        // Decline any sort key whose column requires the JSON-fallback VARCHAR cast:
+        // its emitted representation (a JSON string) would not match the native value
+        // the per-shard ORDER BY sorts by, so the outer merge would re-rank on the
+        // wrong representation and corrupt the global top-N. Resolve the column's
+        // Arrow type from its logical-schema tag (the only type info available at plan
+        // time). A column absent from the logical schema declines defensively.
+        let arrow_type = logical_schema
+            .iter()
+            .find(|f| f.name.to_uppercase() == key.column)
+            .map(|f| crate::types::mapping::arrow_type_from_tag(&f.arrow_type))?;
+        if crate::types::mapping::needs_json_fallback(&arrow_type) {
+            return None;
+        }
+        keys.push(key);
+    }
+    Some(keys)
+}
+
 /// Build a pushdown response with an empty result (no matching files).
-fn empty_pushdown_sql(proj_cols: &[String], proj_types: &[String]) -> Json {
+fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Json {
     let items: Vec<String> = proj_cols
         .iter()
         .zip(proj_types.iter())
-        .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
+        .map(|(item, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(item.emit_name())))
         .collect();
     let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
     serde_json::json!({"type": "pushdown", "sql": sql})
@@ -2940,12 +3310,18 @@ mod tests {
             .cloned()
             .zip(proj_types.iter().cloned())
             .collect();
+        let proj_items: Vec<ProjectionItem> = proj_cols
+            .iter()
+            .cloned()
+            .map(ProjectionItem::Column)
+            .collect();
         let spec_template = ScanSpec {
             table_root: String::new(),
             files: vec![],
-            projection: proj_cols.clone(),
+            projection: proj_items.clone(),
             filter,
             limit,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -2964,7 +3340,7 @@ mod tests {
         build_scan_driving_sql(
             &spec_template,
             &shards,
-            &proj_cols,
+            &proj_items,
             &proj_types,
             limit,
             &col_types,
@@ -3002,12 +3378,18 @@ mod tests {
             .cloned()
             .zip(proj_types.iter().cloned())
             .collect();
+        let proj_items: Vec<ProjectionItem> = proj_cols
+            .iter()
+            .cloned()
+            .map(ProjectionItem::Column)
+            .collect();
         let spec_template = ScanSpec {
             table_root: table_root.to_string(),
             files: vec![],
-            projection: proj_cols.clone(),
+            projection: proj_items.clone(),
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: proj_types.clone(),
@@ -3026,7 +3408,7 @@ mod tests {
         build_scan_driving_sql(
             &spec_template,
             &shards,
-            &proj_cols,
+            &proj_items,
             &proj_types,
             None,
             &col_types,
@@ -3427,7 +3809,7 @@ mod tests {
 
     #[test]
     fn empty_file_list_returns_empty_select() {
-        let proj = vec!["ID".to_string(), "NAME".to_string()];
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
         let types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
         let resp = empty_pushdown_sql(&proj, &types);
         let sql = resp["sql"].as_str().unwrap();
@@ -3525,7 +3907,7 @@ mod tests {
 
         let (names, types) = extract_projection(&request, &pushdown_req).unwrap();
 
-        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        let unique: std::collections::HashSet<&str> = names.iter().map(|p| p.emit_name()).collect();
         assert_eq!(
             unique.len(),
             names.len(),
@@ -3533,7 +3915,7 @@ mod tests {
         );
         assert_eq!(
             names,
-            vec!["ID".to_string(), "NAME".to_string()],
+            vec!["ID", "NAME"],
             "fallback must project the full base-table column set"
         );
         assert_eq!(
@@ -3577,6 +3959,20 @@ mod tests {
             "type": "function_scalar",
             "name": "LENGTH",
             "arguments": [{"type": "column", "name": col}],
+        })
+    }
+
+    /// `<a> * <b>` two-column product node, as Exasol pushes it once `FN_MULT` is
+    /// advertised (node name `MULT`; see decision-log entry [7]). Renders to
+    /// `("<A>" * "<B>")` via the vs-expression translator.
+    fn mult_expr(a: &str, b: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [
+                {"type": "column", "name": a},
+                {"type": "column", "name": b},
+            ],
         })
     }
 
@@ -3687,6 +4083,453 @@ mod tests {
     fn detect_aggregates_returns_none_for_empty_select_list() {
         let req = serde_json::json!({ "selectList": [] });
         assert!(detect_aggregates(&req).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Ordered top-N pushdown (B3)
+    // -----------------------------------------------------------------------
+
+    /// Reproduce `handle_pushdown`'s SYNCHRONOUS row-scan decision path (everything
+    /// after `resolve_file_list`) so tests exercise the real `detect_topn`,
+    /// `effective_limit` withholding glue, and `build_scan_driving_sql` — the exact
+    /// composition production runs, minus the network file resolution.
+    fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
+        let pushdown_req = request
+            .get("pushdownRequest")
+            .cloned()
+            .unwrap_or(Json::Null);
+        let (proj_cols, proj_types) = extract_projection(request, &pushdown_req).unwrap();
+        let filter = pushdown_req
+            .get("filter")
+            .filter(|f| !f.is_null())
+            .and_then(render_df_filter_safe);
+        let limit = extract_limit(&pushdown_req);
+        let has_order_by = order_by_present(&pushdown_req);
+        let col_types = extract_all_column_types(request);
+
+        let aggregates = detect_aggregates(&pushdown_req)
+            .filter(|plans| validate_agg_col_types(plans, &col_types));
+        // Production always resolves a logical schema before detect_topn; reproduce
+        // the LINEITEM schema every plan_scan_sql caller's request scans over.
+        let logical_schema = lineitem_logical_schema();
+        let topn = if aggregates.is_none() {
+            detect_topn(request, &pushdown_req, &proj_cols, &logical_schema)
+        } else {
+            None
+        };
+        let order_by = topn.unwrap_or_default();
+        let effective_limit = if has_order_by && order_by.is_empty() {
+            None
+        } else {
+            limit
+        };
+
+        let spec_template = ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: proj_cols.clone(),
+            filter,
+            limit: effective_limit,
+            order_by,
+            aggregates,
+            group_keys: None,
+            emit_exa_types: proj_types.clone(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        };
+        let g = shard_count(cluster_nodes, 1, files.len());
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let aggregate_types = aggregate_exasol_types(&pushdown_req);
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &proj_cols,
+            &proj_types,
+            effective_limit,
+            &col_types,
+            &aggregate_types,
+            SCAN_UDF_NAME,
+            DISTINCT_MERGE_UDF_NAME,
+        );
+        // Mirror handle_pushdown's row-scan DECLINE wrapping (add-topn-pushdown B6).
+        let declined_order_by =
+            has_order_by && spec_template.order_by.is_empty() && spec_template.aggregates.is_none();
+        if declined_order_by {
+            let keys = parse_order_by_keys(&pushdown_req);
+            if keys.is_empty() {
+                sql
+            } else {
+                let mut wrapped = format!(
+                    "SELECT * FROM ({sql}) ORDER BY {}",
+                    render_order_by_clause(&keys)
+                );
+                if let Some(n) = limit {
+                    wrapped.push_str(&format!(" LIMIT {n}"));
+                }
+                wrapped
+            }
+        } else {
+            sql
+        }
+    }
+
+    /// The logical schema production resolves for the NQ4 (LINEITEM) requests: both
+    /// sort-eligible columns are in-range DECIMALs, so neither needs the JSON
+    /// fallback and `detect_topn` matches. Field-ids are illustrative.
+    fn lineitem_logical_schema() -> Vec<LogicalField> {
+        vec![
+            LogicalField {
+                field_id: 1,
+                name: "L_ORDERKEY".into(),
+                arrow_type: "decimal128(20,0)".into(),
+                nullable: true,
+            },
+            LogicalField {
+                field_id: 2,
+                name: "L_EXTENDEDPRICE".into(),
+                arrow_type: "decimal128(18,2)".into(),
+                nullable: true,
+            },
+        ]
+    }
+
+    /// A single-table request with the NQ4 shape: two projected columns and an
+    /// `ORDER BY <projected col> DESC NULLS LAST LIMIT n`.
+    fn nq4_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [{
+                "name": "LINEITEM",
+                "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
+                ],
+            }],
+            "pushdownRequest": {
+                "type": "select",
+                "selectList": [
+                    {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
+                    {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 20, "scale": 0},
+                    {"type": "decimal", "precision": 18, "scale": 2},
+                ],
+                "orderBy": [{
+                    "type": "order_by_element",
+                    "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                    "isAscending": false,
+                    "nullsLast": true
+                }],
+                "limit": {"numElements": 20}
+            }
+        })
+    }
+
+    /// The `pushdownRequest` sub-object of a request (for direct `detect_topn` calls).
+    fn pd(request: &Json) -> Json {
+        request.get("pushdownRequest").cloned().unwrap()
+    }
+
+    /// Match: the ordered top-N wraps the fan-out in an outer `ORDER BY … LIMIT n`
+    /// and carries the SAME sort keys + limit into the shard-invariant common blob
+    /// (which the scan UDF renders as the per-shard bounded sort). Multi-shard so a
+    /// real fan-out + merge is exercised.
+    #[test]
+    fn ordered_topn_emits_per_shard_and_outer_order_by() {
+        let request = nq4_request();
+        let files = vec![
+            ("s3://w/part-0.parquet".to_string(), 1000u64),
+            ("s3://w/part-1.parquet".to_string(), 1000u64),
+        ];
+        // Two nodes → two shards → a genuine GROUP BY shard_key fan-out.
+        let sql = plan_scan_sql(&request, files, 2);
+
+        // Outer merge ORDER BY, explicit direction + NULL placement, before LIMIT.
+        assert!(
+            sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
+            "matched top-N must render an outer ORDER BY … LIMIT: {sql}"
+        );
+        // The per-shard common blob carries the identical sort keys AND the limit,
+        // so every shard runs the same bounded sort (rendered by the scan UDF).
+        let common = common_arg_literal(&sql);
+        assert!(
+            common.contains(
+                r#""order_by":[{"column":"L_EXTENDEDPRICE","ascending":false,"nulls_last":true}]"#
+            ),
+            "common blob must carry the per-shard sort keys: {common}"
+        );
+        assert!(
+            common.contains(r#""limit":20"#),
+            "common blob must carry the per-shard limit: {common}"
+        );
+    }
+
+    /// Decline (sort key not projected): `ORDER BY` is present but the sort column
+    /// is not in the projection, so the bounded top-N declines. The PER-SHARD sort
+    /// keys and LIMIT are still withheld from the common blob (anti-wrong-truncation
+    /// invariant, decision [4]), but the OUTER wrapper now renders a self-contained
+    /// global `ORDER BY … LIMIT n` (add-topn-pushdown B6): once `ORDER_BY_COLUMN` is
+    /// advertised Exasol no longer re-applies its own backstop sort/limit, so the
+    /// adapter reproduces it in the returned SQL.
+    #[test]
+    fn order_by_present_without_topn_match_withholds_per_shard_limit() {
+        // Project only L_ORDERKEY, but ORDER BY L_EXTENDEDPRICE (unprojected).
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "name": "LINEITEM",
+                "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
+                ],
+            }],
+            "pushdownRequest": {
+                "type": "select",
+                "selectList": [
+                    {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 20, "scale": 0},
+                ],
+                "orderBy": [{
+                    "type": "order_by_element",
+                    "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                    "isAscending": false,
+                    "nullsLast": true
+                }],
+                "limit": {"numElements": 20}
+            }
+        });
+        // detect_topn declines the unprojected-key shape.
+        assert!(
+            detect_topn(
+                &request,
+                &pd(&request),
+                &[ProjectionItem::Column("L_ORDERKEY".into())],
+                &lineitem_logical_schema()
+            )
+            .is_none(),
+            "unprojected sort key must decline the top-N path"
+        );
+
+        let files = vec![
+            ("s3://w/part-0.parquet".to_string(), 1000u64),
+            ("s3://w/part-1.parquet".to_string(), 1000u64),
+        ];
+        let sql = plan_scan_sql(&request, files, 2);
+
+        // The OUTER wrapper renders a self-contained global ORDER BY + LIMIT
+        // (reproducing Exasol's former backstop, which no longer runs).
+        assert!(
+            sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
+            "declined shape must render a self-contained outer ORDER BY … LIMIT: {sql}"
+        );
+        // But the PER-SHARD common blob still carries NO sort keys and NO limit:
+        // the fan-out stays unbounded and unsorted (anti-wrong-truncation invariant).
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\""),
+            "declined shape must withhold the per-shard LIMIT from the common blob: {common}"
+        );
+        assert!(
+            !common.contains("order_by"),
+            "declined shape must not carry sort keys into the common blob: {common}"
+        );
+    }
+
+    /// Every unsupported ordered-query shape declines the top-N path (returns None),
+    /// while the NQ4 shape matches. Covers: join (multiple involved tables), GROUP
+    /// BY present, an expression (non-bare-column) sort key, ORDER BY with no LIMIT.
+    #[test]
+    fn unsupported_order_by_shape_declines_topn() {
+        let projected = vec![
+            ProjectionItem::Column("L_ORDERKEY".into()),
+            ProjectionItem::Column("L_EXTENDEDPRICE".into()),
+        ];
+
+        // Baseline: the well-formed NQ4 shape matches.
+        let ok = nq4_request();
+        assert_eq!(
+            detect_topn(&ok, &pd(&ok), &projected, &lineitem_logical_schema()),
+            Some(vec![SortKey {
+                column: "L_EXTENDEDPRICE".into(),
+                ascending: false,
+                nulls_last: true,
+            }]),
+            "the NQ4 shape must match"
+        );
+
+        // Join: two involved tables.
+        let mut join = nq4_request();
+        let extra_table = serde_json::json!({
+            "name": "ORDERS",
+            "columns": [{"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]
+        });
+        join.get_mut("involvedTables")
+            .and_then(|v| v.as_array_mut())
+            .unwrap()
+            .push(extra_table);
+        assert!(
+            detect_topn(&join, &pd(&join), &projected, &lineitem_logical_schema()).is_none(),
+            "a multi-table (join) shape must decline"
+        );
+
+        // GROUP BY present.
+        let mut grouped = nq4_request();
+        grouped["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+        grouped["pushdownRequest"]["groupBy"] =
+            serde_json::json!([{"type": "column", "name": "L_ORDERKEY"}]);
+        assert!(
+            detect_topn(
+                &grouped,
+                &pd(&grouped),
+                &projected,
+                &lineitem_logical_schema()
+            )
+            .is_none(),
+            "a GROUP BY shape must decline"
+        );
+
+        // Expression (non-bare-column) sort key.
+        let mut expr_key = nq4_request();
+        expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
+                {"type": "column", "name": "L_EXTENDEDPRICE"}
+            ]},
+            "isAscending": false,
+            "nullsLast": true
+        }]);
+        assert!(
+            detect_topn(
+                &expr_key,
+                &pd(&expr_key),
+                &projected,
+                &lineitem_logical_schema()
+            )
+            .is_none(),
+            "an expression sort key must decline (ORDER_BY_EXPRESSION unadvertised)"
+        );
+
+        // ORDER BY with no LIMIT: not a bounded top-N.
+        let mut no_limit = nq4_request();
+        no_limit["pushdownRequest"]
+            .as_object_mut()
+            .unwrap()
+            .remove("limit");
+        assert!(
+            detect_topn(
+                &no_limit,
+                &pd(&no_limit),
+                &projected,
+                &lineitem_logical_schema()
+            )
+            .is_none(),
+            "an ORDER BY without a LIMIT must decline"
+        );
+    }
+
+    /// B3b correctness guard: a sort key whose column requires the JSON-fallback
+    /// VARCHAR cast declines the top-N path, because the per-shard `ORDER BY col`
+    /// sorts the native value while the emitted `CAST(col AS VARCHAR)` is a JSON
+    /// string — so Exasol's outer merge would re-rank on the wrong representation.
+    /// A plain in-range DECIMAL sort key still matches (regression guard), and a
+    /// sort key absent from the logical schema declines defensively.
+    #[test]
+    fn json_fallback_typed_sort_key_declines_topn() {
+        let projected = vec![
+            ProjectionItem::Column("L_ORDERKEY".into()),
+            ProjectionItem::Column("L_EXTENDEDPRICE".into()),
+        ];
+        let request = nq4_request();
+
+        // Regression: plain in-range DECIMAL sort key (L_EXTENDEDPRICE) matches.
+        assert!(
+            detect_topn(
+                &request,
+                &pd(&request),
+                &projected,
+                &lineitem_logical_schema()
+            )
+            .is_some(),
+            "a plain in-range DECIMAL sort key must still match the top-N shape"
+        );
+
+        // The sort key column typed as an OUT-OF-RANGE Decimal128 (emitted as
+        // JSON-fallback VARCHAR): the reachable fallback tag from the logical-schema
+        // vocabulary (List/Struct/Binary all collapse to `utf8`). Must decline.
+        let fallback_schema = vec![
+            LogicalField {
+                field_id: 1,
+                name: "L_ORDERKEY".into(),
+                arrow_type: "decimal128(20,0)".into(),
+                nullable: true,
+            },
+            LogicalField {
+                field_id: 2,
+                name: "L_EXTENDEDPRICE".into(),
+                arrow_type: "decimal128(40,6)".into(),
+                nullable: true,
+            },
+        ];
+        assert!(
+            crate::types::mapping::needs_json_fallback(
+                &crate::types::mapping::arrow_type_from_tag("decimal128(40,6)")
+            ),
+            "sanity: the chosen tag must actually be a JSON-fallback type"
+        );
+        assert!(
+            detect_topn(&request, &pd(&request), &projected, &fallback_schema).is_none(),
+            "a JSON-fallback-typed sort key must decline the top-N path"
+        );
+
+        // The sort key column absent from the logical schema declines defensively.
+        let missing_schema = vec![LogicalField {
+            field_id: 1,
+            name: "L_ORDERKEY".into(),
+            arrow_type: "decimal128(20,0)".into(),
+            nullable: true,
+        }];
+        assert!(
+            detect_topn(&request, &pd(&request), &projected, &missing_schema).is_none(),
+            "a sort key absent from the logical schema must decline defensively"
+        );
+    }
+
+    /// cap-ext scenario: an ORDER BY the adapter cannot bound as a top-N (here: no
+    /// LIMIT) is correctness-safe. The bounded top-N declines (no per-shard sort, no
+    /// per-shard limit in the common blob), but the OUTER wrapper renders a
+    /// self-contained global `ORDER BY` (no LIMIT) — since once `ORDER_BY_COLUMN` is
+    /// advertised Exasol no longer re-applies its own backstop sort (add-topn-pushdown
+    /// B6), the adapter's returned SQL must specify the ordering itself.
+    #[test]
+    fn unbounded_order_by_falls_back_correctness_safe() {
+        // ORDER BY a projected column but NO LIMIT (unbounded).
+        let mut request = nq4_request();
+        request["pushdownRequest"]
+            .as_object_mut()
+            .unwrap()
+            .remove("limit");
+        let files = vec![("s3://w/part-0.parquet".to_string(), 1000u64)];
+        let sql = plan_scan_sql(&request, files, 1);
+        assert!(
+            sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST"#),
+            "unbounded ORDER BY must be rendered self-contained by the adapter: {sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT"),
+            "unbounded ORDER BY must not carry any LIMIT: {sql}"
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("order_by") && !common.contains("\"limit\""),
+            "per-shard common blob must stay clean (no sort keys, no limit): {common}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3813,6 +4656,66 @@ mod tests {
         );
     }
 
+    /// Scenario (NQ1 / TPC-H Q6 shape): `SUM(L_EXTENDEDPRICE * L_DISCOUNT)` over two
+    /// DECIMAL(15,2) columns. Exasol declares the SUM result as DECIMAL(36,4) (it
+    /// widens the DECIMAL(30,4) product's precision to its max 36, holding the
+    /// natural scale 4 — verified live, decision-log entry [7]). The partial column
+    /// must be sized from that declared type — NOT recomputed from the operands'
+    /// own DECIMAL(15,2) types — so it widens to DECIMAL(36,4), and the merge casts
+    /// to the same declared DECIMAL(36,4). This exercises the DECIMAL-with-nonzero-
+    /// scale declared-type path for a two-column product argument.
+    #[test]
+    fn decimal_product_sum_partial_widens_to_decimal_36() {
+        // Detection: SUM(L_EXTENDEDPRICE * L_DISCOUNT) carries the product in
+        // arg_expr (no bare source column) — proving the aggregate is decomposed,
+        // not declined into a raw two-column row scan.
+        let req = serde_json::json!({
+            "selectList": [
+                agg_item_expr("SUM", mult_expr("L_EXTENDEDPRICE", "L_DISCOUNT"), false)
+            ]
+        });
+        let plans =
+            detect_aggregates(&req).expect("SUM(col * col) must decompose, not fall back to scan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].kind, AggKind::Sum);
+        assert!(
+            plans[0].column.is_none(),
+            "a two-column product has no single source column"
+        );
+        assert_eq!(
+            plans[0].arg_expr.as_deref(),
+            Some(r#"("L_EXTENDEDPRICE" * "L_DISCOUNT")"#),
+            "the rendered product must be carried in arg_expr"
+        );
+
+        // Typing is driven purely by Exasol's declared result type; there is
+        // deliberately NO operand column in col_types (the product has none), so a
+        // type recomputed from operands would have to reimplement Exasol's widening
+        // rules. The declared DECIMAL(36,4) is authoritative and read verbatim.
+        let col_types: Vec<(String, String)> = vec![];
+        let declared = ["DECIMAL(36,4)".to_string()];
+
+        let emits = partial_emits_items(&plans, &col_types, &declared);
+        assert_eq!(
+            emits,
+            vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()],
+            "partial SUM column must widen to the declared DECIMAL(36,4)"
+        );
+
+        // The merge wrapper casts the summed partial back to the declared type so
+        // it matches Exasol's positional selectListDataTypes validation.
+        let merge = cast_merge_items(&plans, &declared, "LAKEHOUSE_MERGE");
+        assert_eq!(
+            merge,
+            vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
+            "merge must cast the summed partial to the declared DECIMAL(36,4)"
+        );
+
+        // The expression-argument SUM validates (no operand column → numeric
+        // DOUBLE fallback), so it is never forced into a row scan.
+        assert!(validate_agg_col_types(&plans, &col_types));
+    }
+
     /// Scenario: an aggregate whose argument the VS translator cannot render
     /// declines the whole aggregate pushdown (row-scan fallback), rather than
     /// emitting a plan referencing an argument it could not render soundly.
@@ -3907,6 +4810,7 @@ mod tests {
             projection: vec!["L_SHIPMODE".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(vec![AggregatePlan {
                 kind: AggKind::CountDistinct,
                 column: Some("L_SHIPMODE".into()),
@@ -3933,7 +4837,7 @@ mod tests {
         let sql = build_scan_driving_sql(
             &spec_template,
             &shards,
-            &["L_SHIPMODE".to_string()],
+            &["L_SHIPMODE".into()],
             &["VARCHAR(25)".to_string()],
             None,
             &col_types,
@@ -3992,6 +4896,7 @@ mod tests {
             projection: vec!["AMOUNT".into()],
             filter: Some("(\"REGION\" = 'EU')".into()),
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(vec![
                 AggregatePlan {
                     kind: AggKind::Sum,
@@ -4022,7 +4927,7 @@ mod tests {
         let sql = build_scan_driving_sql(
             &spec_template,
             &shards,
-            &["AMOUNT".to_string()],
+            &["AMOUNT".into()],
             &["DOUBLE PRECISION".to_string()],
             None,
             &col_types,
@@ -4163,6 +5068,7 @@ mod tests {
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -4191,7 +5097,7 @@ mod tests {
         let sql = build_scan_driving_sql(
             &spec_template,
             &shards,
-            &["ID".to_string()],
+            &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
             &[],
@@ -4227,6 +5133,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(agg_plans),
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -4366,6 +5273,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(plans.clone()),
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -4412,6 +5320,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(plans.clone()),
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -4888,6 +5797,141 @@ mod tests {
         assert_eq!(plans[0].kind, AggKind::Count);
     }
 
+    /// Build a minimal grouped `ScanSpec` for the merge-SQL builder tests.
+    fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
+        ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: Some(result.plans.clone()),
+            group_keys: Some(result.group_keys.clone()),
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        }
+    }
+
+    /// A grouped aggregate whose request carries an `orderBy` on a group key but
+    /// NO `limit` must still render an explicit final `ORDER BY` in its merge SQL:
+    /// once `ORDER_BY_COLUMN` is advertised Exasol no longer re-sorts the grouped
+    /// output, so a plain `GROUP BY … ORDER BY` must sort itself (add-topn-pushdown
+    /// B6). The sort key is rendered as a POSITIONAL output ordinal so it sorts the
+    /// type-cast output, not the lexicographic VARCHAR `GK_*` staging column.
+    #[test]
+    fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
+        );
+        // ORDER BY id ASC NULLS LAST, and deliberately NO "limit" key.
+        req["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": {"type": "column", "name": "ID"},
+            "isAscending": true,
+            "nullsLast": true,
+        }]);
+
+        let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        // The group key ID is output column 1 → positional ordinal, explicit dir+nulls.
+        assert_eq!(
+            build_grouped_order_by_clause(&req, &result.group_keys, &result.select_items),
+            Some(GroupedOrderBy::Clause("1 ASC NULLS LAST".to_string())),
+            "grouped ORDER BY must map the sort key to its 1-based output ordinal"
+        );
+
+        let group_key_types =
+            group_key_exasol_types(&req, &result.group_keys, &result.select_items);
+        let sql = build_grouped_aggregate_scan_sql(
+            &grouped_spec(&result),
+            &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
+            &result.group_keys,
+            &group_key_types,
+            &result.plans,
+            &[],
+            &result.select_items,
+            None,
+            &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+            SCAN_UDF_NAME,
+            DISTINCT_MERGE_UDF_NAME,
+            None,
+            Some("1 ASC NULLS LAST"),
+        );
+        assert!(
+            sql.contains(" ORDER BY 1 ASC NULLS LAST"),
+            "merge SQL must render the explicit final ORDER BY: {sql}"
+        );
+        // No LIMIT was requested, so none is rendered.
+        assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
+    }
+
+    /// Row-scan DECLINE with `order_by` but NO `limit` (projected sort column):
+    /// the outer wrapper renders a self-contained global `ORDER BY` (no LIMIT), and
+    /// the per-shard common blob stays clean. Proves the decline path no longer
+    /// withholds the ordering entirely (add-topn-pushdown B6), independent of a
+    /// LIMIT being present.
+    #[test]
+    fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "name": "LINEITEM",
+                "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_EXTENDEDPRICE", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
+                ],
+            }],
+            "pushdownRequest": {
+                "type": "select",
+                "selectList": [
+                    {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"},
+                    {"type": "column", "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 20, "scale": 0},
+                    {"type": "decimal", "precision": 18, "scale": 2},
+                ],
+                "orderBy": [{
+                    "type": "order_by_element",
+                    "expression": {"type": "column", "columnNr": 1, "name": "L_EXTENDEDPRICE", "tableName": "LINEITEM"},
+                    "isAscending": false,
+                    "nullsLast": true
+                }]
+                // No "limit" key: no LIMIT clause anywhere.
+            }
+        });
+        let files = vec![
+            ("s3://w/part-0.parquet".to_string(), 1000u64),
+            ("s3://w/part-1.parquet".to_string(), 1000u64),
+        ];
+        let sql = plan_scan_sql(&request, files, 2);
+
+        assert!(
+            sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST"#),
+            "no-LIMIT decline must still render a self-contained outer ORDER BY: {sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT"),
+            "no LIMIT was requested, so none must be synthesized: {sql}"
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("order_by") && !common.contains("\"limit\""),
+            "per-shard common blob must stay clean (no sort keys, no limit): {common}"
+        );
+    }
+
     /// Scalar expression in GROUP BY (e.g., function_scalar YEAR) renders via render_expression.
     #[test]
     fn detect_group_by_aggregates_expression_key() {
@@ -5007,6 +6051,7 @@ mod tests {
                 projection: vec![],
                 filter: None,
                 limit: None,
+                order_by: Vec::new(),
                 aggregates: Some(result.plans.clone()),
                 group_keys: Some(result.group_keys.clone()),
                 emit_exa_types: Vec::new(),
@@ -5029,6 +6074,7 @@ mod tests {
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            None,
             None,
         );
         assert!(
@@ -5286,6 +6332,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(result.plans.clone()),
             group_keys: Some(result.group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -5311,6 +6358,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            None,
             None,
         );
         assert!(
@@ -5397,6 +6445,7 @@ mod tests {
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -5413,7 +6462,7 @@ mod tests {
         let sql = build_scan_driving_sql(
             &spec_template,
             &shards,
-            &["ID".to_string()],
+            &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
             &[],
@@ -5446,6 +6495,7 @@ mod tests {
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -5462,7 +6512,7 @@ mod tests {
         let sql = build_scan_driving_sql(
             &spec_template,
             &shards,
-            &["ID".to_string()],
+            &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
             &[],
@@ -5527,6 +6577,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -5554,6 +6605,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            None,
             None,
         )
     }
@@ -5623,6 +6675,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
+            order_by: Vec::new(),
             aggregates: Some(vec![AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
@@ -5656,6 +6709,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            None,
             None,
         );
         // The shared common blob (arg 0) is built once with limit = None, so it must
@@ -5793,6 +6847,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -5819,6 +6874,7 @@ mod tests {
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
             having,
+            None,
         )
     }
 
@@ -6065,6 +7121,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -6091,6 +7148,7 @@ mod tests {
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
             Some(&having),
+            None,
         );
         let having_pos = sql.find("HAVING").expect("must contain HAVING");
         let having_clause = &sql[having_pos..];
@@ -6154,6 +7212,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -6179,6 +7238,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            None,
             None,
         );
 
@@ -6240,6 +7300,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
@@ -6271,6 +7332,7 @@ mod tests {
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
             Some(&having),
+            None,
         );
 
         // The per-shard partial scan ends at "GROUP BY shard_key"; everything up to
@@ -6416,6 +7478,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(vec![AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
@@ -6807,10 +7870,17 @@ mod tests {
         });
         let pushdown_req = request["pushdownRequest"].clone();
         let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
-        // The rendered expression should be in projection
+        // The rendered expression should be carried as an Expr projection item, NOT
+        // a bare Column — so the scan splices it verbatim instead of quoting it as a
+        // phantom identifier.
         assert_eq!(proj_cols.len(), 1);
         assert!(
-            proj_cols[0].contains("UPPER") || proj_cols[0].contains("upper"),
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a rendered scalar expression must be an Expr projection item: {proj_cols:?}"
+        );
+        let rendered = proj_cols[0].emit_name();
+        assert!(
+            rendered.contains("UPPER") || rendered.contains("upper"),
             "projection must contain rendered expression: {proj_cols:?}"
         );
         // Type for an expression falls back to VARCHAR(2000000)
@@ -6859,6 +7929,7 @@ mod tests {
             projection: vec!["REGION".into(), "AMOUNT".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: Some(vec![AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
@@ -6897,6 +7968,7 @@ mod tests {
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
             having_filter.as_deref(),
+            None,
         );
         // HAVING must appear in the outer wrapper (after GROUP BY)
         assert!(
@@ -7719,6 +8791,7 @@ mod tests {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
@@ -8318,6 +9391,7 @@ mod tests {
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
@@ -8743,6 +9817,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),

@@ -69,6 +69,140 @@ pub struct AggregatePlan {
     pub arg_expr: Option<String>,
 }
 
+/// One entry in a scan's projection list.
+///
+/// Distinguishes a bare source-column reference from an already-rendered scalar
+/// expression fragment — mirroring how [`AggregatePlan`] separates a bare
+/// `column` from a rendered `arg_expr`, and for the same reason: the two forms
+/// look alike as strings but must be spliced into the scan SQL differently. A
+/// [`Column`](ProjectionItem::Column) is quoted as an identifier by the scan
+/// (applying the VARCHAR cast for JSON-fallback types); an
+/// [`Expr`](ProjectionItem::Expr) is spliced into the SELECT list VERBATIM,
+/// because it is already valid DataFusion SQL that resolves against the
+/// uppercase-aliased inner scan — exactly like `filter` and `arg_expr`.
+///
+/// # Serde
+///
+/// Untagged: a [`Column`](ProjectionItem::Column) serializes as a bare JSON
+/// string and an [`Expr`](ProjectionItem::Expr) as `{"expr": "..."}`. A bare
+/// string therefore deserializes as a `Column`, so payloads and specs that
+/// predate this type (whose projection was a plain string array) still load
+/// correctly — every legacy entry is a column reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProjectionItem {
+    /// A rendered scalar-expression SQL fragment (e.g. `("SCORE" * 2)`) spliced
+    /// into the scan SELECT list verbatim.
+    Expr { expr: String },
+    /// A bare, uppercase source-column identifier (e.g. `SCORE`) quoted as an
+    /// identifier by the scan.
+    Column(String),
+}
+
+impl ProjectionItem {
+    /// The identifier this item contributes as its positional EMITS column name.
+    ///
+    /// Emission is positional, so this string only names the EMITS slot — for an
+    /// [`Expr`](ProjectionItem::Expr) it is the rendered fragment itself, which is
+    /// an ugly-but-valid quoted EMITS identifier and never a column lookup.
+    pub fn emit_name(&self) -> &str {
+        match self {
+            ProjectionItem::Column(name) => name,
+            ProjectionItem::Expr { expr } => expr,
+        }
+    }
+}
+
+impl From<&str> for ProjectionItem {
+    fn from(name: &str) -> Self {
+        ProjectionItem::Column(name.to_string())
+    }
+}
+
+impl From<String> for ProjectionItem {
+    fn from(name: String) -> Self {
+        ProjectionItem::Column(name)
+    }
+}
+
+impl PartialEq<&str> for ProjectionItem {
+    fn eq(&self, other: &&str) -> bool {
+        self.emit_name() == *other
+    }
+}
+
+/// One ORDER BY sort key in a pushed-down ordered top-N plan.
+///
+/// `column` is a bare, uppercase source-column identifier: only `ORDER_BY_COLUMN`
+/// is advertised as a capability (not `ORDER_BY_EXPRESSION`), so Exasol only ever
+/// sends bare column sort keys — see
+/// `specs/_plans/add-topn-pushdown/decision-log.md` decision [3].
+///
+/// `ascending` maps directly to Exasol's `orderBy[].isAscending`
+/// (`true` = `ASC`, `false` = `DESC`). `nulls_last` maps directly to Exasol's
+/// `orderBy[].nullsLast` (`true` = `NULLS LAST`, `false` = `NULLS FIRST`). Both
+/// must be rendered explicitly (never left to a side's default NULL ordering) on
+/// both the per-shard `ORDER BY` and the outer merge `ORDER BY` so the two sorts
+/// induce the same ranking — see decision [7].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortKey {
+    pub column: String,
+    pub ascending: bool,
+    pub nulls_last: bool,
+}
+
+impl SortKey {
+    /// Render this key as one SQL `ORDER BY` element:
+    /// `"COLUMN" ASC|DESC NULLS FIRST|LAST`.
+    ///
+    /// Direction and NULL placement are ALWAYS rendered explicitly (never left to
+    /// a side's default) so the per-shard bounded sort (scan UDF `build_scan_sql`)
+    /// and the outer merge sort (adapter wrapper) induce the same ranking. The
+    /// identifier is double-quoted with embedded quotes doubled — the same quoting
+    /// the adapter and the scan use for column identifiers, and valid in both
+    /// DataFusion SQL (per-shard) and Exasol SQL (merge).
+    fn render_order_by_element(&self) -> String {
+        self.render_ordered(&format!("\"{}\"", self.column.replace('"', "\"\"")))
+    }
+
+    /// Render this key's direction + NULL placement onto an already-rendered
+    /// ordering expression: `<expr> ASC|DESC NULLS FIRST|LAST`.
+    ///
+    /// `expr` may be a quoted column reference (the row-scan and per-shard sorts),
+    /// a positional output ordinal (the grouped-aggregate merge sort, whose output
+    /// columns are `GK_*`/merged aggregates, not the source names), or any other
+    /// valid ordering expression. Routing every ORDER BY the adapter emits through
+    /// this ONE direction/NULL seam is what structurally guarantees they agree on
+    /// direction and NULL placement — the correctness-critical top-N invariant
+    /// (decision [7]).
+    pub fn render_ordered(&self, expr: &str) -> String {
+        let direction = if self.ascending { "ASC" } else { "DESC" };
+        let nulls = if self.nulls_last {
+            "NULLS LAST"
+        } else {
+            "NULLS FIRST"
+        };
+        format!("{expr} {direction} {nulls}")
+    }
+}
+
+/// Render a comma-separated `ORDER BY` element list from sort keys, in order —
+/// e.g. `"L_EXTENDEDPRICE" DESC NULLS LAST, "L_ORDERKEY" ASC NULLS FIRST`.
+///
+/// Returns the element list WITHOUT the leading `ORDER BY ` keyword (callers splice
+/// it after their own `ORDER BY`). This is the SINGLE rendering seam shared by the
+/// adapter's outer merge `ORDER BY` and the scan UDF's per-shard `ORDER BY`: routing
+/// both through this function is what structurally guarantees the two sorts agree on
+/// direction and NULL placement (the correctness-critical top-N invariant). An empty
+/// key slice yields an empty string; callers must guard on that before emitting a
+/// bare `ORDER BY`.
+pub fn render_order_by_clause(keys: &[SortKey]) -> String {
+    keys.iter()
+        .map(SortKey::render_order_by_element)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Storage connection properties (S3-compatible / MinIO).
 /// Fields are plain Strings so serde handles them uniformly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,7 +305,9 @@ pub struct CommonScanSpec {
     pub table_root: String,
 
     /// Projected columns in order. Empty means "all columns" (no projection push).
-    pub projection: Vec<String>,
+    /// Each entry is either a bare column reference or a rendered scalar expression
+    /// (see [`ProjectionItem`]).
+    pub projection: Vec<ProjectionItem>,
 
     /// DataFusion SQL WHERE predicate fragment, already translated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +316,12 @@ pub struct CommonScanSpec {
     /// Row limit. None means no LIMIT pushdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+
+    /// ORDER BY sort keys for a pushed-down ordered top-N scan, in order. Empty
+    /// (the default) means no ordering pushdown; absent from JSON when empty so
+    /// specs that predate this field are unaffected (backward-compatible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_by: Vec<SortKey>,
 
     /// Ordered list of aggregate functions to compute as node-local partial results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,7 +414,9 @@ pub struct ScanSpec {
     pub files: Vec<(String, u64)>,
 
     /// Projected columns in order. Empty means "all columns" (no projection push).
-    pub projection: Vec<String>,
+    /// Each entry is either a bare column reference or a rendered scalar expression
+    /// (see [`ProjectionItem`]).
+    pub projection: Vec<ProjectionItem>,
 
     /// DataFusion SQL WHERE predicate fragment, already translated.
     /// None means no filter pushdown (Exasol keeps the predicate for correctness).
@@ -282,6 +426,12 @@ pub struct ScanSpec {
     /// Row limit. None means no LIMIT pushdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+
+    /// ORDER BY sort keys for a pushed-down ordered top-N scan, in order. Empty
+    /// (the default) means no ordering pushdown (row scan or aggregate); absent
+    /// from JSON when empty so pre-existing scan specs are backward-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_by: Vec<SortKey>,
 
     /// Ordered list of aggregate functions to compute as node-local partial
     /// results. `None` (the default) means row scanning; absent from JSON when
@@ -424,6 +574,7 @@ impl ScanSpec {
             projection: self.projection.clone(),
             filter: self.filter.clone(),
             limit: self.limit,
+            order_by: self.order_by.clone(),
             aggregates: self.aggregates.clone(),
             group_keys: self.group_keys.clone(),
             emit_exa_types: self.emit_exa_types.clone(),
@@ -455,6 +606,7 @@ impl ScanSpec {
             projection: common.projection,
             filter: common.filter,
             limit: common.limit,
+            order_by: common.order_by,
             aggregates: common.aggregates,
             group_keys: common.group_keys,
             emit_exa_types: common.emit_exa_types,
@@ -518,6 +670,7 @@ mod tests {
             projection: vec!["id".into(), "name".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -797,6 +950,94 @@ mod tests {
         assert_eq!(
             legacy_plans[0].arg_expr, None,
             "missing arg_expr must default to None (backward-compat)"
+        );
+    }
+
+    /// Task B1: `order_by` round-trips through JSON, is omitted from the wire form
+    /// when empty (backward-compatible with every pre-existing spec shape), and a
+    /// legacy JSON payload with no `order_by` key deserializes to an empty list.
+    #[test]
+    fn order_by_round_trips_and_defaults_to_empty() {
+        // Empty (default): the field is omitted from serialized JSON.
+        let row_spec = sample_spec();
+        assert!(row_spec.order_by.is_empty());
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("order_by"),
+            "empty order_by must be absent from JSON: {row_json}"
+        );
+
+        // Non-empty: sort keys survive the round-trip, in order, with direction
+        // and NULL placement intact.
+        let mut spec = sample_spec();
+        spec.order_by = vec![
+            SortKey {
+                column: "L_EXTENDEDPRICE".to_string(),
+                ascending: false,
+                nulls_last: true,
+            },
+            SortKey {
+                column: "L_ORDERKEY".to_string(),
+                ascending: true,
+                nulls_last: false,
+            },
+        ];
+        let json = spec.to_json();
+        assert!(
+            json.contains("order_by"),
+            "non-empty order_by must appear in JSON: {json}"
+        );
+
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(back.order_by, spec.order_by);
+        assert_eq!(back.order_by.len(), 2);
+        assert_eq!(back.order_by[0].column, "L_EXTENDEDPRICE");
+        assert!(!back.order_by[0].ascending);
+        assert!(back.order_by[0].nulls_last);
+        assert_eq!(back.order_by[1].column, "L_ORDERKEY");
+        assert!(back.order_by[1].ascending);
+        assert!(!back.order_by[1].nulls_last);
+
+        // Full-spec equality also holds (order_by participates in ScanSpec's PartialEq).
+        assert_eq!(back, spec);
+
+        // The split (to_common) / merge (from_parts) path threads order_by through.
+        let common = spec.to_common();
+        assert_eq!(common.order_by, spec.order_by);
+        let merged = ScanSpec::from_parts(common, spec.files.clone());
+        assert_eq!(merged.order_by, spec.order_by);
+
+        // A legacy payload without the field deserializes to an empty Vec.
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.order_by.is_empty(),
+            "missing order_by must default to empty (backward-compat)"
+        );
+
+        // Same for the common blob in isolation.
+        let legacy_common_json = r#"{
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
+        assert!(
+            legacy_common.order_by.is_empty(),
+            "missing order_by must default to empty on the common blob (backward-compat)"
         );
     }
 
