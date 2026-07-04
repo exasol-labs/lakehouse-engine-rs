@@ -85,9 +85,10 @@ finishes early — no node sits idle waiting on a slow shard.
 |---|---|
 | Column projection — scan only projected columns | Validate returned columns vs. the EMITS list |
 | Filter predicates — Iceberg file pruning + row-group/page skipping + full row-level filter | Re-check only predicates the VS couldn't translate |
-| `LIMIT` — stop the scan early per shard | Re-apply `LIMIT` as a cross-shard backstop |
-| Partial aggregate — node-local `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` over a column or scalar expression, per-group partials for `GROUP BY`, and single-group `COUNT(DISTINCT)` as a per-shard local distinct set | Merge partials: `SUM` of counts/sums, `MIN`/`MAX` of extrema, `SUM(sum)/SUM(count)` for `AVG`, re-group on the user keys; a scalar UDF unions `COUNT(DISTINCT)` sets |
-| — | `ORDER BY`, `HAVING` final pass, grouped `COUNT(DISTINCT)`/`MEDIAN`/`LISTAGG`, joins across virtual tables |
+| `LIMIT` (no `ORDER BY`) — stop the scan early per shard | Re-apply `LIMIT` as a cross-shard backstop |
+| Ordered top-N — bounded per-shard `ORDER BY ... LIMIT n` (a DataFusion `TopK`) when every sort key is a bare projected column, single table, no `GROUP BY` | Merge the `shard_count × n` partial rows with a final `ORDER BY ... LIMIT n` |
+| Partial aggregate — node-local `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` over a column or scalar expression (including two-column binary arithmetic, e.g. `SUM(a * b)`), per-group partials for `GROUP BY`, and single-group `COUNT(DISTINCT)` as a per-shard local distinct set | Merge partials: `SUM` of counts/sums, `MIN`/`MAX` of extrema, `SUM(sum)/SUM(count)` for `AVG`, re-group on the user keys; a scalar UDF unions `COUNT(DISTINCT)` sets |
+| — | `HAVING` final pass, grouped `COUNT(DISTINCT)`/`MEDIAN`/`LISTAGG`, joins across virtual tables, `ORDER BY` that isn't an eligible top-N shape (rendered explicitly by the adapter itself — Exasol does not re-sort once `ORDER_BY_COLUMN` is advertised) |
 
 Aggregates decompose into partial/merge so each node ships one partial row per group, not raw
 rows — minimizing transfer. Single-group `COUNT(DISTINCT)` decomposes too: each shard emits its
