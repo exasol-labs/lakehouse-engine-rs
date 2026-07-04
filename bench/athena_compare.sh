@@ -69,6 +69,29 @@ Q9B="SELECT COUNT(*),
        SUM(length(l_comment))
 FROM lineitem"
 
+# NQ1-NQ5 close the arithmetic-aggregate-pushdown gap + probe LIKE/IN filters, ORDER BY+LIMIT, a
+# 4-way join, and GROUP BY+HAVING — identical SQL (dialect-adjusted) in bench/run.sh,
+# bench/trino_compare.sh, deploy/scripts/spark_queries.py.
+NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"
+
+NQ2="SELECT COUNT(*) FROM lineitem
+WHERE l_shipmode IN ('AIR','REG AIR') AND l_comment LIKE '%late%'"
+
+NQ3="SELECT COUNT(*) AS cnt, SUM(ps.ps_supplycost) AS total_cost
+FROM part p JOIN partsupp ps ON p.p_partkey = ps.ps_partkey
+JOIN supplier s ON ps.ps_suppkey = s.s_suppkey
+JOIN nation n ON s.s_nationkey = n.n_nationkey
+WHERE p.p_size = 15 AND p.p_type LIKE '%BRASS%' AND n.n_name = 'GERMANY'"
+
+NQ4="SELECT l_orderkey, l_extendedprice FROM lineitem
+ORDER BY l_extendedprice DESC LIMIT 20"
+
+NQ5="SELECT o_orderpriority, o_orderstatus, COUNT(*) AS cnt, AVG(o_totalprice) AS avg_price
+FROM orders GROUP BY o_orderpriority, o_orderstatus
+HAVING COUNT(*) > 1000000 ORDER BY o_orderpriority, o_orderstatus"
+
 run_timed() {  # name sql
   local name="$1" sql="$2" qid status ms el
   qid="$(aws athena start-query-execution \
@@ -104,4 +127,9 @@ run_timed "q7" "$Q7"
 run_timed "q8" "$Q8"
 run_timed "q9a" "$Q9A"
 run_timed "q9b" "$Q9B"
+run_timed "nq1" "$NQ1"
+run_timed "nq2" "$NQ2"
+run_timed "nq3" "$NQ3"
+run_timed "nq4" "$NQ4"
+run_timed "nq5" "$NQ5"
 echo "Done. Report: $REPORT"

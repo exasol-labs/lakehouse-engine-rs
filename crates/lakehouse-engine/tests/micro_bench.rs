@@ -301,6 +301,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
         projection: Vec::new(),
         filter: None,
         limit: None,
+        order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
         emit_exa_types: Vec::new(),
