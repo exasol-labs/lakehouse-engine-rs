@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// STDDEV/VARIANCE family are decomposed into a (cnt, sum, sum_sq) sufficient-
 /// statistics triple; the wrapper reconstructs the population or sample statistic.
+///
+/// `CountDistinct` is the single-group `COUNT(DISTINCT col)` shape: each shard computes
+/// its LOCAL distinct value set (NULLs excluded) and emits it as one VARCHAR partial
+/// value carrying a JSON array; a scalar merge UDF unions the per-shard sets and returns
+/// the final cardinality. No Arrow type crosses the `.so` boundary — see
+/// `specs/_plans/add-count-distinct-and-expression-aggregate-pushdown/vs-adapter/pushdown-planning-count-distinct/spec.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggKind {
@@ -35,17 +41,32 @@ pub enum AggKind {
     StddevPop,
     /// STDDEV / STDDEV_SAMP — sqrt(VAR_SAMP).
     StddevSamp,
+    /// Single-group `COUNT(DISTINCT col)` — see the doc above for the shard-local-set /
+    /// scalar-merge-UDF decomposition. Never produced by the grouped (GROUP BY) detection
+    /// path, which still declines `distinct: true` and falls back to row scanning.
+    CountDistinct,
 }
 
 /// One aggregate function in a pushed-down aggregate plan.
 ///
 /// `column` is `None` for `COUNT(*)` and `Some(col_name)` for all other
 /// variants.  The column name matches the projected column name (uppercase).
+///
+/// `arg_expr` carries a DataFusion SQL fragment (rendered via
+/// `vs_expression::render_expression`, the same seam GROUP BY keys use) when the
+/// aggregate's argument is a scalar expression rather than a bare column reference —
+/// e.g. `SUM(LENGTH(L_COMMENT))`. It is `None` for the bare-column and `COUNT(*)` forms.
+/// This is a separate field rather than an overload of `column` so bare-column lookups
+/// (e.g. MIN/MAX exact source type) and the pre-existing JSON wire shape are unaffected;
+/// when both are absent (`COUNT(*)`) the aggregate has no argument at all. See
+/// `specs/_plans/add-count-distinct-and-expression-aggregate-pushdown/vs-adapter/pushdown-planning-expression-aggregate/spec.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregatePlan {
     pub kind: AggKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub column: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_expr: Option<String>,
 }
 
 /// Storage connection properties (S3-compatible / MinIO).
@@ -654,26 +675,37 @@ mod tests {
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::CountCol,
                 column: Some("ID".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Min,
                 column: Some("TS".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Max,
                 column: Some("TS".into()),
+                arg_expr: None,
             },
             AggregatePlan {
                 kind: AggKind::Avg,
                 column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::CountDistinct,
+                column: Some("L_SHIPMODE".into()),
+                arg_expr: None,
             },
         ]);
         let agg_json = agg_spec.to_json();
@@ -684,7 +716,7 @@ mod tests {
 
         let back = ScanSpec::from_json(&agg_json).unwrap();
         let plans = back.aggregates.expect("aggregates must survive round-trip");
-        assert_eq!(plans.len(), 6);
+        assert_eq!(plans.len(), 7);
         assert_eq!(plans[0].kind, AggKind::Count);
         assert_eq!(plans[0].column, None);
         assert_eq!(plans[1].kind, AggKind::CountCol);
@@ -694,6 +726,78 @@ mod tests {
         assert_eq!(plans[4].kind, AggKind::Max);
         assert_eq!(plans[5].kind, AggKind::Avg);
         assert_eq!(plans[5].column.as_deref(), Some("AMOUNT"));
+        assert_eq!(plans[6].kind, AggKind::CountDistinct);
+        assert_eq!(plans[6].column.as_deref(), Some("L_SHIPMODE"));
+    }
+
+    /// Task 1.1: `AggregatePlan.arg_expr` round-trips through JSON, is omitted from the
+    /// wire form when `None` (backward-compatible with bare-column plans), and a plan
+    /// carrying an expression argument survives the round-trip alongside `CountDistinct`.
+    #[test]
+    fn arg_expr_round_trips_and_omitted_when_none() {
+        // A bare-column plan (arg_expr: None) must not carry the key at all.
+        let mut agg_spec = sample_spec();
+        agg_spec.aggregates = Some(vec![AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        }]);
+        let bare_json = agg_spec.to_json();
+        assert!(
+            !bare_json.contains("arg_expr"),
+            "arg_expr must be absent when None: {bare_json}"
+        );
+        let back = ScanSpec::from_json(&bare_json).unwrap();
+        assert_eq!(back.aggregates.unwrap()[0].arg_expr, None);
+
+        // An expression-argument plan carries the rendered SQL fragment and round-trips.
+        let mut expr_spec = sample_spec();
+        expr_spec.aggregates = Some(vec![
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: None,
+                arg_expr: Some("LENGTH(\"L_COMMENT\")".into()),
+            },
+            AggregatePlan {
+                kind: AggKind::CountDistinct,
+                column: Some("L_SHIPMODE".into()),
+                arg_expr: None,
+            },
+        ]);
+        let expr_json = expr_spec.to_json();
+        assert!(
+            expr_json.contains("arg_expr"),
+            "non-empty arg_expr must appear in JSON: {expr_json}"
+        );
+
+        let back = ScanSpec::from_json(&expr_json).unwrap();
+        let plans = back.aggregates.expect("aggregates must survive round-trip");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].kind, AggKind::Sum);
+        assert_eq!(plans[0].column, None);
+        assert_eq!(plans[0].arg_expr.as_deref(), Some("LENGTH(\"L_COMMENT\")"));
+        assert_eq!(plans[1].kind, AggKind::CountDistinct);
+        assert_eq!(plans[1].arg_expr, None);
+
+        // A legacy aggregate payload (predating arg_expr) deserializes with it defaulting
+        // to None — bare-column plans serialized before this field existed still parse.
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100]],
+            "projection": [],
+            "aggregates": [{"kind": "sum", "column": "AMOUNT"}],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        let legacy_plans = legacy.aggregates.expect("legacy aggregates must parse");
+        assert_eq!(
+            legacy_plans[0].arg_expr, None,
+            "missing arg_expr must default to None (backward-compat)"
+        );
     }
 
     /// Task 2.1: group_keys round-trips through JSON and is absent from row-scan specs.

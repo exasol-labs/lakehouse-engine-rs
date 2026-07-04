@@ -16,32 +16,20 @@ each Exasol script references it.
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: One crate exports both the adapter and the scan entry points
 
 * *GIVEN* the UDF crate source declaring a VS adapter entry point, a scan SET-UDF entry point, and a scalar distinct-merge entry point
 * *WHEN* the crate is built in the builder image
 * *THEN* the build SHALL produce exactly one `.so` artifact
 * *AND* that `.so` SHALL export the adapter entry-point symbol, the scan entry-point symbol, and the scalar distinct-merge entry-point symbol
+<!-- /DELTA:CHANGED -->
 
+<!-- DELTA:NEW -->
 ### Scenario: Crate exports a scalar distinct-merge entry point in the same .so
 
 * *GIVEN* the UDF crate declaring a scalar distinct-merge entry point (used by the outer wrapper SQL to merge per-shard `COUNT(DISTINCT)` local distinct sets)
 * *WHEN* the crate is built in the builder image and a SCALAR SCRIPT referencing that `%udf_object` is created
 * *THEN* the scalar-script invocation SHALL run the distinct-merge entry point from the same uploaded `.so`, requiring no second uploaded artifact
 * *AND* the pushdown wrapper SQL SHALL reference that scalar script schema-qualified so it resolves outside the adapter script's schema context, using the same scan-UDF schema resolution the SET script uses
-
-### Scenario: Both scripts resolve from the same uploaded artifact
-
-* *GIVEN* the single `.so` has been uploaded to BucketFS
-* *AND* an ADAPTER SCRIPT and a SET SCRIPT have each been created referencing that `%udf_object`
-* *WHEN* each script is invoked
-* *THEN* the adapter invocation SHALL run the adapter entry point
-* *AND* the SET-script invocation SHALL run the scan entry point
-* *AND* neither invocation SHALL require a second uploaded artifact
-
-### Scenario: Host release build of the .so is rejected by convention
-
-* *GIVEN* the crate manifest and Makefile
-* *WHEN* the documented build path is followed
-* *THEN* the `.so` SHALL be produced only by the containerized build target
-* *AND* the build documentation MUST state that host `cargo build --release` produces an unloadable artifact
+<!-- /DELTA:NEW -->
