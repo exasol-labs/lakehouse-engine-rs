@@ -11,6 +11,7 @@ The `crates/vs-expression` crate exposes three public entry points:
 
 ## Scenarios
 
+<!-- DELTA:CHANGED -->
 ### Scenario: Arithmetic operators translate to binary SQL expressions
 
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is the Exasol scalar-function name for a binary arithmetic operator — addition, subtraction, multiplication, or floating-point division — or for unary negation
@@ -19,6 +20,7 @@ The `crates/vs-expression` crate exposes three public entry points:
 * *THEN* the binary arithmetic nodes SHALL return `(<left> <op> <right>)` where the operators are `+`, `-`, `*`, `/` respectively, for operands that are themselves any renderable expression (including two bare column references, e.g. `(L_EXTENDEDPRICE * L_DISCOUNT)`)
 * *AND* unary negation SHALL return `(-<operand>)`
 * *AND* the set of arithmetic `name` strings the translator matches SHALL correspond exactly to the arithmetic operator capabilities the adapter advertises (`vs-adapter/pushdown-planning-capability-extensions`), so no advertised operator is left unrenderable and no rendered operator is left unadvertised
+<!-- /DELTA:CHANGED -->
 
 ### Scenario: CAST translates to DataFusion CAST syntax
 
