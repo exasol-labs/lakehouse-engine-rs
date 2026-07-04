@@ -53,6 +53,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *AND* the adapter MUST NOT emit a partial/merge plan for any aggregate it cannot decompose into a shard-associative partial/merge plan, because doing so would yield an incorrect result
 * *AND* a single-group (no GROUP BY) `COUNT(DISTINCT col)` SHALL NOT fall back here — it is decomposed via `vs-adapter/pushdown-planning-count-distinct` — while a `COUNT(DISTINCT ...)` inside a GROUP BY request SHALL still fall back
 
+<!-- DELTA:NEW -->
 ### Scenario: Arithmetic operator scalar-function capabilities are advertised so arithmetic expression trees are pushed down
 
 * *GIVEN* the adapter's advertised capability set
@@ -67,19 +68,4 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *WHEN* the `crates/vs-expression` translator cannot render a particular arithmetic node (e.g. an operator or operand shape it does not handle)
 * *THEN* the adapter SHALL fall back on the affected clause exactly as for any other untranslatable expression — a filter is omitted and retained by Exasol, a select-list expression falls back to projecting underlying columns, and an aggregate over the unrenderable argument falls back to row scanning
 * *AND* the adapter MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-
-### Scenario: ORDER_BY_COLUMN is advertised so ordered top-N queries can be pushed down
-
-* *GIVEN* the adapter's advertised capability set
-* *WHEN* Exasol requests `getCapabilities`
-* *THEN* the response SHALL advertise `ORDER_BY_COLUMN` so Exasol pushes column sort keys (with direction and NULL placement) and the accompanying `LIMIT` into the `pushdown` request, enabling the ordered-top-N partial/merge path in `vs-adapter/pushdown-planning-topn`
-* *AND* `ORDER_BY_EXPRESSION` SHALL remain absent, so Exasol never pushes an expression sort key the adapter has no bounded-sort path for
-* *AND* `LIMIT_WITH_OFFSET` SHALL remain absent, so Exasol never pushes an OFFSET and the ordered-top-N path needs no offset handling
-* *AND* join and Cartesian-product capabilities SHALL remain absent (advertising `ORDER_BY_COLUMN` MUST NOT introduce any join capability)
-
-### Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
-
-* *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, or a request that also carries aggregates / group keys / a `having`)
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL fall back to the pre-existing scan plan for that shape without pushing a per-shard row limit ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-* *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows, exactly as it already retains a `LIMIT` and a `HAVING` it pushed as a correctness backstop
+<!-- /DELTA:NEW -->

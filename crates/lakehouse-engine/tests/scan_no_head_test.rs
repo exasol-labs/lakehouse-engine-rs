@@ -256,6 +256,7 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
         projection: vec!["ID".into(), "NAME".into()],
         filter: None,
         limit: None,
+        order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
         emit_exa_types: Vec::new(),

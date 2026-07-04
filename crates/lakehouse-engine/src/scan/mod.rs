@@ -12,7 +12,7 @@ pub mod spec;
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
-use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
+use crate::scan::spec::{AggKind, AggregatePlan, ProjectionItem, ScanSpec, render_order_by_clause};
 use crate::types::mapping::needs_json_fallback;
 use arrow::array::{Array, ListArray};
 use async_trait::async_trait;
@@ -1167,35 +1167,44 @@ async fn build_scan_sql(
         .collect();
     let inner = format!("SELECT {} FROM {table_name}", alias_items.join(", "));
 
-    // Determine the columns to project (already uppercase from the adapter).
-    let proj_cols: Vec<String> = if spec.projection.is_empty() {
+    // Determine the items to project (already uppercase from the adapter). An
+    // empty projection means "all columns"; each is a bare column reference.
+    let proj_items: Vec<ProjectionItem> = if spec.projection.is_empty() {
         schema
             .fields()
             .iter()
-            .map(|f| f.name().to_uppercase())
+            .map(|f| ProjectionItem::Column(f.name().to_uppercase()))
             .collect()
     } else {
         spec.projection.clone()
     };
 
-    // Build outer SELECT items: CAST incompatible types to VARCHAR so the
-    // convert module receives them as Utf8 and emits Value::String. Emission is
-    // positional, so projection order — not name — carries through to EMITS.
-    let select_items: Vec<String> = proj_cols
+    // Build outer SELECT items. A bare column is quoted as an identifier, with a
+    // CAST to VARCHAR for incompatible types so the convert module receives them
+    // as Utf8 and emits Value::String. A rendered scalar expression (e.g.
+    // `("SCORE" * 2)`) is spliced VERBATIM — it is already valid DataFusion SQL
+    // resolved against the uppercase-aliased inner scan, exactly like `filter`
+    // and the aggregate `arg_expr`; quoting it as an identifier would build a
+    // phantom column name that has no matching field. Emission is positional, so
+    // projection order — not name — carries through to EMITS.
+    let select_items: Vec<String> = proj_items
         .iter()
-        .map(|col_name| {
-            let col_lower = col_name.to_lowercase();
-            let needs_cast = schema
-                .fields()
-                .iter()
-                .find(|f| f.name().to_lowercase() == col_lower)
-                .map(|f| needs_json_fallback(f.data_type()))
-                .unwrap_or(false);
-            let upper = col_name.to_uppercase();
-            if needs_cast {
-                format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-            } else {
-                quote_ident(&upper)
+        .map(|item| match item {
+            ProjectionItem::Expr { expr } => expr.clone(),
+            ProjectionItem::Column(col_name) => {
+                let col_lower = col_name.to_lowercase();
+                let needs_cast = schema
+                    .fields()
+                    .iter()
+                    .find(|f| f.name().to_lowercase() == col_lower)
+                    .map(|f| needs_json_fallback(f.data_type()))
+                    .unwrap_or(false);
+                let upper = col_name.to_uppercase();
+                if needs_cast {
+                    format!("CAST({} AS VARCHAR)", quote_ident(&upper))
+                } else {
+                    quote_ident(&upper)
+                }
             }
         })
         .collect();
@@ -1209,6 +1218,21 @@ async fn build_scan_sql(
     {
         sql.push_str(" WHERE ");
         sql.push_str(filter);
+    }
+
+    // Append ORDER BY clause for a pushed-down ordered top-N scan. The keys are
+    // rendered through the SAME shared `render_order_by_clause` the adapter's
+    // outer merge SQL uses, so the per-shard bounded sort and the merge sort
+    // induce the IDENTICAL ranking — key order, direction (ASC/DESC), and explicit
+    // NULL placement (NULLS FIRST/LAST). That structural reuse is what makes the
+    // distributed top-N provably equal to single-node evaluation regardless of any
+    // engine's default NULL ordering. Placed after WHERE and before LIMIT so
+    // DataFusion folds `ORDER BY <keys> LIMIT n` into a bounded, fetch-limited
+    // TopK (not a full global sort). When `order_by` is empty this block emits
+    // nothing, leaving pre-ordering-feature SQL byte-identical.
+    if !spec.order_by.is_empty() {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&render_order_by_clause(&spec.order_by));
     }
 
     // Append LIMIT clause.
@@ -1460,6 +1484,7 @@ mod tests {
             projection: vec![],
             filter: None,
             limit: None,
+            order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
             emit_exa_types: Vec::new(),
@@ -2712,7 +2737,7 @@ mod tests {
         spec.files = vec![(file_url, 0)];
         spec.logical_schema = logical;
         // The adapter pushes uppercase current-name projection.
-        spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+        spec.projection = vec!["ID".into(), "RATING".into()];
 
         // Drive the EXACT production path: register_files + build_scan_sql, then
         // collect the resulting rows.
@@ -2751,6 +2776,136 @@ mod tests {
             got, expected,
             "RATING must read the physical `score` values (rating = 10*id)"
         );
+    }
+
+    /// Task B4 (scenario `topn: Ordered top-N preserves descending and NULL ordering`):
+    /// `build_scan_sql` renders a pushed-down ORDER BY through the SAME shared
+    /// `render_order_by_clause` the adapter's outer merge uses, so per-shard and
+    /// merge agree on direction AND explicit NULL placement. Over a local Parquet
+    /// file whose sort column carries NULLs, a DESC sort yields a bounded,
+    /// correctly-ordered result, and flipping ONLY the `nulls_last` flag moves the
+    /// NULLs from the head to the tail — proving the NULL placement is honored
+    /// explicitly, not left to a DataFusion default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordered_scan_sql_preserves_desc_and_null_placement() {
+        use crate::scan::spec::SortKey;
+        use arrow::array::{Array, Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use parquet::arrow::ArrowWriter;
+
+        // price is nullable with NULLs interleaved among descending-comparable values.
+        let dir = std::env::temp_dir().join(format!("lh_topn_nulls_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("topn.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, true),
+        ]));
+        {
+            let file = std::fs::File::create(&path).expect("create parquet file");
+            let mut writer =
+                ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                    Arc::new(Float64Array::from(vec![
+                        Some(10.0),
+                        None,
+                        Some(30.0),
+                        Some(20.0),
+                        None,
+                    ])),
+                ],
+            )
+            .expect("record batch");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        let file_url = url::Url::from_file_path(&path)
+            .expect("absolute path")
+            .to_string();
+
+        // Collect the (id, Option<price>) rows build_scan_sql produces for a given
+        // sort direction / NULL placement / limit, IN PLAN ORDER (no test-side re-sort).
+        async fn topn_rows(
+            file_url: &str,
+            ascending: bool,
+            nulls_last: bool,
+            limit: u64,
+        ) -> Vec<(i64, Option<f64>)> {
+            let mut spec = minimal_spec();
+            spec.files = vec![(file_url.to_string(), 0)];
+            spec.projection = vec!["ID".into(), "PRICE".into()];
+            spec.order_by = vec![SortKey {
+                column: "PRICE".into(),
+                ascending,
+                nulls_last,
+            }];
+            spec.limit = Some(limit);
+
+            let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+            register_files(&ctx, "scan_target", &spec)
+                .await
+                .expect("register local parquet");
+            let sql = build_scan_sql(&ctx, "scan_target", &spec)
+                .await
+                .expect("build_scan_sql");
+            let df = ctx.sql(&sql).await.expect("plan scan SQL");
+            let batches = df.collect().await.expect("collect");
+            let mut rows: Vec<(i64, Option<f64>)> = Vec::new();
+            for batch in &batches {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("col 0 Int64 (ID)");
+                let price_col = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("col 1 Float64 (PRICE)");
+                for r in 0..batch.num_rows() {
+                    let p = if price_col.is_null(r) {
+                        None
+                    } else {
+                        Some(price_col.value(r))
+                    };
+                    rows.push((id_col.value(r), p));
+                }
+            }
+            rows
+        }
+
+        // DESC + NULLS FIRST, bounded to 3: the two NULLs rank first, then the max.
+        let desc_nulls_first = topn_rows(&file_url, false, false, 3).await;
+        assert_eq!(
+            desc_nulls_first.len(),
+            3,
+            "LIMIT 3 must bound the result: {desc_nulls_first:?}"
+        );
+        assert!(
+            desc_nulls_first[0].1.is_none() && desc_nulls_first[1].1.is_none(),
+            "DESC NULLS FIRST must rank NULLs first: {desc_nulls_first:?}"
+        );
+        assert_eq!(
+            desc_nulls_first[2].1,
+            Some(30.0),
+            "after the NULLs the largest value comes next: {desc_nulls_first:?}"
+        );
+
+        // DESC + NULLS LAST, bounded to 3: flipping ONLY the NULL flag moves the NULLs
+        // to the tail, so the top-3 are the descending non-NULL values.
+        let desc_nulls_last = topn_rows(&file_url, false, true, 3).await;
+        assert_eq!(
+            desc_nulls_last.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![Some(30.0), Some(20.0), Some(10.0)],
+            "DESC NULLS LAST must rank non-NULLs descending ahead of NULLs: {desc_nulls_last:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Scenario: column projection binds by Iceberg field-id across physical layouts.
@@ -2831,7 +2986,7 @@ mod tests {
         let mut spec = minimal_spec();
         spec.files = vec![(file_old, 0), (file_new, 0)];
         spec.logical_schema = logical;
-        spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+        spec.projection = vec!["ID".into(), "RATING".into()];
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
         register_files(&ctx, "scan_target", &spec)
@@ -3151,7 +3306,7 @@ mod tests {
             ctx.register_table("scan_target", Arc::new(table)).unwrap();
 
             let mut spec = super::minimal_spec();
-            spec.projection = vec!["ID".to_string(), "RATING".to_string()];
+            spec.projection = vec!["ID".into(), "RATING".into()];
             spec.logical_schema = logical;
 
             let sql = build_scan_sql(&ctx, "scan_target", &spec).await.unwrap();

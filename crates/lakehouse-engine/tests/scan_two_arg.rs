@@ -129,6 +129,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some("\"ID\" >= 10".into()),
         limit: None,
+        order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
         emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
