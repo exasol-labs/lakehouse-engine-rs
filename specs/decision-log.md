@@ -2101,3 +2101,32 @@ Discovered during implementation (B3b/B4): for a sort key column whose Arrow typ
 ### Consequences
 
 Covered by a unit test (`json_fallback_typed_sort_key_declines_topn`). The guard is evaluated on the same type info the scan path already uses for its own `needs_json_fallback` cast decision, so it becomes fully load-bearing the moment the logical-schema tag vocabulary is enriched to preserve richer types beyond the current out-of-range-Decimal case.
+
+---
+
+## ADR-078: Shape-Aware Zero-Files Short-Circuit via a Hoisted Plan Decision
+
+**Date:** 2026-07-04
+**Plan:** `fix-aggregate-pushdown-empty-file-pruning`
+
+**Status:** Accepted
+
+### Context
+
+`handle_pushdown` resolved the file list once, then short-circuited on zero files by returning the raw row-scan empty shape (`empty_pushdown_sql`) unconditionally — before the aggregate-shape detection (`detect_group_by_aggregates`, single-group `detect_aggregates`) ran later in the function. For an aggregate or grouped-aggregate request, this made the short-circuit return the wrong column count/shape, which Exasol rejected as a positional pushdown mismatch (`sqlCode 04000`). Both detection functions are pure over `pushdown_req` and do not depend on the resolved files, so every input needed to synthesize a shape-correct empty result was already available without any file.
+
+### Decision
+
+Move the request-shape decision ahead of the `files.is_empty()` short-circuit and dispatch to three empty-result builders (grouped zero-row / single-group one-row / row-scan projection), reusing the existing `detect_*` and type helpers so the empty shape is always derived from the same sources as the non-empty shape.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Hoist the plan-shape decision and dispatch to shape-specific empty builders | ✓ Chosen — detection is pure and file-independent, so it can be hoisted with no new I/O, and reusing shared helpers guarantees empty/non-empty shape parity |
+| Pass an "is-aggregate" flag into `empty_pushdown_sql` only | ✗ Rejected — still would not carry grouped shape or per-`AggKind` semantics |
+| Let the empty case fall through the normal fan-out with zero shards | ✗ Rejected — a single-group `COUNT` merges as `SUM(PARTIAL_count)` over zero fan-out rows = `NULL` (wrong, should be `0`), and a grouped fan-out over zero shards is malformed |
+
+### Consequences
+
+Empty and non-empty column shapes can never drift apart, since both derive from the same detection and type helpers. Covered by unit tests for each plan shape (`empty_files_single_group_aggregate_emits_zero_and_null_row`, `empty_files_count_distinct_emits_zero_no_merge_udf`, `empty_files_grouped_aggregate_emits_zero_rows_grouped_shape`, `empty_files_shape_matches_non_empty_plan_priority`) and end-to-end tests confirming Exasol accepts the response over a real all-pruned query.
