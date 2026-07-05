@@ -2083,7 +2083,7 @@ pub async fn handle_pushdown(
     let storage = &effective_storage;
 
     if files.is_empty() {
-        return Ok(empty_pushdown_sql(&proj_cols, &proj_types));
+        return empty_result_sql(&pushdown_req, &proj_cols, &proj_types, &col_types);
     }
 
     // Compute G = shard_count(node_count, parallelism_factor, file_count) and
@@ -3167,6 +3167,142 @@ fn detect_topn(
     Some(keys)
 }
 
+/// Build the shape-correct empty-result response for a fully-pruned file list.
+///
+/// The request-shape decision is hoisted ahead of the zero-files short-circuit
+/// and mirrors the non-empty dispatch priority — grouped aggregate, then
+/// single-group aggregate, then row scan. Both aggregate branches are gated on
+/// the same `validate_agg_col_types` check the non-empty path applies: a
+/// non-numeric aggregate demotes to the next shape, so the empty response's
+/// positional column shape always equals what the non-empty path would have
+/// committed to. A non-numeric grouped aggregate carrying a HAVING is declined
+/// with the same `Err` the non-empty path returns (Exasol retries natively),
+/// because the adapter advertises AGGREGATE_HAVING and dropping the HAVING would
+/// yield wrong results. No scan or distinct-merge UDF is referenced: with zero
+/// files there is nothing to scan or merge.
+fn empty_result_sql(
+    pushdown_req: &Json,
+    proj_cols: &[ProjectionItem],
+    proj_types: &[String],
+    col_types: &[(String, String)],
+) -> Result<Json, UdfError> {
+    if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
+        if validate_agg_col_types(&detection.plans, col_types) {
+            let group_key_types = group_key_exasol_types(
+                pushdown_req,
+                &detection.group_keys,
+                &detection.select_items,
+            );
+            let aggregate_types = aggregate_exasol_types(pushdown_req);
+            return Ok(empty_grouped_sql(
+                &group_key_types,
+                &aggregate_types,
+                &detection.select_items,
+            ));
+        }
+        // Gate failed. The non-empty grouped path declines with an Err when a
+        // HAVING is present (advertised AGGREGATE_HAVING → Exasol will not
+        // re-apply it); mirror that so the empty path declines identically.
+        if pushdown_req
+            .get("having")
+            .filter(|h| !h.is_null())
+            .is_some()
+        {
+            return Err(UdfError::User(
+                "grouped aggregate pushdown declined: HAVING present but aggregate \
+                 column type is non-numeric; Exasol will retry natively"
+                    .into(),
+            ));
+        }
+        // No HAVING: fall through to single-group / row scan, exactly as the
+        // non-empty path does.
+    }
+    if let Some(aggregates) =
+        detect_aggregates(pushdown_req).filter(|plans| validate_agg_col_types(plans, col_types))
+    {
+        return Ok(empty_agg_sql(
+            &aggregates,
+            &aggregate_exasol_types(pushdown_req),
+        ));
+    }
+    Ok(empty_pushdown_sql(proj_cols, proj_types))
+}
+
+/// The empty-result literal for an aggregate evaluated over zero input rows.
+///
+/// The COUNT family yields `0`; every other kind yields `NULL` — single-node SQL
+/// semantics over zero rows, mirroring the zero-count NULL guard (ADR-008).
+fn empty_agg_literal(kind: &AggKind) -> &'static str {
+    match kind {
+        AggKind::Count | AggKind::CountCol | AggKind::CountDistinct => "0",
+        AggKind::Sum
+        | AggKind::Min
+        | AggKind::Max
+        | AggKind::Avg
+        | AggKind::VarPop
+        | AggKind::VarSamp
+        | AggKind::StddevPop
+        | AggKind::StddevSamp => "NULL",
+    }
+}
+
+/// Build the single-group aggregate empty-result response: exactly one row whose
+/// columns are the per-`AggKind` empty literals cast to their declared result
+/// types (from `aggregate_exasol_types`/`selectListDataTypes`), in select-list
+/// order. `FROM DUAL` alone already yields one row, so no `WHERE` is emitted.
+///
+/// The cast decision mirrors `cast_merge_items` (cast when a declared type is
+/// present and not the `VARCHAR(2000000)` default) so the empty column types can
+/// never drift from the non-empty single-group shape.
+fn empty_agg_sql(aggregates: &[AggregatePlan], aggregate_types: &[String]) -> Json {
+    let items: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, plan)| {
+            let literal = empty_agg_literal(&plan.kind);
+            match aggregate_types.get(i) {
+                Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({literal} AS {ty})"),
+                _ => literal.to_string(),
+            }
+        })
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL", items.join(", "));
+    serde_json::json!({"type": "pushdown", "sql": sql})
+}
+
+/// Build the grouped aggregate empty-result response: zero rows
+/// (`FROM DUAL WHERE 1=0`) whose columns are the full grouped output shape —
+/// group-key, merged-aggregate, and constant-projection columns assembled in the
+/// user's select-list order via `select_items`, exactly as the non-empty grouped
+/// merge assembles its outer SELECT.
+///
+/// Group-key and aggregate columns are `CAST(NULL AS <declared-type>)` (types from
+/// `group_key_exasol_types` / `aggregate_exasol_types`); a constant projection
+/// reuses its already-rendered, type-cast expression. A zero-row result satisfies
+/// any HAVING / ORDER BY / LIMIT, so none of those need rendering.
+fn empty_grouped_sql(
+    group_key_types: &[String],
+    aggregate_types: &[String],
+    select_items: &[GroupedSelectItem],
+) -> Json {
+    let mut ordered = select_items.to_vec();
+    ordered.sort_by_key(select_item_index);
+    let items: Vec<String> = ordered
+        .iter()
+        .filter_map(|item| match item {
+            GroupedSelectItem::GroupKey { group_key_slot, .. } => group_key_types
+                .get(*group_key_slot)
+                .map(|ty| format!("CAST(NULL AS {ty})")),
+            GroupedSelectItem::Aggregate { plan_slot, .. } => aggregate_types
+                .get(*plan_slot)
+                .map(|ty| format!("CAST(NULL AS {ty})")),
+            GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
+        })
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
+    serde_json::json!({"type": "pushdown", "sql": sql})
+}
+
 /// Build a pushdown response with an empty result (no matching files).
 fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Json {
     let items: Vec<String> = proj_cols
@@ -3815,6 +3951,311 @@ mod tests {
         let sql = resp["sql"].as_str().unwrap();
         assert!(sql.contains("WHERE 1=0"));
         assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
+    }
+
+    /// Single-group empty result: one row, per-`AggKind` literal cast to its
+    /// declared type — COUNT → `0`, SUM → `NULL` — with no `WHERE 1=0` (a bare
+    /// `FROM DUAL` already yields exactly one row).
+    #[test]
+    fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
+        let aggregates = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+        ];
+        let types = vec!["DECIMAL(18,0)".to_string(), "DECIMAL(36,2)".to_string()];
+        let resp = empty_agg_sql(&aggregates, &types);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(sql.contains("FROM DUAL"), "must select from DUAL: {sql}");
+        assert!(
+            !sql.contains("WHERE 1=0"),
+            "single-group empty is one row, not zero rows: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(0 AS DECIMAL(18,0))"),
+            "COUNT empty literal must be 0 cast to declared type: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(36,2))"),
+            "SUM empty literal must be NULL cast to declared type: {sql}"
+        );
+    }
+
+    /// COUNT(DISTINCT) empty result is `0`, and references neither the scalar
+    /// distinct-merge UDF nor a `LISTAGG` union — with zero files there is nothing
+    /// to merge.
+    #[test]
+    fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
+        let aggregates = vec![AggregatePlan {
+            kind: AggKind::CountDistinct,
+            column: Some("ID".into()),
+            arg_expr: None,
+        }];
+        let types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_agg_sql(&aggregates, &types);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(
+            sql.contains("CAST(0 AS DECIMAL(18,0))"),
+            "COUNT(DISTINCT) empty literal must be 0: {sql}"
+        );
+        assert!(
+            !sql.contains(DISTINCT_MERGE_UDF_NAME),
+            "empty result must not reference the distinct-merge UDF: {sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("LISTAGG"),
+            "empty result must not emit a LISTAGG union: {sql}"
+        );
+    }
+
+    /// Every non-COUNT `AggKind` maps to the `NULL` empty literal — single-node
+    /// SQL semantics over zero rows (only the COUNT family yields `0`).
+    #[test]
+    fn empty_agg_literal_maps_non_count_kinds_to_null() {
+        for kind in [
+            AggKind::Sum,
+            AggKind::Min,
+            AggKind::Max,
+            AggKind::Avg,
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            assert_eq!(
+                empty_agg_literal(&kind),
+                "NULL",
+                "{kind:?} empty literal must be NULL"
+            );
+        }
+        for kind in [AggKind::Count, AggKind::CountCol, AggKind::CountDistinct] {
+            assert_eq!(
+                empty_agg_literal(&kind),
+                "0",
+                "{kind:?} empty literal must be 0"
+            );
+        }
+    }
+
+    /// Grouped empty result: zero rows (`WHERE 1=0`) with one `CAST(NULL AS <ty>)`
+    /// per grouped output column, assembled in select-list order.
+    #[test]
+    fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
+        let select_items = vec![
+            GroupedSelectItem::GroupKey {
+                group_key_slot: 0,
+                select_index: 0,
+            },
+            GroupedSelectItem::Aggregate {
+                plan_slot: 0,
+                select_index: 1,
+            },
+        ];
+        let group_key_types = vec!["DECIMAL(20,0)".to_string()];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(
+            sql.contains("WHERE 1=0"),
+            "grouped empty is zero rows: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(20,0))"),
+            "group-key column typed from group_key_types: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(18,0))"),
+            "aggregate column typed from aggregate_types: {sql}"
+        );
+        let select_clause = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM").next())
+            .unwrap();
+        assert_eq!(
+            select_clause.matches("CAST(NULL AS").count(),
+            2,
+            "one output column per grouped select item: {sql}"
+        );
+    }
+
+    /// A `GroupedSelectItem::Constant` (Exasol's "count the groups" literal
+    /// rewrite) reuses its already-rendered projection expression verbatim,
+    /// slotted into select-list order alongside the group-key and aggregate
+    /// columns — it contributes no aggregate plan and is not re-typed here.
+    #[test]
+    fn empty_grouped_sql_includes_constant_projection_column() {
+        let select_items = vec![
+            GroupedSelectItem::GroupKey {
+                group_key_slot: 0,
+                select_index: 0,
+            },
+            GroupedSelectItem::Constant {
+                select_index: 1,
+                projection: "CAST(NULL AS BOOLEAN)".to_string(),
+            },
+            GroupedSelectItem::Aggregate {
+                plan_slot: 0,
+                select_index: 2,
+            },
+        ];
+        let group_key_types = vec!["DECIMAL(20,0)".to_string()];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
+        let sql = resp["sql"].as_str().unwrap();
+        let select_clause = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM").next())
+            .unwrap();
+        let columns: Vec<&str> = select_clause.split(", ").collect();
+        assert_eq!(
+            columns,
+            vec![
+                "CAST(NULL AS DECIMAL(20,0))",
+                "CAST(NULL AS BOOLEAN)",
+                "CAST(NULL AS DECIMAL(18,0))",
+            ],
+            "constant column is reused verbatim in select-list order: {sql}"
+        );
+    }
+
+    /// Dispatch priority mirrors the non-empty path: grouped first, then
+    /// single-group aggregate (only when `validate_agg_col_types` passes), then
+    /// row scan.
+    #[test]
+    fn empty_result_sql_dispatches_by_plan_shape() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(18,2)".to_string())];
+
+        let grouped = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("COUNT", None, false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 18, "scale": 0},
+            ],
+        });
+        let grouped_sql =
+            empty_result_sql(&grouped, &proj, &proj_types, &col_types).unwrap()["sql"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert!(
+            grouped_sql.contains("WHERE 1=0"),
+            "grouped shape is zero rows: {grouped_sql}"
+        );
+
+        let single = serde_json::json!({
+            "selectList": [agg_item("SUM", Some("amount"), false)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+        });
+        let single_sql = empty_result_sql(&single, &proj, &proj_types, &col_types).unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            single_sql.contains("FROM DUAL") && !single_sql.contains("WHERE 1=0"),
+            "single-group shape is one row: {single_sql}"
+        );
+        assert!(single_sql.contains("CAST(NULL AS DECIMAL(36,2))"));
+
+        // Non-numeric SUM target demotes to the row-scan empty shape (gate honored).
+        let non_numeric = serde_json::json!({
+            "selectList": [agg_item("SUM", Some("name"), false)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+        });
+        let non_numeric_col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+        let row_sql = empty_result_sql(&non_numeric, &proj, &proj_types, &non_numeric_col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            row_sql.contains("CAST(NULL AS DECIMAL(20,0))") && row_sql.contains(&quote_ident("ID")),
+            "non-numeric single-group aggregate must fall through to the row-scan shape: {row_sql}"
+        );
+    }
+
+    /// A grouped aggregate over a non-numeric column with all files pruned must
+    /// fall through to the row-scan empty shape — the same demotion the non-empty
+    /// grouped path applies via `validate_agg_col_types` — never the grouped shape
+    /// (which would reintroduce the #57 column-count mismatch).
+    #[test]
+    fn empty_files_grouped_non_numeric_aggregate_demotes_to_row_scan() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let grouped_non_numeric = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("SUM", Some("name"), false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 36, "scale": 2},
+            ],
+        });
+
+        let row_sql = empty_result_sql(&grouped_non_numeric, &proj, &proj_types, &col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = empty_pushdown_sql(&proj, &proj_types)["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            row_sql, expected,
+            "non-numeric grouped aggregate over zero files must produce the row-scan empty shape"
+        );
+    }
+
+    /// A non-numeric grouped aggregate that also carries a HAVING cannot silently
+    /// demote (AGGREGATE_HAVING is advertised, so Exasol will not re-apply it):
+    /// the empty path must decline with the same `Err` the non-empty path returns.
+    #[test]
+    fn empty_files_grouped_non_numeric_aggregate_with_having_declines() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let grouped_having = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("SUM", Some("name"), false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 36, "scale": 2},
+            ],
+            "having": {"type": "predicate_greater"},
+        });
+
+        let err = empty_result_sql(&grouped_having, &proj, &proj_types, &col_types).unwrap_err();
+        match err {
+            UdfError::User(msg) => assert!(
+                msg.contains("HAVING present"),
+                "decline message must name the HAVING conflict: {msg}"
+            ),
+            other => panic!("expected UdfError::User, got {other:?}"),
+        }
     }
 
     #[test]
