@@ -426,3 +426,77 @@ fn q9b_multiple_count_distinct_and_expression_agg() {
          got {comment_length_sum}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// All-files-pruned pushdown shape (issue #57)
+// ---------------------------------------------------------------------------
+//
+// `distinct_probe` is seeded across two data files with disjoint id ranges
+// (file 1: ids 1..=10, file 2: ids 11..=20 — see `seed_distinct_probe`), so
+// `id > 1000` is beyond both files' max column stats and prunes 100% of the
+// table's data files at the Iceberg level. Before the #57 fix, the zero-files
+// short-circuit in `handle_pushdown` unconditionally returned the row-scan
+// empty shape even for an aggregate/grouped request, so Exasol rejected the
+// pushdown response with sqlCode 04000 ("Expected number of columns is 1 but
+// pushdown query has N"). These three tests exercise the three plan shapes
+// the fix must get right: single-group COUNT(DISTINCT), single-group SUM,
+// and a grouped aggregate.
+
+/// `COUNT(DISTINCT id)` with a predicate that prunes every data file returns
+/// a single row with value `0` — not a pushdown-shape rejection.
+#[test]
+fn count_distinct_all_files_pruned_returns_zero() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(DISTINCT id) FROM {} WHERE id > 1000",
+        distinct_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
+    let count = parse_int(&cols[0][0]);
+    assert_eq!(
+        count, 0,
+        "COUNT(DISTINCT id) over an all-files-pruned predicate must be 0, got {count}"
+    );
+}
+
+/// Single-group `SUM(id)` with a predicate that prunes every data file
+/// returns a single row with value `NULL` (single-node SQL semantics over
+/// zero rows) — not a pushdown-shape rejection.
+#[test]
+fn sum_all_files_pruned_returns_null() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT SUM(id) FROM {} WHERE id > 1000", distinct_table());
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
+    assert!(
+        cols[0][0].is_null(),
+        "SUM(id) over an all-files-pruned predicate must be NULL, got {:?}",
+        cols[0][0]
+    );
+}
+
+/// A grouped aggregate with a predicate that prunes every data file returns
+/// zero rows in the grouped shape — not a pushdown-shape rejection.
+#[test]
+fn grouped_aggregate_all_files_pruned_returns_no_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, COUNT(*) FROM {} WHERE id > 1000 GROUP BY id",
+        distinct_table()
+    );
+    let cols = conn.query_columns(&sql);
+    let total_rows: usize = cols.iter().map(|c| c.len()).sum();
+    assert_eq!(
+        total_rows, 0,
+        "grouped aggregate over an all-files-pruned predicate must return zero rows, got {cols:?}"
+    );
+}
