@@ -280,6 +280,56 @@ pub struct LogicalField {
     pub nullable: bool,
 }
 
+/// The kind of join to execute node-locally in the scan UDF.
+///
+/// This phase supports only `Inner` (inner equi-join); the adapter declines and
+/// falls through for every other join shape, so no other variant is ever produced.
+/// The lowercase serde tag mirrors [`AggKind`], keeping the wire form compact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JoinType {
+    /// INNER JOIN — the only broadcast-join shape this phase pushes down.
+    Inner,
+}
+
+/// The broadcast (small/dimension) side of a pushed-down inner equi-join.
+///
+/// This block is SHARD-INVARIANT: the dimension side's FULL file list is resolved
+/// once in the VS planning layer and carried once in the [`CommonScanSpec`] (the
+/// UDF's first argument), so every shard's UDF invocation re-scans the SAME full
+/// dimension file list and joins it against that shard's fact-file subset. It is
+/// therefore never part of the per-shard files argument, and the fact side's
+/// per-shard `files` and this block's `files` never collide.
+///
+/// The `condition` is a rendered DataFusion SQL expression string (produced by the
+/// VS join-condition renderer), spliced into the scan's inner equi-join VERBATIM —
+/// the same treatment [`ProjectionItem::Expr`] and `filter` receive.
+///
+/// Credentials never appear here: the dimension side is referenced by file list,
+/// not materialized, and storage credentials live once in [`StorageProps`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinSpec {
+    /// The dimension Iceberg table's root location, used to reconstruct absolute
+    /// file paths from relative `files` entries (empty = every path is absolute).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub table_root: String,
+
+    /// The dimension side's FULL file list as `(path, byte_size)` pairs. Carried
+    /// once (shard-invariant) and re-scanned by every shard's DataFusion session.
+    pub files: Vec<(String, u64)>,
+
+    /// Full logical schema of the dimension Iceberg table at query time. Absent
+    /// (empty) falls back to first-file schema inference, as on the raw-scan path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub logical_schema: Vec<LogicalField>,
+
+    /// The join kind. This phase only ever carries [`JoinType::Inner`].
+    pub join_type: JoinType,
+
+    /// Rendered DataFusion SQL join condition, spliced into the equi-join verbatim.
+    pub condition: String,
+}
+
 /// The shard-INVARIANT portion of a scan specification.
 ///
 /// Holds every field the scan UDF reads that is identical across all shards of a
@@ -338,6 +388,14 @@ pub struct CommonScanSpec {
     /// Full logical schema of the Iceberg table at query time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
+
+    /// Broadcast (dimension) side of a pushed-down inner equi-join. `None` (the
+    /// default) means a plain single-table scan; absent from JSON when `None` so
+    /// every pre-existing non-join spec deserializes unchanged (backward-compatible).
+    /// Shard-invariant, hence part of the common blob: the dimension side is
+    /// resolved once and re-scanned by every shard — see [`JoinSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinSpec>,
 
     pub storage: StorageProps,
 
@@ -470,6 +528,15 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
+    /// Broadcast (dimension) side of a pushed-down inner equi-join, or `None` (the
+    /// default) for a plain single-table scan. Shard-invariant, so it round-trips
+    /// through the [`CommonScanSpec`] on the split/merge path. Absent from JSON when
+    /// `None`, so every pre-existing non-join spec deserializes unchanged. The fact
+    /// side stays in `files`; the dimension side's files live in [`JoinSpec::files`],
+    /// so the two file lists never collide. See [`JoinSpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join: Option<JoinSpec>,
+
     pub storage: StorageProps,
 
     /// DataFusion `target_partitions` for this scan instance.
@@ -579,6 +646,7 @@ impl ScanSpec {
             group_keys: self.group_keys.clone(),
             emit_exa_types: self.emit_exa_types.clone(),
             logical_schema: self.logical_schema.clone(),
+            join: self.join.clone(),
             storage: self.storage.clone(),
             df_target_partitions: self.df_target_partitions,
             df_batch_size: self.df_batch_size,
@@ -611,6 +679,7 @@ impl ScanSpec {
             group_keys: common.group_keys,
             emit_exa_types: common.emit_exa_types,
             logical_schema: common.logical_schema,
+            join: common.join,
             storage: common.storage,
             df_target_partitions: common.df_target_partitions,
             df_batch_size: common.df_batch_size,
@@ -675,6 +744,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            join: None,
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
@@ -1570,5 +1640,139 @@ mod tests {
             "common blob JSON must not contain a catalog key: {}",
             spec.to_common_json()
         );
+    }
+
+    /// Task 2.1(a): a spec WITHOUT a join block serializes with no `join` key and a
+    /// legacy payload that predates the field deserializes with `join` defaulting to
+    /// `None` — existing non-join specs are unchanged (backward-compatible).
+    #[test]
+    fn absent_join_block_round_trips_unchanged() {
+        // A non-join spec (join: None) must omit the field from serialized JSON on
+        // both the full spec and the shard-invariant common blob.
+        let spec = sample_spec();
+        assert!(spec.join.is_none());
+        let json = spec.to_json();
+        assert!(
+            !json.contains("\"join\""),
+            "non-join spec must not carry a join key: {json}"
+        );
+        let common_json = spec.to_common_json();
+        assert!(
+            !common_json.contains("\"join\""),
+            "non-join common blob must not carry a join key: {common_json}"
+        );
+
+        // A legacy full-spec payload predating the field deserializes with join = None.
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.join.is_none(),
+            "missing join must default to None (backward-compat)"
+        );
+
+        // Same for the common blob in isolation.
+        let legacy_common_json = r#"{
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
+        assert!(
+            legacy_common.join.is_none(),
+            "missing join must default to None on the common blob (backward-compat)"
+        );
+    }
+
+    /// Task 2.1(b): a spec WITH a join block round-trips through JSON and through the
+    /// common/per-shard split and merge. The join block (dimension side) is
+    /// shard-INVARIANT: it rides in the common blob (UDF argument 0), never in the
+    /// per-shard files list (argument 1), so the fact side's per-shard `files` and
+    /// the dimension side's `join.files` never collide.
+    #[test]
+    fn join_block_round_trips_through_split_and_merge() {
+        let mut spec = sample_spec();
+        spec.join = Some(JoinSpec {
+            table_root: "s3://warehouse/db/dim".into(),
+            files: vec![
+                ("data/dim-00000.parquet".into(), 512),
+                ("data/dim-00001.parquet".into(), 1024),
+            ],
+            logical_schema: vec![LogicalField {
+                field_id: 1,
+                name: "d_key".into(),
+                arrow_type: "int64".into(),
+                nullable: false,
+            }],
+            join_type: JoinType::Inner,
+            condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        });
+
+        // The serialized JSON carries the join block; join_type is a lowercase tag.
+        let json = spec.to_json();
+        assert!(
+            json.contains("\"join\""),
+            "join spec must carry the join block: {json}"
+        );
+        assert!(
+            json.contains("\"join_type\":\"inner\""),
+            "join_type must serialize as the lowercase tag: {json}"
+        );
+
+        // Whole-spec round-trip.
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(back, spec);
+
+        // The join block lives in the shard-invariant common part, so the dimension
+        // files ride in the common blob (once), not per shard.
+        let common = spec.to_common();
+        assert_eq!(common.join, spec.join);
+        let common_json = spec.to_common_json();
+        assert!(
+            common_json.contains("dim-00000.parquet"),
+            "dimension files must ride in the shard-invariant common blob: {common_json}"
+        );
+
+        // The per-shard files list still carries ONLY the fact side's files.
+        let files_json = ScanSpec::files_json(&spec.files);
+        assert!(
+            !files_json.contains("dim-00000.parquet"),
+            "per-shard files must not carry dimension files: {files_json}"
+        );
+
+        // Reconstitution from the two UDF arguments reattaches the join block.
+        let reconstituted = ScanSpec::from_parts_json(&common_json, &files_json).unwrap();
+        assert_eq!(reconstituted, spec);
+        let jb = reconstituted
+            .join
+            .expect("join block must survive reconstitution");
+        assert_eq!(jb.table_root, "s3://warehouse/db/dim");
+        assert_eq!(
+            jb.files,
+            vec![
+                ("data/dim-00000.parquet".to_string(), 512),
+                ("data/dim-00001.parquet".to_string(), 1024),
+            ]
+        );
+        assert_eq!(jb.join_type, JoinType::Inner);
+        assert_eq!(jb.condition, "\"F_KEY\" = \"D_KEY\"");
+        assert_eq!(jb.logical_schema.len(), 1);
+        assert_eq!(jb.logical_schema[0].name, "d_key");
+
+        // The struct-level split/merge is equivalent to the JSON round-trip.
+        let via_struct = ScanSpec::from_parts(spec.to_common(), spec.files.clone());
+        assert_eq!(via_struct, spec);
     }
 }
