@@ -9,7 +9,7 @@ each Exasol script references it.
 
 * The crate is a `cdylib` depending on `exasol-udf-sdk` 0.14.0 (connect-back feature)
   and `exasol-udf-macros` 0.14.0.
-* The `.so` is built only inside the `rust:1.92-bookworm` builder image; it is never
+* The `.so` is built only inside the `rust:1.94-bookworm` builder image; it is never
   built with host `cargo build --release`.
 * Each entry point is declared with the `exasol_udf` macro; Exasol's `CREATE SCRIPT`
   statements reference each by its registered name against the same `%udf_object`.
