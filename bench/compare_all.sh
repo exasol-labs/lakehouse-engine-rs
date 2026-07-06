@@ -32,6 +32,15 @@ grep -E '^  (import_|vs_)' "$IC_REPORT" | awk -F': ' '{
   print "TIMING import-ceiling " label " " sec
 }' >> "$OUT"
 
+if [ -n "${TRINO_HOST:-}" ]; then
+  echo "== import_jdbc_trino.sh ==" | tee -a "$OUT"
+  J_REPORT="bench/reports/import-jdbc-trino-${TS}.txt"
+  bench/import_jdbc_trino.sh "$J_REPORT"
+  grep '^TIMING ' "$J_REPORT" >> "$OUT" || true
+else
+  echo "SKIP import_jdbc_trino.sh (TRINO_HOST unset — run deploy/scripts/trino-up.sh <env> first)" | tee -a "$OUT"
+fi
+
 echo "== athena_compare.sh ==" | tee -a "$OUT"
 A_REPORT="bench/reports/athena-compare-${TS}.txt"
 bench/athena_compare.sh "$A_REPORT"
