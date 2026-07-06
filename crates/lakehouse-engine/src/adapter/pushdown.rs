@@ -71,7 +71,6 @@ async fn build_rest_catalog(
 
     RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load("lakehouse", props)
@@ -171,7 +170,6 @@ fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
 /// files from S3 after we have fetched and deserialized the `LoadTableResult`.
 fn build_s3_file_io(storage: &StorageProps) -> iceberg::io::FileIO {
     let mut builder = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3".to_string(),
         customized_credential_load: None,
     }));
     if !storage.endpoint.is_empty() {
@@ -2422,9 +2420,16 @@ pub async fn resolve_file_list(
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
     let table_ident = TableIdent::new(namespace, table_name);
     let file_io = build_s3_file_io(&effective_storage);
+    let runtime = iceberg::Runtime::try_current().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
     let table_builder = iceberg::table::Table::builder()
         .identifier(table_ident)
         .file_io(file_io)
+        .runtime(runtime)
         .metadata(result.metadata);
     let table = if let Some(loc) = result.metadata_location {
         table_builder.metadata_location(loc).build()
