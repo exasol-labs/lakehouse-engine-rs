@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, LogicalField, ProjectionItem, ScanSpec, SortKey,
-    StorageProps, render_order_by_clause,
+    AggKind, AggregatePlan, CatalogProps, JoinType, LogicalField, ProjectionItem, ScanSpec,
+    SortKey, StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -2022,6 +2022,12 @@ fn relativize_shards_to_root(
 /// `parallelism_factor` — the oversubscription multiplier read from the
 /// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
 ///
+/// `join_broadcast_max_bytes` — the byte-size threshold read from the
+/// `JOIN_BROADCAST_MAX_BYTES` adapterNotes entry (default 128 MiB); a two-table
+/// inner equi-join broadcasts its smaller side when that side's Iceberg-manifest
+/// byte size is at or below this threshold. See backlog BL-001 / plan
+/// `add-join-pushdown-broadcast`.
+///
 /// `creds` — the resolved CONNECTION credentials, used to determine whether
 /// to sign catalog requests and whether to apply vended S3 credentials.
 ///
@@ -2048,8 +2054,13 @@ pub async fn handle_pushdown(
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
     s3_max_connections: usize,
+    join_broadcast_max_bytes: u64,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
+    // Not yet consumed here — task 3.2 (side-selection) reads this threshold to
+    // decide broadcast eligibility. Parsed, defaulted, and threaded through now so
+    // that task can land as a pure additive change.
+    let _ = join_broadcast_max_bytes;
     let pushdown_req = request
         .get("pushdownRequest")
         .cloned()
@@ -3172,6 +3183,197 @@ fn detect_topn(
         keys.push(key);
     }
     Some(keys)
+}
+
+/// Why a join `from` clause is not eligible for broadcast join planning.
+///
+/// Each variant names the specific contract violation (`vs-adapter/pushdown-planning-join`
+/// "A join outside the broadcast contract is declined safely") so a later caller can log or
+/// test the exact reason; every variant carries no data because the shape check alone is
+/// sufficient to explain the decline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IneligibleJoinReason {
+    /// `join_type` is present but not `"inner"` (e.g. an outer join).
+    NotInnerJoinType,
+    /// The join `condition` is present but is not a single `predicate_equal` node.
+    NotEquiCondition,
+    /// The join spans more than two involved tables (a nested `join` node on
+    /// either side, or an `involvedTables` count other than two).
+    TooManyTables,
+    /// The join `from` node is missing a field the broadcast contract requires
+    /// (`left`/`right`/`condition`/table `name`) — a shape the planner does not
+    /// recognize as any of the above, specific reasons.
+    UnsupportedShape,
+}
+
+/// One side of a detected two-table inner equi-join, with its original-cased
+/// Iceberg identifier already recovered from `TABLE_MAP`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EligibleJoin {
+    /// The Exasol virtual table name (`involvedTables[].name` / `from.left.name`).
+    pub left_table_name: String,
+    /// The Exasol virtual table name (`involvedTables[].name` / `from.right.name`).
+    pub right_table_name: String,
+    /// `left_table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
+    pub left_iceberg_ident: String,
+    /// `right_table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
+    pub right_iceberg_ident: String,
+    /// Always [`JoinType::Inner`] — the only join kind this detector accepts.
+    pub join_type: JoinType,
+    /// The raw `predicate_equal` condition node, unrendered (rendering is
+    /// `vs-expression`'s job, done later in the planning pipeline).
+    pub condition: Json,
+}
+
+/// The result of inspecting a pushdown request's `from` clause for the
+/// two-table inner equi-join shape this phase can plan a broadcast join for.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum JoinShape {
+    /// The `from` clause is a plain table reference (or absent) — today's
+    /// single-table pushdown path applies unchanged.
+    NotAJoin,
+    /// The `from` clause is a join, but not one this phase can broadcast.
+    /// The caller falls through to the existing single-table/unaccelerated
+    /// pushdown behavior; it never emits a broadcast plan for this request.
+    Ineligible(IneligibleJoinReason),
+    /// A genuine two-table inner equi-join with both sides' Iceberg
+    /// identifiers resolved.
+    Eligible(EligibleJoin),
+}
+
+/// Detect whether a pushdown request's `from` clause is a two-table inner
+/// equi-join eligible for broadcast join planning.
+///
+/// Per the Exasol virtual-schema-common-java pushdown JSON shape (see
+/// `specs/_plans/add-join-pushdown-broadcast/decision-log.md`), a join `from`
+/// node looks like:
+/// ```json
+/// {"type": "join", "join_type": "inner", "left": {...}, "right": {...}, "condition": {...}}
+/// ```
+/// where `left`/`right` are each a base-table reference (`{"name": ..., "type": "table"}`)
+/// and `condition` is a `predicate_equal` node. Anything else — an outer join, a
+/// non-equi condition, a nested `join` on either side, or an involved-table count
+/// other than two — is [`JoinShape::Ineligible`], never [`JoinShape::Eligible`].
+///
+/// A request whose `from` clause is absent or a plain table reference is
+/// [`JoinShape::NotAJoin`]: today's single-table pushdown path, completely
+/// unaffected by this detector.
+///
+/// Once the shape is a genuine two-table inner equi-join, both involved
+/// tables' original-cased Iceberg identifiers MUST be recoverable from
+/// `TABLE_MAP` — a virtual table absent from `TABLE_MAP` is the same "stale
+/// virtual schema" condition the single-table path reports via
+/// `resolve_pushdown_identifier`, so it is a hard `Err`, not a decline.
+pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
+    let from = match pushdown_req.get("from") {
+        Some(from) => from,
+        None => return Ok(JoinShape::NotAJoin),
+    };
+    if from.get("type").and_then(|t| t.as_str()) != Some("join") {
+        return Ok(JoinShape::NotAJoin);
+    }
+
+    let is_inner = from
+        .get("join_type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("inner"));
+    if !is_inner {
+        return Ok(JoinShape::Ineligible(
+            IneligibleJoinReason::NotInnerJoinType,
+        ));
+    }
+
+    let (left, right) = match (from.get("left"), from.get("right")) {
+        (Some(left), Some(right)) => (left, right),
+        _ => {
+            return Ok(JoinShape::Ineligible(
+                IneligibleJoinReason::UnsupportedShape,
+            ));
+        }
+    };
+
+    // A nested `join` node on either side means more than two tables are
+    // involved; anything other than a plain base-table reference is a shape
+    // this detector does not recognize.
+    for side in [left, right] {
+        match side.get("type").and_then(|t| t.as_str()) {
+            Some("join") => {
+                return Ok(JoinShape::Ineligible(IneligibleJoinReason::TooManyTables));
+            }
+            Some("table") => {}
+            _ => {
+                return Ok(JoinShape::Ineligible(
+                    IneligibleJoinReason::UnsupportedShape,
+                ));
+            }
+        }
+    }
+
+    let left_table_name = match left.get("name").and_then(|n| n.as_str()) {
+        Some(name) => name.to_string(),
+        None => {
+            return Ok(JoinShape::Ineligible(
+                IneligibleJoinReason::UnsupportedShape,
+            ));
+        }
+    };
+    let right_table_name = match right.get("name").and_then(|n| n.as_str()) {
+        Some(name) => name.to_string(),
+        None => {
+            return Ok(JoinShape::Ineligible(
+                IneligibleJoinReason::UnsupportedShape,
+            ));
+        }
+    };
+
+    // Defensive belt: the nested-join check above already rejects a >2-table
+    // shape structurally; this also catches a malformed request that names
+    // the same table twice or omits an involved table entirely.
+    let table_count = request
+        .get("involvedTables")
+        .and_then(|v| v.as_array())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    if table_count != 2 {
+        return Ok(JoinShape::Ineligible(IneligibleJoinReason::TooManyTables));
+    }
+
+    let condition = match from.get("condition").filter(|c| !c.is_null()) {
+        Some(condition) => condition.clone(),
+        None => {
+            return Ok(JoinShape::Ineligible(
+                IneligibleJoinReason::UnsupportedShape,
+            ));
+        }
+    };
+    if condition.get("type").and_then(|t| t.as_str()) != Some("predicate_equal") {
+        return Ok(JoinShape::Ineligible(
+            IneligibleJoinReason::NotEquiCondition,
+        ));
+    }
+
+    let table_map = super::read_table_map(request);
+    let left_iceberg_ident = table_map.get(&left_table_name).cloned().ok_or_else(|| {
+        UdfError::User(format!(
+            "pushdown: virtual table '{left_table_name}' is not in TABLE_MAP; \
+             drop and recreate the virtual schema"
+        ))
+    })?;
+    let right_iceberg_ident = table_map.get(&right_table_name).cloned().ok_or_else(|| {
+        UdfError::User(format!(
+            "pushdown: virtual table '{right_table_name}' is not in TABLE_MAP; \
+             drop and recreate the virtual schema"
+        ))
+    })?;
+
+    Ok(JoinShape::Eligible(EligibleJoin {
+        left_table_name,
+        right_table_name,
+        left_iceberg_ident,
+        right_iceberg_ident,
+        join_type: JoinType::Inner,
+        condition,
+    }))
 }
 
 /// Build the shape-correct empty-result response for a fully-pruned file list.
@@ -4882,6 +5084,201 @@ mod tests {
             )
             .is_none(),
             "an ORDER BY without a LIMIT must decline"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Join detection (task 3.1): `detect_join` shape classification.
+    // ---------------------------------------------------------------------------
+
+    /// Build a two-table-join pushdown request. `from_extra` is spliced into the
+    /// `from` object (e.g. to swap `join_type`, drop a field, or corrupt a side),
+    /// and `condition` becomes the join's `condition` node.
+    fn join_request(from_extra: Json, condition: Json) -> Json {
+        let mut from = serde_json::json!({
+            "type": "join",
+            "join_type": "inner",
+            "left": {"name": "CUSTOMER", "type": "table"},
+            "right": {"name": "ORDERS", "type": "table"},
+        });
+        if let Json::Object(extra) = from_extra {
+            from.as_object_mut().unwrap().extend(extra);
+        }
+        from["condition"] = condition;
+
+        serde_json::json!({
+            "involvedTables": [
+                {
+                    "name": "CUSTOMER",
+                    "columns": [
+                        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                        {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+                    ],
+                },
+                {
+                    "name": "ORDERS",
+                    "columns": [
+                        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                        {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+                    ],
+                },
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": from,
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                ],
+            },
+            "schemaMetadataInfo": {
+                "properties": {},
+                "adapterNotes": serde_json::json!({
+                    "TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}
+                }).to_string(),
+            },
+        })
+    }
+
+    /// The standard equi-join condition: `CUSTOMER.C_CUSTKEY = ORDERS.O_CUSTKEY`.
+    fn equi_condition() -> Json {
+        serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        })
+    }
+
+    /// A genuine two-table inner equi-join is detected as `Eligible`, with both
+    /// original-cased Iceberg identifiers recovered from `TABLE_MAP` (pushdown-planning-join
+    /// "Broadcast-eligible inner equi-join is planned as a broadcast fan-out").
+    #[test]
+    fn genuine_inner_equi_join_is_eligible_with_both_idents() {
+        let request = join_request(Json::Null, equi_condition());
+        let pushdown_req = pd(&request);
+
+        let shape = detect_join(&request, &pushdown_req).expect("TABLE_MAP has both tables");
+        match shape {
+            JoinShape::Eligible(join) => {
+                assert_eq!(join.left_table_name, "CUSTOMER");
+                assert_eq!(join.right_table_name, "ORDERS");
+                assert_eq!(join.left_iceberg_ident, "lh.customer");
+                assert_eq!(join.right_iceberg_ident, "lh.orders");
+                assert_eq!(join.join_type, JoinType::Inner);
+                assert_eq!(join.condition, equi_condition());
+            }
+            other => panic!("expected Eligible, got {other:?}"),
+        }
+    }
+
+    /// A plain single-table pushdown request (today's normal case, no `from` field
+    /// at all) is `NotAJoin` and completely unaffected by the detector.
+    #[test]
+    fn plain_single_table_request_is_not_a_join() {
+        let request = nq4_request();
+        let shape = detect_join(&request, &pd(&request)).expect("not a join, no TABLE_MAP lookup");
+        assert_eq!(shape, JoinShape::NotAJoin);
+    }
+
+    /// A `from` clause that is a plain table reference (`type: "table"`) is also
+    /// `NotAJoin` — the single-table shape some requests carry explicitly.
+    #[test]
+    fn from_table_node_is_not_a_join() {
+        let mut request = nq4_request();
+        request["pushdownRequest"]["from"] =
+            serde_json::json!({"name": "LINEITEM", "type": "table"});
+        let shape = detect_join(&request, &pd(&request)).expect("not a join");
+        assert_eq!(shape, JoinShape::NotAJoin);
+    }
+
+    /// Left/right/full outer joins are declined as `Ineligible(NotInnerJoinType)`,
+    /// never `Eligible` — the broadcast contract advertises only `JOIN_TYPE_INNER`.
+    #[test]
+    fn outer_join_is_ineligible() {
+        for outer in ["left_outer", "right_outer", "full_outer"] {
+            let request = join_request(serde_json::json!({"join_type": outer}), equi_condition());
+            let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
+            assert_eq!(
+                shape,
+                JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType),
+                "join_type '{outer}' must be ineligible, not broadcast-eligible"
+            );
+        }
+    }
+
+    /// A non-equi condition (e.g. `<`) is declined as `Ineligible(NotEquiCondition)`.
+    #[test]
+    fn non_equi_condition_is_ineligible() {
+        let condition = serde_json::json!({
+            "type": "predicate_less",
+            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+        });
+        let request = join_request(Json::Null, condition);
+        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
+        assert_eq!(
+            shape,
+            JoinShape::Ineligible(IneligibleJoinReason::NotEquiCondition)
+        );
+    }
+
+    /// A three-table join (a nested `join` node as the `left` side of the outer
+    /// join) is declined as `Ineligible(TooManyTables)`.
+    #[test]
+    fn three_table_join_is_ineligible() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["from"]["left"] = serde_json::json!({
+            "type": "join",
+            "join_type": "inner",
+            "left": {"name": "CUSTOMER", "type": "table"},
+            "right": {"name": "NATION", "type": "table"},
+            "condition": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C_NATIONKEY", "tableName": "CUSTOMER"},
+                "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"},
+            },
+        });
+        // A three-table join also involves three tables, not two.
+        request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "NATION",
+            "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
+        }));
+        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
+        assert_eq!(
+            shape,
+            JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)
+        );
+    }
+
+    /// An `involvedTables` count other than two (independent of the `from` shape)
+    /// is also declined as `Ineligible(TooManyTables)` — a defensive belt.
+    #[test]
+    fn involved_table_count_mismatch_is_ineligible() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
+            "name": "NATION",
+            "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
+        }));
+        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
+        assert_eq!(
+            shape,
+            JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)
+        );
+    }
+
+    /// An otherwise-eligible join whose virtual table name is absent from
+    /// `TABLE_MAP` is a hard `Err` (stale virtual schema), not a decline — the
+    /// same treatment the single-table path gives an unmapped involved table.
+    #[test]
+    fn join_with_unmapped_table_is_an_error() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["schemaMetadataInfo"]["adapterNotes"] =
+            Json::String(serde_json::json!({"TABLE_MAP": {"CUSTOMER": "lh.customer"}}).to_string());
+        let err = detect_join(&request, &pd(&request))
+            .expect_err("ORDERS is absent from TABLE_MAP: must be Err, not a decline");
+        assert!(
+            err.to_string().contains("ORDERS"),
+            "error must name the unmapped table: {err}"
         );
     }
 
