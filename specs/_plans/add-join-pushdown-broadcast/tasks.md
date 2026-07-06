@@ -5,8 +5,8 @@
 - [x] 2.1 Extend CommonScanSpec/ScanSpec with optional join block; wire serde + reconstitution merge [expert]
 
 ## Phase 2: Implementation (Group B)
-- [ ] 3.1 Detect join `from` clause, recover both Iceberg idents via TABLE_MAP, reject non-inner/non-equi/>2-table
-- [ ] 3.6 Read JOIN_BROADCAST_MAX_BYTES adapter note (with default), thread through handle_pushdown
+- [x] 3.1 Detect join `from` clause, recover both Iceberg idents via TABLE_MAP, reject non-inner/non-equi/>2-table
+- [x] 3.6 Read JOIN_BROADCAST_MAX_BYTES adapter note (with default), thread through handle_pushdown
 
 ## Phase 2: Implementation (Group C)
 - [ ] 3.2 Resolve both sides' file lists/schemas/byte sizes once; select smaller side vs threshold [expert]
