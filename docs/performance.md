@@ -10,25 +10,28 @@ reading the same data. `lakehouse-engine-rs` numbers are post-optimization (arit
 aggregate pushdown + ordered top-N pushdown, see `specs/_recorded/`). Trino ran on an ephemeral
 2-node `r8i.2xlarge` cluster spun up for this run and torn down immediately after. **Win/Loss is
 scored only against Trino** (the stated competitive target); Athena and Spark are included for
-reference, not scored.
+reference, not scored. The "IMPORT FROM JDBC" column (live-verified 2026-07-06) is Exasol's own
+native `IMPORT FROM JDBC` reader pushing each query down as a sub-select over a JDBC connection to
+the same ephemeral Trino cluster — a third access pattern, not itself the scored competitive
+target, so it's informational and excluded from Win/Loss.
 
-| Query | lakehouse-engine-rs | Trino (2-node) | vs Trino | Athena | Spark (EMR Serverless) |
-|---|---|---|---|---|---|
-| Q1 (3-way join, wiring) | 1.67 s | 7.51 s | **WIN** | 2.43 s | 18.89 s |
-| Q2 (3-way join, big scan) | 17.09 s | 12.30 s | LOSS | 2.14 s | 42.89 s |
-| Q3 (join + filter + GROUP BY) | 15.10 s | 8.79 s | LOSS | 2.37 s | 29.20 s |
-| Q4 (pricing summary, filter) | 3.89 s | 5.50 s | **WIN** | 3.43 s | 18.94 s |
-| Q5 (Q3, no filter) | 18.06 s | 9.71 s | LOSS | 2.16 s | 35.38 s |
-| Q6 (Q4, no filter) | 3.56 s | 4.62 s | **WIN** | 2.52 s | 16.52 s |
-| Q7 (high-cardinality GROUP BY) | 5.98 s | 5.28 s | LOSS | 2.30 s | 12.15 s |
-| Q8 (selective filter) | 2.34 s | 4.05 s | **WIN** | 0.99 s | 4.38 s |
-| Q9a (narrow projection) | 1.17 s | 3.69 s | **WIN** | 1.57 s | 4.51 s |
-| Q9b (wide projection) | 11.36 s | 15.65 s | **WIN** | 27.93 s | 57.31 s |
-| NQ1 (arithmetic aggregate: `SUM(price*discount)`) | 3.96 s | 5.31 s | **WIN** | 2.27 s | 10.72 s |
-| NQ2 (LIKE + IN filter pushdown) | 4.19 s | 5.53 s | **WIN** | 2.71 s | 11.45 s |
-| NQ3 (4-way join, part/partsupp) | 4.40 s | 4.97 s | **WIN** | 4.45 s | 3.88 s |
-| NQ4 (ORDER BY + LIMIT top-N) | 2.13 s | 4.71 s | **WIN** | 2.34 s | 11.18 s |
-| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.63 s | 3.87 s | **WIN** | 2.06 s | 5.39 s |
+| Query | lakehouse-engine-rs | Trino (2-node) | vs Trino | Athena | Spark (EMR Serverless) | IMPORT FROM JDBC (Trino) |
+|---|---|---|---|---|---|---|
+| Q1 (3-way join, wiring) | 1.67 s | 7.51 s | **WIN** | 2.43 s | 18.89 s | 1.93 s |
+| Q2 (3-way join, big scan) | 17.09 s | 12.30 s | LOSS | 2.14 s | 42.89 s | 8.15 s |
+| Q3 (join + filter + GROUP BY) | 15.10 s | 8.79 s | LOSS | 2.37 s | 29.20 s | 4.45 s |
+| Q4 (pricing summary, filter) | 3.89 s | 5.50 s | **WIN** | 3.43 s | 18.94 s | 3.01 s |
+| Q5 (Q3, no filter) | 18.06 s | 9.71 s | LOSS | 2.16 s | 35.38 s | 8.29 s |
+| Q6 (Q4, no filter) | 3.56 s | 4.62 s | **WIN** | 2.52 s | 16.52 s | 2.44 s |
+| Q7 (high-cardinality GROUP BY) | 5.98 s | 5.28 s | LOSS | 2.30 s | 12.15 s | 3.58 s |
+| Q8 (selective filter) | 2.34 s | 4.05 s | **WIN** | 0.99 s | 4.38 s | 2.11 s |
+| Q9a (narrow projection) | 1.17 s | 3.69 s | **WIN** | 1.57 s | 4.51 s | 1.36 s |
+| Q9b (wide projection) | 11.36 s | 15.65 s | **WIN** | 27.93 s | 57.31 s | 12.36 s |
+| NQ1 (arithmetic aggregate: `SUM(price*discount)`) | 3.96 s | 5.31 s | **WIN** | 2.27 s | 10.72 s | 3.12 s |
+| NQ2 (LIKE + IN filter pushdown) | 4.19 s | 5.53 s | **WIN** | 2.71 s | 11.45 s | 3.82 s |
+| NQ3 (4-way join, part/partsupp) | 4.40 s | 4.97 s | **WIN** | 4.45 s | 3.88 s | 2.48 s |
+| NQ4 (ORDER BY + LIMIT top-N) | 2.13 s | 4.71 s | **WIN** | 2.34 s | 11.18 s | 2.90 s |
+| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.63 s | 3.87 s | **WIN** | 2.06 s | 5.39 s | 2.19 s |
 
 **11 wins, 4 losses vs Trino.** The 4 losses (Q2, Q3, Q5, Q7) are join-shaped or high-cardinality
 GROUP BY queries; see "Known losses" below for why they are structural, not unoptimized.
