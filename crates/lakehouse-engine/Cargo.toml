@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.23.2"
+version = "0.23.3"
 edition = "2024"
 license.workspace = true
 
@@ -70,21 +70,17 @@ reqwest = { version = "0.12" }
 
 [dev-dependencies]
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Test fixtures (tests/common/seed.rs, tests/tpch_loader.rs) build Arrow
+# RecordBatch + parquet WriterProperties directly with the workspace arrow/parquet
+# 58 and feed them into iceberg 0.10.0-rc.2's writer stack, which also links
+# arrow 58 — a single arrow-58 tree end to end, no per-tree aliases or IPC bridge.
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
-# iceberg 0.9.1 links arrow/parquet 57 internally; the seed helper feeds Arrow
-# RecordBatch + parquet WriterProperties straight into iceberg's writer APIs, so
-# those objects MUST be the 57-typed variants iceberg expects (the workspace
-# arrow/parquet 58 are a different, incompatible type tree). Aliased so both
-# coexist in the test crate.
-ice_arrow_array     = { package = "arrow-array", version = "57" }
-ice_arrow_schema    = { package = "arrow-schema", version = "57" }
-ice_parquet         = { package = "parquet", version = "57" }
-# TPC-H generator for the live smoke test loader (tests/tpch_loader.rs). Pins
-# arrow ^57.1 — same major as the iceberg 0.9.1 write stack above, so the Arrow
-# RecordBatch it yields feeds straight into iceberg's writer with no conversion.
+# TPC-H core row generator for the live smoke-test loader (tests/tpch_loader.rs).
+# `tpchgen` core has zero dependencies (no arrow); the loader builds arrow-58
+# RecordBatches from its rows by hand, so `tpchgen-arrow` (which has no arrow-58
+# release: 2.0.2→arrow 57, 3.0.0→arrow 59) is no longer needed.
 tpchgen             = { version = "2.0.2" }
-tpchgen-arrow       = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 reqwest             = { version = "0.12", features = ["blocking"] }
