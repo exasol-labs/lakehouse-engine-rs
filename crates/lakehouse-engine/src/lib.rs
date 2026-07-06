@@ -22,7 +22,7 @@
 //! - The scan UDF is stateless and discovers no files itself.
 //! - Credentials never appear in error messages.
 //!
-//! Build: `make cross-musl-udf-build` (inside `rust:1.92-bookworm`).
+//! Build: `make cross-musl-udf-build` (inside `rust:1.94-bookworm`).
 //! Never `cargo build --release` on the host — produces an unloadable host-glibc `.so`.
 
 use std::collections::HashSet;
