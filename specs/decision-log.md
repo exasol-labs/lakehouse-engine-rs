@@ -2130,3 +2130,87 @@ Move the request-shape decision ahead of the `files.is_empty()` short-circuit an
 ### Consequences
 
 Empty and non-empty column shapes can never drift apart, since both derive from the same detection and type helpers. Covered by unit tests for each plan shape (`empty_files_single_group_aggregate_emits_zero_and_null_row`, `empty_files_count_distinct_emits_zero_no_merge_udf`, `empty_files_grouped_aggregate_emits_zero_rows_grouped_shape`, `empty_files_shape_matches_non_empty_plan_priority`) and end-to-end tests confirming Exasol accepts the response over a real all-pruned query.
+
+---
+
+## ADR-079: Pin iceberg 0.10.0-rc.2 via git tag, not a crates.io exact-version pin
+
+**Date:** 2026-07-06
+**Plan:** `change-iceberg-rust-0-10-bump`
+**Status:** Accepted
+
+### Context
+
+The bump target, iceberg-rust 0.10.0-rc.2, is a pre-release whose API can still churn. Verification during planning showed crates.io publishes `iceberg`/`iceberg-catalog-rest`/`iceberg-storage-opendal` only up to 0.9.1 — 0.10.0-rc.2 exists only as a git tag (`v0.10.0-rc.2`, commit `be6cc96eaeb1cac4574cabb11ea6e1e92e0aad45`) of `apache/iceberg-rust`, never published to crates.io. The interview's intent was that a later RC/GA bump be deliberate and reviewed, not automatic.
+
+### Decision
+
+Pin `iceberg`, `iceberg-catalog-rest`, and `iceberg-storage-opendal` to the git tag `v0.10.0-rc.2` (commit `be6cc96eaeb1cac4574cabb11ea6e1e92e0aad45`) of `apache/iceberg-rust`, rather than a crates.io version string.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Git tag pin (`v0.10.0-rc.2`) | ✓ Chosen — the only mechanism that resolves the RC at all; the tag is immutable and human-readable, so a later RC/GA requires an explicit edit |
+| `version = "=0.10.0-rc.2"` from crates.io | ✗ Rejected — crates.io does not publish this version; it does not resolve |
+| Bare `rev = <sha>` | ✗ Rejected — resolves the same commit but loses the human-readable tag reference |
+
+### Consequences
+
+The dependency pin is immutable and self-documenting; bumping to a later RC or the GA release is an explicit, reviewed edit rather than something that happens automatically on `cargo update`.
+
+---
+
+## ADR-080: Unify the production/iceberg arrow tree on 58; do not bump the workspace arrow major
+
+**Date:** 2026-07-06
+**Plan:** `change-iceberg-rust-0-10-bump`
+**Status:** Accepted
+
+### Context
+
+iceberg 0.9.1 linked arrow 57, creating a split with the rest of the workspace on arrow 58. Verification against the iceberg 0.10.0-rc.2 tag's `Cargo.toml` confirmed it is on arrow/parquet 58, so the split can be collapsed by the bump alone. A tempting alternative was to instead move the whole workspace to arrow 59 to match `tpchgen-arrow` 3.0.0.
+
+### Decision
+
+Let the bump collapse the production arrow tree onto arrow 58 with no change to the workspace `arrow`, `datafusion`, or SDK pins.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Keep workspace on arrow 58; let iceberg 0.10 collapse onto it | ✓ Chosen — eliminates the 57/58 split with zero change to datafusion, the SDK, or other pins |
+| Move workspace arrow to 59 (matching tpchgen-arrow 3.0.0) | ✗ Rejected — drags datafusion 54, `exasol-udf-sdk` 0.20.2, and iceberg 0.10 (all arrow-58) off their pinned tree; far larger and out-of-scope |
+
+### Consequences
+
+The arrow-57/58 split that existed solely because of iceberg 0.9.1 is fully eliminated. No other workspace dependency pin needs to move, keeping this a scoped, low-risk bump.
+
+---
+
+## ADR-081: Drop `tpchgen-arrow`; build arrow-58 batches from `tpchgen` core directly
+
+**Date:** 2026-07-06
+**Plan:** `change-iceberg-rust-0-10-bump`
+**Status:** Accepted
+
+### Context
+
+`tpchgen-arrow` publishes 2.0.2 (arrow 57) and 3.0.0 (arrow 59) but no arrow-58 release, while the iceberg 0.10 writer now expects arrow-58 `RecordBatch`es. Keeping `tpchgen-arrow` at either version would leave a second, divergent arrow tree in the dev/e2e graph and require an Arrow IPC bridge that does not exist today. `tpchgen` core, by contrast, is a pure row generator with zero dependencies — no arrow at all (verified in `Cargo.lock`).
+
+### Decision
+
+Remove the `tpchgen-arrow` dependency entirely and construct arrow-58 `RecordBatch`es directly in `seed.rs`/`tpch_loader.rs` from `tpchgen` core, using the workspace `arrow` 58 builders.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Drop `tpchgen-arrow`; hand-build arrow-58 batches from `tpchgen` core | ✓ Chosen — reaches a genuinely single arrow-58 tree with no cross-tree hand-off; bounded, test-only cost (~100–200 lines of column builders) |
+| Keep `tpchgen-arrow` 2.0.2 (arrow 57) + Arrow IPC bridge | ✗ Rejected — leaves arrow 57 permanently in the dev lock and introduces an IPC round-trip that doesn't exist today |
+| Bump `tpchgen-arrow` to 3.0.0 (arrow 59) + IPC bridge | ✗ Rejected — introduces arrow 59, a tree newer than the workspace's 58, plus generator API churn plus the same IPC bridge; strictly worse |
+| Drop the TPC-H loader | ✗ Rejected — it backs the live smoke test |
+
+### Consequences
+
+The dev/e2e dependency graph collapses onto a single arrow-58 tree — no arrow 57, no arrow 59, no IPC bridge anywhere. A future workspace arrow bump needs no coordinated `tpchgen-arrow` release, since generator batches are now built with the workspace arrow directly. The cost is bounded, test-only code in `seed.rs`/`tpch_loader.rs`; no production code is affected.
