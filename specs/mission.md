@@ -74,7 +74,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Query engine | DataFusion + Arrow/Parquet 58 | Node-local vectorized scan & pushdown execution |
 | Lakehouse | iceberg-rust (Iceberg + Databricks Iceberg catalogs) | Snapshot discovery, file resolution, table registration |
 | UDF runtime | `exasol-udf-sdk` 0.13.1 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
-| Build | `rust:1.92-bookworm` (glibc 2.36) in Docker | Builds `.so` matching the SLC; never built on host |
+| Build | `rust:1.94-bookworm` (glibc 2.36) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
 > Sibling projects: `strata-rs` (VS adapter + UDF conventions) and `language-container-rs` (the Rust
@@ -85,7 +85,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 ## Commands
 
 ```bash
-# Build (UDF .so — inside the rust:1.92-bookworm container, never host `cargo build --release`)
+# Build (UDF .so — inside the rust:1.94-bookworm container, never host `cargo build --release`)
 make cross-musl-udf-build
 
 # Test (host unit tests)

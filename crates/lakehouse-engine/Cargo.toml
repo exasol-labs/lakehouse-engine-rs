@@ -18,8 +18,8 @@ exasol-e2e = []
 cloud-e2e = []
 
 [dependencies]
-exasol-udf-sdk    = { version = "0.20.1", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.20.1" }
+exasol-udf-sdk    = { version = "0.20.2", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.20.2" }
 
 vs-expression = { path = "../vs-expression" }
 
@@ -54,7 +54,7 @@ url     = { workspace = true }
 tracing = { version = "0.1", default-features = false }
 
 # SigV4 signing for Glue REST catalog requests (engine-only: not used by vs-expression).
-# MSRV 1.91.1 — compatible with rustc 1.92 that builds the UDF .so.
+# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
 aws-sigv4             = { version = "1.4", default-features = true }
 aws-credential-types  = { version = "1.2" }
 # aws-smithy-runtime-api is a direct dependency of aws-sigv4 (for Identity); we declare
