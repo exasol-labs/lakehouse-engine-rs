@@ -29,6 +29,7 @@ All are `CREATE VIRTUAL SCHEMA` properties unless noted, resolved once at
 | `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
 | `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
 | `S3_MAX_CONNECTIONS` | no | `AUTO` | Object-store HTTP connection-pool budget per scan instance. `AUTO` derives from cores/threading; see below. |
+| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold (from Iceberg manifest sizes, no Parquet read) below which a two-table inner equi-join's smaller side is broadcast into every shard; above it, falls back to an unaccelerated two-scan join. See backlog BL-001 / plan `add-join-pushdown-broadcast`. |
 | `LAKEHOUSE_UDF_DEBUG_LEVEL` | no (env var) | `info` | `debug` emits per-scan phase telemetry; `info` is silent. See below. |
 
 **Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the
