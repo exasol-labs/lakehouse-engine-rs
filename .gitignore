@@ -16,6 +16,7 @@ debug-cluster.md
 # Benchmark local config + reports
 bench/.env
 bench/reports/
+bench/.cache/
 
 # Generated third-party notices (embeds full license texts; regenerated at
 # release time via `cargo about generate`, never committed)
