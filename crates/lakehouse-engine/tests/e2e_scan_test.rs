@@ -8,7 +8,7 @@
 //!
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
-//! 2. Install SLC 0.20.1 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
+//! 2. Install SLC 0.20.2 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
 //! 3. Create the LAKEHOUSE_ADAPTER script, the LAKEHOUSE_SCAN SET script, and
 //!    the LAKEHOUSE_DISTINCT_MERGE_COUNT scalar merge script (all from the same .so).
 //! 4. Create the LHVS Virtual Schema over the seeded table.
@@ -58,7 +58,7 @@ const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_en
 /// BucketFS path for the SLC tarball.
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
 /// SLC version we link against.
-const SLC_VERSION: &str = "0.20.1";
+const SLC_VERSION: &str = "0.20.2";
 /// Name of the Exasol CONNECTION carrying catalog + storage credentials.
 const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 /// Language alias for our SLC. This Exasol is dedicated to lakehouse-engine
@@ -91,7 +91,7 @@ fn setup_e2e() {
                 .expect("seed Iceberg events table")
         });
 
-        // 3. Install SLC 0.20.1 (download + upload + ALTER SYSTEM).
+        // 3. Install SLC 0.20.2 (download + upload + ALTER SYSTEM).
         install_slc();
 
         // 4. Upload the .so to BucketFS.
@@ -105,7 +105,7 @@ fn setup_e2e() {
     });
 }
 
-/// Install SLC 0.20.1 for the LHRUST language alias.
+/// Install SLC 0.20.2 for the LHRUST language alias.
 fn install_slc() {
     // Download the SLC tarball.
     let slc_url = format!(
@@ -146,7 +146,7 @@ fn install_slc() {
     );
 
     // Register the RUST language alias, replacing any existing RUST= entry so
-    // the alias points at our freshly-uploaded 0.20.1 SLC. This Exasol is
+    // the alias points at our freshly-uploaded 0.20.2 SLC. This Exasol is
     // dedicated to lakehouse-engine, so a clean replacement is correct.
     let mut conn = exa_conn();
     let rust_def = format!(

@@ -30,7 +30,7 @@ jobs:
   # ── build early ──────────────────────────────────────────────────────────
   # Warms the shared host cargo cache that lint/unit-tests/e2e's test-binary
   # compile reuse. Independent of build-so (different toolchain: host vs the
-  # rust:1.92-bookworm container) — runs in parallel with it.
+  # rust:1.94-bookworm container) — runs in parallel with it.
   build:
     name: Build (warm cache)
     runs-on: ubuntu-latest
@@ -45,8 +45,8 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
         with:
           components: clippy, rustfmt
 
@@ -82,7 +82,7 @@ jobs:
         run: cargo build --workspace --all-targets
 
   # ── the real release artifact ─────────────────────────────────────────────
-  # Built the same way a developer does: inside rust:1.92-bookworm (glibc
+  # Built the same way a developer does: inside rust:1.94-bookworm (glibc
   # 2.36), matching the SLC. Never `cargo build --release` on the runner
   # directly — Ubuntu's glibc is newer and the .so fails to dlopen in Exasol.
   build-so:
@@ -103,7 +103,7 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # This build runs INSIDE rust:1.92-bookworm with its cargo home at
+      # This build runs INSIDE rust:1.94-bookworm with its cargo home at
       # /usr/local/cargo, so Swatinem/rust-cache (host-side, prunes via the host
       # cargo) can't manage it — we stay on actions/cache.
       #
@@ -161,17 +161,17 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
         with:
           components: clippy, rustfmt
 
       # dtolnay/rust-toolchain's `components:` doesn't reliably provision
       # rustfmt/clippy for every toolchain snapshot (observed: "'cargo-fmt' is
-      # not installed for the toolchain '1.92-x86_64-unknown-linux-gnu'") —
+      # not installed for the toolchain '1.94-x86_64-unknown-linux-gnu'") —
       # same fix exasol-labs/language-container-rs's CI already needed.
-      - name: Ensure rustfmt/clippy available on 1.92
-        run: rustup component add rustfmt clippy --toolchain 1.92
+      - name: Ensure rustfmt/clippy available on 1.94
+        run: rustup component add rustfmt clippy --toolchain 1.94
 
       # Restore the pruned cache the build job saved (same shared-key); read
       # only — save-if:false so this job never writes its own copy.
@@ -200,8 +200,8 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -220,8 +220,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -270,8 +270,8 @@ jobs:
           name: lakehouse-engine-so
           path: target/release/
 
-      - name: Install Rust 1.92
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       # Read-only restore of the shared workspace cache to warm the host debug
       # build of the e2e test binary. save-if:false so this job doesn't prune
@@ -491,9 +491,9 @@ jobs:
         with:
           name: lakehouse-engine-so
 
-      - name: Install Rust 1.92
+      - name: Install Rust 1.94
         if: steps.gate.outputs.release == 'true'
-        uses: dtolnay/rust-toolchain@5a814b2e0f75e492da42a3c1227d52112e4dac50 # 1.92 branch (toolchain 1.92.0 baked into action.yml)
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       - name: Install cargo-about
         if: steps.gate.outputs.release == 'true'
