@@ -7,7 +7,19 @@
 # Query text matches bench/athena_compare.sh verbatim (both Presto-derived, identical SQL) —
 # translated from bench/run.sh's Q1-Q4 (lines ~321-349). Keep both in sync if you edit one.
 #
-#   TRINO_HOST=<coordinator-ip> ./trino_compare.sh   # only the coordinator accepts client queries
+# Methodology: ONE persistent Trino CLI session (not a fresh `docker run` per query) launched via
+# SSH onto a TRINO WORKER node — not the operator's machine, not the coordinator. A prior version
+# of this script spun up a fresh Docker container + fresh JVM cold start PER QUERY on the
+# operator's own machine, reaching the coordinator over the public internet; that made native
+# Trino look slower than it is, relative to bench/run.sh (VS) and bench/import_jdbc_trino.sh, both
+# of which pay one lightweight `exapump` process (no JVM) per query talking to Exasol, which then
+# does its own intra-VPC hop to whatever it's querying. Launching from a worker node instead gives
+# this script the same two-hop shape: (operator machine -> the cluster's own node, over the
+# internet) + (that node -> the thing being measured, intra-VPC) — matching exapump's (operator ->
+# Exasol, over the internet) + (Exasol -> Trino, intra-VPC). A worker (not the coordinator) is
+# used deliberately so there's still a real network hop to measure, not zero-latency localhost.
+#
+#   TRINO_HOST=<coordinator-ip> TRINO_WORKER_HOST=<worker-ip> ./trino_compare.sh
 # No -e: run_timed must survive a failing query (OOM, syntax error, ...) and report it as FAILED
 # rather than aborting the whole comparison — same convention as bench/import_ceiling.sh.
 set -uo pipefail
@@ -18,8 +30,28 @@ if [ -z "${TRINO_HOST:-}" ]; then
   echo "SKIP: TRINO_HOST not set (run deploy/scripts/trino-up.sh <env> first)"
   exit 0
 fi
+if [ -z "${TRINO_WORKER_HOST:-}" ]; then
+  echo "SKIP: TRINO_WORKER_HOST not set (the trino_worker_hosts[0] tofu output from trino-up.sh)"
+  exit 0
+fi
 TRINO_PORT="${TRINO_PORT:-8080}"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:465}"
+KEY_FILE="${KEY_FILE:-$HOME/.ssh/spot-strata-rsa}"
+[ -f "$KEY_FILE" ] || { echo "ERROR: SSH private key not found: $KEY_FILE (set KEY_FILE=..., and make sure the Trino stack was applied with -var key_pair_name matching it)"; exit 1; }
+SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+# The worker's docker container connects to the coordinator over the VPC-internal network, not
+# the public internet — it must use the coordinator's PRIVATE ip. Addressing it via the public ip
+# from inside the VPC does not reliably pass the security group's self-referencing "internode"
+# rule (live-verified on test1: connections just hang/time out). Auto-resolve it from $TRINO_HOST
+# via the AWS CLI (already a dependency of the rest of this benchmark suite); override with
+# TRINO_HOST_PRIVATE if the operator machine has no AWS CLI/credentials configured. Explicitly
+# unset the engine-reader static keys bench/.env just sourced (set -a above exported them) — they
+# have no EC2 permissions, only Glue/S3, and would shadow AWS_PROFILE/the default credential chain.
+TRINO_HOST_PRIVATE="${TRINO_HOST_PRIVATE:-$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY aws ec2 describe-instances \
+  --filters "Name=ip-address,Values=${TRINO_HOST}" \
+  --query 'Reservations[].Instances[].PrivateIpAddress' --output text 2>/dev/null)}"
+[ -n "$TRINO_HOST_PRIVATE" ] || { echo "ERROR: could not resolve the coordinator's private ip from TRINO_HOST=$TRINO_HOST (set TRINO_HOST_PRIVATE=... explicitly)"; exit 1; }
 REPORT="${1:-bench/reports/trino-compare-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
@@ -92,38 +124,60 @@ NQ5="SELECT o_orderpriority, o_orderstatus, COUNT(*) AS cnt, AVG(o_totalprice) A
 FROM iceberg.tpch.orders GROUP BY o_orderpriority, o_orderstatus
 HAVING COUNT(*) > 1000000 ORDER BY o_orderpriority, o_orderstatus"
 
-trino_exec() {
-  docker run --rm "$TRINO_IMAGE" trino --server "http://${TRINO_HOST}:${TRINO_PORT}" \
-    --catalog iceberg --schema tpch --output-format CSV --execute "$1"
+# Names/queries in run order. A leading "warmup" entry (discarded from the report) absorbs the
+# one-time SSH+container+JVM cold start so it never lands inside q1's own measured window.
+NAMES=(warmup q1 q2 q3 q4 q5 q6 q7 q8 q9a q9b nq1 nq2 nq3 nq4 nq5)
+QUERIES=("SELECT 1" "$Q1" "$Q2" "$Q3" "$Q4" "$Q5" "$Q6" "$Q7" "$Q8" "$Q9A" "$Q9B" "$NQ1" "$NQ2" "$NQ3" "$NQ4" "$NQ5")
+
+# One `--execute` batch, one JVM cold start for the whole run — not one per query. Each query is
+# followed by a cheap sentinel SELECT so the orchestrator can timestamp completion by watching the
+# streamed CSV output, without depending on the CLI's own internal timing-output format (which can
+# vary by version/mode). `--ignore-errors` is load-bearing: without it, Trino CLI aborts the WHOLE
+# batch on the first failing statement (verified live) — silently losing every later query's
+# timing. With it, a failing query prints its error and the batch continues.
+BATCH=""
+for i in "${!NAMES[@]}"; do
+  BATCH="${BATCH}${QUERIES[$i]}; SELECT '__DONE_${NAMES[$i]}__'; "
+done
+
+echo "== launching persistent Trino CLI batch on worker $TRINO_WORKER_HOST ==" | tee -a "$REPORT"
+echo "trino benchmark (one session via worker ${TRINO_WORKER_HOST}, coordinator ${TRINO_HOST_PRIVATE}:${TRINO_PORT} private) — $(date)" | tee -a "$REPORT"
+
+declare -A PENDING
+for name in "${NAMES[@]}"; do PENDING[$name]=1; done
+
+# NOTE: do not wrap this in an external `timeout` — empirically (live-verified on test1) that
+# breaks bash's coproc pipe wiring and the read loop below never sees any output. The per-line
+# `read -t` below plus the overall wall-clock check inside the loop are the safety net instead.
+# shellcheck disable=SC2016
+coproc TRINOOUT {
+  ssh $SSHOPTS -i "$KEY_FILE" ubuntu@"$TRINO_WORKER_HOST" \
+    "sudo docker run --rm $TRINO_IMAGE trino --ignore-errors --server http://$TRINO_HOST_PRIVATE:$TRINO_PORT --catalog iceberg --schema tpch --output-format CSV --execute \"$BATCH\"" \
+    2>&1
 }
 
-run_timed() {  # name sql
-  local name="$1" sql="$2" t0 t1 out rc el
-  t0=$(date +%s.%N)
-  out="$(trino_exec "$sql" 2>&1)"; rc=$?
-  t1=$(date +%s.%N)
-  el="$(awk "BEGIN{printf \"%.2f\", ${t1}-${t0}}")"
-  if [ $rc -ne 0 ]; then
-    echo "  $name: FAILED :: $(tail -2 <<<"$out")" | tee -a "$REPORT"; return
-  fi
-  echo "  $name: ${el}s" | tee -a "$REPORT"
-  echo "TIMING trino ${name} ${el}" >> "$REPORT"
-}
+start=$(date +%s.%N)
+last=$start
+while IFS= read -r -t 120 line <&"${TRINOOUT[0]}"; do
+  now=$(date +%s.%N)
+  for name in "${NAMES[@]}"; do
+    if [ -n "${PENDING[$name]:-}" ] && [[ "$line" == *"__DONE_${name}__"* ]]; then
+      el=$(awk "BEGIN{printf \"%.2f\", $now - $last}")
+      last=$now
+      unset "PENDING[$name]"
+      [ "$name" = "warmup" ] && continue
+      echo "  $name: ${el}s" | tee -a "$REPORT"
+      echo "TIMING trino ${name} ${el}" >> "$REPORT"
+    fi
+  done
+  # Overall wall-clock ceiling (15 min) in case the batch stalls without closing the pipe.
+  awk "BEGIN{exit !($now - $start > 900)}" && { echo "ERROR: overall batch timeout" | tee -a "$REPORT"; break; }
+done
+kill "${TRINOOUT_PID:-}" 2>/dev/null || true
+wait 2>/dev/null || true
 
-echo "trino benchmark — ${TRINO_HOST}:${TRINO_PORT} — $(date)" | tee -a "$REPORT"
-run_timed "q1" "$Q1"
-run_timed "q2" "$Q2"
-run_timed "q3" "$Q3"
-run_timed "q4" "$Q4"
-run_timed "q5" "$Q5"
-run_timed "q6" "$Q6"
-run_timed "q7" "$Q7"
-run_timed "q8" "$Q8"
-run_timed "q9a" "$Q9A"
-run_timed "q9b" "$Q9B"
-run_timed "nq1" "$NQ1"
-run_timed "nq2" "$NQ2"
-run_timed "nq3" "$NQ3"
-run_timed "nq4" "$NQ4"
-run_timed "nq5" "$NQ5"
+for name in "${NAMES[@]}"; do
+  [ "$name" = "warmup" ] && continue
+  [ -n "${PENDING[$name]:-}" ] && echo "  $name: FAILED (batch aborted before this query's marker — see raw output above)" | tee -a "$REPORT"
+done
 echo "Done. Report: $REPORT"
