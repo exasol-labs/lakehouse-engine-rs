@@ -95,7 +95,7 @@ Verified on the live AWS Glue cluster (2026-06-27) while fixing the lineitem "Q3
 - **SLC/`.so` fingerprint must match exactly.** `EXA_SDK_FINGERPRINT = "{exasol-udf-sdk version}:{rustc_hash}"`
   is checked at UDF load; e.g. a 0.19.1 SLC rejects a 0.19.0-SDK `.so` with `F-UDF-CL-RUST-9001:
   Fingerprint mismatch`. Keep the SLC and the consumer crate's `exasol-udf-sdk` version in lockstep,
-  built with the same rustc (the `rust:1.92-bookworm` SLC builder).
+  built with the same rustc (the `rust:1.94-bookworm` SLC builder).
 
 ## Live debugging (lc-rs 0.19.0 debug surface)
 
@@ -167,10 +167,11 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 
 ## Build
 
-- Build the UDF `.so` only inside `rust:1.92-bookworm` (glibc 2.36, matches the SLC) via
+- Build the UDF `.so` only inside `rust:1.94-bookworm` (glibc 2.36, matches the SLC) via
   `make cross-musl-udf-build`. **Never `cargo build --release` on the host** — it writes a
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - One crate / one `.so` exports **both** entry points (VS adapter + DataFusion scan SET UDF) —
   `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
-- SDK: `exasol-udf-sdk` **0.20.1** + `exasol-udf-macros` **0.20.1**. Since 0.18.0, `connect-back`
+- SDK: `exasol-udf-sdk` **0.20.2** + `exasol-udf-macros` **0.20.2** (built with rustc 1.94 to match
+  the v0.20.2 SLC fingerprint). Since 0.18.0, `connect-back`
   is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.
