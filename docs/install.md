@@ -11,7 +11,7 @@ cluster.
 
 ## Prerequisites
 
-- **Docker** — the `.so` is built inside `rust:1.92-bookworm` (glibc 2.36) to match the SLC.
+- **Docker** — the `.so` is built inside `rust:1.94-bookworm` (glibc 2.36) to match the SLC.
 - **Rust toolchain** — host unit tests only (`cargo test`, debug). Never `cargo build --release` on the host: a host-glibc `.so` fails to load inside Exasol.
 - **[`exapump`](https://github.com/exasol-labs/exapump)** — Exasol/BucketFS CLI used by the `make` targets.
 - **An Exasol cluster + BucketFS**, an **Iceberg REST catalog**, and **S3-compatible storage**.
