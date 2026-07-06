@@ -281,6 +281,13 @@ if [ "${BENCH_DDL_ONLY:-0}" = "1" ]; then
   exit 0
 fi
 
+# PROFILE must be ON *before* the timed queries run — EXA_USER_PROFILE_LAST_DAY
+# only has data for statements executed while profiling was enabled, so turning
+# it on after the fact (the previous location of this line) captured nothing.
+if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then
+  sql "ALTER SYSTEM SET PROFILE = 'ON'" || true
+fi
+
 {
   echo "lakehouse-engine benchmark — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
   echo "namespace=${NAMESPACE}"
@@ -517,7 +524,6 @@ pushdown_check "NQ4 top-N (ORDER BY + LIMIT) pushdown" \
 
 # ---- remote-only best-effort PROFILE dump ------------------------------------
 if [ "$TARGET" = "remote" ] && [ "$PROFILE_ON" = "1" ]; then
-  sql "ALTER SYSTEM SET PROFILE = 'ON'" || true
   echo | tee -a "$REPORT"
   echo "== PROFILE (most recent statements, best-effort) ==" | tee -a "$REPORT"
   sqlf "SELECT STMT_ID, PART_ID, PART_NAME, OBJECT_NAME, OBJECT_ROWS, DURATION, CPU
