@@ -134,6 +134,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
         group_keys: None,
         emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
         logical_schema: Vec::new(),
+        join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
             region: "us-east-1".into(),

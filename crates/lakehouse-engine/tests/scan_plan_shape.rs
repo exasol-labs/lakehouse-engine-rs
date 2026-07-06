@@ -62,6 +62,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
             region: "us-east-1".into(),
@@ -385,6 +386,7 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
             region: "us-east-1".into(),
