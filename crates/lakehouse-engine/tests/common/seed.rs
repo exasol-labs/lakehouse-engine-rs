@@ -1,7 +1,9 @@
 //! Iceberg table seeder for lakehouse-engine E2E tests.
 //!
 //! Seeds a deterministic mixed-column table into the Iceberg REST catalog over MinIO.
-//! Uses iceberg-rust 0.9.1 + iceberg-catalog-rest 0.9.1 (same as the main crate).
+//! Uses iceberg-rust 0.10.0-rc.2 + iceberg-catalog-rest 0.10.0-rc.2 (same as the
+//! main crate). Arrow batches and parquet writer properties are built with the
+//! workspace arrow/parquet 58 — the same single tree iceberg 0.10 links.
 //!
 //! Column mix exercises the full type-mapping table:
 //!   id           INT64        → DECIMAL(20,0)
@@ -11,7 +13,7 @@
 //!   event_ts     TIMESTAMP(µs,None) → TIMESTAMP
 //!
 //! Complex columns (list/struct) are covered by unit tests; they are not written
-//! here because iceberg-rust 0.9.1 does not expose a struct/list writer.
+//! here because iceberg-rust does not expose a struct/list writer.
 //!
 //! Table: e2e_lakehouse.events (namespace=e2e_lakehouse, table=events)
 //! Rows: 20 deterministic rows so LIMIT 5 and WHERE score > 15.0 are both testable.
@@ -25,13 +27,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use futures::TryStreamExt;
-use ice_arrow_array::{
+use arrow::array::{
     Date32Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
-use ice_arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-use ice_parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use ice_parquet::file::properties::WriterProperties;
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use futures::TryStreamExt;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
@@ -55,6 +55,8 @@ use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::file::properties::WriterProperties;
 
 /// Namespace and table names for the E2E seed tables.
 pub const E2E_NAMESPACE: &str = "e2e_lakehouse";
@@ -145,7 +147,6 @@ pub async fn build_seed_catalog(
 
     RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         }))
         .load(label, props)
