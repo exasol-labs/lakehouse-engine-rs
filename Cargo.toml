@@ -28,19 +28,20 @@ datafusion = { version = "54", default-features = false, features = ["parquet", 
 object_store = { version = "0.13.2", features = ["aws"] }
 
 # Iceberg REST catalog.
-# iceberg 0.9.1 links arrow 57 internally; that resolves separately from the
-# datafusion/SDK arrow 58 tree — valid because only SDK Value types cross the
-# .so boundary (never Arrow types). See CLAUDE.md §DataFusion streaming.
-# iceberg 0.9.1's transitive dep fastnum tracks rustc; 0.7.5+ requires rustc
-# 1.94, which this workspace now builds on (see rust-toolchain.toml), so fastnum
-# is no longer lock-pinned.
-iceberg              = { version = "0.9.1" }
-iceberg-catalog-rest = { version = "0.9.1" }
-# iceberg 0.9.1 split storage backends into a separate crate and made a
-# StorageFactory mandatory for RestCatalog. The S3 (MinIO) factory lives here;
-# its config keys (s3.endpoint, s3.region, s3.access-key-id, ...) are passed in
+# Pinned to the v0.10.0-rc.2 git tag (not yet on crates.io). iceberg 0.10.0-rc.2
+# links arrow 58 internally, the same tree as datafusion/exasol-udf-sdk below —
+# the workspace is a single arrow-58 tree end to end.
+# iceberg's transitive dep fastnum tracks rustc; 0.7.5+ requires rustc 1.94,
+# which this workspace builds on (see rust-toolchain.toml), so fastnum is no
+# longer lock-pinned.
+iceberg = { git = "https://github.com/apache/iceberg-rust", tag = "v0.10.0-rc.2" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust", tag = "v0.10.0-rc.2" }
+# iceberg core ships only Local/Memory StorageFactory impls (iceberg::io); S3
+# support lives in this separate crate and a StorageFactory registration is
+# still mandatory for RestCatalog. The S3 (MinIO) factory lives here; its
+# config keys (s3.endpoint, s3.region, s3.access-key-id, ...) are passed in
 # the same props map handed to RestCatalogBuilder::load.
-iceberg-storage-opendal = { version = "0.9.1", default-features = false, features = ["opendal-s3"] }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", tag = "v0.10.0-rc.2", default-features = false, features = ["opendal-s3"] }
 
 # Async runtime: tokio current-thread is sufficient for blocking UDF entry
 # points; full feature set available behind the exasol-e2e feature.
