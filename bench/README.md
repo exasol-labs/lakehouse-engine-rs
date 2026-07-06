@@ -74,9 +74,9 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
   sandboxed-JVM permission denial the driver hits reaching out over the network; the JDBC user's
   password must be empty (Trino's client refuses a non-empty password without TLS); a `BIGINT`-
   sourced `SUM()` (e.g. `SUM(l_orderkey)`, Q9b) must land in a `DECIMAL` column, not `DOUBLE
-  PRECISION` (`ETL-1299`/`ETL-1202` — no BIGINT-to-DOUBLE transformator). Unlike `trino_compare.sh`
-  (query runs from your machine), the JDBC connection here originates from the Exasol cluster
-  itself, so **`trino-up.sh` must allow the Exasol node IPs too**, not just yours:
+  PRECISION` (`ETL-1299`/`ETL-1202` — no BIGINT-to-DOUBLE transformator). The JDBC connection here
+  originates from the Exasol cluster itself (Exasol dispatches the JDBC call, not your machine), so
+  **`trino-up.sh` must allow the Exasol node IPs too**, not just yours:
   `-var 'allowed_cidrs=["<your-ip>/32","<exasol-node-ip>/32",...]'`.
   ```bash
   deploy/scripts/trino-up.sh myenv && export TRINO_HOST=<printed coordinator ip>
@@ -103,20 +103,39 @@ convention as the rest of `bench/`.
   athena_workgroup) ./athena_compare.sh`.
 - **`trino_compare.sh`** — requires an ephemeral Trino cluster stood up first (coordinator +
   workers, sized to match Exasol test1 by default — `r8i.2xlarge` × 2):
-  `deploy/scripts/trino-up.sh <env>` → `export TRINO_HOST=<printed coordinator ip>` →
-  `./trino_compare.sh`. **Tear it down immediately after**: `deploy/scripts/trino-down.sh <env>`
-  (it costs meaningfully more while running than a single small box would). See the "Trino
-  (ephemeral, opt-in)" section in [`../deploy/README.md`](../deploy/README.md).
+  `deploy/scripts/trino-up.sh <env>` → `export TRINO_HOST=<printed coordinator ip>
+  TRINO_WORKER_HOST=<a worker ip, e.g. tofu output -json trino_worker_hosts>` → `./trino_compare.sh`.
+  **Tear it down immediately after**: `deploy/scripts/trino-down.sh <env>` (it costs meaningfully
+  more while running than a single small box would). See the "Trino (ephemeral, opt-in)" section
+  in [`../deploy/README.md`](../deploy/README.md).
+  Methodology: ONE persistent Trino CLI session for the whole 15-query batch (a single `docker run
+  --execute "<all queries>; --ignore-errors`), launched via SSH onto a **worker** node — not your
+  machine, not the coordinator — so this script pays the same client-overhead profile (no per-query
+  container/JVM cold start) and network-hop shape (your machine → the cluster's own node, over the
+  internet; that node → the thing being measured, intra-VPC) as `bench/run.sh` (VS) and
+  `import_jdbc_trino.sh`, both of which measure via a single `exapump` process (no JVM) talking to
+  Exasol. An earlier version spun up a fresh Docker container + JVM **per query** from the operator's
+  machine, reaching Trino over the public internet — that made native Trino look slower than it is,
+  which is why IMPORT FROM JDBC appeared to beat it on every query, purely from measurement bias.
+  Requires the Trino EC2 key pair's private key locally to SSH into the worker (`KEY_FILE`,
+  default `~/.ssh/spot-strata-rsa` — apply the stack with a `key_pair_name` you actually hold);
+  resolves the coordinator's private ip itself via the AWS CLI (connecting from the worker to the
+  coordinator's *public* ip does not reliably pass the security group's internode rule).
 - **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var
   enable_emr_serverless=true` first (off by default). Export `EMR_SERVERLESS_APP_ID` /
   `EMR_SERVERLESS_ROLE_ARN` / `SPARK_SCRIPT_S3_URI` / `SPARK_LOG_S3_URI` from `tofu output`, plus
   `GLUE_CATALOG_URI` / `GLUE_WAREHOUSE` / `AWS_REGION` (already in `bench/.env` for `remote` mode).
   EMR Serverless is billed only while a job runs — see the "Spark / EMR Serverless" section in
   [`../deploy/README.md`](../deploy/README.md).
-- **`compare_all.sh`** — runs `make bench` + `import_ceiling.sh` + `athena_compare.sh`, then
-  `import_jdbc_trino.sh` / `trino_compare.sh` / `spark_compare.sh` only if their env vars are set
-  (clean `SKIP` otherwise — it never auto-provisions). Writes one aggregated
-  `bench/reports/compare-<ts>.txt`.
+- **`compare_all.sh`** — runs `make bench` + `import_ceiling.sh` + `athena_compare.sh` always, then
+  `spark_compare.sh` if its env vars are set (clean `SKIP` otherwise). Trino is the one exception to
+  "never auto-provisions": set `RUN_TRINO_COMPARISON=1` and it stands up an ephemeral Trino cluster,
+  runs `trino_compare.sh` against it, tears it down, stands up a **fresh** cluster, runs
+  `import_jdbc_trino.sh` against that one, tears it down. Native and JDBC each get their own cold,
+  never-before-queried cluster — sharing one cluster between them would let whichever ran first
+  JIT-warm Trino and cache Iceberg metadata for the other, skewing the comparison. This means Trino
+  gets provisioned **twice** per full run — real AWS spend, hence the explicit opt-in. Writes one
+  aggregated `bench/reports/compare-<ts>.txt`.
 
 **The `TIMING` line convention**: every compare script appends lines of the exact form
 `TIMING <engine> <query-name> <seconds>` to its own report. `compare_all.sh` does nothing
