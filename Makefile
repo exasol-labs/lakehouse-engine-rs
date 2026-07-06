@@ -14,7 +14,7 @@ LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 # Rust builder image — MUST match the SLC glibc (Bookworm = 2.36).
 # Never run `cargo build --release` on the host: Ubuntu 24.04 has glibc 2.39
 # and the resulting .so fails to dlopen inside Exasol.
-UDF_BUILDER_IMAGE ?= rust:1.92-bookworm
+UDF_BUILDER_IMAGE ?= rust:1.94-bookworm
 
 # --- UDF .so artifact --------------------------------------------------------
 # Real-file target: `make` rebuilds ONLY when crate sources, manifest, or the
@@ -67,7 +67,7 @@ export LH_REST_PORT
 test-e2e: cross-musl-udf-build
 	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test -- --test-threads=1
 
-# Install and register the Rust SLC 0.20.1 into Exasol under the RUST alias.
+# Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
 #
 # This Exasol is the dedicated lakehouse-engine stack (the sibling strata-rs stack
 # is stopped), so we register the canonical RUST alias cleanly. The Rust E2E
@@ -75,14 +75,14 @@ test-e2e: cross-musl-udf-build
 # the equivalent manual / convenience path.
 #
 # Steps:
-#   1. Download lc-rust-0.20.1.tar.gz from GitHub releases.
+#   1. Download lc-rust-$(SLC_VERSION).tar.gz from GitHub releases.
 #   2. Upload it to BucketFS at /default/slc/lakehouse-rustslc.tar.gz.
 #   3. ALTER SYSTEM SET SCRIPT_LANGUAGES = '... RUST=...' (replacing any
 #      pre-existing RUST= entry).
 #
 # BucketFS write password is extracted at runtime from EXAConf.
 # Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
-SLC_VERSION ?= 0.20.1
+SLC_VERSION ?= 0.20.2
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 
