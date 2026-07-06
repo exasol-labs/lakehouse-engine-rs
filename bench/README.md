@@ -63,6 +63,26 @@ the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
   make bench                                    # produces the report it harvests
   ./bench/import_ceiling.sh bench/reports/import-ceiling-$(date +%Y%m%d-%H%M%S).txt
   ```
+- **`import_jdbc_trino.sh`** (remote only, requires `TRINO_HOST`) — the VS path vs Exasol's
+  **native `IMPORT FROM JDBC`** reader, pushing Q1-Q9b/NQ1-NQ5 down as sub-selects over a JDBC
+  connection to the same ephemeral Trino cluster used by `trino_compare.sh` below. Auto-registers
+  the Trino JDBC driver into BucketFS (downloads the matching `trino-jdbc` jar, uploads it + a
+  `settings.cfg` via `exapump bucketfs cp`) before running. `SKIP`s cleanly if `TRINO_HOST` is
+  unset. Live-verified gotchas on `test1` (2025.2.1): the driver `settings.cfg` MUST include
+  `FETCHSIZE`/`INSERTSIZE` or Exasol silently drops the whole registration
+  (`ETL-1013: Driver=... is unknown`, with no file/permission error); `NOSECURITY=YES` avoids a
+  sandboxed-JVM permission denial the driver hits reaching out over the network; the JDBC user's
+  password must be empty (Trino's client refuses a non-empty password without TLS); a `BIGINT`-
+  sourced `SUM()` (e.g. `SUM(l_orderkey)`, Q9b) must land in a `DECIMAL` column, not `DOUBLE
+  PRECISION` (`ETL-1299`/`ETL-1202` — no BIGINT-to-DOUBLE transformator). Unlike `trino_compare.sh`
+  (query runs from your machine), the JDBC connection here originates from the Exasol cluster
+  itself, so **`trino-up.sh` must allow the Exasol node IPs too**, not just yours:
+  `-var 'allowed_cidrs=["<your-ip>/32","<exasol-node-ip>/32",...]'`.
+  ```bash
+  deploy/scripts/trino-up.sh myenv && export TRINO_HOST=<printed coordinator ip>
+  ./bench/import_jdbc_trino.sh
+  deploy/scripts/trino-down.sh myenv
+  ```
 - **`sweep.sh`** — sweeps the DataFusion threading knobs (`BENCH_DF_*`) across
   `run.sh` invocations to find the best parallelism config.
 - **`parallelism_sweep.sh`** — sweeps `BENCH_PARALLELISM_FACTOR` (8/16/24) across
@@ -94,8 +114,9 @@ convention as the rest of `bench/`.
   EMR Serverless is billed only while a job runs — see the "Spark / EMR Serverless" section in
   [`../deploy/README.md`](../deploy/README.md).
 - **`compare_all.sh`** — runs `make bench` + `import_ceiling.sh` + `athena_compare.sh`, then
-  `trino_compare.sh` / `spark_compare.sh` only if their env vars are set (clean `SKIP` otherwise —
-  it never auto-provisions). Writes one aggregated `bench/reports/compare-<ts>.txt`.
+  `import_jdbc_trino.sh` / `trino_compare.sh` / `spark_compare.sh` only if their env vars are set
+  (clean `SKIP` otherwise — it never auto-provisions). Writes one aggregated
+  `bench/reports/compare-<ts>.txt`.
 
 **The `TIMING` line convention**: every compare script appends lines of the exact form
 `TIMING <engine> <query-name> <seconds>` to its own report. `compare_all.sh` does nothing
