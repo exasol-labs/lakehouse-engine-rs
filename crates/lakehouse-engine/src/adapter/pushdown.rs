@@ -3754,11 +3754,14 @@ fn select_broadcast_sides(
 /// replaces only the `table` field of the shared `catalog` template, so both
 /// sides resolve against the same catalog URI and warehouse.
 ///
-/// No Iceberg-level filter pruning is applied (`filter_json: None`): a pushed
-/// WHERE predicate may reference either table's columns, so pruning one side by it
-/// is unsafe, and the broadcast byte-size decision must reflect the FULL side the
-/// UDF re-scans. DataFusion applies the pushed filter at scan time as the
-/// correctness backstop, exactly as on the single-table path.
+/// `filter_json` is this side's SIDE-LOCAL sub-predicate (see [`side_local_filter`])
+/// — the conjuncts of the WHERE every column of which is this table's — forwarded
+/// for Iceberg manifest pruning exactly as `filter_json_raw` is on the single-table
+/// path. For an inner join a side-local conjunct is a necessary condition for that
+/// side's rows to survive, so pruning by it is sound; cross-table and OR-spanning
+/// conjuncts are already excluded from `filter_json`. `to_iceberg_predicate`
+/// resolves it against this table's OWN schema, and sound-drops anything it cannot
+/// translate. `None` (no side-local conjunct) prunes nothing — every file is kept.
 async fn resolve_one_join_side(
     table_name: &str,
     iceberg_ident: &str,
@@ -3766,13 +3769,14 @@ async fn resolve_one_join_side(
     storage: &StorageProps,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
+    filter_json: Option<&Json>,
 ) -> Result<ResolvedJoinSide, UdfError> {
     let side_catalog = CatalogProps {
         table: iceberg_ident.to_string(),
         ..catalog.clone()
     };
     let (files, effective_storage, logical_schema, table_root) =
-        resolve_file_list(catalog_uri, &side_catalog, storage, creds, None).await?;
+        resolve_file_list(catalog_uri, &side_catalog, storage, creds, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         iceberg_ident.to_string(),
@@ -3792,14 +3796,26 @@ async fn resolve_one_join_side(
 /// [`select_broadcast_sides`]. The returned [`JoinSides`] carries both fully
 /// resolved sides plus the `broadcast_eligible` flag the caller uses to route
 /// between the broadcast plan (task 3.4) and the unaccelerated fallback (task 3.5).
+///
+/// Each side is pruned by its own SIDE-LOCAL WHERE conjuncts ([`side_local_filter`])
+/// so BOTH routes get the Iceberg manifest pruning the single-table path gets —
+/// partition/bounds elimination a partition-selective predicate would otherwise
+/// lose on a join. Attribution is by `tableName`, so the shared-column-name case
+/// stays correct (a conjunct over one table never prunes the other). The pruned
+/// byte totals also feed side selection and the broadcast threshold, which only
+/// makes both more accurate (a side is sized as it will actually be scanned).
 async fn resolve_join_sides(
     eligible: &EligibleJoin,
+    pushdown_req: &Json,
     catalog_uri: &str,
     storage: &StorageProps,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
     join_broadcast_max_bytes: u64,
 ) -> Result<JoinSides, UdfError> {
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let left_filter = filter.and_then(|f| side_local_filter(f, &eligible.left_table_name));
+    let right_filter = filter.and_then(|f| side_local_filter(f, &eligible.right_table_name));
     let left = resolve_one_join_side(
         &eligible.left_table_name,
         &eligible.left_iceberg_ident,
@@ -3807,6 +3823,7 @@ async fn resolve_join_sides(
         storage,
         catalog,
         creds,
+        left_filter.as_ref(),
     )
     .await?;
     let right = resolve_one_join_side(
@@ -3816,6 +3833,7 @@ async fn resolve_join_sides(
         storage,
         catalog,
         creds,
+        right_filter.as_ref(),
     )
     .await?;
     Ok(select_broadcast_sides(
@@ -4079,6 +4097,210 @@ fn render_df_filter_qualified(filter: &Json, alias_of: &HashMap<String, String>)
     render_df_filter_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
+/// Walk an expression tree, recording every `column` node's owning side: its
+/// UPPERCASE `tableName` into `tables`, or `has_untagged` when a `column` carries
+/// no `tableName`. `any_column` becomes true on the first `column` node seen.
+///
+/// `tableName` is the SAME attribution signal [`annotate_columns_with_alias`] uses,
+/// so conjunct-to-side attribution is by table identity — never by column name,
+/// which keeps the shared-column-name case (both tables carry an `ID`) correct.
+fn collect_column_tables(
+    expr: &Json,
+    tables: &mut std::collections::HashSet<String>,
+    has_untagged: &mut bool,
+    any_column: &mut bool,
+) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
+                *any_column = true;
+                match map.get("tableName").and_then(|t| t.as_str()) {
+                    Some(tn) => {
+                        tables.insert(tn.to_ascii_uppercase());
+                    }
+                    None => *has_untagged = true,
+                }
+            }
+            for value in map.values() {
+                collect_column_tables(value, tables, has_untagged, any_column);
+            }
+        }
+        Json::Array(items) => items
+            .iter()
+            .for_each(|item| collect_column_tables(item, tables, has_untagged, any_column)),
+        _ => {}
+    }
+}
+
+/// The single side a conjunct is local to — `Some(UPPERCASE table name)` iff every
+/// `column` node it references is tagged with that ONE `tableName`. `None` when the
+/// conjunct spans two tables, carries an untagged column, or references no column at
+/// all (a bare literal). Such a conjunct is withheld from BOTH sides' pruning; only
+/// the outer wrapper's WHERE (which renders the full predicate) applies it.
+///
+/// Sound for an inner equi-join: a conjunct over one side alone is a necessary
+/// condition for that side's rows to survive the join, so using it to prune that
+/// side can never drop a row the join would have kept.
+fn conjunct_single_side(conjunct: &Json) -> Option<String> {
+    let mut tables = std::collections::HashSet::new();
+    let mut has_untagged = false;
+    let mut any_column = false;
+    collect_column_tables(conjunct, &mut tables, &mut has_untagged, &mut any_column);
+    if has_untagged || !any_column || tables.len() != 1 {
+        return None;
+    }
+    tables.into_iter().next()
+}
+
+/// Flatten a top-level `predicate_and` chain into its individual conjuncts,
+/// recursing through nested `predicate_and` nodes (AND is associative). A non-AND
+/// node (including a top-level `predicate_or`) is a single opaque conjunct — an OR
+/// is never split, so an OR spanning both tables stays withheld from both sides.
+fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
+    if filter.get("type").and_then(|t| t.as_str()) == Some("predicate_and")
+        && let Some(exprs) = filter.get("expressions").and_then(|e| e.as_array())
+    {
+        for expr in exprs {
+            flatten_conjuncts(expr, out);
+        }
+        return;
+    }
+    out.push(filter);
+}
+
+/// The side-local sub-predicate of `filter` for `table_name`: the AND of exactly
+/// those top-level conjuncts every column of which is attributed to `table_name`.
+/// `None` when no conjunct is side-local to it.
+///
+/// This is what is threaded into (a) that side's `resolve_file_list` for Iceberg
+/// manifest pruning and (b) that side's fan-out `ScanSpec.filter` for DataFusion
+/// row-group pruning + row filtering. Cross-table conjuncts and OR-spanning
+/// conjuncts are withheld here and applied only by the outer wrapper's WHERE.
+fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
+    let target = table_name.to_ascii_uppercase();
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(filter, &mut conjuncts);
+    let mut kept: Vec<Json> = conjuncts
+        .into_iter()
+        .filter(|c| conjunct_single_side(c).as_deref() == Some(target.as_str()))
+        .cloned()
+        .collect();
+    match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => Some(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": kept,
+        })),
+    }
+}
+
+/// Deep-clone `expr` with every `tableAlias` key removed, so the reused
+/// `vs-expression` translator renders BARE column names.
+///
+/// Exasol sends each column node with BOTH its `tableName` and the query's
+/// `tableAlias` (e.g. `FROM fact_orders o` yields `tableAlias: "O"`), and the
+/// translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. A single-table
+/// fan-out ([`build_side_fan_out_sql`]) scans one relation exposing BARE uppercase
+/// column names, so an alias-qualified reference would not resolve against it — the
+/// fan-out's pushed filter must be bare, exactly like the single-table scan path.
+/// `tableName` is left intact (the translator ignores it; conjunct attribution has
+/// already read it upstream).
+fn strip_table_alias(expr: &Json) -> Json {
+    match expr {
+        Json::Object(map) => Json::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "tableAlias")
+                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
+                .collect(),
+        ),
+        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Record the UPPERCASE name of every `column` node in `expr` attributed (by
+/// `tableName`, case-insensitive) to `table_name`, recursively.
+fn collect_side_column_names(
+    expr: &Json,
+    table_name: &str,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
+                let tn = map.get("tableName").and_then(|t| t.as_str());
+                let name = map.get("name").and_then(|n| n.as_str());
+                if let (Some(tn), Some(name)) = (tn, name)
+                    && tn.eq_ignore_ascii_case(table_name)
+                {
+                    out.insert(name.to_ascii_uppercase());
+                }
+            }
+            for value in map.values() {
+                collect_side_column_names(value, table_name, out);
+            }
+        }
+        Json::Array(items) => items
+            .iter()
+            .for_each(|item| collect_side_column_names(item, table_name, out)),
+        _ => {}
+    }
+}
+
+/// The subset of `full_cols` this side actually contributes to the outer two-scan
+/// wrapper — dropping columns the wrapper never references, so each fan-out leg
+/// ships narrow rows instead of the table's full column set.
+///
+/// The kept set is every column of this side referenced by any clause the wrapper
+/// renders: the SELECT list, the join condition, the WHERE (the FULL predicate —
+/// the outer wrapper renders all of it, so a side-local *or* cross-table filter
+/// column must survive), GROUP BY, HAVING, and ORDER BY. Order and Exasol types are
+/// preserved from `full_cols`.
+///
+/// Two total-safety fallbacks keep the wrapper buildable: an absent/empty SELECT
+/// list means `SELECT *` over both fan-outs, so every column is kept; and an
+/// (unreachable) empty result keeps `full_cols` rather than emit a zero-column leg.
+fn referenced_side_columns(
+    pushdown_req: &Json,
+    condition: &Json,
+    table_name: &str,
+    full_cols: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut names = std::collections::HashSet::new();
+    match pushdown_req.get("selectList") {
+        Some(Json::Array(list)) if !list.is_empty() => {
+            for item in list {
+                collect_side_column_names(item, table_name, &mut names);
+            }
+        }
+        // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
+        _ => return full_cols.to_vec(),
+    }
+    collect_side_column_names(condition, table_name, &mut names);
+    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+        collect_side_column_names(f, table_name, &mut names);
+    }
+    for key in ["groupBy", "orderBy"] {
+        if let Some(v) = pushdown_req.get(key) {
+            collect_side_column_names(v, table_name, &mut names);
+        }
+    }
+    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
+        collect_side_column_names(h, table_name, &mut names);
+    }
+    let narrowed: Vec<(String, String)> = full_cols
+        .iter()
+        .filter(|(name, _)| names.contains(name))
+        .cloned()
+        .collect();
+    if narrowed.is_empty() {
+        full_cols.to_vec()
+    } else {
+        narrowed
+    }
+}
+
 /// Render one `function_aggregate` select-list item as a plain Exasol aggregate
 /// expression over the joined rows, with any column argument table-qualified.
 ///
@@ -4245,9 +4467,11 @@ async fn plan_eligible_join(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
-    // Resolve both sides ONCE (two catalog resolutions total, never per shard).
+    // Resolve both sides ONCE (two catalog resolutions total, never per shard),
+    // each pruned by its side-local WHERE conjuncts.
     let sides = resolve_join_sides(
         eligible,
+        pushdown_req,
         catalog_uri,
         storage,
         catalog,
@@ -4328,14 +4552,19 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 }
 
 /// Build one side's single-table sharded fan-out SQL (`SELECT * FROM (fan-out)`),
-/// emitting that table's FULL column set — no join block, no projection/filter/limit
-/// push. Used for BOTH sides of the unaccelerated fallback: the outer Exasol query
-/// (see [`build_two_scan_join_sql`]) applies the projection, `ON`, and `WHERE`, so
-/// each subquery must expose every column the condition/filter/projection may
-/// reference. `columns` is the side's `(UPPERCASE name, Exasol type)` list.
+/// emitting the columns the outer wrapper references for this side and pushing this
+/// side's SIDE-LOCAL WHERE conjuncts down as a DataFusion filter. No join block, no
+/// limit push. Used for BOTH sides of the unaccelerated fallback: the outer Exasol
+/// query (see [`build_two_scan_join_sql`]) still applies the projection, `ON`, and
+/// the FULL `WHERE`, so `columns` (the side's narrowed `(UPPERCASE name, Exasol
+/// type)` list, see [`referenced_side_columns`]) must expose every column any outer
+/// clause references. `side_filter` (see [`side_local_filter`]) is rendered bare-name
+/// via `render_df_filter_safe` so DataFusion row-group-prunes and row-filters this
+/// leg before emitting, rather than shipping every row for Exasol to filter.
 fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
     columns: &[(String, String)],
+    side_filter: Option<&Json>,
     tuning: &JoinScanTuning,
     udf_name: &str,
     merge_udf_name: &str,
@@ -4358,7 +4587,13 @@ fn build_side_fan_out_sql(
         table_root: side.table_root.clone(),
         files: vec![],
         projection: proj_cols.clone(),
-        filter: None,
+        // Render BARE (strip Exasol's `tableAlias`): the fan-out is a single-table
+        // scan whose relation exposes bare uppercase column names, so an
+        // alias-qualified reference would not resolve — exactly the single-table
+        // scan path's contract. The outer wrapper's WHERE re-qualifies separately.
+        filter: side_filter
+            .map(strip_table_alias)
+            .and_then(|f| render_df_filter_safe(&f)),
         limit: None,
         order_by: Vec::new(),
         aggregates: None,
@@ -4521,11 +4756,40 @@ fn build_unaccelerated_join_sql(
     let order_by = qualified_join_order_by(pushdown_req, &alias_of)?;
     let limit = extract_limit(pushdown_req);
 
-    let fact_fan_out =
-        build_side_fan_out_sql(&sides.fact, &fact_cols, tuning, udf_name, merge_udf_name);
+    // Per-side pruning (additive, underneath the unchanged outer WHERE): narrow each
+    // leg's projection to the columns the wrapper actually references, and push each
+    // side's side-local WHERE conjuncts down as a DataFusion filter. Cross-table and
+    // OR-spanning conjuncts stay only in the outer WHERE (`filter` above), the
+    // correctness backstop. The FULL `*_cols` still drive `qualified_join_select_items`
+    // so an absent select list keeps projecting every column.
+    let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let fact_narrowed = referenced_side_columns(
+        pushdown_req,
+        &eligible.condition,
+        &sides.fact.table_name,
+        &fact_cols,
+    );
+    let dim_narrowed = referenced_side_columns(
+        pushdown_req,
+        &eligible.condition,
+        &sides.dimension.table_name,
+        &dim_cols,
+    );
+    let fact_filter = where_filter.and_then(|f| side_local_filter(f, &sides.fact.table_name));
+    let dim_filter = where_filter.and_then(|f| side_local_filter(f, &sides.dimension.table_name));
+
+    let fact_fan_out = build_side_fan_out_sql(
+        &sides.fact,
+        &fact_narrowed,
+        fact_filter.as_ref(),
+        tuning,
+        udf_name,
+        merge_udf_name,
+    );
     let dim_fan_out = build_side_fan_out_sql(
         &sides.dimension,
-        &dim_cols,
+        &dim_narrowed,
+        dim_filter.as_ref(),
         tuning,
         udf_name,
         merge_udf_name,
@@ -7322,6 +7586,381 @@ mod tests {
         having["pushdownRequest"]["having"] =
             serde_json::json!({"type": "literal_bool", "value": true});
         assert!(join_requires_exasol_postprocessing(&pd(&having)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-side pruning (PR #70 review): side-local conjunct attribution,
+    // projection narrowing, and per-side filter pushdown in the fallback path.
+    // -----------------------------------------------------------------------
+
+    /// A conjunct referencing only one side's columns is attributed to that side
+    /// alone: the CUSTOMER-only conjunct threads to CUSTOMER, the ORDERS-only
+    /// conjunct to ORDERS, and neither leaks to the other.
+    #[test]
+    fn side_local_filter_attributes_conjuncts_to_owning_side() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "ACME"}},
+                {"type": "predicate_greater",
+                 "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                 "right": {"type": "literal_string", "value": "1995-01-01"}},
+            ],
+        });
+
+        let cust = render_df_filter_safe(
+            &side_local_filter(&filter, "CUSTOMER").expect("a CUSTOMER-local conjunct exists"),
+        )
+        .expect("renders");
+        assert!(
+            cust.contains("C_NAME") && !cust.contains("O_ORDERDATE"),
+            "CUSTOMER side-local filter must carry only C_NAME: {cust}"
+        );
+
+        let ord = render_df_filter_safe(
+            &side_local_filter(&filter, "ORDERS").expect("an ORDERS-local conjunct exists"),
+        )
+        .expect("renders");
+        assert!(
+            ord.contains("O_ORDERDATE") && !ord.contains("C_NAME"),
+            "ORDERS side-local filter must carry only O_ORDERDATE: {ord}"
+        );
+    }
+
+    /// A cross-table conjunct (references both sides) and an OR spanning both sides
+    /// are withheld from BOTH sides' pruning — only the outer wrapper's WHERE
+    /// applies them. A single-side-local conjunct alongside a cross-table one is
+    /// still extracted for its side.
+    #[test]
+    fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                // cross-table: references CUSTOMER and ORDERS
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                 "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
+                // CUSTOMER-local
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "ACME"}},
+            ],
+        });
+        let cust = render_df_filter_safe(
+            &side_local_filter(&filter, "CUSTOMER").expect("CUSTOMER-local conjunct present"),
+        )
+        .expect("renders");
+        assert!(
+            cust.contains("C_NAME") && !cust.contains("O_CUSTKEY"),
+            "the cross-table conjunct must NOT be pushed to CUSTOMER: {cust}"
+        );
+        assert!(
+            side_local_filter(&filter, "ORDERS").is_none(),
+            "ORDERS is only referenced by the cross-table conjunct, so nothing is side-local to it"
+        );
+
+        // An OR spanning both sides is one opaque conjunct referencing both → withheld.
+        let or_filter = serde_json::json!({
+            "type": "predicate_or",
+            "expressions": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "ACME"}},
+                {"type": "predicate_greater",
+                 "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                 "right": {"type": "literal_string", "value": "1995-01-01"}},
+            ],
+        });
+        assert!(side_local_filter(&or_filter, "CUSTOMER").is_none());
+        assert!(side_local_filter(&or_filter, "ORDERS").is_none());
+
+        // An OR referencing only ONE side is side-local to it (still prunable).
+        let one_side_or = serde_json::json!({
+            "type": "predicate_or",
+            "expressions": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "ACME"}},
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "GLOBEX"}},
+            ],
+        });
+        assert!(
+            side_local_filter(&one_side_or, "CUSTOMER").is_some(),
+            "an OR over one side alone is side-local and prunable"
+        );
+        assert!(side_local_filter(&one_side_or, "ORDERS").is_none());
+    }
+
+    /// A filter that is a single (non-AND) conjunct is attributed to its owning side
+    /// without a top-level AND wrapper.
+    #[test]
+    fn side_local_filter_handles_a_single_conjunct() {
+        let single = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            "right": {"type": "literal_string", "value": "ACME"}
+        });
+        assert!(side_local_filter(&single, "CUSTOMER").is_some());
+        assert!(side_local_filter(&single, "ORDERS").is_none());
+    }
+
+    /// Attribution is by `tableName`, NOT by column name: with a column name shared
+    /// across both tables (`ID`), a conjunct on `EVENTS.ID` is side-local to EVENTS
+    /// only and is never applied to LABELS (which also has an `ID`). This is the
+    /// shared-column-name safety the whole per-side pruning rests on.
+    #[test]
+    fn side_local_filter_attributes_shared_column_by_table_not_name() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {"type": "predicate_greater",
+                 "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                 "right": {"type": "literal_exactnumeric", "value": 5}},
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "LABEL", "tableName": "LABELS"},
+                 "right": {"type": "literal_string", "value": "x"}},
+            ],
+        });
+
+        let events = render_df_filter_safe(
+            &side_local_filter(&filter, "EVENTS").expect("EVENTS.ID conjunct is side-local"),
+        )
+        .expect("renders");
+        assert!(
+            events.contains("ID") && events.contains('5'),
+            "EVENTS side-local filter must carry the ID > 5 predicate: {events}"
+        );
+
+        let labels = render_df_filter_safe(
+            &side_local_filter(&filter, "LABELS").expect("LABELS.LABEL conjunct is side-local"),
+        )
+        .expect("renders");
+        assert!(
+            labels.contains("LABEL") && !labels.contains('5'),
+            "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name: {labels}"
+        );
+    }
+
+    /// The fallback projection is narrowed to the columns the outer wrapper
+    /// references for a side — SELECT list + join condition + WHERE — preserving
+    /// the full-column order/type, and dropping columns referenced nowhere.
+    #[test]
+    fn referenced_side_columns_narrows_to_used_columns() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+            "filter": {"type": "predicate_equal",
+                "left": {"type": "column", "name": "C_ADDRESS", "tableName": "CUSTOMER"},
+                "right": {"type": "literal_string", "value": "z"}},
+        });
+        let condition = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
+        });
+        let full = vec![
+            ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
+            ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
+            ("C_ADDRESS".to_string(), "VARCHAR(100)".to_string()),
+            ("C_PHONE".to_string(), "VARCHAR(20)".to_string()),
+        ];
+        let narrowed = referenced_side_columns(&pushdown_req, &condition, "CUSTOMER", &full);
+        let names: Vec<&str> = narrowed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["C_CUSTKEY", "C_NAME", "C_ADDRESS"],
+            "narrows to condition + select + filter columns, in full-column order, dropping C_PHONE"
+        );
+        // The kept columns retain their full-column Exasol types.
+        assert_eq!(
+            narrowed[1],
+            ("C_NAME".to_string(), "VARCHAR(100)".to_string())
+        );
+    }
+
+    /// An absent (or empty) SELECT list means the wrapper projects every column via
+    /// `SELECT *`, so no narrowing is applied — all columns are kept.
+    #[test]
+    fn referenced_side_columns_keeps_all_when_select_list_absent() {
+        let condition = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}
+        });
+        let full = vec![
+            ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
+            ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
+        ];
+        let narrowed =
+            referenced_side_columns(&serde_json::json!({}), &condition, "CUSTOMER", &full);
+        assert_eq!(
+            narrowed, full,
+            "an absent select list ⇒ SELECT *, keep every column"
+        );
+    }
+
+    /// A per-side fan-out pushes its side-local filter down as a DataFusion
+    /// `ScanSpec.filter` (present in the common blob); absent when there is none.
+    ///
+    /// Regression (PR #70 e2e "No field named \"O\".\"O_ORDERDATE\""): Exasol sends
+    /// each column with a `tableAlias` (the query's `FROM fact_orders o` alias). The
+    /// fan-out is a SINGLE-TABLE scan over a relation with BARE uppercase columns, so
+    /// its pushed filter MUST render bare — the alias must be stripped, or the
+    /// alias-qualified reference fails to resolve against the fan-out.
+    #[test]
+    fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
+        let side = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]);
+        let cols = vec![
+            ("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
+            ("O_ORDERDATE".to_string(), "DATE".to_string()),
+        ];
+        // Exactly the Exasol shape: BOTH tableName AND tableAlias present.
+        let filter = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
+            "right": {"type": "literal_string", "value": "1995-01-01"}
+        });
+
+        let sql_with = build_side_fan_out_sql(
+            &side,
+            &cols,
+            Some(&filter),
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        );
+        let common = common_arg_literal(&sql_with);
+        assert!(
+            common.contains("\"filter\"") && common.contains("O_ORDERDATE"),
+            "the side-local filter must be pushed into the fan-out common blob: {common}"
+        );
+        assert!(
+            !common.contains(r#"\"O\".\"O_ORDERDATE\""#)
+                && !common.contains(r#""O"."O_ORDERDATE""#),
+            "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
+        );
+
+        let sql_without =
+            build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "MERGE");
+        let common_none = common_arg_literal(&sql_without);
+        assert!(
+            !common_none.contains("\"filter\""),
+            "no side-local filter ⇒ no filter field in the common blob: {common_none}"
+        );
+    }
+
+    /// The broadcast path is UNCHANGED by the per-side pruning fix: `render_broadcast_join`
+    /// still renders `rendered.filter` exactly as before, PRESERVING Exasol's native
+    /// `tableAlias` qualifier (the in-UDF `build_join_sql` join resolves it). This is
+    /// the mechanical guard the reviewer asked for — the two-scan fan-out's bare
+    /// stripping must NOT leak into, nor alter, the broadcast rendering.
+    #[test]
+    fn render_broadcast_join_preserves_native_table_alias_unchanged() {
+        let mut request = join_request(Json::Null, equi_condition());
+        // Give every join column node Exasol's native tableAlias, as the live cluster does.
+        request["pushdownRequest"]["filter"] = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS", "tableAlias": "O"},
+            "right": {"type": "literal_string", "value": "1995-01-01"}
+        });
+        let eligible = eligible_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+            .expect("renders")
+            .expect("disjoint join renders");
+        let filter = rendered.filter.expect("filter renders");
+        assert!(
+            filter.contains(r#""O"."O_ORDERDATE""#),
+            "broadcast rendering must preserve Exasol's native tableAlias (unchanged): {filter}"
+        );
+    }
+
+    /// End-to-end fallback wiring: the two-scan wrapper prunes each leg (side-local
+    /// filter pushed into BOTH fan-out common blobs) AND narrows each leg's
+    /// projection (an involved column referenced nowhere in the wrapper is dropped),
+    /// while the outer WHERE still applies the full predicate as the backstop.
+    #[test]
+    fn unaccelerated_join_prunes_and_narrows_each_leg() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+                    {"name": "C_ADDRESS", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+                    {"name": "O_TOTALPRICE", "dataType": {"type": "decimal", "precision": 20, "scale": 2}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "CUSTOMER", "type": "table"},
+                    "right": {"name": "ORDERS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                        "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
+                "filter": {"type": "predicate_and", "expressions": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                     "right": {"type": "literal_string", "value": "ACME"}},
+                    {"type": "predicate_greater",
+                     "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                     "right": {"type": "literal_string", "value": "1995-01-01"}}]},
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}})
+                    .to_string()},
+        });
+
+        let eligible = eligible_join(&request);
+        let sides = JoinSides {
+            fact: resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
+            dimension: resolved_side("CUSTOMER", vec![("s3://w/c.parquet", 10)]),
+            broadcast_eligible: false,
+        };
+        let sql = build_unaccelerated_join_sql(
+            &request,
+            &pd(&request),
+            &eligible,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("two-scan wrapper must build");
+
+        // Finding 3: columns referenced nowhere in the wrapper are dropped from the legs.
+        assert!(
+            !sql.contains("C_ADDRESS"),
+            "an unreferenced CUSTOMER column must be narrowed out of the fan-out: {sql}"
+        );
+        assert!(
+            !sql.contains("O_TOTALPRICE"),
+            "an unreferenced ORDERS column must be narrowed out of the fan-out: {sql}"
+        );
+
+        // Finding 2: each leg gets its own side-local filter pushed into its common blob.
+        assert_eq!(
+            sql.matches("\"filter\"").count(),
+            2,
+            "both fan-out legs must carry a side-local ScanSpec.filter: {sql}"
+        );
+
+        // Outer WHERE (the correctness backstop) still applies the full predicate,
+        // table-qualified, over the materialized join.
+        assert!(
+            sql.contains("WHERE")
+                && sql.contains(r#""LHS_DIM"."C_NAME""#)
+                && sql.contains(r#""LHS_FACT"."O_ORDERDATE""#),
+            "the outer WHERE must still render the full predicate qualified: {sql}"
+        );
+        assert!(sql.contains("INNER JOIN"), "{sql}");
     }
 
     /// B3b correctness guard: a sort key whose column requires the JSON-fallback
