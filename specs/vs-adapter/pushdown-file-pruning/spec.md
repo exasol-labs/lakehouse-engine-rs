@@ -5,8 +5,8 @@ Translates the soundly-translatable conjuncts of the Exasol WHERE predicate into
 time, so `plan_files` prunes data files on partition values and per-file min/max bounds
 before any S3 I/O — while the DataFusion scan keeps applying the full filter as the sole
 source of row-level correctness. This delta extends the same resolve-once seam to preserve
-each data file's associated positional-delete files and to fail loud on delete mechanisms
-the engine cannot apply.
+each data file's associated positional-delete files and v3 deletion vectors, and to fail
+loud on the delete mechanisms the engine still cannot apply.
 
 ## Background
 
@@ -22,9 +22,24 @@ the engine cannot apply.
   reach the adapter.
 * A data file's associated positional-delete files (as resolved by `plan_files` per the
   Iceberg sequence-number rules) MUST be preserved into the scan spec, never discarded.
-* Delete mechanisms this engine cannot apply — equality deletes, Puffin/v3 deletion
-  vectors, and ORC/Avro data or delete files — MUST be detected at plan time and fail the
-  request loud.
+* A data file's associated positional-delete files and v3 deletion vector, when present, MUST be
+  preserved into the scan spec by building the normalized per-shard wire: an interned `deleteFiles`
+  pool (each physical delete file/container once per shard, with `path`, `size`, `type`, `format`)
+  and `df`-indexed `deletes` references on each `dataFiles` entry (see
+  `datafusion-scan/scan-execution-spec-reconstitution` for the wire shape). Because iceberg-rust's
+  `plan_files`/`FileScanTask.deletes` does not surface deletion-vector files, DV references MUST be
+  sourced from the manifest / `DataFile`-level walk (the same walk that gates unsupported
+  mechanisms), which is the only place the DV discriminator and the DV-specific coordinates
+  (`content_offset`, `content_size_in_bytes`, and the `referenced_data_file` used only to associate
+  the DV with its data file) are visible.
+* The `referenced_data_file` is used ONLY to attach each deletion vector to the correct `dataFiles`
+  entry (as a `df`-indexed `deletes` reference carrying the blob's `offset`/`length`); it is NOT
+  serialized onto the wire. The association is structural — it lives on the data file's `deletes`
+  list — and the scan-side decoder re-derives and cross-checks it from the Puffin `BlobMetadata`.
+* Delete mechanisms this engine still cannot apply — equality deletes and ORC/Avro data or
+  delete files — MUST be detected at plan time and fail the request loud. v3 / Puffin
+  deletion vectors are NO LONGER in this unsupported set: they are applied on read (see
+  `datafusion-scan/scan-execution-deletion-vectors`).
 * See `vs-adapter/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
 
@@ -69,15 +84,25 @@ the engine cannot apply.
 
 * *GIVEN* a virtual schema over an Iceberg merge-on-read table whose resolved `FileScanTask`s carry associated Parquet positional-delete files, at either `write.delete.granularity=file` or `write.delete.granularity=partition`
 * *WHEN* Exasol sends the corresponding pushdown request and the adapter resolves the file list once
-* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files, and SHALL carry each delete file's path, byte size, and delete content type into the per-shard file entry for the data file(s) it applies to
-* *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is carried for exactly the data files it applies to and no others
+* *THEN* the adapter MUST NOT discard a data file's associated positional-delete files, and SHALL intern each physical delete file EXACTLY ONCE into the per-shard `deleteFiles` pool (`type` `POS_DEL`, `format` `PARQUET`) and attach a `df`-indexed `deletes` reference (with no `offset`/`length`) to each `dataFiles` entry it applies to
+* *AND* a partition-granularity delete file referenced by several data files SHALL appear only ONCE in the `deleteFiles` pool, with each referencing data file carrying a `deletes` entry whose `df` points at that one pool slot
+* *AND* the association between a data file and its delete files SHALL follow the Iceberg sequence-number rules exactly as `plan_files` resolved them, so a delete file is referenced by exactly the data files it applies to and no others
 * *AND* the adapter SHALL carry the delete-file references as the ONLY delete-related addition to the per-shard files argument — it MUST NOT add a serialized Iceberg schema or a bound predicate to the spec for delete support
+
+### Scenario: Deletion-vector files are preserved into the scan spec
+
+* *GIVEN* a virtual schema over an Iceberg `format-version=3` merge-on-read table whose current snapshot carries a `deletion-vector-v1` Puffin blob referencing a data file
+* *WHEN* Exasol sends the corresponding pushdown request and the adapter walks the snapshot's manifests to resolve the file list once
+* *THEN* the adapter SHALL intern the Puffin container into the per-shard `deleteFiles` pool (`type` `DV`, `format` `PUFFIN`, with the Puffin file path and byte size) and attach, to the `dataFiles` entry for the referenced data file, a `deletes` reference whose `df` indexes that pool slot and which carries the blob's `offset` and `length` within the Puffin file
+* *AND* the adapter SHALL associate each deletion vector with exactly the data file the manifest's `referenced_data_file` names and no other, because the v3 spec guarantees at most one deletion vector per data file — but SHALL NOT serialize `referenced_data_file` onto the wire, because the association is structural (it lives on the data file's `deletes` list)
+* *AND* a single Puffin container referenced by many data files SHALL appear only ONCE in the `deleteFiles` pool, each referencing data file carrying its own `df`-indexed `deletes` entry with that blob's `offset`/`length`
+* *AND* the adapter MUST NOT discard the deletion-vector reference, so a DV-backed data file is never read as if it had no deletes
 
 ### Scenario: An unsupported delete mechanism fails loud at plan time
 
-* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply — an equality-delete file, a v3 / Puffin deletion vector, or a delete file (or data file) in ORC or Avro format
-* *WHEN* Exasol sends the corresponding pushdown request and the adapter inspects the snapshot's delete files at the manifest / `DataFile` level, where the Puffin discriminator and file format are still visible
+* *GIVEN* a virtual schema over an Iceberg table whose current snapshot carries a delete mechanism this engine cannot apply — an equality-delete file, or a delete file (or data file) in ORC or Avro format
+* *WHEN* Exasol sends the corresponding pushdown request and the adapter inspects the snapshot's delete files at the manifest / `DataFile` level, where the file format is still visible
 * *THEN* the adapter SHALL fail the request at plan time with a clean error naming the unsupported delete mechanism, BEFORE building or returning any scan-driving SQL and before fan-out
-* *AND* the adapter MUST NOT silently return pre-delete rows and MUST NOT emit scan-driving SQL for that request
-* *AND* the error message MUST NOT contain any storage access key, secret key, or session token
+* *AND* the adapter MUST NOT silently return pre-delete rows nor emit scan-driving SQL for that request, and the error message MUST NOT contain any storage access key, secret key, or session token
+* *AND* a v3 / Puffin deletion vector SHALL NOT trigger this failure — it is a supported mechanism applied on read
 * *AND* this plan-time detection SHALL be the authoritative correctness gate; any scan-time check is a secondary backstop only

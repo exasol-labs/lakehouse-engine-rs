@@ -18,6 +18,9 @@ delete mechanisms fail loud.
   or MinIO is unavailable.
 * Correctness is asserted against the recorded deleted-row set (equivalently, the single-node
   DataFusion result over the same post-delete data).
+* v3 / Puffin deletion vectors are NO LONGER an "unsupported" mechanism at the E2E level; their
+  success path is covered by `packaging/e2e-harness-deletion-vectors`. This harness's fail-loud
+  scenario now covers only the mechanisms that remain unsupported: equality deletes and ORC/Avro.
 
 ## Scenarios
 
@@ -69,9 +72,10 @@ delete mechanisms fail loud.
 
 ### Scenario: End-to-end unsupported delete mechanism fails loud
 
-* *GIVEN* the Docker stack is running with a table whose snapshot carries an unsupported delete mechanism (an equality-delete or a Puffin / v3 deletion-vector table)
+* *GIVEN* the Docker stack is running with a table whose snapshot carries an unsupported delete mechanism (an equality-delete table, or an ORC/Avro data or delete file)
 * *WHEN* a query over that virtual table is issued
 * *THEN* the query MUST fail at plan time with a clean error naming the unsupported delete mechanism, and MUST NOT return any rows
+* *AND* a v3 / Puffin deletion-vector table MUST NOT fail this way — it is queried successfully by `packaging/e2e-harness-deletion-vectors`
 * *AND* the error MUST NOT contain any storage access key, secret key, or session token
 * *AND* the test MUST fail (not skip) if the stack is unavailable
 
