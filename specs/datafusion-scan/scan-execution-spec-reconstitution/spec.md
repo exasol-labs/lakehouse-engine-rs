@@ -18,6 +18,8 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * A parse failure on either argument MUST surface an error identifying scan-spec
   deserialization failure and MUST NOT contain any storage access key, secret key, or
   session token.
+* Per-file positional-delete references travel with their data-file entry in the per-shard
+  argument.
 
 ## Scenarios
 
@@ -30,9 +32,18 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* a parse failure on either argument SHALL surface an error that identifies scan-spec deserialization failure and MUST NOT contain any storage access key, secret key, or session token
 * *AND* the reconstituted `ScanSpec` MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 
-### Scenario: A file-list argument that predates the size and relative-path encoding still reconstitutes
+### Scenario: Reconstitution carries per-file positional-delete references
 
-* *GIVEN* a scan invocation whose common-spec JSON carries no table root (an empty or absent root) and whose second argument holds file entries
+* *GIVEN* a scan invocation whose second argument is a JSON array of per-shard file entries, each carrying a data-file path, its byte size, and zero or more associated positional-delete file references (each with a path, byte size, and delete content type)
 * *WHEN* the scan UDF parses its two input arguments
-* *THEN* the UDF SHALL deserialize the file list, treating a missing table root as "all paths are absolute" so no path is joined onto a root
-* *AND* the resulting `ScanSpec` SHALL be usable by the shared scan path unchanged, because the same `.so` produces and consumes the spec within one deploy (there is no cross-version wire-compatibility requirement)
+* *THEN* the UDF SHALL deserialize each file entry together with its associated delete-file references and MERGE them into one scan spec whose per-shard files (with deletes) come from the second argument and whose every other field comes from the first
+* *AND* the merge SHALL store each data-file and delete-file path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration
+* *AND* the reconstituted scan spec MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
+
+### Scenario: A file-list argument that predates the delete encoding still reconstitutes
+
+* *GIVEN* a scan invocation whose second argument holds legacy file entries that carry a path and byte size but NO delete-file references (a spec that predates positional-delete support)
+* *WHEN* the scan UDF parses its two input arguments
+* *THEN* the UDF SHALL deserialize each legacy entry with its associated delete list defaulting to empty, so the entry reconstitutes as a delete-free data file
+* *AND* a missing table root SHALL still be treated as "all paths are absolute" so no path is joined onto a root
+* *AND* the resulting scan spec SHALL be usable by the shared scan path unchanged, because the same `.so` produces and consumes the spec within one deploy (there is no cross-version wire-compatibility requirement)
