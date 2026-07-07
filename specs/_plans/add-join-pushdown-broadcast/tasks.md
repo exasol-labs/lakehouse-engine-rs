@@ -9,8 +9,8 @@
 - [x] 3.6 Read JOIN_BROADCAST_MAX_BYTES adapter note (with default), thread through handle_pushdown
 
 ## Phase 2: Implementation (Group C)
-- [ ] 3.2 Resolve both sides' file lists/schemas/byte sizes once; select smaller side vs threshold [expert]
-- [ ] 3.3 Render join condition/cross-table projection/EMITS/filter via vs-expression; disjoint-column guard [expert]
+- [x] 3.2 Resolve both sides' file lists/schemas/byte sizes once; select smaller side vs threshold [expert]
+- [x] 3.3 Render join condition/cross-table projection/EMITS/filter via vs-expression; disjoint-column guard [expert]
 
 ## Phase 2: Implementation (Group D)
 - [ ] 3.4 Build broadcast fan-out scan-driving SQL (fact sharded, dimension full file list) [expert]
