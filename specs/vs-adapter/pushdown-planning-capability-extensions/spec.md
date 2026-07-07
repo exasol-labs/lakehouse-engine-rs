@@ -59,7 +59,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *WHEN* Exasol requests `getCapabilities`
 * *THEN* the response SHALL advertise the arithmetic binary-operator scalar-function capabilities for `+`, `-`, `*`, and `/` (the Exasol capability names `FN_ADD`, `FN_SUB`, `FN_MULT`, and `FN_FLOAT_DIV`), verified against the Exasol Virtual Schema capability vocabulary
 * *AND* each advertised arithmetic operator SHALL be backed by a `crates/vs-expression` translator arm that renders it (so an advertised operator is never one the translator would decline), keeping the capability set coherent with the translator the same way GROUP BY tuple advertisement is gated on its backing path
-* *AND* join and Cartesian-product capabilities SHALL remain absent (advertising arithmetic operators MUST NOT introduce any join capability)
+* *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised — advertising arithmetic operators MUST NOT introduce any additional join or cross-join capability
 
 ### Scenario: An advertised arithmetic expression Exasol cannot see decomposed remains correctness-safe
 
@@ -75,7 +75,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *THEN* the response SHALL advertise `ORDER_BY_COLUMN` so Exasol pushes column sort keys (with direction and NULL placement) and the accompanying `LIMIT` into the `pushdown` request, enabling the ordered-top-N partial/merge path in `vs-adapter/pushdown-planning-topn`
 * *AND* `ORDER_BY_EXPRESSION` SHALL remain absent, so Exasol never pushes an expression sort key the adapter has no bounded-sort path for
 * *AND* `LIMIT_WITH_OFFSET` SHALL remain absent, so Exasol never pushes an OFFSET and the ordered-top-N path needs no offset handling
-* *AND* join and Cartesian-product capabilities SHALL remain absent (advertising `ORDER_BY_COLUMN` MUST NOT introduce any join capability)
+* *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised — advertising `ORDER_BY_COLUMN` MUST NOT introduce any additional join or cross-join capability
 
 ### Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 

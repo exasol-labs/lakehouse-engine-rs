@@ -2214,3 +2214,138 @@ Remove the `tpchgen-arrow` dependency entirely and construct arrow-58 `RecordBat
 ### Consequences
 
 The dev/e2e dependency graph collapses onto a single arrow-58 tree — no arrow 57, no arrow 59, no IPC bridge anywhere. A future workspace arrow bump needs no coordinated `tpchgen-arrow` release, since generator batches are now built with the workspace arrow directly. The cost is bounded, test-only code in `seed.rs`/`tpch_loader.rs`; no production code is affected.
+
+---
+
+## ADR-082: Reference the Broadcast Join Dimension Side by File List, Not Materialized Rows
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Broadcast inner equi-join pushdown needs the small (dimension) side's data available to every fact-side shard's DataFusion session with no cross-shard exchange. The VS layer must stay thin (translation, pushdown analysis, parallelization planning) with all execution living in the UDF, per the repo's architecture boundaries, and the shard-invariant common spec is repeated to every shard invocation, so its size directly costs per-shard payload.
+
+### Decision
+
+Carry the dimension side's full file list, table root, and logical schema in the shard-invariant common spec; every shard invocation re-scans that file list itself and joins it node-locally against its fact-file subset, reusing the existing `register_files` path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Carry the dimension side by file-list reference in the common spec | ✓ Chosen — keeps the VS thin (file-list resolution only, no execution), avoids a large VARCHAR blob repeated to every shard, reuses `register_files`; the bounded small side makes per-shard re-scans cheap |
+| Materialize the dimension rows in the VS to Arrow IPC, base64-embed them in the common spec | ✗ Rejected — moves execution into the VS layer and repeats a large blob to every shard invocation |
+
+### Consequences
+
+Every shard invocation performs its own dimension-side file read, bounded by the broadcast threshold (`JOIN_BROADCAST_MAX_BYTES`, default 128 MiB), so the redundant work stays small by construction. The common spec gains a join block (table root, file list, logical schema, join type, rendered condition) that is absent for non-join specs.
+
+---
+
+## ADR-083: Ineligible Joins Fall Back to Deterministic Unaccelerated SQL, Not an Error
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Exasol capabilities are advertised once and statically; once `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` are advertised, Exasol pushes every inner equi-join to the adapter, including shapes outside the broadcast contract (small side over threshold, or a shape the translator/guard cannot serve). The adapter must decide what to return for those ineligible pushdowns without regressing currently-working join queries.
+
+### Decision
+
+For any inner equi-join the adapter cannot broadcast, emit SQL that scans each table independently through its own sharded scan-UDF fan-out subquery and lets Exasol's core engine join the two results (`INNER JOIN ... ON <condition>`). A hard error (relying on Exasol's native retry) is reserved for the genuine last resort, when even that fallback SQL cannot be built.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Deterministic unaccelerated two-scan SQL fallback | ✓ Chosen — reproduces today's (pre-JOIN-capability) behavior deterministically; correctness stays inside adapter control |
+| Always decline ineligible joins with an error and rely on Exasol re-planning | ✗ Rejected — Exasol does not cleanly re-plan on an adapter error; a hard error risks failing currently-working join queries |
+
+### Consequences
+
+The adapter carries two distinct join-rendering paths (broadcast fan-out and unaccelerated two-scan), each independently tested. Post-implementation E2E testing (ADR-085) found the first-cut two-scan rendering itself needed a correction; that refinement supersedes the rendering half of this decision's fallback path without changing the fallback-vs-error routing decided here.
+
+---
+
+## ADR-084: Shard Only the Fact Side; the Large-Side Sharding Model Is Unchanged
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Broadcast join pushdown (Phase 1 of backlog BL-001) needed to decide how much of the existing single-table file-sharding model to change to support joins, given Phase 2 (large/large shuffle join) is explicitly out of scope.
+
+### Decision
+
+The larger (fact) side keeps the existing G work-unit `GROUP BY shard_key` file-sharding exactly as the single-table path does; only the small (dimension) side's delivery (ADR-082) and the in-UDF join execution are new. No cross-shard exchange is introduced.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Shard only the fact side; reuse the existing sharding model unchanged | ✓ Chosen — broadcast is correct with no cross-shard exchange because the full small side is available to every shard; keeps Phase 2 (shuffle) fully out of scope |
+| Re-partition either side by join key (shuffle join) | ✗ Rejected — out of scope for BL-001 Phase 1 |
+
+### Consequences
+
+The existing file-sharding/parallelism model (`parallelism/work-unit-sharding`) is untouched by this plan. Broadcast join pushdown is additive: new join branches in the adapter and scan UDF, no change to how the fact side's files are partitioned into shards.
+
+---
+
+## ADR-085: Two-Scan Fallback Renders Table-Qualified Columns, Independent of the Disjoint-Column Guard
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Supersedes the rendering half of ADR-083's two-scan fallback decision for shared-column-name joins; the broadcast path's bare-name rendering and disjoint-column guard are unchanged. Live E2E testing against a real Exasol Docker container surfaced a regression: a join between two tables that share a column name (e.g. both have `id`) hard-failed once `JOIN` was advertised. The disjoint-column-name guard (which exists only to keep the BROADCAST path's bare-name rendering against a combined in-UDF DataFusion schema unambiguous) correctly rejected the broadcast rendering, but the two-scan fallback wrongly reused that same guard-gated bare-name rendering and returned a hard `Err` instead of falling back — regressing a previously-working query, since Exasol does not retry natively on that error.
+
+### Decision
+
+The two-scan fallback renders its own join condition, WHERE filter, select list, GROUP BY, HAVING, and ORDER BY with table-qualified references (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`), resolved from each `column` node's `tableName` against the side that owns it — never against a combined bare-name schema, and not gated on the disjoint-column guard (that guard governs broadcast eligibility only). Implemented by annotating each `column` node with a `tableAlias` and teaching the shared `vs-expression` translator to emit `"ALIAS"."NAME"` when `tableAlias` is present, bare name otherwise (the single-table path is byte-for-byte unchanged). A disjoint-guard failure is a plain reason the broadcast path is unavailable, not an error; a hard `Err` (native retry) is reserved for a condition that cannot be rendered against either a bare or a qualified schema.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Give the two-scan fallback its own table-qualified rendering, independent of the broadcast disjoint-column guard | ✓ Chosen — the two-scan path is Exasol's own engine joining two already-materialized sub-results, which resolves table-qualified references natively even on a shared column name; fixes the regression without touching the broadcast path |
+| Keep the shared bare-name rendering and widen the disjoint-column guard | ✗ Rejected — would keep declining (via hard error) legitimate shared-column joins that the two-scan path can serve correctly |
+
+### Consequences
+
+`vs-expression`'s column renderer gained an optional `tableAlias` (bare name when absent, so the single-table and broadcast paths are unaffected). The two-scan fallback is now correct for shared-column-name joins. This decision is closely paired with ADR-086 (aggregate-over-join routing), found and fixed in the same post-implementation E2E pass.
+
+---
+
+## ADR-086: Aggregate-Over-Join Routes Through the Qualified Two-Scan Path, Not a Decline
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+The same post-implementation E2E pass that found ADR-085's regression also found `SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM CUSTOMER JOIN ORDERS ON ...` (the plan's own second Manual Testing example) failing with "Expected number of columns is 2 but pushdown query has 5": the fallback ignored the aggregate select list and emitted the full cross-table row projection instead.
+
+### Decision
+
+Any join request that carries an aggregate, GROUP BY, ORDER BY, LIMIT, or HAVING (`join_requires_exasol_postprocessing`) is routed to the two-scan path regardless of broadcast eligibility, because none of those can ride the broadcast in-UDF join (which renders only projection + filter + join condition). The two-scan wrapper renders the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (fact fan-out) JOIN (dim fan-out) ON ... [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`), so Exasol evaluates the aggregate over the joined-and-materialized rows — exactly the pre-JOIN-capability behavior. The aggregate function name is spliced verbatim (it is Exasol's own); only its column argument is table-qualified.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Route aggregate/GROUP BY/ORDER BY/LIMIT/HAVING-bearing joins through the two-scan path unconditionally | ✓ Chosen — matches pre-JOIN-capability behavior exactly and avoids a hard error Exasol does not cleanly re-plan |
+| Decline aggregate-over-join pushdowns with an error | ✗ Rejected — same reasoning as ADR-083: a hard error risks regressing currently-working queries |
+
+### Consequences
+
+Aggregate-over-join, GROUP BY-over-join, ORDER BY-over-join, and LIMIT/HAVING-over-join queries are all served by the qualified two-scan wrapper (ADR-085), never by the broadcast in-UDF join. Both regressions found in this E2E pass (ADR-085 and this one) are covered by new host and E2E tests.
