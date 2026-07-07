@@ -93,6 +93,67 @@ Parquet read. Follows the existing `adapterNotes` configuration pattern.
   side is available to every shard. Phase 2 is explicitly out of scope (BL-001).
 - **Promotes to ADR:** yes
 
+## Post-implementation fix (2026-07-07): qualified two-scan fallback
+
+E2E testing against the live Exasol Docker stack surfaced two correctness
+regressions in the first-cut two-scan fallback. Both are fixed in
+`crates/lakehouse-engine/src/adapter/pushdown.rs` (plus a small `vs-expression`
+addition). The original design decisions [1]–[5] stand; this refines the *rendering*
+and *routing* of the fallback that decision [2] promised.
+
+### [6] The two-scan fallback renders TABLE-QUALIFIED columns, independent of the disjoint-column guard
+
+- **Symptom.** `SELECT a.id, b.label FROM EVENTS a JOIN LABELS b ON a.id = b.id`
+  (both tables have an `id` column) hard-failed. Once `JOIN` was advertised Exasol
+  pushed the whole join; the disjoint-column guard (decision [3]) correctly rejected
+  bare-name rendering; `render_broadcast_join` returned `None`; and `plan_eligible_join`
+  then returned a `User` error instead of falling back. Exasol does NOT re-plan on
+  that error — it surfaced as a hard SQL failure (state 22002), regressing a
+  previously-working query.
+- **Root cause.** The disjoint-column guard exists ONLY because the BROADCAST path
+  renders bare (unqualified) column names against a COMBINED in-UDF DataFusion
+  schema, which is ambiguous on a name collision. The UNACCELERATED two-scan path
+  has no such constraint — it is Exasol's own engine joining two already-materialized
+  sub-results (`… FROM (fan-out) AS "LHS_FACT" INNER JOIN (fan-out) AS "LHS_DIM" ON …`),
+  which resolves table-qualified references natively even when both sides share a
+  column name. The first cut wrongly reused the guard-gated bare-name rendering for
+  the two-scan path.
+- **Decision.** The two-scan wrapper renders its OWN join condition, WHERE filter,
+  select list, GROUP BY, HAVING, and ORDER BY with table-QUALIFIED references
+  (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`), resolved from each `column` node's
+  `tableName` against the side that owns it — never against a combined bare-name
+  schema, and NOT gated on the disjoint guard. Implemented by annotating each
+  `column` node with a `tableAlias` (`annotate_columns_with_alias`) and teaching the
+  shared `vs-expression` translator to emit `"ALIAS"."NAME"` when `tableAlias` is
+  present (bare name otherwise — the single-table path is byte-for-byte unchanged).
+  A disjoint-guard failure is therefore a plain reason the broadcast path is
+  unavailable, NOT an error. A hard `Err` (native retry) is now reserved for the
+  genuine last resort: a condition (or pushed select/GROUP BY/HAVING/ORDER BY
+  element) that cannot be rendered against EITHER a bare or a qualified schema.
+- **Promotes to ADR:** yes (supersedes the rendering half of [3] for the two-scan
+  path; the broadcast path keeps bare-name rendering + the guard unchanged).
+
+### [7] Aggregate-over-join routes through the two-scan path (Exasol aggregates the join), not a decline
+
+- **Symptom.** `SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM CUSTOMER JOIN ORDERS ON …`
+  failed with "Expected number of columns is 2 but pushdown query has 5" — the
+  fallback ignored the aggregate select list and emitted the full cross-table row
+  projection.
+- **Decision.** Any request that carries an aggregate, GROUP BY, ORDER BY, LIMIT, or
+  HAVING (`join_requires_exasol_postprocessing`) is routed to the two-scan path
+  regardless of broadcast eligibility, because none of those can ride the broadcast
+  in-UDF join (it renders only projection + filter + join condition). The two-scan
+  wrapper renders the aggregate select list as ordinary Exasol SQL over the
+  materialized join (`SELECT <aggregates> FROM (fact fan-out) JOIN (dim fan-out) ON …
+  [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), so Exasol evaluates the
+  aggregate over the joined-and-materialized rows — exactly what happened before any
+  `JOIN` capability was advertised (two independent scans, Exasol joins AND
+  aggregates). The aggregate function name is Exasol's own (it pushed it), so it is
+  spliced verbatim; only its column argument is table-qualified. This is preferred
+  over declining aggregate-over-join because a decline is a hard error Exasol does
+  not cleanly re-plan (same reasoning as decision [2]).
+- **Promotes to ADR:** yes.
+
 ## Review Findings
 
 <!-- Populated by speq-implement after code review. -->

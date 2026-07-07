@@ -3762,6 +3762,172 @@ fn projection_item_select_sql(item: &ProjectionItem) -> String {
     }
 }
 
+/// The subquery alias assigned to the fact (sharded) side's fan-out in the
+/// two-scan wrapper.
+const JOIN_FACT_ALIAS: &str = "LHS_FACT";
+/// The subquery alias assigned to the dimension side's fan-out in the two-scan
+/// wrapper.
+const JOIN_DIM_ALIAS: &str = "LHS_DIM";
+
+/// Build the `column.tableName` (UPPERCASE) → subquery-alias map for a two-scan
+/// join, so every column reference the wrapper renders can be table-qualified.
+///
+/// The fact side's fan-out is aliased [`JOIN_FACT_ALIAS`] and the dimension side's
+/// [`JOIN_DIM_ALIAS`]; each side's Exasol virtual table name (the value Exasol puts
+/// in a column node's `tableName`) maps to its alias. Keys are uppercased so the
+/// lookup is casing-insensitive against the request JSON.
+fn build_join_alias_map(sides: &JoinSides) -> HashMap<String, String> {
+    let mut map = HashMap::with_capacity(2);
+    map.insert(
+        sides.fact.table_name.to_ascii_uppercase(),
+        JOIN_FACT_ALIAS.to_string(),
+    );
+    map.insert(
+        sides.dimension.table_name.to_ascii_uppercase(),
+        JOIN_DIM_ALIAS.to_string(),
+    );
+    map
+}
+
+/// Deep-clone an expression node, tagging every `column` node with the subquery
+/// alias its `tableName` maps to (`tableAlias`), so `vs-expression` renders it as a
+/// table-qualified reference (`"ALIAS"."NAME"`).
+///
+/// This is the seam that makes the two-scan wrapper correct regardless of whether
+/// the two joined tables share a column name: bare-name rendering (the broadcast
+/// path) is ambiguous on a collision, but a table-qualified reference resolved
+/// against each side's OWN fan-out subquery never is. A `column` whose `tableName`
+/// is not in `alias_of` is left unqualified (it belongs to neither joined table —
+/// which cannot happen for a well-formed two-table request).
+fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) -> Json {
+    match expr {
+        Json::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len() + 1);
+            for (key, value) in map {
+                out.insert(key.clone(), annotate_columns_with_alias(value, alias_of));
+            }
+            if map.get("type").and_then(|t| t.as_str()) == Some("column")
+                && let Some(alias) = map
+                    .get("tableName")
+                    .and_then(|t| t.as_str())
+                    .and_then(|t| alias_of.get(&t.to_ascii_uppercase()))
+            {
+                out.insert("tableAlias".to_string(), Json::String(alias.clone()));
+            }
+            Json::Object(out)
+        }
+        Json::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|item| annotate_columns_with_alias(item, alias_of))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Render an expression node to table-qualified DataFusion/Exasol SQL for the
+/// two-scan wrapper: annotate each `column` with its side alias, then reuse the
+/// `vs-expression` translator. `None` when the node cannot be rendered.
+fn render_expression_qualified(expr: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
+    render_expression_safe(&annotate_columns_with_alias(expr, alias_of))
+}
+
+/// Render a WHERE filter to a table-qualified Exasol boolean expression for the
+/// two-scan wrapper. `None` when the filter is absent-shaped, trivially true, or
+/// unrenderable — mirroring the single-table `render_df_filter_safe` contract, so a
+/// dropped predicate is Exasol's own backstop responsibility exactly as elsewhere.
+fn render_df_filter_qualified(filter: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
+    render_df_filter_safe(&annotate_columns_with_alias(filter, alias_of))
+}
+
+/// Render one `function_aggregate` select-list item as a plain Exasol aggregate
+/// expression over the joined rows, with any column argument table-qualified.
+///
+/// The `name` Exasol sends is a valid Exasol aggregate function name (Exasol pushed
+/// it), so it is spliced verbatim — this is the two-scan analogue of the
+/// single-table aggregate decomposition, except Exasol (not the scan UDF) evaluates
+/// the aggregate over the already-materialized two-scan join, exactly as it did
+/// before any `JOIN` capability was advertised. `COUNT(*)` (no argument) is the only
+/// argument-free form; every other aggregate must carry a renderable argument.
+/// Returns `None` when the argument cannot be rendered.
+fn render_aggregate_qualified(item: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
+    let name = item.get("name").and_then(|n| n.as_str())?.to_uppercase();
+    let distinct = item.get("distinct").and_then(|d| d.as_bool()) == Some(true);
+    let args = item.get("arguments").and_then(|a| a.as_array());
+    match args.and_then(|a| a.first()) {
+        None => (name == "COUNT").then(|| "COUNT(*)".to_string()),
+        Some(arg) => {
+            let arg_sql = render_expression_qualified(arg, alias_of)?;
+            let distinct_kw = if distinct { "DISTINCT " } else { "" };
+            Some(format!("{name}({distinct_kw}{arg_sql})"))
+        }
+    }
+}
+
+/// Render one select-list item to a table-qualified outer-SELECT expression: an
+/// aggregate through [`render_aggregate_qualified`], everything else (columns,
+/// literals, scalar expressions) through the qualified translator.
+fn render_selectlist_item_qualified(
+    item: &Json,
+    alias_of: &HashMap<String, String>,
+) -> Option<String> {
+    match item.get("type").and_then(|t| t.as_str()) {
+        Some("function_aggregate") => render_aggregate_qualified(item, alias_of),
+        _ => render_expression_qualified(item, alias_of),
+    }
+}
+
+/// Every column of both joined tables as a table-qualified projection item, in
+/// fact-then-dimension order. Used as the two-scan wrapper's SELECT when the
+/// request carries no explicit (or an empty) select list.
+fn full_row_qualified_items(
+    fact_cols: &[(String, String)],
+    dim_cols: &[(String, String)],
+) -> Vec<ProjectionItem> {
+    fact_cols
+        .iter()
+        .map(|(name, _)| (JOIN_FACT_ALIAS, name))
+        .chain(dim_cols.iter().map(|(name, _)| (JOIN_DIM_ALIAS, name)))
+        .map(|(alias, name)| ProjectionItem::Expr {
+            expr: format!("{}.{}", quote_ident(alias), quote_ident(name)),
+        })
+        .collect()
+}
+
+/// Whether a join pushdown request carries work Exasol must execute over the
+/// materialized two-scan join rather than inside the broadcast in-UDF join: an
+/// aggregate (single-group or grouped), a GROUP BY, an ORDER BY, a LIMIT, or a
+/// HAVING. The broadcast path renders only projection + filter + join condition, so
+/// any of these routes the join to the qualified two-scan fallback (which renders
+/// them as ordinary Exasol SQL over the join), reproducing pre-`JOIN`-capability
+/// behavior exactly.
+fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
+    let has_aggregate_item = pushdown_req
+        .get("selectList")
+        .and_then(|v| v.as_array())
+        .is_some_and(|list| {
+            list.iter()
+                .any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
+        });
+    let has_group_by = pushdown_req
+        .get("groupBy")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let is_group_by_aggregation =
+        pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by");
+    let has_having = pushdown_req
+        .get("having")
+        .filter(|h| !h.is_null())
+        .is_some();
+    has_aggregate_item
+        || has_group_by
+        || is_group_by_aggregation
+        || has_having
+        || order_by_present(pushdown_req)
+        || extract_limit(pushdown_req).is_some()
+}
+
 /// Wrap two independently-sharded scan fan-outs in an Exasol-executed inner
 /// equi-join — the unaccelerated fallback (task 3.5).
 ///
@@ -3798,23 +3964,29 @@ pub fn build_two_scan_join_sql(
 }
 
 /// Plan an eligible two-table inner equi-join: resolve BOTH sides once, then route
-/// to the broadcast fan-out (small side ≤ threshold) or the unaccelerated two-scan
-/// fallback, or decline to a native retry when neither can be built correctly.
+/// to the broadcast fan-out or the qualified two-scan fallback, declining to a
+/// native retry only when even the two-scan wrapper cannot be built.
 ///
 /// Routing:
-/// - `render_broadcast_join` declines (`None`) → overlapping column names or an
-///   unrenderable condition. The translator emits only bare names, so a two-scan
-///   wrapper would be ambiguous — decline to a native retry (last resort).
 /// - either side has zero files → an inner join yields zero rows; emit a
-///   shape-correct empty result instead of a fan-out over an empty file list.
-/// - `broadcast_eligible` → shard ONLY the fact side and carry the dimension side's
-///   full file list once in the common blob's join block (task 3.4).
-/// - otherwise → scan each side through its own sharded fan-out and let Exasol join
-///   them (task 3.5).
+///   shape-correct (aggregate-aware) empty result rather than a fan-out over an
+///   empty file list.
+/// - BROADCAST (task 3.4) is used ONLY when the dimension side is within the byte
+///   threshold, the request carries no aggregate / GROUP BY / ORDER BY / LIMIT /
+///   HAVING (`join_requires_exasol_postprocessing`), AND the disjoint-column guard
+///   lets bare-name rendering succeed (`render_broadcast_join` returns `Some`). It
+///   shards only the fact side and carries the dimension side's full file list once
+///   in the common blob's join block.
+/// - otherwise → the QUALIFIED two-scan fallback (task 3.5): each side scanned
+///   through its own sharded fan-out and joined by Exasol's core engine, with the
+///   condition, WHERE, projection, aggregate/GROUP BY/HAVING/ORDER BY/LIMIT all
+///   rendered as table-qualified Exasol SQL. This is correct whether or not the two
+///   tables share a column name, so a disjoint-guard failure is NOT an error — it is
+///   just a reason the broadcast path is unavailable.
 ///
-/// LIMIT / GROUP BY / ORDER BY are never pushed into a join this phase (plan
-/// non-goals); any such extra pushdown fields are ignored here — the join output is
-/// returned in full and Exasol applies them.
+/// A hard `Err` (native retry) is the last resort, reserved for a two-scan wrapper
+/// that genuinely cannot be built — the equi-condition (or a pushed
+/// select/GROUP BY/HAVING/ORDER BY element) cannot be rendered at all.
 #[allow(clippy::too_many_arguments)]
 async fn plan_eligible_join(
     request: &Json,
@@ -3846,26 +4018,14 @@ async fn plan_eligible_join(
     )
     .await?;
 
-    // Render the shared condition/filter/projection. `None` is a clean decline that
-    // the two-scan fallback cannot recover from (bare-name ambiguity / no condition),
-    // so it becomes a native retry.
-    let rendered = match render_broadcast_join(request, pushdown_req, eligible)? {
-        Some(rendered) => rendered,
-        None => {
-            return Err(UdfError::User(
-                "join pushdown declined: overlapping column names or an unrenderable join \
-                 condition prevents a correct two-scan fallback; Exasol will retry natively"
-                    .into(),
-            ));
-        }
-    };
-
-    // An inner join with an empty side is empty regardless of the plan.
+    // An inner join with an empty side is empty regardless of the plan. Emit the
+    // shape-correct empty result (single-group aggregate, grouped, or row) from the
+    // combined column universe rather than a fan-out over an empty file list.
     if sides.fact.files.is_empty() || sides.dimension.files.is_empty() {
-        return Ok(empty_pushdown_sql(
-            &rendered.projection,
-            &rendered.projection_types,
-        ));
+        let mut combined = involved_table_columns(request, &sides.fact.table_name);
+        combined.extend(involved_table_columns(request, &sides.dimension.table_name));
+        let (proj_cols, proj_types) = project_columns(pushdown_req, combined.clone())?;
+        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, &combined);
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
@@ -3881,18 +4041,27 @@ async fn plan_eligible_join(
         s3_max_connections,
     };
 
-    let sql = if sides.broadcast_eligible {
-        build_broadcast_join_sql(&sides, &rendered, &tuning, &udf_name, &merge_udf_name)
-    } else {
-        build_unaccelerated_join_sql(
-            request,
-            &sides,
-            &rendered,
-            &tuning,
-            &udf_name,
-            &merge_udf_name,
-        )?
-    };
+    // Broadcast only for a plain projection+filter inner join whose columns are
+    // disjoint and whose dimension side fits the threshold. `render_broadcast_join`
+    // returns `Ok(None)` on a column-name collision (bare-name ambiguity) — that is
+    // a clean fall-through to the qualified two-scan path, never an error.
+    if sides.broadcast_eligible
+        && !join_requires_exasol_postprocessing(pushdown_req)
+        && let Some(rendered) = render_broadcast_join(request, pushdown_req, eligible)?
+    {
+        let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, &udf_name, &merge_udf_name);
+        return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+    }
+
+    let sql = build_unaccelerated_join_sql(
+        request,
+        pushdown_req,
+        eligible,
+        &sides,
+        &tuning,
+        &udf_name,
+        &merge_udf_name,
+    )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
 
@@ -4056,17 +4225,26 @@ fn build_broadcast_join_sql(
 }
 
 /// Build the unaccelerated two-scan join SQL (task 3.5): each side scanned through
-/// its own sharded fan-out, joined by Exasol's core engine.
+/// its own sharded fan-out, joined — and post-processed — by Exasol's core engine.
 ///
 /// Each side emits its FULL column set (from that table's `involvedTables` column
-/// metadata), so the outer wrapper's projection, `ON`, and `WHERE` can reference any
-/// column the join needs — including join keys and filter columns absent from the
-/// user's select list. Returns an `Err` only when a side carries no column metadata
-/// at all, in which case no correct subquery can be built (native retry).
+/// metadata), so the outer wrapper's projection, `ON`, `WHERE`, aggregate,
+/// GROUP BY, HAVING and ORDER BY can reference any column the join needs. Every one
+/// of those clauses is rendered with TABLE-QUALIFIED column references
+/// (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`) resolved against each side's own
+/// fan-out subquery, so the wrapper is correct whether or not the two tables share a
+/// column name — it does NOT depend on the disjoint-column guard the broadcast path
+/// needs. An aggregate select list is executed by Exasol over the materialized join
+/// (reproducing pre-`JOIN`-capability behavior), not decomposed into the scan UDF.
+///
+/// Returns an `Err` (native retry) only when the wrapper genuinely cannot be built:
+/// a side carries no column metadata, or the equi-condition (or a pushed
+/// select/GROUP BY/HAVING/ORDER BY element) cannot be rendered at all.
 fn build_unaccelerated_join_sql(
     request: &Json,
+    pushdown_req: &Json,
+    eligible: &EligibleJoin,
     sides: &JoinSides,
-    rendered: &RenderedJoinPushdown,
     tuning: &JoinScanTuning,
     udf_name: &str,
     merge_udf_name: &str,
@@ -4081,6 +4259,30 @@ fn build_unaccelerated_join_sql(
         ));
     }
 
+    let alias_of = build_join_alias_map(sides);
+
+    // The equi-condition is the one clause with no lower fallback: if it cannot be
+    // rendered even qualified, no correct join SQL exists → last-resort native retry.
+    let condition =
+        render_expression_qualified(&eligible.condition, &alias_of).ok_or_else(|| {
+            UdfError::User(
+            "join pushdown declined: the equi-join condition could not be rendered against the \
+             qualified two-scan schema; Exasol will retry natively"
+                .into(),
+        )
+        })?;
+
+    let filter = pushdown_req
+        .get("filter")
+        .filter(|f| !f.is_null())
+        .and_then(|f| render_df_filter_qualified(f, &alias_of));
+
+    let select_items = qualified_join_select_items(pushdown_req, &alias_of, &fact_cols, &dim_cols)?;
+    let group_by = qualified_join_group_by(pushdown_req, &alias_of)?;
+    let having = qualified_join_having(pushdown_req, &alias_of)?;
+    let order_by = qualified_join_order_by(pushdown_req, &alias_of)?;
+    let limit = extract_limit(pushdown_req);
+
     let fact_fan_out =
         build_side_fan_out_sql(&sides.fact, &fact_cols, tuning, udf_name, merge_udf_name);
     let dim_fan_out = build_side_fan_out_sql(
@@ -4091,13 +4293,140 @@ fn build_unaccelerated_join_sql(
         merge_udf_name,
     );
 
-    Ok(build_two_scan_join_sql(
+    let mut sql = build_two_scan_join_sql(
         &fact_fan_out,
         &dim_fan_out,
-        &rendered.projection,
-        &rendered.condition,
-        rendered.filter.as_deref(),
-    ))
+        &select_items,
+        &condition,
+        filter.as_deref(),
+    );
+    if let Some(clause) = group_by {
+        sql.push_str(&format!(" GROUP BY {clause}"));
+    }
+    if let Some(clause) = having {
+        sql.push_str(&format!(" HAVING {clause}"));
+    }
+    if let Some(clause) = order_by {
+        sql.push_str(&format!(" ORDER BY {clause}"));
+    }
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
+}
+
+/// The two-scan wrapper's outer SELECT list, table-qualified, in select-list order.
+///
+/// Each `selectList` item renders through [`render_selectlist_item_qualified`]
+/// (aggregate, column, literal, or scalar expression). An absent or empty select
+/// list projects every column of both joined tables. An item that cannot be rendered
+/// is a last-resort native retry (no correct outer SELECT exists for it).
+fn qualified_join_select_items(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+    fact_cols: &[(String, String)],
+    dim_cols: &[(String, String)],
+) -> Result<Vec<ProjectionItem>, UdfError> {
+    match pushdown_req.get("selectList") {
+        Some(Json::Array(list)) if !list.is_empty() => {
+            let mut items = Vec::with_capacity(list.len());
+            for item in list {
+                let sql = render_selectlist_item_qualified(item, alias_of).ok_or_else(|| {
+                    UdfError::User(
+                        "join pushdown declined: a select-list item could not be rendered for the \
+                         qualified two-scan join; Exasol will retry natively"
+                            .into(),
+                    )
+                })?;
+                items.push(ProjectionItem::Expr { expr: sql });
+            }
+            Ok(items)
+        }
+        _ => Ok(full_row_qualified_items(fact_cols, dim_cols)),
+    }
+}
+
+/// The two-scan wrapper's `GROUP BY` clause (without the keyword), table-qualified.
+/// `None` when the request carries no non-empty `groupBy`. A group key that cannot
+/// be rendered is a last-resort native retry.
+fn qualified_join_group_by(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+) -> Result<Option<String>, UdfError> {
+    let keys = match pushdown_req
+        .get("groupBy")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+    {
+        Some(keys) => keys,
+        None => return Ok(None),
+    };
+    let mut parts = Vec::with_capacity(keys.len());
+    for key in keys {
+        parts.push(render_expression_qualified(key, alias_of).ok_or_else(|| {
+            UdfError::User(
+                "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
+                 two-scan join; Exasol will retry natively"
+                    .into(),
+            )
+        })?);
+    }
+    Ok(Some(parts.join(", ")))
+}
+
+/// The two-scan wrapper's `HAVING` clause (without the keyword), table-qualified.
+/// `None` when the request carries no `having`. An unrenderable HAVING is a
+/// last-resort native retry (dropping it would return wrong rows).
+fn qualified_join_having(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+) -> Result<Option<String>, UdfError> {
+    match pushdown_req.get("having").filter(|h| !h.is_null()) {
+        Some(having) => Ok(Some(
+            render_expression_qualified(having, alias_of).ok_or_else(|| {
+                UdfError::User(
+                    "join pushdown declined: HAVING could not be rendered for the qualified \
+                     two-scan join; Exasol will retry natively"
+                        .into(),
+                )
+            })?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The two-scan wrapper's `ORDER BY` clause (without the keyword), table-qualified.
+/// `None` when the request carries no non-empty `orderBy`. Only bare-column sort
+/// keys are advertised (`ORDER_BY_COLUMN`); an element that is not a renderable bare
+/// column is a last-resort native retry (dropping it would return an unordered
+/// result Exasol delegated and no longer re-sorts).
+fn qualified_join_order_by(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+) -> Result<Option<String>, UdfError> {
+    let elements = match pushdown_req
+        .get("orderBy")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+    {
+        Some(elements) => elements,
+        None => return Ok(None),
+    };
+    let decline = || {
+        UdfError::User(
+            "join pushdown declined: an ORDER BY key could not be rendered for the qualified \
+             two-scan join; Exasol will retry natively"
+                .into(),
+        )
+    };
+    let mut parts = Vec::with_capacity(elements.len());
+    for element in elements {
+        let key = parse_sort_key_element(element).ok_or_else(decline)?;
+        let expr = element.get("expression").ok_or_else(decline)?;
+        let rendered = render_expression_qualified(expr, alias_of).ok_or_else(decline)?;
+        parts.push(key.render_ordered(&rendered));
+    }
+    Ok(Some(parts.join(", ")))
 }
 
 /// Build the shape-correct empty-result response for a fully-pruned file list.
@@ -6263,6 +6592,205 @@ mod tests {
             !sql.contains("\"join\""),
             "the unaccelerated path must not embed a broadcast join block: {sql}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Qualified two-scan fallback (fix: qualified rendering independent of the
+    // disjoint-column guard, and aggregate-over-join routed through two-scan)
+    // -----------------------------------------------------------------------
+
+    fn two_scan_tuning() -> JoinScanTuning {
+        JoinScanTuning {
+            cluster_nodes: 1,
+            parallelism_factor: 1,
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 0,
+            s3_max_connections: 1,
+        }
+    }
+
+    /// A join whose two tables share a column name (`ID`) fails the disjoint guard
+    /// (so the broadcast path declines), but the qualified two-scan fallback still
+    /// builds a correct, UNAMBIGUOUS wrapper: the condition and projection reference
+    /// `"LHS_FACT"."ID"` / `"LHS_DIM"."ID"`, never a bare ambiguous `"ID"`. This is
+    /// the `EVENTS ⋈ LABELS ON a.id = b.id` regression.
+    #[test]
+    fn colliding_columns_render_qualified_two_scan_without_error() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "double"}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "EVENTS", "type": "table"},
+                    "right": {"name": "LABELS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                        "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                "selectList": [
+                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    {"type": "column", "name": "LABEL", "tableName": "LABELS"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP": {"EVENTS": "lh.events", "LABELS": "lh.labels"}})
+                    .to_string()},
+        });
+
+        // Precondition: the shared ID column fails the disjoint guard, so broadcast
+        // rendering declines (Ok(None)) — the very reason the OLD code errored.
+        let left = involved_table_columns(&request, "EVENTS");
+        let right = involved_table_columns(&request, "LABELS");
+        assert!(!disjoint_schema_guard(&left, &right));
+        let eligible = eligible_join(&request);
+        assert!(
+            render_broadcast_join(&request, &pd(&request), &eligible)
+                .unwrap()
+                .is_none()
+        );
+
+        let sides = JoinSides {
+            fact: resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
+            dimension: resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+            broadcast_eligible: false,
+        };
+        let sql = build_unaccelerated_join_sql(
+            &request,
+            &pd(&request),
+            &eligible,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the qualified two-scan must build despite the column-name collision");
+
+        assert!(
+            sql.contains(r#"ON ("LHS_FACT"."ID" = "LHS_DIM"."ID")"#),
+            "the equi-condition must be table-qualified, never bare/ambiguous: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_FACT"."ID""#) && sql.contains(r#""LHS_DIM"."LABEL""#),
+            "the projection must be table-qualified per owning side: {sql}"
+        );
+        assert!(sql.contains("INNER JOIN"), "{sql}");
+    }
+
+    /// An aggregate over a join (the plan's second Manual Testing query,
+    /// `COUNT(*), MIN(o.O_ORDERDATE)`) routes through the two-scan wrapper and lets
+    /// Exasol evaluate the aggregate over the materialized join — a two-column result
+    /// (`COUNT(*)`, `MIN("LHS_FACT"."O_ORDERDATE")`), not the full-row projection the
+    /// old code emitted (which produced the "expected 2 columns but pushdown has 5"
+    /// failure).
+    #[test]
+    fn aggregate_over_join_renders_exasol_aggregate_over_two_scan() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {"type": "function_aggregate", "name": "COUNT", "arguments": []},
+            {"type": "function_aggregate", "name": "MIN", "arguments": [
+                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+        ]);
+
+        assert!(
+            join_requires_exasol_postprocessing(&pd(&request)),
+            "an aggregate select list must force the two-scan (Exasol-executed) path"
+        );
+
+        let eligible = eligible_join(&request);
+        let sides = JoinSides {
+            fact: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            dimension: resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            broadcast_eligible: false,
+        };
+        let sql = build_unaccelerated_join_sql(
+            &request,
+            &pd(&request),
+            &eligible,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("aggregate-over-join must build a two-scan wrapper");
+
+        assert!(sql.contains("COUNT(*)"), "COUNT(*) must be rendered: {sql}");
+        assert!(
+            sql.contains(r#"MIN("LHS_FACT"."O_ORDERDATE")"#),
+            "MIN must qualify its argument to the owning side: {sql}"
+        );
+        assert!(
+            sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_FACT"."O_ORDERDATE") FROM"#),
+            "the outer SELECT must be exactly the two aggregate columns: {sql}"
+        );
+        assert!(
+            sql.contains("INNER JOIN") && !sql.contains("\"join\":{"),
+            "aggregate-over-join is an Exasol two-scan join, never a broadcast block: {sql}"
+        );
+    }
+
+    /// A bare-column ORDER BY over a join is rendered table-qualified in the two-scan
+    /// wrapper (with explicit direction + NULL placement), so Exasol — which has
+    /// delegated the ordering — sorts on the unambiguous, owning-side column.
+    #[test]
+    fn order_by_over_join_renders_qualified_in_two_scan() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["orderBy"] = serde_json::json!([
+            {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+             "isAscending": true, "nullsLast": false},
+        ]);
+
+        assert!(join_requires_exasol_postprocessing(&pd(&request)));
+
+        let eligible = eligible_join(&request);
+        let sides = JoinSides {
+            fact: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            dimension: resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            broadcast_eligible: false,
+        };
+        let sql = build_unaccelerated_join_sql(
+            &request,
+            &pd(&request),
+            &eligible,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("ordered two-scan must build");
+        assert!(
+            sql.contains(r#"ORDER BY "LHS_FACT"."O_ORDERDATE" ASC NULLS FIRST"#),
+            "ORDER BY must be table-qualified with explicit direction/nulls: {sql}"
+        );
+    }
+
+    /// `join_requires_exasol_postprocessing` fires for every clause the broadcast
+    /// in-UDF join cannot serve, and is false for a plain projection+filter join.
+    #[test]
+    fn post_processing_predicate_covers_every_forcing_clause() {
+        let plain = join_request(Json::Null, equi_condition());
+        assert!(!join_requires_exasol_postprocessing(&pd(&plain)));
+
+        let mut limited = join_request(Json::Null, equi_condition());
+        limited["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10});
+        assert!(join_requires_exasol_postprocessing(&pd(&limited)));
+
+        let mut grouped = join_request(Json::Null, equi_condition());
+        grouped["pushdownRequest"]["groupBy"] =
+            serde_json::json!([{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]);
+        assert!(join_requires_exasol_postprocessing(&pd(&grouped)));
+
+        let mut having = join_request(Json::Null, equi_condition());
+        having["pushdownRequest"]["having"] =
+            serde_json::json!({"type": "literal_bool", "value": true});
+        assert!(join_requires_exasol_postprocessing(&pd(&having)));
     }
 
     /// B3b correctness guard: a sort key whose column requires the JSON-fallback
