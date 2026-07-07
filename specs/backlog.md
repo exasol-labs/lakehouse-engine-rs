@@ -31,3 +31,26 @@ co-locate per shard — a sharding-model redesign with no cross-shard exchange t
 and files can't be assigned to key-shards without reading them first. Exasol already
 joins large/large well, so the pushdown win is mostly Iceberg pruning. Investigate
 only if benchmarks justify it.
+
+---
+
+## BL-002: Adopt lc-rs `feat/add-emit-transfer-spikes` once released
+
+**Raised by:** performance investigation vs Trino (2026-07-06), see
+[`docs/performance.md`](../docs/performance.md#bottleneck-analysis-2026-07-06)
+**Status:** Open — blocked on an external, unreleased dependency
+
+`language-container-rs` branch `feat/add-emit-transfer-spikes` (local, uncommitted-turned-commit
+`8387a1f` at the time of this writing, not released to crates.io) pre-sizes the emit/ingest `Vec`
+buffers in `EmitBuffer`/`encode_slice`/`decode_string_block` and replaces `chrono`/`Decimal`
+`Display`-based DATE/TIMESTAMP/DECIMAL string formatting with hand-rolled fixed-format byte
+parsers, verified byte-identical to the paths they replace by unit test. `lineitem`'s 3 DATE + 4
+DECIMAL columns are exactly the string-block-encoded types this targets, and every wide-lineitem
+TPC-H query (Q2, Q3, Q5, Q9b, NQ1) pays that encoding cost. ABI version is unchanged (still 6), so
+this is expected to be a drop-in `exasol-udf-sdk`/SLC version bump with no wire-format break, once
+released.
+
+Not adoptable now: `exasol-udf-sdk`/SLC are pinned to the released 0.20.2; this branch only exists
+locally on the machine that authored it. Revisit when it ships — bump the SDK/SLC pin
+(`crates/lakehouse-engine/Cargo.toml`, `Makefile`'s `SLC_VERSION`, `bench/.env`'s
+`BENCH_SLC_VERSION`) and re-run `bench/compare_all.sh` to quantify the query-level delta.

@@ -142,11 +142,16 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_AGG_VAR_SAMP",
     // GROUP BY aggregate pushdown: column references, scalar expressions, and
     // multi-column (tuple) group keys. HAVING is advertised; COUNT(DISTINCT)
-    // and join pushdown are NOT.
+    // inside a GROUP BY is NOT.
     "AGGREGATE_GROUP_BY_COLUMN",
     "AGGREGATE_GROUP_BY_EXPRESSION",
     "AGGREGATE_GROUP_BY_TUPLE",
     "AGGREGATE_HAVING",
+    // Join pushdown: two-table inner equi-join only (broadcast, add-join-pushdown-broadcast).
+    // Outer joins, non-equi ("all condition") joins, and Cartesian products are NOT advertised.
+    "JOIN",
+    "JOIN_TYPE_INNER",
+    "JOIN_CONDITION_EQUI",
 ];
 
 /// Build the `getCapabilities` JSON response.
@@ -160,6 +165,20 @@ pub fn get_capabilities_response() -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True if `cap_strs` advertises any join shape outside the broadcast inner
+    /// equi-join contract: outer joins, non-equi ("all condition") joins, or any
+    /// Cartesian-product capability. `JOIN`, `JOIN_TYPE_INNER`, and
+    /// `JOIN_CONDITION_EQUI` are the only sanctioned join capabilities.
+    fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
+        cap_strs.iter().any(|c| {
+            c.contains("CARTESIAN")
+                || *c == "JOIN_TYPE_LEFT_OUTER"
+                || *c == "JOIN_TYPE_RIGHT_OUTER"
+                || *c == "JOIN_TYPE_FULL_OUTER"
+                || *c == "JOIN_CONDITION_ALL"
+        })
+    }
 
     /// Adapter advertises GROUP BY column, expression, and multi-column (tuple)
     /// capabilities — and `AGGREGATE_GROUP_BY_TUPLE` is advertised ONLY because the
@@ -225,16 +244,19 @@ mod tests {
 
         // Single-group COUNT(DISTINCT) is now advertised (issue #56); grouped
         // COUNT(DISTINCT) still falls back to row scanning via
-        // `pushdown::detect_group_by_aggregates` rejecting `distinct:true`. Join
-        // pushdown remains genuinely unsupported.
+        // `pushdown::detect_group_by_aggregates` rejecting `distinct:true`.
         assert!(
             cap_strs.contains(&"FN_AGG_COUNT_DISTINCT"),
             "FN_AGG_COUNT_DISTINCT must be advertised: {cap_strs:?}"
         );
-        let has_join = cap_strs
-            .iter()
-            .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
-        assert!(!has_join, "join capabilities must not be advertised");
+
+        // Inner equi-join pushdown (add-join-pushdown-broadcast) is now advertised,
+        // but outer joins, non-equi ("all condition") joins, and any Cartesian
+        // product remain out of scope and unadvertised.
+        assert!(
+            !has_disallowed_join_capability(&cap_strs),
+            "outer/all-condition/Cartesian join capabilities must not be advertised: {cap_strs:?}"
+        );
     }
 
     /// Adapter reports the full audited capability set.
@@ -430,12 +452,18 @@ mod tests {
                 "{name} must NOT be advertised: {cap_strs:?}"
             );
         }
-        let has_join = cap_strs
-            .iter()
-            .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
+        // Inner equi-join pushdown is advertised (add-join-pushdown-broadcast);
+        // outer joins, non-equi ("all condition") joins, and any Cartesian product
+        // remain out of scope and must not be advertised.
         assert!(
-            !has_join,
-            "join capabilities must not be advertised: {cap_strs:?}"
+            cap_strs.contains(&"JOIN")
+                && cap_strs.contains(&"JOIN_TYPE_INNER")
+                && cap_strs.contains(&"JOIN_CONDITION_EQUI"),
+            "inner equi-join capabilities must be advertised: {cap_strs:?}"
+        );
+        assert!(
+            !has_disallowed_join_capability(&cap_strs),
+            "outer/all-condition/Cartesian join capabilities must not be advertised: {cap_strs:?}"
         );
 
         // AGGREGATE_GROUP_BY_TUPLE is now advertised (issue #53), backed by the
@@ -548,11 +576,14 @@ mod tests {
             "TUPLE group-by must be backed by single-key GROUP BY capabilities: {cap_strs:?}"
         );
 
-        // Unsupported capabilities must NOT be advertised.
-        let has_join = cap_strs
-            .iter()
-            .any(|c| c.contains("JOIN") || c.contains("CARTESIAN"));
-        assert!(!has_join, "join capabilities must not be advertised");
+        // Unsupported join shapes must NOT be advertised: outer joins, non-equi
+        // ("all condition") joins, and any Cartesian product. Inner equi-join
+        // pushdown itself IS advertised (add-join-pushdown-broadcast) and is
+        // asserted separately in `advertises_inner_equi_join_capabilities`.
+        assert!(
+            !has_disallowed_join_capability(&cap_strs),
+            "outer/all-condition/Cartesian join capabilities must not be advertised: {cap_strs:?}"
+        );
 
         // Projection, filter, and LIMIT must still be present.
         assert!(cap_strs.contains(&"SELECTLIST_PROJECTION"));
@@ -582,5 +613,69 @@ mod tests {
             cap_strs.contains(&"AGGREGATE_SINGLE_GROUP"),
             "single-group COUNT(DISTINCT) requires AGGREGATE_SINGLE_GROUP: {cap_strs:?}"
         );
+    }
+
+    /// Scenario (vs-adapter/pushdown-planning-join): Adapter advertises inner
+    /// equi-join capabilities.
+    ///
+    /// `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` must be advertised so
+    /// Exasol pushes single two-table inner equi-joins to the adapter
+    /// (`add-join-pushdown-broadcast`). Outer joins, non-equi ("all condition")
+    /// joins, and any Cartesian product are explicit non-goals and must never be
+    /// advertised.
+    #[test]
+    fn advertises_inner_equi_join_capabilities() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        for name in &["JOIN", "JOIN_TYPE_INNER", "JOIN_CONDITION_EQUI"] {
+            assert!(
+                cap_strs.contains(name),
+                "{name} must be advertised: {cap_strs:?}"
+            );
+        }
+
+        for name in &[
+            "JOIN_TYPE_LEFT_OUTER",
+            "JOIN_TYPE_RIGHT_OUTER",
+            "JOIN_TYPE_FULL_OUTER",
+            "JOIN_CONDITION_ALL",
+        ] {
+            assert!(
+                !cap_strs.contains(name),
+                "{name} must NOT be advertised: {cap_strs:?}"
+            );
+        }
+
+        let has_cartesian = cap_strs.iter().any(|c| c.contains("CARTESIAN"));
+        assert!(
+            !has_cartesian,
+            "Cartesian-product capabilities must not be advertised: {cap_strs:?}"
+        );
+    }
+
+    /// Scenario (vs-adapter/pushdown-planning, CHANGED): the full advertised
+    /// capability set includes inner equi-join pushdown alongside the existing
+    /// projection/filter/LIMIT/aggregate pushdown capabilities.
+    #[test]
+    fn reports_capabilities_includes_inner_join() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        assert!(
+            cap_strs.contains(&"JOIN")
+                && cap_strs.contains(&"JOIN_TYPE_INNER")
+                && cap_strs.contains(&"JOIN_CONDITION_EQUI"),
+            "inner equi-join capabilities must be advertised: {cap_strs:?}"
+        );
+
+        // Existing pushdown capabilities remain advertised alongside join.
+        assert!(cap_strs.contains(&"SELECTLIST_PROJECTION"));
+        assert!(cap_strs.contains(&"FILTER_EXPRESSIONS"));
+        assert!(cap_strs.contains(&"LIMIT"));
+        assert!(cap_strs.contains(&"AGGREGATE_SINGLE_GROUP"));
+        assert!(cap_strs.contains(&"AGGREGATE_GROUP_BY_COLUMN"));
     }
 }
