@@ -38,7 +38,13 @@ only if benchmarks justify it.
 
 **Raised by:** performance investigation vs Trino (2026-07-06), see
 [`docs/performance.md`](../docs/performance.md#bottleneck-analysis-2026-07-06)
-**Status:** Open — blocked on an external, unreleased dependency
+**Status:** Closed (2026-07-07) — released as lc-rs v0.20.3 and adopted (SDK/macros/SLC
+bumped 0.20.2 → 0.20.3, `specs/_recorded/2026-07-07-change-lc-rs-sdk-0-20-3/`). A same-session
+A/B benchmark on `test1` found no measurable end-to-end query-time win — see
+[`docs/performance.md` §3](../docs/performance.md#3-string-block-wire-encoding-for-datedecimalnumeric-columns-adopted-but-no-measurable-end-to-end-win-2026-07-07):
+the formatter cost this targets is a small fraction of end-to-end wall-clock next to
+S3/Parquet I/O and DataFusion/Exasol-join cost. Adopted anyway (unconditional in lc-rs, free).
+No further action.
 
 `language-container-rs` branch `feat/add-emit-transfer-spikes` (local, uncommitted-turned-commit
 `8387a1f` at the time of this writing, not released to crates.io) pre-sizes the emit/ingest `Vec`
