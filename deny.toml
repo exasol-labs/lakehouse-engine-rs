@@ -32,6 +32,18 @@ ignore = [
     # reqsign/opendal/object_store bump their quick-xml requirement.
     { id = "RUSTSEC-2026-0194", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
     { id = "RUSTSEC-2026-0195", reason = "Blocked by reqsign/opendal/object_store's quick-xml semver pins; XML source is the operator-configured storage/catalog endpoint, not untrusted internet input" },
+
+    # Invalid pointer dereference in crossbeam-epoch's `fmt::Pointer`/`fmt::Display`
+    # impls for `Atomic`/`Shared` when the underlying pointer is null/invalid,
+    # fixed in >=0.9.20. Transitive via moka 0.12.15 (iceberg-rust 0.10.0's
+    # concurrent-cache dependency, ADR-079's git-tag pin) -> crossbeam-epoch
+    # 0.9.18, three levels below our own code. Neither lakehouse-engine nor
+    # moka's public API exposes a way to Display/Debug-format a raw
+    # crossbeam_epoch::Atomic/Shared value; triggering this requires reaching
+    # into moka's internal cache implementation directly. Blocked on moka/
+    # iceberg-rust bumping their crossbeam-epoch requirement; re-evaluate on
+    # the next iceberg-rust bump.
+    { id = "RUSTSEC-2026-0204", reason = "Transitive via moka (iceberg-rust's cache dependency) -> crossbeam-epoch 0.9.18; not reachable through moka's public API, blocked by iceberg-rust's pinned moka version" },
 ]
 
 [licenses]
