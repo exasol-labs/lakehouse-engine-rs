@@ -2095,6 +2095,27 @@ pub async fn handle_pushdown(
     match detect_join(request, &pushdown_req)? {
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
+        JoinShape::MultiTable(multi) => {
+            return plan_multi_table_join(
+                request,
+                &pushdown_req,
+                &multi,
+                catalog_uri,
+                storage,
+                catalog,
+                creds,
+                scan_schema,
+                cluster_nodes,
+                parallelism_factor,
+                df_target_partitions,
+                df_batch_size,
+                df_threads_per_udf,
+                memory_pool_fraction,
+                instance_overhead_mb,
+                s3_max_connections,
+            )
+            .await;
+        }
         JoinShape::Eligible(eligible) => {
             return plan_eligible_join(
                 request,
@@ -3470,6 +3491,32 @@ pub(crate) struct EligibleJoin {
     pub condition: Json,
 }
 
+/// One base-table leaf of a multi-table (N≥3) inner-join tree, with its
+/// original-cased Iceberg identifier already recovered from `TABLE_MAP`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MultiTableJoinLeaf {
+    /// The Exasol virtual table name (a `from`-tree leaf's `name`).
+    pub table_name: String,
+    /// `table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
+    pub iceberg_ident: String,
+}
+
+/// A detected inner-join tree spanning three or more involved tables.
+///
+/// `tables` are the base-table leaves in stable left-to-right tree order; every
+/// leaf's Iceberg identifier is resolved from `TABLE_MAP` at detection time (a
+/// missing leaf is a hard `Err`, not a value here). `conditions` are the N-1
+/// join-node `condition` expressions collected while walking the tree —
+/// AND-conjoined by the N-scan wrapper, which is order-agnostic for an all-inner
+/// join (decision-log [2]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MultiTableJoin {
+    /// The N≥3 base-table leaves in stable left-to-right tree order.
+    pub tables: Vec<MultiTableJoinLeaf>,
+    /// The N-1 raw join-node `condition` expressions, unrendered.
+    pub conditions: Vec<Json>,
+}
+
 /// The result of inspecting a pushdown request's `from` clause for the
 /// two-table inner equi-join shape this phase can plan a broadcast join for.
 #[derive(Debug, Clone, PartialEq)]
@@ -3484,6 +3531,105 @@ pub(crate) enum JoinShape {
     /// A genuine two-table inner equi-join with both sides' Iceberg
     /// identifiers resolved.
     Eligible(EligibleJoin),
+    /// A nested all-inner join tree spanning three or more involved tables, every
+    /// leaf's Iceberg identifier resolved from `TABLE_MAP`. Served by the N-scan
+    /// unaccelerated fallback ([`plan_multi_table_join`]), never an error.
+    MultiTable(MultiTableJoin),
+}
+
+/// Whether `from` is a join tree spanning three or more base tables — detected by
+/// an immediate `left`/`right` child that is itself a `join` node.
+///
+/// This inspects only the two immediate children because any binary join tree with
+/// three or more leaves necessarily has an internal join node as a child of its
+/// root; a plain two-table join has two `table` children and returns `false`,
+/// falling through to the frozen two-table detector.
+fn join_tree_is_multi_table(from: &Json) -> bool {
+    ["left", "right"].iter().any(|side| {
+        from.get(*side)
+            .and_then(|s| s.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("join")
+    })
+}
+
+/// Recursively collect a join tree's base-table leaf names (into `tables`, stable
+/// left-to-right order) and every join node's `condition` (into `conditions`,
+/// post-order).
+///
+/// Returns the specific [`IneligibleJoinReason`] on the first non-inner join node
+/// ([`IneligibleJoinReason::NotInnerJoinType`]), a join node missing a
+/// `left`/`right`/`condition` field or a leaf missing its `name`, or a leaf that is
+/// neither a `join` nor a `table` node ([`IneligibleJoinReason::UnsupportedShape`]).
+fn collect_join_tree(
+    node: &Json,
+    tables: &mut Vec<String>,
+    conditions: &mut Vec<Json>,
+) -> Result<(), IneligibleJoinReason> {
+    match node.get("type").and_then(|t| t.as_str()) {
+        Some("join") => {
+            let is_inner = node
+                .get("join_type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("inner"));
+            if !is_inner {
+                return Err(IneligibleJoinReason::NotInnerJoinType);
+            }
+            let (left, right) = match (node.get("left"), node.get("right")) {
+                (Some(left), Some(right)) => (left, right),
+                _ => return Err(IneligibleJoinReason::UnsupportedShape),
+            };
+            let condition = match node.get("condition").filter(|c| !c.is_null()) {
+                Some(condition) => condition.clone(),
+                None => return Err(IneligibleJoinReason::UnsupportedShape),
+            };
+            collect_join_tree(left, tables, conditions)?;
+            collect_join_tree(right, tables, conditions)?;
+            conditions.push(condition);
+            Ok(())
+        }
+        Some("table") => match node.get("name").and_then(|n| n.as_str()) {
+            Some(name) => {
+                tables.push(name.to_string());
+                Ok(())
+            }
+            None => Err(IneligibleJoinReason::UnsupportedShape),
+        },
+        _ => Err(IneligibleJoinReason::UnsupportedShape),
+    }
+}
+
+/// Classify a nested (N≥3) inner-join `from` tree into [`JoinShape::MultiTable`].
+///
+/// Walks the tree with [`collect_join_tree`] (asserting every join node is inner),
+/// then recovers each leaf table's original-cased Iceberg identifier from
+/// `TABLE_MAP`. A leaf absent from `TABLE_MAP` is a hard `Err` (stale virtual
+/// schema), exactly as [`detect_join`]'s two-table path reports. A non-inner node
+/// or a malformed/non-table node is [`JoinShape::Ineligible`], so the router's
+/// last-resort decline handles it uniformly with the two-table path.
+fn detect_multi_table_join(request: &Json, from: &Json) -> Result<JoinShape, UdfError> {
+    let mut table_names = Vec::new();
+    let mut conditions = Vec::new();
+    if let Err(reason) = collect_join_tree(from, &mut table_names, &mut conditions) {
+        return Ok(JoinShape::Ineligible(reason));
+    }
+
+    let table_map = super::read_table_map(request);
+    let mut tables = Vec::with_capacity(table_names.len());
+    for table_name in table_names {
+        let iceberg_ident = table_map.get(&table_name).cloned().ok_or_else(|| {
+            UdfError::User(format!(
+                "pushdown: virtual table '{table_name}' is not in TABLE_MAP; \
+                 drop and recreate the virtual schema"
+            ))
+        })?;
+        tables.push(MultiTableJoinLeaf {
+            table_name,
+            iceberg_ident,
+        });
+    }
+
+    Ok(JoinShape::MultiTable(MultiTableJoin { tables, conditions }))
 }
 
 /// Detect whether a pushdown request's `from` clause is a two-table inner
@@ -3516,6 +3662,15 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
     };
     if from.get("type").and_then(|t| t.as_str()) != Some("join") {
         return Ok(JoinShape::NotAJoin);
+    }
+
+    // A nested `join` node on either immediate side means the tree spans three or
+    // more base tables (any binary join tree with ≥3 leaves has an internal join
+    // node as a child of its root). Route it to the additive N-table detector; a
+    // plain two-table tree falls through to the frozen two-table logic below,
+    // byte-for-byte unchanged.
+    if join_tree_is_multi_table(from) {
+        return detect_multi_table_join(request, from);
     }
 
     let is_inner = from
@@ -4525,6 +4680,291 @@ async fn plan_eligible_join(
         &merge_udf_name,
     )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// Plan a multi-table (N≥3) all-inner join: resolve each of the N sides once, then
+/// build the N-scan unaccelerated wrapper — each table scanned through its own
+/// sharded fan-out and reconstructed into the original inner join by Exasol's core
+/// engine. Never a broadcast plan (broadcast stays strictly two-table).
+///
+/// An inner join with any empty side yields zero rows regardless of the plan, so an
+/// empty side short-circuits to the shape-correct empty result over the combined
+/// N-table column universe (generalizing the two-table empty path). A hard `Err`
+/// (native retry) is the last resort, delegated to [`build_n_scan_join_sql`] for a
+/// wrapper that genuinely cannot be built.
+#[allow(clippy::too_many_arguments)]
+async fn plan_multi_table_join(
+    request: &Json,
+    pushdown_req: &Json,
+    multi: &MultiTableJoin,
+    catalog_uri: &str,
+    storage: &StorageProps,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+    scan_schema: Option<&str>,
+    cluster_nodes: usize,
+    parallelism_factor: usize,
+    df_target_partitions: usize,
+    df_batch_size: usize,
+    df_threads_per_udf: usize,
+    memory_pool_fraction: f64,
+    instance_overhead_mb: u64,
+    s3_max_connections: usize,
+) -> Result<Json, UdfError> {
+    // Resolve each side ONCE (one catalog resolution per involved table, never per
+    // shard), each pruned by its own side-local WHERE conjuncts for Iceberg manifest
+    // pruning — exactly as the two-table `resolve_join_sides` does per side.
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let mut sides = Vec::with_capacity(multi.tables.len());
+    for leaf in &multi.tables {
+        let side_filter = filter.and_then(|f| side_local_filter(f, &leaf.table_name));
+        let side = resolve_one_join_side(
+            &leaf.table_name,
+            &leaf.iceberg_ident,
+            catalog_uri,
+            storage,
+            catalog,
+            creds,
+            side_filter.as_ref(),
+        )
+        .await?;
+        sides.push(side);
+    }
+
+    // An inner join with any empty side is empty regardless of the plan. Emit the
+    // shape-correct empty result over the combined N-table column universe (in stable
+    // side order, matching the wrapper's full-row projection) rather than a fan-out
+    // over an empty file list.
+    if sides.iter().any(|s| s.files.is_empty()) {
+        let mut combined = Vec::new();
+        for leaf in &multi.tables {
+            combined.extend(involved_table_columns(request, &leaf.table_name));
+        }
+        let (proj_cols, proj_types) = project_columns(pushdown_req, combined.clone())?;
+        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, &combined);
+    }
+
+    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
+    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
+    let tuning = JoinScanTuning {
+        cluster_nodes,
+        parallelism_factor,
+        df_target_partitions,
+        df_batch_size,
+        df_threads_per_udf,
+        memory_pool_fraction,
+        instance_overhead_mb,
+        s3_max_connections,
+    };
+
+    let sql = build_n_scan_join_sql(
+        request,
+        pushdown_req,
+        multi,
+        &sides,
+        &tuning,
+        &udf_name,
+        &merge_udf_name,
+    )?;
+    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// The N-table analog of [`build_join_alias_map`]: side `i`'s Exasol virtual table
+/// name (UPPERCASE) maps to `aliases[i]` (`LHS_T{i}`), so every column reference the
+/// N-scan wrapper renders is table-qualified from its `tableName`.
+fn build_n_scan_alias_map(
+    sides: &[ResolvedJoinSide],
+    aliases: &[String],
+) -> HashMap<String, String> {
+    sides
+        .iter()
+        .zip(aliases)
+        .map(|(side, alias)| (side.table_name.to_ascii_uppercase(), alias.clone()))
+        .collect()
+}
+
+/// Every column of all involved tables as a table-qualified projection item, in
+/// side order (the N-table analog of [`full_row_qualified_items`]). `cols_per_side[i]`
+/// belongs to the side aliased `aliases[i]`.
+fn n_full_row_qualified_items(
+    aliases: &[String],
+    cols_per_side: &[Vec<(String, String)>],
+) -> Vec<ProjectionItem> {
+    aliases
+        .iter()
+        .zip(cols_per_side)
+        .flat_map(|(alias, cols)| {
+            cols.iter().map(move |(name, _)| ProjectionItem::Expr {
+                expr: format!("{}.{}", quote_ident(alias), quote_ident(name)),
+            })
+        })
+        .collect()
+}
+
+/// The N-scan wrapper's outer SELECT list, table-qualified (the N-table analog of
+/// [`qualified_join_select_items`]). An absent/empty select list projects every
+/// column of all involved tables in side order. An item that cannot be rendered is a
+/// last-resort native retry.
+fn n_scan_join_select_items(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+    aliases: &[String],
+    cols_per_side: &[Vec<(String, String)>],
+) -> Result<Vec<ProjectionItem>, UdfError> {
+    match pushdown_req.get("selectList") {
+        Some(Json::Array(list)) if !list.is_empty() => {
+            let mut items = Vec::with_capacity(list.len());
+            for item in list {
+                let sql = render_selectlist_item_qualified(item, alias_of).ok_or_else(|| {
+                    UdfError::User(
+                        "join pushdown declined: a select-list item could not be rendered for the \
+                         qualified N-scan join; Exasol will retry natively"
+                            .into(),
+                    )
+                })?;
+                items.push(ProjectionItem::Expr { expr: sql });
+            }
+            Ok(items)
+        }
+        _ => Ok(n_full_row_qualified_items(aliases, cols_per_side)),
+    }
+}
+
+/// Build the N-scan (N≥3) unaccelerated inner-join SQL: each involved table scanned
+/// through its own sharded fan-out, cross-joined, and reconstructed into the original
+/// inner join by Exasol's core engine via a conjunctive table-qualified WHERE.
+///
+/// Each side emits its full column set (narrowed to the columns the wrapper actually
+/// references across all clauses), so the outer wrapper's SELECT, every join
+/// condition, WHERE, aggregate, GROUP BY, HAVING, and ORDER BY can reference any
+/// column the join needs — all rendered TABLE-QUALIFIED (`"LHS_T{i}"."COL"`) from
+/// each `column` node's `tableName`, so the wrapper is correct whether or not any
+/// two involved tables share a column name (decision-log [2]).
+///
+/// For an all-inner join, `FROM a, b, c WHERE c1 AND c2 AND <filter>` is equivalent
+/// to any chained `INNER JOIN … ON` ordering and is order-agnostic, so no per-node
+/// ON-scope bookkeeping is needed; Exasol's optimizer turns the equi-conditioned
+/// cross join into hash joins. Each WHERE part is parenthesized so a top-level `OR`
+/// in any condition or in the residual filter cannot bind across the ANDs.
+///
+/// Returns an `Err` (native retry) only when the wrapper genuinely cannot be built:
+/// an involved table carries no column metadata, or a join condition (or a pushed
+/// select/GROUP BY/HAVING/ORDER BY element) cannot be rendered at all.
+fn build_n_scan_join_sql(
+    request: &Json,
+    pushdown_req: &Json,
+    multi: &MultiTableJoin,
+    sides: &[ResolvedJoinSide],
+    tuning: &JoinScanTuning,
+    udf_name: &str,
+    merge_udf_name: &str,
+) -> Result<String, UdfError> {
+    let cols_per_side: Vec<Vec<(String, String)>> = sides
+        .iter()
+        .map(|s| involved_table_columns(request, &s.table_name))
+        .collect();
+    if cols_per_side.iter().any(|c| c.is_empty()) {
+        return Err(UdfError::User(
+            "join pushdown declined: an involved table carries no column metadata, so the \
+             unaccelerated N-scan fallback cannot be built; Exasol will retry natively"
+                .into(),
+        ));
+    }
+
+    let aliases: Vec<String> = (0..sides.len()).map(|i| format!("LHS_T{i}")).collect();
+    let alias_of = build_n_scan_alias_map(sides, &aliases);
+
+    // Every join-tree condition, table-qualified. A condition is the one clause with
+    // no lower fallback: if it cannot be rendered even qualified, no correct join SQL
+    // exists → last-resort native retry.
+    let mut conditions = Vec::with_capacity(multi.conditions.len());
+    for cond in &multi.conditions {
+        let rendered = render_expression_qualified(cond, &alias_of).ok_or_else(|| {
+            UdfError::User(
+                "join pushdown declined: a join condition could not be rendered against the \
+                 qualified N-scan schema; Exasol will retry natively"
+                    .into(),
+            )
+        })?;
+        conditions.push(rendered);
+    }
+
+    let filter = pushdown_req
+        .get("filter")
+        .filter(|f| !f.is_null())
+        .and_then(|f| render_df_filter_qualified(f, &alias_of));
+
+    let select_items = n_scan_join_select_items(pushdown_req, &alias_of, &aliases, &cols_per_side)?;
+    let group_by = qualified_join_group_by(pushdown_req, &alias_of)?;
+    let having = qualified_join_having(pushdown_req, &alias_of)?;
+    let order_by = qualified_join_order_by(pushdown_req, &alias_of)?;
+    let limit = extract_limit(pushdown_req);
+
+    // Per-side fan-out: narrow each leg's projection to the columns the wrapper
+    // references (across the SELECT list, ALL join conditions, WHERE, GROUP BY,
+    // HAVING, and ORDER BY), and push each side's side-local WHERE conjuncts down as a
+    // DataFusion filter. Cross-table and OR-spanning conjuncts stay only in the outer
+    // WHERE (`filter`), the correctness backstop. All N-1 conditions are passed as one
+    // JSON array so `referenced_side_columns` (which walks arbitrary nodes) keeps a
+    // side's column referenced by ANY condition.
+    let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let all_conditions = Json::Array(multi.conditions.clone());
+    let mut fan_outs = Vec::with_capacity(sides.len());
+    for (i, side) in sides.iter().enumerate() {
+        let narrowed = referenced_side_columns(
+            pushdown_req,
+            &all_conditions,
+            &side.table_name,
+            &cols_per_side[i],
+        );
+        let side_filter = where_filter.and_then(|f| side_local_filter(f, &side.table_name));
+        fan_outs.push(build_side_fan_out_sql(
+            side,
+            &narrowed,
+            side_filter.as_ref(),
+            tuning,
+            udf_name,
+            merge_udf_name,
+        ));
+    }
+
+    // Assemble the cross-join wrapper. FROM is the comma-joined aliased fan-outs;
+    // WHERE is every join condition AND-conjoined with the qualified residual filter.
+    let select = if select_items.is_empty() {
+        "*".to_string()
+    } else {
+        select_items
+            .iter()
+            .map(projection_item_select_sql)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let from = fan_outs
+        .iter()
+        .zip(&aliases)
+        .map(|(fan, alias)| format!("({fan}) AS {}", quote_ident(alias)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut where_parts: Vec<String> = conditions.iter().map(|c| format!("({c})")).collect();
+    if let Some(f) = &filter {
+        where_parts.push(format!("({f})"));
+    }
+    let where_clause = where_parts.join(" AND ");
+
+    let mut sql = format!("SELECT {select} FROM {from} WHERE {where_clause}");
+    if let Some(clause) = group_by {
+        sql.push_str(&format!(" GROUP BY {clause}"));
+    }
+    if let Some(clause) = having {
+        sql.push_str(&format!(" HAVING {clause}"));
+    }
+    if let Some(clause) = order_by {
+        sql.push_str(&format!(" ORDER BY {clause}"));
+    }
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
 }
 
 /// The DataFusion execution + sharding knobs threaded into join SQL building.
@@ -7070,32 +7510,220 @@ mod tests {
         );
     }
 
-    /// A three-table join (a nested `join` node as the `left` side of the outer
-    /// join) is declined as `Ineligible(TooManyTables)`.
-    #[test]
-    fn three_table_join_is_ineligible() {
-        let mut request = join_request(Json::Null, equi_condition());
-        request["pushdownRequest"]["from"]["left"] = serde_json::json!({
-            "type": "join",
-            "join_type": "inner",
-            "left": {"name": "CUSTOMER", "type": "table"},
-            "right": {"name": "NATION", "type": "table"},
-            "condition": {
-                "type": "predicate_equal",
-                "left": {"type": "column", "name": "C_NATIONKEY", "tableName": "CUSTOMER"},
-                "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"},
+    /// A three-table inner-join pushdown request: `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`,
+    /// all three in `TABLE_MAP`. Leaves in stable tree order CUSTOMER, ORDERS,
+    /// LINEITEM; two join conditions (`C_CUSTKEY=O_CUSTKEY`, `O_ORDERKEY=L_ORDERKEY`).
+    fn three_table_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "LINEITEM", "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_QUANTITY", "dataType": {"type": "decimal", "precision": 15, "scale": 2}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "CUSTOMER", "type": "table"},
+                        "right": {"name": "ORDERS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                    "right": {"name": "LINEITEM", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
+                        "right": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}}},
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "L_QUANTITY", "tableName": "LINEITEM"}],
             },
-        });
-        // A three-table join also involves three tables, not two.
-        request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
-            "name": "NATION",
-            "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
-        }));
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders", "LINEITEM": "lh.lineitem"}})
+                    .to_string()},
+        })
+    }
+
+    /// A three-table all-inner nested join is classified `MultiTable` (never an
+    /// error, never Ineligible): the three leaves in stable tree order and the two
+    /// collected join conditions, each leaf's Iceberg ident recovered from
+    /// `TABLE_MAP` (pushdown-planning-join "A three-or-more-table inner join falls
+    /// back to an N-scan unaccelerated wrapper").
+    #[test]
+    fn three_table_inner_join_is_multitable() {
+        let request = three_table_join_request();
+        let shape = detect_join(&request, &pd(&request)).expect("all leaves are in TABLE_MAP");
+        match shape {
+            JoinShape::MultiTable(multi) => {
+                let names: Vec<&str> = multi.tables.iter().map(|t| t.table_name.as_str()).collect();
+                assert_eq!(names, ["CUSTOMER", "ORDERS", "LINEITEM"]);
+                let idents: Vec<&str> = multi
+                    .tables
+                    .iter()
+                    .map(|t| t.iceberg_ident.as_str())
+                    .collect();
+                assert_eq!(idents, ["lh.customer", "lh.orders", "lh.lineitem"]);
+                assert_eq!(multi.conditions.len(), 2, "N-1 conditions for N=3 tables");
+            }
+            other => panic!("expected MultiTable, got {other:?}"),
+        }
+    }
+
+    /// A non-inner join node ANYWHERE in the tree (here the nested left node is a
+    /// left outer join) declines as `Ineligible(NotInnerJoinType)` — a cross-join +
+    /// conjunctive WHERE cannot reproduce outer-join semantics.
+    #[test]
+    fn non_inner_node_in_join_tree_is_ineligible() {
+        let mut request = three_table_join_request();
+        request["pushdownRequest"]["from"]["left"]["join_type"] = serde_json::json!("left_outer");
         let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
         assert_eq!(
             shape,
-            JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)
+            JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType)
         );
+    }
+
+    /// A leaf of a multi-table tree absent from `TABLE_MAP` is a hard `Err` (stale
+    /// virtual schema), identical to the two-table path — never a silent decline.
+    #[test]
+    fn multi_table_leaf_absent_from_table_map_is_err() {
+        let mut request = three_table_join_request();
+        request["schemaMetadataInfo"]["adapterNotes"] = Json::String(
+            serde_json::json!({"TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}})
+                .to_string(),
+        );
+        let err = detect_join(&request, &pd(&request))
+            .expect_err("LINEITEM is absent from TABLE_MAP: must be Err, not a decline");
+        assert!(
+            err.to_string().contains("LINEITEM"),
+            "error must name the unmapped table: {err}"
+        );
+    }
+
+    /// The Q1-shape three-table inner-join pushdown request:
+    /// `(SUPPLIER ⋈ NATION) ⋈ REGION`, all three in `TABLE_MAP`. Leaves in stable
+    /// tree order SUPPLIER, NATION, REGION; two join conditions
+    /// (`S_NATIONKEY=N_NATIONKEY`, `N_REGIONKEY=R_REGIONKEY`).
+    fn q1_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "REGION", "columns": [
+                    {"name": "R_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "R_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "SUPPLIER", "type": "table"},
+                        "right": {"name": "NATION", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                            "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                    "right": {"name": "REGION", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "N_REGIONKEY", "tableName": "NATION"},
+                        "right": {"type": "column", "name": "R_REGIONKEY", "tableName": "REGION"}}},
+                "selectList": [
+                    {"type": "column", "name": "S_NAME", "tableName": "SUPPLIER"},
+                    {"type": "column", "name": "R_NAME", "tableName": "REGION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"SUPPLIER": "lh.supplier", "NATION": "lh.nation", "REGION": "lh.region"}})
+                    .to_string()},
+        })
+    }
+
+    /// The NQ3-shape four-table inner-join pushdown request:
+    /// `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`, all four in `TABLE_MAP`. Leaves in
+    /// stable tree order PART, PARTSUPP, SUPPLIER, NATION; three join conditions.
+    fn nq3_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "PART", "columns": [
+                    {"name": "P_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "P_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "PARTSUPP", "columns": [
+                    {"name": "PS_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_AVAILQTY", "dataType": {"type": "decimal", "precision": 15, "scale": 0}}]},
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"type": "join", "join_type": "inner",
+                            "left": {"name": "PART", "type": "table"},
+                            "right": {"name": "PARTSUPP", "type": "table"},
+                            "condition": {"type": "predicate_equal",
+                                "left": {"type": "column", "name": "P_PARTKEY", "tableName": "PART"},
+                                "right": {"type": "column", "name": "PS_PARTKEY", "tableName": "PARTSUPP"}}},
+                        "right": {"name": "SUPPLIER", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "PS_SUPPKEY", "tableName": "PARTSUPP"},
+                            "right": {"type": "column", "name": "S_SUPPKEY", "tableName": "SUPPLIER"}}},
+                    "right": {"name": "NATION", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                        "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                "selectList": [
+                    {"type": "column", "name": "P_NAME", "tableName": "PART"},
+                    {"type": "column", "name": "PS_AVAILQTY", "tableName": "PARTSUPP"},
+                    {"type": "column", "name": "N_NAME", "tableName": "NATION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP": {
+                    "PART": "lh.part", "PARTSUPP": "lh.partsupp",
+                    "SUPPLIER": "lh.supplier", "NATION": "lh.nation"}})
+                    .to_string()},
+        })
+    }
+
+    /// A four-table all-inner nested join (NQ3 shape: `part⋈partsupp⋈supplier⋈nation`)
+    /// is classified `MultiTable` with all four leaves (stable tree order) and the
+    /// three collected join conditions — the detector generalizes past N=3, never
+    /// capping at three tables.
+    #[test]
+    fn four_table_inner_join_is_multitable() {
+        let request = nq3_join_request();
+        let shape = detect_join(&request, &pd(&request)).expect("all leaves are in TABLE_MAP");
+        match shape {
+            JoinShape::MultiTable(multi) => {
+                let names: Vec<&str> = multi.tables.iter().map(|t| t.table_name.as_str()).collect();
+                assert_eq!(names, ["PART", "PARTSUPP", "SUPPLIER", "NATION"]);
+                let idents: Vec<&str> = multi
+                    .tables
+                    .iter()
+                    .map(|t| t.iceberg_ident.as_str())
+                    .collect();
+                assert_eq!(
+                    idents,
+                    ["lh.part", "lh.partsupp", "lh.supplier", "lh.nation"]
+                );
+                assert_eq!(multi.conditions.len(), 3, "N-1 conditions for N=4 tables");
+            }
+            other => panic!("expected MultiTable, got {other:?}"),
+        }
     }
 
     /// An `involvedTables` count other than two (independent of the `from` shape)
@@ -7477,6 +8105,227 @@ mod tests {
             "the projection must be table-qualified per owning side: {sql}"
         );
         assert!(sql.contains("INNER JOIN"), "{sql}");
+    }
+
+    /// The N-scan (N≥3) builder produces a cross-join + conjunctive table-qualified
+    /// WHERE wrapper — N distinct `LHS_T*` fan-out aliases, every one of the N-1 join
+    /// conditions rendered table-qualified, and the select list qualified to its
+    /// owning side — never an `Err` for an all-inner tree over resolvable tables
+    /// (pushdown-planning-join "A three-or-more-table inner join falls back to an
+    /// N-scan unaccelerated wrapper").
+    #[test]
+    fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
+        let request = three_table_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("multi-table shape") {
+            JoinShape::MultiTable(m) => m,
+            other => panic!("expected MultiTable, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("an all-inner N-scan wrapper must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."O_ORDERKEY" = "LHS_T2"."L_ORDERKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(" WHERE ") && sql.contains(" AND "),
+            "conditions must be AND-conjoined in a WHERE (cross-join reconstruction): {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T0"."C_NAME""#) && sql.contains(r#""LHS_T2"."L_QUANTITY""#),
+            "the select list must be qualified to each column's owning side: {sql}"
+        );
+    }
+
+    /// The N-scan builder also handles the Q1 shape (`supplier⋈nation⋈region`): three
+    /// distinct `LHS_T*` fan-out aliases and both join conditions rendered
+    /// table-qualified, never an `Err`.
+    #[test]
+    fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
+        let request = q1_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("multi-table shape") {
+            JoinShape::MultiTable(m) => m,
+            other => panic!("expected MultiTable, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 10)]),
+            resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
+            resolved_side("REGION", vec![("s3://w/r-0.parquet", 2)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."S_NATIONKEY" = "LHS_T1"."N_NATIONKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."N_REGIONKEY" = "LHS_T2"."R_REGIONKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+    }
+
+    /// The N-scan builder also handles the NQ3 shape
+    /// (`part⋈partsupp⋈supplier⋈nation`, N=4): four distinct `LHS_T*` fan-out
+    /// aliases and all three join conditions rendered table-qualified, never an
+    /// `Err` — the builder generalizes past N=3.
+    #[test]
+    fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
+        let request = nq3_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("multi-table shape") {
+            JoinShape::MultiTable(m) => m,
+            other => panic!("expected MultiTable, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("PART", vec![("s3://w/p-0.parquet", 10)]),
+            resolved_side("PARTSUPP", vec![("s3://w/ps-0.parquet", 40)]),
+            resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 5)]),
+            resolved_side("NATION", vec![("s3://w/n-0.parquet", 3)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2", "LHS_T3"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."P_PARTKEY" = "LHS_T1"."PS_PARTKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."PS_SUPPKEY" = "LHS_T2"."S_SUPPKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T2"."S_NATIONKEY" = "LHS_T3"."N_NATIONKEY""#),
+            "third join condition must be table-qualified: {sql}"
+        );
+    }
+
+    /// Three tables that ALL share a column name (`ID`) — the N-table analog of
+    /// `colliding_columns_render_qualified_two_scan_without_error` — still build a
+    /// correct, unambiguous N-scan wrapper: every `ID` reference (both join
+    /// conditions and the select list) is table-qualified, never bare.
+    #[test]
+    fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "double"}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "TAGS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "TAG_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "EVENTS", "type": "table"},
+                        "right": {"name": "LABELS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                            "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                    "right": {"name": "TAGS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "ID", "tableName": "LABELS"},
+                        "right": {"type": "column", "name": "ID", "tableName": "TAGS"}}},
+                "selectList": [
+                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    {"type": "column", "name": "LABEL", "tableName": "LABELS"},
+                    {"type": "column", "name": "TAG_NAME", "tableName": "TAGS"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"EVENTS": "lh.events", "LABELS": "lh.labels", "TAGS": "lh.tags"}})
+                    .to_string()},
+        });
+        let multi = match detect_join(&request, &pd(&request)).expect("multi-table shape") {
+            JoinShape::MultiTable(m) => m,
+            other => panic!("expected MultiTable, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
+            resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+            resolved_side("TAGS", vec![("s3://w/t-0.parquet", 10)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("three tables sharing an ID column must still build, never Err");
+
+        assert!(
+            sql.contains(r#""LHS_T0"."ID" = "LHS_T1"."ID""#),
+            "first condition must be table-qualified, never bare/ambiguous: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."ID" = "LHS_T2"."ID""#),
+            "second condition must be table-qualified, never bare/ambiguous: {sql}"
+        );
+        // The outer wrapper's own SELECT list (as opposed to each independently
+        // scanned, unambiguous per-side fan-out's inner projection) must qualify
+        // every shared `ID` reference — never a bare, cross-side-ambiguous `"ID"`.
+        assert!(
+            sql.starts_with(r#"SELECT "LHS_T0"."ID", "LHS_T1"."LABEL", "LHS_T2"."TAG_NAME" FROM "#),
+            "the outer SELECT list must qualify the shared ID column, never bare: {sql}"
+        );
     }
 
     /// An aggregate over a join (the plan's second Manual Testing query,

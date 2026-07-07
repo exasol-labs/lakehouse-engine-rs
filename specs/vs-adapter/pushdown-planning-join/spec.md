@@ -8,6 +8,7 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the single-two-t
 * Both sides' Iceberg snapshot, data-file list, and per-file byte size are resolved exactly once per pushdown, in the planning layer; neither scan UDF invocation discovers files itself.
 * The broadcast threshold is read from a VS adapter note (`JOIN_BROADCAST_MAX_BYTES`, default 134217728) and compared against each side's Iceberg-metadata byte size — computed from manifest `file_size_in_bytes`, with NO Parquet data read.
 * The broadcast contract is: exactly two involved tables, `join_type = "inner"`, an equi-join condition, disjoint column-name sets across the two tables, and a condition/filter/projection the `crates/vs-expression` translator can render; any deviation takes the unaccelerated fallback (or, only when even the fallback cannot be built, an error so Exasol retries natively).
+* Because the adapter advertises `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` statically, Exasol pushes inner joins that span MORE than two involved tables (a nested `join` on a side of the top `from` node). The broadcast path stays strictly two-table; a join over three or more involved tables is always served by the unaccelerated per-table-scan fallback — each involved table scanned through its own sharded fan-out, all N reconstructed into the original inner join by Exasol's core engine — never by an error. A hard error is a last resort reserved for a shape whose fallback genuinely cannot be built (a non-inner join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column metadata, or a condition/clause the translator cannot render at all).
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 
 ## Scenarios
@@ -71,9 +72,21 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the single-two-t
 * *GIVEN* a `pushdown` request whose `from` clause is a join
 * *WHEN* the join is not a single two-table inner equi-join — it is non-inner, non-equi, spans more than two involved tables, has overlapping column names across the two tables, or carries a condition/filter/projection the translator cannot render
 * *THEN* the adapter SHALL NOT emit a broadcast plan for that request
-* *AND* the adapter SHALL instead emit the unaccelerated two-scan join SQL when it can build one, so Exasol's core engine produces the correct result
-* *AND* only when even the unaccelerated fallback cannot be built SHALL the adapter return an error so Exasol retries the query natively
+* *AND* the adapter SHALL instead emit the unaccelerated per-table-scan join SQL (a two-scan wrapper for two involved tables, an N-scan wrapper for three or more) when it can build one, so Exasol's core engine produces the correct result
+* *AND* spanning more than two involved tables SHALL by itself NEVER be a reason to return an error — a three-or-more-table inner join is always served by the N-scan fallback
+* *AND* only when even the unaccelerated fallback cannot be built — a non-inner join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column metadata, or a condition/clause the translator cannot render — SHALL the adapter return an error so Exasol retries the query natively
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
+
+### Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
+
+* *GIVEN* a `pushdown` request whose `from` clause is a nested inner-join tree over three or more involved tables (e.g. `supplier ⋈ nation ⋈ region`, `customer ⋈ orders ⋈ lineitem`, or `part ⋈ partsupp ⋈ supplier ⋈ nation`), every join node of which is `join_type = "inner"`
+* *WHEN* Exasol sends the `pushdown` request
+* *THEN* the adapter SHALL NOT return an error and SHALL NOT emit a broadcast plan for that request
+* *AND* the adapter SHALL resolve each involved table's Iceberg snapshot, data-file list, and logical schema exactly once — recovering each table's original-cased Iceberg identifier from `TABLE_MAP` by its involved-table name — and SHALL treat an involved table absent from `TABLE_MAP` as the same stale-virtual-schema hard error the single-table and two-table paths report
+* *AND* the adapter SHALL emit SQL that scans EACH involved table independently through its own sharded scan-UDF fan-out subquery and reconstructs the original inner join over all N subquery results in Exasol's core engine, carrying every one of the tree's join conditions
+* *AND* every join condition, WHERE filter, select-list item, GROUP BY, HAVING, and ORDER BY the wrapper renders SHALL use table-qualified column references resolved from each `column` node's `tableName` against the involved table that owns it, so the wrapper is correct whether or not any two involved tables share a column name
+* *AND* the returned result SHALL equal — as an order-independent multiset — the result of the same inner join evaluated on a single node
+* *AND* the adapter MUST NOT read any involved table's Parquet row data in the planning layer — only file-level metadata crosses into each side's scan spec
 
 ### Scenario: Shared-column-name join uses qualified two-scan, not bare-name broadcast rendering
 
