@@ -26,7 +26,10 @@
 
 mod common;
 use common::exasol_ws::ExaConn;
-use common::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, seed_events};
+use common::seed::{
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
+    LINEITEM_ROWS, seed_events,
+};
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
     exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
@@ -231,6 +234,14 @@ fn vs_fact_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_FACT_TABLE.to_uppercase())
 }
 
+fn vs_lineitem_table(vs_name: &str) -> String {
+    format!("{vs_name}.{}", E2E_LINEITEM_TABLE.to_uppercase())
+}
+
+fn vs_supplier_table(vs_name: &str) -> String {
+    format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
+}
+
 /// The `SELECT C_NAME, O_ORDERDATE FROM fact JOIN dim ...` query for one VS.
 fn join_query(vs_name: &str) -> String {
     format!(
@@ -271,6 +282,17 @@ fn has_broadcast_join_block(pushed_sql: &str) -> bool {
 /// wrapper, never in a native retry or the broadcast path.
 fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
     pushed_sql.contains("LHS_FACT") && pushed_sql.contains("LHS_DIM")
+}
+
+/// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
+/// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
+/// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
+/// aliases (`build_n_scan_alias_map`) are unique to the N-scan wrapper's
+/// generated SQL — never present in a native retry, a broadcast join, or the
+/// two-table `LHS_FACT`/`LHS_DIM` wrapper.
+fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
+    (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))
+        && !pushed_sql.contains(&format!(r#"AS "LHS_T{n}""#))
 }
 
 /// Fetch the join result as a sorted `Vec<(C_NAME, O_ORDERDATE)>` for
@@ -537,4 +559,269 @@ fn e2e_aggregate_over_join_result_correct() {
             "MIN(O_ORDERDATE) over the join must equal the single-table MIN for {vs_name}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6.2  N-scan unaccelerated fallback: 3-table and 4-table inner joins actually
+// succeed end-to-end (no F-UDF-CL-RUST-9001) and return correct results.
+//
+// Chain: dim_customer ⋈ fact_orders ⋈ fact_lineitem [⋈ dim_supplier], joined on
+// C_CUSTKEY=O_CUSTKEY, then O_ORDERKEY=L_ORDERKEY, then (4-table only)
+// L_SUPPKEY=S_SUPPKEY. See `common/seed.rs::seed_multi_table_join_extension`:
+// every line item references exactly one seeded order and one seeded supplier,
+// so both joins yield every seeded `fact_lineitem` row — `LINEITEM_ROWS`.
+// ---------------------------------------------------------------------------
+
+/// Fetch a query's result columns as a sorted `Vec<Vec<String>>` (row-major,
+/// order-independent multiset comparison), generalizing `columns_to_sorted_pairs`
+/// past a fixed 2-column shape.
+fn fetch_rows_as_vecs(cols: &[Vec<serde_json::Value>]) -> Vec<Vec<String>> {
+    let row_count = cols.first().map_or(0, Vec::len);
+    let mut rows: Vec<Vec<String>> = (0..row_count)
+        .map(|i| cols.iter().map(|col| value_to_string(&col[i])).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Build a `key -> value` map from a 2-column `(key, value)` query result,
+/// generalizing the map-building step `expected_join_rows` inlines for a single
+/// pair, reused across the 3-table and 4-table expected-result computations.
+fn build_key_to_value_map(cols: &[Vec<serde_json::Value>]) -> HashMap<String, String> {
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 columns (key, value), got {}",
+        cols.len()
+    );
+    cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(k, v)| (value_to_string(k), value_to_string(v)))
+        .collect()
+}
+
+/// `dim_customer ⋈ fact_orders ⋈ fact_lineitem` for one VS.
+fn three_table_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {} c \
+         JOIN {} o ON c.C_CUSTKEY = o.O_CUSTKEY \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY",
+        vs_dim_table(vs_name),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name)
+    )
+}
+
+/// `dim_customer ⋈ fact_orders ⋈ fact_lineitem ⋈ dim_supplier` for one VS —
+/// the same chain as [`three_table_join_query`] extended with the supplier side.
+fn four_table_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY, s.S_NAME FROM {} c \
+         JOIN {} o ON c.C_CUSTKEY = o.O_CUSTKEY \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
+         JOIN {} s ON l.L_SUPPKEY = s.S_SUPPKEY",
+        vs_dim_table(vs_name),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name),
+        vs_supplier_table(vs_name)
+    )
+}
+
+fn fetch_three_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
+    let cols = conn.query_columns(&three_table_join_query(vs_name));
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 result columns, got {}",
+        cols.len()
+    );
+    fetch_rows_as_vecs(&cols)
+}
+
+fn fetch_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
+    let cols = conn.query_columns(&four_table_join_query(vs_name));
+    assert_eq!(
+        cols.len(),
+        4,
+        "expected 4 result columns, got {}",
+        cols.len()
+    );
+    fetch_rows_as_vecs(&cols)
+}
+
+/// Compute the expected 3-table join result INDEPENDENTLY of the join pushdown:
+/// read all three tables un-joined through the same VS and join them in-process
+/// — the ground truth the N-scan wrapper result must match.
+fn expected_three_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
+    let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    )));
+    let orderkey_to_custkey = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
+        vs_fact_table(vs_name)
+    )));
+
+    let line_cols = conn.query_columns(&format!(
+        "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY FROM {}",
+        vs_lineitem_table(vs_name)
+    ));
+    assert_eq!(line_cols.len(), 3, "lineitem query must return 3 columns");
+
+    let mut rows: Vec<Vec<String>> = (0..line_cols[0].len())
+        .map(|i| {
+            let order_key = value_to_string(&line_cols[0][i]);
+            let line_number = value_to_string(&line_cols[1][i]);
+            let quantity = value_to_string(&line_cols[2][i]);
+            let cust_key = orderkey_to_custkey
+                .get(&order_key)
+                .unwrap_or_else(|| panic!("L_ORDERKEY {order_key} has no matching order"));
+            let name = custkey_to_name
+                .get(cust_key)
+                .unwrap_or_else(|| panic!("O_CUSTKEY {cust_key} has no matching customer"))
+                .clone();
+            vec![name, line_number, quantity]
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Compute the expected 4-table join result INDEPENDENTLY of the join pushdown
+/// — the same ground-truth approach as [`expected_three_table_join_rows`],
+/// extended with the supplier side.
+fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
+    let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    )));
+    let orderkey_to_custkey = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
+        vs_fact_table(vs_name)
+    )));
+    let suppkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT S_SUPPKEY, S_NAME FROM {}",
+        vs_supplier_table(vs_name)
+    )));
+
+    let line_cols = conn.query_columns(&format!(
+        "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY, L_SUPPKEY FROM {}",
+        vs_lineitem_table(vs_name)
+    ));
+    assert_eq!(line_cols.len(), 4, "lineitem query must return 4 columns");
+
+    let mut rows: Vec<Vec<String>> = (0..line_cols[0].len())
+        .map(|i| {
+            let order_key = value_to_string(&line_cols[0][i]);
+            let line_number = value_to_string(&line_cols[1][i]);
+            let quantity = value_to_string(&line_cols[2][i]);
+            let supp_key = value_to_string(&line_cols[3][i]);
+            let cust_key = orderkey_to_custkey
+                .get(&order_key)
+                .unwrap_or_else(|| panic!("L_ORDERKEY {order_key} has no matching order"));
+            let name = custkey_to_name
+                .get(cust_key)
+                .unwrap_or_else(|| panic!("O_CUSTKEY {cust_key} has no matching customer"))
+                .clone();
+            let supplier_name = suppkey_to_name
+                .get(&supp_key)
+                .unwrap_or_else(|| panic!("L_SUPPKEY {supp_key} has no matching supplier"))
+                .clone();
+            vec![name, line_number, quantity, supplier_name]
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A three-table inner-join pushdown (`dim_customer ⋈ fact_orders ⋈
+/// fact_lineitem`) succeeds end-to-end (no `F-UDF-CL-RUST-9001` — issue #76's
+/// hard failure) via the N-scan unaccelerated wrapper (three distinct `LHS_T*`
+/// aliases), never a broadcast join or the two-table `LHS_FACT`/`LHS_DIM`
+/// shape, and returns the result computed independently from the un-joined
+/// tables.
+#[test]
+fn e2e_three_table_join_result_correct() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let pushed = explain_virtual_sql(&mut conn, &three_table_join_query(VS_NAME));
+    assert!(
+        has_n_scan_wrapper(&pushed, 3),
+        "three-table inner join must emit the N-scan wrapper with three distinct \
+         LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a three-table join must NOT carry a broadcast common-blob join block \
+         (broadcast stays strictly two-table):\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a three-table join must NOT emit the two-table LHS_FACT/LHS_DIM \
+         wrapper:\n{pushed}"
+    );
+
+    let actual = fetch_three_table_join_rows(&mut conn, VS_NAME);
+    let expected = expected_three_table_join_rows(&mut conn, VS_NAME);
+
+    // Every line item matches exactly one order and every order matches exactly
+    // one customer, so the inner join drops nothing and duplicates nothing.
+    assert_eq!(
+        actual.len(),
+        LINEITEM_ROWS,
+        "expected {LINEITEM_ROWS} joined rows (one per seeded line item), got {}: {actual:?}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "three-table N-scan join result must equal the independently computed join.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A four-table inner-join pushdown (`dim_customer ⋈ fact_orders ⋈
+/// fact_lineitem ⋈ dim_supplier`) succeeds end-to-end (no `F-UDF-CL-RUST-9001`)
+/// via the N-scan unaccelerated wrapper (four distinct `LHS_T*` aliases),
+/// never a broadcast join or the two-table wrapper, and returns the result
+/// computed independently from the un-joined tables.
+#[test]
+fn e2e_four_table_join_result_correct() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let pushed = explain_virtual_sql(&mut conn, &four_table_join_query(VS_NAME));
+    assert!(
+        has_n_scan_wrapper(&pushed, 4),
+        "four-table inner join must emit the N-scan wrapper with four distinct \
+         LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a four-table join must NOT carry a broadcast common-blob join block \
+         (broadcast stays strictly two-table):\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a four-table join must NOT emit the two-table LHS_FACT/LHS_DIM \
+         wrapper:\n{pushed}"
+    );
+
+    let actual = fetch_four_table_join_rows(&mut conn, VS_NAME);
+    let expected = expected_four_table_join_rows(&mut conn, VS_NAME);
+
+    // Every line item matches exactly one order, one customer, and one
+    // supplier, so the inner join drops nothing and duplicates nothing.
+    assert_eq!(
+        actual.len(),
+        LINEITEM_ROWS,
+        "expected {LINEITEM_ROWS} joined rows (one per seeded line item), got {}: {actual:?}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "four-table N-scan join result must equal the independently computed join.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
 }

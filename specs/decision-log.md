@@ -2485,3 +2485,130 @@ For an inner equi-join (all this PR builds), attribute each WHERE conjunct to a 
 Both join routes now get free Iceberg manifest pruning per side; the two-scan fallback filters and footer-prunes each leg before emitting and ships only referenced columns — closing the pruning regression versus pre-PR single-table pushdown. The narrowed projection deliberately includes the FULL WHERE's columns (not just side-local ones) because the outer wrapper still renders the whole predicate qualified, and an absent SELECT list keeps every column (`SELECT *`). Pruned byte totals also feed side selection and the broadcast threshold, which only makes both more accurate. All new logic is `tableName`-driven and unit-tested for the shared-column-name (`EVENTS.ID` ⋈ `LABELS.ID`) case so it cannot regress the ADR-085 fix.
 
 **E2E-surfaced correction (the fan-out filter must render BARE).** The live cluster sends every column node with BOTH `tableName` (e.g. `FACT_ORDERS`) AND the query's `tableAlias` (e.g. `O` for `FROM fact_orders o`), and the `vs-expression` translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. The first cut pushed the side-local predicate into the two-scan leg's `ScanSpec.filter` via `render_df_filter_safe` unchanged, so it rendered `("O"."O_ORDERDATE" …)` — but a per-side fan-out is a SINGLE-TABLE scan whose relation exposes BARE uppercase columns (`scan_target` wrapped in an unaliased derived table), so the alias-qualified reference failed to resolve (`No field named "O"."O_ORDERDATE"`), regressing every filtered join. Fix: strip `tableAlias` (`strip_table_alias`) before rendering the leg's filter, so it is bare exactly like the single-table scan path. The outer two-scan wrapper is unaffected — its `render_df_filter_qualified` re-qualifies each column to `LHS_FACT`/`LHS_DIM` (overwriting the native alias) against each side's own fan-out subquery. The broadcast path is likewise untouched: it keeps rendering the native `tableAlias`, which the in-UDF `build_join_sql` resolves against its two registered sides — a mechanical regression test now pins both behaviors (bare in the fan-out, native-alias-preserving in broadcast). Iceberg manifest pruning (`to_iceberg_predicate`) is alias-agnostic (it resolves by bare column `name`), so Finding 1 needed no stripping.
+
+---
+
+## ADR-092: N-Table Inner Joins Fall Back to an N-Scan Unaccelerated Wrapper (Generalizes ADR-083 to N Tables)
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+Issue #76: a pushdown over an inner join spanning three or more involved tables (Q1
+`supplier⋈nation⋈region`, Q2 `customer⋈orders⋈lineitem`, NQ3
+`part⋈partsupp⋈supplier⋈nation`) hard-failed with `F-UDF-CL-RUST-9001: join pushdown
+declined: the join spans more than two tables …`, originating from
+`JoinShape::Ineligible(TooManyTables)` in `handle_pushdown`. The `exasol-udf-macros`
+0.20.3 FFI shim erases every `UdfError` variant to return code 1, which the UDF host
+surfaces as a hard SQL error — there is no native-retry path in this repo or the SDK for
+a declined pushdown. This is the same false premise ADR-083 rejected and ADR-085/086
+fixed for the two-table case; the feature spec already required N-table fallback
+behavior, so the >2-table decline was a spec-vs-implementation mismatch, not a design
+gap. The alternative of advertising fewer join capabilities so Exasol never pushes
+multi-table joins was rejected because it would regress the two-table broadcast benefit
+and still not match the already-written spec.
+
+### Decision
+
+A pushdown over an inner join spanning three or more involved tables is served by
+materializing each table through its own sharded scan-UDF fan-out and reconstructing the
+original inner join in Exasol's core engine — never by returning an error. An error is
+reserved for a shape whose fallback genuinely cannot be built (a non-inner join node, an
+involved table absent from `TABLE_MAP` or carrying no column metadata, or a
+condition/clause the translator cannot render).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| N-scan unaccelerated fallback for 3+ table inner joins | ✓ Chosen — closes #76, honors the existing spec wording, extends the proven ADR-083/085/086 "never wrong, only unaccelerated" pattern from two tables to N |
+| Keep declining `TooManyTables` (status quo) | ✗ Rejected — hard-fails a query class the spec already requires to work |
+| Advertise fewer join capabilities so Exasol never pushes multi-table joins | ✗ Rejected — regresses the two-table broadcast benefit and does not match the already-written spec |
+
+### Consequences
+
+A 3+ table inner-join pushdown now always returns a valid pushdown response instead of
+an error; Exasol's core engine reconstructs the join over N independently-scanned
+sub-results. The two-table broadcast and two-scan paths are unaffected. Future
+multi-table query classes (Q1/Q2/NQ3-shaped joins) become usable without requiring a
+broadcast N-way join to be built first.
+
+---
+
+## ADR-093: N-Scan Wrapper Renders as Cross-Join + Conjunctive Table-Qualified WHERE
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+Generalizing the two-table unaccelerated fallback (ADR-085/086) to N tables requires
+choosing how to reconstruct an arbitrary all-inner nested join tree over N
+independently-scanned fan-out subqueries. A chained `INNER JOIN … ON` tree that
+faithfully reproduces the pushed join tree would require ON-scope bookkeeping so each
+condition references only tables already introduced earlier in the chain — error-prone
+for arbitrary trees.
+
+### Decision
+
+The N-scan wrapper renders as `SELECT <qualified select list> FROM (fan0) "LHS_T0",
+(fan1) "LHS_T1", … WHERE <all N-1 join conditions AND-conjoined with the qualified
+residual filter> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`, with every column
+reference table-qualified from its `tableName` via the ADR-085 alias-annotation
+machinery.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Cross-join + conjunctive qualified WHERE | ✓ Chosen — provably equivalent to any join-tree ordering for all-inner joins, order-agnostic, no ON-scope bookkeeping; Exasol's optimizer turns equi-conditioned cross joins into hash joins |
+| Chained `INNER JOIN … ON` tree reproducing the pushed join tree | ✗ Rejected — requires ON-scope bookkeeping so each condition references only tables already introduced; error-prone for arbitrary trees and buys nothing since Exasol re-optimizes anyway |
+
+### Consequences
+
+The builder need not track which tables each condition spans, simplifying the
+implementation to N-entry alias-map construction plus conjunctive WHERE assembly. The
+existing ADR-085 qualified-rendering machinery (`render_expression_qualified`,
+`render_df_filter_qualified`, `qualified_join_select_items`/`_group_by`/`_having`/`_order_by`)
+is reused wholesale, so correctness on shared column names carries over unchanged.
+
+---
+
+## ADR-094: Freeze the Two-Table Join Path; Add the N-Table Path Additively
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+The N-table fallback could either be built by retrofitting N-table support into the
+existing `EligibleJoin`/`JoinSides`/`build_unaccelerated_join_sql` two-table
+structures, or added as a separate, additive path alongside them. The two-table
+broadcast and two-scan fallback (ADR-081..086) are working, live-tested code with real
+regression coverage (`has_two_scan_wrapper` and friends).
+
+### Decision
+
+Add `JoinShape::MultiTable(MultiTableJoin)` + `plan_multi_table_join` +
+`build_n_scan_join_sql` for N≥3, leaving the two-table `Eligible`/`JoinSides`/
+`build_unaccelerated_join_sql`/`build_two_scan_join_sql`/`LHS_FACT`/`LHS_DIM` path and
+all its ADR-081..086 tests byte-for-byte unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Additive `JoinShape::MultiTable` path, two-table path frozen | ✓ Chosen — confines the change to new, independently-testable units and guarantees the two-table broadcast benefit and its live-tested regressions stay intact |
+| Retrofit N tables into the existing `EligibleJoin`/`JoinSides` structures | ✗ Rejected — churns the working two-table broadcast + two-scan code and its E2E assertions, raising regression risk for no benefit |
+
+### Consequences
+
+The two-table broadcast and two-scan paths carry zero risk of regression from this
+change. Future planners extending N-table join behavior should build on the
+`MultiTable`/`plan_multi_table_join`/`build_n_scan_join_sql` path rather than
+re-unifying it with the two-table path, unless a broadcast N-way join is deliberately
+pursued (currently out of scope per the mission's "no N-table broadcast" non-goal).
