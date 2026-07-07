@@ -4,7 +4,9 @@
 
 # Performance
 
-TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06.
+TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06; lakehouse-engine-rs column re-verified 2026-07-07 post lc-rs 0.20.3 (see §3 below for the A/B). Competitor columns (Trino/Athena/Spark) are unchanged from 2026-07-06 — not re-run this pass.
+
+**Q1, Q2, and NQ3 are currently broken** (3+ table joins hard-fail — [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76), unrelated to lc-rs 0.20.3, see §4); their lakehouse-engine-rs numbers below are the last-known-good 2026-07-06 values, not re-verified 2026-07-07.
 
 | Engine | Resources |
 |---|---|
@@ -64,24 +66,65 @@ query already gets fewer shards. Verified by reading `handle_pushdown` in
 `crates/lakehouse-engine/src/adapter/pushdown.rs`; ruled out as an improvement area rather than
 assumed to be one.
 
-### 3. String-block wire encoding for DATE/DECIMAL/NUMERIC columns is a real, separate cost
+### 3. String-block wire encoding for DATE/DECIMAL/NUMERIC columns: adopted, but no measurable end-to-end win (2026-07-07)
 
 `lineitem` carries 3 DATE + 4 DECIMAL columns, encoded as string blocks over the UDF ABI
-regardless of their final SQL column type. A local, cluster-free microbenchmark
-(`language-container-rs` `benches/emit-bench`) of the unreleased `feat/add-emit-transfer-spikes`
-branch — which pre-sizes the emit/ingest `Vec` buffers (avoiding `Vec::new()`+`push`'s doubling
-reallocation curve) and replaces `chrono`/`Decimal`-`Display` DATE/TIMESTAMP/DECIMAL formatting
-with hand-rolled fixed-format byte parsers — measured a mixed-shape (no temporal/decimal columns)
-throughput baseline of ~720k–810k rows/s Rust vs ~140k–210k rows/s Python3 (4–5x) pre-patch.
-Cannot be adopted yet: it lives in an unreleased `exasol-udf-sdk`/SLC version ("only use local
-artifacts for testing" — the branch will be released later). Logged as a backlog item
-(`BL-002`) to revisit once released.
+regardless of their final SQL column type. lc-rs v0.20.3 (released 2026-07-07, PR #44)
+shipped exactly this optimization — hand-rolled fixed-format Decimal/Date/Timestamp
+formatters replacing `chrono`'s/`Decimal`'s generic `Display` — measuring **+28% to +46%**
+on its own isolated `benches/emit-bench` "wide" shape (a pure emit-throughput microbenchmark:
+`BIGINT, DECIMAL(18,2), DATE, TIMESTAMP, VARCHAR(100)`, no network/S3/DataFusion/Exasol-join
+cost in the loop). Adopted here by bumping `exasol-udf-sdk`/`exasol-udf-macros`/the SLC from
+0.20.2 to 0.20.3 (no code change — ships unconditionally).
 
-**Correctness note, found via an actual failing run, not assumed**: the branch's own new
-ingest-throughput test harness had a bug — it read back a parallel SET UDF's per-shard partial
-row counts with no `GROUP BY`/`SUM()`, undercounting (e.g. 64,696 counted vs 1,000,000 expected).
-Fixed locally (one-line `SUM()`). The *runtime* encode/decode logic itself is unrelated to that
-harness bug and passes all 31 existing unit tests unchanged on the patched branch.
+**End-to-end, it doesn't move the needle.** A same-session, same-cluster A/B on `test1`
+(0.20.2 rebuilt and re-benchmarked back-to-back against 0.20.3, isolating the SDK/SLC version
+as the only variable — cross-session comparisons carry too much cloud-environment noise to
+trust) shows every query within roughly ±10-15% of its 0.20.2 time, with no consistent
+direction:
+
+| Query | 0.20.2 | 0.20.3 (avg of 2 runs) | Δ |
+|---|---|---|---|
+| Q3 | 16.31 s | 15.51 s | -4.9% |
+| Q4 | 4.77 s | 4.90 s | +2.7% |
+| Q5 | 19.26 s | 17.92 s | -7.0% |
+| Q6 | 4.18 s | 4.18 s | 0% |
+| Q7 | 6.59 s | 7.01 s | +6.4% |
+| Q8 | 3.31 s | 3.06 s | -7.6% |
+| Q9a | 2.08 s | 2.55 s | +22.6%* |
+| Q9b | 11.00 s | 11.11 s | +1.0% |
+| NQ1 | 4.56 s | 4.77 s | +4.6% |
+| NQ2 | 4.38 s | 5.01 s | +14.4% |
+| NQ4 | 2.79 s | 3.57 s | +27.9%* |
+| NQ5 | 2.43 s | 2.10 s | -13.6% |
+
+\* Q9a/NQ4 are short (2-4s) queries where ~0.5-1s of absolute run-to-run cloud noise is a
+large fraction of the total — the two individual 0.20.3 runs disagreed with each other by
+more than they disagreed with 0.20.2 (e.g. Q9a: 3.22s then 1.87s).
+
+This is the expected outcome once you look at where the wall-clock actually goes for a
+TPC-H-shaped query here: string-block formatting is one line item inside a scan/emit path
+dominated by S3/Parquet I/O, DataFusion execution, and (for join queries) Exasol-side
+`JOIN`/`GROUP BY` reassembly. A 28-46% win on the formatter alone doesn't surface above
+noise at the full-query level for this workload. The optimization is real and worth having
+(it's unconditional and free), it's just not the lever for *this* bottleneck — §1 (join
+pushdown) remains the primary one.
+
+**Correctness note** (from when this was still an unreleased branch, kept for the record):
+the SLC's own new ingest-throughput test harness had a bug — it read back a parallel SET
+UDF's per-shard partial row counts with no `GROUP BY`/`SUM()`, undercounting (e.g. 64,696
+counted vs 1,000,000 expected). Fixed upstream; unrelated to the runtime encode/decode logic,
+which passed all unit tests unchanged.
+
+### 4. Join-pushdown-broadcast (PR #70) regressed 3+ table joins — separate from this pass
+
+Found while re-running this benchmark on 2026-07-07: Q1, Q2, and NQ3 (all 3+ table joins)
+now hard-fail with `F-UDF-CL-RUST-9001: UDF error: join pushdown declined: ... Exasol will
+retry the query natively` — except no native retry actually happens; the error propagates to
+the client as a failed statement. Reproduces identically on `main` before the lc-rs 0.20.3
+bump, so it's unrelated to this pass — a regression from the broadcast join-pushdown feature
+merged just before. Filed as [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76);
+their previous timings (Q1 1.67s, Q2 17.09s, NQ3 4.40s, table below) are stale until fixed.
 
 ### 4. Small/narrow-result queries (Q8, Q9a, NQ4, NQ5) still lose 2–4x despite trivial output
 
