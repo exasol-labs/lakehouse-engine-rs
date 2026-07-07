@@ -529,6 +529,65 @@ fn scan_rejects_unapplicable_delete_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Scenario (fail loud): a malformed positional-delete file carrying a negative
+/// `pos` is rejected with a clean error rather than silently dropped (casting a
+/// negative to `u64` would wrap to a huge index and skip the delete).
+#[test]
+fn scan_rejects_negative_positional_delete() {
+    let dir = temp_dir("neg_pos");
+    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let delete_url = write_delete_parquet(&dir, "delete.parquet", &[(data_url.as_str(), -1)]);
+    let entry = FileEntry::with_deletes(
+        data_url.clone(),
+        local_file_size(&data_url),
+        vec![delete_ref(&delete_url)],
+    );
+    let spec = scan_spec(vec![entry], None, None);
+
+    let err = block_on(try_run_scan_with_store(
+        &spec,
+        &data_url,
+        Arc::new(LocalFileSystem::new()),
+    ))
+    .expect_err("a negative pos must be rejected, not silently dropped");
+    // NB: the `dummy_storage` secret_key is "s", so credential redaction strips
+    // every "s" from the message — assert on tokens that survive it.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("negative") && msg.contains("(-1)"),
+        "error must name the malformed negative position: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (fail loud): a spec whose files resolve to more than one
+/// object-store root is rejected at registration. The scan registers a single
+/// store (keyed by the first file); a file under a different scheme/host would
+/// otherwise be read through the wrong store and fail confusingly.
+#[test]
+fn scan_rejects_mixed_object_store_roots() {
+    let dir = temp_dir("mixed_roots");
+    let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
+    let local = FileEntry::new(data_url.clone(), local_file_size(&data_url));
+    // A second data file under a DIFFERENT (s3://) root than the first (file://).
+    let foreign = FileEntry::new("s3://other-bucket/part-0.parquet", 10);
+    let spec = scan_spec(vec![local, foreign], None, None);
+
+    let err = block_on(try_run_scan_with_store(
+        &spec,
+        &data_url,
+        Arc::new(LocalFileSystem::new()),
+    ))
+    .expect_err("a spec mixing object-store roots must be rejected");
+    assert!(
+        err.to_string().contains("mixes object-store roots"),
+        "error must explain the mixed-root rejection: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scenario: a data file with NO associated delete files scans unchanged —
 /// the unified `PositionalDeleteScanTable` path must not regress the
 /// delete-free case.

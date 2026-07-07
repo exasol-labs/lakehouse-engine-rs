@@ -1035,6 +1035,48 @@ fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
         .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {abs}")))
 }
 
+/// Verify every data file and associated delete file in `spec` resolves to the
+/// same object-store root (scheme + host) as `first_abs`.
+///
+/// The scan registers a single object store keyed by that root (see
+/// [`register_files`] / [`build_session_context`]); a file under a different
+/// root would be read through the wrong store. This fails loud on a mixed-root
+/// spec rather than misreading or failing confusingly downstream.
+fn validate_uniform_object_store(spec: &ScanSpec, first_abs: &str) -> Result<(), UdfError> {
+    // Compare the exact `ObjectStoreUrl` (scheme + authority) each file resolves
+    // to — the very key the store is registered/looked up under — so the check
+    // matches the runtime invariant precisely (and accepts every URI form the
+    // scan itself accepts, e.g. bare local paths).
+    let store_key = |abs: &str| -> Result<String, UdfError> {
+        Ok(ListingTableUrl::parse(abs)
+            .map_err(|e| UdfError::User(format!("invalid file URI '{abs}': {e}")))?
+            .object_store()
+            .as_str()
+            .to_string())
+    };
+    let expected = store_key(first_abs)?;
+    let check = |abs: &str, kind: &str| -> Result<(), UdfError> {
+        let got = store_key(abs)?;
+        if got != expected {
+            return Err(UdfError::User(format!(
+                "scan spec mixes object-store roots: {kind} '{abs}' resolves to store '{got}' but \
+                 the first file resolves to '{expected}'; the scan registers a single object store"
+            )));
+        }
+        Ok(())
+    };
+    for entry in &spec.files {
+        check(&reconstruct_abs_uri(&entry.path, &spec.table_root), "data file")?;
+        for delete in &entry.deletes {
+            check(
+                &reconstruct_abs_uri(&delete.path, &spec.table_root),
+                "delete file",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Build the DataFrame: register files as a ListingTable, then apply
 /// projection/filter/limit SQL.
 async fn build_dataframe(
@@ -1081,6 +1123,15 @@ pub async fn register_files(
             .path,
         &spec.table_root,
     );
+    // The scan registers exactly ONE object store, keyed by the first file's
+    // scheme+host (`object_store_url` below and the store registered in
+    // `build_session_context`). Every data file and every associated delete file
+    // must resolve to that same root; a file under a different bucket/host would
+    // be read through the wrong (or an unregistered) store — a confusing failure
+    // or, worse, a wrong-key read. Fail loud on a mixed-root spec (e.g. an
+    // Iceberg `write.data.path` or a delete file in a different bucket) instead.
+    validate_uniform_object_store(spec, &first_abs)?;
+
     let object_store_url = ListingTableUrl::parse(&first_abs)
         .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?
         .object_store();
