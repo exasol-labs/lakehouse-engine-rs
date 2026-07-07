@@ -22,7 +22,7 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
-use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -131,7 +131,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
         .unwrap_or(0);
     ScanSpec {
         table_root: String::new(),
-        files: vec![(file_url, size)],
+        files: vec![FileEntry::new(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: None,
         limit: None,

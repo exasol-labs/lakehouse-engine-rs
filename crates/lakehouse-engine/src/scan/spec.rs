@@ -280,6 +280,151 @@ pub struct LogicalField {
     pub nullable: bool,
 }
 
+/// The Iceberg delete mechanism a [`DeleteFileRef`] belongs to.
+///
+/// Carries just enough to tell an actually-applicable Parquet positional
+/// delete apart from every delete mechanism this engine does not apply. Plan
+/// time (the adapter) is the authoritative gate that fails loud on anything
+/// other than [`PositionDeletes`](DeleteFileContentType::PositionDeletes)
+/// BEFORE a file reaches this spec; the other variants exist so the scan
+/// reader's read-time backstop can still reject a delete file cleanly (rather
+/// than panic or apply it incorrectly) if one ever slips through — see the
+/// "Minimal ScanSpec surface" decision in
+/// `specs/_plans/add-positional-delete-application/plan.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteFileContentType {
+    /// A Parquet positional-delete file (`file_path`/`pos` columns) — the
+    /// only delete mechanism this engine applies.
+    PositionDeletes,
+    /// An Iceberg equality-delete file. Never applied by this engine.
+    EqualityDeletes,
+    /// A Puffin-encoded v3 deletion vector. Never applied by this engine.
+    PuffinDeletionVector,
+}
+
+/// Reference to one Iceberg delete file associated with a [`FileEntry`].
+///
+/// Deliberately minimal — `path`, `size`, and `content_type` only. Per the
+/// "Minimal ScanSpec surface" decision this carries NO serialized Iceberg
+/// `Schema` or `BoundPredicate`: the scan reader already has the logical
+/// schema (`ScanSpec::logical_schema`) and does its own predicate pushdown, so
+/// a delete ref needs nothing beyond what it takes to open the file (`path`,
+/// `size`, matching how a [`FileEntry`] itself carries no more than that) and
+/// to reject it cleanly if unsupported (`content_type`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteFileRef {
+    /// Path to the delete file, relative to `ScanSpec::table_root` when
+    /// non-empty and the file lives under it, otherwise an absolute URI —
+    /// exactly like [`FileEntry::path`].
+    pub path: String,
+    /// Byte size, used the same way as [`FileEntry::size`]: to build the
+    /// delete file's `ObjectMeta` without an object-store HEAD.
+    pub size: u64,
+    /// The delete mechanism this file encodes.
+    pub content_type: DeleteFileContentType,
+}
+
+/// One per-shard scanned-file entry: a data file's path and byte size, plus
+/// the positional-delete files (if any) that must be applied when reading it.
+///
+/// # Chosen shape: struct-per-file with an untagged legacy fallback
+///
+/// The Rust-level API is a plain struct (`path`, `size`, `deletes`) so callers
+/// never pattern-match a bare tuple to reach the delete list. On the wire,
+/// `#[serde(from/into = "FileEntryWire")]` routes (de)serialization through
+/// the private [`FileEntryWire`] enum, mirroring how [`ProjectionItem`]
+/// already gives a bare-string legacy payload a typed fallback in this same
+/// module:
+/// - A legacy `[path, size]` 2-tuple (every entry written before
+///   positional-delete support) deserializes with an empty `deletes` list.
+/// - `[path, size, deletes]` (a 3-tuple) deserializes with `deletes` intact.
+/// - Serialization always picks the SHORTEST form for the value at hand: the
+///   compact 2-tuple when `deletes` is empty (keeping the still-common
+///   delete-free case exactly as small on the wire as before this field
+///   existed) and the 3-tuple only when there is something to carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "FileEntryWire", into = "FileEntryWire")]
+pub struct FileEntry {
+    /// Path to the data file, relative to `ScanSpec::table_root` when
+    /// non-empty and the file lives under it, otherwise an absolute URI (S3
+    /// or s3a).
+    pub path: String,
+    /// Byte size, used to build the file's `ObjectMeta` without an
+    /// object-store HEAD.
+    pub size: u64,
+    /// Positional-delete files that must be applied when reading this data
+    /// file. Empty (the default for legacy and delete-free entries) means the
+    /// file is read as-is.
+    pub deletes: Vec<DeleteFileRef>,
+}
+
+/// Wire form of [`FileEntry`] — see that struct's doc for why this shape
+/// exists. Not part of the public API; [`FileEntry`] is the only type callers
+/// construct or match on.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum FileEntryWire {
+    Legacy(String, u64),
+    WithDeletes(String, u64, Vec<DeleteFileRef>),
+}
+
+impl From<FileEntryWire> for FileEntry {
+    fn from(wire: FileEntryWire) -> Self {
+        match wire {
+            FileEntryWire::Legacy(path, size) => FileEntry {
+                path,
+                size,
+                deletes: Vec::new(),
+            },
+            FileEntryWire::WithDeletes(path, size, deletes) => FileEntry {
+                path,
+                size,
+                deletes,
+            },
+        }
+    }
+}
+
+impl From<FileEntry> for FileEntryWire {
+    fn from(entry: FileEntry) -> Self {
+        if entry.deletes.is_empty() {
+            FileEntryWire::Legacy(entry.path, entry.size)
+        } else {
+            FileEntryWire::WithDeletes(entry.path, entry.size, entry.deletes)
+        }
+    }
+}
+
+impl FileEntry {
+    /// A data-file entry with no associated delete files — the common case,
+    /// and the only shape a legacy (pre-delete-support) entry can take.
+    pub fn new(path: impl Into<String>, size: u64) -> Self {
+        FileEntry {
+            path: path.into(),
+            size,
+            deletes: Vec::new(),
+        }
+    }
+
+    /// A data-file entry with its associated positional-delete file refs.
+    pub fn with_deletes(path: impl Into<String>, size: u64, deletes: Vec<DeleteFileRef>) -> Self {
+        FileEntry {
+            path: path.into(),
+            size,
+            deletes,
+        }
+    }
+}
+
+/// Eases migrating existing `(path, size)` call sites to [`FileEntry`]: every
+/// such tuple is a delete-free entry.
+impl From<(String, u64)> for FileEntry {
+    fn from((path, size): (String, u64)) -> Self {
+        FileEntry::new(path, size)
+    }
+}
+
 /// The shard-INVARIANT portion of a scan specification.
 ///
 /// Holds every field the scan UDF reads that is identical across all shards of a
@@ -406,12 +551,14 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub table_root: String,
 
-    /// Explicit list of assigned Parquet files as `(path, byte_size)` pairs.
-    /// `path` is relative to `table_root` when non-empty and the file lives
-    /// under it, otherwise an absolute URI (S3 or s3a). The scan UDF registers
-    /// ONLY these files — no catalog discovery — and uses `byte_size` to build
-    /// each file's `ObjectMeta` without an object-store HEAD.
-    pub files: Vec<(String, u64)>,
+    /// Explicit list of assigned Parquet files, each carrying its byte size
+    /// and its associated positional-delete file refs (if any). `path` is
+    /// relative to `table_root` when non-empty and the file lives under it,
+    /// otherwise an absolute URI (S3 or s3a). The scan UDF registers ONLY
+    /// these files — no catalog discovery — and uses `size` to build each
+    /// file's `ObjectMeta` without an object-store HEAD. See [`FileEntry`]
+    /// for the wire shape and its backward-compatible legacy fallback.
+    pub files: Vec<FileEntry>,
 
     /// Projected columns in order. Empty means "all columns" (no projection push).
     /// Each entry is either a bare column reference or a rendered scalar expression
@@ -599,7 +746,7 @@ impl ScanSpec {
     /// Reconstitute a full `ScanSpec` from a shard-invariant common spec and a
     /// per-shard files list. This is the SOLE way to reattach `files`, which makes
     /// `files` the only per-shard field by construction.
-    pub fn from_parts(common: CommonScanSpec, files: Vec<(String, u64)>) -> Self {
+    pub fn from_parts(common: CommonScanSpec, files: Vec<FileEntry>) -> Self {
         Self {
             table_root: common.table_root,
             files,
@@ -632,16 +779,19 @@ impl ScanSpec {
     }
 
     /// Serialize a per-shard files list to the JSON array carried in the UDF's
-    /// second argument. Each entry is a compact `[path, size]` 2-tuple. Paired
-    /// with `files_from_json`.
-    pub fn files_json(files: &[(String, u64)]) -> String {
+    /// second argument. Each delete-free entry is a compact `[path, size]`
+    /// 2-tuple; an entry carrying positional-delete refs is a `[path, size,
+    /// deletes]` 3-tuple (see [`FileEntry`]). Paired with `files_from_json`.
+    pub fn files_json(files: &[FileEntry]) -> String {
         serde_json::to_string(files).expect("files list serialization is infallible")
     }
 
     /// Deserialize a per-shard files list from the UDF's second argument.
     ///
-    /// Returns an error that does NOT include the raw input.
-    pub fn files_from_json(s: &str) -> Result<Vec<(String, u64)>, String> {
+    /// Accepts both the legacy `[path, size]` wire form (reconstituted with an
+    /// empty delete list) and the current `[path, size, deletes]` form — see
+    /// [`FileEntry`]. Returns an error that does NOT include the raw input.
+    pub fn files_from_json(s: &str) -> Result<Vec<FileEntry>, String> {
         serde_json::from_str(s).map_err(|e| {
             // Do not echo `s`. A data error (e.g. a bare-string entry where a
             // [path, size] tuple is expected) can quote the input in `e`'s Display,
@@ -664,8 +814,8 @@ mod tests {
         ScanSpec {
             table_root: "s3://warehouse/db/table".into(),
             files: vec![
-                ("data/part-00000.parquet".into(), 1024),
-                ("data/part-00001.parquet".into(), 2048),
+                FileEntry::new("data/part-00000.parquet", 1024),
+                FileEntry::new("data/part-00001.parquet", 2048),
             ],
             projection: vec!["id".into(), "name".into()],
             filter: Some("(\"ID\" > 10)".into()),
@@ -719,8 +869,8 @@ mod tests {
         assert_eq!(
             back.files,
             vec![
-                ("data/part-00000.parquet".to_string(), 1024),
-                ("data/part-00001.parquet".to_string(), 2048),
+                FileEntry::new("data/part-00000.parquet", 1024),
+                FileEntry::new("data/part-00001.parquet", 2048),
             ]
         );
         assert_eq!(back.table_root, "s3://warehouse/db/table");
@@ -1439,8 +1589,8 @@ mod tests {
         assert_eq!(
             reconstituted.files,
             vec![
-                ("data/part-00000.parquet".to_string(), 1024),
-                ("data/part-00001.parquet".to_string(), 2048),
+                FileEntry::new("data/part-00000.parquet", 1024),
+                FileEntry::new("data/part-00001.parquet", 2048),
             ]
         );
 
@@ -1532,7 +1682,7 @@ mod tests {
             legacy.table_root, "",
             "missing table_root must default to empty (backward-compat; paths are absolute)"
         );
-        assert_eq!(legacy.files, vec![("s3://w/f0.parquet".to_string(), 100)]);
+        assert_eq!(legacy.files, vec![FileEntry::new("s3://w/f0.parquet", 100)]);
 
         // Same for the common blob in isolation.
         let legacy_common_json = r#"{
@@ -1551,8 +1701,10 @@ mod tests {
         );
 
         // from_parts reattaches the empty table_root onto the reconstituted spec.
-        let reconstituted =
-            ScanSpec::from_parts(legacy_common, vec![("s3://w/f0.parquet".to_string(), 100)]);
+        let reconstituted = ScanSpec::from_parts(
+            legacy_common,
+            vec![FileEntry::new("s3://w/f0.parquet", 100)],
+        );
         assert_eq!(reconstituted.table_root, "");
     }
 
@@ -1569,6 +1721,96 @@ mod tests {
             !spec.to_common_json().contains("catalog"),
             "common blob JSON must not contain a catalog key: {}",
             spec.to_common_json()
+        );
+    }
+
+    /// Task 1.1: a legacy `[path, size]` per-shard file entry (every entry ever
+    /// written before positional-delete support) still deserializes — as a
+    /// [`FileEntry`] whose `deletes` list is empty — inside a full `ScanSpec`
+    /// payload, inside the isolated `files_from_json` helper, and as the
+    /// compact wire form a delete-free [`FileEntry`] serializes back to.
+    #[test]
+    fn legacy_file_entry_reconstitutes_empty_deletes() {
+        // A whole legacy ScanSpec payload whose `files` array uses the
+        // pre-existing bare `[path, size]` 2-tuple wire form.
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100], ["s3://w/f1.parquet", 200]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert_eq!(legacy.files.len(), 2);
+        for entry in &legacy.files {
+            assert!(
+                entry.deletes.is_empty(),
+                "legacy [path, size] entry must reconstitute with an empty delete list: {entry:?}"
+            );
+        }
+        assert_eq!(legacy.files[0].path, "s3://w/f0.parquet");
+        assert_eq!(legacy.files[0].size, 100);
+        assert_eq!(legacy.files[1].path, "s3://w/f1.parquet");
+        assert_eq!(legacy.files[1].size, 200);
+        assert_eq!(
+            legacy.files,
+            vec![
+                FileEntry::new("s3://w/f0.parquet", 100),
+                FileEntry::new("s3://w/f1.parquet", 200),
+            ]
+        );
+
+        // The same legacy 2-tuple form deserializes through the isolated
+        // per-shard `files_from_json` helper the UDF boundary actually uses.
+        let files_only_json = r#"[["s3://w/f0.parquet", 100], ["s3://w/f1.parquet", 200]]"#;
+        let files = ScanSpec::files_from_json(files_only_json).unwrap();
+        assert_eq!(
+            files,
+            vec![
+                FileEntry::new("s3://w/f0.parquet", 100),
+                FileEntry::new("s3://w/f1.parquet", 200),
+            ]
+        );
+        assert!(files.iter().all(|f| f.deletes.is_empty()));
+
+        // A delete-free FileEntry serializes back to the SAME compact 2-tuple
+        // form (not a 3-tuple with a trailing empty array) — the wire stays
+        // minimal for the still-common delete-free case.
+        let round_tripped = ScanSpec::files_json(&files);
+        assert_eq!(
+            round_tripped,
+            files_only_json.replace(' ', ""),
+            "delete-free entries must round-trip to the compact [path,size] form: {round_tripped}"
+        );
+
+        // A FileEntry carrying positional-delete refs serializes as a 3-tuple
+        // and deserializes back with the delete refs intact.
+        let with_deletes = FileEntry::with_deletes(
+            "s3://w/f2.parquet",
+            300,
+            vec![DeleteFileRef {
+                path: "s3://w/deletes/d0.parquet".to_string(),
+                size: 50,
+                content_type: DeleteFileContentType::PositionDeletes,
+            }],
+        );
+        let mixed_json = ScanSpec::files_json(&[
+            FileEntry::new("s3://w/f0.parquet", 100),
+            with_deletes.clone(),
+        ]);
+        assert!(
+            mixed_json.contains("s3://w/deletes/d0.parquet"),
+            "delete-carrying entry must serialize its delete file path: {mixed_json}"
+        );
+        let mixed_back = ScanSpec::files_from_json(&mixed_json).unwrap();
+        assert_eq!(mixed_back[0].deletes, Vec::new());
+        assert_eq!(mixed_back[1], with_deletes);
+        assert_eq!(
+            mixed_back[1].deletes[0].content_type,
+            DeleteFileContentType::PositionDeletes
         );
     }
 }

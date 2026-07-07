@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2978,6 +2978,7 @@ dependencies = [
  "parquet",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "roaring",
  "rsa",
  "serde",
  "serde_json",
