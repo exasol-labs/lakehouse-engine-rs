@@ -65,7 +65,7 @@ export LH_REST_PORT
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 test-e2e: cross-musl-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_deletion_vectors_test -- --test-threads=1
 
 # Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
 #

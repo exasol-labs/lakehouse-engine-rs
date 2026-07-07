@@ -4,9 +4,11 @@
 /// SessionContext, registers ONLY the assigned files over MinIO, applies
 /// projection/filter/limit, and streams rows back via ctx.emit.
 pub mod convert;
+pub mod deletion_vectors;
 pub mod diagnostics;
 pub mod emit;
 pub mod positional_deletes;
+pub mod puffin;
 pub mod runtime;
 pub mod spec;
 

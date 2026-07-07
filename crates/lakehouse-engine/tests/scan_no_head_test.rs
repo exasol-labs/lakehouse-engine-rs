@@ -39,9 +39,7 @@ use exasol_udf_sdk::value::Value;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
-};
+use lakehouse_engine::scan::spec::{FileEntry, ResolvedDelete, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
@@ -636,7 +634,7 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
 
 /// Scenario (file-metadata): a delete-carrying scan issues NO object-store HEAD
 /// for its associated positional-delete file — the delete file's `ObjectMeta`
-/// is built directly from the spec-supplied size (`DeleteFileRef::size`), the
+/// is built directly from the spec-supplied size (`ResolvedDelete::size`), the
 /// same no-HEAD mechanism `FileEntry::size` already gives data files.
 #[test]
 fn scan_issues_no_head_for_delete_files() {
@@ -654,11 +652,7 @@ fn scan_issues_no_head_for_delete_files() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         data_size,
-        vec![DeleteFileRef {
-            path: delete_url.clone(),
-            size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
-        }],
+        vec![ResolvedDelete::position(delete_url.clone(), delete_size)],
     );
     let spec = raw_spec(vec![], String::new());
     let mut spec = spec;
@@ -721,11 +715,7 @@ fn scan_reads_footer_via_range_get_once() {
     let delta_entry = FileEntry::with_deletes(
         delta_url.clone(),
         delta_size,
-        vec![DeleteFileRef {
-            path: delete_url.clone(),
-            size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
-        }],
+        vec![ResolvedDelete::position(delete_url.clone(), delete_size)],
     );
 
     let mut baseline_spec = raw_spec(vec![], String::new());

@@ -22,7 +22,7 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageProps};
+use crate::scan::spec::{DeleteFormat, DeleteType, FileEntry, ResolvedDelete, StorageProps};
 use crate::scan::{FieldIdExprAdapterFactory, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
@@ -192,12 +192,7 @@ pub(crate) fn build_deletes_row_selection(
     results.into()
 }
 
-/// Redact any credential fragments from an error string before surfacing it.
-fn redact(msg: String, secrets: &[String]) -> String {
-    let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    let stripped = crate::scan::emit::redact_secret_values(&msg, &borrowed);
-    crate::scan::emit::redact_credentials(&stripped)
-}
+use crate::scan::emit::redact;
 
 /// The object-store [`ObjectMeta`] for an absolute file URI and its known byte
 /// size, keyed by the same `Path` the store observes — built without any
@@ -214,25 +209,31 @@ fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     })
 }
 
-/// Read-time backstop (task 2.6): reject any assigned delete file this engine
-/// cannot apply as a Parquet positional delete, with a clean,
-/// credential-redacted error, BEFORE any row of the affected data file is
-/// emitted. The plan-time gate (adapter) is the authoritative filter; this is
-/// cheap defense-in-depth against a non-positional delete slipping through.
-fn ensure_positional_delete(delete: &DeleteFileRef, secrets: &[String]) -> Result<(), UdfError> {
-    if delete.content_type == DeleteFileContentType::PositionDeletes {
-        return Ok(());
+/// Read-time backstop: reject any assigned delete file this engine cannot apply,
+/// with a clean, credential-redacted error, BEFORE any row of the affected data
+/// file is emitted. The plan-time gate (adapter) is the authoritative filter;
+/// this is cheap defense-in-depth against an unapplicable delete slipping through.
+///
+/// Accepts the two mechanisms this engine applies on read: a Parquet positional
+/// delete (`POS_DEL`/`PARQUET`) and a v3 deletion vector (`DV`/`PUFFIN`, applied
+/// by [`crate::scan::puffin`]). Every other combination — equality deletes, ORC or
+/// Avro delete files — is rejected.
+fn ensure_applicable_delete(delete: &ResolvedDelete, secrets: &[String]) -> Result<(), UdfError> {
+    match (delete.delete_type, delete.format) {
+        (DeleteType::PosDel, DeleteFormat::Parquet) => return Ok(()),
+        (DeleteType::Dv, DeleteFormat::Puffin) => return Ok(()),
+        _ => {}
     }
-    let mechanism = match delete.content_type {
-        DeleteFileContentType::PositionDeletes => unreachable!(),
-        DeleteFileContentType::EqualityDeletes => "an Iceberg equality delete",
-        DeleteFileContentType::PuffinDeletionVector => "a Puffin deletion vector",
+    let mechanism = match delete.delete_type {
+        DeleteType::EqDel => "an Iceberg equality delete".to_string(),
+        DeleteType::PosDel => format!("a {:?}-format positional delete", delete.format),
+        DeleteType::Dv => format!("a {:?}-format deletion vector", delete.format),
     };
     let path = redact(delete.path.clone(), secrets);
     Err(UdfError::User(format!(
         "assigned delete file '{path}' is {mechanism}, which this engine cannot apply on read \
-         (only Parquet positional deletes are supported); refusing to emit rows for the affected \
-         data file"
+         (only Parquet positional deletes and v3 Puffin deletion vectors are supported); refusing \
+         to emit rows for the affected data file"
     )))
 }
 
@@ -384,6 +385,7 @@ fn build_access_plan(
 /// access-plan construction here and the scan. Never issues an object-store HEAD.
 ///
 /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
+#[allow(clippy::too_many_arguments)]
 async fn access_plan_for_data_file(
     entry: &FileEntry,
     data_file_abs: &str,
@@ -391,21 +393,59 @@ async fn access_plan_for_data_file(
     store: Arc<dyn ObjectStore>,
     metadata_cache: Arc<dyn datafusion::execution::cache::cache_manager::FileMetadataCache>,
     table_root: &str,
+    puffin_readers: &mut crate::scan::puffin::PuffinReaders,
     secrets: &[String],
 ) -> Result<Option<ParquetAccessPlan>, UdfError> {
+    // Union every associated delete mechanism into ONE per-data-file position set,
+    // dispatched per delete ref: a Parquet positional delete goes through
+    // `union_delete_positions`; a v3 deletion vector is decoded from its Puffin
+    // blob. A DV-derived selection is indistinguishable downstream from a
+    // positional-delete-derived one, so both feed the same `build_access_plan`.
     let mut deletes = RoaringTreemap::new();
     for delete in &entry.deletes {
-        ensure_positional_delete(delete, secrets)?;
+        ensure_applicable_delete(delete, secrets)?;
         let delete_abs = reconstruct_abs_uri(&delete.path, table_root);
-        let delete_meta = object_meta_for(&delete_abs, delete.size)?;
-        union_delete_positions(
-            Arc::clone(&store),
-            delete_meta,
-            data_file_abs,
-            &mut deletes,
-            secrets,
-        )
-        .await?;
+        match delete.delete_type {
+            DeleteType::PosDel => {
+                let delete_meta = object_meta_for(&delete_abs, delete.size)?;
+                union_delete_positions(
+                    Arc::clone(&store),
+                    delete_meta,
+                    data_file_abs,
+                    &mut deletes,
+                    secrets,
+                )
+                .await?;
+            }
+            DeleteType::Dv => {
+                // Blob coordinates were resolved once at plan time; the scan MUST
+                // NOT re-derive them. `ensure_applicable_delete` already proved the
+                // format is Puffin.
+                let (offset, length) = match (delete.offset, delete.length) {
+                    (Some(o), Some(l)) => (o, l),
+                    _ => {
+                        return Err(UdfError::User(format!(
+                            "deletion-vector reference for '{}' is missing its blob offset/length",
+                            redact(data_file_abs.to_string(), secrets)
+                        )));
+                    }
+                };
+                puffin_readers
+                    .union_deletion_vector_positions(
+                        &delete_abs,
+                        offset,
+                        length,
+                        data_file_abs,
+                        &mut deletes,
+                        secrets,
+                    )
+                    .await?;
+            }
+            DeleteType::EqDel => {
+                // Rejected above by `ensure_applicable_delete`.
+                unreachable!("equality deletes are rejected by ensure_applicable_delete");
+            }
+        }
     }
 
     if deletes.is_empty() {
@@ -458,6 +498,7 @@ pub(crate) struct PositionalDeleteScanTable {
     use_field_id_adapter: bool,
     files: Vec<FileEntry>,
     table_root: String,
+    storage: StorageProps,
     secrets: Vec<String>,
     format: Arc<ParquetFormat>,
 }
@@ -487,6 +528,7 @@ impl PositionalDeleteScanTable {
             use_field_id_adapter,
             files,
             table_root,
+            storage: storage.clone(),
             secrets,
             format: Arc::new(ParquetFormat::default()),
         }
@@ -509,6 +551,10 @@ impl PositionalDeleteScanTable {
             })?;
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
 
+        // One Puffin-container cache per shard: a container shared by many data
+        // files (decision [8]) is opened and footer-parsed ONCE, not per file.
+        let mut puffin_readers = crate::scan::puffin::PuffinReaders::new(self.storage.clone());
+
         let mut files = Vec::with_capacity(self.files.len());
         for entry in &self.files {
             let abs = reconstruct_abs_uri(&entry.path, &self.table_root);
@@ -523,6 +569,7 @@ impl PositionalDeleteScanTable {
                     Arc::clone(&store),
                     Arc::clone(&metadata_cache),
                     &self.table_root,
+                    &mut puffin_readers,
                     &self.secrets,
                 )
                 .await?
@@ -850,16 +897,20 @@ mod tests {
         assert_eq!(deletes.iter().collect::<Vec<u64>>(), vec![3, 7, 9]);
     }
 
-    /// Task 2.6: the read-time backstop rejects a non-positional delete file with
-    /// a clean error that names the mechanism and does not leak credentials.
+    /// Task 2.D.1: the read-time backstop rejects an equality delete (naming the
+    /// mechanism, leaking no credentials) while ACCEPTING both a Parquet positional
+    /// delete and a v3 Puffin deletion vector.
     #[test]
-    fn backstop_rejects_equality_delete() {
-        let delete = DeleteFileRef {
+    fn backstop_rejects_equality_not_dv() {
+        let equality = ResolvedDelete {
             path: "s3://bucket/db/t/data/eq-delete.parquet".to_string(),
             size: 10,
-            content_type: DeleteFileContentType::EqualityDeletes,
+            delete_type: DeleteType::EqDel,
+            format: DeleteFormat::Parquet,
+            offset: None,
+            length: None,
         };
-        let err = ensure_positional_delete(&delete, &["SECRETKEY".to_string()])
+        let err = ensure_applicable_delete(&equality, &["SECRETKEY".to_string()])
             .unwrap_err()
             .to_string();
         assert!(
@@ -871,11 +922,23 @@ mod tests {
             "must not leak credentials: {err}"
         );
 
-        let ok = DeleteFileRef {
-            path: "s3://bucket/db/t/data/pos-delete.parquet".to_string(),
+        // A Parquet positional delete is accepted.
+        let pos = ResolvedDelete::position("s3://bucket/db/t/data/pos-delete.parquet", 10);
+        assert!(ensure_applicable_delete(&pos, &[]).is_ok());
+
+        // A v3 Puffin deletion vector is accepted (no longer rejected).
+        let dv = ResolvedDelete::deletion_vector("s3://bucket/db/t/data/dv.puffin", 4096, 4, 33);
+        assert!(ensure_applicable_delete(&dv, &[]).is_ok());
+
+        // An ORC positional delete is still rejected.
+        let orc = ResolvedDelete {
+            path: "s3://bucket/db/t/data/pos.orc".to_string(),
             size: 10,
-            content_type: DeleteFileContentType::PositionDeletes,
+            delete_type: DeleteType::PosDel,
+            format: DeleteFormat::Orc,
+            offset: None,
+            length: None,
         };
-        assert!(ensure_positional_delete(&ok, &[]).is_ok());
+        assert!(ensure_applicable_delete(&orc, &[]).is_err());
     }
 }

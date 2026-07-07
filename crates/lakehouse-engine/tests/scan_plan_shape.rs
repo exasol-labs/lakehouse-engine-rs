@@ -21,8 +21,8 @@ use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{build_scan_driving_sql, detect_aggregates};
 use lakehouse_engine::scan::spec::{
-    AggKind, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ProjectionItem,
-    ScanSpec, SortKey, StorageProps,
+    AggKind, FileEntry, JoinSpec, JoinType, ProjectionItem, ResolvedDelete, ScanSpec, SortKey,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -741,11 +741,10 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
     spec.files = vec![FileEntry::with_deletes(
         data_url.clone(),
         local_size(&data_url),
-        vec![DeleteFileRef {
-            path: delete_url.clone(),
-            size: local_size(&delete_url),
-            content_type: DeleteFileContentType::PositionDeletes,
-        }],
+        vec![ResolvedDelete::position(
+            delete_url.clone(),
+            local_size(&delete_url),
+        )],
     )];
     // Predicate keeps only ids 200..=399 → row groups 2 and 3; prunes the other
     // eight tight, disjoint row groups.

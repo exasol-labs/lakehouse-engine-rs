@@ -1,8 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry,
-    JoinSpec, JoinType, LogicalField, ProjectionItem, ScanSpec, SortKey, StorageProps,
-    render_order_by_clause,
+    AggKind, AggregatePlan, CatalogProps, FileEntry, JoinSpec, JoinType, LogicalField,
+    ProjectionItem, ResolvedDelete, ScanSpec, SortKey, StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -16,7 +15,7 @@ use iceberg_catalog_rest::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde_json::Value as Json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 /// Pushdown planning: resolve the Iceberg file list ONCE and build the
 /// scan-driving SQL that invokes the LAKEHOUSE_SCAN SET UDF.
@@ -2498,14 +2497,34 @@ pub async fn resolve_file_list(
     // Extract the logical schema before `plan_files_from_table` consumes `table`.
     let logical_schema = build_logical_schema(table.metadata().current_schema());
 
-    // AUTHORITATIVE correctness gate: fail loud at the manifest/`DataFile` level on
-    // any delete/data mechanism this engine cannot apply (equality delete, Puffin/v3
-    // deletion vector, ORC/Avro data or delete file) BEFORE building any
-    // scan-driving SQL. This must run before `plan_files_from_table` so the deletes
-    // it associates are guaranteed to be applicable Parquet positional deletes.
-    ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
+    // AUTHORITATIVE correctness gate + deletion-vector producer: fail loud at the
+    // manifest/`DataFile` level on any delete/data mechanism this engine cannot
+    // apply (equality delete, ORC/Avro data or delete file) BEFORE building any
+    // scan-driving SQL, and collect the v3 deletion-vector references (the only
+    // place the DV discriminator and coordinates survive). This must run before
+    // `plan_files_from_table` so the positional deletes it associates are
+    // guaranteed to be applicable Parquet positional deletes.
+    let (dv_refs, all_data_files) =
+        gate_and_collect_deletion_vectors(&table, &catalog_props.table).await?;
 
-    let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
+    // The Puffin DV containers the manifest walk collected. iceberg-rust 0.10 ALSO
+    // surfaces these in `FileScanTask.deletes`, so exclude them from the positional
+    // refs `plan_files_from_table` produces (they are attached as DV refs below).
+    // Built before `dv_refs` is moved into `attach_deletion_vectors`.
+    let dv_container_paths: HashSet<String> =
+        dv_refs.iter().map(|dv| dv.puffin_path.clone()).collect();
+
+    let mut files = plan_files_from_table(
+        table,
+        &catalog_props.table,
+        filter_json,
+        &dv_container_paths,
+    )
+    .await?;
+    // Union the manifest-sourced deletion vectors onto their referenced data files'
+    // entries, alongside any Parquet positional deletes `plan_files` surfaced;
+    // fail loud on a DV that matches no snapshot data file.
+    attach_deletion_vectors(&mut files, dv_refs, &all_data_files, &catalog_props.table)?;
     Ok((files, effective_storage, logical_schema, table_root))
 }
 
@@ -2520,8 +2539,6 @@ pub async fn resolve_file_list(
 enum UnsupportedDeleteMechanism {
     /// Iceberg equality deletes (`DataContentType::EqualityDeletes`).
     EqualityDelete,
-    /// Iceberg v3 Puffin deletion vector (position delete stored as a Puffin blob).
-    DeletionVector,
     /// An ORC data file (`DataFileFormat::Orc`).
     OrcDataFile,
     /// An Avro data file (`DataFileFormat::Avro`).
@@ -2540,7 +2557,6 @@ impl UnsupportedDeleteMechanism {
     fn describe(self) -> &'static str {
         match self {
             UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
-            UnsupportedDeleteMechanism::DeletionVector => "Iceberg v3 Puffin deletion vectors",
             UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
             UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
             UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
@@ -2555,10 +2571,12 @@ impl UnsupportedDeleteMechanism {
 /// are still visible — `plan_files` drops them, so a deletion vector would be
 /// indistinguishable from a Parquet positional delete at read time).
 ///
-/// Returns `Ok(())` ONLY for the two mechanisms this engine can apply correctly:
-/// a Parquet DATA file and a Parquet POSITION-DELETE file. Every other
-/// (content, format) combination returns the specific unsupported mechanism so
-/// the caller can fail loud before building any scan-driving SQL.
+/// Returns `Ok(())` for the mechanisms this engine can apply correctly: a Parquet
+/// DATA file, a Parquet POSITION-DELETE file, and a Puffin POSITION-DELETE file (a
+/// v3 deletion vector, applied on read — see
+/// `datafusion-scan/scan-execution-deletion-vectors`). Every other (content,
+/// format) combination returns the specific unsupported mechanism so the caller
+/// can fail loud before building any scan-driving SQL.
 fn classify_manifest_file(
     content: iceberg::spec::DataContentType,
     format: iceberg::spec::DataFileFormat,
@@ -2575,8 +2593,9 @@ fn classify_manifest_file(
         },
         PositionDeletes => match format {
             Parquet => Ok(()),
-            // A position delete stored as a Puffin blob IS a v3 deletion vector.
-            Puffin => Err(U::DeletionVector),
+            // A position delete stored as a Puffin blob is a v3 deletion vector,
+            // which this engine now applies on read (decoded scan-side).
+            Puffin => Ok(()),
             Orc => Err(U::OrcDeleteFile),
             Avro => Err(U::AvroDeleteFile),
         },
@@ -2592,16 +2611,39 @@ fn classify_manifest_file(
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
-         cannot apply on read (only Parquet positional deletes are supported); \
-         Exasol will retry the query natively",
+         cannot apply on read (only Parquet positional deletes and v3 Puffin deletion \
+         vectors are supported); Exasol will retry the query natively",
         table_name,
         mechanism.describe(),
     );
     UdfError::User(redact_catalog_error(&msg))
 }
 
+/// One v3 deletion-vector reference sourced from the manifest / `DataFile` walk.
+///
+/// `plan_files`/`FileScanTask.deletes` does not surface deletion-vector files, so
+/// the manifest walk is the ONLY place the DV discriminator and its Puffin
+/// coordinates survive. `referenced_data_file` is used solely to attach the DV to
+/// its data file's entry — it is NOT serialized onto the wire (the association is
+/// structural on the data file's `deletes` list, and the decoder cross-checks it
+/// from the Puffin `BlobMetadata` at read time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeletionVectorRef {
+    /// Absolute path of the data file this deletion vector applies to.
+    referenced_data_file: String,
+    /// Absolute path of the Puffin container holding the DV blob.
+    puffin_path: String,
+    /// Byte size of the Puffin container.
+    puffin_size: u64,
+    /// Byte offset of the DV blob within the Puffin container.
+    offset: u64,
+    /// Byte length of the DV blob within the Puffin container.
+    length: u64,
+}
+
 /// Fail loud at plan time if the table's current snapshot uses ANY delete/data
-/// mechanism this engine cannot apply, detected at the manifest/`DataFile` level.
+/// mechanism this engine cannot apply, AND collect the v3 deletion-vector
+/// references, both detected at the manifest/`DataFile` level.
 ///
 /// This is the AUTHORITATIVE correctness gate (invalid results must never be
 /// returned). It enumerates the current snapshot's manifest list, loads each
@@ -2611,14 +2653,27 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 /// path and drops the Puffin discriminator and file format needed to tell a
 /// Parquet positional delete from a deletion vector.
 ///
-/// A table with no current snapshot (empty table) trivially passes.
-async fn ensure_supported_delete_mechanisms(
+/// For each alive Puffin position-delete `DataFile` (a v3 deletion vector) it also
+/// reads `referenced_data_file()`, `content_offset()`, and
+/// `content_size_in_bytes()` and returns them as a [`DeletionVectorRef`] so the
+/// caller can attach the DV to its data file's per-shard entry. A malformed DV
+/// entry (missing referenced-data-file or blob coordinates, or negative
+/// coordinates) fails loud.
+///
+/// Also returns the set of ALL data-file paths in the current snapshot (every
+/// alive `Data`-content `DataFile`, pre-pruning), so the caller can tell a DV
+/// whose referenced data file was PRUNED from the resolved list (safe to skip)
+/// apart from one that matches NO snapshot data file (a path-form mismatch that
+/// must fail loud rather than silently return pre-delete rows).
+///
+/// A table with no current snapshot (empty table) trivially passes with no DV refs.
+async fn gate_and_collect_deletion_vectors(
     table: &iceberg::table::Table,
     table_name: &str,
-) -> Result<(), UdfError> {
+) -> Result<(Vec<DeletionVectorRef>, HashSet<String>), UdfError> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(());
+        return Ok((Vec::new(), HashSet::new()));
     };
     let file_io = table.file_io();
 
@@ -2653,6 +2708,8 @@ async fn ensure_supported_delete_mechanisms(
         ))
     })?;
 
+    let mut dv_refs = Vec::new();
+    let mut all_data_files = HashSet::new();
     for manifest_file in manifest_list.entries() {
         let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
             UdfError::User(format!(
@@ -2670,9 +2727,109 @@ async fn ensure_supported_delete_mechanisms(
             let data_file = entry.data_file();
             classify_manifest_file(data_file.content_type(), data_file.file_format())
                 .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
+
+            // Record every data file's path so the caller can distinguish a pruned
+            // DV target (safe to skip) from an unmatched one (fail loud).
+            if data_file.content_type() == iceberg::spec::DataContentType::Data {
+                all_data_files.insert(data_file.file_path().to_string());
+            }
+
+            // A Puffin position-delete DataFile is a v3 deletion vector: extract its
+            // Puffin coordinates so the caller can attach it to the referenced data
+            // file's per-shard entry.
+            if data_file.content_type() == iceberg::spec::DataContentType::PositionDeletes
+                && data_file.file_format() == iceberg::spec::DataFileFormat::Puffin
+            {
+                dv_refs.push(extract_deletion_vector_ref(data_file, table_name)?);
+            }
         }
     }
 
+    Ok((dv_refs, all_data_files))
+}
+
+/// Extract a [`DeletionVectorRef`] from a Puffin position-delete `DataFile`.
+///
+/// Fails loud (clean, credential-free error) if the manifest entry is missing the
+/// referenced-data-file or the blob's offset/length, or carries negative
+/// coordinates — a malformed DV entry we refuse to silently misapply.
+fn extract_deletion_vector_ref(
+    data_file: &iceberg::spec::DataFile,
+    table_name: &str,
+) -> Result<DeletionVectorRef, UdfError> {
+    let malformed = |what: &str| {
+        UdfError::User(format!(
+            "table '{table_name}' has a malformed v3 deletion-vector manifest entry ({what})"
+        ))
+    };
+    let referenced_data_file = data_file
+        .referenced_data_file()
+        .ok_or_else(|| malformed("no referenced_data_file"))?;
+    let offset = data_file
+        .content_offset()
+        .ok_or_else(|| malformed("no content_offset"))?;
+    let length = data_file
+        .content_size_in_bytes()
+        .ok_or_else(|| malformed("no content_size_in_bytes"))?;
+    if offset < 0 || length < 0 {
+        return Err(malformed("negative blob offset or length"));
+    }
+    Ok(DeletionVectorRef {
+        referenced_data_file,
+        puffin_path: data_file.file_path().to_string(),
+        puffin_size: data_file.file_size_in_bytes(),
+        offset: offset as u64,
+        length: length as u64,
+    })
+}
+
+/// Attach each collected [`DeletionVectorRef`] to its referenced data file's
+/// entry as a `df`-indexed deletion-vector delete, unioned with any positional
+/// deletes already present.
+///
+/// A DV whose referenced data file is absent from the resolved list is handled by
+/// the pre-pruning `all_data_files` set:
+/// - present in `all_data_files` but absent from `files` ⇒ the data file was
+///   PRUNED by the Iceberg predicate; it is not scanned, so skip the DV silently;
+/// - absent from `all_data_files` too ⇒ the DV references a data file that matches
+///   NO snapshot data file (e.g. an `s3://` vs `s3a://`/normalization path-form
+///   mismatch). Attaching nothing here would silently return pre-delete rows —
+///   the exact silent-correctness failure this line exists to close — so FAIL
+///   LOUD instead.
+fn attach_deletion_vectors(
+    files: &mut [FileEntry],
+    dv_refs: Vec<DeletionVectorRef>,
+    all_data_files: &HashSet<String>,
+    table_name: &str,
+) -> Result<(), UdfError> {
+    if dv_refs.is_empty() {
+        return Ok(());
+    }
+    let index: HashMap<String, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.path.clone(), i))
+        .collect();
+    for dv in dv_refs {
+        if let Some(&i) = index.get(dv.referenced_data_file.as_str()) {
+            files[i].deletes.push(ResolvedDelete::deletion_vector(
+                dv.puffin_path,
+                dv.puffin_size,
+                dv.offset,
+                dv.length,
+            ));
+        } else if all_data_files.contains(&dv.referenced_data_file) {
+            // Pruned from the resolved list — the data file is not scanned.
+            continue;
+        } else {
+            return Err(UdfError::User(redact_catalog_error(&format!(
+                "table '{table_name}': a v3 deletion vector references data file '{}', which \
+                 matches no data file in the current snapshot (possible object-store path-form \
+                 mismatch); refusing to run the query and risk returning pre-delete rows",
+                dv.referenced_data_file
+            ))));
+        }
+    }
     Ok(())
 }
 
@@ -2681,29 +2838,35 @@ async fn ensure_supported_delete_mechanisms(
 /// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
 /// `plan_files` so manifests and files that cannot match are skipped. DataFusion
 /// remains the row-level correctness backstop; this is pruning-only.
-/// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
+/// Map a data file's `FileScanTask` delete entries (as `(path, size)` pairs) to
+/// positional-delete [`ResolvedDelete`]s, EXCLUDING any whose path is a v3
+/// deletion-vector Puffin container.
 ///
-/// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
-/// ([`ensure_supported_delete_mechanisms`]) has already rejected any table that
-/// uses equality deletes or Puffin deletion vectors, so every `PositionDeletes`
-/// task delete is guaranteed to be a Parquet positional delete. The other arms
-/// are mapped honestly for defense-in-depth: they can only be produced if a
-/// mechanism somehow slips past the gate, and the scan reader's read-time backstop
-/// then rejects them cleanly. `Data` never appears in a task's delete list; it is
-/// mapped to a non-positional sentinel so it is likewise rejected rather than
-/// silently applied.
-fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileContentType {
-    match t {
-        iceberg::spec::DataContentType::PositionDeletes => DeleteFileContentType::PositionDeletes,
-        iceberg::spec::DataContentType::EqualityDeletes => DeleteFileContentType::EqualityDeletes,
-        iceberg::spec::DataContentType::Data => DeleteFileContentType::EqualityDeletes,
-    }
+/// Empirically, iceberg-rust 0.10's `plan_files` DOES surface a v3 Puffin
+/// deletion-vector file in `FileScanTask.deletes` (as `file_type ==
+/// PositionDeletes`, with NO file-format discriminator on
+/// `FileScanTaskDeleteFile`), so a Puffin DV container would otherwise be mapped
+/// to a bogus Parquet-typed POS_DEL ref and later fail parsing its footer as
+/// Parquet. Those containers are the DV refs the manifest walk already collected
+/// (`gate_and_collect_deletion_vectors` → `attach_deletion_vectors`), so they are
+/// excluded here by exact absolute path (paths are absolute on both sides at this
+/// point; relativization runs later). The manifest walk is authoritative for DVs.
+fn positional_delete_refs(
+    deletes: &[(String, u64)],
+    dv_container_paths: &HashSet<String>,
+) -> Vec<ResolvedDelete> {
+    deletes
+        .iter()
+        .filter(|(path, _)| !dv_container_paths.contains(path))
+        .map(|(path, size)| ResolvedDelete::position(path.clone(), *size))
+        .collect()
 }
 
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
     filter_json: Option<&Json>,
+    dv_container_paths: &HashSet<String>,
 ) -> Result<Vec<FileEntry>, UdfError> {
     let mut scan_builder = table.scan();
     if let Some(fj) = filter_json {
@@ -2733,22 +2896,26 @@ async fn plan_files_from_table(
     })?;
 
     // Associate each data file's Parquet positional-delete files into its entry.
-    // The plan-time fail-loud gate (`ensure_supported_delete_mechanisms`) has
-    // already run, so any `.deletes` present here are applicable Parquet
+    // The plan-time fail-loud gate (`gate_and_collect_deletion_vectors`) has
+    // already run, so any Parquet `.deletes` present here are applicable Parquet
     // positional deletes. Absolute delete paths are relativized later, in
     // `relativize_shards_to_root`, EXACTLY like the data-file path.
+    //
+    // IMPORTANT: iceberg-rust 0.10 ALSO surfaces a v3 Puffin deletion-vector file
+    // in `FileScanTask.deletes` (verified against a real Spark format-version=3
+    // fixture). Those are handled as DV refs by the manifest walk, so they MUST be
+    // excluded from the positional refs here (otherwise a Puffin container is
+    // mistyped as a Parquet POS_DEL and its footer fails to parse). The manifest
+    // walk is authoritative for DVs; `positional_delete_refs` drops them by path.
     Ok(tasks
         .into_iter()
         .map(|t| {
-            let deletes: Vec<DeleteFileRef> = t
+            let delete_pairs: Vec<(String, u64)> = t
                 .deletes
                 .iter()
-                .map(|d| DeleteFileRef {
-                    path: d.file_path.clone(),
-                    size: d.file_size_in_bytes,
-                    content_type: map_delete_content_type(d.file_type),
-                })
+                .map(|d| (d.file_path.clone(), d.file_size_in_bytes))
                 .collect();
+            let deletes = positional_delete_refs(&delete_pairs, dv_container_paths);
             FileEntry::with_deletes(
                 t.data_file_path().to_string(),
                 t.file_size_in_bytes,
@@ -5164,16 +5331,38 @@ mod tests {
         }
     }
 
-    /// A position delete stored as a Puffin blob is a v3 deletion vector — the
-    /// exact case indistinguishable from a Parquet positional delete once
-    /// `plan_files` has dropped the format discriminator, so it MUST be caught at
-    /// the manifest level.
+    /// A position delete stored as a Puffin blob is a v3 deletion vector, which
+    /// this engine now applies on read — so it is ACCEPTED at the manifest gate
+    /// (equality/ORC/Avro remain rejected). Named per the plan's coverage table.
     #[test]
-    fn classify_rejects_puffin_deletion_vector() {
+    fn classify_rejects_equality_orc_avro_accepts_dv() {
+        // DV (Puffin position delete) is accepted.
+        assert!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Puffin)
+                .is_ok(),
+            "Puffin position delete (deletion vector) must be accepted"
+        );
+        // Equality deletes still rejected regardless of format.
+        for fmt in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+            DataFileFormat::Puffin,
+        ] {
+            assert_eq!(
+                classify_manifest_file(DataContentType::EqualityDeletes, fmt),
+                Err(UnsupportedDeleteMechanism::EqualityDelete),
+                "equality delete ({fmt:?}) must fail loud"
+            );
+        }
+        // ORC/Avro data and delete files still rejected.
         assert_eq!(
-            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Puffin),
-            Err(UnsupportedDeleteMechanism::DeletionVector),
-            "Puffin position delete (deletion vector) must fail loud"
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Orc),
+            Err(UnsupportedDeleteMechanism::OrcDataFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Avro),
+            Err(UnsupportedDeleteMechanism::AvroDeleteFile),
         );
     }
 
@@ -5203,19 +5392,19 @@ mod tests {
     #[test]
     fn unsupported_delete_error_names_mechanism_and_redacts() {
         let err = unsupported_delete_error(
-            UnsupportedDeleteMechanism::DeletionVector,
-            "db.mor_dv_table",
+            UnsupportedDeleteMechanism::EqualityDelete,
+            "db.mor_eq_table",
         );
         let msg = match err {
             UdfError::User(m) => m,
             other => panic!("expected UdfError::User, got {other:?}"),
         };
         assert!(
-            msg.contains("Iceberg v3 Puffin deletion vectors"),
+            msg.contains("Iceberg equality deletes"),
             "error must name the mechanism: {msg}"
         );
         assert!(
-            msg.contains("db.mor_dv_table"),
+            msg.contains("db.mor_eq_table"),
             "error must name the offending table: {msg}"
         );
         // No credential label may survive the defensive redaction.
@@ -5234,12 +5423,8 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// A Parquet positional-delete file ref.
-    fn pos_delete(path: &str, size: u64) -> DeleteFileRef {
-        DeleteFileRef {
-            path: path.into(),
-            size,
-            content_type: DeleteFileContentType::PositionDeletes,
-        }
+    fn pos_delete(path: &str, size: u64) -> ResolvedDelete {
+        ResolvedDelete::position(path, size)
     }
 
     /// A minimal delete-carrying row-scan `ScanSpec` template (files replaced per
@@ -5268,21 +5453,6 @@ mod tests {
         }
     }
 
-    /// `map_delete_content_type` maps the iceberg task-level content type onto the
-    /// wire enum honestly (position → position; equality → equality).
-    #[test]
-    fn map_delete_content_type_maps_position_and_equality() {
-        use iceberg::spec::DataContentType;
-        assert_eq!(
-            map_delete_content_type(DataContentType::PositionDeletes),
-            DeleteFileContentType::PositionDeletes
-        );
-        assert_eq!(
-            map_delete_content_type(DataContentType::EqualityDeletes),
-            DeleteFileContentType::EqualityDeletes
-        );
-    }
-
     /// A data file's associated positional-delete file paths are relativized by
     /// the SAME rule as the data-file path: an under-root path is stripped to a
     /// root-relative path, a path not under the root stays absolute. Delete size
@@ -5309,8 +5479,8 @@ mod tests {
         );
         assert_eq!(e.deletes[0].size, 50, "delete size preserved");
         assert_eq!(
-            e.deletes[0].content_type,
-            DeleteFileContentType::PositionDeletes,
+            e.deletes[0].delete_type,
+            crate::scan::spec::DeleteType::PosDel,
             "delete content type preserved"
         );
         assert_eq!(
@@ -5334,8 +5504,8 @@ mod tests {
         assert_eq!(back, file_gran, "file-granularity deletes must round-trip");
         assert_eq!(back[0].deletes.len(), 1);
         assert_eq!(
-            back[0].deletes[0].content_type,
-            DeleteFileContentType::PositionDeletes
+            back[0].deletes[0].delete_type,
+            crate::scan::spec::DeleteType::PosDel
         );
 
         // partition granularity: the SAME delete file is referenced by two data files.
@@ -5352,11 +5522,11 @@ mod tests {
         assert_eq!(back2[1].deletes[0].path, shared);
     }
 
-    /// A delete-carrying entry serializes with its content type on the wire; a
-    /// delete-free entry stays the compact `[path, size]` 2-tuple (no wire bloat,
-    /// backward-compatible with pre-delete payloads).
+    /// A delete-carrying entry serializes with its pooled `type` on the wire; a
+    /// delete-free entry stays the compact `{dataFiles:[{path,size}]}` form (no
+    /// deleteFiles pool, no per-file deletes key).
     #[test]
-    fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
+    fn delete_file_entry_carries_delete_type_and_delete_free_stays_compact() {
         let with_del = vec![FileEntry::with_deletes(
             "d.parquet",
             5,
@@ -5364,21 +5534,195 @@ mod tests {
         )];
         let json = shard_files_json(&with_del);
         assert!(
-            json.contains("position_deletes"),
-            "delete content type must appear on the wire: {json}"
+            json.contains(r#""type":"POS_DEL""#),
+            "pooled delete type must appear on the wire: {json}"
         );
         let back = ScanSpec::files_from_json(&json).unwrap();
         assert_eq!(
-            back[0].deletes[0].content_type,
-            DeleteFileContentType::PositionDeletes
+            back[0].deletes[0].delete_type,
+            crate::scan::spec::DeleteType::PosDel
         );
 
         let free = vec![FileEntry::new("data/part-0.parquet", 1000)];
         assert_eq!(
             shard_files_json(&free),
-            r#"[["data/part-0.parquet",1000]]"#,
-            "delete-free entry must stay the compact 2-tuple form"
+            r#"{"dataFiles":[{"path":"data/part-0.parquet","size":1000}]}"#,
+            "delete-free entry must stay the compact dataFiles form"
         );
+    }
+
+    /// Task 2.C.3: `attach_deletion_vectors` populates the correct data file with a
+    /// DV delete carrying the correct Puffin offset/length, unions it with an
+    /// existing positional delete, interns the shared Puffin container once, and
+    /// drops a DV whose referenced data file is absent (pruned).
+    #[test]
+    fn dv_refs_preserved_into_scan_spec() {
+        use crate::scan::spec::{DeleteType, FileSet};
+        let mut files = vec![
+            // A data file that already carries a Parquet positional delete.
+            FileEntry::with_deletes(
+                "s3://w/data/f0.parquet",
+                1000,
+                vec![pos_delete("s3://w/deletes/d0.parquet", 50)],
+            ),
+            // A delete-free data file that a DV references.
+            FileEntry::new("s3://w/data/f1.parquet", 2000),
+        ];
+        let dv_refs = vec![
+            DeletionVectorRef {
+                referenced_data_file: "s3://w/data/f0.parquet".into(),
+                puffin_path: "s3://w/deletes/dv.puffin".into(),
+                puffin_size: 4096,
+                offset: 4,
+                length: 33,
+            },
+            DeletionVectorRef {
+                referenced_data_file: "s3://w/data/f1.parquet".into(),
+                puffin_path: "s3://w/deletes/dv.puffin".into(),
+                puffin_size: 4096,
+                offset: 40,
+                length: 33,
+            },
+            // References a data file NOT in the resolved list but PRESENT in the
+            // snapshot (pruned by the predicate) — must be dropped silently.
+            DeletionVectorRef {
+                referenced_data_file: "s3://w/data/pruned.parquet".into(),
+                puffin_path: "s3://w/deletes/dv.puffin".into(),
+                puffin_size: 4096,
+                offset: 80,
+                length: 10,
+            },
+        ];
+        // The pre-pruning snapshot data-file set contains all three data files,
+        // including the pruned one.
+        let all_data_files: HashSet<String> = [
+            "s3://w/data/f0.parquet",
+            "s3://w/data/f1.parquet",
+            "s3://w/data/pruned.parquet",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        attach_deletion_vectors(&mut files, dv_refs, &all_data_files, "db.t").unwrap();
+
+        // f0 now has [POS_DEL, DV]; the DV carries offset 4 / length 33.
+        assert_eq!(files[0].deletes.len(), 2);
+        assert_eq!(files[0].deletes[0].delete_type, DeleteType::PosDel);
+        assert_eq!(files[0].deletes[1].delete_type, DeleteType::Dv);
+        assert_eq!(files[0].deletes[1].offset, Some(4));
+        assert_eq!(files[0].deletes[1].length, Some(33));
+        // f1 gained a DV with offset 40.
+        assert_eq!(files[1].deletes.len(), 1);
+        assert_eq!(files[1].deletes[0].delete_type, DeleteType::Dv);
+        assert_eq!(files[1].deletes[0].offset, Some(40));
+
+        // The shared Puffin container is interned exactly once in the pool.
+        let set = FileSet::from_entries(&files);
+        let puffin_pool_entries = set
+            .delete_files
+            .iter()
+            .filter(|d| d.format == crate::scan::spec::DeleteFormat::Puffin)
+            .count();
+        assert_eq!(
+            puffin_pool_entries, 1,
+            "shared Puffin container interned once"
+        );
+    }
+
+    /// Task R.1: a deletion vector whose referenced data file matches NEITHER a
+    /// resolved (scanned) file NOR any data file in the current snapshot (a
+    /// path-form mismatch) fails loud — attaching nothing would silently return
+    /// pre-delete rows. A pruned target (present in the snapshot, absent from the
+    /// resolved list) is still skipped without error.
+    #[test]
+    fn dv_ref_matching_no_snapshot_data_file_fails_loud() {
+        let mut files = vec![FileEntry::new("s3://w/data/f0.parquet", 1000)];
+        // This DV names a data file that exists in NO form in the snapshot set
+        // (e.g. an s3a:// vs s3:// scheme mismatch).
+        let dv_refs = vec![DeletionVectorRef {
+            referenced_data_file: "s3a://w/data/f0.parquet".into(),
+            puffin_path: "s3://w/deletes/dv.puffin".into(),
+            puffin_size: 4096,
+            offset: 4,
+            length: 33,
+        }];
+        let all_data_files: HashSet<String> = ["s3://w/data/f0.parquet"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let err = attach_deletion_vectors(&mut files, dv_refs, &all_data_files, "db.t")
+            .expect_err("an unmatched DV reference must fail loud");
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains("matches no data file in the current snapshot"),
+            "error must name the unmatched-DV condition: {msg}"
+        );
+        // f0 gained no delete (the query is refused, not silently under-deleted).
+        assert!(files[0].deletes.is_empty());
+
+        // A PRUNED target (in the snapshot set, absent from the resolved list) is
+        // skipped without error.
+        let mut files2 = vec![FileEntry::new("s3://w/data/f0.parquet", 1000)];
+        let pruned = vec![DeletionVectorRef {
+            referenced_data_file: "s3://w/data/pruned.parquet".into(),
+            puffin_path: "s3://w/deletes/dv.puffin".into(),
+            puffin_size: 4096,
+            offset: 4,
+            length: 33,
+        }];
+        let snapshot: HashSet<String> = ["s3://w/data/f0.parquet", "s3://w/data/pruned.parquet"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        attach_deletion_vectors(&mut files2, pruned, &snapshot, "db.t")
+            .expect("a pruned DV target must be skipped, not errored");
+        assert!(files2[0].deletes.is_empty());
+    }
+
+    /// Task R.6: `positional_delete_refs` keeps genuine Parquet positional deletes
+    /// and EXCLUDES v3 Puffin DV containers — which iceberg-rust 0.10 empirically
+    /// surfaces in `FileScanTask.deletes` too (verified against a real Spark
+    /// format-version=3 fixture) — so a Puffin container is never mistyped as a
+    /// Parquet POS_DEL ref (which would fail parsing its footer as Parquet).
+    #[test]
+    fn positional_delete_refs_excludes_dv_puffin_containers() {
+        use crate::scan::spec::{DeleteFormat, DeleteType};
+        let dv_paths: HashSet<String> = ["s3://w/deletes/dv.puffin"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        // A genuine Parquet positional delete is kept, typed POS_DEL/PARQUET.
+        let kept =
+            positional_delete_refs(&[("s3://w/deletes/pos.parquet".to_string(), 50)], &dv_paths);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].delete_type, DeleteType::PosDel);
+        assert_eq!(kept[0].format, DeleteFormat::Parquet);
+        assert_eq!(kept[0].path, "s3://w/deletes/pos.parquet");
+
+        // A data file whose ONLY task-delete entry is the DV Puffin container ends
+        // up with an EMPTY positional list (the DV is attached by the manifest walk).
+        let only_dv =
+            positional_delete_refs(&[("s3://w/deletes/dv.puffin".to_string(), 4096)], &dv_paths);
+        assert!(only_dv.is_empty(), "DV Puffin container must be excluded");
+
+        // Mixed: keep the Parquet positional delete, drop the Puffin DV container.
+        let mixed = positional_delete_refs(
+            &[
+                ("s3://w/deletes/pos.parquet".to_string(), 50),
+                ("s3://w/deletes/dv.puffin".to_string(), 4096),
+            ],
+            &dv_paths,
+        );
+        assert_eq!(
+            mixed.len(),
+            1,
+            "only the Parquet positional delete survives"
+        );
+        assert_eq!(mixed[0].path, "s3://w/deletes/pos.parquet");
     }
 
     /// Delete refs ride ONLY in the per-shard files argument, never in the
@@ -5637,13 +5981,14 @@ mod tests {
             "common blob must carry table_root once: {common}"
         );
 
-        // Each per-shard payload carries its file's byte size as a [path,size] tuple.
+        // Each per-shard payload carries its file's byte size in the normalized
+        // dataFiles object.
         assert!(
-            sql.contains(r#"[["part-00000.parquet",1024]]"#),
+            sql.contains(r#"{"dataFiles":[{"path":"part-00000.parquet","size":1024}]}"#),
             "shard payload must carry relative path + size for file 0: {sql}"
         );
         assert!(
-            sql.contains(r#"[["part-00001.parquet",2048]]"#),
+            sql.contains(r#"{"dataFiles":[{"path":"part-00001.parquet","size":2048}]}"#),
             "shard payload must carry relative path + size for file 1: {sql}"
         );
     }
@@ -5705,12 +6050,12 @@ mod tests {
 
         // The under-root file is emitted relative.
         assert!(
-            sql.contains(r#"["part-00000.parquet",1024]"#),
+            sql.contains(r#"{"path":"part-00000.parquet","size":1024}"#),
             "under-root path must be relativized: {sql}"
         );
         // The not-under-root file keeps its full absolute URI, with its size.
         assert!(
-            sql.contains(&format!(r#"["{outside}",2048]"#)),
+            sql.contains(&format!(r#"{{"path":"{outside}","size":2048}}"#)),
             "path outside the table root must stay absolute: {sql}"
         );
         // The table root is still carried exactly once (the absolute outside path
@@ -5819,11 +6164,11 @@ mod tests {
             "root must be serialized once in the common blob: {sql}"
         );
 
-        // Each per-shard files literal is a JSON array of [path,size] 2-tuples.
+        // Each per-shard files literal is the normalized dataFiles object.
         assert!(
-            sql.contains(r#"[["part-00000.parquet",1024]]"#)
-                && sql.contains(r#"[["part-00001.parquet",2048]]"#),
-            "each shard literal must be a [[path,size],...] tuple array: {sql}"
+            sql.contains(r#"{"dataFiles":[{"path":"part-00000.parquet","size":1024}]}"#)
+                && sql.contains(r#"{"dataFiles":[{"path":"part-00001.parquet","size":2048}]}"#),
+            "each shard literal must be a {{dataFiles:[...]}} object: {sql}"
         );
     }
 

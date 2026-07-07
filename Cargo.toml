@@ -32,6 +32,12 @@ object_store = { version = "0.13.2", features = ["aws"] }
 # UDF's vendored `build_deletes_row_selection` consumes the identical type.
 roaring = { version = "0.11" }
 
+# CRC-32 validation of the deletion-vector-v1 Puffin blob. crc32fast implements
+# CRC-32/ISO-HDLC (the zlib/gzip "IEEE" polynomial), the same variant Iceberg's
+# and Delta's deletion-vector writers use (java.util.zip.CRC32), so it validates
+# the blob's trailing checksum exactly. Already resolved transitively in the lock.
+crc32fast = { version = "1.5" }
+
 # Iceberg REST catalog.
 # Pinned to the v0.10.0-rc.2 git tag (not yet on crates.io). iceberg 0.10.0-rc.2
 # links arrow 58 internally, the same tree as datafusion/exasol-udf-sdk below —
