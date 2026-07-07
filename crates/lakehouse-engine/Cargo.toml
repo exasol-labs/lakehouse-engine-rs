@@ -32,6 +32,10 @@ object_store = { workspace = true }
 # spec-size HEAD wrapper. Already resolved transitively via object_store/datafusion.
 async-trait = "0.1"
 
+# Positional-delete set: the scan UDF unions delete positions into a
+# `RoaringTreemap` and feeds the vendored `build_deletes_row_selection`.
+roaring = { workspace = true }
+
 iceberg              = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }

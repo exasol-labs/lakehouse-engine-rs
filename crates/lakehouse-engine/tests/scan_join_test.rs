@@ -29,7 +29,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{JoinSpec, JoinType, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{FileEntry, JoinSpec, JoinType, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
 };
@@ -185,7 +185,7 @@ fn join_spec(
 ) -> ScanSpec {
     ScanSpec {
         table_root: String::new(),
-        files: fact_files,
+        files: fact_files.into_iter().map(FileEntry::from).collect(),
         projection: projection.into_iter().map(Into::into).collect(),
         filter: filter.map(Into::into),
         limit,
@@ -196,7 +196,7 @@ fn join_spec(
         logical_schema: Vec::new(),
         join: Some(JoinSpec {
             table_root: String::new(),
-            files: dim_files,
+            files: dim_files.into_iter().map(FileEntry::from).collect(),
             logical_schema: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
@@ -255,13 +255,21 @@ fn join_spec_reconstitutes_two_file_lists() {
         ScanSpec::from_parts_json(&common_json, &files_json).expect("from_parts_json");
 
     // Fact side: the per-shard files list.
-    assert_eq!(reconstituted.files, fact, "fact file list must round-trip");
+    assert_eq!(
+        reconstituted.files,
+        fact.into_iter().map(FileEntry::from).collect::<Vec<_>>(),
+        "fact file list must round-trip"
+    );
 
     // Dimension side: the shard-invariant join block's full file list.
     let join = reconstituted
         .join
         .expect("join block must survive the split/merge");
-    assert_eq!(join.files, dim, "dimension file list must round-trip");
+    assert_eq!(
+        join.files,
+        dim.into_iter().map(FileEntry::from).collect::<Vec<_>>(),
+        "dimension file list must round-trip"
+    );
     assert_eq!(join.join_type, JoinType::Inner);
     assert_eq!(join.condition, "\"C_CUSTKEY\" = \"O_CUSTKEY\"");
 

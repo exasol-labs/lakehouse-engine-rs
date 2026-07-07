@@ -16,13 +16,20 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{build_scan_driving_sql, detect_aggregates};
 use lakehouse_engine::scan::spec::{
-    AggKind, JoinSpec, JoinType, ProjectionItem, ScanSpec, SortKey, StorageProps,
+    AggKind, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ProjectionItem,
+    ScanSpec, SortKey, StorageProps,
 };
-use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
+use lakehouse_engine::scan::{
+    build_raw_scan_physical_plan, register_files, session_config_for_spec,
+};
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::file::properties::WriterProperties;
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![
@@ -55,7 +62,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         .unwrap_or(0);
     ScanSpec {
         table_root: String::new(),
-        files: vec![(file_url, size)],
+        files: vec![FileEntry::new(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some(r#""ID" >= 10"#.into()),
         limit: None,
@@ -91,7 +98,7 @@ async fn raw_scan_plan_has_no_repartition_stage() {
     let spec = single_partition_spec(file_url);
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    ctx.register_parquet("scan_target", &spec.files[0].0, Default::default())
+    ctx.register_parquet("scan_target", &spec.files[0].path, Default::default())
         .await
         .expect("register local parquet");
 
@@ -153,7 +160,7 @@ async fn raw_scan_plan_has_no_repartition_stage() {
         .set_bool("datafusion.execution.parquet.pushdown_filters", false);
     let baseline_ctx = SessionContext::new_with_config(baseline_config);
     baseline_ctx
-        .register_parquet("scan_target", &spec.files[0].0, Default::default())
+        .register_parquet("scan_target", &spec.files[0].path, Default::default())
         .await
         .expect("register baseline parquet");
     let rows_baseline = collect_rows(&baseline_ctx, &spec).await;
@@ -229,7 +236,7 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
     ];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    ctx.register_parquet("scan_target", &spec.files[0].0, Default::default())
+    ctx.register_parquet("scan_target", &spec.files[0].path, Default::default())
         .await
         .expect("register local parquet");
 
@@ -348,7 +355,7 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     spec.limit = Some(5);
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    ctx.register_parquet("scan_target", &spec.files[0].0, Default::default())
+    ctx.register_parquet("scan_target", &spec.files[0].path, Default::default())
         .await
         .expect("register local parquet");
 
@@ -511,7 +518,7 @@ fn join_broadcast_fan_out_sql_shape() {
     // Dimension side: full file list, carried once (shard-invariant) in the join block.
     let join = JoinSpec {
         table_root: "s3://warehouse/lh/customer".to_string(),
-        files: vec![("data/cust-0.parquet".to_string(), 4096)],
+        files: vec![FileEntry::new("data/cust-0.parquet", 4096)],
         logical_schema: Vec::new(),
         join_type: JoinType::Inner,
         condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
@@ -596,4 +603,226 @@ fn join_broadcast_fan_out_sql_shape() {
         sql.contains("data/ord-0.parquet") && sql.contains("data/ord-1.parquet"),
         "the fact side must be sharded across the VALUES work units:\n{sql}"
     );
+}
+
+/// Write a data Parquet with ten tight, disjoint row groups (100 rows each,
+/// `id` monotonically increasing 0..1000) so row-group statistics pruning has
+/// something to skip, and return its `file://` URL. Mirrors the fixture the
+/// dedicated pruning test uses, so the two tests prove pruning fires on the
+/// SAME shape — this one additionally with a base `ParquetAccessPlan` attached.
+fn write_multi_row_group_parquet(dir: &std::path::Path) -> String {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let path = dir.join("access_plan_pruning.parquet");
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(100))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
+    let total = 1_000i64;
+    let ids: Vec<i64> = (0..total).collect();
+    let names: Vec<String> = (0..total).map(|i| format!("row-{i:04}")).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// Write an Iceberg-shaped positional-delete Parquet (`file_path`/`pos` columns,
+/// located by the reserved field-ids 2147483546 / 2147483545) that deletes the
+/// single row `pos = 250` of `data_file_url`, and return its `file://` URL.
+///
+/// `pos = 250` lands inside row group 2 (rows 200..300) — a row group the
+/// pruning predicate KEEPS — so the delete is applied precisely where pruning
+/// does NOT remove the group, proving deletes compose WITH (never replace)
+/// pruning. `file_path` carries the full data-file URL because the provider
+/// filters delete rows by exact `file_path` equality (partition-granularity).
+fn write_positional_delete_parquet(dir: &std::path::Path, data_file_url: &str) -> String {
+    use std::collections::HashMap;
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_path", DataType::Utf8, false).with_metadata(field_id_meta(2_147_483_546)),
+        Field::new("pos", DataType::Int64, false).with_metadata(field_id_meta(2_147_483_545)),
+    ]));
+    let path = dir.join("access_plan_pruning-delete.parquet");
+    let file = std::fs::File::create(&path).expect("create delete parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![data_file_url])),
+            Arc::new(Int64Array::from(vec![250_i64])),
+        ],
+    )
+    .expect("delete record batch");
+    writer.write(&batch).expect("write delete batch");
+    writer.close().expect("close delete writer");
+    url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string()
+}
+
+fn local_size(file_url: &str) -> u64 {
+    std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(file_url))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Sum the `row_groups_pruned_statistics` pruned count across every node of the
+/// executed physical plan. A non-zero total is direct evidence that Parquet
+/// row-group statistics pruning fired.
+fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
+    let mut total = 0;
+    if let Some(metrics) = plan.metrics() {
+        for metric in metrics.iter() {
+            if let MetricValue::PruningMetrics {
+                name,
+                pruning_metrics,
+            } = metric.value()
+                && name == "row_groups_pruned_statistics"
+            {
+                total += pruning_metrics.pruned();
+            }
+        }
+    }
+    for child in plan.children() {
+        total += sum_row_groups_pruned(child.as_ref());
+    }
+    total
+}
+
+/// GATE test (plan Task 4.2) for the unified-vs-conditional provider decision
+/// (Task 2.1). It asserts BOTH halves of the gate on the SAME scan — a
+/// delete-carrying data file driven through the real production
+/// `PositionalDeleteScanTable` provider (registered via `register_files`, the
+/// exact production seam; the built-in `register_parquet` shortcut the other
+/// plan-shape tests use never attaches a base `ParquetAccessPlan`):
+///
+/// 1. **Lean shape preserved** — the raw-scan physical plan has exactly ONE
+///    output partition and contains NO `RepartitionExec` and NO
+///    `CoalescePartitionsExec`, even with the access plan attached.
+/// 2. **Pruning preserved WITH a base access plan** — row-group statistics
+///    pruning STILL fires (`row_groups_pruned_statistics` > 0) when a base
+///    `ParquetAccessPlan` (from the positional delete) is attached, i.e. the
+///    opener intersects pruning ON TOP of the delete's access plan rather than
+///    the access plan defeating pruning.
+///
+/// The result set proves the two compose correctly: the predicate keeps ids
+/// 200..=399 (row groups 2 and 3; the other eight are pruned) and the delete
+/// removes id 250 from the KEPT row group 2 — so exactly 199 rows survive and
+/// 250 is absent. Were the access plan silently dropped, 250 would remain and
+/// the count would be 200; were pruning defeated, the pruned metric would be 0.
+///
+/// If this test fails, the unified provider path is NOT safe and the plan's
+/// conditional fallback (`ListingTable` for delete-free files, custom provider
+/// only when deletes are present) must be adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_plan_lean_and_prunes_with_access_plan() {
+    let dir = std::env::temp_dir().join(format!("lh_gate_access_plan_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let data_url = write_multi_row_group_parquet(&dir);
+    let delete_url = write_positional_delete_parquet(&dir, &data_url);
+
+    // A single delete-carrying data file: the provider will read the delete
+    // file, build a base `ParquetAccessPlan` skipping pos 250, and attach it.
+    let mut spec = single_partition_spec(data_url.clone());
+    spec.files = vec![FileEntry::with_deletes(
+        data_url.clone(),
+        local_size(&data_url),
+        vec![DeleteFileRef {
+            path: delete_url.clone(),
+            size: local_size(&delete_url),
+            content_type: DeleteFileContentType::PositionDeletes,
+        }],
+    )];
+    // Predicate keeps only ids 200..=399 → row groups 2 and 3; prunes the other
+    // eight tight, disjoint row groups.
+    spec.filter = Some(r#""ID" >= 200 AND "ID" < 400"#.into());
+
+    // Register the REAL production provider (attaches the access plan), then ask
+    // for the exact committed raw-scan pipeline.
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    register_files(&ctx, "scan_target", &spec)
+        .await
+        .expect("register production positional-delete provider");
+    let plan = build_raw_scan_physical_plan(&ctx, &spec)
+        .await
+        .expect("build physical plan through the delete-carrying provider");
+
+    // GATE part 1: the lean single-partition shape survives the access plan.
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    eprintln!(
+        "=== gate raw-scan physical plan ===\n{rendered}\n==================================="
+    );
+    for forbidden in ["RepartitionExec", "CoalescePartitionsExec"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "delete-carrying raw-scan plan must stay lean (no {forbidden}):\n{rendered}"
+        );
+    }
+    assert_eq!(
+        plan.output_partitioning().partition_count(),
+        1,
+        "delete-carrying raw-scan plan must have exactly one output partition:\n{rendered}"
+    );
+
+    // Execute; pruning + delete metrics accumulate on the plan tree.
+    let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect delete-carrying scan");
+
+    // GATE part 2: row-group statistics pruning STILL fires with the base
+    // access plan attached (the novel assertion this gate exists for).
+    let pruned = sum_row_groups_pruned(plan.as_ref());
+    eprintln!("row_groups_pruned_statistics (pruned) = {pruned}");
+    assert!(
+        pruned > 0,
+        "row-group pruning must STILL occur with a base ParquetAccessPlan attached \
+         (deletes must compose WITH pruning, not defeat it); pruned = {pruned}\n{rendered}"
+    );
+
+    // Composition correctness: the kept predicate range minus the deleted row.
+    let mut rows: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("col 0 Int64");
+        for i in 0..batch.num_rows() {
+            rows.push(ids.value(i));
+        }
+    }
+    rows.sort_unstable();
+
+    assert!(
+        !rows.contains(&250),
+        "the positional delete must remove id 250 (the access plan WAS applied)"
+    );
+    assert_eq!(
+        rows.len(),
+        199,
+        "predicate keeps ids 200..=399 (200 rows) and the delete removes id 250 → 199 rows"
+    );
+    assert_eq!(*rows.first().unwrap(), 200, "lowest surviving id is 200");
+    assert_eq!(*rows.last().unwrap(), 399, "highest surviving id is 399");
+    let expected: Vec<i64> = (200..=399).filter(|&id| id != 250).collect();
+    assert_eq!(
+        rows, expected,
+        "surviving rows must be exactly ids 200..=399 except the deleted 250"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
