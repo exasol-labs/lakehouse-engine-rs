@@ -3937,7 +3937,7 @@ fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
 /// and optional `WHERE <filter>` all reference bare column names unambiguously and
 /// Exasol's core engine performs the join. This reproduces the pre-broadcast
 /// two-scan behavior deterministically: no broadcast replication, no adapter error.
-pub fn build_two_scan_join_sql(
+pub(crate) fn build_two_scan_join_sql(
     fact_fan_out: &str,
     dimension_fan_out: &str,
     projection: &[ProjectionItem],
@@ -3954,8 +3954,8 @@ pub fn build_two_scan_join_sql(
             .join(", ")
     };
     let mut sql = format!(
-        "SELECT {select} FROM ({fact_fan_out}) AS \"LHS_FACT\" \
-         INNER JOIN ({dimension_fan_out}) AS \"LHS_DIM\" ON {condition}"
+        "SELECT {select} FROM ({fact_fan_out}) AS \"{JOIN_FACT_ALIAS}\" \
+         INNER JOIN ({dimension_fan_out}) AS \"{JOIN_DIM_ALIAS}\" ON {condition}"
     );
     if let Some(f) = filter {
         sql.push_str(&format!(" WHERE {f}"));
