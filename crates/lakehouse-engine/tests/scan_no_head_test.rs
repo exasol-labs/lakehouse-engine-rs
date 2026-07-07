@@ -39,17 +39,26 @@ use exasol_udf_sdk::value::Value;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{
+    DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
+};
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use url::Url;
+
+/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
+/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated
+/// here since this integration test cannot import a `pub(crate)` item).
+const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
+const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
 /// A fake `UdfContext` serving one input row and decoding every emitted Arrow IPC
 /// batch — the same capture pattern the sibling two-arg integration test uses.
@@ -252,7 +261,7 @@ fn dummy_storage() -> StorageProps {
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     ScanSpec {
         table_root,
-        files,
+        files: files.into_iter().map(FileEntry::from).collect(),
         projection: vec!["ID".into(), "NAME".into()],
         filter: None,
         limit: None,
@@ -312,6 +321,143 @@ fn head_key(abs_file_url: &str) -> ObjectStorePath {
         .expect("listing url")
         .prefix()
         .clone()
+}
+
+/// Write a local positional-delete Parquet at `dir/relative`: `file_path`/`pos`
+/// columns tagged with the Iceberg reserved field-ids, one row per
+/// `(referenced_file_abs_url, position)` entry. Returns the file's absolute
+/// `file://` URL.
+fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str, i64)]) -> String {
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_path", DataType::Utf8, false)
+            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
+        Field::new("pos", DataType::Int64, false)
+            .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
+    ]));
+    let path = dir.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create parent dir");
+    }
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
+    let positions: Vec<i64> = entries.iter().map(|(_, pos)| *pos).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(paths)),
+            Arc::new(Int64Array::from(positions)),
+        ],
+    )
+    .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// One logged request: the location, whether it was a HEAD, and the byte
+/// range requested (if any).
+type LoggedRequest = (ObjectStorePath, bool, Option<GetRange>);
+
+/// An [`ObjectStore`] decorator that records the location of every request
+/// (HEAD or GET, with its byte range) into a shared log and answers every HEAD
+/// from a caller-supplied size map with NO inner I/O — extending
+/// [`CountingHeadStore`]'s head-interception with a full request log so a test
+/// can assert exactly WHICH locations, and how many times each, were fetched.
+#[derive(Debug)]
+struct RequestLoggingStore {
+    inner: Arc<dyn ObjectStore>,
+    sizes: HashMap<ObjectStorePath, u64>,
+    log: Arc<std::sync::Mutex<Vec<LoggedRequest>>>,
+}
+
+impl std::fmt::Display for RequestLoggingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RequestLoggingStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RequestLoggingStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectStorePath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectStorePath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectStorePath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((location.clone(), options.head, options.range.clone()));
+        if options.head
+            && let Some(&size) = self.sizes.get(location)
+        {
+            let meta = ObjectMeta {
+                location: location.clone(),
+                last_modified: Utc.timestamp_nanos(0),
+                size,
+                e_tag: None,
+                version: None,
+            };
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(futures::stream::empty().boxed()),
+                meta,
+                range: 0..0,
+                attributes: object_store::Attributes::default(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectStorePath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectStorePath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectStorePath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectStorePath,
+        to: &ObjectStorePath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -483,6 +629,163 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
     assert_eq!(
         rel_rows, abs_rows,
         "relative-entry + table_root scan must return the same rows as the absolute-entry scan"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (file-metadata): a delete-carrying scan issues NO object-store HEAD
+/// for its associated positional-delete file — the delete file's `ObjectMeta`
+/// is built directly from the spec-supplied size (`DeleteFileRef::size`), the
+/// same no-HEAD mechanism `FileEntry::size` already gives data files.
+#[test]
+fn scan_issues_no_head_for_delete_files() {
+    let dir = std::env::temp_dir().join(format!("lh_no_head_del_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let data_url = write_local_parquet(&dir, "data.parquet", 40);
+    let data_size = std::fs::metadata(data_url.strip_prefix("file://").unwrap())
+        .expect("stat data parquet")
+        .len();
+    let delete_url = write_delete_parquet(&dir, "deletes.parquet", &[(&data_url, 3)]);
+    let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
+        .expect("stat delete parquet")
+        .len();
+
+    let entry = FileEntry::with_deletes(
+        data_url.clone(),
+        data_size,
+        vec![DeleteFileRef {
+            path: delete_url.clone(),
+            size: delete_size,
+            content_type: DeleteFileContentType::PositionDeletes,
+        }],
+    );
+    let spec = raw_spec(vec![], String::new());
+    let mut spec = spec;
+    spec.files = vec![entry];
+
+    let mut sizes = HashMap::new();
+    sizes.insert(head_key(&data_url), data_size);
+    sizes.insert(head_key(&delete_url), delete_size);
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(RequestLoggingStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        sizes,
+        log: Arc::clone(&log),
+    });
+
+    let rows = block_on(run_scan_with_store(&spec, &data_url, store));
+    assert_eq!(rows_of(&rows).len(), 39, "1 row deleted out of 40");
+
+    let recorded = log.lock().unwrap();
+    let delete_key = head_key(&delete_url);
+    let delete_head_calls = recorded
+        .iter()
+        .filter(|(loc, head, _)| *head && *loc == delete_key)
+        .count();
+    assert_eq!(
+        delete_head_calls, 0,
+        "the positional-delete file must never receive an object-store HEAD: {recorded:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (file-metadata / memory-creds): the shared session
+/// `FileMetadataCache` (task 2.5) means attaching a positional-delete file to a
+/// data file causes NO additional object-store GET against the DATA file
+/// itself — the footer is parsed once (through the cache) and reused by both
+/// the access-plan construction and the opener's own read, rather than being
+/// fetched a second time.
+#[test]
+fn scan_reads_footer_via_range_get_once() {
+    let dir = std::env::temp_dir().join(format!("lh_footer_once_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let baseline_url = write_local_parquet(&dir, "baseline/data.parquet", 200);
+    let baseline_size = std::fs::metadata(baseline_url.strip_prefix("file://").unwrap())
+        .expect("stat baseline parquet")
+        .len();
+    let delta_url = write_local_parquet(&dir, "delta/data.parquet", 200);
+    let delta_size = std::fs::metadata(delta_url.strip_prefix("file://").unwrap())
+        .expect("stat delta parquet")
+        .len();
+    // A single deleted position (never a whole row group) so every row group of
+    // the delta file is opened identically to the baseline — isolating any
+    // difference in call pattern to metadata/footer reads.
+    let delete_url = write_delete_parquet(&dir, "delta/deletes.parquet", &[(&delta_url, 5)]);
+    let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
+        .expect("stat delete parquet")
+        .len();
+
+    let baseline_entry = FileEntry::new(baseline_url.clone(), baseline_size);
+    let delta_entry = FileEntry::with_deletes(
+        delta_url.clone(),
+        delta_size,
+        vec![DeleteFileRef {
+            path: delete_url.clone(),
+            size: delete_size,
+            content_type: DeleteFileContentType::PositionDeletes,
+        }],
+    );
+
+    let mut baseline_spec = raw_spec(vec![], String::new());
+    baseline_spec.files = vec![baseline_entry];
+    let mut delta_spec = raw_spec(vec![], String::new());
+    delta_spec.files = vec![delta_entry];
+
+    let baseline_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let baseline_store = Arc::new(RequestLoggingStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        sizes: HashMap::from([(head_key(&baseline_url), baseline_size)]),
+        log: Arc::clone(&baseline_log),
+    });
+    let baseline_rows = block_on(run_scan_with_store(
+        &baseline_spec,
+        &baseline_url,
+        baseline_store,
+    ));
+    assert_eq!(
+        rows_of(&baseline_rows).len(),
+        200,
+        "baseline has no deletes"
+    );
+
+    let delta_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let delta_store = Arc::new(RequestLoggingStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        sizes: HashMap::from([
+            (head_key(&delta_url), delta_size),
+            (head_key(&delete_url), delete_size),
+        ]),
+        log: Arc::clone(&delta_log),
+    });
+    let delta_rows = block_on(run_scan_with_store(&delta_spec, &delta_url, delta_store));
+    assert_eq!(rows_of(&delta_rows).len(), 199, "1 row deleted out of 200");
+
+    // Every non-HEAD GET the delta scan issues AGAINST THE DATA FILE (i.e.
+    // excluding the delete file's own, separately necessary, reads) must be
+    // byte-range-identical to the baseline's data-file reads: the delete
+    // file's associated access-plan construction reads the SAME footer through
+    // the shared `FileMetadataCache` the opener uses, rather than fetching it a
+    // second time from the object store.
+    let baseline_data_calls: Vec<Option<GetRange>> = baseline_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, head, _)| !head)
+        .map(|(_, _, range)| range.clone())
+        .collect();
+    let delta_data_calls: Vec<Option<GetRange>> = delta_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(loc, head, _)| !head && *loc == head_key(&delta_url))
+        .map(|(_, _, range)| range.clone())
+        .collect();
+    assert_eq!(
+        delta_data_calls, baseline_data_calls,
+        "attaching a positional delete must not add any extra GET against the data file's own \
+         footer/content (shared FileMetadataCache => footer parsed once): baseline={baseline_data_calls:?} delta={delta_data_calls:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
