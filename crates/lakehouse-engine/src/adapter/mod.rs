@@ -96,6 +96,15 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 /// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
 /// applying the pool fraction.
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
+// VS property and adapterNotes key names for the join-broadcast byte-size threshold: the
+// smaller side of a two-table inner equi-join is broadcast (replicated into every shard's
+// common spec) when its Iceberg-manifest byte size is at or below this threshold; larger
+// joins fall back to an unaccelerated two-scan join. See backlog BL-001 / plan
+// `add-join-pushdown-broadcast`.
+const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
+const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
+/// Default join-broadcast byte-size threshold: 128 MiB.
+const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
 // VS/connection property and adapterNotes key for the object-store connection-concurrency
 // budget (mirrors the native `IMPORT FROM PARQUET` `MaxConnections` vocabulary). An explicit
 // positive integer pins the per-instance budget (FIXED-like); absent/empty/zero/invalid
@@ -206,6 +215,7 @@ fn handle_create_virtual_schema(
     let df_batch_size = resolve_df_batch_size(&props);
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
+    let join_broadcast_max_bytes = resolve_join_broadcast_max_bytes(&props);
     // Same un-clamped `parallelism_factor` used as `udf_instances_per_node` above:
     // the conservative maximal per-node fan-out keeps the AUTO connection budget
     // from oversubscribing a node even at the configured shard-fan-out ceiling.
@@ -266,6 +276,7 @@ fn handle_create_virtual_schema(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        join_broadcast_max_bytes,
         &table_map,
     );
 
@@ -329,6 +340,10 @@ async fn handle_pushdown_request(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(DEFAULT_S3_MAX_CONNECTIONS);
+    let join_broadcast_max_bytes = adapter_note(request, NOTE_JOIN_BROADCAST_MAX_BYTES)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES);
 
     // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
@@ -348,6 +363,7 @@ async fn handle_pushdown_request(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        join_broadcast_max_bytes,
         creds,
     )
     .await
@@ -478,10 +494,10 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
 /// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
 /// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
-/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS, and TABLE_MAP
-/// (a nested JSON object mapping Exasol table names to original-cased Iceberg
-/// identifiers). Any pre-existing notes on the request are preserved (merge,
-/// not clobber).
+/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
+/// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
+/// table names to original-cased Iceberg identifiers). Any pre-existing notes on
+/// the request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
@@ -497,6 +513,7 @@ fn build_adapter_notes(
     memory_pool_fraction: f64,
     instance_overhead_mb: u64,
     s3_max_connections: usize,
+    join_broadcast_max_bytes: u64,
     table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
@@ -539,6 +556,10 @@ fn build_adapter_notes(
     notes.insert(
         NOTE_S3_MAX_CONNECTIONS.to_string(),
         Json::String(s3_max_connections.to_string()),
+    );
+    notes.insert(
+        NOTE_JOIN_BROADCAST_MAX_BYTES.to_string(),
+        Json::String(join_broadcast_max_bytes.to_string()),
     );
     // TABLE_MAP: nested JSON object within the notes string.
     let map_obj: serde_json::Map<String, Json> = table_map
@@ -751,6 +772,19 @@ fn resolve_instance_overhead_mb(props: &Json) -> u64 {
     str_prop(props, PROP_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
+}
+
+/// Read and validate the JOIN_BROADCAST_MAX_BYTES VS property.
+///
+/// A positive `u64` byte count wins. When the property is absent, empty,
+/// non-numeric, zero, or (since `u64` cannot hold one) negative, the default is
+/// `DEFAULT_JOIN_BROADCAST_MAX_BYTES` (128 MiB). See backlog BL-001 / plan
+/// `add-join-pushdown-broadcast`.
+fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
+    str_prop(props, PROP_JOIN_BROADCAST_MAX_BYTES)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
 }
 
 /// Parse the `NR_OF_CORES` VS property into an override value.
@@ -1003,6 +1037,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let schema_metadata = serde_json::json!({
@@ -1051,6 +1086,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1113,6 +1149,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1153,6 +1190,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1199,6 +1237,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1240,6 +1279,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1351,6 +1391,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1404,6 +1445,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1455,6 +1497,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1566,6 +1609,98 @@ mod tests {
         );
     }
 
+    /// Scenario: resolve_join_broadcast_max_bytes defaults/validates.
+    /// Task 3.6 — property present + valid numeric parses correctly; absent
+    /// defaults to 128 MiB; invalid (non-numeric or zero/negative) falls back
+    /// to the default. See backlog BL-001 / plan `add-join-pushdown-broadcast`.
+    #[test]
+    fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
+        // Absent → default 128 MiB.
+        let absent = serde_json::json!({});
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&absent),
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            "absent → default 128 MiB"
+        );
+        assert_eq!(
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES, 134_217_728,
+            "default must be exactly 128 MiB"
+        );
+
+        // Empty string → default (str_prop filters empty strings).
+        let empty = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "" });
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&empty),
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            "empty → default 128 MiB"
+        );
+
+        // Present + valid numeric → parsed correctly.
+        let valid = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "67108864" });
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&valid),
+            67_108_864,
+            "\"67108864\" (64 MiB) must be parsed as-is"
+        );
+
+        // Non-numeric → default.
+        let garbage = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "not-a-number" });
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&garbage),
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            "unparseable value → default 128 MiB"
+        );
+
+        // Zero → invalid (must be positive) → default.
+        let zero = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "0" });
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&zero),
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            "\"0\" is not positive → default 128 MiB"
+        );
+
+        // Negative → invalid (u64 parse fails) → default.
+        let negative = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "-1" });
+        assert_eq!(
+            resolve_join_broadcast_max_bytes(&negative),
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            "\"-1\" is negative (unparseable as u64) → default 128 MiB"
+        );
+    }
+
+    /// Scenario: JOIN_BROADCAST_MAX_BYTES round-trips through build_adapter_notes →
+    /// adapter_note (mirroring memory_budget_params_round_trip_through_adapter_notes).
+    #[test]
+    fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
+        let create_req = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &create_req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
+            67_108_864,
+            &[],
+        );
+
+        let pushdown_req = serde_json::json!({
+            "type": "pushdown",
+            "schemaMetadataInfo": { "adapterNotes": notes.as_str().unwrap() },
+        });
+
+        assert_eq!(
+            adapter_note(&pushdown_req, NOTE_JOIN_BROADCAST_MAX_BYTES).as_deref(),
+            Some("67108864"),
+            "JOIN_BROADCAST_MAX_BYTES must round-trip through adapterNotes"
+        );
+    }
+
     /// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through
     /// build_adapter_notes → adapter_note (mirroring adapter_notes_cluster_nodes_round_trips).
     #[test]
@@ -1583,6 +1718,7 @@ mod tests {
             0.5,
             256,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1815,6 +1951,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[],
         );
         let parsed: serde_json::Value =
@@ -1923,6 +2060,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1962,6 +2100,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -2000,6 +2139,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &[("T".to_string(), "ns.t".to_string())],
         );
         let parsed: serde_json::Value =
@@ -2046,6 +2186,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             table_map,
         );
         let notes_str = notes.as_str().unwrap().to_string();
@@ -2183,6 +2324,7 @@ mod tests {
             DEFAULT_MEMORY_POOL_FRACTION,
             DEFAULT_INSTANCE_OVERHEAD_MB,
             DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
             &table_map,
         );
         let notes_str = notes.as_str().expect("adapterNotes is a JSON string");

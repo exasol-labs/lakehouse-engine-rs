@@ -2217,7 +2217,139 @@ The dev/e2e dependency graph collapses onto a single arrow-58 tree — no arrow 
 
 ---
 
-## ADR-082: Keep DataFusion `ParquetSource`; Apply Positional Deletes via a Per-File Base `ParquetAccessPlan`
+## ADR-082: Reference the Broadcast Join Dimension Side by File List, Not Materialized Rows
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Broadcast inner equi-join pushdown needs the small (dimension) side's data available to every fact-side shard's DataFusion session with no cross-shard exchange. The VS layer must stay thin (translation, pushdown analysis, parallelization planning) with all execution living in the UDF, per the repo's architecture boundaries, and the shard-invariant common spec is repeated to every shard invocation, so its size directly costs per-shard payload.
+
+### Decision
+
+Carry the dimension side's full file list, table root, and logical schema in the shard-invariant common spec; every shard invocation re-scans that file list itself and joins it node-locally against its fact-file subset, reusing the existing `register_files` path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Carry the dimension side by file-list reference in the common spec | ✓ Chosen — keeps the VS thin (file-list resolution only, no execution), avoids a large VARCHAR blob repeated to every shard, reuses `register_files`; the bounded small side makes per-shard re-scans cheap |
+| Materialize the dimension rows in the VS to Arrow IPC, base64-embed them in the common spec | ✗ Rejected — moves execution into the VS layer and repeats a large blob to every shard invocation |
+
+### Consequences
+
+Every shard invocation performs its own dimension-side file read, bounded by the broadcast threshold (`JOIN_BROADCAST_MAX_BYTES`, default 128 MiB), so the redundant work stays small by construction. The common spec gains a join block (table root, file list, logical schema, join type, rendered condition) that is absent for non-join specs.
+
+---
+
+## ADR-083: Ineligible Joins Fall Back to Deterministic Unaccelerated SQL, Not an Error
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Exasol capabilities are advertised once and statically; once `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` are advertised, Exasol pushes every inner equi-join to the adapter, including shapes outside the broadcast contract (small side over threshold, or a shape the translator/guard cannot serve). The adapter must decide what to return for those ineligible pushdowns without regressing currently-working join queries.
+
+### Decision
+
+For any inner equi-join the adapter cannot broadcast, emit SQL that scans each table independently through its own sharded scan-UDF fan-out subquery and lets Exasol's core engine join the two results (`INNER JOIN ... ON <condition>`). A hard error (relying on Exasol's native retry) is reserved for the genuine last resort, when even that fallback SQL cannot be built.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Deterministic unaccelerated two-scan SQL fallback | ✓ Chosen — reproduces today's (pre-JOIN-capability) behavior deterministically; correctness stays inside adapter control |
+| Always decline ineligible joins with an error and rely on Exasol re-planning | ✗ Rejected — Exasol does not cleanly re-plan on an adapter error; a hard error risks failing currently-working join queries |
+
+### Consequences
+
+The adapter carries two distinct join-rendering paths (broadcast fan-out and unaccelerated two-scan), each independently tested. Post-implementation E2E testing (ADR-085) found the first-cut two-scan rendering itself needed a correction; that refinement supersedes the rendering half of this decision's fallback path without changing the fallback-vs-error routing decided here.
+
+---
+
+## ADR-084: Shard Only the Fact Side; the Large-Side Sharding Model Is Unchanged
+
+**Date:** 2026-07-06
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Broadcast join pushdown (Phase 1 of backlog BL-001) needed to decide how much of the existing single-table file-sharding model to change to support joins, given Phase 2 (large/large shuffle join) is explicitly out of scope.
+
+### Decision
+
+The larger (fact) side keeps the existing G work-unit `GROUP BY shard_key` file-sharding exactly as the single-table path does; only the small (dimension) side's delivery (ADR-082) and the in-UDF join execution are new. No cross-shard exchange is introduced.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Shard only the fact side; reuse the existing sharding model unchanged | ✓ Chosen — broadcast is correct with no cross-shard exchange because the full small side is available to every shard; keeps Phase 2 (shuffle) fully out of scope |
+| Re-partition either side by join key (shuffle join) | ✗ Rejected — out of scope for BL-001 Phase 1 |
+
+### Consequences
+
+The existing file-sharding/parallelism model (`parallelism/work-unit-sharding`) is untouched by this plan. Broadcast join pushdown is additive: new join branches in the adapter and scan UDF, no change to how the fact side's files are partitioned into shards.
+
+---
+
+## ADR-085: Two-Scan Fallback Renders Table-Qualified Columns, Independent of the Disjoint-Column Guard
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+Supersedes the rendering half of ADR-083's two-scan fallback decision for shared-column-name joins; the broadcast path's bare-name rendering and disjoint-column guard are unchanged. Live E2E testing against a real Exasol Docker container surfaced a regression: a join between two tables that share a column name (e.g. both have `id`) hard-failed once `JOIN` was advertised. The disjoint-column-name guard (which exists only to keep the BROADCAST path's bare-name rendering against a combined in-UDF DataFusion schema unambiguous) correctly rejected the broadcast rendering, but the two-scan fallback wrongly reused that same guard-gated bare-name rendering and returned a hard `Err` instead of falling back — regressing a previously-working query, since Exasol does not retry natively on that error.
+
+### Decision
+
+The two-scan fallback renders its own join condition, WHERE filter, select list, GROUP BY, HAVING, and ORDER BY with table-qualified references (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`), resolved from each `column` node's `tableName` against the side that owns it — never against a combined bare-name schema, and not gated on the disjoint-column guard (that guard governs broadcast eligibility only). Implemented by annotating each `column` node with a `tableAlias` and teaching the shared `vs-expression` translator to emit `"ALIAS"."NAME"` when `tableAlias` is present, bare name otherwise (the single-table path is byte-for-byte unchanged). A disjoint-guard failure is a plain reason the broadcast path is unavailable, not an error; a hard `Err` (native retry) is reserved for a condition that cannot be rendered against either a bare or a qualified schema.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Give the two-scan fallback its own table-qualified rendering, independent of the broadcast disjoint-column guard | ✓ Chosen — the two-scan path is Exasol's own engine joining two already-materialized sub-results, which resolves table-qualified references natively even on a shared column name; fixes the regression without touching the broadcast path |
+| Keep the shared bare-name rendering and widen the disjoint-column guard | ✗ Rejected — would keep declining (via hard error) legitimate shared-column joins that the two-scan path can serve correctly |
+
+### Consequences
+
+`vs-expression`'s column renderer gained an optional `tableAlias` (bare name when absent, so the single-table and broadcast paths are unaffected). The two-scan fallback is now correct for shared-column-name joins. This decision is closely paired with ADR-086 (aggregate-over-join routing), found and fixed in the same post-implementation E2E pass.
+
+---
+
+## ADR-086: Aggregate-Over-Join Routes Through the Qualified Two-Scan Path, Not a Decline
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+The same post-implementation E2E pass that found ADR-085's regression also found `SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM CUSTOMER JOIN ORDERS ON ...` (the plan's own second Manual Testing example) failing with "Expected number of columns is 2 but pushdown query has 5": the fallback ignored the aggregate select list and emitted the full cross-table row projection instead.
+
+### Decision
+
+Any join request that carries an aggregate, GROUP BY, ORDER BY, LIMIT, or HAVING (`join_requires_exasol_postprocessing`) is routed to the two-scan path regardless of broadcast eligibility, because none of those can ride the broadcast in-UDF join (which renders only projection + filter + join condition). The two-scan wrapper renders the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (fact fan-out) JOIN (dim fan-out) ON ... [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ...]`), so Exasol evaluates the aggregate over the joined-and-materialized rows — exactly the pre-JOIN-capability behavior. The aggregate function name is spliced verbatim (it is Exasol's own); only its column argument is table-qualified.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Route aggregate/GROUP BY/ORDER BY/LIMIT/HAVING-bearing joins through the two-scan path unconditionally | ✓ Chosen — matches pre-JOIN-capability behavior exactly and avoids a hard error Exasol does not cleanly re-plan |
+| Decline aggregate-over-join pushdowns with an error | ✗ Rejected — same reasoning as ADR-083: a hard error risks regressing currently-working queries |
+
+### Consequences
+
+Aggregate-over-join, GROUP BY-over-join, ORDER BY-over-join, and LIMIT/HAVING-over-join queries are all served by the qualified two-scan wrapper (ADR-085), never by the broadcast in-UDF join. Both regressions found in this E2E pass (ADR-085 and this one) are covered by new host and E2E tests.
+## ADR-087: Keep DataFusion `ParquetSource`; Apply Positional Deletes via a Per-File Base `ParquetAccessPlan`
 
 **Date:** 2026-07-06
 **Plan:** `add-positional-delete-application`
@@ -2240,11 +2372,11 @@ Do NOT swap in iceberg-rust's `ArrowReader` / `iceberg-datafusion` `IcebergTable
 
 ### Consequences
 
-Positional-delete application composes with all existing pushdown and pruning rather than bypassing it, so performance on the delete-free path is unaffected and the delete-carrying path keeps the same pruning behavior (cf. apache/iceberg-rust#2376). The approach requires vendoring the positions-to-`RowSelection` construction (see ADR-084 area of the plan's decision log) since it isn't a public dependency surface.
+Positional-delete application composes with all existing pushdown and pruning rather than bypassing it, so performance on the delete-free path is unaffected and the delete-carrying path keeps the same pruning behavior (cf. apache/iceberg-rust#2376). The approach requires vendoring the positions-to-`RowSelection` construction (see ADR-089 area of the plan's decision log) since it isn't a public dependency surface.
 
 ---
 
-## ADR-083: Unify the Scan Provider on the Custom `ParquetSource`-Backed `TableProvider`, Gated by a Plan-Shape Test
+## ADR-088: Unify the Scan Provider on the Custom `ParquetSource`-Backed `TableProvider`, Gated by a Plan-Shape Test
 
 **Date:** 2026-07-06
 **Plan:** `add-positional-delete-application`
@@ -2271,7 +2403,7 @@ The delete-free scan path now goes through the same provider code as the merge-o
 
 ---
 
-## ADR-084: Plan-Time Fail-Loud at the Manifest / `DataFile` Level Is the Authoritative Correctness Gate for Unsupported Deletes
+## ADR-089: Plan-Time Fail-Loud at the Manifest / `DataFile` Level Is the Authoritative Correctness Gate for Unsupported Deletes
 
 **Date:** 2026-07-06
 **Plan:** `add-positional-delete-application`
@@ -2298,7 +2430,7 @@ An unsupported-delete query now fails immediately, cleanly, and without emitting
 
 ---
 
-## ADR-085: Minimal Scan-Spec Surface for Delete Support — Per-File References Only
+## ADR-090: Minimal Scan-Spec Surface for Delete Support — Per-File References Only
 
 **Date:** 2026-07-06
 **Plan:** `add-positional-delete-application`
@@ -2322,3 +2454,34 @@ Add only per-file positional-delete references (path, byte size, delete content 
 ### Consequences
 
 The scan spec's delete-related surface stays minimal and backward-compatible: a delete-free table produces a byte-identical common spec to before this feature, and legacy per-shard entries without deletes still reconstitute correctly. Any future delete mechanism support (equality deletes, deletion vectors) will need to extend this same minimal per-file surface rather than reintroducing the rejected schema/predicate approach.
+
+---
+
+## ADR-091: Per-Side Predicate Pushdown for Joins by `tableName` Conjunct Attribution
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+PR #70 review (antonireus) found three performance-only gaps in the join-pushdown paths — the plan was correct as-is, but each side of a join was over-scanning. (1) Both join routes resolve their file lists through `resolve_join_sides`, which passed `filter_json: None` to `resolve_file_list`, so neither side got the Iceberg manifest pruning (partition/bounds elimination) the single-table path gets from `filter_json_raw`. (2) The unaccelerated two-scan fallback built each leg's `ScanSpec` with `filter: None`, so each leg full-scanned and shipped every row to Exasol to filter. (3) That fallback also projected each table's FULL involved-column set, shipping columns no clause referenced. The `None` filter was originally justified because a pushed WHERE "may reference either table's columns" — but that rationale only holds for the *combined* predicate.
+
+The naive fix "just pass the whole WHERE JSON to each side" is UNSOUND here: `to_iceberg_predicate` resolves columns by NAME only (via `extract_column`, which ignores `tableName`), so on a shared column name (both tables have an `ID`) it would resolve the other side's `dimension.ID = 5` conjunct against THIS side's `ID` and wrongly prune fact files — the same shared-column-name hazard ADR-085 already had to defend against.
+
+### Decision
+
+For an inner equi-join (all this PR builds), attribute each WHERE conjunct to a side by its column nodes' `tableName` — the identical signal `annotate_columns_with_alias`/`build_join_alias_map` (ADR-085) already use — and push only side-local conjuncts down per side. A conjunct is side-local to side X iff EVERY column it references is tagged `tableName = X`; cross-table conjuncts, the equi-join condition, and any OR spanning both tables are withheld from both sides and applied only by the outer wrapper's WHERE (unchanged — still the correctness backstop). Because attribution is by table identity, a side-local conjunct contains only that side's columns, so `to_iceberg_predicate`/`render_df_filter_safe` resolve it against that side's own schema and the shared-column-name case stays correct. Concretely: (a) thread each side's side-local sub-predicate into `resolve_one_join_side`'s `resolve_file_list` for manifest pruning (both routes); (b) set the two-scan fallback leg's `ScanSpec.filter` to its bare-name side-local predicate for DataFusion row-group pruning + row filtering; (c) narrow each fallback leg's projection to the columns the outer wrapper actually references for that side (SELECT + condition + full WHERE + GROUP BY/HAVING/ORDER BY), dropping the rest. This is purely additive pruning; the broadcast SQL builder is untouched.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Pass the whole WHERE JSON to each side and rely on `to_iceberg_predicate` dropping unknown columns | ✗ Rejected — unsound on a shared column name: name-only resolution applies the other side's conjunct to this side and prunes wrongly |
+| `tableName`-based conjunct attribution; push only side-local conjuncts (filter + manifest pruning); narrow projection to referenced columns | ✓ Chosen — sound for inner equi-joins (a one-side conjunct is a necessary survival condition for that side's rows), reuses the ADR-085 attribution signal, and keeps shared-column-name joins correct |
+
+### Consequences
+
+Both join routes now get free Iceberg manifest pruning per side; the two-scan fallback filters and footer-prunes each leg before emitting and ships only referenced columns — closing the pruning regression versus pre-PR single-table pushdown. The narrowed projection deliberately includes the FULL WHERE's columns (not just side-local ones) because the outer wrapper still renders the whole predicate qualified, and an absent SELECT list keeps every column (`SELECT *`). Pruned byte totals also feed side selection and the broadcast threshold, which only makes both more accurate. All new logic is `tableName`-driven and unit-tested for the shared-column-name (`EVENTS.ID` ⋈ `LABELS.ID`) case so it cannot regress the ADR-085 fix.
+
+**E2E-surfaced correction (the fan-out filter must render BARE).** The live cluster sends every column node with BOTH `tableName` (e.g. `FACT_ORDERS`) AND the query's `tableAlias` (e.g. `O` for `FROM fact_orders o`), and the `vs-expression` translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. The first cut pushed the side-local predicate into the two-scan leg's `ScanSpec.filter` via `render_df_filter_safe` unchanged, so it rendered `("O"."O_ORDERDATE" …)` — but a per-side fan-out is a SINGLE-TABLE scan whose relation exposes BARE uppercase columns (`scan_target` wrapped in an unaliased derived table), so the alias-qualified reference failed to resolve (`No field named "O"."O_ORDERDATE"`), regressing every filtered join. Fix: strip `tableAlias` (`strip_table_alias`) before rendering the leg's filter, so it is bare exactly like the single-table scan path. The outer two-scan wrapper is unaffected — its `render_df_filter_qualified` re-qualifies each column to `LHS_FACT`/`LHS_DIM` (overwriting the native alias) against each side's own fan-out subquery. The broadcast path is likewise untouched: it keeps rendering the native `tableAlias`, which the in-UDF `build_join_sql` resolves against its two registered sides — a mechanical regression test now pins both behaviors (bare in the fan-out, native-alias-preserving in broadcast). Iceberg manifest pruning (`to_iceberg_predicate`) is alias-agnostic (it resolves by bare column `name`), so Finding 1 needed no stripping.
