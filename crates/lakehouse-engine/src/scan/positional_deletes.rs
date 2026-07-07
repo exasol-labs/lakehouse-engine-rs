@@ -302,9 +302,19 @@ async fn union_delete_positions(
             .ok_or_else(|| UdfError::User("positional-delete pos column is not Int64".into()))?;
 
         // Downcast the `file_path` column once per batch (tolerating `Utf8`/`LargeUtf8`)
-        // and borrow each cell in place — no per-row downcast or allocation.
+        // and borrow each cell in place — no per-row downcast or allocation. Fail
+        // loud on any other type: a silent `None`-for-every-row fallback would drop
+        // ALL positional deletes without error — exactly the silent-correctness
+        // failure mode this feature exists to eliminate.
         let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
         let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
+        if utf8.is_none() && large_utf8.is_none() {
+            return Err(UdfError::User(format!(
+                "positional-delete file_path column has unexpected type {:?} \
+                 (expected Utf8 or LargeUtf8)",
+                file_paths.data_type()
+            )));
+        }
         let path_at = |row: usize| -> Option<&str> {
             if file_paths.is_null(row) {
                 return None;
@@ -321,7 +331,17 @@ async fn union_delete_positions(
                 continue;
             }
             if path_at(row) == Some(data_file_abs) {
-                out.insert(positions.value(row) as u64);
+                let pos = positions.value(row);
+                // A negative `pos` is malformed: casting it to u64 would wrap to a
+                // huge index and silently drop the delete. Reject it loudly rather
+                // than emit a row Iceberg intended to delete.
+                if pos < 0 {
+                    return Err(UdfError::User(format!(
+                        "positional-delete file has a negative pos ({pos}); refusing to \
+                         apply a malformed delete"
+                    )));
+                }
+                out.insert(pos as u64);
             }
         }
     }
