@@ -93,3 +93,27 @@ go stale — in which case update only that reference.
 ## Review Findings
 
 <!-- Populated by speq-implement after code review. -->
+
+### Plan gap found during verification: hardcoded SLC_VERSION in test harness
+
+`make test-e2e` initially failed with `F-UDF-CL-RUST-9001: Fingerprint mismatch: expected
+0.20.2:... found 0.20.3:...`. Root cause: each of the 5 E2E test files
+(`e2e_scan_test.rs`, `e2e_capability_test.rs`, `e2e_count_distinct_test.rs`,
+`e2e_join_test.rs`, `e2e_positional_deletes_test.rs`) has its own
+`const SLC_VERSION: &str = "0.20.2"`, independent of the `Makefile`'s `SLC_VERSION` var,
+used by that file's in-process `install_slc()` to download+register the SLC. The plan's
+task 5 only covered the `Makefile` variable. Fixed by bumping all 5 consts to `"0.20.3"`;
+re-ran `make test-e2e` clean.
+
+### Code review: one fix applied, one follow-up deferred
+
+`code-reviewer` flagged 4 stale `0.20.2` narrative comments in `e2e_scan_test.rs` (lines
+11, 94, 108, 149) left behind by the const bump — fixed in this PR (comment-only, no
+rebuild needed).
+
+Flagged, deliberately deferred: the 5x duplicated `const SLC_VERSION` mirrors an
+already-blessed duplication pattern (`e2e_capability_test.rs`'s own
+`// ponytail: duplicate of e2e_scan_test setup` comment). A shared `tests/common/mod.rs`
+constant would collapse 5 bump sites to 1 and remove exactly this "miss one, get a
+fingerprint mismatch" hazard — but it changes test structure beyond a pure dependency
+bump, so it's left as a follow-up rather than folded into this PR.
