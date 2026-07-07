@@ -78,6 +78,32 @@ services:
       lakehouse:
         ipv4_address: 10.84.0.11
 
+  # Positional-delete fixtures (Apache Spark, Iceberg Spark runtime). One-shot
+  # job — mirrors minio-init: not a long-running service, just Spark's
+  # merge-on-read write path exercised once at stack bring-up to author
+  # Iceberg positional-delete fixtures that iceberg-rust cannot write itself
+  # (see scripts/spark-fixtures/run_fixtures.sh for the upstream-tracking
+  # comment + drop condition, apache/iceberg-rust#340). Joined to the SAME
+  # shared REST catalog + MinIO the rest of the stack uses, so the VS
+  # resolves the fixtures through its normal catalog path.
+  spark-iceberg-fixtures:
+    image: apache/spark:3.5.7
+    depends_on:
+      minio:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    volumes:
+      - ./scripts/spark-fixtures:/fixtures:ro
+    entrypoint:
+      - /bin/bash
+      - /fixtures/run_fixtures.sh
+    # "no" (same rationale as minio-init): a one-shot fixture job, not a
+    # long-running service.
+    restart: "no"
+    networks:
+      - lakehouse
+
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.2.1}"
     privileged: true
