@@ -2454,3 +2454,34 @@ Add only per-file positional-delete references (path, byte size, delete content 
 ### Consequences
 
 The scan spec's delete-related surface stays minimal and backward-compatible: a delete-free table produces a byte-identical common spec to before this feature, and legacy per-shard entries without deletes still reconstitute correctly. Any future delete mechanism support (equality deletes, deletion vectors) will need to extend this same minimal per-file surface rather than reintroducing the rejected schema/predicate approach.
+
+---
+
+## ADR-091: Per-Side Predicate Pushdown for Joins by `tableName` Conjunct Attribution
+
+**Date:** 2026-07-07
+**Plan:** `add-join-pushdown-broadcast`
+**Status:** Accepted
+
+### Context
+
+PR #70 review (antonireus) found three performance-only gaps in the join-pushdown paths — the plan was correct as-is, but each side of a join was over-scanning. (1) Both join routes resolve their file lists through `resolve_join_sides`, which passed `filter_json: None` to `resolve_file_list`, so neither side got the Iceberg manifest pruning (partition/bounds elimination) the single-table path gets from `filter_json_raw`. (2) The unaccelerated two-scan fallback built each leg's `ScanSpec` with `filter: None`, so each leg full-scanned and shipped every row to Exasol to filter. (3) That fallback also projected each table's FULL involved-column set, shipping columns no clause referenced. The `None` filter was originally justified because a pushed WHERE "may reference either table's columns" — but that rationale only holds for the *combined* predicate.
+
+The naive fix "just pass the whole WHERE JSON to each side" is UNSOUND here: `to_iceberg_predicate` resolves columns by NAME only (via `extract_column`, which ignores `tableName`), so on a shared column name (both tables have an `ID`) it would resolve the other side's `dimension.ID = 5` conjunct against THIS side's `ID` and wrongly prune fact files — the same shared-column-name hazard ADR-085 already had to defend against.
+
+### Decision
+
+For an inner equi-join (all this PR builds), attribute each WHERE conjunct to a side by its column nodes' `tableName` — the identical signal `annotate_columns_with_alias`/`build_join_alias_map` (ADR-085) already use — and push only side-local conjuncts down per side. A conjunct is side-local to side X iff EVERY column it references is tagged `tableName = X`; cross-table conjuncts, the equi-join condition, and any OR spanning both tables are withheld from both sides and applied only by the outer wrapper's WHERE (unchanged — still the correctness backstop). Because attribution is by table identity, a side-local conjunct contains only that side's columns, so `to_iceberg_predicate`/`render_df_filter_safe` resolve it against that side's own schema and the shared-column-name case stays correct. Concretely: (a) thread each side's side-local sub-predicate into `resolve_one_join_side`'s `resolve_file_list` for manifest pruning (both routes); (b) set the two-scan fallback leg's `ScanSpec.filter` to its bare-name side-local predicate for DataFusion row-group pruning + row filtering; (c) narrow each fallback leg's projection to the columns the outer wrapper actually references for that side (SELECT + condition + full WHERE + GROUP BY/HAVING/ORDER BY), dropping the rest. This is purely additive pruning; the broadcast SQL builder is untouched.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Pass the whole WHERE JSON to each side and rely on `to_iceberg_predicate` dropping unknown columns | ✗ Rejected — unsound on a shared column name: name-only resolution applies the other side's conjunct to this side and prunes wrongly |
+| `tableName`-based conjunct attribution; push only side-local conjuncts (filter + manifest pruning); narrow projection to referenced columns | ✓ Chosen — sound for inner equi-joins (a one-side conjunct is a necessary survival condition for that side's rows), reuses the ADR-085 attribution signal, and keeps shared-column-name joins correct |
+
+### Consequences
+
+Both join routes now get free Iceberg manifest pruning per side; the two-scan fallback filters and footer-prunes each leg before emitting and ships only referenced columns — closing the pruning regression versus pre-PR single-table pushdown. The narrowed projection deliberately includes the FULL WHERE's columns (not just side-local ones) because the outer wrapper still renders the whole predicate qualified, and an absent SELECT list keeps every column (`SELECT *`). Pruned byte totals also feed side selection and the broadcast threshold, which only makes both more accurate. All new logic is `tableName`-driven and unit-tested for the shared-column-name (`EVENTS.ID` ⋈ `LABELS.ID`) case so it cannot regress the ADR-085 fix.
+
+**E2E-surfaced correction (the fan-out filter must render BARE).** The live cluster sends every column node with BOTH `tableName` (e.g. `FACT_ORDERS`) AND the query's `tableAlias` (e.g. `O` for `FROM fact_orders o`), and the `vs-expression` translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. The first cut pushed the side-local predicate into the two-scan leg's `ScanSpec.filter` via `render_df_filter_safe` unchanged, so it rendered `("O"."O_ORDERDATE" …)` — but a per-side fan-out is a SINGLE-TABLE scan whose relation exposes BARE uppercase columns (`scan_target` wrapped in an unaliased derived table), so the alias-qualified reference failed to resolve (`No field named "O"."O_ORDERDATE"`), regressing every filtered join. Fix: strip `tableAlias` (`strip_table_alias`) before rendering the leg's filter, so it is bare exactly like the single-table scan path. The outer two-scan wrapper is unaffected — its `render_df_filter_qualified` re-qualifies each column to `LHS_FACT`/`LHS_DIM` (overwriting the native alias) against each side's own fan-out subquery. The broadcast path is likewise untouched: it keeps rendering the native `tableAlias`, which the in-UDF `build_join_sql` resolves against its two registered sides — a mechanical regression test now pins both behaviors (bare in the fan-out, native-alias-preserving in broadcast). Iceberg manifest pruning (`to_iceberg_predicate`) is alias-agnostic (it resolves by bare column `name`), so Finding 1 needed no stripping.
