@@ -117,11 +117,13 @@ pub struct SeedHandle {
     pub data_file_paths: Vec<String>,
 }
 
-/// Seed all E2E tables (events, labels, regions) into the REST catalog. Idempotent.
+/// Seed all E2E tables (events, labels, regions, star schema) into the REST
+/// catalog. Idempotent.
 pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
     let events_handle = seed_events_table(catalog_url, warehouse).await?;
     seed_labels_table(catalog_url, warehouse).await?;
     seed_partitioned(catalog_url, warehouse).await?;
+    seed_star_schema(catalog_url, warehouse).await?;
     Ok(events_handle)
 }
 
@@ -747,6 +749,147 @@ async fn write_one_labels_data_file<C: Catalog>(
         .context("commit labels Iceberg snapshot")?;
 
     Ok(paths)
+}
+
+// ---------------------------------------------------------------------------
+// Star-schema tables (dim_customer / fact_orders) for join-pushdown E2E tests
+// ---------------------------------------------------------------------------
+//
+// Two tables with a genuine foreign-key relationship and DISJOINT column-name
+// prefixes (C_* vs O_*, TPC-H customer/orders shape). The disjoint prefixes are
+// what let the join-pushdown adapter's disjoint-column guard reuse the
+// vs-expression translator and render a broadcast inner equi-join — the shared
+// `id` on the events/labels tables would instead trip that guard.
+//
+// | table        | columns                          | rows | files |
+// |--------------|----------------------------------|------|-------|
+// | dim_customer | C_CUSTKEY, C_NAME                | 5    | 1     |
+// | fact_orders  | O_ORDERKEY, O_CUSTKEY, O_ORDERDATE| 10  | 2     |
+//
+// Every order references a valid customer (O_CUSTKEY = ((O_ORDERKEY-1) % 5) + 1),
+// so the inner join `fact_orders ⋈ dim_customer ON O_CUSTKEY = C_CUSTKEY` yields
+// all FACT_ORDERS_ROWS rows. fact_orders is written across two files so the
+// broadcast fan-out (fact side sharded) is observable; dim_customer's single,
+// smaller file makes it the broadcast/dimension side under the default threshold.
+
+/// Dimension table name for the join-pushdown E2E tests.
+pub const E2E_DIM_TABLE: &str = "dim_customer";
+/// Fact table name for the join-pushdown E2E tests.
+pub const E2E_FACT_TABLE: &str = "fact_orders";
+/// Rows in `dim_customer` (customer keys 1..=DIM_CUSTOMER_ROWS).
+pub const DIM_CUSTOMER_ROWS: usize = 5;
+/// Rows in `fact_orders` (order keys 1..=FACT_ORDERS_ROWS), across two files.
+pub const FACT_ORDERS_ROWS: usize = 10;
+
+/// The customer key an order references: `((order_key - 1) % DIM_CUSTOMER_ROWS) + 1`.
+/// Every order therefore matches exactly one seeded customer.
+pub fn order_custkey(order_key: usize) -> i64 {
+    (((order_key - 1) % DIM_CUSTOMER_ROWS) + 1) as i64
+}
+
+/// Days-since-epoch for an order's `O_ORDERDATE`: `BASE_DATE + (order_key - 1)`,
+/// i.e. 2024-01-01 for order 1, 2024-01-02 for order 2, and so on.
+pub fn order_date_days(order_key: usize) -> i32 {
+    BASE_DATE + (order_key as i32 - 1)
+}
+
+/// Seed the `dim_customer` and `fact_orders` star-schema tables into the
+/// `e2e_lakehouse` namespace. Idempotent.
+pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-star").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for star schema")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let dim_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "C_CUSTKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "C_NAME", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build dim_customer Iceberg schema")?;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_DIM_TABLE,
+        dim_schema,
+        vec![vec![make_customer_batch(1, DIM_CUSTOMER_ROWS)]],
+    )
+    .await
+    .context("seed dim_customer table")?;
+
+    let fact_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "O_ORDERKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "O_CUSTKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(3, "O_ORDERDATE", Type::Primitive(PrimitiveType::Date)).into(),
+        ])
+        .build()
+        .context("build fact_orders Iceberg schema")?;
+    let mid = FACT_ORDERS_ROWS / 2;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_FACT_TABLE,
+        fact_schema,
+        vec![
+            vec![make_orders_batch(1, mid)],
+            vec![make_orders_batch(mid + 1, FACT_ORDERS_ROWS)],
+        ],
+    )
+    .await
+    .context("seed fact_orders table")?;
+    Ok(())
+}
+
+fn make_customer_batch(first_key: usize, last_key: usize) -> RecordBatch {
+    let keys: Vec<i64> = (first_key as i64..=last_key as i64).collect();
+    let names: Vec<String> = (first_key..=last_key)
+        .map(|k| format!("customer-{k:02}"))
+        .collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("C_CUSTKEY", DataType::Int64, false),
+        Field::new("C_NAME", DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("dim_customer RecordBatch construction is infallible")
+}
+
+fn make_orders_batch(first_key: usize, last_key: usize) -> RecordBatch {
+    let order_keys: Vec<i64> = (first_key as i64..=last_key as i64).collect();
+    let cust_keys: Vec<i64> = (first_key..=last_key).map(order_custkey).collect();
+    let dates: Vec<i32> = (first_key..=last_key).map(order_date_days).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("O_ORDERKEY", DataType::Int64, false),
+        Field::new("O_CUSTKEY", DataType::Int64, false),
+        Field::new("O_ORDERDATE", DataType::Date32, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(order_keys)),
+            Arc::new(Int64Array::from(cust_keys)),
+            Arc::new(Date32Array::from(dates)),
+        ],
+    )
+    .expect("fact_orders RecordBatch construction is infallible")
 }
 
 // ---------------------------------------------------------------------------
