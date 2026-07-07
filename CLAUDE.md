@@ -172,6 +172,6 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - One crate / one `.so` exports **both** entry points (VS adapter + DataFusion scan SET UDF) —
   `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
-- SDK: `exasol-udf-sdk` **0.20.2** + `exasol-udf-macros` **0.20.2** (built with rustc 1.94 to match
-  the v0.20.2 SLC fingerprint). Since 0.18.0, `connect-back`
+- SDK: `exasol-udf-sdk` **0.20.3** + `exasol-udf-macros` **0.20.3** (built with rustc 1.94 to match
+  the v0.20.3 SLC fingerprint). Since 0.18.0, `connect-back`
   is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.

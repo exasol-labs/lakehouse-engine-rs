@@ -1991,9 +1991,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-macros"
-version = "0.20.2"
+version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "386ffa6054c7a066387b1ff25681b67016d18dbfdbb7ad86483b97f94fca994f"
+checksum = "ea24b9dba7a379baffda0bf5a24181669c24389129854ee7931dd2a44b2b490c"
 dependencies = [
  "exasol-udf-sdk",
  "proc-macro2",
@@ -2003,9 +2003,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-sdk"
-version = "0.20.2"
+version = "0.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1448daac632abe923e81732e5a0aabbcba135f76e8e861051c5959e78c5462af"
+checksum = "0262e85a8617593d83f22d7c04cdff917bb6fda1d538abfd95f14cd482339f14"
 dependencies = [
  "arrow",
  "chrono",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.24.0"
+version = "0.24.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4354,7 +4354,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
