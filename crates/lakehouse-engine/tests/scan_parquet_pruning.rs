@@ -19,7 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::scan::spec::{ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -70,7 +70,7 @@ fn pruning_spec(file_url: String) -> ScanSpec {
         .unwrap_or(0);
     ScanSpec {
         table_root: String::new(),
-        files: vec![(file_url, size)],
+        files: vec![FileEntry::new(file_url, size)],
         projection: vec!["ID".into(), "NAME".into()],
         filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
         limit: None,

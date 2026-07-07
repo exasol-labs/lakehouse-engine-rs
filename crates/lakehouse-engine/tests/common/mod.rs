@@ -12,5 +12,7 @@
 #[cfg(feature = "exasol-e2e")]
 pub mod exasol_ws;
 #[cfg(feature = "exasol-e2e")]
+pub mod pos_delete_fixtures;
+#[cfg(feature = "exasol-e2e")]
 pub mod seed;
 pub mod stack;

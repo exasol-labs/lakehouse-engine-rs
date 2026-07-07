@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, LogicalField, ProjectionItem, ScanSpec, SortKey,
-    StorageProps, render_order_by_clause,
+    AggKind, AggregatePlan, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry,
+    LogicalField, ProjectionItem, ScanSpec, SortKey, StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -1148,6 +1148,18 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 // SQL builder (pure; used by handle_pushdown and unit tests)
 // ---------------------------------------------------------------------------
 
+/// Serialize one shard's file list to the per-shard UDF argument JSON.
+///
+/// Generic over the shard element so production (`FileEntry`, carrying its
+/// positional-delete refs) and legacy/test call sites (bare `(path, size)`
+/// tuples) share one path: each element is converted into a [`FileEntry`] via
+/// `Into` — the identity conversion for a `FileEntry` (deletes preserved) and
+/// the delete-free [`FileEntry::new`] for a tuple — before serialization.
+fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {
+    let entries: Vec<FileEntry> = files.iter().cloned().map(Into::into).collect();
+    ScanSpec::files_json(&entries)
+}
+
 /// Build the scan-driving SQL from a resolved file list partitioned into shards.
 ///
 /// **Row queries** (no aggregates in spec):
@@ -1170,9 +1182,9 @@ fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 /// type. Pass `&[]` to emit uncast merge items (row scans never read it).
 // ponytail: 8 args is one over the lint threshold; matches the sibling grouped builder.
 #[allow(clippy::too_many_arguments)]
-pub fn build_scan_driving_sql(
+pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<(String, u64)>],
+    shards: &[Vec<E>],
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
@@ -1216,9 +1228,9 @@ pub fn build_scan_driving_sql(
 /// the one shared [`render_order_by_clause`] seam, so they agree on direction and
 /// NULL placement — the correctness-critical invariant. `order_by` is empty for
 /// plain (unordered) row scans, leaving that path byte-identical to before.
-fn build_row_scan_sql(
+fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<(String, u64)>],
+    shards: &[Vec<E>],
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
@@ -1245,7 +1257,7 @@ fn build_row_scan_sql(
     let inner = if shards.len() == 1 {
         let files = &shards[0];
         let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
+        let files_literal = sql_string_literal(&shard_files_json(files));
         format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
@@ -1269,9 +1281,9 @@ fn build_row_scan_sql(
 /// The EMITS clause names and types follow the COLUMN CONTRACT defined in
 /// `crate::scan::build_partial_agg_sql`.  The outer merge SELECT consumes those
 /// exact column names.
-fn build_aggregate_scan_sql(
+fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<(String, u64)>],
+    shards: &[Vec<E>],
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
     aggregate_types: &[String],
@@ -1285,7 +1297,7 @@ fn build_aggregate_scan_sql(
     let fan_out = if shards.len() == 1 {
         let files = &shards[0];
         let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
+        let files_literal = sql_string_literal(&shard_files_json(files));
         format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
@@ -1407,9 +1419,9 @@ enum GroupedOrderBy {
 // two places and every argument is a distinct, already-resolved plan input (no
 // natural sub-grouping) — a params struct would just rename the boilerplate.
 #[allow(clippy::too_many_arguments)]
-pub fn build_grouped_aggregate_scan_sql(
+pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<(String, u64)>],
+    shards: &[Vec<E>],
     group_keys: &[String],
     group_key_types: &[String],
     aggregates: &[AggregatePlan],
@@ -1487,7 +1499,7 @@ pub fn build_grouped_aggregate_scan_sql(
     let fan_out = if shards.len() == 1 {
         let files = &shards[0];
         let common_literal = sql_string_literal(&common_template.to_common_json());
-        let files_literal = sql_string_literal(&ScanSpec::files_json(files));
+        let files_literal = sql_string_literal(&shard_files_json(files));
         format!(
             "SELECT {udf}({common}, {files}) EMITS ({emits})",
             udf = udf_name,
@@ -1946,9 +1958,9 @@ fn cast_merge_items(
 /// aggregation for aggregate pushdown. Callers that must exclude the LIMIT from the
 /// shard scan (grouped aggregates) pass a `spec_template` whose `limit` is already
 /// `None`, so the shared common blob carries no LIMIT for every shard by construction.
-pub fn build_fan_out_inner(
+pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
-    shards: &[Vec<(String, u64)>],
+    shards: &[Vec<E>],
     emits: &str,
     udf_name: &str,
 ) -> String {
@@ -1958,7 +1970,7 @@ pub fn build_fan_out_inner(
         .iter()
         .enumerate()
         .map(|(i, files)| {
-            let files_literal = sql_string_literal(&ScanSpec::files_json(files));
+            let files_literal = sql_string_literal(&shard_files_json(files));
             format!("({i},{files_literal})")
         })
         .collect();
@@ -1999,16 +2011,25 @@ fn relativize_path_to_root(path: &str, table_root: &str) -> String {
 /// Strip `table_root` from every under-root file path in each shard (see
 /// [`relativize_path_to_root`]) while preserving byte sizes and shard membership.
 /// Paths not under the root stay absolute.
-fn relativize_shards_to_root(
-    shards: Vec<Vec<(String, u64)>>,
-    table_root: &str,
-) -> Vec<Vec<(String, u64)>> {
+///
+/// Each data file's associated positional-delete file paths are relativized by
+/// the SAME [`relativize_path_to_root`] rule as the data-file path, so the scan
+/// UDF rejoins them onto `table_root` identically (delete files written by the
+/// same engine live under the same table root). Delete byte sizes and content
+/// types are preserved unchanged.
+fn relativize_shards_to_root(shards: Vec<Vec<FileEntry>>, table_root: &str) -> Vec<Vec<FileEntry>> {
     shards
         .into_iter()
         .map(|shard| {
             shard
                 .into_iter()
-                .map(|(path, size)| (relativize_path_to_root(&path, table_root), size))
+                .map(|mut entry| {
+                    entry.path = relativize_path_to_root(&entry.path, table_root);
+                    for delete in &mut entry.deletes {
+                        delete.path = relativize_path_to_root(&delete.path, table_root);
+                    }
+                    entry
+                })
                 .collect()
         })
         .collect()
@@ -2380,7 +2401,7 @@ pub async fn resolve_file_list(
     storage: &StorageProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
-) -> Result<(Vec<(String, u64)>, StorageProps, Vec<LogicalField>, String), UdfError> {
+) -> Result<(Vec<FileEntry>, StorageProps, Vec<LogicalField>, String), UdfError> {
     // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
     // catalog-auth mode applies, then derive the effective storage gated SOLELY on
     // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
@@ -2446,8 +2467,182 @@ pub async fn resolve_file_list(
     // Extract the logical schema before `plan_files_from_table` consumes `table`.
     let logical_schema = build_logical_schema(table.metadata().current_schema());
 
+    // AUTHORITATIVE correctness gate: fail loud at the manifest/`DataFile` level on
+    // any delete/data mechanism this engine cannot apply (equality delete, Puffin/v3
+    // deletion vector, ORC/Avro data or delete file) BEFORE building any
+    // scan-driving SQL. This must run before `plan_files_from_table` so the deletes
+    // it associates are guaranteed to be applicable Parquet positional deletes.
+    ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
+
     let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
     Ok((files, effective_storage, logical_schema, table_root))
+}
+
+/// A data- or delete-file mechanism the lakehouse engine cannot apply on read.
+///
+/// This engine applies ONLY Parquet positional deletes over Parquet data files.
+/// Every other mechanism must fail loud at plan time — invalid results must never
+/// be returned (mission: "correctness and safety are first-class"). The variant is
+/// used solely to name the mechanism in a clean, credential-free error; it never
+/// carries a file path or any secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsupportedDeleteMechanism {
+    /// Iceberg equality deletes (`DataContentType::EqualityDeletes`).
+    EqualityDelete,
+    /// Iceberg v3 Puffin deletion vector (position delete stored as a Puffin blob).
+    DeletionVector,
+    /// An ORC data file (`DataFileFormat::Orc`).
+    OrcDataFile,
+    /// An Avro data file (`DataFileFormat::Avro`).
+    AvroDataFile,
+    /// An ORC positional-delete file.
+    OrcDeleteFile,
+    /// An Avro positional-delete file.
+    AvroDeleteFile,
+    /// A data file in a format this engine does not read as columnar Parquet.
+    NonParquetDataFile,
+}
+
+impl UnsupportedDeleteMechanism {
+    /// A stable, credential-free English name for the mechanism, spliced into the
+    /// plan-time fail-loud error. Never includes a file path or any secret value.
+    fn describe(self) -> &'static str {
+        match self {
+            UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
+            UnsupportedDeleteMechanism::DeletionVector => "Iceberg v3 Puffin deletion vectors",
+            UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
+            UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
+            UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
+            UnsupportedDeleteMechanism::AvroDeleteFile => "Avro delete files",
+            UnsupportedDeleteMechanism::NonParquetDataFile => "non-Parquet data files",
+        }
+    }
+}
+
+/// Classify one manifest `DataFile` by its content type and file format, at the
+/// authoritative manifest level (where the Puffin discriminator and file format
+/// are still visible — `plan_files` drops them, so a deletion vector would be
+/// indistinguishable from a Parquet positional delete at read time).
+///
+/// Returns `Ok(())` ONLY for the two mechanisms this engine can apply correctly:
+/// a Parquet DATA file and a Parquet POSITION-DELETE file. Every other
+/// (content, format) combination returns the specific unsupported mechanism so
+/// the caller can fail loud before building any scan-driving SQL.
+fn classify_manifest_file(
+    content: iceberg::spec::DataContentType,
+    format: iceberg::spec::DataFileFormat,
+) -> Result<(), UnsupportedDeleteMechanism> {
+    use UnsupportedDeleteMechanism as U;
+    use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
+    use iceberg::spec::DataFileFormat::{Avro, Orc, Parquet, Puffin};
+    match content {
+        Data => match format {
+            Parquet => Ok(()),
+            Orc => Err(U::OrcDataFile),
+            Avro => Err(U::AvroDataFile),
+            Puffin => Err(U::NonParquetDataFile),
+        },
+        PositionDeletes => match format {
+            Parquet => Ok(()),
+            // A position delete stored as a Puffin blob IS a v3 deletion vector.
+            Puffin => Err(U::DeletionVector),
+            Orc => Err(U::OrcDeleteFile),
+            Avro => Err(U::AvroDeleteFile),
+        },
+        EqualityDeletes => Err(U::EqualityDelete),
+    }
+}
+
+/// Build the plan-time fail-loud error for an unsupported delete mechanism.
+///
+/// The message names ONLY the mechanism (never a file path, which could in
+/// principle embed a presigned credential) and is defensively passed through
+/// [`redact_catalog_error`] so no secret can survive into surfaced SQL/error text.
+fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
+    let msg = format!(
+        "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
+         cannot apply on read (only Parquet positional deletes are supported); \
+         Exasol will retry the query natively",
+        table_name,
+        mechanism.describe(),
+    );
+    UdfError::User(redact_catalog_error(&msg))
+}
+
+/// Fail loud at plan time if the table's current snapshot uses ANY delete/data
+/// mechanism this engine cannot apply, detected at the manifest/`DataFile` level.
+///
+/// This is the AUTHORITATIVE correctness gate (invalid results must never be
+/// returned). It enumerates the current snapshot's manifest list, loads each
+/// manifest, and classifies every ALIVE `DataFile` (both data and delete
+/// manifests) via [`classify_manifest_file`]. Detection happens here — before any
+/// scan-driving SQL is built — because `plan_files` collapses each task to a bare
+/// path and drops the Puffin discriminator and file format needed to tell a
+/// Parquet positional delete from a deletion vector.
+///
+/// A table with no current snapshot (empty table) trivially passes.
+async fn ensure_supported_delete_mechanisms(
+    table: &iceberg::table::Table,
+    table_name: &str,
+) -> Result<(), UdfError> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(());
+    };
+    let file_io = table.file_io();
+
+    let manifest_list_bytes = file_io
+        .new_input(snapshot.manifest_list())
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to open Iceberg manifest list for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?
+        .read()
+        .await
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to read Iceberg manifest list for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?;
+
+    let manifest_list = iceberg::spec::ManifestList::parse_with_version(
+        &manifest_list_bytes,
+        metadata.format_version(),
+    )
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to parse Iceberg manifest list for '{}': {}",
+            table_name,
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+            UdfError::User(format!(
+                "failed to load Iceberg manifest for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?;
+        for entry in manifest.entries() {
+            // Skip entries removed in this snapshot: a DELETED manifest entry no
+            // longer applies, so failing on it would spuriously reject queries.
+            if !entry.is_alive() {
+                continue;
+            }
+            let data_file = entry.data_file();
+            classify_manifest_file(data_file.content_type(), data_file.file_format())
+                .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Drive the iceberg scan and collect the data-file paths with their sizes.
@@ -2455,11 +2650,30 @@ pub async fn resolve_file_list(
 /// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
 /// `plan_files` so manifests and files that cannot match are skipped. DataFusion
 /// remains the row-level correctness backstop; this is pruning-only.
+/// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
+///
+/// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
+/// ([`ensure_supported_delete_mechanisms`]) has already rejected any table that
+/// uses equality deletes or Puffin deletion vectors, so every `PositionDeletes`
+/// task delete is guaranteed to be a Parquet positional delete. The other arms
+/// are mapped honestly for defense-in-depth: they can only be produced if a
+/// mechanism somehow slips past the gate, and the scan reader's read-time backstop
+/// then rejects them cleanly. `Data` never appears in a task's delete list; it is
+/// mapped to a non-positional sentinel so it is likewise rejected rather than
+/// silently applied.
+fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileContentType {
+    match t {
+        iceberg::spec::DataContentType::PositionDeletes => DeleteFileContentType::PositionDeletes,
+        iceberg::spec::DataContentType::EqualityDeletes => DeleteFileContentType::EqualityDeletes,
+        iceberg::spec::DataContentType::Data => DeleteFileContentType::EqualityDeletes,
+    }
+}
+
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
     filter_json: Option<&Json>,
-) -> Result<Vec<(String, u64)>, UdfError> {
+) -> Result<Vec<FileEntry>, UdfError> {
     let mut scan_builder = table.scan();
     if let Some(fj) = filter_json {
         let schema = table.metadata().current_schema();
@@ -2487,9 +2701,29 @@ async fn plan_files_from_table(
         ))
     })?;
 
+    // Associate each data file's Parquet positional-delete files into its entry.
+    // The plan-time fail-loud gate (`ensure_supported_delete_mechanisms`) has
+    // already run, so any `.deletes` present here are applicable Parquet
+    // positional deletes. Absolute delete paths are relativized later, in
+    // `relativize_shards_to_root`, EXACTLY like the data-file path.
     Ok(tasks
         .into_iter()
-        .map(|t| (t.data_file_path().to_string(), t.file_size_in_bytes))
+        .map(|t| {
+            let deletes: Vec<DeleteFileRef> = t
+                .deletes
+                .iter()
+                .map(|d| DeleteFileRef {
+                    path: d.file_path.clone(),
+                    size: d.file_size_in_bytes,
+                    content_type: map_delete_content_type(d.file_type),
+                })
+                .collect();
+            FileEntry::with_deletes(
+                t.data_file_path().to_string(),
+                t.file_size_in_bytes,
+                deletes,
+            )
+        })
         .collect())
 }
 
@@ -3367,7 +3601,296 @@ fn redact_catalog_error(msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan::spec::StorageProps;
+    use iceberg::spec::{DataContentType, DataFileFormat};
     use vs_expression::render_df_filter_safe;
+
+    // ---------------------------------------------------------------------------
+    // Task 1.3 — fail-loud on unsupported delete/data mechanisms (manifest level)
+    // ---------------------------------------------------------------------------
+
+    /// The two mechanisms this engine CAN apply — a Parquet data file and a
+    /// Parquet positional-delete file — classify as supported (`Ok`).
+    #[test]
+    fn classify_accepts_parquet_data_and_parquet_positional_delete() {
+        assert!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Parquet).is_ok(),
+            "Parquet data file must be supported"
+        );
+        assert!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Parquet)
+                .is_ok(),
+            "Parquet positional delete must be supported"
+        );
+    }
+
+    /// Equality deletes fail loud regardless of file format.
+    #[test]
+    fn classify_rejects_equality_deletes() {
+        for fmt in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+        ] {
+            assert_eq!(
+                classify_manifest_file(DataContentType::EqualityDeletes, fmt),
+                Err(UnsupportedDeleteMechanism::EqualityDelete),
+                "equality delete ({fmt:?}) must fail loud"
+            );
+        }
+    }
+
+    /// A position delete stored as a Puffin blob is a v3 deletion vector — the
+    /// exact case indistinguishable from a Parquet positional delete once
+    /// `plan_files` has dropped the format discriminator, so it MUST be caught at
+    /// the manifest level.
+    #[test]
+    fn classify_rejects_puffin_deletion_vector() {
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Puffin),
+            Err(UnsupportedDeleteMechanism::DeletionVector),
+            "Puffin position delete (deletion vector) must fail loud"
+        );
+    }
+
+    /// ORC/Avro data and delete files fail loud.
+    #[test]
+    fn classify_rejects_orc_and_avro_data_and_delete_files() {
+        assert_eq!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Orc),
+            Err(UnsupportedDeleteMechanism::OrcDataFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Avro),
+            Err(UnsupportedDeleteMechanism::AvroDataFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Orc),
+            Err(UnsupportedDeleteMechanism::OrcDeleteFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Avro),
+            Err(UnsupportedDeleteMechanism::AvroDeleteFile),
+        );
+    }
+
+    /// The fail-loud error names the mechanism, names the table, and leaks no
+    /// credential (defensively redacted).
+    #[test]
+    fn unsupported_delete_error_names_mechanism_and_redacts() {
+        let err = unsupported_delete_error(
+            UnsupportedDeleteMechanism::DeletionVector,
+            "db.mor_dv_table",
+        );
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains("Iceberg v3 Puffin deletion vectors"),
+            "error must name the mechanism: {msg}"
+        );
+        assert!(
+            msg.contains("db.mor_dv_table"),
+            "error must name the offending table: {msg}"
+        );
+        // No credential label may survive the defensive redaction.
+        assert!(
+            !msg.contains("access_key"),
+            "must not leak access_key: {msg}"
+        );
+        assert!(
+            !msg.contains("secret_key"),
+            "must not leak secret_key: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
+    // ---------------------------------------------------------------------------
+
+    /// A Parquet positional-delete file ref.
+    fn pos_delete(path: &str, size: u64) -> DeleteFileRef {
+        DeleteFileRef {
+            path: path.into(),
+            size,
+            content_type: DeleteFileContentType::PositionDeletes,
+        }
+    }
+
+    /// A minimal delete-carrying row-scan `ScanSpec` template (files replaced per
+    /// shard by the builder), used to assert what the per-shard/common arguments
+    /// carry.
+    fn delete_spec_template() -> ScanSpec {
+        ScanSpec {
+            table_root: "s3://warehouse/db/table".into(),
+            files: vec![],
+            projection: vec![ProjectionItem::Column("ID".into())],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: vec!["DECIMAL(20,0)".into()],
+            logical_schema: Vec::new(),
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        }
+    }
+
+    /// `map_delete_content_type` maps the iceberg task-level content type onto the
+    /// wire enum honestly (position → position; equality → equality).
+    #[test]
+    fn map_delete_content_type_maps_position_and_equality() {
+        use iceberg::spec::DataContentType;
+        assert_eq!(
+            map_delete_content_type(DataContentType::PositionDeletes),
+            DeleteFileContentType::PositionDeletes
+        );
+        assert_eq!(
+            map_delete_content_type(DataContentType::EqualityDeletes),
+            DeleteFileContentType::EqualityDeletes
+        );
+    }
+
+    /// A data file's associated positional-delete file paths are relativized by
+    /// the SAME rule as the data-file path: an under-root path is stripped to a
+    /// root-relative path, a path not under the root stays absolute. Delete size
+    /// and content type are preserved.
+    #[test]
+    fn delete_file_paths_use_relative_absolute_encoding() {
+        let root = "s3://warehouse/db/table";
+        let entry = FileEntry::with_deletes(
+            format!("{root}/data/part-0.parquet"),
+            1000,
+            vec![
+                // under the table root — must relativize exactly like the data path
+                pos_delete(&format!("{root}/data/deletes/del-0.parquet"), 50),
+                // not under the root — must stay absolute
+                pos_delete("s3://other-bucket/del-x.parquet", 60),
+            ],
+        );
+        let shards = relativize_shards_to_root(vec![vec![entry]], root);
+        let e = &shards[0][0];
+        assert_eq!(e.path, "data/part-0.parquet", "data path must relativize");
+        assert_eq!(
+            e.deletes[0].path, "data/deletes/del-0.parquet",
+            "under-root delete path must relativize EXACTLY like the data path"
+        );
+        assert_eq!(e.deletes[0].size, 50, "delete size preserved");
+        assert_eq!(
+            e.deletes[0].content_type,
+            DeleteFileContentType::PositionDeletes,
+            "delete content type preserved"
+        );
+        assert_eq!(
+            e.deletes[1].path, "s3://other-bucket/del-x.parquet",
+            "a delete path not under the root must stay absolute"
+        );
+    }
+
+    /// Positional deletes survive into the per-shard scan spec for BOTH
+    /// `write.delete.granularity=file` (one data file → its own delete file) and
+    /// `partition` (one delete file referenced by multiple data files).
+    #[test]
+    fn adapter_preserves_positional_deletes_into_scan_spec() {
+        // file granularity: one data file carries its own positional-delete file.
+        let file_gran = vec![FileEntry::with_deletes(
+            "data/part-0.parquet",
+            1000,
+            vec![pos_delete("data/deletes/del-0.parquet", 50)],
+        )];
+        let back = ScanSpec::files_from_json(&shard_files_json(&file_gran)).unwrap();
+        assert_eq!(back, file_gran, "file-granularity deletes must round-trip");
+        assert_eq!(back[0].deletes.len(), 1);
+        assert_eq!(
+            back[0].deletes[0].content_type,
+            DeleteFileContentType::PositionDeletes
+        );
+
+        // partition granularity: the SAME delete file is referenced by two data files.
+        let shared = "data/deletes/part-del.parquet";
+        let part_gran = vec![
+            FileEntry::with_deletes("data/p0.parquet", 1, vec![pos_delete(shared, 80)]),
+            FileEntry::with_deletes("data/p1.parquet", 1, vec![pos_delete(shared, 80)]),
+        ];
+        let back2 = ScanSpec::files_from_json(&shard_files_json(&part_gran)).unwrap();
+        assert_eq!(
+            back2, part_gran,
+            "both data files must retain the shared partition delete"
+        );
+        assert_eq!(back2[1].deletes[0].path, shared);
+    }
+
+    /// A delete-carrying entry serializes with its content type on the wire; a
+    /// delete-free entry stays the compact `[path, size]` 2-tuple (no wire bloat,
+    /// backward-compatible with pre-delete payloads).
+    #[test]
+    fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
+        let with_del = vec![FileEntry::with_deletes(
+            "d.parquet",
+            5,
+            vec![pos_delete("del.parquet", 2)],
+        )];
+        let json = shard_files_json(&with_del);
+        assert!(
+            json.contains("position_deletes"),
+            "delete content type must appear on the wire: {json}"
+        );
+        let back = ScanSpec::files_from_json(&json).unwrap();
+        assert_eq!(
+            back[0].deletes[0].content_type,
+            DeleteFileContentType::PositionDeletes
+        );
+
+        let free = vec![FileEntry::new("data/part-0.parquet", 1000)];
+        assert_eq!(
+            shard_files_json(&free),
+            r#"[["data/part-0.parquet",1000]]"#,
+            "delete-free entry must stay the compact 2-tuple form"
+        );
+    }
+
+    /// Delete refs ride ONLY in the per-shard files argument, never in the
+    /// shard-invariant common blob, and the common blob carries no serialized
+    /// Iceberg schema or bound predicate (the minimal-surface decision).
+    #[test]
+    fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
+        let spec_template = delete_spec_template();
+        let shards = vec![vec![FileEntry::with_deletes(
+            "data/part-0.parquet",
+            1000,
+            vec![pos_delete("data/deletes/del-0.parquet", 50)],
+        )]];
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &[ProjectionItem::Column("ID".into())],
+            &["DECIMAL(20,0)".to_string()],
+            None,
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+            DISTINCT_MERGE_UDF_NAME,
+        );
+        assert!(
+            sql.contains("del-0.parquet"),
+            "per-shard files argument must carry the delete file: {sql}"
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("del-0.parquet"),
+            "common blob must NOT carry per-shard delete refs: {common}"
+        );
+        assert!(
+            !common.contains("BoundPredicate") && !common.contains("bound_predicate"),
+            "common blob must carry no serialized iceberg predicate: {common}"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // shard_count — cap/clamp boundary tests
@@ -3475,7 +3998,8 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
-        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let files_with_sizes: Vec<FileEntry> =
+            files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
         let shards =
             crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
@@ -3543,6 +4067,7 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
+        let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
         let g = shard_count(cluster_nodes, 1, files.len());
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let shards = relativize_shards_to_root(shards, table_root);
@@ -4589,6 +5114,7 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
+        let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
         let g = shard_count(cluster_nodes, 1, files.len());
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let aggregate_types = aggregate_exasol_types(&pushdown_req);
@@ -5388,7 +5914,7 @@ mod tests {
         let spec_json = {
             // Reconstruct the shard spec as the builder would.
             let mut s = spec_template.clone();
-            s.files = vec![("s3://warehouse/f.parquet".into(), 1)];
+            s.files = vec![FileEntry::new("s3://warehouse/f.parquet", 1)];
             s.to_json()
         };
         let parsed = ScanSpec::from_json(&spec_json).expect("spec must parse");
@@ -5538,7 +6064,10 @@ mod tests {
 
         // cluster_nodes=3 forces 3 shards (one file each) — the same multi-shard
         // fan-out shape `handle_pushdown` builds via `build_scan_driving_sql`.
-        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let files_with_sizes: Vec<FileEntry> = files
+            .into_iter()
+            .map(|p: String| FileEntry::new(p, 1))
+            .collect();
         let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, 3);
         let sql = build_scan_driving_sql(
             &spec_template,
@@ -5592,7 +6121,8 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
-        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let files_with_sizes: Vec<FileEntry> =
+            files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
         let shards =
             crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
         build_scan_driving_sql(
@@ -7036,7 +7566,8 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
-        let files_with_sizes: Vec<(String, u64)> = files.into_iter().map(|p| (p, 1)).collect();
+        let files_with_sizes: Vec<FileEntry> =
+            files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
         let shards = crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, g);
         let select_items = keys_first_select_items(group_keys.len(), agg_plans.len());
         build_grouped_aggregate_scan_sql(
@@ -7920,7 +8451,7 @@ mod tests {
         let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
         let spec = ScanSpec {
             table_root: String::new(),
-            files: vec![("s3://w/f0.parquet".into(), 1)],
+            files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
             projection: vec![],
             filter: None,
             limit: None,
@@ -9233,7 +9764,10 @@ mod tests {
         // NEVER threaded into ScanSpec (it has no auth fields by construction).
         let spec = ScanSpec {
             table_root: String::new(),
-            files: vec![("s3://warehouse/db/events/part-00000.parquet".into(), 1)],
+            files: vec![FileEntry::new(
+                "s3://warehouse/db/events/part-00000.parquet",
+                1,
+            )],
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
@@ -9833,7 +10367,10 @@ mod tests {
 
         let spec = ScanSpec {
             table_root: String::new(),
-            files: vec![("s3://warehouse/db/events/part-00000.parquet".into(), 1)],
+            files: vec![FileEntry::new(
+                "s3://warehouse/db/events/part-00000.parquet",
+                1,
+            )],
             projection: vec!["ID".into()],
             filter: None,
             limit: None,
