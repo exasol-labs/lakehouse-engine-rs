@@ -36,7 +36,13 @@ spec argument, serialized once for the whole fan-out.
 * Storage credentials (including vended S3 keys) reach the UDF only inside the
   shard-invariant common spec argument, serialized once for the whole fan-out rather
   than repeated per shard; the UDF never contacts the catalog or re-requests credentials.
-* Credentials MUST NOT appear in any error message.
+  This single S3 object store built from those credentials is reused for both data files
+  and their associated positional-delete files.
+* Credentials MUST NOT appear in any error message, including one raised while reading a
+  delete file.
+* Delete-carrying data files need their Parquet footer both for access-plan construction
+  and by the opener; a shared reader factory / cached metadata reader avoids parsing the
+  footer twice.
 * See `datafusion-scan/scan-execution` for the base two-argument scan execution scenarios.
 
 ## Scenarios
@@ -90,3 +96,19 @@ spec argument, serialized once for the whole fan-out.
 * *AND* a row group whose column statistics provably exclude the predicate SHALL NOT be decoded
 * *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `vs-adapter/pushdown-file-pruning` — files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
+
+### Scenario: Positional-delete files are read with the same vended credentials
+
+* *GIVEN* a scan invocation whose shard-invariant common spec carries a storage block with vended S3 credentials (access key, secret key, session token) resolved once by the planning layer
+* *WHEN* the scan UDF reads a data file's associated positional-delete files from object storage
+* *THEN* the UDF SHALL read the delete files through the SAME S3 object store configured from those common-spec credentials, reusing the object store built for the data files
+* *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials to read a delete file
+* *AND* a credential value MUST NOT appear in any error message the UDF returns while reading a delete file
+
+### Scenario: A shared Parquet metadata reader avoids a duplicate footer parse
+
+* *GIVEN* a data file that carries positional deletes, whose Parquet footer is needed both to build the base `ParquetAccessPlan` and by the Parquet opener
+* *WHEN* the scan UDF configures the `ParquetSource` for its assigned files
+* *THEN* the UDF SHOULD install a `ParquetFileReaderFactory` (or an equivalent cached metadata reader) so the data file's footer metadata parsed for access-plan construction is reused by the opener rather than parsed a second time
+* *AND* if no shared reader is installed, the UDF MAY accept one additional footer range GET per delete-carrying data file, but MUST NOT issue a HEAD request in either case
+* *AND* the configured batch size and Parquet row-group / page pruning SHALL apply unchanged whether or not a shared reader is installed

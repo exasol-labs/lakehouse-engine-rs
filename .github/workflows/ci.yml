@@ -25,6 +25,7 @@ env:
   EXASOL_IMAGE_TAG: "2025.2.1"
   MINIO_IMAGE_TAG: "RELEASE.2025-01-20T14-49-07Z"
   ICEBERG_REST_IMAGE_TAG: "1.10.1"
+  SPARK_IMAGE_TAG: "3.5.7"
 
 jobs:
   # ── build early ──────────────────────────────────────────────────────────
@@ -345,6 +346,29 @@ jobs:
             docker save "apache/iceberg-rest-fixture:$TAG" -o "$TAR"
           fi
 
+      # Only the base Spark image is cached here; the Iceberg Spark runtime +
+      # AWS bundle jars come from `--packages` (Ivy resolution) inside the
+      # spark-iceberg-fixtures container itself. That ~150 MB download is NOT
+      # cached — it is repeated on every stack bring-up (a container-local Ivy
+      # cache under /tmp, deliberately not volume-backed; see the rationale in
+      # scripts/spark-fixtures/run_fixtures.sh).
+      - name: Cache Spark image
+        uses: actions/cache@v6
+        with:
+          path: /tmp/spark.tar
+          key: spark-${{ env.SPARK_IMAGE_TAG }}
+
+      - name: Load or pull Spark image
+        run: |
+          TAG="${{ env.SPARK_IMAGE_TAG }}"
+          TAR=/tmp/spark.tar
+          if [ -f "$TAR" ]; then
+            docker load -i "$TAR"
+          else
+            docker pull "apache/spark:$TAG"
+            docker save "apache/spark:$TAG" -o "$TAR"
+          fi
+
       # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
       # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
       # Exasol launches nschroot to sandbox the UDF, which needs CAP_SYS_ADMIN
@@ -376,6 +400,18 @@ jobs:
             exit 1
           fi
           docker compose up -d --wait exasol minio iceberg-rest
+
+          # spark-iceberg-fixtures is a second one-shot job (same rationale as
+          # minio-init above): it authors the positional-delete E2E fixtures
+          # by running Apache Spark once, then exits — so it's waited on with
+          # `docker wait`, not folded into the --wait set above.
+          docker compose up -d spark-iceberg-fixtures
+          SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
+          if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
+            echo "::error::spark-iceberg-fixtures exited $SPARK_FIXTURES_EXIT (positional-delete fixture authoring failed)"
+            docker compose logs spark-iceberg-fixtures
+            exit 1
+          fi
 
       # SLC download, BucketFS upload, and VS creation all happen in-process
       # inside the Rust test harness (crates/lakehouse-engine/tests/e2e_scan_test.rs

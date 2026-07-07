@@ -1,6 +1,6 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files. The scan-driving SQL passes the shard-invariant parts (projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once as the UDF's common argument and each shard's per-file `(path, size)` subset as the per-shard argument. See `vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate sub-select) that don't map onto the source table's own columns.
+Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files. The scan-driving SQL passes the shard-invariant parts (projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once as the UDF's common argument and each shard's per-file `(path, size)` subset as the per-shard argument. See `vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate sub-select) that don't map onto the source table's own columns. This delta extends the resolve-once seam to also associate each data file's positional-delete files and carry them minimally in the per-shard argument.
 
 ## Background
 
@@ -9,6 +9,8 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 * The scan-driving SQL serializes the shard-invariant common spec once (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) and carries only each shard's per-file `(path, size)` subset per shard.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
+* The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
+* Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
 
 ## Scenarios
 
@@ -96,3 +98,11 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 * *WHEN* the adapter resolves that identifier to load the table from the catalog
 * *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
 * *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path
+
+### Scenario: Positional-delete file references are carried in the per-shard files argument
+
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by MinIO, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
+* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
+* *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
