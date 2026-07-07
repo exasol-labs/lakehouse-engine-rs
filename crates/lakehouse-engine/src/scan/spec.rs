@@ -288,9 +288,9 @@ pub struct LogicalField {
 /// other than [`PositionDeletes`](DeleteFileContentType::PositionDeletes)
 /// BEFORE a file reaches this spec; the other variants exist so the scan
 /// reader's read-time backstop can still reject a delete file cleanly (rather
-/// than panic or apply it incorrectly) if one ever slips through — see the
-/// "Minimal ScanSpec surface" decision in
-/// `specs/_plans/add-positional-delete-application/plan.md`.
+/// than panic or apply it incorrectly) if one ever slips through — see
+/// ADR-085 ("Minimal Scan-Spec Surface for Delete Support") in
+/// `specs/decision-log.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteFileContentType {

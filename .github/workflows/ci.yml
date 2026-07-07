@@ -348,10 +348,10 @@ jobs:
 
       # Only the base Spark image is cached here; the Iceberg Spark runtime +
       # AWS bundle jars come from `--packages` (Ivy resolution) inside the
-      # spark-iceberg-fixtures container itself, cached across runs via the
-      # spark-ivy-cache Docker volume declared in docker-compose.yml (not
-      # available to cache here since it's populated at container run time,
-      # not image build time).
+      # spark-iceberg-fixtures container itself. That ~150 MB download is NOT
+      # cached — it is repeated on every stack bring-up (a container-local Ivy
+      # cache under /tmp, deliberately not volume-backed; see the rationale in
+      # scripts/spark-fixtures/run_fixtures.sh).
       - name: Cache Spark image
         uses: actions/cache@v6
         with:

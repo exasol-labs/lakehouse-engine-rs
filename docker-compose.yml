@@ -93,6 +93,13 @@ services:
         condition: service_healthy
       iceberg-rest:
         condition: service_healthy
+    # S3FileIO uses the AWS SDK v2, whose DefaultAwsRegionProviderChain fails
+    # the write with "Unable to load region from any of the providers" unless a
+    # region is supplied — even against MinIO, where the region is otherwise
+    # irrelevant. Mirror the iceberg-rest service (which sets the same var); the
+    # SDK's SystemSettingsRegionProvider reads AWS_REGION from the environment.
+    environment:
+      AWS_REGION: us-east-1
     volumes:
       - ./scripts/spark-fixtures:/fixtures:ro
     entrypoint:
