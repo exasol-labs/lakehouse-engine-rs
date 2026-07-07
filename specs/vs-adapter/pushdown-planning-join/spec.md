@@ -74,3 +74,20 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the single-two-t
 * *AND* the adapter SHALL instead emit the unaccelerated two-scan join SQL when it can build one, so Exasol's core engine produces the correct result
 * *AND* only when even the unaccelerated fallback cannot be built SHALL the adapter return an error so Exasol retries the query natively
 * *AND* the adapter MUST NOT emit any scan spec that would compute a different result than single-node evaluation
+
+### Scenario: Shared-column-name join uses qualified two-scan, not bare-name broadcast rendering
+
+* *GIVEN* an inner equi-join `pushdown` request over two involved tables that share a column name (e.g. both have an `id` column)
+* *WHEN* the adapter builds the unaccelerated two-scan fallback SQL
+* *THEN* the adapter SHALL render the join condition, WHERE filter, select list, GROUP BY, HAVING, and ORDER BY with table-qualified references (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`), resolved from each `column` node's `tableName` against the side that owns it — never against a combined bare-name schema
+* *AND* the disjoint-column-name guard SHALL gate broadcast eligibility only, NOT the two-scan fallback's rendering path
+* *AND* a disjoint-guard failure SHALL be treated as a plain reason the broadcast path is unavailable, not as an error, so the request falls through to the qualified two-scan SQL instead of a hard `Err`
+* *AND* the returned result SHALL equal the result of the same inner equi-join evaluated on a single node
+
+### Scenario: Aggregate over a join routes through the qualified two-scan wrapper
+
+* *GIVEN* an inner equi-join `pushdown` request whose select list, GROUP BY, HAVING, ORDER BY, or LIMIT requires Exasol postprocessing (an aggregate, `GROUP BY`, `ORDER BY`, `LIMIT`, or `HAVING`)
+* *WHEN* the adapter plans the request
+* *THEN* the adapter SHALL route the request to the qualified two-scan path unconditionally, regardless of whether the join would otherwise be broadcast-eligible, because the broadcast in-UDF join renders only projection, filter, and join condition
+* *AND* the two-scan wrapper SHALL render the aggregate select list as ordinary Exasol SQL over the materialized join (`SELECT <aggregates> FROM (fact fan-out) JOIN (dim fan-out) ON … [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`), splicing Exasol's own aggregate function name verbatim while table-qualifying only its column argument
+* *AND* the returned result SHALL equal the result of evaluating the same aggregate over the same inner equi-join on a single node
