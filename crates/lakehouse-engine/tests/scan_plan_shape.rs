@@ -18,7 +18,9 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{build_scan_driving_sql, detect_aggregates};
-use lakehouse_engine::scan::spec::{AggKind, ProjectionItem, ScanSpec, SortKey, StorageProps};
+use lakehouse_engine::scan::spec::{
+    AggKind, JoinSpec, JoinType, ProjectionItem, ScanSpec, SortKey, StorageProps,
+};
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 
@@ -482,5 +484,116 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     assert!(
         !sql.contains("SELECT * FROM"),
         "must not be a raw two-column row-scan fallback:\n{sql}"
+    );
+}
+
+/// Minimal MinIO-style storage for spec construction (no secrets asserted here).
+fn test_storage() -> StorageProps {
+    StorageProps {
+        endpoint: "http://minio:9000".to_string(),
+        region: "us-east-1".to_string(),
+        access_key: "minioadmin".to_string(),
+        secret_key: "minioadmin".to_string(),
+        session_token: None,
+        allow_http: true,
+        path_style: true,
+    }
+}
+
+/// pushdown-planning-join "Broadcast-eligible inner equi-join is planned as a
+/// broadcast fan-out". The broadcast plan shards ONLY the fact side and carries the
+/// dimension side's FULL file list once in the shard-invariant common blob's join
+/// block (`ScanSpec.join`), so the generated fan-out is exactly the single-table
+/// `GROUP BY shard_key` fan-out with the join block riding along in the common blob:
+/// every shard invocation re-scans the same dimension side and joins it node-locally.
+#[test]
+fn join_broadcast_fan_out_sql_shape() {
+    // Dimension side: full file list, carried once (shard-invariant) in the join block.
+    let join = JoinSpec {
+        table_root: "s3://warehouse/lh/customer".to_string(),
+        files: vec![("data/cust-0.parquet".to_string(), 4096)],
+        logical_schema: Vec::new(),
+        join_type: JoinType::Inner,
+        condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
+    };
+
+    let spec = ScanSpec {
+        table_root: "s3://warehouse/lh/orders".to_string(),
+        files: vec![], // replaced per shard
+        projection: vec![
+            ProjectionItem::Column("C_NAME".into()),
+            ProjectionItem::Column("O_ORDERDATE".into()),
+        ],
+        filter: None,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
+        logical_schema: Vec::new(),
+        join: Some(join),
+        storage: test_storage(),
+        df_target_partitions: 1,
+        df_batch_size: 8192,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 200,
+        s3_max_connections: 8,
+    };
+
+    // Fact side sharded into two byte-balanced work units → a real GROUP BY fan-out.
+    let shards = vec![
+        vec![("data/ord-0.parquet".to_string(), 8192u64)],
+        vec![("data/ord-1.parquet".to_string(), 8192u64)],
+    ];
+    let proj = spec.projection.clone();
+    let types = spec.emit_exa_types.clone();
+    let sql = build_scan_driving_sql(
+        &spec,
+        &shards,
+        &proj,
+        &types,
+        None,
+        &[],
+        &[],
+        "LAKEHOUSE_SCAN",
+        "LAKEHOUSE_MERGE",
+    );
+
+    // The fan-out is the single-table GROUP BY shard_key shape.
+    assert!(
+        sql.contains("GROUP BY shard_key") && sql.contains("AS shards(shard_key, files)"),
+        "broadcast join must drive the fact side through the GROUP BY shard_key fan-out:\n{sql}"
+    );
+    // EMITS the cross-table projection in order and type.
+    assert!(
+        sql.contains(r#"EMITS ("C_NAME" VARCHAR(100), "O_ORDERDATE" DATE)"#),
+        "the EMITS clause must span both tables in projection order:\n{sql}"
+    );
+    // The join block rides in the shard-invariant common blob (serialized once).
+    // The common blob is a single-quoted SQL literal, so JSON object keys appear
+    // with raw (unescaped) double quotes.
+    assert!(
+        sql.contains(r#""join":{"#),
+        "the common blob must carry a join block:\n{sql}"
+    );
+    // The dimension side's full file list and the rendered condition are carried once.
+    assert!(
+        sql.contains("data/cust-0.parquet"),
+        "the dimension side's file list must ride in the common blob:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"(\"C_CUSTKEY\" = \"O_CUSTKEY\")"#),
+        "the rendered join condition must ride in the common blob:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#""join_type":"inner""#),
+        "the join block must declare an inner join:\n{sql}"
+    );
+    // Only the fact side is sharded per work unit; the dimension side is NOT
+    // partitioned into the per-shard VALUES rows.
+    assert!(
+        sql.contains("data/ord-0.parquet") && sql.contains("data/ord-1.parquet"),
+        "the fact side must be sharded across the VALUES work units:\n{sql}"
     );
 }
