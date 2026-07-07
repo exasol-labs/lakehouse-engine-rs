@@ -16,9 +16,19 @@ positional-delete case (tracked as issue #68).
   before this change the scan collapsed each iceberg `FileScanTask` to a bare `(path, size)` pair
   and discarded its `.deletes`, so every MOR query returned pre-delete rows with no error.
 * Scope is **Parquet data files + Parquet positional-delete files only**, at both
-  `write.delete.granularity=file` and `write.delete.granularity=partition`. Equality deletes,
-  v3/Puffin deletion vectors, and ORC or Avro data or delete files are OUT OF SCOPE and MUST fail
-  loud (the authoritative gate is at plan time — see `vs-adapter/pushdown-file-pruning`).
+  `write.delete.granularity=file` and `write.delete.granularity=partition`.
+* Equality deletes and ORC or Avro data or delete files are OUT OF SCOPE for THIS feature and
+  MUST fail loud (the authoritative gate is at plan time — see `vs-adapter/pushdown-file-pruning`).
+  v3 / Puffin deletion vectors are handled by the sibling feature
+  `datafusion-scan/scan-execution-deletion-vectors`, which feeds its decoded delete positions into
+  the SAME per-data-file union point and `RowSelection`/`ParquetAccessPlan` machinery described
+  below; they are no longer rejected by the read-time backstop.
+* Each data file's associated delete files are resolved through its `deletes` references, each a
+  `df` index into the shard's interned `deleteFiles` pool (see
+  `datafusion-scan/scan-execution-spec-reconstitution` for the wire shape); a partition-granularity
+  delete file shared by several data files is interned ONCE in the pool and referenced by `df` from
+  each data file it applies to. A positional-delete reference carries no `offset`/`length` (those
+  are present only for a blob-addressed deletion vector).
 * The scan reads each associated positional-delete Parquet file (columns `file_path` Utf8,
   field-id `2147483546`, and `pos` Int64, field-id `2147483545`), keeps only the rows whose
   `file_path` equals the data file currently being read, and accumulates the `pos` values into a
@@ -38,14 +48,16 @@ positional-delete case (tracked as issue #68).
   and aggregation operate on are already the post-delete rows — no downstream stage can
   reintroduce a deleted row.
 * **Fail-loud backstop (read-time):** the primary, authoritative gate is at plan time; this
-  scan-time check is cheap defense-in-depth. If an assigned delete file is not a Parquet
-  positional delete (a Puffin / deletion-vector payload, an equality-delete file, or an unknown
-  content type), the scan MUST return a clean, credential-redacted error naming the unsupported
-  mechanism rather than silently returning pre-delete rows.
+  scan-time check is cheap defense-in-depth. If an assigned delete file is neither a Parquet
+  positional delete nor a v3 deletion vector (an equality-delete file or an unknown content type),
+  the scan MUST return a clean, credential-redacted error naming the unsupported mechanism rather
+  than silently returning pre-delete rows.
 * See `datafusion-scan/scan-execution` for the base scan flow and the unified-provider plan
   shape, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire
-  format, `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read, and
-  `packaging/e2e-harness-positional-deletes` for the full-stack matrix.
+  format, `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read,
+  `datafusion-scan/scan-execution-deletion-vectors` for the v3 deletion-vector path that shares
+  this feature's union point, and `packaging/e2e-harness-positional-deletes` for the full-stack
+  matrix.
 
 ## Scenarios
 
@@ -88,10 +100,11 @@ positional-delete case (tracked as issue #68).
 
 ### Scenario: An unapplicable delete file is rejected with a clean error (read-time backstop)
 
-* *GIVEN* a scan invocation whose assigned files include a delete file that is not a Parquet positional delete (a Puffin / deletion-vector payload, an equality-delete file, or an unknown delete content type)
+* *GIVEN* a scan invocation whose assigned files include a delete file that is neither a Parquet positional delete nor a v3 deletion vector (an equality-delete file or an unknown delete content type)
 * *WHEN* the scan UDF prepares that data file's scan
 * *THEN* the UDF SHALL return a clean error that names the unsupported delete mechanism BEFORE emitting any row for the affected data file
 * *AND* the UDF MUST NOT silently emit pre-delete rows for that file
+* *AND* a v3 / Puffin deletion vector SHALL NOT be rejected by this backstop — it is applied by `datafusion-scan/scan-execution-deletion-vectors`
 * *AND* the error message MUST NOT contain any storage access key, secret key, or session token
 
 ### Scenario: A delete-free data file scans through the same provider unchanged

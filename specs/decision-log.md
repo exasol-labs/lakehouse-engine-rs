@@ -2485,3 +2485,142 @@ For an inner equi-join (all this PR builds), attribute each WHERE conjunct to a 
 Both join routes now get free Iceberg manifest pruning per side; the two-scan fallback filters and footer-prunes each leg before emitting and ships only referenced columns — closing the pruning regression versus pre-PR single-table pushdown. The narrowed projection deliberately includes the FULL WHERE's columns (not just side-local ones) because the outer wrapper still renders the whole predicate qualified, and an absent SELECT list keeps every column (`SELECT *`). Pruned byte totals also feed side selection and the broadcast threshold, which only makes both more accurate. All new logic is `tableName`-driven and unit-tested for the shared-column-name (`EVENTS.ID` ⋈ `LABELS.ID`) case so it cannot regress the ADR-085 fix.
 
 **E2E-surfaced correction (the fan-out filter must render BARE).** The live cluster sends every column node with BOTH `tableName` (e.g. `FACT_ORDERS`) AND the query's `tableAlias` (e.g. `O` for `FROM fact_orders o`), and the `vs-expression` translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. The first cut pushed the side-local predicate into the two-scan leg's `ScanSpec.filter` via `render_df_filter_safe` unchanged, so it rendered `("O"."O_ORDERDATE" …)` — but a per-side fan-out is a SINGLE-TABLE scan whose relation exposes BARE uppercase columns (`scan_target` wrapped in an unaliased derived table), so the alias-qualified reference failed to resolve (`No field named "O"."O_ORDERDATE"`), regressing every filtered join. Fix: strip `tableAlias` (`strip_table_alias`) before rendering the leg's filter, so it is bare exactly like the single-table scan path. The outer two-scan wrapper is unaffected — its `render_df_filter_qualified` re-qualifies each column to `LHS_FACT`/`LHS_DIM` (overwriting the native alias) against each side's own fan-out subquery. The broadcast path is likewise untouched: it keeps rendering the native `tableAlias`, which the in-UDF `build_join_sql` resolves against its two registered sides — a mechanical regression test now pins both behaviors (bare in the fan-out, native-alias-preserving in broadcast). Iceberg manifest pruning (`to_iceberg_predicate`) is alias-agnostic (it resolves by bare column `name`), so Finding 1 needed no stripping.
+
+---
+
+## ADR-092: Hand-Roll the `deletion-vector-v1` Decoder Rather Than Depend on Upstream iceberg-rust
+
+**Date:** 2026-07-07
+**Plan:** `add-deletion-vector-application`
+**Status:** Accepted
+
+### Context
+
+iceberg-rust 0.10 (`v0.10.0-rc.2`, pinned by release tag per the project's crate-version discipline) reads the Puffin file container — footer parse and blob decompression via `PuffinReader` — but does NOT decode the `deletion-vector-v1` blob payload itself, and its `plan_files`/`FileScanTask.deletes` does not surface deletion-vector files. Databricks UniForm steers managed-Iceberg tables toward v3, where deletes are DVs, so a DV-blind reader silently returns pre-delete rows on exactly the mission's Databricks target (issue #11 → #12). Upstream apache/iceberg-rust has open DV-read work (#2414, #2681) but it is unmerged and could still change shape.
+
+### Decision
+
+Decode the `deletion-vector-v1` Puffin blob payload ourselves — magic bytes, big-endian length prefix, portable Roaring vector, big-endian CRC-32 — on top of iceberg-rust's `PuffinReader`, which continues to handle only the file container, footer parsing, and blob decompression. Use the `roaring` crate (already a direct workspace dependency, consumed by `positional_deletes.rs`) and `crc32fast` (already in `Cargo.lock`). No new dependency, no iceberg-rust version bump.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Hand-roll the `deletion-vector-v1` decoder on `PuffinReader` output | ✓ Chosen — iceberg-rust is pinned by release tag; issue #12 itself names our own decoder as the fallback; no new dependency |
+| Track/vendor apache/iceberg-rust's unmerged DV-read branch (#2681) | ✗ Rejected — open/unmerged and could change shape; the project does not vendor unmerged upstream branches |
+
+### Consequences
+
+The engine owns the full `deletion-vector-v1` decode path and its correctness (magic/CRC/cardinality validation), independent of iceberg-rust's DV-read timeline. If/when iceberg-rust ships native DV decode, this hand-rolled path can be revisited, but nothing depends on that landing.
+
+---
+
+## ADR-093: Reuse the Positional-Delete Union Point and `RowSelection`/`ParquetAccessPlan` Machinery for Deletion Vectors
+
+**Date:** 2026-07-07
+**Plan:** `add-deletion-vector-application`
+**Status:** Accepted
+
+### Context
+
+Deletion vectors and Parquet positional deletes both resolve to the same abstraction: a per-data-file set of deleted row positions. The positional-delete feature (`add-positional-delete-application`, ADR-087) already built the `access_plan_for_data_file` union point and the `RowSelection`/`ParquetAccessPlan` construction that lets a delete-derived row selection compose with DataFusion's own predicate/row-group/page pruning rather than defeating it.
+
+### Decision
+
+A decoded deletion vector becomes a per-data-file `RoaringTreemap`, fed into the SAME `access_plan_for_data_file` union point and `build_deletes_row_selection`/`build_access_plan` path the positional-delete feature already uses, dispatched per delete reference on the pooled `deleteFiles` entry's `type` (`POS_DEL` vs `DV`). The downstream `RowSelection`/`ParquetAccessPlan` construction is unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Reuse the existing union point and `RowSelection`/`ParquetAccessPlan` machinery, dispatched by pooled delete-file `type` | ✓ Chosen — a DV-derived selection is indistinguishable downstream from a positional-delete one, so DVs compose with pushdown for free and mixed-mechanism shards fall out naturally |
+| A separate DV-specific access-plan builder or a distinct DataFusion filter stage for DVs | ✗ Rejected — duplicates correctness-critical selection logic for no behavioral benefit |
+
+### Consequences
+
+Deletion vectors inherit every property already proven for positional deletes (pushdown composition, page/row-group pruning, streaming) without new machinery. A shard with data files under both mechanisms resolves each file independently at the same call site, which is what makes the mixed-mechanism scenario provable rather than assumed.
+
+---
+
+## ADR-094: Source Deletion-Vector References from the Manifest Walk, Not `FileScanTask.deletes`
+
+**Date:** 2026-07-07
+**Plan:** `add-deletion-vector-application`
+**Status:** Accepted
+
+### Context
+
+Applying a deletion vector requires its Puffin coordinates (`content_offset`, `content_size_in_bytes`) and the data file it applies to. iceberg-rust's `plan_files`/`FileScanTask.deletes` drops the Puffin discriminator and these DV-specific coordinates, so that path cannot be the source. The manifest / `DataFile`-level walk already runs, ahead of `plan_files`, to gate unsupported delete mechanisms — and it is the only place these fields remain visible.
+
+### Decision
+
+Extract DV coordinates from the manifest/`DataFile`-level walk (`ensure_supported_delete_mechanisms`), the same walk that gates unsupported mechanisms. `referenced_data_file` is read from the manifest ONLY to associate each DV with the correct `dataFiles` entry at plan time; it is NOT serialized onto the wire (ADR-095) — the association is structural, living on the data file's `deletes` list, and the scan-side decoder re-derives and cross-checks it from the Puffin `BlobMetadata` at read time.
+
+**E2E correction (discovered against a real Spark v3 fixture):** the premise that `FileScanTask.deletes` never surfaces DV files was only half true — iceberg-rust 0.10 DOES surface the Puffin DV delete file there, mis-typed as a position-delete entry, even though it drops the DV coordinates. The manifest walk remains the authoritative source for DV coordinates, but the positional-delete producer (`plan_files_from_table`) must exclude any delete-file path already collected by the manifest walk as a DV container, or the same Puffin file is emitted twice — once correctly as a DV reference and once incorrectly as a POS_DEL reference that then fails trying to open the Puffin footer as Parquet.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Extract DV coordinates from the manifest/`DataFile`-level walk | ✓ Chosen — the only place the Puffin discriminator and DV coordinates survive; the walk already runs for the unsupported-mechanism gate |
+| Wait for iceberg-rust's `plan_files`/`FileScanTask.deletes` to surface DV files with coordinates | ✗ Rejected — iceberg-rust has no DV scan-planning support at the pinned version |
+
+### Consequences
+
+DV-reference extraction is coupled to the manifest-walk gate rather than to `plan_files`, and the positional-delete producer must actively de-duplicate against the manifest walk's DV container set — a cross-cutting fix threaded through `plan_files_from_table` that host-only integration tests (which hand-build scan specs) cannot catch; only a real `plan_files`-driven E2E run surfaces it.
+
+---
+
+## ADR-095: Validate Cardinality, Magic, and CRC on Every Deletion Vector; Fail Loud on Any Mismatch
+
+**Date:** 2026-07-07
+**Plan:** `add-deletion-vector-application`
+**Status:** Accepted
+
+### Context
+
+A deletion vector that decodes to the wrong position set — from a corrupt Puffin file, a parser bug, or a mismatched blob-to-data-file association — would silently misapply deletes, reproducing exactly the silent-correctness failure (#11 → #12) this effort exists to close. The Puffin `BlobMetadata` carries a `cardinality` property (expected deleted-row count) and the blob itself carries a magic sequence and trailing CRC-32.
+
+### Decision
+
+The decoder verifies the `D1 D3 39 64` magic bytes, the trailing CRC-32 over magic + serialized vector, and that the decoded position count equals the declared `cardinality`, returning a clean, credential-redacted error on any mismatch BEFORE emitting a row for the affected data file. The decoder additionally cross-checks the blob's `referenced-data-file` (from Puffin `BlobMetadata`) against the data file it is being applied to, since that association is no longer carried on the wire (ADR-094).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Validate magic, CRC, cardinality, and referenced-data-file; fail loud on any mismatch | ✓ Chosen — consistent with the project's fail-loud posture (manifest gate, read-time backstop); a mismatch signals corruption or a parser bug, and silent misapplication is the exact failure mode being closed |
+| Trust the decoded bitmap; log-and-continue on mismatch | ✗ Rejected — reproduces the silent-correctness bug this effort exists to close |
+
+### Consequences
+
+Every deletion vector applied is provably well-formed and correctly associated before any row is emitted from its data file. A corrupt or mismatched DV surfaces as a clean, named, credential-redacted error rather than a wrong result — matching the posture already established for positional deletes and the plan-time unsupported-mechanism gate.
+
+---
+
+## ADR-096: Normalized Interned Per-Shard Wire (`deleteFiles` Pool + `df`-Indexed Refs), Retiring `FileEntryWire`
+
+**Date:** 2026-07-07
+**Plan:** `add-deletion-vector-application`
+**Status:** Accepted
+
+### Context
+
+The positional-delete feature's per-shard wire (`FileEntryWire`, a `Legacy`/`WithDeletes` untagged tuple enum, plus a flat `DeleteFileRef` carrying path/size/content_type) repeats a delete file's path once per referencing data file. Deletion vectors need additional coordinates (`offset`/`length` locating a blob inside a Puffin container) and, unlike partition-granularity positional deletes, are referenced structurally rather than by back-reference. Growing the flat `DeleteFileRef` with optional DV fields (the originally-planned approach, decision [6]/superseded) would keep an inconsistent shape — positional deletes duplicate a ref per referencing data file while DVs would use a back-reference — and would repeat a shared Puffin container's path across every data file that references it, which is catastrophic when thousands of data files share one packed DV container. There is no cross-version wire-compatibility requirement: the same `.so` produces and consumes the spec within one deploy.
+
+### Decision
+
+Replace the per-shard `files` argument (UDF arg 1) with a JSON OBJECT of two arrays: an interned `deleteFiles` pool, in which each physical delete file/container is interned EXACTLY ONCE per shard (`path`, `size`, `type` = `POS_DEL`/`EQ_DEL`/`DV`, `format` = `PARQUET`/`AVRO`/`ORC`/`PUFFIN`, SCREAMING_SNAKE_CASE), and a `dataFiles` list whose entries carry `path`, `size`, and an optional `deletes` array of `{df, offset?, length?}` references — `df` indexes the pool, and `offset`/`length` are present only for a blob-addressed DV. `referenced_data_file` is dropped from the wire entirely (ADR-094/ADR-095 cover how that correctness is preserved). The pool is scoped per-shard, not placed in the shard-invariant common blob (arg 0), keeping each shard self-contained. This retires `FileEntryWire`, the flat `DeleteFileRef`, and `DeleteFileContentType` outright — including migrating the broadcast-join dimension side (`JoinSpec.files`, added by the concurrently-merged join-pushdown feature #71) onto the same normalized shape, since it was a second consumer of the retired types.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Interned `deleteFiles` pool + `df`-indexed `deletes` refs on `dataFiles`, dropping `referenced_data_file` | ✓ Chosen — compact (each delete file's path stored once per shard regardless of referencing-data-file count), uniform across mechanisms, extensible via `type`+`format`; no wire-compat requirement to preserve |
+| Grow the flat `DeleteFileRef` with optional DV coordinate fields, keeping the untagged `FileEntryWire` tuple serde (superseded decision [6]) | ✗ Rejected — inconsistent across mechanisms and non-compact; repeats a shared Puffin container's path per referencing data file |
+| Place the interned pool in the shard-invariant common blob (arg 0) instead of per-shard | ✗ Rejected — breaks shard self-containment; each shard must carry exactly the delete files its own data files reference |
+| A separate `DeletionVectorRef` type or a tagged delete-ref enum | ✗ Rejected — adds a second file-list encoding alongside the existing one instead of unifying |
+
+### Consequences
+
+One normalized file-set encoding now covers positional deletes and deletion vectors, on both the per-shard fact side (arg 1) and the shard-invariant join dimension side (arg 0), with no legacy tuple form to accept or maintain. Any future delete mechanism extends the same `type`+`format` split rather than growing a new ad hoc shape. The migration was a clean break (no dual-read path) because the same `.so` build produces and consumes the spec within one deploy.
