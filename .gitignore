@@ -8,10 +8,9 @@
 .idea
 *.iml
 
-# Local follow-up scratch notes (not tracked)
-next.md
-current-state.md
-debug-cluster.md
+# Local scratch notes (not tracked)
+PROMPT.md
+STATE.md
 
 # Benchmark local config + reports
 bench/.env
