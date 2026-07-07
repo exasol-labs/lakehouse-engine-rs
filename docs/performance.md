@@ -4,9 +4,9 @@
 
 # Performance
 
-TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06; lakehouse-engine-rs column re-verified 2026-07-07 post lc-rs 0.20.3 (see §3 below for the A/B). Competitor columns (Trino/Athena/Spark) are unchanged from 2026-07-06 — not re-run this pass.
+TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06; lakehouse-engine-rs column re-verified 2026-07-07 post lc-rs 0.20.3 (see §3 below for the A/B), then fully re-run again 2026-07-07 against `test1` on `feat/fix-join-decline-hard-fail` (PR #78) to confirm the #76 join-pushdown-decline fix. Competitor columns (Trino/Athena/Spark) are unchanged from 2026-07-06 — not re-run this pass.
 
-**Q1, Q2, and NQ3 are currently broken** (3+ table joins hard-fail — [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76), unrelated to lc-rs 0.20.3, see §4); their lakehouse-engine-rs numbers below are the last-known-good 2026-07-06 values, not re-verified 2026-07-07.
+Q1, Q2, and NQ3 (previously broken by [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76), fixed in PR #78) re-verified passing as of 2026-07-07 — see §5. The full table below is a fresh clean re-run of all 15 queries on that date, superseding the prior 2026-07-06 lakehouse-engine-rs numbers.
 
 | Engine | Resources |
 |---|---|
@@ -20,21 +20,21 @@ Fastest time per query in **bold**.
 
 | Query | lakehouse-engine-rs | Trino (2-node) | Athena | Spark (EMR Serverless) | IMPORT FROM JDBC (Trino) |
 |---|---|---|---|---|---|
-| Q1 (3-way join, wiring) | **1.67 s** | 2.81 s | 2.43 s | 18.89 s | 3.13 s |
-| Q2 (3-way join, big scan) | 17.09 s | 9.71 s | **2.14 s** | 42.89 s | 8.77 s |
-| Q3 (join + filter + GROUP BY) | 15.10 s | 5.12 s | **2.37 s** | 29.20 s | 4.91 s |
-| Q4 (pricing summary, filter) | 3.89 s | **2.09 s** | 3.43 s | 18.94 s | 3.22 s |
-| Q5 (Q3, no filter) | 18.06 s | 6.63 s | **2.16 s** | 35.38 s | 7.57 s |
-| Q6 (Q4, no filter) | 3.56 s | **1.34 s** | 2.52 s | 16.52 s | 2.62 s |
-| Q7 (high-cardinality GROUP BY) | 5.98 s | **2.04 s** | 2.30 s | 12.15 s | 2.71 s |
-| Q8 (selective filter) | 2.34 s | **0.73 s** | 0.99 s | 4.38 s | 2.22 s |
-| Q9a (narrow projection) | 1.17 s | **0.65 s** | 1.57 s | 4.51 s | 2.15 s |
-| Q9b (wide projection) | **11.36 s** | 11.91 s | 27.93 s | 57.31 s | 12.78 s |
+| Q1 (3-way join, wiring) | **2.31 s** | 2.81 s | 2.43 s | 18.89 s | 3.13 s |
+| Q2 (3-way join, big scan) | 18.45 s | 9.71 s | **2.14 s** | 42.89 s | 8.77 s |
+| Q3 (join + filter + GROUP BY) | 15.55 s | 5.12 s | **2.37 s** | 29.20 s | 4.91 s |
+| Q4 (pricing summary, filter) | 5.56 s | **2.09 s** | 3.43 s | 18.94 s | 3.22 s |
+| Q5 (Q3, no filter) | 17.96 s | 6.63 s | **2.16 s** | 35.38 s | 7.57 s |
+| Q6 (Q4, no filter) | 4.27 s | **1.34 s** | 2.52 s | 16.52 s | 2.62 s |
+| Q7 (high-cardinality GROUP BY) | 6.89 s | **2.04 s** | 2.30 s | 12.15 s | 2.71 s |
+| Q8 (selective filter) | 3.18 s | **0.73 s** | 0.99 s | 4.38 s | 2.22 s |
+| Q9a (narrow projection) | 2.50 s | **0.65 s** | 1.57 s | 4.51 s | 2.15 s |
+| Q9b (wide projection) | **11.22 s** | 11.91 s | 27.93 s | 57.31 s | 12.78 s |
 | NQ1 (arithmetic aggregate: `SUM(price*discount)`) | 3.96 s | **1.91 s** | 2.27 s | 10.72 s | 3.26 s |
-| NQ2 (LIKE + IN filter pushdown) | 4.19 s | **2.38 s** | 2.71 s | 11.45 s | 3.67 s |
-| NQ3 (4-way join, part/partsupp) | 4.40 s | **1.55 s** | 4.45 s | 3.88 s | 2.47 s |
-| NQ4 (ORDER BY + LIMIT top-N) | 2.13 s | **1.62 s** | 2.34 s | 11.18 s | 2.88 s |
-| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.63 s | **0.54 s** | 2.06 s | 5.39 s | 2.18 s |
+| NQ2 (LIKE + IN filter pushdown) | 4.21 s | **2.38 s** | 2.71 s | 11.45 s | 3.67 s |
+| NQ3 (4-way join, part/partsupp) | 5.12 s | **1.55 s** | 4.45 s | 3.88 s | 2.47 s |
+| NQ4 (ORDER BY + LIMIT top-N) | 2.85 s | **1.62 s** | 2.34 s | 11.18 s | 2.88 s |
+| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.88 s | **0.54 s** | 2.06 s | 5.39 s | 2.18 s |
 
 Reproduce: `RUN_TRINO_COMPARISON=1 bench/compare_all.sh` ([`bench/README.md`](../bench/README.md)).
 
@@ -126,7 +126,25 @@ bump, so it's unrelated to this pass — a regression from the broadcast join-pu
 merged just before. Filed as [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76);
 their previous timings (Q1 1.67s, Q2 17.09s, NQ3 4.40s, table below) are stale until fixed.
 
-### 4. Small/narrow-result queries (Q8, Q9a, NQ4, NQ5) still lose 2–4x despite trivial output
+**Fixed 2026-07-07 in PR #78** — see §5 for the re-verification run.
+
+### 5. Join-pushdown-decline hard-fail (#76) fixed and re-verified (2026-07-07)
+
+PR #78 (`feat/fix-join-decline-hard-fail`) fixes the hard-fail described in §4. Re-verified
+against a fresh start/stop cycle of the `test1` cluster on that branch with a full clean
+15-query re-run (numbers folded into the results table above, superseding the prior
+2026-07-06 lakehouse-engine-rs column): Q1 now completes in 2.31s, Q2 in 18.45s, and NQ3 in
+5.12s — all three previously hard-failing with `F-UDF-CL-RUST-9001`, now returning correct
+results with no error. All other queries and every `PUSHDOWN` wiring check in the suite also
+passed clean.
+
+Also fixed in passing: `deploy/scripts/secrets.sh` still hardcoded the pre-0.20.3
+`BENCH_SLC_VERSION=0.20.2`, which produced an unrelated `F-UDF-CL-RUST-9001` fingerprint
+mismatch (expected 0.20.2, `.so` built against 0.20.3) before the join fix could even be
+exercised on a freshly-provisioned `bench/.env`. Bumped to `0.20.3` to match the Makefile
+default and the SDK version this branch actually builds against.
+
+### 6. Small/narrow-result queries (Q8, Q9a, NQ4, NQ5) still lose 2–4x despite trivial output
 
 PROFILE shows a recurring ~0.3–1.0s `PUSHDOWN` / `COMPILE / EXECUTE` cost per query — Exasol
 planning and compiling the (per-shard) pushdown SQL literal — that doesn't shrink with query
