@@ -1066,7 +1066,10 @@ fn validate_uniform_object_store(spec: &ScanSpec, first_abs: &str) -> Result<(),
         Ok(())
     };
     for entry in &spec.files {
-        check(&reconstruct_abs_uri(&entry.path, &spec.table_root), "data file")?;
+        check(
+            &reconstruct_abs_uri(&entry.path, &spec.table_root),
+            "data file",
+        )?;
         for delete in &entry.deletes {
             check(
                 &reconstruct_abs_uri(&delete.path, &spec.table_root),
