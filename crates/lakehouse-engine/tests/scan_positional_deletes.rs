@@ -216,6 +216,7 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        join: None,
         storage: dummy_storage(),
         df_target_partitions: 1,
         df_batch_size: 64,

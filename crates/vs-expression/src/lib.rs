@@ -155,7 +155,21 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_uppercase();
-            return Ok(Some(quote_ident(&name)));
+            let quoted = quote_ident(&name);
+            // A `tableAlias` (injected by the caller for a multi-table render, e.g.
+            // the join two-scan wrapper) qualifies the reference as
+            // `"ALIAS"."NAME"`, disambiguating a name shared by two joined subqueries.
+            // Absent (the default single-table path), a bare quoted name is rendered
+            // exactly as before.
+            return Ok(Some(
+                match value("tableAlias")
+                    .and_then(|a| a.as_str())
+                    .filter(|a| !a.is_empty())
+                {
+                    Some(alias) => format!("{}.{}", quote_ident(alias), quoted),
+                    None => quoted,
+                },
+            ));
         }
         _ => {}
     }
@@ -800,6 +814,20 @@ mod tests {
         let sql = render_expression(&expr).unwrap();
         // embedded " must be doubled
         assert_eq!(sql, r#""MY""COL""#);
+    }
+
+    #[test]
+    fn renders_table_qualified_column_when_alias_present() {
+        let expr = json!({"type": "column", "name": "id", "tableAlias": "LHS_FACT"});
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, r#""LHS_FACT"."ID""#);
+    }
+
+    #[test]
+    fn empty_table_alias_falls_back_to_bare_column() {
+        let expr = json!({"type": "column", "name": "id", "tableAlias": ""});
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, r#""ID""#);
     }
 
     // --- Literals ---
