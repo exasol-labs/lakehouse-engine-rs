@@ -54,17 +54,24 @@ serialized once for the whole fan-out (including the Iceberg table root), and a 
   common/per-shard merge, malformed-input handling, and the no-catalog-block guarantee.
 * See `datafusion-scan/scan-execution-file-metadata` for spec-backed per-file metadata
   (no per-file `HEAD`) and relative/absolute path resolution against the table root.
+* Positional-delete application (see `datafusion-scan/scan-execution-positional-deletes`)
+  attaches a per-data-file base `ParquetAccessPlan` to the same `ParquetSource`-backed
+  provider without changing this plan shape.
+* See `datafusion-scan/scan-execution-positional-deletes` for delete-application scenarios
+  (base `ParquetAccessPlan` attachment, delete-set composition with pushdown, and the
+  read-time backstop for unsupported delete mechanisms).
 
 ## Scenarios
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan invocation receiving TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical Iceberg schema, projection, filter, limit, storage credentials, the Iceberg table root, and tuning knobs) and a per-shard files argument listing specific Iceberg Parquet files in MinIO as `(path, size)` entries
+* *GIVEN* a scan invocation receiving TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical Iceberg schema, projection, filter, limit, storage credentials, the Iceberg table root, and tuning knobs) and a per-shard files argument listing specific Iceberg Parquet files in MinIO, each optionally carrying its associated positional-delete file references
 * *AND* a projection naming a subset of columns
 * *WHEN* the scan UDF runs for that invocation
-* *THEN* the UDF SHALL read the common spec from the first input argument and the `(path, size)` file list from the second, and reconstitute a single `ScanSpec` whose files come from the second argument and whose every other field comes from the first (only `Value::String` crossing the `.so` boundary — both arguments are VARCHAR JSON)
-* *AND* the UDF SHALL resolve each file entry to an absolute URI (absolute entries pass through; relative entries are joined onto the common spec's table root) and register ONLY those files as one `scan_target` whose declared schema is the logical Iceberg schema (each field carrying its `field_id` metadata), NOT a schema inferred from the first file, and MUST NOT resolve or discover any additional files from the catalog
-* *AND* the UDF SHALL emit one output row per scanned source row containing only the projected columns
+* *THEN* the UDF SHALL read the common spec from the first input argument and the file list from the second, and reconstitute a single scan spec whose files (and their delete references) come from the second argument and whose every other field comes from the first (only serialized bytes crossing the `.so` boundary — both arguments are VARCHAR JSON)
+* *AND* the UDF SHALL resolve each file entry to an absolute URI (absolute entries pass through; relative entries are joined onto the common spec's table root) and register ONLY those files through a custom `TableProvider` built over DataFusion's own `ParquetSource` (replacing the prior `ListingTable`) whose declared schema is the logical Iceberg schema (each field carrying its field-id metadata, bound via the existing field-id expression adapter), NOT a schema inferred from the first file, and MUST NOT resolve or discover any additional files from the catalog
+* *AND* the `ParquetSource`-backed provider SHALL let a per-data-file base `ParquetAccessPlan` be attached for positional-delete application (see `datafusion-scan/scan-execution-positional-deletes`) while projection/filter/LIMIT pushdown and Parquet pruning are preserved
+* *AND* the UDF SHALL emit one output row per surviving source row containing only the projected columns
 
 ### Scenario: Filter predicate restricts the emitted rows
 
@@ -129,11 +136,12 @@ serialized once for the whole fan-out (including the Iceberg table root), and a 
 
 ### Scenario: Raw-scan physical plan carries no needless repartition or coalesce-partitions stage
 
-* *GIVEN* a scan spec on the raw-row path whose `df_target_partitions` is `1` (one partition per shard, the single-instance scan unit)
-* *WHEN* the scan UDF builds the DataFusion physical plan for the assigned files
-* *THEN* the physical plan SHALL NOT contain a `RepartitionExec`, a `CoalescePartitionsExec`, a global `SortExec`, or a global aggregate stage on the raw-row path
-* *AND* the plan SHALL be the lean pipeline `ParquetExec → FilterExec → ProjectionExec → CoalesceBatchesExec` feeding the incremental emit, so no stage redistributes or re-buffers rows beyond what projection, filter, and batch coalescing require
-* *AND* the emitted rows SHALL be identical to those the unpruned, un-optimized plan would produce
+* *GIVEN* a scan spec on the raw-row path whose shard is one partition (one partition per shard, the single-instance scan unit), scanned through the custom `ParquetSource`-backed `TableProvider`
+* *WHEN* the scan UDF builds the DataFusion physical plan for the assigned files, whether or not a base `ParquetAccessPlan` is attached for positional deletes
+* *THEN* the physical plan SHALL NOT contain a repartition, a coalesce-partitions, a global sort, or a global aggregate stage on the raw-row path
+* *AND* the plan SHALL remain the lean single-partition pipeline feeding the incremental emit, so no stage redistributes or re-buffers rows beyond what projection, filter, and batch coalescing require — the custom provider MUST NOT introduce a plan-shape regression versus the prior `ListingTable`
+* *AND* Parquet row-group and predicate/page pruning SHALL still occur with a base `ParquetAccessPlan` attached, the opener intersecting pruning ON TOP of the injected row selection rather than disabling it
+* *AND* the emitted rows SHALL be identical to those the unpruned, un-optimized plan would produce (with deletes applied)
 
 ### Scenario: Scan emits a bounded local top-N when the spec carries an order-by
 

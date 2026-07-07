@@ -6,6 +6,7 @@
 pub mod convert;
 pub mod diagnostics;
 pub mod emit;
+pub mod positional_deletes;
 pub mod runtime;
 pub mod spec;
 
@@ -18,9 +19,7 @@ use arrow::array::{Array, ListArray};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
+use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_expr_adapter::{
     DefaultPhysicalExprAdapterFactory, PhysicalExprAdapter, PhysicalExprAdapterFactory,
@@ -842,7 +841,7 @@ fn client_options_for(budget: usize) -> ClientOptions {
 /// unchanged. Otherwise it is relative to `table_root` and joined onto it with
 /// exactly one `/` separator (a trailing `/` on the root and a leading `/` on the
 /// entry are both trimmed first, so the separator is neither doubled nor dropped).
-fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
+pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
     if entry_path.contains("://") {
         return entry_path.to_string();
     }
@@ -860,11 +859,11 @@ fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
 /// [`Path`]: object_store::path::Path
 fn build_spec_size_index(spec: &ScanSpec) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
     let mut sizes = HashMap::with_capacity(spec.files.len());
-    for (path, size) in &spec.files {
-        let abs = reconstruct_abs_uri(path, &spec.table_root);
+    for entry in &spec.files {
+        let abs = reconstruct_abs_uri(&entry.path, &spec.table_root);
         let url = ListingTableUrl::parse(&abs)
             .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))?;
-        sizes.insert(url.prefix().clone(), *size);
+        sizes.insert(url.prefix().clone(), entry.size);
     }
     Ok(sizes)
 }
@@ -1025,15 +1024,60 @@ fn build_s3_store(
 /// the bucket is then the host of that absolute URI. For the all-absolute case
 /// (empty `table_root`) reconstruction is a no-op, so behavior is unchanged.
 fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
-    let (first, _size) = spec
+    let first = spec
         .files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
-    let abs = reconstruct_abs_uri(first, &spec.table_root);
+    let abs = reconstruct_abs_uri(&first.path, &spec.table_root);
     let url = Url::parse(&abs).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
     url.host_str()
         .map(|h| h.to_string())
         .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {abs}")))
+}
+
+/// Verify every data file and associated delete file in `spec` resolves to the
+/// same object-store root (scheme + host) as `first_abs`.
+///
+/// The scan registers a single object store keyed by that root (see
+/// [`register_files`] / [`build_session_context`]); a file under a different
+/// root would be read through the wrong store. This fails loud on a mixed-root
+/// spec rather than misreading or failing confusingly downstream.
+fn validate_uniform_object_store(spec: &ScanSpec, first_abs: &str) -> Result<(), UdfError> {
+    // Compare the exact `ObjectStoreUrl` (scheme + authority) each file resolves
+    // to — the very key the store is registered/looked up under — so the check
+    // matches the runtime invariant precisely (and accepts every URI form the
+    // scan itself accepts, e.g. bare local paths).
+    let store_key = |abs: &str| -> Result<String, UdfError> {
+        Ok(ListingTableUrl::parse(abs)
+            .map_err(|e| UdfError::User(format!("invalid file URI '{abs}': {e}")))?
+            .object_store()
+            .as_str()
+            .to_string())
+    };
+    let expected = store_key(first_abs)?;
+    let check = |abs: &str, kind: &str| -> Result<(), UdfError> {
+        let got = store_key(abs)?;
+        if got != expected {
+            return Err(UdfError::User(format!(
+                "scan spec mixes object-store roots: {kind} '{abs}' resolves to store '{got}' but \
+                 the first file resolves to '{expected}'; the scan registers a single object store"
+            )));
+        }
+        Ok(())
+    };
+    for entry in &spec.files {
+        check(
+            &reconstruct_abs_uri(&entry.path, &spec.table_root),
+            "data file",
+        )?;
+        for delete in &entry.deletes {
+            check(
+                &reconstruct_abs_uri(&delete.path, &spec.table_root),
+                "delete file",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the DataFrame: register files as a ListingTable, then apply
@@ -1053,52 +1097,77 @@ async fn build_dataframe(
         .map_err(|e| UdfError::User(format!("DataFusion SQL error: {e}")))
 }
 
-/// Register the assigned Parquet files as a ListingTable named `table_name`.
-async fn register_files(
+/// Register the assigned Parquet files as `table_name`, backed by the custom
+/// [`PositionalDeleteScanTable`] provider over DataFusion's `ParquetSource`.
+///
+/// This replaces the previous `ListingTable`: a `ListingTable` cannot build a
+/// `FileScanConfig` directly and therefore cannot attach the per-data-file base
+/// `ParquetAccessPlan` that applies Iceberg positional deletes. The custom
+/// provider is unified across ALL scans — delete-free files take the identical
+/// path (no access plan attached) — and preserves exactly: the logical schema,
+/// the `FieldIdExprAdapter` (field-id-first column binding), and the lean
+/// single-partition plan.
+///
+/// Public so plan-shape / pruning-preservation integration tests can register
+/// the exact production provider (with per-file base `ParquetAccessPlan`s) as
+/// `scan_target` before asking [`build_raw_scan_physical_plan`] for the committed
+/// pipeline — the built-in `SessionContext::register_parquet` shortcut never
+/// attaches an access plan and so cannot exercise the delete-carrying path.
+pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
-    let file_format = Arc::new(ParquetFormat::default());
-    let listing_options = ListingOptions::new(file_format)
-        .with_file_extension(".parquet")
-        // Disable glob — we supply exact paths.
-        .with_collect_stat(false);
+    let first_abs = reconstruct_abs_uri(
+        &spec
+            .files
+            .first()
+            .ok_or_else(|| UdfError::User("scan spec has no files".into()))?
+            .path,
+        &spec.table_root,
+    );
+    // The scan registers exactly ONE object store, keyed by the first file's
+    // scheme+host (`object_store_url` below and the store registered in
+    // `build_session_context`). Every data file and every associated delete file
+    // must resolve to that same root; a file under a different bucket/host would
+    // be read through the wrong (or an unregistered) store — a confusing failure
+    // or, worse, a wrong-key read. Fail loud on a mixed-root spec (e.g. an
+    // Iceberg `write.data.path` or a delete file in a different bucket) instead.
+    validate_uniform_object_store(spec, &first_abs)?;
 
-    let table_paths: Vec<ListingTableUrl> = spec
-        .files
-        .iter()
-        .map(|(path, _size)| {
-            let abs = reconstruct_abs_uri(path, &spec.table_root);
-            ListingTableUrl::parse(&abs)
-                .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))
-        })
-        .collect::<Result<_, _>>()?;
+    let object_store_url = ListingTableUrl::parse(&first_abs)
+        .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?
+        .object_store();
 
     // Prefer the query-time logical schema (with Iceberg field-ids) when the
-    // adapter supplied one: register it as the table schema and install the
-    // field-id expression adapter so column binding is field-id-first (name
-    // fallback) — correct across schema evolution. When it is absent (legacy
-    // specs), fall back to inferring one Arrow schema from the first file.
+    // adapter supplied one: use it as the table schema and install the field-id
+    // expression adapter so column binding is field-id-first (name fallback) —
+    // correct across schema evolution. When it is absent (legacy specs), fall
+    // back to inferring one Arrow schema from the first file.
     let secrets = spec.storage.secret_values();
-    let config = if spec.logical_schema.is_empty() {
-        let resolved_schema = listing_options
-            .infer_schema(&ctx.state(), &table_paths[0])
-            .await
-            .map_err(|e| classify_scan_error(e, &secrets))?;
-        ListingTableConfig::new_with_multi_paths(table_paths)
-            .with_listing_options(listing_options)
-            .with_schema(resolved_schema)
+    let use_field_id_adapter = !spec.logical_schema.is_empty();
+    let table_schema = if use_field_id_adapter {
+        build_logical_arrow_schema(&spec.logical_schema)
     } else {
-        let logical_schema = build_logical_arrow_schema(&spec.logical_schema);
-        ListingTableConfig::new_with_multi_paths(table_paths)
-            .with_listing_options(listing_options)
-            .with_schema(logical_schema)
-            .with_expr_adapter_factory(Arc::new(FieldIdExprAdapterFactory))
+        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension(".parquet")
+            .with_collect_stat(false);
+        let first_url = ListingTableUrl::parse(&first_abs)
+            .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?;
+        listing_options
+            .infer_schema(&ctx.state(), &first_url)
+            .await
+            .map_err(|e| classify_scan_error(e, &secrets))?
     };
 
-    let table = ListingTable::try_new(config)
-        .map_err(|e| UdfError::User(format!("failed to create listing table: {e}")))?;
+    let table = crate::scan::positional_deletes::PositionalDeleteScanTable::new(
+        object_store_url,
+        table_schema,
+        use_field_id_adapter,
+        spec.files.clone(),
+        spec.table_root.clone(),
+        &spec.storage,
+    );
 
     ctx.register_table(table_name, Arc::new(table))
         .map_err(|e| UdfError::User(format!("failed to register table: {e}")))?;
@@ -1434,7 +1503,7 @@ fn rename_physical_to_logical(
 /// [`FieldIdExprAdapterFactory`] can bind physical file columns to it by id, and
 /// carries the schema's declared nullability (Iceberg `optional`). The Arrow data
 /// type is reconstructed from the compact tag via [`arrow_type_from_tag`].
-fn build_logical_arrow_schema(
+pub(crate) fn build_logical_arrow_schema(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> arrow::datatypes::SchemaRef {
     use crate::types::mapping::arrow_type_from_tag;
@@ -1468,7 +1537,7 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
-    use crate::scan::spec::{AggKind, AggregatePlan, StorageProps};
+    use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
     use object_store::ClientConfigKey;
 
@@ -1477,10 +1546,23 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
+    /// The byte size of the local file behind a `file://` URL.
+    ///
+    /// The custom `ParquetSource`-backed provider builds each file's `ObjectMeta`
+    /// from the spec-supplied size (the no-HEAD design), so tests that register a
+    /// local Parquet file must supply its real size instead of a `0` placeholder.
+    fn local_file_size(file_url: &str) -> u64 {
+        let path = url::Url::parse(file_url)
+            .expect("valid file URL")
+            .to_file_path()
+            .expect("file:// URL");
+        std::fs::metadata(path).expect("stat local parquet").len()
+    }
+
     fn minimal_spec() -> ScanSpec {
         ScanSpec {
             table_root: String::new(),
-            files: vec![("s3://test-bucket/data/part-0.parquet".into(), 1024)],
+            files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024)],
             projection: vec![],
             filter: None,
             limit: None,
@@ -1667,8 +1749,8 @@ mod tests {
         let mut spec = minimal_spec();
         spec.table_root = "s3://bucket/db/table".into();
         spec.files = vec![
-            ("data/rel.parquet".into(), 111),
-            ("s3://bucket/db/table/data/abs.parquet".into(), 222),
+            FileEntry::new("data/rel.parquet", 111),
+            FileEntry::new("s3://bucket/db/table/data/abs.parquet", 222),
         ];
         let index = build_spec_size_index(&spec).expect("index must build");
 
@@ -1691,13 +1773,13 @@ mod tests {
         // Relative first entry: bucket comes from the table root.
         let mut rel = minimal_spec();
         rel.table_root = "s3://warehouse/db/table".into();
-        rel.files = vec![("data/part-0.parquet".into(), 1)];
+        rel.files = vec![FileEntry::new("data/part-0.parquet", 1)];
         assert_eq!(extract_bucket(&rel).unwrap(), "warehouse");
 
         // Absolute first entry, empty root (legacy): unchanged behavior.
         let mut abs = minimal_spec();
         abs.table_root = String::new();
-        abs.files = vec![("s3://legacy-bucket/data/part-0.parquet".into(), 1)];
+        abs.files = vec![FileEntry::new("s3://legacy-bucket/data/part-0.parquet", 1)];
         assert_eq!(extract_bucket(&abs).unwrap(), "legacy-bucket");
     }
 
@@ -2628,9 +2710,11 @@ mod tests {
 
         // Build a spec with empty logical_schema — the fallback inference path.
         // Absolute file:// entry (empty table_root) exercises the passthrough
-        // reconstruction branch; the size is unused for the local-FS store.
+        // reconstruction branch; the real file size is supplied because the
+        // provider builds each file's ObjectMeta from it (no-HEAD design).
         let mut spec = minimal_spec();
-        spec.files = vec![(file_url, 0)];
+        let file_size = local_file_size(&file_url);
+        spec.files = vec![FileEntry::new(file_url, file_size)];
         spec.logical_schema = Vec::new();
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -2734,7 +2818,8 @@ mod tests {
         ];
 
         let mut spec = minimal_spec();
-        spec.files = vec![(file_url, 0)];
+        let file_size = local_file_size(&file_url);
+        spec.files = vec![FileEntry::new(file_url, file_size)];
         spec.logical_schema = logical;
         // The adapter pushes uppercase current-name projection.
         spec.projection = vec!["ID".into(), "RATING".into()];
@@ -2837,7 +2922,8 @@ mod tests {
             limit: u64,
         ) -> Vec<(i64, Option<f64>)> {
             let mut spec = minimal_spec();
-            spec.files = vec![(file_url.to_string(), 0)];
+            let file_size = local_file_size(file_url);
+            spec.files = vec![FileEntry::new(file_url, file_size)];
             spec.projection = vec!["ID".into(), "PRICE".into()];
             spec.order_by = vec![SortKey {
                 column: "PRICE".into(),
@@ -2984,7 +3070,12 @@ mod tests {
         ];
 
         let mut spec = minimal_spec();
-        spec.files = vec![(file_old, 0), (file_new, 0)];
+        let old_size = local_file_size(&file_old);
+        let new_size = local_file_size(&file_new);
+        spec.files = vec![
+            FileEntry::new(file_old, old_size),
+            FileEntry::new(file_new, new_size),
+        ];
         spec.logical_schema = logical;
         spec.projection = vec!["ID".into(), "RATING".into()];
 

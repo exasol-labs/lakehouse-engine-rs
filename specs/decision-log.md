@@ -2214,3 +2214,111 @@ Remove the `tpchgen-arrow` dependency entirely and construct arrow-58 `RecordBat
 ### Consequences
 
 The dev/e2e dependency graph collapses onto a single arrow-58 tree — no arrow 57, no arrow 59, no IPC bridge anywhere. A future workspace arrow bump needs no coordinated `tpchgen-arrow` release, since generator batches are now built with the workspace arrow directly. The cost is bounded, test-only code in `seed.rs`/`tpch_loader.rs`; no production code is affected.
+
+---
+
+## ADR-082: Keep DataFusion `ParquetSource`; Apply Positional Deletes via a Per-File Base `ParquetAccessPlan`
+
+**Date:** 2026-07-06
+**Plan:** `add-positional-delete-application`
+**Status:** Accepted
+
+### Context
+
+Issue #11 identified a silent-correctness bug: the scan collapsed each Iceberg `FileScanTask` to a bare `(path, size)` pair and discarded its `.deletes`, so every merge-on-read query returned pre-delete rows with no error. A fix needed to apply Iceberg positional deletes on read (tracked as issue #68) without giving up DataFusion's own scan engine — projection/filter/LIMIT pushdown, row-group and page pruning, statistics, and streaming.
+
+### Decision
+
+Do NOT swap in iceberg-rust's `ArrowReader` / `iceberg-datafusion` `IcebergTableScan`. Keep DataFusion's `ParquetSource` as the scan engine and apply positional deletes by attaching a per-data-file `ParquetAccessPlan` (a base row selection) via `PartitionedFile::with_extensions`; the Parquet opener intersects predicate/bloom-filter/row-group/page pruning on top of the injected selection rather than the selection defeating that pruning.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Per-file base `ParquetAccessPlan` on DataFusion's `ParquetSource` | ✓ Chosen — DataFusion 54 exposes this access-plan seam natively (verified at `datafusion-datasource-parquet-54.0.0` opener/mod.rs and access_plan.rs); the injected selection composes with pushdown instead of disabling it |
+| iceberg-rust `ArrowReader` / `iceberg-datafusion` `IcebergTableScan` | ✗ Rejected — loses DataFusion projection/filter/LIMIT pushdown, row-group/page pruning, statistics, and streaming, and re-plans files inside the scan, breaking file-level work assignment and the resolve-once seam |
+
+### Consequences
+
+Positional-delete application composes with all existing pushdown and pruning rather than bypassing it, so performance on the delete-free path is unaffected and the delete-carrying path keeps the same pruning behavior (cf. apache/iceberg-rust#2376). The approach requires vendoring the positions-to-`RowSelection` construction (see ADR-084 area of the plan's decision log) since it isn't a public dependency surface.
+
+---
+
+## ADR-083: Unify the Scan Provider on the Custom `ParquetSource`-Backed `TableProvider`, Gated by a Plan-Shape Test
+
+**Date:** 2026-07-06
+**Plan:** `add-positional-delete-application`
+**Status:** Accepted
+
+### Context
+
+Attaching a per-file `ParquetAccessPlan` requires building a `FileScanConfig` directly, which the prior `ListingTable`-based registration path does not permit. The scan needed either one unified provider for all files (delete-free and merge-on-read alike) or two divergent registration paths gated on whether a file carries deletes.
+
+### Decision
+
+Build the custom `ParquetSource`-backed `TableProvider` for every scan, delete-free and merge-on-read alike, replacing `ListingTable` in file registration — unless a plan-shape/pruning-preservation test shows a noticeable regression on the delete-free path, in which case fall back to a conditional path (`ListingTable` for delete-free, the custom provider only when deletes are present).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Unified custom `TableProvider` for all scans | ✓ Chosen — one code path, simpler; the plan-shape/pruning-preservation test is the objective gate that would trigger falling back |
+| Conditional from the start (`ListingTable` for delete-free, custom provider only for MOR) | ✗ Rejected as the default — retained as the documented fallback if the unified path regresses the delete-free plan shape |
+
+### Consequences
+
+The delete-free scan path now goes through the same provider code as the merge-on-read path, so a regression there would affect every query, not just delete-carrying ones — the plan-shape test exists specifically to catch that before it ships. If the fallback is ever triggered, the codebase gains a second, conditional registration path.
+
+---
+
+## ADR-084: Plan-Time Fail-Loud at the Manifest / `DataFile` Level Is the Authoritative Correctness Gate for Unsupported Deletes
+
+**Date:** 2026-07-06
+**Plan:** `add-positional-delete-application`
+**Status:** Accepted
+
+### Context
+
+The engine cannot apply every Iceberg delete mechanism — equality deletes, Puffin/v3 deletion vectors, and ORC/Avro data or delete files are out of scope. Before this feature, none of these were detected, so the engine would silently return pre-delete rows for tables using them. `plan_files` drops the Puffin discriminator, so detection at scan/read time cannot reliably distinguish a deletion vector from a Parquet positional delete.
+
+### Decision
+
+Detect unsupported delete mechanisms at plan time, in the adapter, at the manifest / `DataFile` level (where the Puffin discriminator and file format are still visible) — before building or returning any scan-driving SQL. This plan-time detection is the authoritative gate. A lightweight scan-time check is retained only as cheap defense-in-depth.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Plan-time detection at the manifest/`DataFile` level, with a scan-time backstop | ✓ Chosen — reliable, because the discriminator and file format are still visible at that level; fails before any SQL is emitted or any node is engaged |
+| Read-time-only detection on `FileScanTaskDeleteFile` | ✗ Rejected as the sole guard — `plan_files` drops the Puffin discriminator, making a deletion vector indistinguishable from a Parquet positional delete once the scan spec is built |
+
+### Consequences
+
+An unsupported-delete query now fails immediately, cleanly, and without emitting scan-driving SQL or any credential — closing the silent-correctness gap for those mechanisms too. Equality deletes and deletion vectors remain explicit future work under issue #11; adding support for them later means extending the same manifest-level detection point.
+
+---
+
+## ADR-085: Minimal Scan-Spec Surface for Delete Support — Per-File References Only
+
+**Date:** 2026-07-06
+**Plan:** `add-positional-delete-application`
+**Status:** Accepted
+
+### Context
+
+Applying positional deletes needs enough information for the scan UDF to read and interpret each data file's associated delete files, but the wire format between the adapter and the scan UDF is deliberately kept minimal (no catalog access from the UDF, no repeated per-shard fields). A more expansive design would have carried a serialized Iceberg `Schema` and a bound `BoundPredicate` into the scan spec to support delete application generically.
+
+### Decision
+
+Add only per-file positional-delete references (path, byte size, delete content type) to the per-shard `files` argument. Keep `logical_schema` and the existing `FieldIdExprAdapter` exactly as they are; do not carry a serialized Iceberg `Schema` or a `BoundPredicate`. Legacy `(path, size)` entries deserialize with an empty delete list, preserving backward compatibility within one deploy.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Per-file delete references only (path, byte size, content type) | ✓ Chosen — keeps the wire format lean; DataFusion already does its own pushdown from the SQL filter, and the existing field-id adapter already handles schema evolution |
+| Carry a serialized Iceberg `Schema` + bound `BoundPredicate` | ✗ Rejected — unnecessary weight; this was the design of an earlier, rejected broader plan (`add-iceberg-delete-application`) |
+
+### Consequences
+
+The scan spec's delete-related surface stays minimal and backward-compatible: a delete-free table produces a byte-identical common spec to before this feature, and legacy per-shard entries without deletes still reconstitute correctly. Any future delete mechanism support (equality deletes, deletion vectors) will need to extend this same minimal per-file surface rather than reintroducing the rejected schema/predicate approach.
