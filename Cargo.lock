@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2966,6 +2966,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "crc32fast",
  "datafusion",
  "exasol-udf-macros",
  "exasol-udf-sdk",

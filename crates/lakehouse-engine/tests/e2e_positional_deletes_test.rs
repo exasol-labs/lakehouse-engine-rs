@@ -6,12 +6,16 @@
 //! `packaging/positional-delete-fixtures`).
 //!
 //! The fixture tables (`mor_pos_file`, `mor_pos_partition`, and the
-//! unsupported-delete `mor_dv_unsupported`) are authored ONCE by the
+//! still-unsupported `mor_orc_unsupported`) are authored ONCE by the
 //! `spark-iceberg-fixtures` one-shot Compose job at stack bring-up (see
 //! `scripts/spark-fixtures/`) — this file never seeds them itself, only the
 //! delete-free `events` table used by the no-regression scenario. Ground
 //! truth for the fixtures lives in `tests/common/pos_delete_fixtures.rs` and
 //! MUST stay in lockstep with the Spark SQL scripts that produce them.
+//!
+//! The deletion-vector table (`mor_dv`, now a SUPPORTED positive-path
+//! fixture) and the mixed-mechanism table (`mor_mixed`) are exercised by
+//! `e2e_deletion_vectors_test.rs`, not here.
 //!
 //! All tests FAIL (never skip) when the stack is unavailable — per project
 //! rules — because every test starts with `setup_e2e()`, which panics (via
@@ -22,8 +26,8 @@
 mod common;
 use common::exasol_ws::ExaConn;
 use common::pos_delete_fixtures::{
-    DELETION_VECTOR_TABLE, FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS,
-    FILE_GRANULARITY_TABLE, FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, PARTITION_COL,
+    FILE_GRANULARITY_DELETED_IDS, FILE_GRANULARITY_REMAINING_ROWS, FILE_GRANULARITY_TABLE,
+    FILE_GRANULARITY_TOTAL_ROWS, NAMESPACE, ORC_UNSUPPORTED_TABLE, PARTITION_COL,
     PARTITION_EAST_DELETED_IDS, PARTITION_GRANULARITY_DELETED_IDS,
     PARTITION_GRANULARITY_REMAINING_ROWS, PARTITION_GRANULARITY_TABLE,
     PARTITION_GRANULARITY_TOTAL_ROWS, PARTITION_WEST_DELETED_IDS,
@@ -39,7 +43,7 @@ use common::stack::{
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::{resolve_file_list, shard_count};
 use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
-use lakehouse_engine::scan::spec::{CatalogProps, DeleteFileContentType, StorageProps};
+use lakehouse_engine::scan::spec::{CatalogProps, DeleteType, StorageProps};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -381,8 +385,8 @@ fn fixture_spark_file_granularity_delete_table() {
         );
         for delete in &entry.deletes {
             assert_eq!(
-                delete.content_type,
-                DeleteFileContentType::PositionDeletes,
+                delete.delete_type,
+                DeleteType::PosDel,
                 "file granularity: delete file for {} must be a Parquet positional delete",
                 entry.path
             );
@@ -431,8 +435,8 @@ fn fixture_spark_partition_granularity_delete_table() {
             entry.deletes.len()
         );
         assert_eq!(
-            entry.deletes[0].content_type,
-            DeleteFileContentType::PositionDeletes,
+            entry.deletes[0].delete_type,
+            DeleteType::PosDel,
             "partition granularity: delete file for {} must be a Parquet positional delete",
             entry.path
         );
@@ -826,27 +830,24 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 // ---------------------------------------------------------------------------
 
 /// End-to-end: a query over a table whose snapshot carries an unsupported
-/// delete mechanism (equality delete or Puffin/v3 deletion vector) MUST fail
+/// mechanism (equality delete, or an ORC/Avro data or delete file) MUST fail
 /// at plan time with a clean error naming the mechanism, and MUST NOT return
 /// any rows or leak credentials.
 ///
-/// Targets `mor_dv_unsupported` (`DELETION_VECTOR_TABLE`), a
-/// `format-version=3` merge-on-read table whose Spark `DELETE FROM` commits a
-/// Puffin deletion vector instead of a Parquet positional-delete file (see
-/// `scripts/spark-fixtures/create_deletion_vector_fixture.sql`). The
-/// EqualityDelete arm of `UnsupportedDeleteMechanism` remains untested at the
-/// E2E level — only Flink's row-level upsert connectors write equality
-/// deletes, and Flink is not part of this stack
+/// Targets `mor_orc_unsupported` (`ORC_UNSUPPORTED_TABLE`), a table whose
+/// single data file is ORC rather than Parquet (see
+/// `scripts/spark-fixtures/create_orc_unsupported_fixture.sql`). Iceberg v3
+/// Puffin deletion vectors are NO LONGER exercised here — they are a
+/// SUPPORTED mechanism now, applied on read and covered by the positive-path
+/// tests in `e2e_deletion_vectors_test.rs` (`e2e_dv_returns_post_delete_rows`
+/// et al.), which is what proves a deletion-vector table does NOT fail this
+/// way. The EqualityDelete arm of `UnsupportedDeleteMechanism` remains
+/// untested at the E2E level — only Flink's row-level upsert connectors write
+/// equality deletes, and Flink is not part of this stack
 /// (`scripts/spark-fixtures/run_fixtures.sh`'s header) — but shares the same
 /// plan-time gate (`classify_manifest_file` in `adapter/pushdown.rs`) as the
-/// DeletionVector arm exercised here, and is covered directly by that
-/// function's unit tests.
-///
-/// UPSTREAM TRACKING (apache/iceberg-rust#2681, #2580, #2411): once
-/// iceberg-rust gains v3 deletion-vector READ support, `mor_dv_unsupported`
-/// becomes readable rather than rejected, and this test will need a
-/// genuinely unsupported fixture in its place (or retirement) plus a new
-/// positive-path DV read test.
+/// OrcDataFile arm exercised here, and is covered directly by that function's
+/// unit tests.
 #[test]
 fn e2e_unsupported_delete_fails_loud() {
     setup_e2e();
@@ -854,14 +855,14 @@ fn e2e_unsupported_delete_fails_loud() {
 
     let sql = format!(
         "SELECT * FROM {} LIMIT 1",
-        vs_table(VS_NAME, DELETION_VECTOR_TABLE)
+        vs_table(VS_NAME, ORC_UNSUPPORTED_TABLE)
     );
     let resp = conn.try_execute(&sql);
 
     assert_eq!(
         resp["status"].as_str(),
         Some("error"),
-        "query over an unsupported-delete table must fail, got: {resp}"
+        "query over an unsupported-mechanism table must fail, got: {resp}"
     );
 
     let message = resp["exception"]["text"]
@@ -870,11 +871,8 @@ fn e2e_unsupported_delete_fails_loud() {
         .unwrap_or_default()
         .to_ascii_lowercase();
     assert!(
-        message.contains("equality")
-            || message.contains("deletion vector")
-            || message.contains("puffin"),
-        "error must name the unsupported delete mechanism (equality delete or \
-         deletion vector/Puffin), got: {resp}"
+        message.contains("orc"),
+        "error must name the unsupported mechanism (ORC data files), got: {resp}"
     );
 
     for secret_marker in [

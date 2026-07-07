@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 license.workspace = true
 
@@ -35,6 +35,9 @@ async-trait = "0.1"
 # Positional-delete set: the scan UDF unions delete positions into a
 # `RoaringTreemap` and feeds the vendored `build_deletes_row_selection`.
 roaring = { workspace = true }
+
+# CRC-32 validation of the deletion-vector-v1 Puffin blob (see workspace root).
+crc32fast = { workspace = true }
 
 iceberg              = { workspace = true }
 iceberg-catalog-rest = { workspace = true }

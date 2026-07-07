@@ -26,7 +26,7 @@ use exasol_udf_sdk::value::Value;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
+    DeleteFormat, DeleteType, FileEntry, ResolvedDelete, ScanSpec, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -193,13 +193,9 @@ fn write_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> 
         .to_string()
 }
 
-/// A [`DeleteFileRef`] for the Parquet positional-delete file at `abs_url`.
-fn delete_ref(abs_url: &str) -> DeleteFileRef {
-    DeleteFileRef {
-        path: abs_url.to_string(),
-        size: local_file_size(abs_url),
-        content_type: DeleteFileContentType::PositionDeletes,
-    }
+/// A [`ResolvedDelete`] for the Parquet positional-delete file at `abs_url`.
+fn delete_ref(abs_url: &str) -> ResolvedDelete {
+    ResolvedDelete::position(abs_url, local_file_size(abs_url))
 }
 
 /// A row-scan `ScanSpec` over `files` (already absolute, `table_root` empty),
@@ -503,10 +499,13 @@ fn scan_rejects_unapplicable_delete_file() {
     let dir = temp_dir("unapplicable");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
 
-    let bogus_delete = DeleteFileRef {
+    let bogus_delete = ResolvedDelete {
         path: format!("{}/does-not-need-to-exist.parquet", dir.to_string_lossy()),
         size: 10,
-        content_type: DeleteFileContentType::EqualityDeletes,
+        delete_type: DeleteType::EqDel,
+        format: DeleteFormat::Parquet,
+        offset: None,
+        length: None,
     };
     let entry = FileEntry::with_deletes(
         data_url.clone(),

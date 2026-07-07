@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Runs the Apache Spark (Iceberg Spark runtime) fixture scripts that author
-# Iceberg merge-on-read positional-delete tables (and one unsupported-delete
-# table) for the lakehouse-engine E2E stack, against the SAME shared Iceberg
-# REST catalog + MinIO the rest of the stack uses.
+# Iceberg merge-on-read positional-delete, deletion-vector, mixed-mechanism,
+# and still-unsupported-mechanism tables for the lakehouse-engine E2E stack,
+# against the SAME shared Iceberg REST catalog + MinIO the rest of the stack
+# uses.
 #
 # UPSTREAM TRACKING (apache/iceberg-rust#340): iceberg-rust 0.10 has no
 # position-delete writer, and pyiceberg is copy-on-write only, so Apache
@@ -10,17 +11,23 @@
 # plain Spark `DELETE FROM` against a `write.delete.mode=merge-on-read` table
 # commits Parquet POSITION deletes (Flink's row-level upsert connectors are
 # the ones that commit EQUALITY deletes instead), which is exactly the delete
-# mechanism this feature applies on read. The third fixture below instead sets
-# `format-version=3` so the SAME merge-on-read DELETE commits a Puffin
-# deletion vector — a delete mechanism this feature deliberately REJECTS at
-# plan time (see create_deletion_vector_fixture.sql).
+# mechanism this feature applies on read. The deletion-vector fixture instead
+# sets `format-version=3` so the SAME merge-on-read DELETE commits a Puffin
+# deletion vector — a delete mechanism this engine now APPLIES on read (see
+# `datafusion-scan/scan-execution-deletion-vectors`). The mixed-mechanism
+# fixture upgrades format-version mid-fixture so ONE table ends up with a
+# data file under each mechanism (the v2→v3 migration shape). The ORC fixture
+# exercises a mechanism that remains genuinely unsupported (equality deletes
+# cannot be produced by this stack — only Flink writes them, and Flink is not
+# part of this stack).
 #
 # DROP CONDITION: once #340 lands and iceberg-rust exposes a position-delete
 # writer, replace the first two steps with native Rust fixture authoring in
 # tests/common/seed.rs (matching its other seed tables), and delete this
-# script, the two positional-delete fixture .sql files, and the
-# spark-iceberg-fixtures docker-compose service. The deletion-vector fixture
-# has a SEPARATE drop condition — see its own header comment.
+# script, the positional-delete fixture .sql files, and the
+# spark-iceberg-fixtures docker-compose service. The deletion-vector and
+# mixed-mechanism fixtures have a SEPARATE drop condition — see their own
+# header comments.
 set -euo pipefail
 
 ICEBERG_VERSION="1.10.1"
@@ -71,5 +78,11 @@ echo "=== spark-iceberg-fixtures: write.delete.granularity=partition MOR fixture
 
 echo "=== spark-iceberg-fixtures: format-version=3 Puffin deletion-vector fixture ==="
 /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_deletion_vector_fixture.sql
+
+echo "=== spark-iceberg-fixtures: mixed positional-delete + deletion-vector fixture ==="
+/opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_mixed_mechanism_fixture.sql
+
+echo "=== spark-iceberg-fixtures: still-unsupported ORC data file fixture ==="
+/opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_orc_unsupported_fixture.sql
 
 echo "=== spark-iceberg-fixtures: done ==="

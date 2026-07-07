@@ -27,9 +27,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
-};
+use lakehouse_engine::scan::spec::{DeleteType, FileEntry, ResolvedDelete, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -443,11 +441,10 @@ fn spec_reconstitutes_with_delete_entries() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         file_size(&data_url),
-        vec![DeleteFileRef {
-            path: delete_url.clone(),
-            size: file_size(&delete_url),
-            content_type: DeleteFileContentType::PositionDeletes,
-        }],
+        vec![ResolvedDelete::position(
+            delete_url.clone(),
+            file_size(&delete_url),
+        )],
     );
     let spec = spec_for_files(vec![entry]);
 
@@ -468,8 +465,8 @@ fn spec_reconstitutes_with_delete_entries() {
     );
     assert_eq!(reconstituted.files[0].deletes.len(), 1);
     assert_eq!(
-        reconstituted.files[0].deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes
+        reconstituted.files[0].deletes[0].delete_type,
+        DeleteType::PosDel
     );
 
     // Functional reconstitution: driving the two-argument pipeline actually

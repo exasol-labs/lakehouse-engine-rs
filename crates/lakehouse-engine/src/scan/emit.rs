@@ -246,6 +246,15 @@ pub fn redact_secret_values(s: &str, secrets: &[&str]) -> String {
     result
 }
 
+/// Redact both literal secret values and credential-shaped substrings from an
+/// error message before it is surfaced. The one shared redaction seam used by the
+/// scan read path (positional-delete and deletion-vector application): strips the
+/// exact `secrets` values first, then applies the label/pattern heuristic.
+pub(crate) fn redact(msg: String, secrets: &[String]) -> String {
+    let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    redact_credentials(&redact_secret_values(&msg, &borrowed))
+}
+
 /// Replace credential-shaped substrings with "[REDACTED]".
 ///
 /// Catches common S3 credential patterns, SigV4 Authorization headers, and
