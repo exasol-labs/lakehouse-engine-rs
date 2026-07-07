@@ -21,7 +21,7 @@
 
 mod common;
 use common::exasol_ws::ExaConn;
-use common::seed::{E2E_NAMESPACE, E2E_TABLE, seed_events};
+use common::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, seed_events};
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
     exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
@@ -199,6 +199,29 @@ fn vs_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
 }
 
+fn vs_dim_table() -> String {
+    format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
+}
+
+fn vs_fact_table() -> String {
+    format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
+}
+
+/// Run `EXPLAIN VIRTUAL <query_sql>` and return the pushed SQL text (the
+/// generated scan-driving IMPORT statement plus Exasol's echoed pushdown
+/// request), flattened to one string for substring inspection. Mirrors the
+/// helper in `e2e_scan_test.rs`.
+fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    conn.fetch_result_columns(result_set)
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // Shared numeric parsers (also in e2e_scan_test.rs; ponytail: small dup OK)
 // ---------------------------------------------------------------------------
@@ -213,6 +236,52 @@ fn parse_int(v: &serde_json::Value) -> i64 {
     v.as_i64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
+}
+
+// ---------------------------------------------------------------------------
+// 5.1  Inner equi-join capability advertisement (live round-trip)
+// ---------------------------------------------------------------------------
+
+/// A live `getCapabilities` round-trip against the running VS advertises the
+/// inner equi-join capabilities `JOIN`, `JOIN_TYPE_INNER`, and
+/// `JOIN_CONDITION_EQUI`.
+///
+/// `EXPLAIN VIRTUAL` of a query over a virtual schema drives Exasol's planner
+/// through `getCapabilities`, and its output echoes the adapter's capability
+/// response verbatim (a compact JSON `"capabilities":[...]` array). Asserting the
+/// three join tokens are present in that live response — rather than only against
+/// the in-process `CAPABILITIES` constant (the unit test) — proves the deployed
+/// `.so` advertises them end to end. The comma-adjacent `"JOIN","JOIN_TYPE_INNER"`
+/// substring isolates the bare `JOIN` capability token from the `INNER JOIN` SQL
+/// keyword and the `JOIN_*` compound tokens.
+#[test]
+fn e2e_advertises_inner_equi_join_capability() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // A join query guarantees the join capabilities are exercised in planning;
+    // the capability list itself is echoed regardless of the query shape.
+    let query = format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
+        vs_fact_table(),
+        vs_dim_table()
+    );
+    let advertised = explain_virtual_sql(&mut conn, &query);
+
+    assert!(
+        advertised.contains("\"capabilities\":"),
+        "EXPLAIN VIRTUAL must echo the getCapabilities response:\n{advertised}"
+    );
+    assert!(
+        advertised.contains("\"JOIN\",\"JOIN_TYPE_INNER\""),
+        "getCapabilities must advertise the bare JOIN and JOIN_TYPE_INNER \
+         capabilities:\n{advertised}"
+    );
+    assert!(
+        advertised.contains("\"JOIN_CONDITION_EQUI\""),
+        "getCapabilities must advertise the JOIN_CONDITION_EQUI capability:\n{advertised}"
+    );
 }
 
 // ---------------------------------------------------------------------------
