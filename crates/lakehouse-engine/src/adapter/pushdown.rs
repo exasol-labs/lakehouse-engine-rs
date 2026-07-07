@@ -2840,29 +2840,22 @@ fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
-    let involved = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    project_columns(pushdown_req, extract_all_column_types(request))
+}
 
-    // Get all columns from the first involved table.
-    let all_cols: Vec<(String, String)> = involved
-        .first()
-        .and_then(|t| t.get("columns"))
-        .and_then(|c| c.as_array())
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| {
-                    let name = c.get("name")?.as_str()?.to_uppercase();
-                    let dt_json = c.get("dataType")?;
-                    let exasol_type = exasol_type_from_json(dt_json);
-                    Some((name, exasol_type))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
+/// Resolve a pushdown request's select list into an ordered projection and its
+/// positionally-aligned Exasol EMITS types, drawing from a given column universe.
+///
+/// `all_cols` is the `(UPPERCASE name, Exasol type)` set the projection may
+/// reference: the first involved table for a single-table scan, or the disjoint
+/// union of BOTH involved tables for a broadcast join. Factoring the select-list
+/// logic here lets the join path reuse it verbatim — a projected column's EMITS
+/// type is looked up in whichever side owns it, with no bespoke join code — while
+/// the single-table path is unchanged.
+fn project_columns(
+    pushdown_req: &Json,
+    all_cols: Vec<(String, String)>,
+) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
     if all_cols.is_empty() {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
@@ -3373,6 +3366,340 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         right_iceberg_ident,
         join_type: JoinType::Inner,
         condition,
+    }))
+}
+
+/// One fully-resolved side of a two-table inner equi-join.
+///
+/// Every field is resolved ONCE per query in the VS planning layer from Iceberg
+/// manifest metadata — the same `resolve_file_list` path the single-table scan
+/// uses — never per shard and never per node (mission.md "resolve metadata once
+/// per query"). `total_bytes` is the sum of every file's `file_size_in_bytes`
+/// (the Iceberg-manifest byte size, NO Parquet read), the quantity the broadcast
+/// threshold is evaluated against.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedJoinSide {
+    /// The Exasol virtual table name (from [`EligibleJoin`]).
+    pub table_name: String,
+    /// The original-cased Iceberg identifier this side was resolved from.
+    pub iceberg_ident: String,
+    /// The Iceberg table root (`table.metadata().location()`); empty ⇒ every
+    /// `files` path is absolute.
+    pub table_root: String,
+    /// This side's FULL file list as `(path, file_size_in_bytes)` pairs.
+    pub files: Vec<(String, u64)>,
+    /// Full logical schema of this side's Iceberg table at query time.
+    pub logical_schema: Vec<LogicalField>,
+    /// Effective storage for this side (vended STS creds when applicable).
+    pub effective_storage: StorageProps,
+    /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
+    pub total_bytes: u64,
+}
+
+impl ResolvedJoinSide {
+    /// Assemble a resolved side, computing `total_bytes` from the file list with a
+    /// saturating sum (a byte total that overflows `u64` is clamped to `u64::MAX`,
+    /// which is correctly treated as "far over any broadcast threshold").
+    fn new(
+        table_name: String,
+        iceberg_ident: String,
+        table_root: String,
+        files: Vec<(String, u64)>,
+        logical_schema: Vec<LogicalField>,
+        effective_storage: StorageProps,
+    ) -> Self {
+        let total_bytes = files
+            .iter()
+            .fold(0u64, |acc, (_, size)| acc.saturating_add(*size));
+        Self {
+            table_name,
+            iceberg_ident,
+            table_root,
+            files,
+            logical_schema,
+            effective_storage,
+            total_bytes,
+        }
+    }
+}
+
+/// The outcome of resolving BOTH sides of an eligible inner equi-join once and
+/// deciding broadcast eligibility from Iceberg-manifest byte sizes.
+///
+/// Both sides are always carried fully resolved: the broadcast path (task 3.4)
+/// shards `fact` and replicates `dimension`; the unaccelerated fallback (task 3.5)
+/// scans BOTH sides through their own fan-outs, so it needs both here too. The
+/// only role of `broadcast_eligible` is to route between those two SQL builders —
+/// it is NEVER an error (decision-log [2]: an ineligible join takes the
+/// deterministic two-scan fallback, not a native retry).
+///
+/// # Edge cases (decision-log has no explicit ruling; choices made here)
+///
+/// - **Self-join** (both sides the same Iceberg table): resolved and sized like
+///   any other pair — both sides carry identical file lists and equal byte totals,
+///   so the tie-break makes the LEFT side the dimension. Broadcasting a table
+///   against itself is a *correct* inner join (every fact-shard row is matched
+///   against the full table). No special case is needed here; the disjoint-
+///   column-name guard (task 3.3) independently declines a self-join to the
+///   unaccelerated path because its two sides share every column name.
+/// - **Empty side** (either side resolves to zero files): its `total_bytes` is 0,
+///   so an empty side is always the (trivially broadcast-eligible) dimension. An
+///   inner join with an empty side yields zero rows either way; the caller may
+///   short-circuit to an empty result by testing `fact.files.is_empty() ||
+///   dimension.files.is_empty()`. Selection deliberately does not special-case it
+///   — sizing and role assignment stay total and deterministic.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinSides {
+    /// The LARGER side by total bytes — sharded across the cluster exactly like
+    /// the single-table scan path.
+    pub fact: ResolvedJoinSide,
+    /// The SMALLER side by total bytes — the broadcast/dimension candidate.
+    pub dimension: ResolvedJoinSide,
+    /// `true` when `dimension.total_bytes <= join_broadcast_max_bytes`: plan a
+    /// broadcast join. `false`: the smaller side is still too big to replicate to
+    /// every shard, so the caller builds the unaccelerated two-scan fallback SQL.
+    pub broadcast_eligible: bool,
+}
+
+/// Choose the fact (sharded) and dimension (broadcast) roles from two resolved
+/// sides and gate broadcast eligibility on the dimension's byte size.
+///
+/// The SMALLER side by total Iceberg-manifest bytes is the dimension; the larger
+/// is the fact. On an exact byte-size tie the first argument (`a`) becomes the
+/// dimension — deterministic and arbitrary, since equal-sized candidates are
+/// interchangeable. The join is broadcast-eligible iff the chosen dimension's
+/// total bytes are at or below `join_broadcast_max_bytes`.
+///
+/// This is the pure, catalog-free core of side selection so it is unit-testable
+/// without a live Iceberg catalog; [`resolve_join_sides`] performs the two
+/// metadata resolutions and delegates here.
+fn select_broadcast_sides(
+    a: ResolvedJoinSide,
+    b: ResolvedJoinSide,
+    join_broadcast_max_bytes: u64,
+) -> JoinSides {
+    let (dimension, fact) = if a.total_bytes <= b.total_bytes {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let broadcast_eligible = dimension.total_bytes <= join_broadcast_max_bytes;
+    JoinSides {
+        fact,
+        dimension,
+        broadcast_eligible,
+    }
+}
+
+/// Resolve ONE join side's file list, logical schema, table root, and effective
+/// storage from the Iceberg catalog, reusing the single-table `resolve_file_list`
+/// path unchanged.
+///
+/// `iceberg_ident` (the original-cased identifier recovered from `TABLE_MAP`)
+/// replaces only the `table` field of the shared `catalog` template, so both
+/// sides resolve against the same catalog URI and warehouse.
+///
+/// No Iceberg-level filter pruning is applied (`filter_json: None`): a pushed
+/// WHERE predicate may reference either table's columns, so pruning one side by it
+/// is unsafe, and the broadcast byte-size decision must reflect the FULL side the
+/// UDF re-scans. DataFusion applies the pushed filter at scan time as the
+/// correctness backstop, exactly as on the single-table path.
+async fn resolve_one_join_side(
+    table_name: &str,
+    iceberg_ident: &str,
+    catalog_uri: &str,
+    storage: &StorageProps,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+) -> Result<ResolvedJoinSide, UdfError> {
+    let side_catalog = CatalogProps {
+        table: iceberg_ident.to_string(),
+        ..catalog.clone()
+    };
+    let (files, effective_storage, logical_schema, table_root) =
+        resolve_file_list(catalog_uri, &side_catalog, storage, creds, None).await?;
+    Ok(ResolvedJoinSide::new(
+        table_name.to_string(),
+        iceberg_ident.to_string(),
+        table_root,
+        files,
+        logical_schema,
+        effective_storage,
+    ))
+}
+
+/// Resolve BOTH sides of an eligible inner equi-join exactly once and decide
+/// broadcast eligibility against `join_broadcast_max_bytes`.
+///
+/// Each side is resolved through [`resolve_one_join_side`] (the shared
+/// `resolve_file_list` path) — twice total, once per table, never per shard.
+/// Selection and the threshold gate are delegated to the pure
+/// [`select_broadcast_sides`]. The returned [`JoinSides`] carries both fully
+/// resolved sides plus the `broadcast_eligible` flag the caller uses to route
+/// between the broadcast plan (task 3.4) and the unaccelerated fallback (task 3.5).
+async fn resolve_join_sides(
+    eligible: &EligibleJoin,
+    catalog_uri: &str,
+    storage: &StorageProps,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+    join_broadcast_max_bytes: u64,
+) -> Result<JoinSides, UdfError> {
+    let left = resolve_one_join_side(
+        &eligible.left_table_name,
+        &eligible.left_iceberg_ident,
+        catalog_uri,
+        storage,
+        catalog,
+        creds,
+    )
+    .await?;
+    let right = resolve_one_join_side(
+        &eligible.right_table_name,
+        &eligible.right_iceberg_ident,
+        catalog_uri,
+        storage,
+        catalog,
+        creds,
+    )
+    .await?;
+    Ok(select_broadcast_sides(
+        left,
+        right,
+        join_broadcast_max_bytes,
+    ))
+}
+
+/// The `(UPPERCASE name, Exasol type)` columns of the named involved table.
+///
+/// Locates the `involvedTables[]` entry whose `name` equals `table_name` (the
+/// Exasol virtual table name carried in [`EligibleJoin`]) and maps its columns
+/// exactly as the single-table projection does — uppercased names, Exasol types
+/// from `dataType`. Returns an empty vec when the table or its columns are absent.
+fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
+    request
+        .get("involvedTables")
+        .and_then(|v| v.as_array())
+        .and_then(|tables| {
+            tables
+                .iter()
+                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
+        })
+        .and_then(|t| t.get("columns"))
+        .and_then(|c| c.as_array())
+        .map(|cols| {
+            cols.iter()
+                .filter_map(|c| {
+                    let name = c.get("name")?.as_str()?.to_uppercase();
+                    let dt_json = c.get("dataType")?;
+                    Some((name, exasol_type_from_json(dt_json)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The disjoint-column-name guard for reusing the `vs-expression` translator
+/// unchanged on a two-table join.
+///
+/// Returns `true` when no column NAME appears on both sides. Only then do bare,
+/// non-table-qualified column references (which is all the translator renders —
+/// see `render_expression`) resolve unambiguously against the COMBINED DataFusion
+/// schema of both registered tables. A single shared name makes a bare reference
+/// ambiguous, so the join is NOT eligible for translator-reuse rendering; the
+/// caller declines to the unaccelerated two-scan path (this is a clean decline,
+/// never an error). Comparison is by name only — a name collision breaks
+/// resolution regardless of the columns' types. Both inputs already carry
+/// uppercased names, so the check is exact.
+fn disjoint_schema_guard(left: &[(String, String)], right: &[(String, String)]) -> bool {
+    let left_names: std::collections::HashSet<&str> =
+        left.iter().map(|(n, _)| n.as_str()).collect();
+    !right.iter().any(|(n, _)| left_names.contains(n.as_str()))
+}
+
+/// Render a join's equi-condition node to a DataFusion SQL boolean expression via
+/// the `vs-expression` translator (bare column names). `None` when the node cannot
+/// be rendered — a defensive decline, since [`detect_join`] already guarantees a
+/// `predicate_equal` shape. Uses `render_expression` (not the filter renderer) so
+/// the boolean expression is returned verbatim, never suppressed as trivially true.
+fn render_join_condition(condition: &Json) -> Option<String> {
+    render_expression_safe(condition)
+}
+
+/// The cross-table projection and Exasol EMITS types for a broadcast join.
+///
+/// Reuses [`project_columns`] against the disjoint union of both involved tables'
+/// columns, so a projected column spanning either side is typed from whichever
+/// side owns it. The caller must have already passed the [`disjoint_schema_guard`]
+/// so the union carries no name collision.
+fn extract_join_projection(
+    request: &Json,
+    pushdown_req: &Json,
+    eligible: &EligibleJoin,
+) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+    let mut combined = involved_table_columns(request, &eligible.left_table_name);
+    combined.extend(involved_table_columns(request, &eligible.right_table_name));
+    project_columns(pushdown_req, combined)
+}
+
+/// The translator-reuse artifacts for a broadcast inner equi-join, rendered once
+/// in the VS planning layer and consumed by the broadcast fan-out SQL builder.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RenderedJoinPushdown {
+    /// The rendered DataFusion SQL boolean join condition (→ [`JoinSpec::condition`]).
+    pub condition: String,
+    /// The rendered cross-table WHERE filter, or `None` when the request carries
+    /// none (or it is trivially true and Exasol keeps it as a backstop).
+    pub filter: Option<String>,
+    /// The cross-table projection, spanning columns from both tables, in order.
+    pub projection: Vec<ProjectionItem>,
+    /// The Exasol EMITS type per projected column, positionally aligned with
+    /// `projection`.
+    pub projection_types: Vec<String>,
+}
+
+/// Render every `vs-expression` artifact a broadcast inner equi-join needs, after
+/// enforcing the disjoint-column-name guard.
+///
+/// Returns `Ok(None)` — a clean decline, NOT an error — when the two tables share
+/// any column name (the guard fails) or the equi-condition cannot be rendered; the
+/// caller then falls through to the deterministic unaccelerated two-scan join,
+/// exactly as for any other join ineligibility. `Ok(Some(..))` carries the rendered
+/// join condition, the cross-table WHERE filter, and the cross-table projection
+/// with its EMITS types. `Err` is reserved for a genuinely malformed request with
+/// no column metadata at all (the same contract [`project_columns`] enforces for
+/// the single-table path).
+///
+/// Rendering is side-agnostic: the translator emits bare column names, so the
+/// result does not depend on which side is later selected as fact vs dimension.
+pub(crate) fn render_broadcast_join(
+    request: &Json,
+    pushdown_req: &Json,
+    eligible: &EligibleJoin,
+) -> Result<Option<RenderedJoinPushdown>, UdfError> {
+    let left_cols = involved_table_columns(request, &eligible.left_table_name);
+    let right_cols = involved_table_columns(request, &eligible.right_table_name);
+    if !disjoint_schema_guard(&left_cols, &right_cols) {
+        return Ok(None);
+    }
+
+    let condition = match render_join_condition(&eligible.condition) {
+        Some(condition) => condition,
+        None => return Ok(None),
+    };
+
+    let filter = pushdown_req
+        .get("filter")
+        .filter(|f| !f.is_null())
+        .and_then(render_df_filter_safe);
+
+    let (projection, projection_types) = extract_join_projection(request, pushdown_req, eligible)?;
+
+    Ok(Some(RenderedJoinPushdown {
+        condition,
+        filter,
+        projection,
+        projection_types,
     }))
 }
 
@@ -5279,6 +5606,149 @@ mod tests {
         assert!(
             err.to_string().contains("ORDERS"),
             "error must name the unmapped table: {err}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Join rendering (task 3.3): disjoint-column guard + condition/filter/projection
+    // rendering via the reused vs-expression translator.
+    // ---------------------------------------------------------------------------
+
+    /// Recover the `EligibleJoin` a request classifies to (the tests below all
+    /// operate on the standard two-table CUSTOMER⋈ORDERS shape from `join_request`).
+    fn eligible_join(request: &Json) -> EligibleJoin {
+        match detect_join(request, &pd(request)).expect("eligible join shape") {
+            JoinShape::Eligible(join) => join,
+            other => panic!("expected Eligible, got {other:?}"),
+        }
+    }
+
+    /// Two tables whose column names are genuinely disjoint (TPC-H `C_*` vs `O_*`)
+    /// pass the guard, so bare column names resolve unambiguously.
+    #[test]
+    fn disjoint_schema_guard_passes_for_disjoint_column_names() {
+        let request = join_request(Json::Null, equi_condition());
+        let left = involved_table_columns(&request, "CUSTOMER");
+        let right = involved_table_columns(&request, "ORDERS");
+        assert!(
+            disjoint_schema_guard(&left, &right),
+            "C_* and O_* column sets are disjoint and must pass the guard"
+        );
+    }
+
+    /// ANY overlapping column name fails the guard, and the failure is surfaced as
+    /// a clean decline (`Ok(None)`) — the caller falls through to the unaccelerated
+    /// path — never as an error.
+    #[test]
+    fn overlapping_column_name_fails_guard_and_declines_without_error() {
+        let mut request = join_request(Json::Null, equi_condition());
+        // Give BOTH sides a column with the same name.
+        for table_idx in [0, 1] {
+            request["involvedTables"][table_idx]["columns"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": "SHARED_KEY",
+                    "dataType": {"type": "varchar", "size": 10}
+                }));
+        }
+
+        let left = involved_table_columns(&request, "CUSTOMER");
+        let right = involved_table_columns(&request, "ORDERS");
+        assert!(
+            !disjoint_schema_guard(&left, &right),
+            "a shared column name must fail the disjoint guard"
+        );
+
+        // The whole rendering entry point declines cleanly, not with an Err.
+        let eligible = eligible_join(&request);
+        let outcome = render_broadcast_join(&request, &pd(&request), &eligible)
+            .expect("a guard failure is a decline, not an error");
+        assert!(
+            outcome.is_none(),
+            "a column-name collision must decline to the unaccelerated path"
+        );
+    }
+
+    /// A simple equi-condition renders to the correct DataFusion SQL boolean
+    /// expression via the reused translator, and is threaded verbatim into the
+    /// rendered join's `condition` (→ `JoinSpec::condition`).
+    #[test]
+    fn join_condition_renders_via_translator() {
+        assert_eq!(
+            render_join_condition(&equi_condition()).as_deref(),
+            Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
+            "the equi-condition must render to a bare-name DataFusion boolean expr"
+        );
+
+        let request = join_request(Json::Null, equi_condition());
+        let eligible = eligible_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+            .expect("disjoint, renderable join")
+            .expect("a disjoint join must render, not decline");
+        assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    }
+
+    /// A WHERE filter referencing columns from BOTH sides renders correctly against
+    /// the combined schema (bare names, disjoint → unambiguous).
+    #[test]
+    fn join_where_filter_spanning_both_sides_renders() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["filter"] = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                 "right": {"type": "literal_string", "value": "ACME"}},
+                {"type": "predicate_greater",
+                 "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                 "right": {"type": "literal_string", "value": "1995-01-01"}},
+            ],
+        });
+
+        let eligible = eligible_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+            .expect("disjoint, renderable join")
+            .expect("must render");
+        let filter = rendered
+            .filter
+            .expect("a cross-side WHERE filter must render");
+        assert!(
+            filter.contains(r#""C_NAME""#),
+            "the left-side column must appear in the rendered filter: {filter}"
+        );
+        assert!(
+            filter.contains(r#""O_ORDERDATE""#),
+            "the right-side column must appear in the rendered filter: {filter}"
+        );
+        assert!(
+            filter.contains("AND"),
+            "the conjunction of both sides must render: {filter}"
+        );
+    }
+
+    /// The cross-table projection attributes each projected column to its OWNING
+    /// side's Exasol type: `C_NAME` from CUSTOMER (`VARCHAR(100)`), `O_ORDERDATE`
+    /// from ORDERS (`DATE`).
+    #[test]
+    fn join_projection_emits_attribute_each_side_owning_type() {
+        let request = join_request(Json::Null, equi_condition());
+        let eligible = eligible_join(&request);
+        let (projection, types) =
+            extract_join_projection(&request, &pd(&request), &eligible).expect("projectable");
+
+        assert_eq!(
+            projection,
+            vec![
+                ProjectionItem::Column("C_NAME".into()),
+                ProjectionItem::Column("O_ORDERDATE".into()),
+            ],
+            "projection spans both tables in select-list order"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
+            "each column's EMITS type comes from the side that owns it"
         );
     }
 
@@ -10718,5 +11188,167 @@ mod tests {
             common_back.logical_schema, logical,
             "logical_schema must be carried in the common arg"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Join side selection + broadcast threshold (task 3.2): `select_broadcast_sides`.
+    // The pure core of both-sides resolution — exercised without a live Iceberg
+    // catalog. The async `resolve_join_sides`/`resolve_one_join_side` wrappers just
+    // call `resolve_file_list` twice and delegate here, so this covers the decision.
+    // ---------------------------------------------------------------------------
+
+    /// The default `JOIN_BROADCAST_MAX_BYTES` (128 MiB).
+    const BROADCAST_MAX: u64 = 134_217_728;
+
+    /// Build a resolved join side with a given `(path, byte_size)` file list.
+    /// Storage/schema/root are populated so the tests can assert the full resolved
+    /// payload rides along with the selected role; only the byte totals drive
+    /// selection.
+    fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> ResolvedJoinSide {
+        let lower = table_name.to_lowercase();
+        ResolvedJoinSide::new(
+            table_name.to_string(),
+            format!("lh.{lower}"),
+            format!("s3://warehouse/lh/{lower}"),
+            files.into_iter().map(|(p, s)| (p.to_string(), s)).collect(),
+            vec![LogicalField {
+                field_id: 1,
+                name: format!("{table_name}_KEY"),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+            }],
+            sample_storage(),
+        )
+    }
+
+    /// `total_bytes` is the saturating sum of every file's `file_size_in_bytes`
+    /// (the Iceberg-manifest size — no Parquet read).
+    #[test]
+    fn resolved_side_sums_file_bytes_saturating() {
+        assert_eq!(
+            resolved_side("ORDERS", vec![("a", 100), ("b", 250), ("c", 4)]).total_bytes,
+            354
+        );
+        // Empty side ⇒ zero bytes.
+        assert_eq!(resolved_side("EMPTY", vec![]).total_bytes, 0);
+        // A byte total that would overflow u64 saturates to u64::MAX (treated as
+        // "far over any threshold"), never wraps.
+        assert_eq!(
+            resolved_side("HUGE", vec![("x", u64::MAX), ("y", 1)]).total_bytes,
+            u64::MAX
+        );
+    }
+
+    /// The smaller side by bytes is the dimension; the larger is the fact, and the
+    /// full resolved payload (files, schema, root, storage, idents) rides along
+    /// with each role for tasks 3.3/3.4. Here the LEFT argument is smaller.
+    #[test]
+    fn dimension_is_left_when_left_side_is_smaller() {
+        let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
+        let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
+        let sides = select_broadcast_sides(customer, orders, BROADCAST_MAX);
+
+        assert_eq!(sides.dimension.table_name, "CUSTOMER");
+        assert_eq!(sides.fact.table_name, "ORDERS");
+        assert_eq!(sides.dimension.total_bytes, 1_000);
+        assert_eq!(sides.fact.total_bytes, 100_000);
+        assert!(
+            sides.broadcast_eligible,
+            "1000 bytes is well under the 128 MiB threshold"
+        );
+        // Resolved payload travels with the role.
+        assert_eq!(sides.dimension.iceberg_ident, "lh.customer");
+        assert_eq!(sides.fact.iceberg_ident, "lh.orders");
+        assert_eq!(sides.dimension.files, vec![("c1".to_string(), 1_000)]);
+        assert_eq!(sides.dimension.table_root, "s3://warehouse/lh/customer");
+        assert_eq!(sides.dimension.logical_schema.len(), 1);
+        assert_eq!(sides.dimension.effective_storage, sample_storage());
+    }
+
+    /// Reversing the FROM-clause order (larger side first) still selects the
+    /// smaller side as the dimension — selection is by byte size, not position.
+    #[test]
+    fn dimension_is_right_when_right_side_is_smaller() {
+        let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
+        let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
+        let sides = select_broadcast_sides(orders, customer, BROADCAST_MAX);
+
+        assert_eq!(sides.dimension.table_name, "CUSTOMER");
+        assert_eq!(sides.fact.table_name, "ORDERS");
+        assert_eq!(sides.dimension.total_bytes, 1_000);
+        assert!(sides.broadcast_eligible);
+    }
+
+    /// The dimension (smaller) side exceeding the threshold is reported as NOT
+    /// broadcast-eligible — cleanly via the flag, never an error — so the caller
+    /// builds the deterministic unaccelerated two-scan fallback (decision-log [2]).
+    #[test]
+    fn dimension_over_threshold_is_not_broadcast_eligible() {
+        let part = resolved_side("PART", vec![("p1", 200)]);
+        let lineitem = resolved_side("LINEITEM", vec![("l1", 900)]);
+        // Threshold 100 is below even the smaller side's 200 bytes.
+        let sides = select_broadcast_sides(part, lineitem, 100);
+
+        assert_eq!(
+            sides.dimension.table_name, "PART",
+            "PART (200 bytes) is the smaller side"
+        );
+        assert_eq!(sides.fact.table_name, "LINEITEM");
+        assert!(
+            !sides.broadcast_eligible,
+            "dimension total 200 > threshold 100: not broadcast-eligible"
+        );
+    }
+
+    /// A dimension exactly AT the threshold is eligible (inclusive `<=`); one byte
+    /// over is not — the boundary the byte-size decision hinges on.
+    #[test]
+    fn threshold_boundary_is_inclusive() {
+        let at = select_broadcast_sides(
+            resolved_side("DIM", vec![("d", 100)]),
+            resolved_side("FACT", vec![("f", 10_000)]),
+            100,
+        );
+        assert!(
+            at.broadcast_eligible,
+            "dimension == threshold must be eligible"
+        );
+
+        let over = select_broadcast_sides(
+            resolved_side("DIM", vec![("d", 101)]),
+            resolved_side("FACT", vec![("f", 10_000)]),
+            100,
+        );
+        assert!(
+            !over.broadcast_eligible,
+            "dimension == threshold + 1 must not be eligible"
+        );
+    }
+
+    /// An empty side (zero files ⇒ zero bytes) is the trivially broadcast-eligible
+    /// dimension, and selection stays deterministic (documented empty-side edge).
+    #[test]
+    fn empty_side_is_the_eligible_dimension() {
+        let empty = resolved_side("EMPTYDIM", vec![]);
+        let fact = resolved_side("FACT", vec![("f", 5_000)]);
+        let sides = select_broadcast_sides(empty, fact, BROADCAST_MAX);
+
+        assert_eq!(sides.dimension.table_name, "EMPTYDIM");
+        assert_eq!(sides.dimension.total_bytes, 0);
+        assert!(sides.dimension.files.is_empty());
+        assert!(sides.broadcast_eligible);
+    }
+
+    /// On an exact byte-size tie (e.g. a self-join, both sides the same table) the
+    /// FIRST argument is the dimension — deterministic, documented tie-break.
+    #[test]
+    fn equal_size_tie_breaks_to_first_argument() {
+        let a = resolved_side("SELF_A", vec![("s", 4_242)]);
+        let b = resolved_side("SELF_B", vec![("s", 4_242)]);
+        let sides = select_broadcast_sides(a, b, BROADCAST_MAX);
+
+        assert_eq!(sides.dimension.table_name, "SELF_A");
+        assert_eq!(sides.fact.table_name, "SELF_B");
+        assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
     }
 }
