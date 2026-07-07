@@ -13,11 +13,11 @@
 - [x] 3.3 Render join condition/cross-table projection/EMITS/filter via vs-expression; disjoint-column guard [expert]
 
 ## Phase 2: Implementation (Group D)
-- [ ] 3.4 Build broadcast fan-out scan-driving SQL (fact sharded, dimension full file list) [expert]
-- [ ] 3.5 Build unaccelerated two-scan join fallback SQL; error only as last resort
-- [ ] 4.1 UDF: register fact(shard)+dimension(full) as two tables in one session, aliased sub-SELECTs
-- [ ] 4.2 Execute inner equi-join with projection/filter/limit; stream via emit_batch; dimension = build side [expert]
-- [ ] 4.3 Route unreadable-file/deserialization errors through classify_scan_error
+- [x] 3.4 Build broadcast fan-out scan-driving SQL (fact sharded, dimension full file list) [expert]
+- [x] 3.5 Build unaccelerated two-scan join fallback SQL; error only as last resort
+- [x] 4.1 UDF: register fact(shard)+dimension(full) as two tables in one session, aliased sub-SELECTs
+- [x] 4.2 Execute inner equi-join with projection/filter/limit; stream via emit_batch; dimension = build side [expert]
+- [x] 4.3 Route unreadable-file/deserialization errors through classify_scan_error
 
 ## Phase 2: Implementation (Group E)
 - [ ] 5.1 Capability advertisement test (unit + e2e_capability_test.rs)

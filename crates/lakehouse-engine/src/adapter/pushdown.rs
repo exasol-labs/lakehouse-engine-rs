@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, JoinType, LogicalField, ProjectionItem, ScanSpec,
-    SortKey, StorageProps, render_order_by_clause,
+    AggKind, AggregatePlan, CatalogProps, JoinSpec, JoinType, LogicalField, ProjectionItem,
+    ScanSpec, SortKey, StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -2057,14 +2057,45 @@ pub async fn handle_pushdown(
     join_broadcast_max_bytes: u64,
     creds: &ConnectionCreds,
 ) -> Result<Json, UdfError> {
-    // Not yet consumed here — task 3.2 (side-selection) reads this threshold to
-    // decide broadcast eligibility. Parsed, defaulted, and threaded through now so
-    // that task can land as a pure additive change.
-    let _ = join_broadcast_max_bytes;
     let pushdown_req = request
         .get("pushdownRequest")
         .cloned()
         .unwrap_or(Json::Null);
+
+    // Two-table inner equi-join handling MUST run before the single-table path.
+    // `handle_pushdown` is invoked once per pushdown REQUEST, resolving only
+    // `involvedTables[0]` (adapter::mod::handle_pushdown_request); a join-shaped
+    // `from` that fell through would scan just the first table and silently drop the
+    // join. `NotAJoin` is today's normal single-table request — fall through
+    // unchanged. `Ineligible` cannot be served by a correct two-scan fallback (wrong
+    // join type / >2 tables / non-equi / malformed shape), so it declines to a native
+    // retry rather than mis-scan. `Eligible` is planned here and returns directly.
+    match detect_join(request, &pushdown_req)? {
+        JoinShape::NotAJoin => {}
+        JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
+        JoinShape::Eligible(eligible) => {
+            return plan_eligible_join(
+                request,
+                &pushdown_req,
+                &eligible,
+                catalog_uri,
+                storage,
+                catalog,
+                creds,
+                scan_schema,
+                cluster_nodes,
+                parallelism_factor,
+                df_target_partitions,
+                df_batch_size,
+                df_threads_per_udf,
+                memory_pool_fraction,
+                instance_overhead_mb,
+                s3_max_connections,
+                join_broadcast_max_bytes,
+            )
+            .await;
+        }
+    }
 
     let (proj_cols, proj_types) = extract_projection(request, &pushdown_req)?;
 
@@ -2105,25 +2136,11 @@ pub async fn handle_pushdown(
     // stay absolute. The scan UDF rejoins relative paths onto `table_root`.
     let shards = relativize_shards_to_root(shards, &table_root);
 
-    // The scan UDF must be schema-qualified: the pushdown query executes
-    // outside the adapter script's schema, so an unqualified name would not
+    // The scan and distinct-merge UDFs must be schema-qualified: the pushdown query
+    // executes outside the adapter script's schema, so an unqualified name would not
     // resolve ("function or script LAKEHOUSE_SCAN not found").
-    let udf_name = match scan_schema {
-        Some(schema) if !schema.is_empty() => {
-            format!("{}.{}", quote_ident(schema), SCAN_UDF_NAME)
-        }
-        _ => SCAN_UDF_NAME.to_string(),
-    };
-
-    // The scalar distinct-merge UDF (used only by single-group COUNT(DISTINCT)
-    // outer wrappers) must be schema-qualified the same way the scan UDF is, for
-    // the same reason: the pushdown query runs outside the adapter script's schema.
-    let merge_udf_name = match scan_schema {
-        Some(schema) if !schema.is_empty() => {
-            format!("{}.{}", quote_ident(schema), DISTINCT_MERGE_UDF_NAME)
-        }
-        _ => DISTINCT_MERGE_UDF_NAME.to_string(),
-    };
+    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
+    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
 
     // The raw HAVING node (for grouped aggregate queries). Rendered against the
     // merge decomposition in the grouped branch below (its aggregates reference
@@ -3701,6 +3718,386 @@ pub(crate) fn render_broadcast_join(
         projection,
         projection_types,
     }))
+}
+
+/// Schema-qualify a UDF/script name for a pushdown-driving query.
+///
+/// The generated SQL runs outside the adapter script's own schema, so an
+/// unqualified name would fail to resolve. Shared by the single-table path and the
+/// join planner so both qualify identically.
+fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
+    match scan_schema {
+        Some(schema) if !schema.is_empty() => format!("{}.{}", quote_ident(schema), udf),
+        _ => udf.to_string(),
+    }
+}
+
+/// The `User` decline error for a join `from` clause the broadcast contract cannot
+/// serve as a two-table inner equi-join.
+///
+/// An `Ineligible` shape has no pair of resolved sides and no rendered equi-condition
+/// to build a correct unaccelerated two-scan from, and falling through to the
+/// single-table path would scan only the first involved table and silently drop the
+/// join. So the only safe outcome is a `User` error that makes Exasol retry the query
+/// natively (`vs-adapter/pushdown-planning-join` "declined safely", last resort).
+fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError {
+    let detail = match reason {
+        IneligibleJoinReason::NotInnerJoinType => "the join is not an inner join",
+        IneligibleJoinReason::NotEquiCondition => "the join condition is not an equi-condition",
+        IneligibleJoinReason::TooManyTables => "the join spans more than two tables",
+        IneligibleJoinReason::UnsupportedShape => "the join `from` clause has an unsupported shape",
+    };
+    UdfError::User(format!(
+        "join pushdown declined: {detail}; a correct two-scan fallback cannot be built \
+         for this shape, so Exasol will retry the query natively"
+    ))
+}
+
+/// Render one projection item as an outer-query SELECT expression: a bare column is
+/// double-quoted, an already-rendered scalar expression is spliced verbatim.
+fn projection_item_select_sql(item: &ProjectionItem) -> String {
+    match item {
+        ProjectionItem::Column(name) => quote_ident(name),
+        ProjectionItem::Expr { expr } => expr.clone(),
+    }
+}
+
+/// Wrap two independently-sharded scan fan-outs in an Exasol-executed inner
+/// equi-join — the unaccelerated fallback (task 3.5).
+///
+/// Each `*_fan_out` is a self-contained subquery emitting its table's full column
+/// set. The two tables' column names are disjoint (guaranteed by the disjoint-column
+/// guard that gates reaching this path), so the outer projection, `ON <condition>`,
+/// and optional `WHERE <filter>` all reference bare column names unambiguously and
+/// Exasol's core engine performs the join. This reproduces the pre-broadcast
+/// two-scan behavior deterministically: no broadcast replication, no adapter error.
+pub fn build_two_scan_join_sql(
+    fact_fan_out: &str,
+    dimension_fan_out: &str,
+    projection: &[ProjectionItem],
+    condition: &str,
+    filter: Option<&str>,
+) -> String {
+    let select = if projection.is_empty() {
+        "*".to_string()
+    } else {
+        projection
+            .iter()
+            .map(projection_item_select_sql)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut sql = format!(
+        "SELECT {select} FROM ({fact_fan_out}) AS \"LHS_FACT\" \
+         INNER JOIN ({dimension_fan_out}) AS \"LHS_DIM\" ON {condition}"
+    );
+    if let Some(f) = filter {
+        sql.push_str(&format!(" WHERE {f}"));
+    }
+    sql
+}
+
+/// Plan an eligible two-table inner equi-join: resolve BOTH sides once, then route
+/// to the broadcast fan-out (small side ≤ threshold) or the unaccelerated two-scan
+/// fallback, or decline to a native retry when neither can be built correctly.
+///
+/// Routing:
+/// - `render_broadcast_join` declines (`None`) → overlapping column names or an
+///   unrenderable condition. The translator emits only bare names, so a two-scan
+///   wrapper would be ambiguous — decline to a native retry (last resort).
+/// - either side has zero files → an inner join yields zero rows; emit a
+///   shape-correct empty result instead of a fan-out over an empty file list.
+/// - `broadcast_eligible` → shard ONLY the fact side and carry the dimension side's
+///   full file list once in the common blob's join block (task 3.4).
+/// - otherwise → scan each side through its own sharded fan-out and let Exasol join
+///   them (task 3.5).
+///
+/// LIMIT / GROUP BY / ORDER BY are never pushed into a join this phase (plan
+/// non-goals); any such extra pushdown fields are ignored here — the join output is
+/// returned in full and Exasol applies them.
+#[allow(clippy::too_many_arguments)]
+async fn plan_eligible_join(
+    request: &Json,
+    pushdown_req: &Json,
+    eligible: &EligibleJoin,
+    catalog_uri: &str,
+    storage: &StorageProps,
+    catalog: &CatalogProps,
+    creds: &ConnectionCreds,
+    scan_schema: Option<&str>,
+    cluster_nodes: usize,
+    parallelism_factor: usize,
+    df_target_partitions: usize,
+    df_batch_size: usize,
+    df_threads_per_udf: usize,
+    memory_pool_fraction: f64,
+    instance_overhead_mb: u64,
+    s3_max_connections: usize,
+    join_broadcast_max_bytes: u64,
+) -> Result<Json, UdfError> {
+    // Resolve both sides ONCE (two catalog resolutions total, never per shard).
+    let sides = resolve_join_sides(
+        eligible,
+        catalog_uri,
+        storage,
+        catalog,
+        creds,
+        join_broadcast_max_bytes,
+    )
+    .await?;
+
+    // Render the shared condition/filter/projection. `None` is a clean decline that
+    // the two-scan fallback cannot recover from (bare-name ambiguity / no condition),
+    // so it becomes a native retry.
+    let rendered = match render_broadcast_join(request, pushdown_req, eligible)? {
+        Some(rendered) => rendered,
+        None => {
+            return Err(UdfError::User(
+                "join pushdown declined: overlapping column names or an unrenderable join \
+                 condition prevents a correct two-scan fallback; Exasol will retry natively"
+                    .into(),
+            ));
+        }
+    };
+
+    // An inner join with an empty side is empty regardless of the plan.
+    if sides.fact.files.is_empty() || sides.dimension.files.is_empty() {
+        return Ok(empty_pushdown_sql(
+            &rendered.projection,
+            &rendered.projection_types,
+        ));
+    }
+
+    let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
+    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
+    let tuning = JoinScanTuning {
+        cluster_nodes,
+        parallelism_factor,
+        df_target_partitions,
+        df_batch_size,
+        df_threads_per_udf,
+        memory_pool_fraction,
+        instance_overhead_mb,
+        s3_max_connections,
+    };
+
+    let sql = if sides.broadcast_eligible {
+        build_broadcast_join_sql(&sides, &rendered, &tuning, &udf_name, &merge_udf_name)
+    } else {
+        build_unaccelerated_join_sql(
+            request,
+            &sides,
+            &rendered,
+            &tuning,
+            &udf_name,
+            &merge_udf_name,
+        )?
+    };
+    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// The DataFusion execution + sharding knobs threaded into join SQL building.
+///
+/// Bundled so the two join SQL builders take one config parameter instead of eight
+/// positional numbers whose order is easy to transpose (guardrails: few arguments,
+/// config at high levels).
+struct JoinScanTuning {
+    cluster_nodes: usize,
+    parallelism_factor: usize,
+    df_target_partitions: usize,
+    df_batch_size: usize,
+    df_threads_per_udf: usize,
+    memory_pool_fraction: f64,
+    instance_overhead_mb: u64,
+    s3_max_connections: usize,
+}
+
+/// Relativize one file list against its table root (single-list convenience over
+/// [`relativize_shards_to_root`], preserving order and byte sizes).
+fn relativize_files_to_root(files: Vec<(String, u64)>, table_root: &str) -> Vec<(String, u64)> {
+    relativize_shards_to_root(vec![files], table_root)
+        .pop()
+        .unwrap_or_default()
+}
+
+/// Build one side's single-table sharded fan-out SQL (`SELECT * FROM (fan-out)`),
+/// emitting that table's FULL column set — no join block, no projection/filter/limit
+/// push. Used for BOTH sides of the unaccelerated fallback: the outer Exasol query
+/// (see [`build_two_scan_join_sql`]) applies the projection, `ON`, and `WHERE`, so
+/// each subquery must expose every column the condition/filter/projection may
+/// reference. `columns` is the side's `(UPPERCASE name, Exasol type)` list.
+fn build_side_fan_out_sql(
+    side: &ResolvedJoinSide,
+    columns: &[(String, String)],
+    tuning: &JoinScanTuning,
+    udf_name: &str,
+    merge_udf_name: &str,
+) -> String {
+    let proj_cols: Vec<ProjectionItem> = columns
+        .iter()
+        .map(|(name, _)| ProjectionItem::Column(name.clone()))
+        .collect();
+    let proj_types: Vec<String> = columns.iter().map(|(_, ty)| ty.clone()).collect();
+
+    let g = shard_count(
+        tuning.cluster_nodes,
+        tuning.parallelism_factor,
+        side.files.len(),
+    );
+    let shards = crate::adapter::sharding::partition_files_by_bytes(side.files.clone(), g);
+    let shards = relativize_shards_to_root(shards, &side.table_root);
+
+    let spec = ScanSpec {
+        table_root: side.table_root.clone(),
+        files: vec![],
+        projection: proj_cols.clone(),
+        filter: None,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        emit_exa_types: proj_types.clone(),
+        logical_schema: side.logical_schema.clone(),
+        join: None,
+        storage: side.effective_storage.clone(),
+        df_target_partitions: tuning.df_target_partitions,
+        df_batch_size: tuning.df_batch_size,
+        df_threads_per_udf: tuning.df_threads_per_udf,
+        memory_pool_fraction: tuning.memory_pool_fraction,
+        instance_overhead_mb: tuning.instance_overhead_mb,
+        s3_max_connections: tuning.s3_max_connections,
+    };
+    build_scan_driving_sql(
+        &spec,
+        &shards,
+        &proj_cols,
+        &proj_types,
+        None,
+        &[],
+        &[],
+        udf_name,
+        merge_udf_name,
+    )
+}
+
+/// Build the broadcast fan-out scan-driving SQL (task 3.4).
+///
+/// The fact (larger) side is sharded into G byte-balanced work units exactly as the
+/// single-table path does; the dimension (smaller) side's FULL file list, table
+/// root, logical schema, join type, and rendered condition ride ONCE in the
+/// shard-invariant common blob's join block ([`JoinSpec`]). Every shard invocation
+/// therefore re-scans the same dimension side and joins it against its fact-file
+/// subset node-locally, with no cross-shard exchange. Reuses [`build_scan_driving_sql`]
+/// unchanged — the join block travels transparently inside the common blob.
+///
+/// One `StorageProps` serves both registered tables inside the single DataFusion
+/// session; the fact side's effective storage is used. When vended credentials are
+/// disabled (the common MinIO case) both sides' effective storage is identical, so
+/// this is exact; with per-prefix vended STS creds both tables must be readable with
+/// the fact side's grant (both live under one warehouse for the broadcast target).
+fn build_broadcast_join_sql(
+    sides: &JoinSides,
+    rendered: &RenderedJoinPushdown,
+    tuning: &JoinScanTuning,
+    udf_name: &str,
+    merge_udf_name: &str,
+) -> String {
+    let fact = &sides.fact;
+    let dimension = &sides.dimension;
+
+    let g = shard_count(
+        tuning.cluster_nodes,
+        tuning.parallelism_factor,
+        fact.files.len(),
+    );
+    let shards = crate::adapter::sharding::partition_files_by_bytes(fact.files.clone(), g);
+    let shards = relativize_shards_to_root(shards, &fact.table_root);
+
+    let join = JoinSpec {
+        table_root: dimension.table_root.clone(),
+        files: relativize_files_to_root(dimension.files.clone(), &dimension.table_root),
+        logical_schema: dimension.logical_schema.clone(),
+        join_type: JoinType::Inner,
+        condition: rendered.condition.clone(),
+    };
+
+    let spec = ScanSpec {
+        table_root: fact.table_root.clone(),
+        files: vec![],
+        projection: rendered.projection.clone(),
+        filter: rendered.filter.clone(),
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        emit_exa_types: rendered.projection_types.clone(),
+        logical_schema: fact.logical_schema.clone(),
+        join: Some(join),
+        storage: fact.effective_storage.clone(),
+        df_target_partitions: tuning.df_target_partitions,
+        df_batch_size: tuning.df_batch_size,
+        df_threads_per_udf: tuning.df_threads_per_udf,
+        memory_pool_fraction: tuning.memory_pool_fraction,
+        instance_overhead_mb: tuning.instance_overhead_mb,
+        s3_max_connections: tuning.s3_max_connections,
+    };
+
+    build_scan_driving_sql(
+        &spec,
+        &shards,
+        &rendered.projection,
+        &rendered.projection_types,
+        None,
+        &[],
+        &[],
+        udf_name,
+        merge_udf_name,
+    )
+}
+
+/// Build the unaccelerated two-scan join SQL (task 3.5): each side scanned through
+/// its own sharded fan-out, joined by Exasol's core engine.
+///
+/// Each side emits its FULL column set (from that table's `involvedTables` column
+/// metadata), so the outer wrapper's projection, `ON`, and `WHERE` can reference any
+/// column the join needs — including join keys and filter columns absent from the
+/// user's select list. Returns an `Err` only when a side carries no column metadata
+/// at all, in which case no correct subquery can be built (native retry).
+fn build_unaccelerated_join_sql(
+    request: &Json,
+    sides: &JoinSides,
+    rendered: &RenderedJoinPushdown,
+    tuning: &JoinScanTuning,
+    udf_name: &str,
+    merge_udf_name: &str,
+) -> Result<String, UdfError> {
+    let fact_cols = involved_table_columns(request, &sides.fact.table_name);
+    let dim_cols = involved_table_columns(request, &sides.dimension.table_name);
+    if fact_cols.is_empty() || dim_cols.is_empty() {
+        return Err(UdfError::User(
+            "join pushdown declined: an involved table carries no column metadata, so the \
+             unaccelerated two-scan fallback cannot be built; Exasol will retry natively"
+                .into(),
+        ));
+    }
+
+    let fact_fan_out =
+        build_side_fan_out_sql(&sides.fact, &fact_cols, tuning, udf_name, merge_udf_name);
+    let dim_fan_out = build_side_fan_out_sql(
+        &sides.dimension,
+        &dim_cols,
+        tuning,
+        udf_name,
+        merge_udf_name,
+    );
+
+    Ok(build_two_scan_join_sql(
+        &fact_fan_out,
+        &dim_fan_out,
+        &rendered.projection,
+        &rendered.condition,
+        rendered.filter.as_deref(),
+    ))
 }
 
 /// Build the shape-correct empty-result response for a fully-pruned file list.
@@ -5749,6 +6146,122 @@ mod tests {
             types,
             vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
             "each column's EMITS type comes from the side that owns it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Join SQL-shape and decline routing (tasks 3.4 / 3.5)
+    // -----------------------------------------------------------------------
+
+    /// pushdown-planning-join "A join outside the broadcast contract is declined
+    /// safely". Two independent facets are asserted together because they are the
+    /// two ways a join leaves the broadcast contract:
+    ///
+    /// 1. A shape `detect_join` classifies `Ineligible` (outer, non-equi, >2 tables,
+    ///    malformed) cannot yield a correct two-scan fallback — there is no pair of
+    ///    resolved sides and no rendered equi-condition to join on — so it MUST map
+    ///    to a `User` decline error (Exasol retries natively), NEVER fall through to
+    ///    the single-table path (which would scan only the first involved table and
+    ///    silently drop the join).
+    /// 2. An otherwise-eligible join whose two tables share a column name fails the
+    ///    disjoint-column guard, so `render_broadcast_join` declines with `Ok(None)`.
+    ///    The `vs-expression` translator emits only bare column names, so a two-scan
+    ///    wrapper would carry an ambiguous `ON`/`WHERE`/`SELECT` — hence the router
+    ///    treats `None` as "fallback cannot be built" and errors rather than emit a
+    ///    wrong plan.
+    #[test]
+    fn join_outside_contract_declined_safely() {
+        // Facet 1: every ineligible reason declines to a native-retry error.
+        for reason in [
+            IneligibleJoinReason::NotInnerJoinType,
+            IneligibleJoinReason::NotEquiCondition,
+            IneligibleJoinReason::TooManyTables,
+            IneligibleJoinReason::UnsupportedShape,
+        ] {
+            let err = ineligible_join_decline(reason);
+            match err {
+                UdfError::User(msg) => assert!(
+                    msg.contains("join pushdown declined") && msg.contains("retry"),
+                    "ineligible reason {reason:?} must decline for native retry: {msg}"
+                ),
+                other => panic!("ineligible join must be a User decline, got {other:?}"),
+            }
+        }
+
+        // An outer join reaches the decline path as Ineligible, never Eligible.
+        let outer = join_request(
+            serde_json::json!({"join_type": "left_outer"}),
+            equi_condition(),
+        );
+        assert!(
+            matches!(
+                detect_join(&outer, &pd(&outer)),
+                Ok(JoinShape::Ineligible(
+                    IneligibleJoinReason::NotInnerJoinType
+                ))
+            ),
+            "an outer join must classify Ineligible so the decline path is taken"
+        );
+
+        // Facet 2: overlapping column names → render declines with Ok(None).
+        let mut request = join_request(Json::Null, equi_condition());
+        for table_idx in [0, 1] {
+            request["involvedTables"][table_idx]["columns"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "name": "SHARED_COL",
+                    "dataType": {"type": "varchar", "size": 10}
+                }));
+        }
+        let eligible = eligible_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+            .expect("guard failure is a decline, not an error");
+        assert!(
+            rendered.is_none(),
+            "overlapping column names must decline broadcast rendering (Ok(None))"
+        );
+    }
+
+    /// task 3.5: the unaccelerated wrapper joins two independently-sharded fan-out
+    /// subqueries with an Exasol-executed `INNER JOIN ... ON <condition>`, projecting
+    /// the cross-table select list and applying the optional cross-side WHERE. The
+    /// two subqueries are opaque here (any SQL text); this asserts only the wrapper
+    /// shape, so it is independent of the per-side fan-out builder.
+    #[test]
+    fn join_above_threshold_unaccelerated_sql() {
+        let projection = vec![
+            ProjectionItem::Column("C_NAME".into()),
+            ProjectionItem::Column("O_ORDERDATE".into()),
+        ];
+        let sql = build_two_scan_join_sql(
+            "FACT_FAN_OUT",
+            "DIM_FAN_OUT",
+            &projection,
+            r#"("C_CUSTKEY" = "O_CUSTKEY")"#,
+            Some(r#"("O_ORDERDATE" > DATE '1995-01-01')"#),
+        );
+
+        assert!(
+            sql.contains("(FACT_FAN_OUT)") && sql.contains("(DIM_FAN_OUT)"),
+            "both side fan-outs must appear as derived-table subqueries: {sql}"
+        );
+        assert!(
+            sql.contains("INNER JOIN") && sql.contains(r#"ON ("C_CUSTKEY" = "O_CUSTKEY")"#),
+            "the outer query must be an Exasol INNER JOIN on the rendered condition: {sql}"
+        );
+        assert!(
+            sql.contains(r#"SELECT "C_NAME", "O_ORDERDATE" FROM"#),
+            "the cross-table projection must drive the outer SELECT in order: {sql}"
+        );
+        assert!(
+            sql.contains(r#"WHERE ("O_ORDERDATE" > DATE '1995-01-01')"#),
+            "a cross-side WHERE filter must be applied by the outer query: {sql}"
+        );
+        // No broadcast join block is ever embedded in the unaccelerated wrapper.
+        assert!(
+            !sql.contains("\"join\""),
+            "the unaccelerated path must not embed a broadcast join block: {sql}"
         );
     }
 

@@ -117,13 +117,28 @@ fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String>
 /// files, the Parquet reader then drops row groups and pages within survivors.
 /// Pruning narrows what is read; it never changes the result set.
 pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
-    SessionConfig::new()
+    let config = SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(spec.df_target_partitions.max(1))
         .with_batch_size(spec.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
-        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
+        .set_bool("datafusion.execution.parquet.pushdown_filters", true);
+
+    if spec.join.is_some() {
+        // Broadcast-join build-side determinism. The scan places the bounded
+        // dimension on the LEFT of the join (`build_join_sql`), and `HashJoinExec`
+        // always builds its hash table from the left child. DataFusion's
+        // `JoinSelection` would otherwise swap inputs based on table statistics —
+        // but the scan disables statistics collection (`with_collect_stat(false)`),
+        // so a swap decision would be non-deterministic. Turning join reordering
+        // off pins the dimension as the build side regardless of statistics, which
+        // is exactly the bounded, memory-safe build side the broadcast contract
+        // guarantees fits in the pool.
+        config.set_bool("datafusion.optimizer.join_reordering", false)
+    } else {
+        config
+    }
 }
 
 /// Reconstitute the full `ScanSpec` from the two scan-UDF input arguments.
@@ -188,7 +203,13 @@ async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(),
 
     let memory_limit_bytes = ctx.memory_limit();
     let session_ctx = build_session_context(spec, memory_limit_bytes)?;
-    if spec.aggregates.is_some() {
+    if spec.join.is_some() {
+        // A join spec drives the two-table broadcast inner equi-join path: register
+        // the sharded fact side and the full dimension side in one session, join
+        // node-locally, and stream joined batches. Takes precedence over the
+        // aggregate/raw dispatch (the VS never combines a join with aggregates).
+        run_join_scan_with_session(ctx, &session_ctx, spec, &mut timers).await
+    } else if spec.aggregates.is_some() {
         // Partial-aggregate paths emit a single summary row; phase telemetry
         // targets the raw-row streaming path where startup / import / send-back
         // are the throughput question. Leave the aggregate path unchanged.
@@ -223,6 +244,238 @@ pub async fn run_raw_scan_with_session(
     // logging/sink failure NEVER fails the scan (the scan already succeeded).
     emit_phase_telemetry(ctx, timers);
     Ok(())
+}
+
+/// Registered table name for the sharded fact (large) side of a broadcast join.
+const JOIN_FACT_TABLE: &str = "fact_scan";
+/// Registered table name for the full dimension (small/build) side of a broadcast join.
+const JOIN_DIM_TABLE: &str = "dim_scan";
+
+/// Stream a two-table inner equi-join over an already-built session.
+///
+/// Registers the sharded fact file list (`spec.files`) and the full, shard-invariant
+/// dimension file list (`spec.join.files`) as two tables in the SAME session, each
+/// wrapped in an aliased sub-SELECT exposing Exasol-facing uppercase column names,
+/// then executes `SELECT <projection> FROM (dim) INNER JOIN (fact) ON <condition>
+/// [WHERE <filter>] [LIMIT n]` and streams the joined batches through [`emit_stream`]
+/// (one fetched, emitted, dropped before the next — never collect-all).
+///
+/// The bounded dimension side is placed on the LEFT of the join and join reordering
+/// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
+/// the hash-join build side regardless of table statistics. Read/deserialization
+/// errors for EITHER side route through [`classify_scan_error`], so no credential
+/// value can leak. Exposed so a host integration test can drive this exact path over
+/// local Parquet (no S3 store).
+pub async fn run_join_scan_with_session(
+    ctx: &mut dyn UdfContext,
+    session_ctx: &SessionContext,
+    spec: &ScanSpec,
+    timers: &mut diagnostics::PhaseTimers,
+) -> Result<(), UdfError> {
+    let secrets = spec.storage.secret_values();
+    register_join_tables(session_ctx, spec, &secrets).await?;
+    let sql = build_join_sql(session_ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
+    let df = session_ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| UdfError::User(format!("join SQL error: {e}")))?;
+    let stream = df
+        .execute_stream()
+        .await
+        .map_err(|e| classify_scan_error(e, &secrets))?;
+    emit_stream(ctx, stream, &secrets, &spec.emit_exa_types, timers).await?;
+    emit_phase_telemetry(ctx, timers);
+    Ok(())
+}
+
+/// Register both sides of a broadcast join into one session: the sharded fact file
+/// list and the full dimension file list, each via [`register_file_list`].
+///
+/// Aggregates or GROUP BY alongside a join are out of scope for this phase (the VS
+/// never emits that combination); such a spec is rejected with a clear error rather
+/// than silently producing a wrong-shaped result.
+async fn register_join_tables(
+    ctx: &SessionContext,
+    spec: &ScanSpec,
+    secrets: &[&str],
+) -> Result<(), UdfError> {
+    let join = spec
+        .join
+        .as_ref()
+        .expect("register_join_tables called without a join block");
+
+    if spec.aggregates.is_some() || spec.group_keys.is_some() {
+        return Err(UdfError::User(
+            "join pushdown does not support aggregate or GROUP BY in the same scan spec".into(),
+        ));
+    }
+
+    register_file_list(
+        ctx,
+        JOIN_FACT_TABLE,
+        &spec.files,
+        &spec.table_root,
+        &spec.logical_schema,
+        secrets,
+    )
+    .await?;
+    register_file_list(
+        ctx,
+        JOIN_DIM_TABLE,
+        &join.files,
+        &join.table_root,
+        &join.logical_schema,
+        secrets,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Build the DataFusion SQL for a two-table inner equi-join.
+///
+/// Both registered tables are wrapped in an aliased sub-SELECT exposing uppercase,
+/// Exasol-facing column names (the same seam the single-table and partial-aggregate
+/// paths use), so the pushed projection, the rendered join `condition`, and the
+/// WHERE filter — all uppercase and disjoint across the two tables — resolve
+/// unambiguously against the join's combined schema.
+///
+/// The dimension side is placed on the LEFT so it is the hash-join build side (see
+/// [`run_join_scan_with_session`]). Output column order follows `spec.projection`
+/// (positionally aligned with `emit_exa_types`); an empty projection expands to
+/// every column, dimension columns first. `LIMIT`, when present, is applied here
+/// exactly as the single-table scan applies it — the VS does not currently push a
+/// LIMIT alongside a join, but the path handles it identically for consistency.
+async fn build_join_sql(
+    ctx: &SessionContext,
+    fact_table: &str,
+    dim_table: &str,
+    spec: &ScanSpec,
+) -> Result<String, UdfError> {
+    let join = spec
+        .join
+        .as_ref()
+        .expect("build_join_sql called without a join block");
+
+    let fact = ctx
+        .table(fact_table)
+        .await
+        .map_err(|e| UdfError::User(format!("cannot resolve registered fact table: {e}")))?;
+    let dim = ctx
+        .table(dim_table)
+        .await
+        .map_err(|e| UdfError::User(format!("cannot resolve registered dimension table: {e}")))?;
+    let fact_schema = fact.schema();
+    let dim_schema = dim.schema();
+
+    let fact_aliased = format!(
+        "SELECT {} FROM {fact_table}",
+        build_alias_items(fact_schema).join(", ")
+    );
+    let dim_aliased = format!(
+        "SELECT {} FROM {dim_table}",
+        build_alias_items(dim_schema).join(", ")
+    );
+
+    // Uppercase output column names paired with their Arrow type, dimension side
+    // first (matching the left/build side). Columns are disjoint across the two
+    // tables (VS guarantee), so a bare uppercase name resolves in exactly one side.
+    let combined = combined_upper_fields(dim_schema, fact_schema);
+
+    let proj_items: Vec<ProjectionItem> = if spec.projection.is_empty() {
+        combined
+            .iter()
+            .map(|(name, _)| ProjectionItem::Column(name.clone()))
+            .collect()
+    } else {
+        spec.projection.clone()
+    };
+
+    let select_items: Vec<String> = proj_items
+        .iter()
+        .map(|item| render_join_select_item(item, &combined))
+        .collect();
+
+    // Dimension on the LEFT = hash-join build side (reordering is disabled).
+    let mut sql = format!(
+        "SELECT {} FROM ({dim_aliased}) INNER JOIN ({fact_aliased}) ON {}",
+        select_items.join(", "),
+        join.condition
+    );
+
+    if let Some(filter) = &spec.filter
+        && !filter.is_empty()
+    {
+        sql.push_str(" WHERE ");
+        sql.push_str(filter);
+    }
+
+    if let Some(limit) = spec.limit {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+
+    Ok(sql)
+}
+
+/// Build an ordered `(UPPERCASE_NAME, DataType)` list for every column across both
+/// join inputs, dimension columns first (matching the left/build side). Column
+/// names are disjoint across the two tables (VS guarantee), so the flattened list
+/// carries no duplicate names.
+fn combined_upper_fields(
+    dim_schema: &datafusion::common::DFSchema,
+    fact_schema: &datafusion::common::DFSchema,
+) -> Vec<(String, arrow::datatypes::DataType)> {
+    dim_schema
+        .fields()
+        .iter()
+        .chain(fact_schema.fields().iter())
+        .map(|f| (f.name().to_uppercase(), f.data_type().clone()))
+        .collect()
+}
+
+/// Render one projection item for the join SELECT list. A rendered scalar
+/// expression is spliced verbatim; a bare column is quoted as an uppercase
+/// identifier, wrapped in `CAST(... AS VARCHAR)` when its Arrow type needs the
+/// JSON fallback — the same rule the single-table scan applies in `build_scan_sql`.
+fn render_join_select_item(
+    item: &ProjectionItem,
+    combined: &[(String, arrow::datatypes::DataType)],
+) -> String {
+    match item {
+        ProjectionItem::Expr { expr } => expr.clone(),
+        ProjectionItem::Column(col_name) => {
+            let upper = col_name.to_uppercase();
+            let needs_cast = combined
+                .iter()
+                .find(|(name, _)| *name == upper)
+                .map(|(_, dt)| needs_json_fallback(dt))
+                .unwrap_or(false);
+            if needs_cast {
+                format!("CAST({} AS VARCHAR)", quote_ident(&upper))
+            } else {
+                quote_ident(&upper)
+            }
+        }
+    }
+}
+
+/// Build the physical plan for the two-table inner equi-join, registering both
+/// sides into `ctx`. Exposed so a host test can assert the bounded dimension side
+/// is the hash-join build (left) side without standing up an S3 store — the caller
+/// registers local Parquet files, then inspects the plan this function produces.
+pub async fn build_join_physical_plan(
+    ctx: &SessionContext,
+    spec: &ScanSpec,
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, UdfError> {
+    let secrets = spec.storage.secret_values();
+    register_join_tables(ctx, spec, &secrets).await?;
+    let sql = build_join_sql(ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| UdfError::User(format!("join SQL error: {e}")))?;
+    df.create_physical_plan()
+        .await
+        .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
 /// Emit the per-VM phase-telemetry record, gated on the debug level.
@@ -810,16 +1063,56 @@ fn build_session_context(
     // Register the MinIO object store for the S3 URL scheme, wrapped so that
     // per-file HEAD requests are answered from the caller-supplied sizes in the
     // spec instead of issuing an object-store HEAD over the network.
-    let bucket = extract_bucket(spec)?;
-    let s3 = build_s3_store(&spec.storage, &bucket, spec.s3_max_connections)?;
     let sizes = build_spec_size_index(spec)?;
-    let sized_store = SpecSizedObjectStore::new(Arc::new(s3), sizes);
+    let bucket = extract_bucket(spec)?;
+    register_bucket_store(
+        &ctx,
+        &spec.storage,
+        &bucket,
+        spec.s3_max_connections,
+        &sizes,
+    )?;
+
+    // A broadcast join's dimension side may live in a different bucket than the
+    // sharded fact side. Register a store for it too (same credentials, same size
+    // index) so DataFusion can resolve its object store; skip when it coincides
+    // with the fact bucket — the common same-warehouse case, where the fact store
+    // already serves both sides.
+    if let Some(join) = &spec.join
+        && !join.files.is_empty()
+    {
+        let dim_bucket = extract_bucket_from_files(&join.files, &join.table_root)?;
+        if dim_bucket != bucket {
+            register_bucket_store(
+                &ctx,
+                &spec.storage,
+                &dim_bucket,
+                spec.s3_max_connections,
+                &sizes,
+            )?;
+        }
+    }
+
+    Ok(ctx)
+}
+
+/// Build an S3 store for `bucket` (sized-HEAD wrapped) and register it on `ctx`
+/// under the `s3://{bucket}` URL. Shared by the single-table scan and the two
+/// sides of a broadcast join (which may span two buckets under one credential).
+fn register_bucket_store(
+    ctx: &SessionContext,
+    storage: &crate::scan::spec::StorageProps,
+    bucket: &str,
+    s3_max_connections: usize,
+    sizes: &HashMap<ObjectStorePath, u64>,
+) -> Result<(), UdfError> {
+    let s3 = build_s3_store(storage, bucket, s3_max_connections)?;
+    let sized_store = SpecSizedObjectStore::new(Arc::new(s3), sizes.clone());
     let store_url = Url::parse(&format!("s3://{bucket}"))
         .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
     ctx.runtime_env()
         .register_object_store(&store_url, Arc::new(sized_store));
-
-    Ok(ctx)
+    Ok(())
 }
 
 /// HTTP client options that bound the object store's warm connection pool to the
@@ -860,13 +1153,33 @@ fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
 /// [`Path`]: object_store::path::Path
 fn build_spec_size_index(spec: &ScanSpec) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
     let mut sizes = HashMap::with_capacity(spec.files.len());
-    for (path, size) in &spec.files {
-        let abs = reconstruct_abs_uri(path, &spec.table_root);
+    index_file_sizes(&mut sizes, &spec.files, &spec.table_root)?;
+    // A broadcast join carries the dimension side's full file list; its per-file
+    // sizes are indexed too so DataFusion answers the dimension HEADs from the spec
+    // (no network round-trip), exactly as it does for the sharded fact side.
+    if let Some(join) = &spec.join {
+        index_file_sizes(&mut sizes, &join.files, &join.table_root)?;
+    }
+    Ok(sizes)
+}
+
+/// Insert each `(path, size)` entry into `sizes`, keyed by the object-store [`Path`]
+/// DataFusion passes to `head` for that exact-file URL (the `ListingTableUrl`
+/// prefix), reconstructing relative paths against `table_root`.
+///
+/// [`Path`]: object_store::path::Path
+fn index_file_sizes(
+    sizes: &mut HashMap<ObjectStorePath, u64>,
+    files: &[(String, u64)],
+    table_root: &str,
+) -> Result<(), UdfError> {
+    for (path, size) in files {
+        let abs = reconstruct_abs_uri(path, table_root);
         let url = ListingTableUrl::parse(&abs)
             .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))?;
         sizes.insert(url.prefix().clone(), *size);
     }
-    Ok(sizes)
+    Ok(())
 }
 
 /// An [`ObjectStore`] decorator that answers per-file metadata (`head`) from a
@@ -1025,11 +1338,20 @@ fn build_s3_store(
 /// the bucket is then the host of that absolute URI. For the all-absolute case
 /// (empty `table_root`) reconstruction is a no-op, so behavior is unchanged.
 fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
-    let (first, _size) = spec
-        .files
+    extract_bucket_from_files(&spec.files, &spec.table_root)
+}
+
+/// Extract the S3 bucket (host) from the first entry of an explicit file list,
+/// reconstructing a relative first entry against `table_root`. Shared by the fact
+/// side (`extract_bucket`) and a join's dimension side.
+fn extract_bucket_from_files(
+    files: &[(String, u64)],
+    table_root: &str,
+) -> Result<String, UdfError> {
+    let (first, _size) = files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
-    let abs = reconstruct_abs_uri(first, &spec.table_root);
+    let abs = reconstruct_abs_uri(first, table_root);
     let url = Url::parse(&abs).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
     url.host_str()
         .map(|h| h.to_string())
@@ -1059,41 +1381,70 @@ async fn register_files(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
+    let secrets = spec.storage.secret_values();
+    register_file_list(
+        ctx,
+        table_name,
+        &spec.files,
+        &spec.table_root,
+        &spec.logical_schema,
+        &secrets,
+    )
+    .await
+}
+
+/// Register an explicit `(path, size)` file list as a ListingTable named `table_name`.
+///
+/// The lower-level seam shared by the single-table scan (`register_files`) and the
+/// broadcast-join path (`register_join_tables`), which registers a fact and a
+/// dimension file list into the SAME session. `table_root` reconstructs relative
+/// paths; a non-empty `logical_schema` registers that schema and installs the
+/// field-id expression adapter (column binding is field-id-first — correct across
+/// Iceberg schema evolution), otherwise one Arrow schema is inferred from the first
+/// file. Read/inference errors route through [`classify_scan_error`] so no
+/// credential value can leak, whichever side's file list is unreadable.
+async fn register_file_list(
+    ctx: &SessionContext,
+    table_name: &str,
+    files: &[(String, u64)],
+    table_root: &str,
+    logical_schema: &[crate::scan::spec::LogicalField],
+    secrets: &[&str],
+) -> Result<(), UdfError> {
     let file_format = Arc::new(ParquetFormat::default());
     let listing_options = ListingOptions::new(file_format)
         .with_file_extension(".parquet")
         // Disable glob — we supply exact paths.
         .with_collect_stat(false);
 
-    let table_paths: Vec<ListingTableUrl> = spec
-        .files
+    let table_paths: Vec<ListingTableUrl> = files
         .iter()
         .map(|(path, _size)| {
-            let abs = reconstruct_abs_uri(path, &spec.table_root);
+            let abs = reconstruct_abs_uri(path, table_root);
             ListingTableUrl::parse(&abs)
                 .map_err(|e| UdfError::User(format!("invalid listing URL '{abs}': {e}")))
         })
         .collect::<Result<_, _>>()?;
 
-    // Prefer the query-time logical schema (with Iceberg field-ids) when the
-    // adapter supplied one: register it as the table schema and install the
-    // field-id expression adapter so column binding is field-id-first (name
-    // fallback) — correct across schema evolution. When it is absent (legacy
-    // specs), fall back to inferring one Arrow schema from the first file.
-    let secrets = spec.storage.secret_values();
-    let config = if spec.logical_schema.is_empty() {
+    if table_paths.is_empty() {
+        return Err(UdfError::User(format!(
+            "cannot register '{table_name}': the assigned file list is empty"
+        )));
+    }
+
+    let config = if logical_schema.is_empty() {
         let resolved_schema = listing_options
             .infer_schema(&ctx.state(), &table_paths[0])
             .await
-            .map_err(|e| classify_scan_error(e, &secrets))?;
+            .map_err(|e| classify_scan_error(e, secrets))?;
         ListingTableConfig::new_with_multi_paths(table_paths)
             .with_listing_options(listing_options)
             .with_schema(resolved_schema)
     } else {
-        let logical_schema = build_logical_arrow_schema(&spec.logical_schema);
+        let arrow_schema = build_logical_arrow_schema(logical_schema);
         ListingTableConfig::new_with_multi_paths(table_paths)
             .with_listing_options(listing_options)
-            .with_schema(logical_schema)
+            .with_schema(arrow_schema)
             .with_expr_adapter_factory(Arc::new(FieldIdExprAdapterFactory))
     };
 
