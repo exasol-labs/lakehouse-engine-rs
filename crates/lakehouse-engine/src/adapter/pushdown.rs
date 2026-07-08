@@ -1409,7 +1409,7 @@ fn build_grouped_order_by_clause(
 /// Outcome of resolving a grouped-aggregate merge `ORDER BY` (see
 /// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key that
 /// cannot be mapped to a grouped output column — the caller declines the pushdown
-/// (native retry) rather than emitting a merge that silently drops the ordering.
+/// as a hard error rather than emitting a merge that silently drops the ordering.
 #[derive(Debug, PartialEq, Eq)]
 enum GroupedOrderBy {
     Clause(String),
@@ -2084,22 +2084,23 @@ pub async fn handle_pushdown(
         .cloned()
         .unwrap_or(Json::Null);
 
-    // Two-table inner equi-join handling MUST run before the single-table path.
-    // `handle_pushdown` is invoked once per pushdown REQUEST, resolving only
-    // `involvedTables[0]` (adapter::mod::handle_pushdown_request); a join-shaped
-    // `from` that fell through would scan just the first table and silently drop the
-    // join. `NotAJoin` is today's normal single-table request — fall through
-    // unchanged. `Ineligible` cannot be served by a correct two-scan fallback (wrong
-    // join type / >2 tables / non-equi / malformed shape), so it declines to a native
-    // retry rather than mis-scan. `Eligible` is planned here and returns directly.
+    // Inner-join handling MUST run before the single-table path. `handle_pushdown`
+    // is invoked once per pushdown REQUEST, resolving only `involvedTables[0]`
+    // (adapter::mod::handle_pushdown_request); a join-shaped `from` that fell through
+    // would scan just the first table and silently drop the join. `NotAJoin` is
+    // today's normal single-table request — fall through unchanged. `Ineligible` is a
+    // shape the adapter cannot render at all (a non-inner join node, or a malformed
+    // shape), so it is a hard client-facing error (Exasol does not re-plan on an
+    // adapter error). `Join` is served here by the single unified join path and
+    // returns directly.
     match detect_join(request, &pushdown_req)? {
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
-        JoinShape::Eligible(eligible) => {
-            return plan_eligible_join(
+        JoinShape::Join(join) => {
+            return plan_join(
                 request,
                 &pushdown_req,
-                &eligible,
+                &join,
                 catalog_uri,
                 storage,
                 catalog,
@@ -2185,11 +2186,12 @@ pub async fn handle_pushdown(
             // If a HAVING predicate is present, we cannot fall through silently:
             // the adapter has advertised AGGREGATE_HAVING, so Exasol will not
             // re-apply a HAVING we claim to handle. Dropping it yields wrong results.
-            // Return an error so Exasol executes the query natively.
+            // Raise a hard error (the FFI shim surfaces it as F-UDF-CL-RUST-9001);
+            // Exasol does not re-plan the query natively.
             if having_node.is_some() {
                 return Err(UdfError::User(
                     "grouped aggregate pushdown declined: HAVING present but aggregate \
-                     column type is non-numeric; Exasol will retry natively"
+                     column type is non-numeric; this is a hard error, not a native re-plan"
                         .into(),
                 ));
             }
@@ -2210,7 +2212,7 @@ pub async fn handle_pushdown(
                             return Err(UdfError::User(
                                 "grouped aggregate pushdown declined: HAVING references an \
                              aggregate that cannot be merged or an unsupported node; \
-                             Exasol will retry natively"
+                             this is a hard error, not a native re-plan"
                                     .into(),
                             ));
                         }
@@ -2224,15 +2226,15 @@ pub async fn handle_pushdown(
             // merge SQL must render its own explicit final ORDER BY over the grouped
             // output columns. Resolve it now: a pushed sort key that cannot be mapped
             // to a grouped output column is a shape SQL forbids — decline the pushdown
-            // (native retry) rather than emit an unsorted merge.
+            // as a hard error rather than emit an unsorted merge.
             let grouped_order_by =
                 match build_grouped_order_by_clause(&pushdown_req, &group_keys, &select_items) {
                     Some(GroupedOrderBy::Clause(clause)) => Some(clause),
                     Some(GroupedOrderBy::Unresolvable) => {
                         return Err(UdfError::User(
                             "grouped aggregate pushdown declined: ORDER BY references a \
-                         column that is not a grouped output column; Exasol will \
-                         retry natively"
+                         column that is not a grouped output column; this is a hard \
+                         error, not a native re-plan"
                                 .into(),
                         ));
                     }
@@ -2593,7 +2595,7 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
          cannot apply on read (only Parquet positional deletes are supported); \
-         Exasol will retry the query natively",
+         this is a hard error, not a native re-plan",
         table_name,
         mechanism.describe(),
     );
@@ -3430,85 +3432,142 @@ fn detect_topn(
     Some(keys)
 }
 
-/// Why a join `from` clause is not eligible for broadcast join planning.
+/// Why a join `from` clause cannot be rendered by the join path at all.
 ///
-/// Each variant names the specific contract violation (`vs-adapter/pushdown-planning-join`
-/// "A join outside the broadcast contract is declined safely") so a later caller can log or
-/// test the exact reason; every variant carries no data because the shape check alone is
-/// sufficient to explain the decline.
+/// The unified join path serves EVERY inner join of any arity (broadcast or the
+/// N-scan fallback), so an `Ineligible` shape is the genuine last resort — a shape
+/// the adapter cannot render, routed to a hard client-facing error. Each variant
+/// names the specific reason so a caller can log or test it; every variant carries
+/// no data because the shape check alone explains the decline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IneligibleJoinReason {
-    /// `join_type` is present but not `"inner"` (e.g. an outer join).
+    /// A join node ANYWHERE in the tree has `join_type` other than `"inner"` (e.g.
+    /// an outer join); a cross-join + conjunctive WHERE cannot reproduce its
+    /// semantics.
     NotInnerJoinType,
-    /// The join `condition` is present but is not a single `predicate_equal` node.
-    NotEquiCondition,
-    /// The join spans more than two involved tables (a nested `join` node on
-    /// either side, or an `involvedTables` count other than two).
-    TooManyTables,
-    /// The join `from` node is missing a field the broadcast contract requires
-    /// (`left`/`right`/`condition`/table `name`) — a shape the planner does not
-    /// recognize as any of the above, specific reasons.
+    /// A join node is missing a `left`/`right`/`condition` field, or a leaf is
+    /// neither a `join` nor a `table` node — a shape the planner does not recognize.
     UnsupportedShape,
 }
 
-/// One side of a detected two-table inner equi-join, with its original-cased
+/// One base-table leaf of a detected inner-join tree, with its original-cased
 /// Iceberg identifier already recovered from `TABLE_MAP`.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EligibleJoin {
-    /// The Exasol virtual table name (`involvedTables[].name` / `from.left.name`).
-    pub left_table_name: String,
-    /// The Exasol virtual table name (`involvedTables[].name` / `from.right.name`).
-    pub right_table_name: String,
-    /// `left_table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
-    pub left_iceberg_ident: String,
-    /// `right_table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
-    pub right_iceberg_ident: String,
-    /// Always [`JoinType::Inner`] — the only join kind this detector accepts.
-    pub join_type: JoinType,
-    /// The raw `predicate_equal` condition node, unrendered (rendering is
-    /// `vs-expression`'s job, done later in the planning pipeline).
-    pub condition: Json,
+pub(crate) struct JoinLeaf {
+    /// The Exasol virtual table name (a `from`-tree leaf's `name`).
+    pub table_name: String,
+    /// `table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
+    pub iceberg_ident: String,
 }
 
-/// The result of inspecting a pushdown request's `from` clause for the
-/// two-table inner equi-join shape this phase can plan a broadcast join for.
+/// A detected all-inner join tree over N ≥ 2 involved tables — the single unified
+/// join shape (the two-involved-table case is simply N = 2).
+///
+/// `tables` are the base-table leaves in stable left-to-right tree order; every
+/// leaf's Iceberg identifier is resolved from `TABLE_MAP` at detection time (a
+/// missing leaf is a hard `Err`, not a value here). `conditions` are the N-1
+/// join-node `condition` expressions collected while walking the tree —
+/// AND-conjoined by the N-scan fallback, which is order-agnostic for an all-inner
+/// join.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DetectedJoin {
+    /// The N ≥ 2 base-table leaves in stable left-to-right tree order.
+    pub tables: Vec<JoinLeaf>,
+    /// The N-1 raw join-node `condition` expressions, unrendered.
+    pub conditions: Vec<Json>,
+}
+
+/// The result of inspecting a pushdown request's `from` clause for the inner
+/// equi-join shape this phase plans.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum JoinShape {
     /// The `from` clause is a plain table reference (or absent) — today's
     /// single-table pushdown path applies unchanged.
     NotAJoin,
-    /// The `from` clause is a join, but not one this phase can broadcast.
-    /// The caller falls through to the existing single-table/unaccelerated
-    /// pushdown behavior; it never emits a broadcast plan for this request.
+    /// The `from` clause is a join the adapter cannot render at all (a non-inner
+    /// join node in the tree, or a malformed shape). Routed to a hard error — the
+    /// genuine last resort, never a native re-plan.
     Ineligible(IneligibleJoinReason),
-    /// A genuine two-table inner equi-join with both sides' Iceberg
-    /// identifiers resolved.
-    Eligible(EligibleJoin),
+    /// An all-inner join tree spanning N ≥ 2 involved tables, every leaf's Iceberg
+    /// identifier resolved from `TABLE_MAP`. Served by the SINGLE unified join path
+    /// ([`plan_join`]): broadcast when the two-table (N = 2) case is eligible,
+    /// otherwise the N-scan unaccelerated fallback. The two-table case is simply
+    /// N = 2 — there is no separate two-table shape.
+    Join(DetectedJoin),
 }
 
-/// Detect whether a pushdown request's `from` clause is a two-table inner
-/// equi-join eligible for broadcast join planning.
+/// Recursively collect a join tree's base-table leaf names (into `tables`, stable
+/// left-to-right order) and every join node's `condition` (into `conditions`,
+/// post-order).
 ///
-/// Per the Exasol virtual-schema-common-java pushdown JSON shape (see
-/// `specs/_plans/add-join-pushdown-broadcast/decision-log.md`), a join `from`
+/// Returns the specific [`IneligibleJoinReason`] on the first non-inner join node
+/// ([`IneligibleJoinReason::NotInnerJoinType`]), a join node missing a
+/// `left`/`right`/`condition` field or a leaf missing its `name`, or a leaf that is
+/// neither a `join` nor a `table` node ([`IneligibleJoinReason::UnsupportedShape`]).
+fn collect_join_tree(
+    node: &Json,
+    tables: &mut Vec<String>,
+    conditions: &mut Vec<Json>,
+) -> Result<(), IneligibleJoinReason> {
+    match node.get("type").and_then(|t| t.as_str()) {
+        Some("join") => {
+            let is_inner = node
+                .get("join_type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case("inner"));
+            if !is_inner {
+                return Err(IneligibleJoinReason::NotInnerJoinType);
+            }
+            let (left, right) = match (node.get("left"), node.get("right")) {
+                (Some(left), Some(right)) => (left, right),
+                _ => return Err(IneligibleJoinReason::UnsupportedShape),
+            };
+            let condition = match node.get("condition").filter(|c| !c.is_null()) {
+                Some(condition) => condition.clone(),
+                None => return Err(IneligibleJoinReason::UnsupportedShape),
+            };
+            collect_join_tree(left, tables, conditions)?;
+            collect_join_tree(right, tables, conditions)?;
+            conditions.push(condition);
+            Ok(())
+        }
+        Some("table") => match node.get("name").and_then(|n| n.as_str()) {
+            Some(name) => {
+                tables.push(name.to_string());
+                Ok(())
+            }
+            None => Err(IneligibleJoinReason::UnsupportedShape),
+        },
+        _ => Err(IneligibleJoinReason::UnsupportedShape),
+    }
+}
+
+/// Detect whether a pushdown request's `from` clause is an inner-join tree the
+/// unified join path serves, over N ≥ 2 involved tables.
+///
+/// Per the Exasol virtual-schema-common-java pushdown JSON shape, a join `from`
 /// node looks like:
 /// ```json
 /// {"type": "join", "join_type": "inner", "left": {...}, "right": {...}, "condition": {...}}
 /// ```
 /// where `left`/`right` are each a base-table reference (`{"name": ..., "type": "table"}`)
-/// and `condition` is a `predicate_equal` node. Anything else — an outer join, a
-/// non-equi condition, a nested `join` on either side, or an involved-table count
-/// other than two — is [`JoinShape::Ineligible`], never [`JoinShape::Eligible`].
+/// or a nested `join` node. The whole tree is walked ONCE by [`collect_join_tree`]:
+/// it collects the base-table leaves (stable left-to-right order) and every join
+/// node's `condition`, asserting every join node is `join_type = "inner"`. The
+/// two-involved-table case is simply N = 2 — there is no separate two-table shape,
+/// and no equi-condition gate here (broadcast eligibility, computed later in
+/// [`plan_join`], is what requires an equi condition; the N-scan fallback renders
+/// any inner-join condition into its WHERE).
 ///
 /// A request whose `from` clause is absent or a plain table reference is
-/// [`JoinShape::NotAJoin`]: today's single-table pushdown path, completely
-/// unaffected by this detector.
+/// [`JoinShape::NotAJoin`]: today's single-table pushdown path, unaffected.
 ///
-/// Once the shape is a genuine two-table inner equi-join, both involved
-/// tables' original-cased Iceberg identifiers MUST be recoverable from
-/// `TABLE_MAP` — a virtual table absent from `TABLE_MAP` is the same "stale
-/// virtual schema" condition the single-table path reports via
-/// `resolve_pushdown_identifier`, so it is a hard `Err`, not a decline.
+/// A non-inner join node or a malformed node is [`JoinShape::Ineligible`] (a hard
+/// error, the genuine last resort). Once the tree is a valid all-inner join, every
+/// involved table's original-cased Iceberg identifier MUST be recoverable from
+/// `TABLE_MAP` — a virtual table absent from `TABLE_MAP` is the same "stale virtual
+/// schema" condition the single-table path reports, so it is a hard `Err`, not a
+/// decline.
 pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
     let from = match pushdown_req.get("from") {
         Some(from) => from,
@@ -3518,107 +3577,28 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         return Ok(JoinShape::NotAJoin);
     }
 
-    let is_inner = from
-        .get("join_type")
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| t.eq_ignore_ascii_case("inner"));
-    if !is_inner {
-        return Ok(JoinShape::Ineligible(
-            IneligibleJoinReason::NotInnerJoinType,
-        ));
-    }
-
-    let (left, right) = match (from.get("left"), from.get("right")) {
-        (Some(left), Some(right)) => (left, right),
-        _ => {
-            return Ok(JoinShape::Ineligible(
-                IneligibleJoinReason::UnsupportedShape,
-            ));
-        }
-    };
-
-    // A nested `join` node on either side means more than two tables are
-    // involved; anything other than a plain base-table reference is a shape
-    // this detector does not recognize.
-    for side in [left, right] {
-        match side.get("type").and_then(|t| t.as_str()) {
-            Some("join") => {
-                return Ok(JoinShape::Ineligible(IneligibleJoinReason::TooManyTables));
-            }
-            Some("table") => {}
-            _ => {
-                return Ok(JoinShape::Ineligible(
-                    IneligibleJoinReason::UnsupportedShape,
-                ));
-            }
-        }
-    }
-
-    let left_table_name = match left.get("name").and_then(|n| n.as_str()) {
-        Some(name) => name.to_string(),
-        None => {
-            return Ok(JoinShape::Ineligible(
-                IneligibleJoinReason::UnsupportedShape,
-            ));
-        }
-    };
-    let right_table_name = match right.get("name").and_then(|n| n.as_str()) {
-        Some(name) => name.to_string(),
-        None => {
-            return Ok(JoinShape::Ineligible(
-                IneligibleJoinReason::UnsupportedShape,
-            ));
-        }
-    };
-
-    // Defensive belt: the nested-join check above already rejects a >2-table
-    // shape structurally; this also catches a malformed request that names
-    // the same table twice or omits an involved table entirely.
-    let table_count = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .map(|t| t.len())
-        .unwrap_or(0);
-    if table_count != 2 {
-        return Ok(JoinShape::Ineligible(IneligibleJoinReason::TooManyTables));
-    }
-
-    let condition = match from.get("condition").filter(|c| !c.is_null()) {
-        Some(condition) => condition.clone(),
-        None => {
-            return Ok(JoinShape::Ineligible(
-                IneligibleJoinReason::UnsupportedShape,
-            ));
-        }
-    };
-    if condition.get("type").and_then(|t| t.as_str()) != Some("predicate_equal") {
-        return Ok(JoinShape::Ineligible(
-            IneligibleJoinReason::NotEquiCondition,
-        ));
+    let mut table_names = Vec::new();
+    let mut conditions = Vec::new();
+    if let Err(reason) = collect_join_tree(from, &mut table_names, &mut conditions) {
+        return Ok(JoinShape::Ineligible(reason));
     }
 
     let table_map = super::read_table_map(request);
-    let left_iceberg_ident = table_map.get(&left_table_name).cloned().ok_or_else(|| {
-        UdfError::User(format!(
-            "pushdown: virtual table '{left_table_name}' is not in TABLE_MAP; \
-             drop and recreate the virtual schema"
-        ))
-    })?;
-    let right_iceberg_ident = table_map.get(&right_table_name).cloned().ok_or_else(|| {
-        UdfError::User(format!(
-            "pushdown: virtual table '{right_table_name}' is not in TABLE_MAP; \
-             drop and recreate the virtual schema"
-        ))
-    })?;
+    let mut tables = Vec::with_capacity(table_names.len());
+    for table_name in table_names {
+        let iceberg_ident = table_map.get(&table_name).cloned().ok_or_else(|| {
+            UdfError::User(format!(
+                "pushdown: virtual table '{table_name}' is not in TABLE_MAP; \
+                 drop and recreate the virtual schema"
+            ))
+        })?;
+        tables.push(JoinLeaf {
+            table_name,
+            iceberg_ident,
+        });
+    }
 
-    Ok(JoinShape::Eligible(EligibleJoin {
-        left_table_name,
-        right_table_name,
-        left_iceberg_ident,
-        right_iceberg_ident,
-        join_type: JoinType::Inner,
-        condition,
-    }))
+    Ok(JoinShape::Join(DetectedJoin { tables, conditions }))
 }
 
 /// One fully-resolved side of a two-table inner equi-join.
@@ -3631,7 +3611,7 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 /// threshold is evaluated against.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedJoinSide {
-    /// The Exasol virtual table name (from [`EligibleJoin`]).
+    /// The Exasol virtual table name (a detected join leaf).
     pub table_name: String,
     /// The original-cased Iceberg identifier this side was resolved from.
     pub iceberg_ident: String,
@@ -3686,7 +3666,7 @@ impl ResolvedJoinSide {
 /// scans BOTH sides through their own fan-outs, so it needs both here too. The
 /// only role of `broadcast_eligible` is to route between those two SQL builders —
 /// it is NEVER an error (decision-log [2]: an ineligible join takes the
-/// deterministic two-scan fallback, not a native retry).
+/// deterministic N-scan fallback, not a native re-plan).
 ///
 /// # Edge cases (decision-log has no explicit ruling; choices made here)
 ///
@@ -3726,8 +3706,8 @@ pub(crate) struct JoinSides {
 /// total bytes are at or below `join_broadcast_max_bytes`.
 ///
 /// This is the pure, catalog-free core of side selection so it is unit-testable
-/// without a live Iceberg catalog; [`resolve_join_sides`] performs the two
-/// metadata resolutions and delegates here.
+/// without a live Iceberg catalog; [`plan_join`] resolves each side and delegates
+/// here for the two-table broadcast role/threshold decision.
 fn select_broadcast_sides(
     a: ResolvedJoinSide,
     b: ResolvedJoinSide,
@@ -3787,66 +3767,10 @@ async fn resolve_one_join_side(
     ))
 }
 
-/// Resolve BOTH sides of an eligible inner equi-join exactly once and decide
-/// broadcast eligibility against `join_broadcast_max_bytes`.
-///
-/// Each side is resolved through [`resolve_one_join_side`] (the shared
-/// `resolve_file_list` path) — twice total, once per table, never per shard.
-/// Selection and the threshold gate are delegated to the pure
-/// [`select_broadcast_sides`]. The returned [`JoinSides`] carries both fully
-/// resolved sides plus the `broadcast_eligible` flag the caller uses to route
-/// between the broadcast plan (task 3.4) and the unaccelerated fallback (task 3.5).
-///
-/// Each side is pruned by its own SIDE-LOCAL WHERE conjuncts ([`side_local_filter`])
-/// so BOTH routes get the Iceberg manifest pruning the single-table path gets —
-/// partition/bounds elimination a partition-selective predicate would otherwise
-/// lose on a join. Attribution is by `tableName`, so the shared-column-name case
-/// stays correct (a conjunct over one table never prunes the other). The pruned
-/// byte totals also feed side selection and the broadcast threshold, which only
-/// makes both more accurate (a side is sized as it will actually be scanned).
-async fn resolve_join_sides(
-    eligible: &EligibleJoin,
-    pushdown_req: &Json,
-    catalog_uri: &str,
-    storage: &StorageProps,
-    catalog: &CatalogProps,
-    creds: &ConnectionCreds,
-    join_broadcast_max_bytes: u64,
-) -> Result<JoinSides, UdfError> {
-    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let left_filter = filter.and_then(|f| side_local_filter(f, &eligible.left_table_name));
-    let right_filter = filter.and_then(|f| side_local_filter(f, &eligible.right_table_name));
-    let left = resolve_one_join_side(
-        &eligible.left_table_name,
-        &eligible.left_iceberg_ident,
-        catalog_uri,
-        storage,
-        catalog,
-        creds,
-        left_filter.as_ref(),
-    )
-    .await?;
-    let right = resolve_one_join_side(
-        &eligible.right_table_name,
-        &eligible.right_iceberg_ident,
-        catalog_uri,
-        storage,
-        catalog,
-        creds,
-        right_filter.as_ref(),
-    )
-    .await?;
-    Ok(select_broadcast_sides(
-        left,
-        right,
-        join_broadcast_max_bytes,
-    ))
-}
-
 /// The `(UPPERCASE name, Exasol type)` columns of the named involved table.
 ///
 /// Locates the `involvedTables[]` entry whose `name` equals `table_name` (the
-/// Exasol virtual table name carried in [`EligibleJoin`]) and maps its columns
+/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns
 /// exactly as the single-table projection does — uppercased names, Exasol types
 /// from `dataType`. Returns an empty vec when the table or its columns are absent.
 fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
@@ -3892,9 +3816,10 @@ fn disjoint_schema_guard(left: &[(String, String)], right: &[(String, String)]) 
 
 /// Render a join's equi-condition node to a DataFusion SQL boolean expression via
 /// the `vs-expression` translator (bare column names). `None` when the node cannot
-/// be rendered — a defensive decline, since [`detect_join`] already guarantees a
-/// `predicate_equal` shape. Uses `render_expression` (not the filter renderer) so
-/// the boolean expression is returned verbatim, never suppressed as trivially true.
+/// be rendered — a defensive decline, since [`plan_join`] only reaches the broadcast
+/// path for a `predicate_equal` condition. Uses `render_expression` (not the filter
+/// renderer) so the boolean expression is returned verbatim, never suppressed as
+/// trivially true.
 fn render_join_condition(condition: &Json) -> Option<String> {
     render_expression_safe(condition)
 }
@@ -3904,14 +3829,15 @@ fn render_join_condition(condition: &Json) -> Option<String> {
 /// Reuses [`project_columns`] against the disjoint union of both involved tables'
 /// columns, so a projected column spanning either side is typed from whichever
 /// side owns it. The caller must have already passed the [`disjoint_schema_guard`]
-/// so the union carries no name collision.
+/// so the union carries no name collision. Broadcast is a two-table optimization,
+/// so `join.tables[0]`/`[1]` are the two involved tables.
 fn extract_join_projection(
     request: &Json,
     pushdown_req: &Json,
-    eligible: &EligibleJoin,
+    join: &DetectedJoin,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
-    let mut combined = involved_table_columns(request, &eligible.left_table_name);
-    combined.extend(involved_table_columns(request, &eligible.right_table_name));
+    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
+    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
     project_columns(pushdown_req, combined)
 }
 
@@ -3934,29 +3860,31 @@ pub(crate) struct RenderedJoinPushdown {
 /// Render every `vs-expression` artifact a broadcast inner equi-join needs, after
 /// enforcing the disjoint-column-name guard.
 ///
-/// Returns `Ok(None)` — a clean decline, NOT an error — when the two tables share
-/// any column name (the guard fails) or the equi-condition cannot be rendered; the
-/// caller then falls through to the deterministic unaccelerated two-scan join,
-/// exactly as for any other join ineligibility. `Ok(Some(..))` carries the rendered
-/// join condition, the cross-table WHERE filter, and the cross-table projection
-/// with its EMITS types. `Err` is reserved for a genuinely malformed request with
-/// no column metadata at all (the same contract [`project_columns`] enforces for
-/// the single-table path).
+/// Broadcast is a two-table optimization, so `join.tables[0]`/`[1]` are the two
+/// involved tables and `join.conditions[0]` is the equi-condition. Returns
+/// `Ok(None)` — a clean decline, NOT an error — when the two tables share any
+/// column name (the guard fails) or the equi-condition cannot be rendered; the
+/// caller then falls through to the deterministic N-scan fallback, exactly as for
+/// any other join off the broadcast path. `Ok(Some(..))` carries the rendered join
+/// condition, the cross-table WHERE filter, and the cross-table projection with its
+/// EMITS types. `Err` is reserved for a genuinely malformed request with no column
+/// metadata at all (the same contract [`project_columns`] enforces for the
+/// single-table path).
 ///
 /// Rendering is side-agnostic: the translator emits bare column names, so the
 /// result does not depend on which side is later selected as fact vs dimension.
 pub(crate) fn render_broadcast_join(
     request: &Json,
     pushdown_req: &Json,
-    eligible: &EligibleJoin,
+    join: &DetectedJoin,
 ) -> Result<Option<RenderedJoinPushdown>, UdfError> {
-    let left_cols = involved_table_columns(request, &eligible.left_table_name);
-    let right_cols = involved_table_columns(request, &eligible.right_table_name);
+    let left_cols = involved_table_columns(request, &join.tables[0].table_name);
+    let right_cols = involved_table_columns(request, &join.tables[1].table_name);
     if !disjoint_schema_guard(&left_cols, &right_cols) {
         return Ok(None);
     }
 
-    let condition = match render_join_condition(&eligible.condition) {
+    let condition = match render_join_condition(&join.conditions[0]) {
         Some(condition) => condition,
         None => return Ok(None),
     };
@@ -3966,7 +3894,7 @@ pub(crate) fn render_broadcast_join(
         .filter(|f| !f.is_null())
         .and_then(render_df_filter_safe);
 
-    let (projection, projection_types) = extract_join_projection(request, pushdown_req, eligible)?;
+    let (projection, projection_types) = extract_join_projection(request, pushdown_req, join)?;
 
     Ok(Some(RenderedJoinPushdown {
         condition,
@@ -3988,24 +3916,25 @@ fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
     }
 }
 
-/// The `User` decline error for a join `from` clause the broadcast contract cannot
-/// serve as a two-table inner equi-join.
+/// The `User` decline error for a join `from` clause the adapter cannot render at
+/// all — the genuine last resort.
 ///
-/// An `Ineligible` shape has no pair of resolved sides and no rendered equi-condition
-/// to build a correct unaccelerated two-scan from, and falling through to the
-/// single-table path would scan only the first involved table and silently drop the
-/// join. So the only safe outcome is a `User` error that makes Exasol retry the query
-/// natively (`vs-adapter/pushdown-planning-join` "declined safely", last resort).
+/// Spanning more than two tables, needing Exasol postprocessing, or overlapping
+/// column names are NEVER reasons to reach here — every such inner join is served
+/// by the unified fallback. Only a non-inner join node in the tree or a malformed
+/// shape lands here, and falling through to the single-table path would scan only
+/// the first involved table and silently drop the join. So the only safe outcome is
+/// a `User` error — surfaced by the FFI shim as a hard `F-UDF-CL-RUST-9001` client
+/// error with no native re-plan (`vs-adapter/pushdown-planning-join` "declined
+/// safely", last resort).
 fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError {
     let detail = match reason {
         IneligibleJoinReason::NotInnerJoinType => "the join is not an inner join",
-        IneligibleJoinReason::NotEquiCondition => "the join condition is not an equi-condition",
-        IneligibleJoinReason::TooManyTables => "the join spans more than two tables",
         IneligibleJoinReason::UnsupportedShape => "the join `from` clause has an unsupported shape",
     };
     UdfError::User(format!(
-        "join pushdown declined: {detail}; a correct two-scan fallback cannot be built \
-         for this shape, so Exasol will retry the query natively"
+        "join pushdown declined: {detail}; the adapter cannot render this join shape, \
+         so this is a hard error, not a native re-plan"
     ))
 }
 
@@ -4016,33 +3945,6 @@ fn projection_item_select_sql(item: &ProjectionItem) -> String {
         ProjectionItem::Column(name) => quote_ident(name),
         ProjectionItem::Expr { expr } => expr.clone(),
     }
-}
-
-/// The subquery alias assigned to the fact (sharded) side's fan-out in the
-/// two-scan wrapper.
-const JOIN_FACT_ALIAS: &str = "LHS_FACT";
-/// The subquery alias assigned to the dimension side's fan-out in the two-scan
-/// wrapper.
-const JOIN_DIM_ALIAS: &str = "LHS_DIM";
-
-/// Build the `column.tableName` (UPPERCASE) → subquery-alias map for a two-scan
-/// join, so every column reference the wrapper renders can be table-qualified.
-///
-/// The fact side's fan-out is aliased [`JOIN_FACT_ALIAS`] and the dimension side's
-/// [`JOIN_DIM_ALIAS`]; each side's Exasol virtual table name (the value Exasol puts
-/// in a column node's `tableName`) maps to its alias. Keys are uppercased so the
-/// lookup is casing-insensitive against the request JSON.
-fn build_join_alias_map(sides: &JoinSides) -> HashMap<String, String> {
-    let mut map = HashMap::with_capacity(2);
-    map.insert(
-        sides.fact.table_name.to_ascii_uppercase(),
-        JOIN_FACT_ALIAS.to_string(),
-    );
-    map.insert(
-        sides.dimension.table_name.to_ascii_uppercase(),
-        JOIN_DIM_ALIAS.to_string(),
-    );
-    map
 }
 
 /// Deep-clone an expression node, tagging every `column` node with the subquery
@@ -4301,58 +4203,25 @@ fn referenced_side_columns(
     }
 }
 
-/// Render one `function_aggregate` select-list item as a plain Exasol aggregate
-/// expression over the joined rows, with any column argument table-qualified.
+/// Render one select-list item to a table-qualified outer-SELECT expression through
+/// the SINGLE `vs-expression` path — columns, literals, scalar expressions, a
+/// top-level `function_aggregate`, AND a `function_aggregate` nested inside a scalar
+/// function all render through the same recursive translator.
 ///
-/// The `name` Exasol sends is a valid Exasol aggregate function name (Exasol pushed
-/// it), so it is spliced verbatim — this is the two-scan analogue of the
-/// single-table aggregate decomposition, except Exasol (not the scan UDF) evaluates
-/// the aggregate over the already-materialized two-scan join, exactly as it did
-/// before any `JOIN` capability was advertised. `COUNT(*)` (no argument) is the only
-/// argument-free form; every other aggregate must carry a renderable argument.
-/// Returns `None` when the argument cannot be rendered.
-fn render_aggregate_qualified(item: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
-    let name = item.get("name").and_then(|n| n.as_str())?.to_uppercase();
-    let distinct = item.get("distinct").and_then(|d| d.as_bool()) == Some(true);
-    let args = item.get("arguments").and_then(|a| a.as_array());
-    match args.and_then(|a| a.first()) {
-        None => (name == "COUNT").then(|| "COUNT(*)".to_string()),
-        Some(arg) => {
-            let arg_sql = render_expression_qualified(arg, alias_of)?;
-            let distinct_kw = if distinct { "DISTINCT " } else { "" };
-            Some(format!("{name}({distinct_kw}{arg_sql})"))
-        }
-    }
-}
-
-/// Render one select-list item to a table-qualified outer-SELECT expression: an
-/// aggregate through [`render_aggregate_qualified`], everything else (columns,
-/// literals, scalar expressions) through the qualified translator.
+/// The translator splices an Exasol aggregate `name` verbatim (Exasol pushed it, so
+/// it is a valid Exasol aggregate — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, the
+/// STDDEV/VARIANCE family), renders each argument by recursion (table-qualifying any
+/// column argument via its `tableAlias`), handles `COUNT(*)`, and honors `DISTINCT`.
+/// This is byte-compatible with the former top-level `render_aggregate_qualified`
+/// (single-arg aggregate → `NAME(<arg>)`, `COUNT(*)` → `COUNT(*)`), and additionally
+/// renders a scalar expression that wraps aggregates (e.g.
+/// `ROUND(100.0 * SUM(CASE …) / COUNT(*), 2)`) instead of declining. `None` only when
+/// the node genuinely cannot be rendered.
 fn render_selectlist_item_qualified(
     item: &Json,
     alias_of: &HashMap<String, String>,
 ) -> Option<String> {
-    match item.get("type").and_then(|t| t.as_str()) {
-        Some("function_aggregate") => render_aggregate_qualified(item, alias_of),
-        _ => render_expression_qualified(item, alias_of),
-    }
-}
-
-/// Every column of both joined tables as a table-qualified projection item, in
-/// fact-then-dimension order. Used as the two-scan wrapper's SELECT when the
-/// request carries no explicit (or an empty) select list.
-fn full_row_qualified_items(
-    fact_cols: &[(String, String)],
-    dim_cols: &[(String, String)],
-) -> Vec<ProjectionItem> {
-    fact_cols
-        .iter()
-        .map(|(name, _)| (JOIN_FACT_ALIAS, name))
-        .chain(dim_cols.iter().map(|(name, _)| (JOIN_DIM_ALIAS, name)))
-        .map(|(alias, name)| ProjectionItem::Expr {
-            expr: format!("{}.{}", quote_ident(alias), quote_ident(name)),
-        })
-        .collect()
+    render_expression_qualified(item, alias_of)
 }
 
 /// Whether a join pushdown request carries work Exasol must execute over the
@@ -4388,70 +4257,32 @@ fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
         || extract_limit(pushdown_req).is_some()
 }
 
-/// Wrap two independently-sharded scan fan-outs in an Exasol-executed inner
-/// equi-join — the unaccelerated fallback (task 3.5).
+/// Plan an inner join (N ≥ 2 involved tables) through the SINGLE unified join path.
 ///
-/// Each `*_fan_out` is a self-contained subquery emitting its table's full column
-/// set. The two tables' column names are disjoint (guaranteed by the disjoint-column
-/// guard that gates reaching this path), so the outer projection, `ON <condition>`,
-/// and optional `WHERE <filter>` all reference bare column names unambiguously and
-/// Exasol's core engine performs the join. This reproduces the pre-broadcast
-/// two-scan behavior deterministically: no broadcast replication, no adapter error.
-pub(crate) fn build_two_scan_join_sql(
-    fact_fan_out: &str,
-    dimension_fan_out: &str,
-    projection: &[ProjectionItem],
-    condition: &str,
-    filter: Option<&str>,
-) -> String {
-    let select = if projection.is_empty() {
-        "*".to_string()
-    } else {
-        projection
-            .iter()
-            .map(projection_item_select_sql)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let mut sql = format!(
-        "SELECT {select} FROM ({fact_fan_out}) AS \"{JOIN_FACT_ALIAS}\" \
-         INNER JOIN ({dimension_fan_out}) AS \"{JOIN_DIM_ALIAS}\" ON {condition}"
-    );
-    if let Some(f) = filter {
-        sql.push_str(&format!(" WHERE {f}"));
-    }
-    sql
-}
-
-/// Plan an eligible two-table inner equi-join: resolve BOTH sides once, then route
-/// to the broadcast fan-out or the qualified two-scan fallback, declining to a
-/// native retry only when even the two-scan wrapper cannot be built.
+/// Resolves each involved table's file list, logical schema, and byte size ONCE
+/// (one catalog resolution per table, never per shard), pruned by that table's
+/// side-local WHERE conjuncts. An inner join with any empty side yields zero rows,
+/// so an empty side short-circuits to the shape-correct empty result over the
+/// combined N-table column universe (in stable side order, matching the fallback's
+/// full-row projection).
 ///
-/// Routing:
-/// - either side has zero files → an inner join yields zero rows; emit a
-///   shape-correct (aggregate-aware) empty result rather than a fan-out over an
-///   empty file list.
-/// - BROADCAST (task 3.4) is used ONLY when the dimension side is within the byte
-///   threshold, the request carries no aggregate / GROUP BY / ORDER BY / LIMIT /
-///   HAVING (`join_requires_exasol_postprocessing`), AND the disjoint-column guard
-///   lets bare-name rendering succeed (`render_broadcast_join` returns `Some`). It
-///   shards only the fact side and carries the dimension side's full file list once
-///   in the common blob's join block.
-/// - otherwise → the QUALIFIED two-scan fallback (task 3.5): each side scanned
-///   through its own sharded fan-out and joined by Exasol's core engine, with the
-///   condition, WHERE, projection, aggregate/GROUP BY/HAVING/ORDER BY/LIMIT all
-///   rendered as table-qualified Exasol SQL. This is correct whether or not the two
-///   tables share a column name, so a disjoint-guard failure is NOT an error — it is
-///   just a reason the broadcast path is unavailable.
-///
-/// A hard `Err` (native retry) is the last resort, reserved for a two-scan wrapper
-/// that genuinely cannot be built — the equi-condition (or a pushed
-/// select/GROUP BY/HAVING/ORDER BY element) cannot be rendered at all.
+/// Broadcast is an OPTIMIZATION selected inside this one path — never a second
+/// implementation. It is taken only for a two-table (N = 2) equi-join whose smaller
+/// side fits `join_broadcast_max_bytes`, whose request needs no Exasol
+/// postprocessing (the in-UDF join renders only projection + filter + condition),
+/// and whose bare-name broadcast render succeeds (disjoint column names + renderable
+/// condition — `render_broadcast_join` returns `Ok(None)` otherwise, a clean
+/// fall-through, never an error). Every other inner join — N ≥ 3, above threshold,
+/// non-equi, overlapping columns, or needing postprocessing — takes the SOLE
+/// fallback renderer, [`build_n_scan_join_sql`], which scans each table through its
+/// own sharded fan-out and reconstructs the join in Exasol's core engine. A hard
+/// `Err` (a client-facing error, no native re-plan) is the last resort, delegated to
+/// the builder for a wrapper that genuinely cannot be built.
 #[allow(clippy::too_many_arguments)]
-async fn plan_eligible_join(
+async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
-    eligible: &EligibleJoin,
+    join: &DetectedJoin,
     catalog_uri: &str,
     storage: &StorageProps,
     catalog: &CatalogProps,
@@ -4467,25 +4298,34 @@ async fn plan_eligible_join(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
-    // Resolve both sides ONCE (two catalog resolutions total, never per shard),
-    // each pruned by its side-local WHERE conjuncts.
-    let sides = resolve_join_sides(
-        eligible,
-        pushdown_req,
-        catalog_uri,
-        storage,
-        catalog,
-        creds,
-        join_broadcast_max_bytes,
-    )
-    .await?;
+    // Resolve each side ONCE (one catalog resolution per involved table, never per
+    // shard), each pruned by its own side-local WHERE conjuncts for Iceberg manifest
+    // pruning — attributed by `tableName`, so a shared-column-name case stays correct.
+    let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let mut sides = Vec::with_capacity(join.tables.len());
+    for leaf in &join.tables {
+        let side_filter = filter.and_then(|f| side_local_filter(f, &leaf.table_name));
+        let side = resolve_one_join_side(
+            &leaf.table_name,
+            &leaf.iceberg_ident,
+            catalog_uri,
+            storage,
+            catalog,
+            creds,
+            side_filter.as_ref(),
+        )
+        .await?;
+        sides.push(side);
+    }
 
-    // An inner join with an empty side is empty regardless of the plan. Emit the
-    // shape-correct empty result (single-group aggregate, grouped, or row) from the
-    // combined column universe rather than a fan-out over an empty file list.
-    if sides.fact.files.is_empty() || sides.dimension.files.is_empty() {
-        let mut combined = involved_table_columns(request, &sides.fact.table_name);
-        combined.extend(involved_table_columns(request, &sides.dimension.table_name));
+    // An inner join with any empty side is empty regardless of the plan. Emit the
+    // shape-correct empty result over the combined N-table column universe (stable
+    // side order) rather than a fan-out over an empty file list.
+    if sides.iter().any(|s| s.files.is_empty()) {
+        let mut combined = Vec::new();
+        for leaf in &join.tables {
+            combined.extend(involved_table_columns(request, &leaf.table_name));
+        }
         let (proj_cols, proj_types) = project_columns(pushdown_req, combined.clone())?;
         return empty_result_sql(pushdown_req, &proj_cols, &proj_types, &combined);
     }
@@ -4503,28 +4343,240 @@ async fn plan_eligible_join(
         s3_max_connections,
     };
 
-    // Broadcast only for a plain projection+filter inner join whose columns are
-    // disjoint and whose dimension side fits the threshold. `render_broadcast_join`
-    // returns `Ok(None)` on a column-name collision (bare-name ambiguity) — that is
-    // a clean fall-through to the qualified two-scan path, never an error.
-    if sides.broadcast_eligible
-        && !join_requires_exasol_postprocessing(pushdown_req)
-        && let Some(rendered) = render_broadcast_join(request, pushdown_req, eligible)?
-    {
-        let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, &udf_name, &merge_udf_name);
-        return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+    // Broadcast eligibility is a PROPERTY of the request, computed here: exactly two
+    // involved tables, a `predicate_equal` condition, and no Exasol postprocessing.
+    // When it holds, size the two sides (smaller = dimension) and take the broadcast
+    // fan-out iff the dimension fits the threshold AND the bare-name render succeeds.
+    // Any miss falls through to the N-scan fallback below — never an error.
+    let is_equi =
+        join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
+    if join.tables.len() == 2 && is_equi && !join_requires_exasol_postprocessing(pushdown_req) {
+        let candidate =
+            select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
+        if candidate.broadcast_eligible
+            && let Some(rendered) = render_broadcast_join(request, pushdown_req, join)?
+        {
+            let sql = build_broadcast_join_sql(
+                &candidate,
+                &rendered,
+                &tuning,
+                &udf_name,
+                &merge_udf_name,
+            );
+            return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+        }
     }
 
-    let sql = build_unaccelerated_join_sql(
+    let sql = build_n_scan_join_sql(
         request,
         pushdown_req,
-        eligible,
+        join,
         &sides,
         &tuning,
         &udf_name,
         &merge_udf_name,
     )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// Side `i`'s Exasol virtual table name (UPPERCASE) maps to `aliases[i]`
+/// (`LHS_T{i}`), so every column reference the N-scan wrapper renders is
+/// table-qualified from its `tableName`.
+fn build_n_scan_alias_map(
+    sides: &[ResolvedJoinSide],
+    aliases: &[String],
+) -> HashMap<String, String> {
+    sides
+        .iter()
+        .zip(aliases)
+        .map(|(side, alias)| (side.table_name.to_ascii_uppercase(), alias.clone()))
+        .collect()
+}
+
+/// Every column of all involved tables as a table-qualified projection item, in
+/// side order. `cols_per_side[i]` belongs to the side aliased `aliases[i]`.
+fn n_full_row_qualified_items(
+    aliases: &[String],
+    cols_per_side: &[Vec<(String, String)>],
+) -> Vec<ProjectionItem> {
+    aliases
+        .iter()
+        .zip(cols_per_side)
+        .flat_map(|(alias, cols)| {
+            cols.iter().map(move |(name, _)| ProjectionItem::Expr {
+                expr: format!("{}.{}", quote_ident(alias), quote_ident(name)),
+            })
+        })
+        .collect()
+}
+
+/// The N-scan wrapper's outer SELECT list, table-qualified. An absent/empty select
+/// list projects every column of all involved tables in side order. An item that
+/// cannot be rendered is a last-resort hard error (no native re-plan).
+fn n_scan_join_select_items(
+    pushdown_req: &Json,
+    alias_of: &HashMap<String, String>,
+    aliases: &[String],
+    cols_per_side: &[Vec<(String, String)>],
+) -> Result<Vec<ProjectionItem>, UdfError> {
+    match pushdown_req.get("selectList") {
+        Some(Json::Array(list)) if !list.is_empty() => {
+            let mut items = Vec::with_capacity(list.len());
+            for item in list {
+                let sql = render_selectlist_item_qualified(item, alias_of).ok_or_else(|| {
+                    UdfError::User(
+                        "join pushdown declined: a select-list item could not be rendered for the \
+                         qualified N-scan join; this is a hard error, not a native re-plan"
+                            .into(),
+                    )
+                })?;
+                items.push(ProjectionItem::Expr { expr: sql });
+            }
+            Ok(items)
+        }
+        _ => Ok(n_full_row_qualified_items(aliases, cols_per_side)),
+    }
+}
+
+/// Build the N-scan (N ≥ 2) unaccelerated inner-join SQL — the SOLE unaccelerated
+/// fallback renderer (the two-involved-table case is simply N = 2). Each involved
+/// table is scanned through its own sharded fan-out, cross-joined, and reconstructed
+/// into the original inner join by Exasol's core engine via a conjunctive
+/// table-qualified WHERE.
+///
+/// Each side emits its full column set (narrowed to the columns the wrapper actually
+/// references across all clauses), so the outer wrapper's SELECT, every join
+/// condition, WHERE, aggregate, GROUP BY, HAVING, and ORDER BY can reference any
+/// column the join needs — all rendered TABLE-QUALIFIED (`"LHS_T{i}"."COL"`) from
+/// each `column` node's `tableName`, so the wrapper is correct whether or not any
+/// two involved tables share a column name (decision-log [2]).
+///
+/// For an all-inner join, `FROM a, b, c WHERE c1 AND c2 AND <filter>` is equivalent
+/// to any chained `INNER JOIN … ON` ordering and is order-agnostic, so no per-node
+/// ON-scope bookkeeping is needed; Exasol's optimizer turns the equi-conditioned
+/// cross join into hash joins. Each WHERE part is parenthesized so a top-level `OR`
+/// in any condition or in the residual filter cannot bind across the ANDs.
+///
+/// Returns an `Err` (a hard client-facing error, no native re-plan) only when the
+/// wrapper genuinely cannot be built: an involved table carries no column metadata,
+/// or a join condition (or a pushed select/GROUP BY/HAVING/ORDER BY element) cannot
+/// be rendered at all.
+fn build_n_scan_join_sql(
+    request: &Json,
+    pushdown_req: &Json,
+    join: &DetectedJoin,
+    sides: &[ResolvedJoinSide],
+    tuning: &JoinScanTuning,
+    udf_name: &str,
+    merge_udf_name: &str,
+) -> Result<String, UdfError> {
+    let cols_per_side: Vec<Vec<(String, String)>> = sides
+        .iter()
+        .map(|s| involved_table_columns(request, &s.table_name))
+        .collect();
+    if cols_per_side.iter().any(|c| c.is_empty()) {
+        return Err(UdfError::User(
+            "join pushdown declined: an involved table carries no column metadata, so the \
+             unaccelerated N-scan fallback cannot be built; this is a hard error, not a \
+             native re-plan"
+                .into(),
+        ));
+    }
+
+    let aliases: Vec<String> = (0..sides.len()).map(|i| format!("LHS_T{i}")).collect();
+    let alias_of = build_n_scan_alias_map(sides, &aliases);
+
+    // Every join-tree condition, table-qualified. A condition is the one clause with
+    // no lower fallback: if it cannot be rendered even qualified, no correct join SQL
+    // exists → last-resort hard error (no native re-plan).
+    let mut conditions = Vec::with_capacity(join.conditions.len());
+    for cond in &join.conditions {
+        let rendered = render_expression_qualified(cond, &alias_of).ok_or_else(|| {
+            UdfError::User(
+                "join pushdown declined: a join condition could not be rendered against the \
+                 qualified N-scan schema; this is a hard error, not a native re-plan"
+                    .into(),
+            )
+        })?;
+        conditions.push(rendered);
+    }
+
+    let filter = pushdown_req
+        .get("filter")
+        .filter(|f| !f.is_null())
+        .and_then(|f| render_df_filter_qualified(f, &alias_of));
+
+    let select_items = n_scan_join_select_items(pushdown_req, &alias_of, &aliases, &cols_per_side)?;
+    let group_by = qualified_join_group_by(pushdown_req, &alias_of)?;
+    let having = qualified_join_having(pushdown_req, &alias_of)?;
+    let order_by = qualified_join_order_by(pushdown_req, &alias_of)?;
+    let limit = extract_limit(pushdown_req);
+
+    // Per-side fan-out: narrow each leg's projection to the columns the wrapper
+    // references (across the SELECT list, ALL join conditions, WHERE, GROUP BY,
+    // HAVING, and ORDER BY), and push each side's side-local WHERE conjuncts down as a
+    // DataFusion filter. Cross-table and OR-spanning conjuncts stay only in the outer
+    // WHERE (`filter`), the correctness backstop. All N-1 conditions are passed as one
+    // JSON array so `referenced_side_columns` (which walks arbitrary nodes) keeps a
+    // side's column referenced by ANY condition.
+    let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let all_conditions = Json::Array(join.conditions.clone());
+    let mut fan_outs = Vec::with_capacity(sides.len());
+    for (i, side) in sides.iter().enumerate() {
+        let narrowed = referenced_side_columns(
+            pushdown_req,
+            &all_conditions,
+            &side.table_name,
+            &cols_per_side[i],
+        );
+        let side_filter = where_filter.and_then(|f| side_local_filter(f, &side.table_name));
+        fan_outs.push(build_side_fan_out_sql(
+            side,
+            &narrowed,
+            side_filter.as_ref(),
+            tuning,
+            udf_name,
+            merge_udf_name,
+        ));
+    }
+
+    // Assemble the cross-join wrapper. FROM is the comma-joined aliased fan-outs;
+    // WHERE is every join condition AND-conjoined with the qualified residual filter.
+    let select = if select_items.is_empty() {
+        "*".to_string()
+    } else {
+        select_items
+            .iter()
+            .map(projection_item_select_sql)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let from = fan_outs
+        .iter()
+        .zip(&aliases)
+        .map(|(fan, alias)| format!("({fan}) AS {}", quote_ident(alias)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut where_parts: Vec<String> = conditions.iter().map(|c| format!("({c})")).collect();
+    if let Some(f) = &filter {
+        where_parts.push(format!("({f})"));
+    }
+    let where_clause = where_parts.join(" AND ");
+
+    let mut sql = format!("SELECT {select} FROM {from} WHERE {where_clause}");
+    if let Some(clause) = group_by {
+        sql.push_str(&format!(" GROUP BY {clause}"));
+    }
+    if let Some(clause) = having {
+        sql.push_str(&format!(" HAVING {clause}"));
+    }
+    if let Some(clause) = order_by {
+        sql.push_str(&format!(" ORDER BY {clause}"));
+    }
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    Ok(sql)
 }
 
 /// The DataFusion execution + sharding knobs threaded into join SQL building.
@@ -4555,7 +4607,7 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 /// emitting the columns the outer wrapper references for this side and pushing this
 /// side's SIDE-LOCAL WHERE conjuncts down as a DataFusion filter. No join block, no
 /// limit push. Used for BOTH sides of the unaccelerated fallback: the outer Exasol
-/// query (see [`build_two_scan_join_sql`]) still applies the projection, `ON`, and
+/// query (see [`build_n_scan_join_sql`]) still applies the projection, conditions, and
 /// the FULL `WHERE`, so `columns` (the side's narrowed `(UPPERCASE name, Exasol
 /// type)` list, see [`referenced_side_columns`]) must expose every column any outer
 /// clause references. `side_filter` (see [`side_local_filter`]) is rendered bare-name
@@ -4697,160 +4749,9 @@ fn build_broadcast_join_sql(
     )
 }
 
-/// Build the unaccelerated two-scan join SQL (task 3.5): each side scanned through
-/// its own sharded fan-out, joined — and post-processed — by Exasol's core engine.
-///
-/// Each side emits its FULL column set (from that table's `involvedTables` column
-/// metadata), so the outer wrapper's projection, `ON`, `WHERE`, aggregate,
-/// GROUP BY, HAVING and ORDER BY can reference any column the join needs. Every one
-/// of those clauses is rendered with TABLE-QUALIFIED column references
-/// (`"LHS_FACT"."COL"` / `"LHS_DIM"."COL"`) resolved against each side's own
-/// fan-out subquery, so the wrapper is correct whether or not the two tables share a
-/// column name — it does NOT depend on the disjoint-column guard the broadcast path
-/// needs. An aggregate select list is executed by Exasol over the materialized join
-/// (reproducing pre-`JOIN`-capability behavior), not decomposed into the scan UDF.
-///
-/// Returns an `Err` (native retry) only when the wrapper genuinely cannot be built:
-/// a side carries no column metadata, or the equi-condition (or a pushed
-/// select/GROUP BY/HAVING/ORDER BY element) cannot be rendered at all.
-fn build_unaccelerated_join_sql(
-    request: &Json,
-    pushdown_req: &Json,
-    eligible: &EligibleJoin,
-    sides: &JoinSides,
-    tuning: &JoinScanTuning,
-    udf_name: &str,
-    merge_udf_name: &str,
-) -> Result<String, UdfError> {
-    let fact_cols = involved_table_columns(request, &sides.fact.table_name);
-    let dim_cols = involved_table_columns(request, &sides.dimension.table_name);
-    if fact_cols.is_empty() || dim_cols.is_empty() {
-        return Err(UdfError::User(
-            "join pushdown declined: an involved table carries no column metadata, so the \
-             unaccelerated two-scan fallback cannot be built; Exasol will retry natively"
-                .into(),
-        ));
-    }
-
-    let alias_of = build_join_alias_map(sides);
-
-    // The equi-condition is the one clause with no lower fallback: if it cannot be
-    // rendered even qualified, no correct join SQL exists → last-resort native retry.
-    let condition =
-        render_expression_qualified(&eligible.condition, &alias_of).ok_or_else(|| {
-            UdfError::User(
-            "join pushdown declined: the equi-join condition could not be rendered against the \
-             qualified two-scan schema; Exasol will retry natively"
-                .into(),
-        )
-        })?;
-
-    let filter = pushdown_req
-        .get("filter")
-        .filter(|f| !f.is_null())
-        .and_then(|f| render_df_filter_qualified(f, &alias_of));
-
-    let select_items = qualified_join_select_items(pushdown_req, &alias_of, &fact_cols, &dim_cols)?;
-    let group_by = qualified_join_group_by(pushdown_req, &alias_of)?;
-    let having = qualified_join_having(pushdown_req, &alias_of)?;
-    let order_by = qualified_join_order_by(pushdown_req, &alias_of)?;
-    let limit = extract_limit(pushdown_req);
-
-    // Per-side pruning (additive, underneath the unchanged outer WHERE): narrow each
-    // leg's projection to the columns the wrapper actually references, and push each
-    // side's side-local WHERE conjuncts down as a DataFusion filter. Cross-table and
-    // OR-spanning conjuncts stay only in the outer WHERE (`filter` above), the
-    // correctness backstop. The FULL `*_cols` still drive `qualified_join_select_items`
-    // so an absent select list keeps projecting every column.
-    let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let fact_narrowed = referenced_side_columns(
-        pushdown_req,
-        &eligible.condition,
-        &sides.fact.table_name,
-        &fact_cols,
-    );
-    let dim_narrowed = referenced_side_columns(
-        pushdown_req,
-        &eligible.condition,
-        &sides.dimension.table_name,
-        &dim_cols,
-    );
-    let fact_filter = where_filter.and_then(|f| side_local_filter(f, &sides.fact.table_name));
-    let dim_filter = where_filter.and_then(|f| side_local_filter(f, &sides.dimension.table_name));
-
-    let fact_fan_out = build_side_fan_out_sql(
-        &sides.fact,
-        &fact_narrowed,
-        fact_filter.as_ref(),
-        tuning,
-        udf_name,
-        merge_udf_name,
-    );
-    let dim_fan_out = build_side_fan_out_sql(
-        &sides.dimension,
-        &dim_narrowed,
-        dim_filter.as_ref(),
-        tuning,
-        udf_name,
-        merge_udf_name,
-    );
-
-    let mut sql = build_two_scan_join_sql(
-        &fact_fan_out,
-        &dim_fan_out,
-        &select_items,
-        &condition,
-        filter.as_deref(),
-    );
-    if let Some(clause) = group_by {
-        sql.push_str(&format!(" GROUP BY {clause}"));
-    }
-    if let Some(clause) = having {
-        sql.push_str(&format!(" HAVING {clause}"));
-    }
-    if let Some(clause) = order_by {
-        sql.push_str(&format!(" ORDER BY {clause}"));
-    }
-    if let Some(n) = limit {
-        sql.push_str(&format!(" LIMIT {n}"));
-    }
-    Ok(sql)
-}
-
-/// The two-scan wrapper's outer SELECT list, table-qualified, in select-list order.
-///
-/// Each `selectList` item renders through [`render_selectlist_item_qualified`]
-/// (aggregate, column, literal, or scalar expression). An absent or empty select
-/// list projects every column of both joined tables. An item that cannot be rendered
-/// is a last-resort native retry (no correct outer SELECT exists for it).
-fn qualified_join_select_items(
-    pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
-    fact_cols: &[(String, String)],
-    dim_cols: &[(String, String)],
-) -> Result<Vec<ProjectionItem>, UdfError> {
-    match pushdown_req.get("selectList") {
-        Some(Json::Array(list)) if !list.is_empty() => {
-            let mut items = Vec::with_capacity(list.len());
-            for item in list {
-                let sql = render_selectlist_item_qualified(item, alias_of).ok_or_else(|| {
-                    UdfError::User(
-                        "join pushdown declined: a select-list item could not be rendered for the \
-                         qualified two-scan join; Exasol will retry natively"
-                            .into(),
-                    )
-                })?;
-                items.push(ProjectionItem::Expr { expr: sql });
-            }
-            Ok(items)
-        }
-        _ => Ok(full_row_qualified_items(fact_cols, dim_cols)),
-    }
-}
-
-/// The two-scan wrapper's `GROUP BY` clause (without the keyword), table-qualified.
+/// The N-scan wrapper's `GROUP BY` clause (without the keyword), table-qualified.
 /// `None` when the request carries no non-empty `groupBy`. A group key that cannot
-/// be rendered is a last-resort native retry.
+/// be rendered is a last-resort hard error (no native re-plan).
 fn qualified_join_group_by(
     pushdown_req: &Json,
     alias_of: &HashMap<String, String>,
@@ -4868,7 +4769,7 @@ fn qualified_join_group_by(
         parts.push(render_expression_qualified(key, alias_of).ok_or_else(|| {
             UdfError::User(
                 "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
-                 two-scan join; Exasol will retry natively"
+                 N-scan join; this is a hard error, not a native re-plan"
                     .into(),
             )
         })?);
@@ -4876,9 +4777,9 @@ fn qualified_join_group_by(
     Ok(Some(parts.join(", ")))
 }
 
-/// The two-scan wrapper's `HAVING` clause (without the keyword), table-qualified.
+/// The N-scan wrapper's `HAVING` clause (without the keyword), table-qualified.
 /// `None` when the request carries no `having`. An unrenderable HAVING is a
-/// last-resort native retry (dropping it would return wrong rows).
+/// last-resort hard error (dropping it would return wrong rows; no native re-plan).
 fn qualified_join_having(
     pushdown_req: &Json,
     alias_of: &HashMap<String, String>,
@@ -4888,7 +4789,7 @@ fn qualified_join_having(
             render_expression_qualified(having, alias_of).ok_or_else(|| {
                 UdfError::User(
                     "join pushdown declined: HAVING could not be rendered for the qualified \
-                     two-scan join; Exasol will retry natively"
+                     N-scan join; this is a hard error, not a native re-plan"
                         .into(),
                 )
             })?,
@@ -4897,11 +4798,11 @@ fn qualified_join_having(
     }
 }
 
-/// The two-scan wrapper's `ORDER BY` clause (without the keyword), table-qualified.
+/// The N-scan wrapper's `ORDER BY` clause (without the keyword), table-qualified.
 /// `None` when the request carries no non-empty `orderBy`. Only bare-column sort
 /// keys are advertised (`ORDER_BY_COLUMN`); an element that is not a renderable bare
-/// column is a last-resort native retry (dropping it would return an unordered
-/// result Exasol delegated and no longer re-sorts).
+/// column is a last-resort hard error (dropping it would return an unordered
+/// result Exasol delegated and no longer re-sorts; no native re-plan).
 fn qualified_join_order_by(
     pushdown_req: &Json,
     alias_of: &HashMap<String, String>,
@@ -4917,7 +4818,7 @@ fn qualified_join_order_by(
     let decline = || {
         UdfError::User(
             "join pushdown declined: an ORDER BY key could not be rendered for the qualified \
-             two-scan join; Exasol will retry natively"
+             N-scan join; this is a hard error, not a native re-plan"
                 .into(),
         )
     };
@@ -4940,7 +4841,7 @@ fn qualified_join_order_by(
 /// non-numeric aggregate demotes to the next shape, so the empty response's
 /// positional column shape always equals what the non-empty path would have
 /// committed to. A non-numeric grouped aggregate carrying a HAVING is declined
-/// with the same `Err` the non-empty path returns (Exasol retries natively),
+/// with the same `Err` the non-empty path returns (a hard error, no native re-plan),
 /// because the adapter advertises AGGREGATE_HAVING and dropping the HAVING would
 /// yield wrong results. No scan or distinct-merge UDF is referenced: with zero
 /// files there is nothing to scan or merge.
@@ -4974,7 +4875,7 @@ fn empty_result_sql(
         {
             return Err(UdfError::User(
                 "grouped aggregate pushdown declined: HAVING present but aggregate \
-                 column type is non-numeric; Exasol will retry natively"
+                 column type is non-numeric; this is a hard error, not a native re-plan"
                     .into(),
             ));
         }
@@ -6997,25 +6898,25 @@ mod tests {
         })
     }
 
-    /// A genuine two-table inner equi-join is detected as `Eligible`, with both
-    /// original-cased Iceberg identifiers recovered from `TABLE_MAP` (pushdown-planning-join
-    /// "Broadcast-eligible inner equi-join is planned as a broadcast fan-out").
+    /// A genuine two-table inner equi-join is detected as the unified `Join` shape,
+    /// with both leaves' original-cased Iceberg identifiers recovered from `TABLE_MAP`
+    /// (the two-table case is simply N = 2).
     #[test]
-    fn genuine_inner_equi_join_is_eligible_with_both_idents() {
+    fn genuine_inner_equi_join_is_detected_with_both_idents() {
         let request = join_request(Json::Null, equi_condition());
         let pushdown_req = pd(&request);
 
         let shape = detect_join(&request, &pushdown_req).expect("TABLE_MAP has both tables");
         match shape {
-            JoinShape::Eligible(join) => {
-                assert_eq!(join.left_table_name, "CUSTOMER");
-                assert_eq!(join.right_table_name, "ORDERS");
-                assert_eq!(join.left_iceberg_ident, "lh.customer");
-                assert_eq!(join.right_iceberg_ident, "lh.orders");
-                assert_eq!(join.join_type, JoinType::Inner);
-                assert_eq!(join.condition, equi_condition());
+            JoinShape::Join(join) => {
+                assert_eq!(join.tables.len(), 2);
+                assert_eq!(join.tables[0].table_name, "CUSTOMER");
+                assert_eq!(join.tables[1].table_name, "ORDERS");
+                assert_eq!(join.tables[0].iceberg_ident, "lh.customer");
+                assert_eq!(join.tables[1].iceberg_ident, "lh.orders");
+                assert_eq!(join.conditions, vec![equi_condition()]);
             }
-            other => panic!("expected Eligible, got {other:?}"),
+            other => panic!("expected Join, got {other:?}"),
         }
     }
 
@@ -7054,64 +6955,261 @@ mod tests {
         }
     }
 
-    /// A non-equi condition (e.g. `<`) is declined as `Ineligible(NotEquiCondition)`.
+    /// A non-equi two-table inner join (e.g. `<`) is NOT declined — it is served by
+    /// the unified fallback, so it yields the `Join` shape carrying both tables and
+    /// the (non-equi) condition. Only broadcast (an inner optimization) is gated on
+    /// equi; the N-scan fallback renders any inner-join condition into its WHERE.
     #[test]
-    fn non_equi_condition_is_ineligible() {
+    fn non_equi_two_table_join_is_served_by_unified_fallback() {
         let condition = serde_json::json!({
             "type": "predicate_less",
             "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
             "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
         });
-        let request = join_request(Json::Null, condition);
-        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-        assert_eq!(
-            shape,
-            JoinShape::Ineligible(IneligibleJoinReason::NotEquiCondition)
-        );
+        let request = join_request(Json::Null, condition.clone());
+        match detect_join(&request, &pd(&request)).expect("served, not declined") {
+            JoinShape::Join(join) => {
+                assert_eq!(join.tables.len(), 2);
+                assert_eq!(join.conditions, vec![condition]);
+            }
+            other => panic!("expected Join (unified fallback), got {other:?}"),
+        }
     }
 
-    /// A three-table join (a nested `join` node as the `left` side of the outer
-    /// join) is declined as `Ineligible(TooManyTables)`.
-    #[test]
-    fn three_table_join_is_ineligible() {
-        let mut request = join_request(Json::Null, equi_condition());
-        request["pushdownRequest"]["from"]["left"] = serde_json::json!({
-            "type": "join",
-            "join_type": "inner",
-            "left": {"name": "CUSTOMER", "type": "table"},
-            "right": {"name": "NATION", "type": "table"},
-            "condition": {
-                "type": "predicate_equal",
-                "left": {"type": "column", "name": "C_NATIONKEY", "tableName": "CUSTOMER"},
-                "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"},
+    /// A three-table inner-join pushdown request: `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`,
+    /// all three in `TABLE_MAP`. Leaves in stable tree order CUSTOMER, ORDERS,
+    /// LINEITEM; two join conditions (`C_CUSTKEY=O_CUSTKEY`, `O_ORDERKEY=L_ORDERKEY`).
+    fn three_table_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "CUSTOMER", "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "ORDERS", "columns": [
+                    {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "LINEITEM", "columns": [
+                    {"name": "L_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "L_QUANTITY", "dataType": {"type": "decimal", "precision": 15, "scale": 2}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "CUSTOMER", "type": "table"},
+                        "right": {"name": "ORDERS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}}},
+                    "right": {"name": "LINEITEM", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
+                        "right": {"type": "column", "name": "L_ORDERKEY", "tableName": "LINEITEM"}}},
+                "selectList": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "column", "name": "L_QUANTITY", "tableName": "LINEITEM"}],
             },
-        });
-        // A three-table join also involves three tables, not two.
-        request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
-            "name": "NATION",
-            "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
-        }));
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders", "LINEITEM": "lh.lineitem"}})
+                    .to_string()},
+        })
+    }
+
+    /// A three-table all-inner nested join is classified as the unified `Join` shape
+    /// (never an error, never Ineligible): the three leaves in stable tree order and
+    /// the two collected join conditions, each leaf's Iceberg ident recovered from
+    /// `TABLE_MAP` (pushdown-planning-join "A three-or-more-table inner join falls
+    /// back to an N-scan unaccelerated wrapper").
+    #[test]
+    fn three_table_inner_join_is_unified_join() {
+        let request = three_table_join_request();
+        let shape = detect_join(&request, &pd(&request)).expect("all leaves are in TABLE_MAP");
+        match shape {
+            JoinShape::Join(join) => {
+                let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
+                assert_eq!(names, ["CUSTOMER", "ORDERS", "LINEITEM"]);
+                let idents: Vec<&str> = join
+                    .tables
+                    .iter()
+                    .map(|t| t.iceberg_ident.as_str())
+                    .collect();
+                assert_eq!(idents, ["lh.customer", "lh.orders", "lh.lineitem"]);
+                assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 tables");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// A non-inner join node ANYWHERE in the tree (here the nested left node is a
+    /// left outer join) declines as `Ineligible(NotInnerJoinType)` — a cross-join +
+    /// conjunctive WHERE cannot reproduce outer-join semantics.
+    #[test]
+    fn non_inner_node_in_join_tree_is_ineligible() {
+        let mut request = three_table_join_request();
+        request["pushdownRequest"]["from"]["left"]["join_type"] = serde_json::json!("left_outer");
         let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
         assert_eq!(
             shape,
-            JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)
+            JoinShape::Ineligible(IneligibleJoinReason::NotInnerJoinType)
         );
     }
 
-    /// An `involvedTables` count other than two (independent of the `from` shape)
-    /// is also declined as `Ineligible(TooManyTables)` — a defensive belt.
+    /// A leaf of a multi-table tree absent from `TABLE_MAP` is a hard `Err` (stale
+    /// virtual schema), identical to the two-table path — never a silent decline.
     #[test]
-    fn involved_table_count_mismatch_is_ineligible() {
+    fn multi_table_leaf_absent_from_table_map_is_err() {
+        let mut request = three_table_join_request();
+        request["schemaMetadataInfo"]["adapterNotes"] = Json::String(
+            serde_json::json!({"TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}})
+                .to_string(),
+        );
+        let err = detect_join(&request, &pd(&request))
+            .expect_err("LINEITEM is absent from TABLE_MAP: must be Err, not a decline");
+        assert!(
+            err.to_string().contains("LINEITEM"),
+            "error must name the unmapped table: {err}"
+        );
+    }
+
+    /// The Q1-shape three-table inner-join pushdown request:
+    /// `(SUPPLIER ⋈ NATION) ⋈ REGION`, all three in `TABLE_MAP`. Leaves in stable
+    /// tree order SUPPLIER, NATION, REGION; two join conditions
+    /// (`S_NATIONKEY=N_NATIONKEY`, `N_REGIONKEY=R_REGIONKEY`).
+    fn q1_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "REGION", "columns": [
+                    {"name": "R_REGIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "R_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "SUPPLIER", "type": "table"},
+                        "right": {"name": "NATION", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                            "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                    "right": {"name": "REGION", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "N_REGIONKEY", "tableName": "NATION"},
+                        "right": {"type": "column", "name": "R_REGIONKEY", "tableName": "REGION"}}},
+                "selectList": [
+                    {"type": "column", "name": "S_NAME", "tableName": "SUPPLIER"},
+                    {"type": "column", "name": "R_NAME", "tableName": "REGION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"SUPPLIER": "lh.supplier", "NATION": "lh.nation", "REGION": "lh.region"}})
+                    .to_string()},
+        })
+    }
+
+    /// The NQ3-shape four-table inner-join pushdown request:
+    /// `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`, all four in `TABLE_MAP`. Leaves in
+    /// stable tree order PART, PARTSUPP, SUPPLIER, NATION; three join conditions.
+    fn nq3_join_request() -> Json {
+        serde_json::json!({
+            "involvedTables": [
+                {"name": "PART", "columns": [
+                    {"name": "P_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "P_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "PARTSUPP", "columns": [
+                    {"name": "PS_PARTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "PS_AVAILQTY", "dataType": {"type": "decimal", "precision": 15, "scale": 0}}]},
+                {"name": "SUPPLIER", "columns": [
+                    {"name": "S_SUPPKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "S_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "NATION", "columns": [
+                    {"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"type": "join", "join_type": "inner",
+                            "left": {"name": "PART", "type": "table"},
+                            "right": {"name": "PARTSUPP", "type": "table"},
+                            "condition": {"type": "predicate_equal",
+                                "left": {"type": "column", "name": "P_PARTKEY", "tableName": "PART"},
+                                "right": {"type": "column", "name": "PS_PARTKEY", "tableName": "PARTSUPP"}}},
+                        "right": {"name": "SUPPLIER", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "PS_SUPPKEY", "tableName": "PARTSUPP"},
+                            "right": {"type": "column", "name": "S_SUPPKEY", "tableName": "SUPPLIER"}}},
+                    "right": {"name": "NATION", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "S_NATIONKEY", "tableName": "SUPPLIER"},
+                        "right": {"type": "column", "name": "N_NATIONKEY", "tableName": "NATION"}}},
+                "selectList": [
+                    {"type": "column", "name": "P_NAME", "tableName": "PART"},
+                    {"type": "column", "name": "PS_AVAILQTY", "tableName": "PARTSUPP"},
+                    {"type": "column", "name": "N_NAME", "tableName": "NATION"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP": {
+                    "PART": "lh.part", "PARTSUPP": "lh.partsupp",
+                    "SUPPLIER": "lh.supplier", "NATION": "lh.nation"}})
+                    .to_string()},
+        })
+    }
+
+    /// A four-table all-inner nested join (NQ3 shape: `part⋈partsupp⋈supplier⋈nation`)
+    /// is the unified `Join` shape with all four leaves (stable tree order) and the
+    /// three collected join conditions — the detector generalizes past N=3, never
+    /// capping at three tables.
+    #[test]
+    fn four_table_inner_join_is_unified_join() {
+        let request = nq3_join_request();
+        let shape = detect_join(&request, &pd(&request)).expect("all leaves are in TABLE_MAP");
+        match shape {
+            JoinShape::Join(join) => {
+                let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
+                assert_eq!(names, ["PART", "PARTSUPP", "SUPPLIER", "NATION"]);
+                let idents: Vec<&str> = join
+                    .tables
+                    .iter()
+                    .map(|t| t.iceberg_ident.as_str())
+                    .collect();
+                assert_eq!(
+                    idents,
+                    ["lh.part", "lh.partsupp", "lh.supplier", "lh.nation"]
+                );
+                assert_eq!(join.conditions.len(), 3, "N-1 conditions for N=4 tables");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// `detect_join` is driven by the `from` TREE, not the `involvedTables` count:
+    /// a two-table `from` yields the unified `Join` shape with exactly those two
+    /// tables even when `involvedTables` lists more (the old `TooManyTables`
+    /// defensive belt is gone — the tree is authoritative).
+    #[test]
+    fn detect_join_follows_from_tree_not_involved_tables_count() {
         let mut request = join_request(Json::Null, equi_condition());
         request["involvedTables"].as_array_mut().unwrap().push(serde_json::json!({
             "name": "NATION",
             "columns": [{"name": "N_NATIONKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
         }));
-        let shape = detect_join(&request, &pd(&request)).expect("shape decline, no Err");
-        assert_eq!(
-            shape,
-            JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)
-        );
+        match detect_join(&request, &pd(&request)).expect("tree-driven, no decline") {
+            JoinShape::Join(join) => {
+                let names: Vec<&str> = join.tables.iter().map(|t| t.table_name.as_str()).collect();
+                assert_eq!(names, ["CUSTOMER", "ORDERS"], "only the from-tree leaves");
+            }
+            other => panic!("expected Join over the two from-tree tables, got {other:?}"),
+        }
     }
 
     /// An otherwise-eligible join whose virtual table name is absent from
@@ -7135,12 +7233,12 @@ mod tests {
     // rendering via the reused vs-expression translator.
     // ---------------------------------------------------------------------------
 
-    /// Recover the `EligibleJoin` a request classifies to (the tests below all
+    /// Recover the [`DetectedJoin`] a request classifies to (the tests below all
     /// operate on the standard two-table CUSTOMER⋈ORDERS shape from `join_request`).
-    fn eligible_join(request: &Json) -> EligibleJoin {
-        match detect_join(request, &pd(request)).expect("eligible join shape") {
-            JoinShape::Eligible(join) => join,
-            other => panic!("expected Eligible, got {other:?}"),
+    fn detected_join(request: &Json) -> DetectedJoin {
+        match detect_join(request, &pd(request)).expect("detected join shape") {
+            JoinShape::Join(join) => join,
+            other => panic!("expected Join, got {other:?}"),
         }
     }
 
@@ -7182,8 +7280,8 @@ mod tests {
         );
 
         // The whole rendering entry point declines cleanly, not with an Err.
-        let eligible = eligible_join(&request);
-        let outcome = render_broadcast_join(&request, &pd(&request), &eligible)
+        let detected = detected_join(&request);
+        let outcome = render_broadcast_join(&request, &pd(&request), &detected)
             .expect("a guard failure is a decline, not an error");
         assert!(
             outcome.is_none(),
@@ -7203,8 +7301,8 @@ mod tests {
         );
 
         let request = join_request(Json::Null, equi_condition());
-        let eligible = eligible_join(&request);
-        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
             .expect("disjoint, renderable join")
             .expect("a disjoint join must render, not decline");
         assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
@@ -7227,8 +7325,8 @@ mod tests {
             ],
         });
 
-        let eligible = eligible_join(&request);
-        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
             .expect("disjoint, renderable join")
             .expect("must render");
         let filter = rendered
@@ -7254,9 +7352,9 @@ mod tests {
     #[test]
     fn join_projection_emits_attribute_each_side_owning_type() {
         let request = join_request(Json::Null, equi_condition());
-        let eligible = eligible_join(&request);
+        let detected = detected_join(&request);
         let (projection, types) =
-            extract_join_projection(&request, &pd(&request), &eligible).expect("projectable");
+            extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
 
         assert_eq!(
             projection,
@@ -7281,12 +7379,12 @@ mod tests {
     /// safely". Two independent facets are asserted together because they are the
     /// two ways a join leaves the broadcast contract:
     ///
-    /// 1. A shape `detect_join` classifies `Ineligible` (outer, non-equi, >2 tables,
-    ///    malformed) cannot yield a correct two-scan fallback — there is no pair of
-    ///    resolved sides and no rendered equi-condition to join on — so it MUST map
-    ///    to a `User` decline error (Exasol retries natively), NEVER fall through to
-    ///    the single-table path (which would scan only the first involved table and
-    ///    silently drop the join).
+    /// 1. A shape `detect_join` classifies `Ineligible` (a non-inner join node in the
+    ///    tree, or a malformed shape) cannot be rendered at all — so it MUST map to a
+    ///    `User` decline error, NEVER fall through to the single-table path (which
+    ///    would scan only the first involved table and silently drop the join).
+    ///    Spanning more than two tables, non-equi, and overlapping column names are
+    ///    NOT Ineligible — they are served by the unified fallback.
     /// 2. An otherwise-eligible join whose two tables share a column name fails the
     ///    disjoint-column guard, so `render_broadcast_join` declines with `Ok(None)`.
     ///    The `vs-expression` translator emits only bare column names, so a two-scan
@@ -7295,24 +7393,30 @@ mod tests {
     ///    wrong plan.
     #[test]
     fn join_outside_contract_declined_safely() {
-        // Facet 1: every ineligible reason declines to a native-retry error.
+        // Facet 1: every ineligible reason declines to a HARD error — a
+        // client-facing F-UDF-CL-RUST-9001, NEVER a native re-plan. The message must
+        // say so plainly (contains "declined"/"cannot") and MUST NOT claim a retry.
         for reason in [
             IneligibleJoinReason::NotInnerJoinType,
-            IneligibleJoinReason::NotEquiCondition,
-            IneligibleJoinReason::TooManyTables,
             IneligibleJoinReason::UnsupportedShape,
         ] {
             let err = ineligible_join_decline(reason);
             match err {
-                UdfError::User(msg) => assert!(
-                    msg.contains("join pushdown declined") && msg.contains("retry"),
-                    "ineligible reason {reason:?} must decline for native retry: {msg}"
-                ),
+                UdfError::User(msg) => {
+                    assert!(
+                        msg.contains("join pushdown declined") && msg.contains("cannot"),
+                        "ineligible reason {reason:?} must be a plain hard-error decline: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("retry"),
+                        "ineligible reason {reason:?} must NOT claim a native retry: {msg}"
+                    );
+                }
                 other => panic!("ineligible join must be a User decline, got {other:?}"),
             }
         }
 
-        // An outer join reaches the decline path as Ineligible, never Eligible.
+        // An outer join reaches the decline path as Ineligible, never Join.
         let outer = join_request(
             serde_json::json!({"join_type": "left_outer"}),
             equi_condition(),
@@ -7338,8 +7442,8 @@ mod tests {
                     "dataType": {"type": "varchar", "size": 10}
                 }));
         }
-        let eligible = eligible_join(&request);
-        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
             .expect("guard failure is a decline, not an error");
         assert!(
             rendered.is_none(),
@@ -7347,45 +7451,61 @@ mod tests {
         );
     }
 
-    /// task 3.5: the unaccelerated wrapper joins two independently-sharded fan-out
-    /// subqueries with an Exasol-executed `INNER JOIN ... ON <condition>`, projecting
-    /// the cross-table select list and applying the optional cross-side WHERE. The
-    /// two subqueries are opaque here (any SQL text); this asserts only the wrapper
-    /// shape, so it is independent of the per-side fan-out builder.
+    /// The unified fallback (N = 2): each side scanned through its own sharded
+    /// fan-out, cross-joined with a table-qualified conjunctive WHERE (the join
+    /// condition AND-conjoined with the residual filter), projecting the qualified
+    /// select list. The two-table case uses the SAME `LHS_T*` renderer as N ≥ 3 —
+    /// never `INNER JOIN ... ON`.
     #[test]
-    fn join_above_threshold_unaccelerated_sql() {
-        let projection = vec![
-            ProjectionItem::Column("C_NAME".into()),
-            ProjectionItem::Column("O_ORDERDATE".into()),
+    fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["filter"] = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+            "right": {"type": "literal_string", "value": "1995-01-01"}
+        });
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
         ];
-        let sql = build_two_scan_join_sql(
-            "FACT_FAN_OUT",
-            "DIM_FAN_OUT",
-            &projection,
-            r#"("C_CUSTKEY" = "O_CUSTKEY")"#,
-            Some(r#"("O_ORDERDATE" > DATE '1995-01-01')"#),
-        );
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the two-table unified fallback must build");
 
+        for alias in ["LHS_T0", "LHS_T1"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "both side fan-outs must appear as aliased derived-table subqueries: {sql}"
+            );
+        }
         assert!(
-            sql.contains("(FACT_FAN_OUT)") && sql.contains("(DIM_FAN_OUT)"),
-            "both side fan-outs must appear as derived-table subqueries: {sql}"
+            sql.contains(r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#),
+            "the equi-condition must be table-qualified in the WHERE: {sql}"
         );
         assert!(
-            sql.contains("INNER JOIN") && sql.contains(r#"ON ("C_CUSTKEY" = "O_CUSTKEY")"#),
-            "the outer query must be an Exasol INNER JOIN on the rendered condition: {sql}"
-        );
-        assert!(
-            sql.contains(r#"SELECT "C_NAME", "O_ORDERDATE" FROM"#),
+            sql.contains(r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM"#),
             "the cross-table projection must drive the outer SELECT in order: {sql}"
         );
         assert!(
-            sql.contains(r#"WHERE ("O_ORDERDATE" > DATE '1995-01-01')"#),
-            "a cross-side WHERE filter must be applied by the outer query: {sql}"
+            sql.contains(" WHERE ")
+                && sql.contains(" AND ")
+                && sql.contains(r#""LHS_T1"."O_ORDERDATE""#),
+            "the condition AND the residual filter must render qualified in the WHERE: {sql}"
         );
-        // No broadcast join block is ever embedded in the unaccelerated wrapper.
+        // The unified fallback is a cross-join + WHERE, never `INNER JOIN ... ON`, and
+        // never a broadcast join block.
+        assert!(!sql.contains("INNER JOIN"), "{sql}");
         assert!(
-            !sql.contains("\"join\""),
-            "the unaccelerated path must not embed a broadcast join block: {sql}"
+            !sql.contains("\"join\":{"),
+            "the fallback must not embed a broadcast join block: {sql}"
         );
     }
 
@@ -7408,12 +7528,12 @@ mod tests {
     }
 
     /// A join whose two tables share a column name (`ID`) fails the disjoint guard
-    /// (so the broadcast path declines), but the qualified two-scan fallback still
-    /// builds a correct, UNAMBIGUOUS wrapper: the condition and projection reference
-    /// `"LHS_FACT"."ID"` / `"LHS_DIM"."ID"`, never a bare ambiguous `"ID"`. This is
-    /// the `EVENTS ⋈ LABELS ON a.id = b.id` regression.
+    /// (so the broadcast path declines), but the unified N-scan fallback still builds
+    /// a correct, UNAMBIGUOUS wrapper (N = 2): the condition and projection reference
+    /// `"LHS_T0"."ID"` / `"LHS_T1"."ID"`, never a bare ambiguous `"ID"`. This is the
+    /// `EVENTS ⋈ LABELS ON a.id = b.id` regression.
     #[test]
-    fn colliding_columns_render_qualified_two_scan_without_error() {
+    fn colliding_columns_render_qualified_unified_wrapper_without_error() {
         let request = serde_json::json!({
             "involvedTables": [
                 {"name": "EVENTS", "columns": [
@@ -7445,48 +7565,267 @@ mod tests {
         let left = involved_table_columns(&request, "EVENTS");
         let right = involved_table_columns(&request, "LABELS");
         assert!(!disjoint_schema_guard(&left, &right));
-        let eligible = eligible_join(&request);
+        let detected = detected_join(&request);
         assert!(
-            render_broadcast_join(&request, &pd(&request), &eligible)
+            render_broadcast_join(&request, &pd(&request), &detected)
                 .unwrap()
                 .is_none()
         );
 
-        let sides = JoinSides {
-            fact: resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
-            dimension: resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
-            broadcast_eligible: false,
-        };
-        let sql = build_unaccelerated_join_sql(
+        let sides = vec![
+            resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
+            resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+        ];
+        let sql = build_n_scan_join_sql(
             &request,
             &pd(&request),
-            &eligible,
+            &detected,
             &sides,
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
         )
-        .expect("the qualified two-scan must build despite the column-name collision");
+        .expect("the qualified unified fallback must build despite the column-name collision");
 
         assert!(
-            sql.contains(r#"ON ("LHS_FACT"."ID" = "LHS_DIM"."ID")"#),
+            sql.contains(r#"("LHS_T0"."ID" = "LHS_T1"."ID")"#),
             "the equi-condition must be table-qualified, never bare/ambiguous: {sql}"
         );
         assert!(
-            sql.contains(r#""LHS_FACT"."ID""#) && sql.contains(r#""LHS_DIM"."LABEL""#),
+            sql.contains(r#""LHS_T0"."ID""#) && sql.contains(r#""LHS_T1"."LABEL""#),
             "the projection must be table-qualified per owning side: {sql}"
         );
-        assert!(sql.contains("INNER JOIN"), "{sql}");
+        assert!(!sql.contains("INNER JOIN"), "{sql}");
     }
 
-    /// An aggregate over a join (the plan's second Manual Testing query,
-    /// `COUNT(*), MIN(o.O_ORDERDATE)`) routes through the two-scan wrapper and lets
-    /// Exasol evaluate the aggregate over the materialized join — a two-column result
-    /// (`COUNT(*)`, `MIN("LHS_FACT"."O_ORDERDATE")`), not the full-row projection the
-    /// old code emitted (which produced the "expected 2 columns but pushdown has 5"
-    /// failure).
+    /// The N-scan (N≥3) builder produces a cross-join + conjunctive table-qualified
+    /// WHERE wrapper — N distinct `LHS_T*` fan-out aliases, every one of the N-1 join
+    /// conditions rendered table-qualified, and the select list qualified to its
+    /// owning side — never an `Err` for an all-inner tree over resolvable tables
+    /// (pushdown-planning-join "A three-or-more-table inner join falls back to an
+    /// N-scan unaccelerated wrapper").
     #[test]
-    fn aggregate_over_join_renders_exasol_aggregate_over_two_scan() {
+    fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
+        let request = three_table_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("an all-inner N-scan wrapper must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."O_ORDERKEY" = "LHS_T2"."L_ORDERKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(" WHERE ") && sql.contains(" AND "),
+            "conditions must be AND-conjoined in a WHERE (cross-join reconstruction): {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T0"."C_NAME""#) && sql.contains(r#""LHS_T2"."L_QUANTITY""#),
+            "the select list must be qualified to each column's owning side: {sql}"
+        );
+    }
+
+    /// The N-scan builder also handles the Q1 shape (`supplier⋈nation⋈region`): three
+    /// distinct `LHS_T*` fan-out aliases and both join conditions rendered
+    /// table-qualified, never an `Err`.
+    #[test]
+    fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
+        let request = q1_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 10)]),
+            resolved_side("NATION", vec![("s3://w/n-0.parquet", 5)]),
+            resolved_side("REGION", vec![("s3://w/r-0.parquet", 2)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."S_NATIONKEY" = "LHS_T1"."N_NATIONKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."N_REGIONKEY" = "LHS_T2"."R_REGIONKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+    }
+
+    /// The N-scan builder also handles the NQ3 shape
+    /// (`part⋈partsupp⋈supplier⋈nation`, N=4): four distinct `LHS_T*` fan-out
+    /// aliases and all three join conditions rendered table-qualified, never an
+    /// `Err` — the builder generalizes past N=3.
+    #[test]
+    fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
+        let request = nq3_join_request();
+        let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("PART", vec![("s3://w/p-0.parquet", 10)]),
+            resolved_side("PARTSUPP", vec![("s3://w/ps-0.parquet", 40)]),
+            resolved_side("SUPPLIER", vec![("s3://w/s-0.parquet", 5)]),
+            resolved_side("NATION", vec![("s3://w/n-0.parquet", 3)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
+
+        for alias in ["LHS_T0", "LHS_T1", "LHS_T2", "LHS_T3"] {
+            assert!(
+                sql.contains(&format!(r#"AS "{alias}""#)),
+                "missing distinct fan-out alias {alias}: {sql}"
+            );
+        }
+        assert!(
+            sql.contains(r#""LHS_T0"."P_PARTKEY" = "LHS_T1"."PS_PARTKEY""#),
+            "first join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."PS_SUPPKEY" = "LHS_T2"."S_SUPPKEY""#),
+            "second join condition must be table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T2"."S_NATIONKEY" = "LHS_T3"."N_NATIONKEY""#),
+            "third join condition must be table-qualified: {sql}"
+        );
+    }
+
+    /// Three tables that ALL share a column name (`ID`) — the N-table analog of
+    /// `colliding_columns_render_qualified_two_scan_without_error` — still build a
+    /// correct, unambiguous N-scan wrapper: every `ID` reference (both join
+    /// conditions and the select list) is table-qualified, never bare.
+    #[test]
+    fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "EVENTS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "double"}}]},
+                {"name": "LABELS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "LABEL", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "TAGS", "columns": [
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                    {"name": "TAG_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"type": "join", "join_type": "inner",
+                        "left": {"name": "EVENTS", "type": "table"},
+                        "right": {"name": "LABELS", "type": "table"},
+                        "condition": {"type": "predicate_equal",
+                            "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                            "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+                    "right": {"name": "TAGS", "type": "table"},
+                    "condition": {"type": "predicate_equal",
+                        "left": {"type": "column", "name": "ID", "tableName": "LABELS"},
+                        "right": {"type": "column", "name": "ID", "tableName": "TAGS"}}},
+                "selectList": [
+                    {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    {"type": "column", "name": "LABEL", "tableName": "LABELS"},
+                    {"type": "column", "name": "TAG_NAME", "tableName": "TAGS"}],
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"EVENTS": "lh.events", "LABELS": "lh.labels", "TAGS": "lh.tags"}})
+                    .to_string()},
+        });
+        let multi = match detect_join(&request, &pd(&request)).expect("detected join shape") {
+            JoinShape::Join(m) => m,
+            other => panic!("expected Join, got {other:?}"),
+        };
+        let sides = vec![
+            resolved_side("EVENTS", vec![("s3://w/e-0.parquet", 100)]),
+            resolved_side("LABELS", vec![("s3://w/l-0.parquet", 10)]),
+            resolved_side("TAGS", vec![("s3://w/t-0.parquet", 10)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &multi,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+        )
+        .expect("three tables sharing an ID column must still build, never Err");
+
+        assert!(
+            sql.contains(r#""LHS_T0"."ID" = "LHS_T1"."ID""#),
+            "first condition must be table-qualified, never bare/ambiguous: {sql}"
+        );
+        assert!(
+            sql.contains(r#""LHS_T1"."ID" = "LHS_T2"."ID""#),
+            "second condition must be table-qualified, never bare/ambiguous: {sql}"
+        );
+        // The outer wrapper's own SELECT list (as opposed to each independently
+        // scanned, unambiguous per-side fan-out's inner projection) must qualify
+        // every shared `ID` reference — never a bare, cross-side-ambiguous `"ID"`.
+        assert!(
+            sql.starts_with(r#"SELECT "LHS_T0"."ID", "LHS_T1"."LABEL", "LHS_T2"."TAG_NAME" FROM "#),
+            "the outer SELECT list must qualify the shared ID column, never bare: {sql}"
+        );
+    }
+
+    /// An aggregate over a join (`COUNT(*), MIN(o.O_ORDERDATE)`) routes through the
+    /// unified N-scan wrapper and lets Exasol evaluate the aggregate over the
+    /// materialized join — a two-column result (`COUNT(*)`,
+    /// `MIN("LHS_T1"."O_ORDERDATE")`), not the full-row projection the old code
+    /// emitted (which produced the "expected 2 columns but pushdown has 5" failure).
+    #[test]
+    fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
         let mut request = join_request(Json::Null, equi_condition());
         request["pushdownRequest"]["selectList"] = serde_json::json!([
             {"type": "function_aggregate", "name": "COUNT", "arguments": []},
@@ -7496,46 +7835,137 @@ mod tests {
 
         assert!(
             join_requires_exasol_postprocessing(&pd(&request)),
-            "an aggregate select list must force the two-scan (Exasol-executed) path"
+            "an aggregate select list must force the Exasol-executed fallback path"
         );
 
-        let eligible = eligible_join(&request);
-        let sides = JoinSides {
-            fact: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-            dimension: resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-            broadcast_eligible: false,
-        };
-        let sql = build_unaccelerated_join_sql(
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
             &request,
             &pd(&request),
-            &eligible,
+            &detected,
             &sides,
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
         )
-        .expect("aggregate-over-join must build a two-scan wrapper");
+        .expect("aggregate-over-join must build the unified wrapper");
 
         assert!(sql.contains("COUNT(*)"), "COUNT(*) must be rendered: {sql}");
         assert!(
-            sql.contains(r#"MIN("LHS_FACT"."O_ORDERDATE")"#),
+            sql.contains(r#"MIN("LHS_T1"."O_ORDERDATE")"#),
             "MIN must qualify its argument to the owning side: {sql}"
         );
         assert!(
-            sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_FACT"."O_ORDERDATE") FROM"#),
+            sql.starts_with(r#"SELECT COUNT(*), MIN("LHS_T1"."O_ORDERDATE") FROM"#),
             "the outer SELECT must be exactly the two aggregate columns: {sql}"
         );
         assert!(
-            sql.contains("INNER JOIN") && !sql.contains("\"join\":{"),
-            "aggregate-over-join is an Exasol two-scan join, never a broadcast block: {sql}"
+            !sql.contains("INNER JOIN") && !sql.contains("\"join\":{"),
+            "aggregate-over-join is a cross-join + WHERE fallback, never a broadcast block: {sql}"
         );
     }
 
-    /// A bare-column ORDER BY over a join is rendered table-qualified in the two-scan
+    /// A three-side `alias_of` map ({CUSTOMER→LHS_T0, ORDERS→LHS_T1,
+    /// LINEITEM→LHS_T2}) for the seam-unification tests, matching the `LHS_T*` scheme
+    /// [`build_n_scan_alias_map`] produces from resolved sides.
+    fn seam_alias_of() -> HashMap<String, String> {
+        HashMap::from([
+            ("CUSTOMER".to_string(), "LHS_T0".to_string()),
+            ("ORDERS".to_string(), "LHS_T1".to_string()),
+            ("LINEITEM".to_string(), "LHS_T2".to_string()),
+        ])
+    }
+
+    /// The finding-#1 seam: a select item that is a SCALAR FUNCTION WRAPPING
+    /// AGGREGATES — the reported `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1
+    /// ELSE 0 END) / COUNT(*), 2)` — renders through `render_selectlist_item_qualified`
+    /// (NOT `None`, no decline), with its nested aggregates spliced verbatim and its
+    /// nested column argument table-qualified to the owning side. Before the vs-expression
+    /// aggregate arm + seam unification this recursed into the translator's catch-all and
+    /// returned `None`, declining the whole grouped-join pushdown at every arity.
+    #[test]
+    fn render_selectlist_item_qualified_renders_scalar_over_aggregate() {
+        let alias_of = seam_alias_of();
+        let sum_case = serde_json::json!({
+            "type": "function_aggregate", "name": "SUM", "distinct": false,
+            "arguments": [{
+                "type": "function_scalar", "name": "CASE", "arguments": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "L_RETURNFLAG", "tableName": "LINEITEM"},
+                     "right": {"type": "literal_string", "value": "R"}},
+                    {"type": "literal_exactnumeric", "value": 1},
+                    {"type": "literal_exactnumeric", "value": 0}]}]
+        });
+        let count_star = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
+        });
+        let item = serde_json::json!({
+            "type": "function_scalar", "name": "ROUND", "arguments": [
+                {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
+                    {"type": "function_scalar", "name": "MULT", "arguments": [
+                        {"type": "literal_double", "value": 100.0},
+                        sum_case]},
+                    count_star]},
+                {"type": "literal_exactnumeric", "value": 2}]
+        });
+
+        let sql = render_selectlist_item_qualified(&item, &alias_of)
+            .expect("a scalar-over-aggregate item must render, never decline to None");
+        assert!(
+            sql.contains(r#"SUM(CASE WHEN ("LHS_T2"."L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
+            "the nested SUM(CASE ...) must render with its column table-qualified: {sql}"
+        );
+        assert!(
+            sql.contains("COUNT(*)"),
+            "the nested COUNT(*) must render as the star case: {sql}"
+        );
+    }
+
+    /// The finding-#1 byte-compatibility guard: a TOP-LEVEL bare aggregate renders
+    /// through the unified `render_selectlist_item_qualified` byte-identically to the
+    /// former dedicated `render_aggregate_qualified` — a single-arg aggregate as
+    /// `NAME("ALIAS"."COL")`, `COUNT(*)` as `COUNT(*)`, and `DISTINCT` preserved. The
+    /// exact expected strings are captured here so any future drift at the seam fails.
+    #[test]
+    fn render_selectlist_item_qualified_top_level_aggregate_byte_compatible() {
+        let alias_of = seam_alias_of();
+
+        let sum = serde_json::json!({
+            "type": "function_aggregate", "name": "SUM", "distinct": false,
+            "arguments": [{"type": "column", "name": "O_TOTALPRICE", "tableName": "ORDERS"}]
+        });
+        assert_eq!(
+            render_selectlist_item_qualified(&sum, &alias_of).as_deref(),
+            Some(r#"SUM("LHS_T1"."O_TOTALPRICE")"#)
+        );
+
+        let count_star = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
+        });
+        assert_eq!(
+            render_selectlist_item_qualified(&count_star, &alias_of).as_deref(),
+            Some("COUNT(*)")
+        );
+
+        let count_distinct = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "distinct": true,
+            "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+        });
+        assert_eq!(
+            render_selectlist_item_qualified(&count_distinct, &alias_of).as_deref(),
+            Some(r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#)
+        );
+    }
+
+    /// A bare-column ORDER BY over a join is rendered table-qualified in the unified
     /// wrapper (with explicit direction + NULL placement), so Exasol — which has
     /// delegated the ordering — sorts on the unambiguous, owning-side column.
     #[test]
-    fn order_by_over_join_renders_qualified_in_two_scan() {
+    fn order_by_over_join_renders_qualified_in_unified_wrapper() {
         let mut request = join_request(Json::Null, equi_condition());
         request["pushdownRequest"]["orderBy"] = serde_json::json!([
             {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
@@ -7544,24 +7974,23 @@ mod tests {
 
         assert!(join_requires_exasol_postprocessing(&pd(&request)));
 
-        let eligible = eligible_join(&request);
-        let sides = JoinSides {
-            fact: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
-            dimension: resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
-            broadcast_eligible: false,
-        };
-        let sql = build_unaccelerated_join_sql(
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
             &request,
             &pd(&request),
-            &eligible,
+            &detected,
             &sides,
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
         )
-        .expect("ordered two-scan must build");
+        .expect("ordered unified wrapper must build");
         assert!(
-            sql.contains(r#"ORDER BY "LHS_FACT"."O_ORDERDATE" ASC NULLS FIRST"#),
+            sql.contains(r#"ORDER BY "LHS_T1"."O_ORDERDATE" ASC NULLS FIRST"#),
             "ORDER BY must be table-qualified with explicit direction/nulls: {sql}"
         );
     }
@@ -7866,8 +8295,8 @@ mod tests {
             "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS", "tableAlias": "O"},
             "right": {"type": "literal_string", "value": "1995-01-01"}
         });
-        let eligible = eligible_join(&request);
-        let rendered = render_broadcast_join(&request, &pd(&request), &eligible)
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
             .expect("renders")
             .expect("disjoint join renders");
         let filter = rendered.filter.expect("filter renders");
@@ -7877,12 +8306,12 @@ mod tests {
         );
     }
 
-    /// End-to-end fallback wiring: the two-scan wrapper prunes each leg (side-local
+    /// End-to-end fallback wiring: the unified wrapper prunes each leg (side-local
     /// filter pushed into BOTH fan-out common blobs) AND narrows each leg's
     /// projection (an involved column referenced nowhere in the wrapper is dropped),
     /// while the outer WHERE still applies the full predicate as the backstop.
     #[test]
-    fn unaccelerated_join_prunes_and_narrows_each_leg() {
+    fn unified_join_prunes_and_narrows_each_leg() {
         let request = serde_json::json!({
             "involvedTables": [
                 {"name": "CUSTOMER", "columns": [
@@ -7918,22 +8347,21 @@ mod tests {
                     .to_string()},
         });
 
-        let eligible = eligible_join(&request);
-        let sides = JoinSides {
-            fact: resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
-            dimension: resolved_side("CUSTOMER", vec![("s3://w/c.parquet", 10)]),
-            broadcast_eligible: false,
-        };
-        let sql = build_unaccelerated_join_sql(
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
             &request,
             &pd(&request),
-            &eligible,
+            &detected,
             &sides,
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
         )
-        .expect("two-scan wrapper must build");
+        .expect("unified wrapper must build");
 
         // Finding 3: columns referenced nowhere in the wrapper are dropped from the legs.
         assert!(
@@ -7956,11 +8384,11 @@ mod tests {
         // table-qualified, over the materialized join.
         assert!(
             sql.contains("WHERE")
-                && sql.contains(r#""LHS_DIM"."C_NAME""#)
-                && sql.contains(r#""LHS_FACT"."O_ORDERDATE""#),
+                && sql.contains(r#""LHS_T0"."C_NAME""#)
+                && sql.contains(r#""LHS_T1"."O_ORDERDATE""#),
             "the outer WHERE must still render the full predicate qualified: {sql}"
         );
-        assert!(sql.contains("INNER JOIN"), "{sql}");
+        assert!(!sql.contains("INNER JOIN"), "{sql}");
     }
 
     /// B3b correctness guard: a sort key whose column requires the JSON-fallback
@@ -13413,10 +13841,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Join side selection + broadcast threshold (task 3.2): `select_broadcast_sides`.
-    // The pure core of both-sides resolution — exercised without a live Iceberg
-    // catalog. The async `resolve_join_sides`/`resolve_one_join_side` wrappers just
-    // call `resolve_file_list` twice and delegate here, so this covers the decision.
+    // Join side selection + broadcast threshold: `select_broadcast_sides`.
+    // The pure core of the two-table broadcast role/threshold decision — exercised
+    // without a live Iceberg catalog. `plan_join` resolves each side via
+    // `resolve_one_join_side` and delegates here, so this covers the decision.
     // ---------------------------------------------------------------------------
 
     /// The default `JOIN_BROADCAST_MAX_BYTES` (128 MiB).
