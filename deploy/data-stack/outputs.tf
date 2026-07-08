@@ -76,3 +76,8 @@ output "emr_serverless_log_uri" {
 output "spark_script_s3_uri" {
   value = var.enable_emr_serverless ? "s3://${aws_s3_bucket.warehouse.bucket}/${aws_s3_object.spark_queries[0].key}" : null
 }
+
+output "spark_deletes_script_s3_uri" {
+  value       = var.enable_emr_serverless ? "s3://${aws_s3_bucket.warehouse.bucket}/${aws_s3_object.make_deletes_remote[0].key}" : null
+  description = "Entrypoint for the one-time deploy/scripts/make-deletes-remote.sh delete-prep job (authors tpch_deletes)."
+}

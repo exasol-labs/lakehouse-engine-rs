@@ -26,6 +26,34 @@ To stand up a remote AWS cluster + catalog (and to enable co-workers), see
 [`../deploy/README.md`](../deploy/README.md); `deploy/scripts/secrets.sh <env>`
 generates the `bench/.env` for a deployed cluster.
 
+## Delete-bearing benchmark (`BENCH_WITH_DELETES`)
+
+`BENCH_WITH_DELETES=1` runs the SAME query set (Q1-Q9b/NQ1-NQ5) against Iceberg v2
+merge-on-read copies of the TPC-H tables with ~5% of rows position-deleted per table
+(deterministic — same deleted set every run), instead of the pristine baseline. This
+is a scale measurement of the engine's merge-on-read **read cost**: reconstructing
+the live row set by applying Parquet position-delete files during a scan.
+
+- **Default (`BENCH_WITH_DELETES=0`) is byte-for-byte identical to the benchmark's
+  existing behavior.** Everything below is inert unless the flag is set.
+- **Docker mode**: fully automatic. `make bench` with the flag set authors the
+  delete-bearing namespace via `make_deletes_docker.sh` (idempotent — skips if
+  already populated) before running the suite. No operator action beyond setting
+  the flag.
+- **Remote mode**: requires a ONE-TIME prerequisite — run
+  `deploy/scripts/make-deletes-remote.sh` (env-var configured — see its header) once per environment before the
+  first delete-bench (it submits `deploy/scripts/make_deletes_remote.py` as an EMR
+  Serverless job). If skipped, `run.sh` hard-errors pointing at that script.
+- `BENCH_DELETE_NAMESPACE` overrides which namespace is used (default
+  `${ICEBERG_NAMESPACE}_deletes` docker / `tpch_deletes` remote); see
+  `bench/.env.example` for the exact knobs.
+- A flag-gated sanity check confirms deletes are actually applied on read (not
+  ignored, not over-applied): `OK  delete-count LINEITEM: <n> (~95% of baseline
+  <m>)`, comparing the delete namespace's LINEITEM count against a second,
+  lightweight VS built over the untouched baseline namespace.
+- Deletes are authored by Apache Spark, not PyIceberg/iceberg-rust — see
+  `scripts/spark-fixtures/create_tpch_deletes.sql`'s header comment for why.
+
 ## What it does
 
 1. Builds the working-tree `.so` and uploads it + the SLC to BucketFS.
