@@ -25,11 +25,20 @@ deploy/iam/SETUP.md         # create user spot-strata-deployer, attach deployer-
 export AWS_PROFILE=spot-strata-deployer
 aws sts get-caller-identity # verify
 
-# An EC2 key pair for the cluster nodes (import your public key):
-aws ec2 import-key-pair --key-name spot-strata-key \
-  --public-key-material fileb://~/.ssh/id_ed25519.pub
-# keep the matching private key at ~/.ssh/spot-strata-key.pem (or set KEY_FILE=...)
+# An EC2 key pair for the cluster nodes. Seed it ONCE (generates the key, imports the EC2 key pair,
+# and stores the private key in SSM SecureString for the whole team):
+deploy/scripts/rotate-cluster-key.sh          # default key name: spot-strata-key
 ```
+
+This is the **single shared cluster SSH key** across all `env_name` workspaces (`test1` and any
+future named clusters). Its private half lives only in SSM SecureString at
+`/spot-strata/deploy/ssh_key/<key_pair_name>` — the same source of truth as the cluster passwords.
+`cluster-up.sh` **auto-fetches it from SSM if it isn't already at `~/.ssh/<key_pair_name>` (or
+`KEY_FILE=...`)** and copies it into `~/.ssh`, so a teammate with deployer credentials needs **no
+manual key-sharing step** (and the later `secrets.sh` then finds it locally).
+Re-run `rotate-cluster-key.sh` to rotate the key when it is lost, compromised, or on a schedule (see
+"Rotating the shared key" below). If per-environment keys are ever wanted, that is a separate future
+change — today it is deliberately one shared key.
 
 ## 1. Data + catalog stack (persistent — do once)
 
@@ -65,6 +74,7 @@ tofu apply -var env_name=myenv -var key_pair_name=spot-strata-key
 #   allowed_cidrs defaults to THIS machine's public IP /32 — add CIDRs (or 0.0.0.0/0) to widen.
 
 ../scripts/cluster-up.sh myenv          # render .ccc/config, c4 host play, wait for DB
+#   (auto-fetches the shared SSH key from SSM if it isn't already local — no manual key copy needed)
 ../scripts/secrets.sh myenv             # write bench/.env (host + Glue creds from outputs/SSM)
 ```
 
@@ -77,6 +87,45 @@ make bench       # builds .so, installs SLC + .so to BucketFS, runs Q1–Q4, wri
 
 Athena benchmark (same catalog): `bench/athena_compare.sh` runs the Q1-Q4 set against the
 `spot-strata-<env>-athena` workgroup automatically (see `bench/README.md`); no infra to stand up.
+
+> **Quick path (recommended):** `deploy/scripts/bench-remote.sh <env>` chains steps 2-3-5
+> (`cluster-up.sh` → `secrets.sh` → `make bench` → `cluster-down.sh`) into one command that
+> **always** tears the cluster down — on success, failure, or interrupt — because it installs its
+> teardown trap *before* bringing anything up. Any `BENCH_*`/`LAKEHOUSE_*` env you export (e.g.
+> `BENCH_WITH_DELETES=1`) flows through untouched to `make bench`:
+> ```bash
+> AWS_PROFILE=spot-strata-deployer deploy/scripts/bench-remote.sh test1
+> AWS_PROFILE=spot-strata-deployer BENCH_WITH_DELETES=1 deploy/scripts/bench-remote.sh test1
+> ```
+> Same cost-safety framing as the Trino teardown warning below: a live `r8i.2xlarge` × N cluster
+> bills continuously, so guaranteed teardown is the whole point — the script's final line states
+> whether teardown ran, but **verify actual termination yourself** via `aws ec2 describe-instances`
+> before considering the run done. The manual step 2/3/5 sequence above still works and is what
+> the wrapper does under the hood — use it directly for fine-grained control (e.g. leaving the
+> cluster up between repeated `make bench` runs).
+
+### Delete-bearing benchmark prerequisite (remote, one-time per environment)
+
+`BENCH_WITH_DELETES=1` (see `bench/README.md`) runs the perf test against Iceberg v2
+merge-on-read, 5%-position-deleted copies of the TPC-H tables; the default
+(`BENCH_WITH_DELETES=0`) is byte-for-byte identical to the benchmark's existing behavior. In
+remote mode the delete-bearing tables must be
+pre-authored once per environment — `run.sh` never authors them itself (unlike docker mode) —
+via a one-time EMR Serverless job, same shape as `spark_compare.sh` below:
+
+```bash
+cd deploy/data-stack   # requires enable_emr_serverless=true (see section 4)
+export EMR_SERVERLESS_APP_ID=$(tofu output -raw emr_serverless_app_id)
+export EMR_SERVERLESS_ROLE_ARN=$(tofu output -raw emr_serverless_job_role_arn)
+export SPARK_DELETES_SCRIPT_S3_URI=$(tofu output -raw spark_deletes_script_s3_uri)
+export SPARK_LOG_S3_URI=$(tofu output -raw emr_serverless_log_uri)
+cd ../.. && deploy/scripts/make-deletes-remote.sh
+```
+
+This submits `deploy/scripts/make_deletes_remote.py`, which authors the `tpch_deletes` Glue
+database (8 MOR tables, deterministic ~5% position deletes) from the existing `tpch` Glue tables —
+idempotent, safe to re-run. Skip this and `run.sh BENCH_WITH_DELETES=1` hard-errors pointing back
+at this script.
 
 ## 4. Competitive comparison (Athena / Trino / Spark, opt-in)
 
@@ -150,6 +199,28 @@ CIDRs (or `0.0.0.0/0`) to the variable. Inter-node traffic is via a self-referen
 uses a self-signed cert — clients pass `validateservercertificate=0`. Secrets live only in SSM
 SecureString (KMS) and the gitignored `bench/.env`; tfstate password values are marked sensitive.
 
+The **cluster SSH private key** is also SSM-only: one shared key for all `env_name` workspaces,
+stored (SecureString) at `/spot-strata/deploy/ssh_key/<key_pair_name>` and auto-fetched by
+`cluster-up.sh` when it is not already local. Nothing needs `ssm:*`/KMS beyond what the
+deployer principal already has (`iam/deployer-policy.json`: `CoreInfra` + `KmsForSsmSecureString`),
+so this reuses the existing grants. The fetch writes the key straight into a `0600` file — it is
+never printed and never world/group-readable, even transiently.
+
+### Rotating the shared key
+
+Run the helper whenever the key is **lost, compromised, or due for scheduled rotation**:
+
+```bash
+AWS_PROFILE=spot-strata-deployer deploy/scripts/rotate-cluster-key.sh   # default key: spot-strata-key
+```
+
+It generates a fresh ed25519 key, re-imports the EC2 key pair under the same name, and overwrites the
+SSM SecureString parameter — the private key only ever touches a `0700` tempdir that is shredded on
+exit. Rotation applies to nodes created **after** it runs (existing nodes keep the old
+`authorized_keys`), so re-provision affected clusters (`tofu apply` + `cluster-up.sh <env>`) to move
+them onto the new key. This was the fix after the original `test1` key was lost with no shared copy:
+storing the key in SSM means a lost local copy is no longer a lockout.
+
 ## Enabling co-workers
 
 Tofu state is **local and gitignored** (`.terraform.lock.hcl` is tracked; `*.tfstate` is not), and
@@ -217,5 +288,12 @@ deploy/
   trino-stack/{providers,variables,main,outputs}.tf  trino-userdata.sh.tftpl
     # ephemeral Trino cluster (coordinator + workers) for the competitive comparison (opt-in)
   scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh,
-           trino-up.sh, trino-down.sh, spark_queries.py}
+           trino-up.sh, trino-down.sh, spark_queries.py,
+           bench-remote.sh,             # cluster-up -> secrets -> make bench -> cluster-down, one command
+           make_deletes_remote.py, make-deletes-remote.sh,  # one-time remote delete-prep (BENCH_WITH_DELETES)
+           rotate-cluster-key.sh}       # seed/rotate the shared cluster SSH key in SSM (issue #89)
 ```
+
+Related, outside `deploy/` (documented in `bench/README.md`'s "Delete-bearing benchmark" section):
+`scripts/spark-fixtures/create_tpch_deletes.sql` (the delete-authoring SQL, shared by docker + remote)
+and `bench/make_deletes_docker.sh` (the docker-mode caller).
