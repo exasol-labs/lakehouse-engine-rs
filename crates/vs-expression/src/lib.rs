@@ -725,6 +725,33 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 ))),
             }
         }
+        // Aggregate function node. Unlike `function_scalar`, the `name` is NOT
+        // mapped to a DataFusion alias — Exasol pushed a valid aggregate name
+        // (SUM, COUNT, AVG, MIN, MAX, the STDDEV/VARIANCE family), so it is spliced
+        // verbatim, uppercased. Arguments are rendered by recursion (so a nested
+        // CASE, arithmetic, or `tableAlias`-qualified column argument renders in
+        // full), letting a scalar expression that wraps aggregates render instead
+        // of failing at the nested aggregate. An empty argument list is the
+        // COUNT(*) star case (`<NAME>(*)`); `distinct: true` prefixes DISTINCT.
+        "function_aggregate" => {
+            let name = value("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| UdfError::User("function_aggregate missing 'name'".into()))?
+                .to_uppercase();
+            match value("arguments").and_then(|a| a.as_array()) {
+                None => Ok(Some(format!("{name}(*)"))),
+                Some(args) if args.is_empty() => Ok(Some(format!("{name}(*)"))),
+                Some(args) => {
+                    let distinct = value("distinct").and_then(|d| d.as_bool()) == Some(true);
+                    let distinct_kw = if distinct { "DISTINCT " } else { "" };
+                    let rendered = render_args(args)?;
+                    Ok(Some(format!(
+                        "{name}({distinct_kw}{})",
+                        rendered.join(", ")
+                    )))
+                }
+            }
+        }
         other => Err(UdfError::User(format!(
             "unsupported expression node type: {other}"
         ))),
@@ -1854,5 +1881,132 @@ mod tests {
                 "safe mode must return None for '{name}'"
             );
         }
+    }
+
+    // --- Aggregate function nodes (function_aggregate) ---
+
+    #[test]
+    fn render_expression_renders_aggregate_nodes() {
+        // SUM(col) — aggregate name spliced verbatim, bare column argument recursed.
+        let sum = json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{"type": "column", "name": "col"}],
+            "distinct": false
+        });
+        assert_eq!(render_expression(&sum).unwrap(), r#"SUM("COL")"#);
+
+        // COUNT(*) — empty argument list is the star case.
+        let count_star = json!({
+            "type": "function_aggregate",
+            "name": "COUNT",
+            "arguments": [],
+            "distinct": false
+        });
+        assert_eq!(render_expression(&count_star).unwrap(), "COUNT(*)");
+
+        // COUNT(DISTINCT col) — distinct keyword precedes the rendered argument.
+        let count_distinct = json!({
+            "type": "function_aggregate",
+            "name": "COUNT",
+            "arguments": [{"type": "column", "name": "col"}],
+            "distinct": true
+        });
+        assert_eq!(
+            render_expression(&count_distinct).unwrap(),
+            r#"COUNT(DISTINCT "COL")"#
+        );
+
+        // AVG(col).
+        let avg = json!({
+            "type": "function_aggregate",
+            "name": "AVG",
+            "arguments": [{"type": "column", "name": "col"}],
+            "distinct": false
+        });
+        assert_eq!(render_expression(&avg).unwrap(), r#"AVG("COL")"#);
+
+        // A column argument carrying a tableAlias renders table-qualified via the
+        // shared `column` arm — nested aggregate arguments qualify over a join.
+        let sum_qualified = json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{"type": "column", "name": "amount", "tableAlias": "O"}],
+            "distinct": false
+        });
+        assert_eq!(
+            render_expression(&sum_qualified).unwrap(),
+            r#"SUM("O"."AMOUNT")"#
+        );
+    }
+
+    #[test]
+    fn render_expression_renders_scalar_wrapping_aggregates() {
+        // The reported failing select item:
+        //   ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)
+        let sum_case = json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{
+                "type": "function_scalar",
+                "name": "CASE",
+                "arguments": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "l_returnflag"},
+                     "right": {"type": "literal_string", "value": "R"}},
+                    {"type": "literal_exactnumeric", "value": 1},
+                    {"type": "literal_exactnumeric", "value": 0}
+                ]
+            }],
+            "distinct": false
+        });
+        let count_star = json!({
+            "type": "function_aggregate",
+            "name": "COUNT",
+            "arguments": [],
+            "distinct": false
+        });
+        let round = json!({
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                {"type": "function_scalar", "name": "FLOAT_DIV", "arguments": [
+                    {"type": "function_scalar", "name": "MULT", "arguments": [
+                        {"type": "literal_double", "value": 100.0},
+                        sum_case
+                    ]},
+                    count_star
+                ]},
+                {"type": "literal_exactnumeric", "value": 2}
+            ]
+        });
+
+        let sql = render_expression_safe(&round).expect("scalar-over-aggregate must render");
+        assert!(
+            sql.contains(r#"SUM(CASE WHEN ("L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
+            "nested SUM(CASE ...) must be spliced verbatim: {sql}"
+        );
+        assert!(
+            sql.contains("COUNT(*)"),
+            "nested COUNT(*) must render as the star case: {sql}"
+        );
+    }
+
+    #[test]
+    fn aggregate_with_unrenderable_argument_declines() {
+        let bad = json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{"type": "totally_unknown_node"}],
+            "distinct": false
+        });
+        assert!(
+            render_expression(&bad).is_err(),
+            "an unrenderable argument must raise in raising mode"
+        );
+        assert!(
+            render_expression_safe(&bad).is_none(),
+            "an unrenderable argument must be None in safe mode"
+        );
     }
 }
