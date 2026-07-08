@@ -334,10 +334,33 @@ resource "aws_iam_role_policy" "emr_serverless_job" {
         Resource = "*"
       },
       {
+        # Needed by make_deletes_remote.py (the one-time delete-authoring job): it CTAS-copies the
+        # tpch tables into a NEW tpch_deletes Glue database, which requires create/update, not just
+        # the read-only access the original (read-only spark_queries.py comparison job) needed.
+        Sid    = "GlueWriteForDeleteAuthoring"
+        Effect = "Allow"
+        Action = [
+          "glue:CreateDatabase",
+          "glue:CreateTable",
+          "glue:UpdateTable",
+          "glue:DeleteTable",
+          "glue:BatchCreatePartition"
+        ]
+        Resource = "*"
+      },
+      {
         Sid      = "S3ReadWarehouse"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [aws_s3_bucket.warehouse.arn, "${aws_s3_bucket.warehouse.arn}/*"]
+      },
+      {
+        # Same rationale as GlueWriteForDeleteAuthoring: the CTAS+DELETE writes new Parquet data
+        # files, manifests, and metadata.json under the warehouse bucket for the tpch_deletes tables.
+        Sid      = "S3WriteForDeleteAuthoring"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${aws_s3_bucket.warehouse.arn}/*"]
       },
       {
         Sid      = "S3Logs"
