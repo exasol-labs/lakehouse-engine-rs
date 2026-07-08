@@ -31,6 +31,19 @@ converges with that sibling project (possibly a monorepo) long-term.
 - Use `exapump` for all Exasol/BucketFS interaction.
 - DSNs must include `validateservercertificate=0` (self-signed Docker cert).
 
+## Bench harness gotchas
+
+- **A stray `bench/.env` silently redirects `make bench`/`bench/run.sh` at a remote target.**
+  `bench/.env` is gitignored and target-specific (docker vs remote) — one left over from a prior
+  `deploy/scripts/secrets.sh <env>` run sets `BENCH_TARGET=remote` plus a real `EXASOL_HOST`. Exporting
+  `BENCH_TARGET=docker` alone is NOT enough to force docker mode cleanly: other vars the `.env` also
+  sets (`LH_BUCKETFS_PORT`, `EXASOL_SYS_PASSWORD`, `BUCKETFS_WRITE_PASS`, ...) still leak into the
+  docker-mode run unless you override every one of them too. Worse, `wait_exasol`'s TCP check has no
+  per-attempt connect timeout, so an unreachable/stale remote host doesn't fail fast — each retry can
+  block for a long time, and the whole loop can look like a stuck process rather than a clear error
+  for 15-40+ minutes. **Before debugging a "hung" bench run, check for a stray `bench/.env` and either
+  move it aside or override every var it sets** — don't just set `BENCH_TARGET`.
+
 ## Architecture boundaries
 
 - **VS stays thin** — query translation, pushdown analysis, parallelization planning, result schema

@@ -334,10 +334,33 @@ resource "aws_iam_role_policy" "emr_serverless_job" {
         Resource = "*"
       },
       {
+        # Needed by make_deletes_remote.py (the one-time delete-authoring job): it CTAS-copies the
+        # tpch tables into a NEW tpch_deletes Glue database, which requires create/update, not just
+        # the read-only access the original (read-only spark_queries.py comparison job) needed.
+        Sid    = "GlueWriteForDeleteAuthoring"
+        Effect = "Allow"
+        Action = [
+          "glue:CreateDatabase",
+          "glue:CreateTable",
+          "glue:UpdateTable",
+          "glue:DeleteTable",
+          "glue:BatchCreatePartition"
+        ]
+        Resource = "*"
+      },
+      {
         Sid      = "S3ReadWarehouse"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
         Resource = [aws_s3_bucket.warehouse.arn, "${aws_s3_bucket.warehouse.arn}/*"]
+      },
+      {
+        # Same rationale as GlueWriteForDeleteAuthoring: the CTAS+DELETE writes new Parquet data
+        # files, manifests, and metadata.json under the warehouse bucket for the tpch_deletes tables.
+        Sid      = "S3WriteForDeleteAuthoring"
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:DeleteObject"]
+        Resource = ["${aws_s3_bucket.warehouse.arn}/*"]
       },
       {
         Sid      = "S3Logs"
@@ -382,4 +405,14 @@ resource "aws_s3_object" "spark_queries" {
   key    = "scripts/spark_queries.py"
   source = "${path.module}/../scripts/spark_queries.py"
   etag   = filemd5("${path.module}/../scripts/spark_queries.py")
+}
+
+# One-time delete-prep entrypoint (deploy/scripts/make-deletes-remote.sh submits this). Under the same
+# scripts/ prefix the job role's S3ScriptRead statement already covers — no IAM change needed.
+resource "aws_s3_object" "make_deletes_remote" {
+  count  = var.enable_emr_serverless ? 1 : 0
+  bucket = aws_s3_bucket.warehouse.id
+  key    = "scripts/make_deletes_remote.py"
+  source = "${path.module}/../scripts/make_deletes_remote.py"
+  etag   = filemd5("${path.module}/../scripts/make_deletes_remote.py")
 }
