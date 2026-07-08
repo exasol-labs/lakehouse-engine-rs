@@ -24,7 +24,7 @@ Ship the VS adapter and the DataFusion scan SET UDF as two `#[exasol_udf]` entry
 | Option | Verdict |
 |--------|---------|
 | One crate / one `.so` with two entry points | ✓ Chosen — 0.14.0 supports it; one artifact halves deploy surface and exercises the new capability under test |
-| Two crates / two `.so` files (pre-0.14.0 strata-rs shape) | ✗ Rejected — doubles BucketFS upload surface; unnecessary given 0.14.0 capability |
+| Two crates / two `.so` files (the sibling project's pre-0.14.0 shape) | ✗ Rejected — doubles BucketFS upload surface; unnecessary given 0.14.0 capability |
 
 ### Consequences
 
@@ -40,7 +40,7 @@ One BucketFS upload suffices for both scripts. The build target is single-crate,
 
 ### Context
 
-The VS adapter must return a pushdown response to Exasol. In the sibling project strata-rs, the adapter calls a `populate_cache()` library function via connect-back and returns a plain `SELECT` from a cache table. The mission explicitly lists caching and materialization as non-goals; the PoC hypothesis is DataFusion-in-UDF as the distributed execution substrate.
+The VS adapter must return a pushdown response to Exasol. In the sibling project, the adapter calls a `populate_cache()` library function via connect-back and returns a plain `SELECT` from a cache table. The mission explicitly lists caching and materialization as non-goals; the PoC hypothesis is DataFusion-in-UDF as the distributed execution substrate.
 
 ### Decision
 
@@ -51,7 +51,7 @@ The adapter's `pushdown` response is SQL that invokes the scan SET UDF with an e
 | Option | Verdict |
 |--------|---------|
 | Adapter returns SQL invoking a DataFusion scan SET UDF | ✓ Chosen — proves the PoC hypothesis; execution lives in DataFusion as intended |
-| Mirror strata-rs: populate_cache() via connect-back, return SELECT from cache | ✗ Rejected — caching/materialization are explicit mission non-goals; would not test DataFusion-in-UDF execution path |
+| Mirror the sibling project: populate_cache() via connect-back, return SELECT from cache | ✗ Rejected — caching/materialization are explicit mission non-goals; would not test DataFusion-in-UDF execution path |
 
 ### Consequences
 
@@ -179,7 +179,7 @@ One connect-back at schema creation time; zero connect-back overhead at pushdown
 
 ### Context
 
-The adapter must distribute N file shards across N Exasol cluster nodes so each node's DataFusion UDF invocation scans only its own shard. Exasol's IPROC() function identifies the current execution node; GROUP BY over IPROC() causes Exasol to route each group to a distinct node when driving a SET UDF. No existing pattern in the sibling project strata-rs covers IPROC-based fan-out (strata-rs uses a single-invocation cache UDF with no IPROC/NPROC use), so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
+The adapter must distribute N file shards across N Exasol cluster nodes so each node's DataFusion UDF invocation scans only its own shard. Exasol's IPROC() function identifies the current execution node; GROUP BY over IPROC() causes Exasol to route each group to a distinct node when driving a SET UDF. No existing pattern in the sibling project covers IPROC-based fan-out (the sibling project uses a single-invocation cache UDF with no IPROC/NPROC use), so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
 
 ### Decision
 
@@ -235,7 +235,7 @@ Network transfer is bounded to one partial-result row per shard, regardless of h
 
 ### Context
 
-The VS adapter needed to translate Exasol pushdown expression-JSON nodes (column references, literals, comparison predicates, logical connectives, arithmetic, CAST, IN, BETWEEN, LIKE, IS NULL) into DataFusion SQL fragments for both filter pushdown and GROUP BY key rendering. The existing walker lived in `adapter/predicate.rs` inside `lakehouse-engine`, tightly coupled to engine internals and unreusable by the sibling `strata-rs` project.
+The VS adapter needed to translate Exasol pushdown expression-JSON nodes (column references, literals, comparison predicates, logical connectives, arithmetic, CAST, IN, BETWEEN, LIKE, IS NULL) into DataFusion SQL fragments for both filter pushdown and GROUP BY key rendering. The existing walker lived in `adapter/predicate.rs` inside `lakehouse-engine`, tightly coupled to engine internals and unreusable by the sibling project.
 
 ### Decision
 
@@ -245,13 +245,13 @@ Create a standalone workspace crate (`crates/vs-expression`) containing the full
 
 | Option | Verdict |
 |--------|---------|
-| Standalone `crates/vs-expression` crate with no engine-internal deps | ✓ Chosen — clean, testable, reusable by strata-rs; supports future monorepo convergence |
-| Extend `adapter/predicate.rs` inline | ✗ Rejected — blocks strata-rs reuse; keeps expression logic coupled to engine internals |
+| Standalone `crates/vs-expression` crate with no engine-internal deps | ✓ Chosen — clean, testable, reusable by the sibling project; supports future monorepo convergence |
+| Extend `adapter/predicate.rs` inline | ✗ Rejected — blocks reuse by the sibling project; keeps expression logic coupled to engine internals |
 | Add a SQL-parser dependency (sqlparser-rs) as the IR | ✗ Rejected — user declined; overweight for a narrow translation job; serde_json walker is proven |
 
 ### Consequences
 
-Expression translation is a separate, testable, reusable unit. The three-function public API (raising, safe, filter-safe) is stable and minimal. Long-term monorepo convergence with strata-rs is straightforward. `adapter/predicate.rs` is deleted; any future predicate coverage goes in `vs-expression`.
+Expression translation is a separate, testable, reusable unit. The three-function public API (raising, safe, filter-safe) is stable and minimal. Long-term monorepo convergence with the sibling project is straightforward. `adapter/predicate.rs` is deleted; any future predicate coverage goes in `vs-expression`.
 
 ---
 
@@ -477,7 +477,7 @@ The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never 
 
 ---
 
-## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror strata-rs)
+## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
 
 **Date:** 2026-06-23
 **Plan:** `add-glue-catalog-sigv4-connection`
@@ -485,7 +485,7 @@ The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never 
 
 ### Context
 
-The engine previously read catalog URI and S3 credentials straight from plain VS properties (`CATALOG_URI`, `ACCESS_KEY`, `SECRET_KEY`, etc.). This means credentials appear in the `CREATE VIRTUAL SCHEMA` SQL text, are visible to anyone who can read the query profile, and cannot be rotated without re-issuing the DDL. The strata-rs sibling project already uses Exasol CONNECTION objects to solve this problem, with `ctx.connection(name)` returning `{address, password}` where the password is a JSON credential block.
+The engine previously read catalog URI and S3 credentials straight from plain VS properties (`CATALOG_URI`, `ACCESS_KEY`, `SECRET_KEY`, etc.). This means credentials appear in the `CREATE VIRTUAL SCHEMA` SQL text, are visible to anyone who can read the query profile, and cannot be rotated without re-issuing the DDL. The sibling project already uses Exasol CONNECTION objects to solve this problem, with `ctx.connection(name)` returning `{address, password}` where the password is a JSON credential block.
 
 ### Decision
 
@@ -495,7 +495,7 @@ Read the catalog URI and all S3/signing credentials from `ctx.connection(<CATALO
 
 | Option | Verdict |
 |--------|---------|
-| CONNECTION object via `ctx.connection` (mirror strata-rs) | ✓ Chosen — keeps secrets out of SQL text; Exasol access-controls the CONNECTION; mirrors the existing sibling convention |
+| CONNECTION object via `ctx.connection` (mirror the sibling project) | ✓ Chosen — keeps secrets out of SQL text; Exasol access-controls the CONNECTION; mirrors the existing sibling convention |
 | Keep reading plain VS properties | ✗ Rejected — leaks credentials into `CREATE VIRTUAL SCHEMA` text and query profile; no rotation without DDL change |
 | Inject credentials via request JSON | ✗ Rejected — not how the SDK surfaces them; would require a custom request-shape convention |
 
@@ -551,7 +551,7 @@ After the self-issued signed `load_table` GET (see ADR-019), the adapter extract
 
 | Option | Verdict |
 |--------|---------|
-| Resolve vended creds once in the planning layer, embed in each ScanSpec | ✓ Chosen — honours resolve-once and stateless-UDF invariants; mirrors strata-rs shape |
+| Resolve vended creds once in the planning layer, embed in each ScanSpec | ✓ Chosen — honours resolve-once and stateless-UDF invariants; mirrors the sibling project's shape |
 | Rely on `iceberg-catalog-rest` to auto-apply vended creds | ✗ Rejected — 0.9.1 silently drops `storage_credentials`; not viable |
 | Re-vend per node inside the scan UDF | ✗ Rejected — violates resolve-once invariant; adds catalog access to the UDF |
 
@@ -809,7 +809,7 @@ Any query with an `OR` involving a non-translatable predicate receives no Iceber
 
 ### Context
 
-Iceberg file-level pruning requires constructing `iceberg::expr::Predicate` values from the Exasol filter JSON. Two candidate homes exist: the shared `crates/vs-expression` crate (already parses and translates Exasol filter JSON for DataFusion) or a new lakehouse-engine-specific module. The `vs-expression` crate is designed to be shared with the sibling `strata-rs` project and is intentionally free of `iceberg-rust` dependencies.
+Iceberg file-level pruning requires constructing `iceberg::expr::Predicate` values from the Exasol filter JSON. Two candidate homes exist: the shared `crates/vs-expression` crate (already parses and translates Exasol filter JSON for DataFusion) or a new lakehouse-engine-specific module. The `vs-expression` crate is designed to be shared with the sibling project and is intentionally free of `iceberg-rust` dependencies.
 
 ### Decision
 
@@ -819,12 +819,12 @@ Author a dedicated `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs` mo
 
 | Option | Verdict |
 |--------|---------|
-| New `adapter/iceberg_predicate.rs` in lakehouse-engine | ✓ Chosen — keeps `iceberg-rust` types out of the strata-rs-shared `vs-expression` crate; iceberg coupling lives only where iceberg is already a dependency |
-| Extend `vs-expression` to also emit `iceberg::expr::Predicate` | ✗ Rejected — would add `iceberg-rust` as a dependency of `vs-expression`, polluting the strata-rs cross-project sharing contract |
+| New `adapter/iceberg_predicate.rs` in lakehouse-engine | ✓ Chosen — keeps `iceberg-rust` types out of the cross-project-shared `vs-expression` crate; iceberg coupling lives only where iceberg is already a dependency |
+| Extend `vs-expression` to also emit `iceberg::expr::Predicate` | ✗ Rejected — would add `iceberg-rust` as a dependency of `vs-expression`, polluting the cross-project sharing contract |
 
 ### Consequences
 
-`vs-expression` remains `iceberg-rust`-free and sharable with `strata-rs` unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future strata-rs project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
+`vs-expression` remains `iceberg-rust`-free and sharable with the sibling project unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future sibling project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
 
 ## ADR-031: Adopt Arrow-IPC `emit_batch` on the Raw-Row Scan Path
 
@@ -2485,3 +2485,276 @@ For an inner equi-join (all this PR builds), attribute each WHERE conjunct to a 
 Both join routes now get free Iceberg manifest pruning per side; the two-scan fallback filters and footer-prunes each leg before emitting and ships only referenced columns — closing the pruning regression versus pre-PR single-table pushdown. The narrowed projection deliberately includes the FULL WHERE's columns (not just side-local ones) because the outer wrapper still renders the whole predicate qualified, and an absent SELECT list keeps every column (`SELECT *`). Pruned byte totals also feed side selection and the broadcast threshold, which only makes both more accurate. All new logic is `tableName`-driven and unit-tested for the shared-column-name (`EVENTS.ID` ⋈ `LABELS.ID`) case so it cannot regress the ADR-085 fix.
 
 **E2E-surfaced correction (the fan-out filter must render BARE).** The live cluster sends every column node with BOTH `tableName` (e.g. `FACT_ORDERS`) AND the query's `tableAlias` (e.g. `O` for `FROM fact_orders o`), and the `vs-expression` translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. The first cut pushed the side-local predicate into the two-scan leg's `ScanSpec.filter` via `render_df_filter_safe` unchanged, so it rendered `("O"."O_ORDERDATE" …)` — but a per-side fan-out is a SINGLE-TABLE scan whose relation exposes BARE uppercase columns (`scan_target` wrapped in an unaliased derived table), so the alias-qualified reference failed to resolve (`No field named "O"."O_ORDERDATE"`), regressing every filtered join. Fix: strip `tableAlias` (`strip_table_alias`) before rendering the leg's filter, so it is bare exactly like the single-table scan path. The outer two-scan wrapper is unaffected — its `render_df_filter_qualified` re-qualifies each column to `LHS_FACT`/`LHS_DIM` (overwriting the native alias) against each side's own fan-out subquery. The broadcast path is likewise untouched: it keeps rendering the native `tableAlias`, which the in-UDF `build_join_sql` resolves against its two registered sides — a mechanical regression test now pins both behaviors (bare in the fan-out, native-alias-preserving in broadcast). Iceberg manifest pruning (`to_iceberg_predicate`) is alias-agnostic (it resolves by bare column `name`), so Finding 1 needed no stripping.
+
+---
+
+## ADR-092: N-Table Inner Joins Fall Back to an N-Scan Unaccelerated Wrapper (Generalizes ADR-083 to N Tables)
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Superseded by ADR-095
+
+### Context
+
+Issue #76: a pushdown over an inner join spanning three or more involved tables (Q1
+`supplier⋈nation⋈region`, Q2 `customer⋈orders⋈lineitem`, NQ3
+`part⋈partsupp⋈supplier⋈nation`) hard-failed with `F-UDF-CL-RUST-9001: join pushdown
+declined: the join spans more than two tables …`, originating from
+`JoinShape::Ineligible(TooManyTables)` in `handle_pushdown`. The `exasol-udf-macros`
+0.20.3 FFI shim erases every `UdfError` variant to return code 1, which the UDF host
+surfaces as a hard SQL error — there is no native-retry path in this repo or the SDK for
+a declined pushdown. This is the same false premise ADR-083 rejected and ADR-085/086
+fixed for the two-table case; the feature spec already required N-table fallback
+behavior, so the >2-table decline was a spec-vs-implementation mismatch, not a design
+gap. The alternative of advertising fewer join capabilities so Exasol never pushes
+multi-table joins was rejected because it would regress the two-table broadcast benefit
+and still not match the already-written spec.
+
+### Decision
+
+A pushdown over an inner join spanning three or more involved tables is served by
+materializing each table through its own sharded scan-UDF fan-out and reconstructing the
+original inner join in Exasol's core engine — never by returning an error. An error is
+reserved for a shape whose fallback genuinely cannot be built (a non-inner join node, an
+involved table absent from `TABLE_MAP` or carrying no column metadata, or a
+condition/clause the translator cannot render).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| N-scan unaccelerated fallback for 3+ table inner joins | ✓ Chosen — closes #76, honors the existing spec wording, extends the proven ADR-083/085/086 "never wrong, only unaccelerated" pattern from two tables to N |
+| Keep declining `TooManyTables` (status quo) | ✗ Rejected — hard-fails a query class the spec already requires to work |
+| Advertise fewer join capabilities so Exasol never pushes multi-table joins | ✗ Rejected — regresses the two-table broadcast benefit and does not match the already-written spec |
+
+### Consequences
+
+A 3+ table inner-join pushdown now always returns a valid pushdown response instead of
+an error; Exasol's core engine reconstructs the join over N independently-scanned
+sub-results. The two-table broadcast and two-scan paths are unaffected. Future
+multi-table query classes (Q1/Q2/NQ3-shaped joins) become usable without requiring a
+broadcast N-way join to be built first.
+
+---
+
+## ADR-093: N-Scan Wrapper Renders as Cross-Join + Conjunctive Table-Qualified WHERE
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Superseded by ADR-095
+
+### Context
+
+Generalizing the two-table unaccelerated fallback (ADR-085/086) to N tables requires
+choosing how to reconstruct an arbitrary all-inner nested join tree over N
+independently-scanned fan-out subqueries. A chained `INNER JOIN … ON` tree that
+faithfully reproduces the pushed join tree would require ON-scope bookkeeping so each
+condition references only tables already introduced earlier in the chain — error-prone
+for arbitrary trees.
+
+### Decision
+
+The N-scan wrapper renders as `SELECT <qualified select list> FROM (fan0) "LHS_T0",
+(fan1) "LHS_T1", … WHERE <all N-1 join conditions AND-conjoined with the qualified
+residual filter> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`, with every column
+reference table-qualified from its `tableName` via the ADR-085 alias-annotation
+machinery.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Cross-join + conjunctive qualified WHERE | ✓ Chosen — provably equivalent to any join-tree ordering for all-inner joins, order-agnostic, no ON-scope bookkeeping; Exasol's optimizer turns equi-conditioned cross joins into hash joins |
+| Chained `INNER JOIN … ON` tree reproducing the pushed join tree | ✗ Rejected — requires ON-scope bookkeeping so each condition references only tables already introduced; error-prone for arbitrary trees and buys nothing since Exasol re-optimizes anyway |
+
+### Consequences
+
+The builder need not track which tables each condition spans, simplifying the
+implementation to N-entry alias-map construction plus conjunctive WHERE assembly. The
+existing ADR-085 qualified-rendering machinery (`render_expression_qualified`,
+`render_df_filter_qualified`, `qualified_join_select_items`/`_group_by`/`_having`/`_order_by`)
+is reused wholesale, so correctness on shared column names carries over unchanged.
+
+---
+
+## ADR-094: Freeze the Two-Table Join Path; Add the N-Table Path Additively
+
+**Date:** 2026-07-07
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Superseded by ADR-095
+
+### Context
+
+The N-table fallback could either be built by retrofitting N-table support into the
+existing `EligibleJoin`/`JoinSides`/`build_unaccelerated_join_sql` two-table
+structures, or added as a separate, additive path alongside them. The two-table
+broadcast and two-scan fallback (ADR-081..086) are working, live-tested code with real
+regression coverage (`has_two_scan_wrapper` and friends).
+
+### Decision
+
+Add `JoinShape::MultiTable(MultiTableJoin)` + `plan_multi_table_join` +
+`build_n_scan_join_sql` for N≥3, leaving the two-table `Eligible`/`JoinSides`/
+`build_unaccelerated_join_sql`/`build_two_scan_join_sql`/`LHS_FACT`/`LHS_DIM` path and
+all its ADR-081..086 tests byte-for-byte unchanged.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Additive `JoinShape::MultiTable` path, two-table path frozen | ✓ Chosen — confines the change to new, independently-testable units and guarantees the two-table broadcast benefit and its live-tested regressions stay intact |
+| Retrofit N tables into the existing `EligibleJoin`/`JoinSides` structures | ✗ Rejected — churns the working two-table broadcast + two-scan code and its E2E assertions, raising regression risk for no benefit |
+
+### Consequences
+
+The two-table broadcast and two-scan paths carry zero risk of regression from this
+change. Future planners extending N-table join behavior should build on the
+`MultiTable`/`plan_multi_table_join`/`build_n_scan_join_sql` path rather than
+re-unifying it with the two-table path, unless a broadcast N-way join is deliberately
+pursued (currently out of scope per the mission's "no N-table broadcast" non-goal).
+
+---
+
+## ADR-095: Single Unified N≥2 Unaccelerated Join Renderer (Supersedes ADR-092, ADR-093, ADR-094)
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+PR #78 code review found that ADR-094's additive design — a frozen two-table path
+(`plan_eligible_join`/`build_unaccelerated_join_sql`/`build_two_scan_join_sql`,
+`LHS_FACT`/`LHS_DIM`) alongside a separate N≥3 path
+(`plan_multi_table_join`/`build_n_scan_join_sql`, `LHS_T0..`) — is architecturally
+unsound: the rendering gap that caused issue #76 existed in BOTH implementations, and
+the first fix touched only one of them. Because the adapter advertises
+`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` statically with no per-query opt-out,
+Exasol pushes every inner equi-join of any arity, so any divergence between the two
+renderers is a latent correctness gap waiting to be hit at whichever arity was not
+fixed.
+
+### Decision
+
+Collapse the two join implementations into one. `detect_join` yields a single join
+shape carrying the N (≥2) resolved involved tables and the N-1 join conditions;
+`handle_pushdown` routes through one `plan_join`, which computes broadcast eligibility
+(N==2, small side ≤ `JOIN_BROADCAST_MAX_BYTES`, no Exasol postprocessing) as a property
+and, when eligible, takes the broadcast fan-out — otherwise calls the SOLE fallback
+renderer `build_n_scan_join_sql` (`LHS_T0..LHS_T{N-1}`, cross-join + conjunctive
+table-qualified WHERE per ADR-093's technique, ADR-091 per-side predicate pushdown,
+ADR-085 qualified rendering). `build_unaccelerated_join_sql`, `build_two_scan_join_sql`,
+`resolve_join_sides`, the `Eligible`/`MultiTable` `JoinShape` split, and the
+`LHS_FACT`/`LHS_DIM` alias scheme are removed. The two-table fallback is now exactly
+N=2, structurally, not by coincidence. This supersedes ADR-092 (outcome retained: a 3+
+table inner join never errors), ADR-093 (rendering technique retained, restated as part
+of the one renderer), and ADR-094 (its "freeze and add additively" decision is
+reversed).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Single unified N≥2 renderer; broadcast an inner optimization | ✓ Chosen — a single renderer cannot diverge from itself; "two-table = N=2" becomes structural |
+| Keep the additive two-path design (ADR-094) | ✗ Rejected — the two copies already drifted and shipped the #76/PR-78 bug; retrofitting the aggregate fix into both would leave the same two-copies risk for the next fix |
+
+### Consequences
+
+There is exactly one unaccelerated join rendering implementation for all inner joins of
+arity N≥2. Existing two-scan tests (`has_two_scan_wrapper`, `LHS_FACT`/`LHS_DIM`)
+migrate to `LHS_T0`/`LHS_T1` aliases; the two-table SQL shape is otherwise unchanged.
+Any future join-rendering fix lands once, not twice.
+
+---
+
+## ADR-096: `vs-expression` Renders Aggregate Function Nodes at the Shared Seam
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+The actual root cause of the PR #78 defect was not join arity: a grouped-aggregate
+select list over a join whose select item is a SCALAR FUNCTION WRAPPING AGGREGATES —
+e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)` —
+declined at every arity (single-table, two-table, N-table).
+`render_selectlist_item_qualified` (`pushdown.rs:4486`) only special-cased a top-level
+`function_aggregate`; anything else recursed into
+`vs_expression::render_expression_safe` → `render_expression_inner`
+(`vs-expression/src/lib.rs:100`), which had a `function_scalar` arm (ROUND, arithmetic,
+CASE) but no `function_aggregate` arm, so recursion into a nested `SUM`/`COUNT` hit the
+unsupported-node catch-all → `Err`/`None` → decline.
+
+### Decision
+
+Add a `function_aggregate` arm to `render_expression_inner`: splice the aggregate
+`name` verbatim (uppercased — not translated like a scalar function), render
+`COUNT(*)` for empty/star arguments, render each argument by recursion, honor
+`distinct: true` → `COUNT(DISTINCT arg)`, and qualify column arguments via the ADR-085
+`tableAlias` annotation. Unify `render_selectlist_item_qualified` and
+`render_aggregate_qualified` (`pushdown.rs`) onto this path so a top-level aggregate and
+a nested aggregate render identically, keeping the top-level output byte-compatible
+with the shapes it already handled.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Aggregate arm at the shared `vs-expression` seam | ✓ Chosen — the seam is shared by all arities and any future caller; one fix repairs single-table, two-table, and N-table simultaneously |
+| Special-case scalar-over-aggregate only in the join select-list path (`pushdown.rs`) | ✗ Rejected — leaves the identical gap for single-table nested aggregates and any future caller of `vs-expression` |
+| Keep declining scalar-over-aggregate select items | ✗ Rejected — it is a valid, expected TPC-H-shaped query and there is no native retry (ADR-097) to fall back on |
+
+### Consequences
+
+A scalar expression wrapping one or more aggregates renders correctly regardless of
+join arity. Top-level and nested aggregate rendering are consistent by construction.
+The single-table partial/merge aggregate decomposition paths (`pushdown-planning`,
+`-count-distinct`, `-expression-aggregate`, `-grouped-agg`) are unaffected: they detect
+a top-level `function_aggregate` before recursing into `vs-expression`, so the new arm
+only changes behavior for aggregates nested inside another expression — exactly the
+case that previously errored.
+
+---
+
+## ADR-097: Advertised Capability Must Render — Purge the Native-Retry Fiction
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+15 `UdfError::User` join/aggregate decline sites in `pushdown.rs` (lines 2211, 2231,
+2253, 2614, 4161, 4819, 4867, 4883, 5168, 5181, 5277, 5309, 5329, 5358, 5415) were
+framed as "Exasol will retry the query natively." This is false: the
+`exasol-udf-macros` FFI shim erases every `UdfError::User` into a hard
+`F-UDF-CL-RUST-9001` client-facing SQL error; Exasol never re-plans on an adapter error
+(ADR-083, ADR-085 already established this for the two-table case). A unit test at
+`pushdown.rs:7936` asserted `msg.contains("retry")`, encoding the false framing into a
+regression check.
+
+### Decision
+
+Remove the native-retry framing from all 15 sites. Delete the sites whose shapes now
+always render after ADR-095/ADR-096 (the join-arity and aggregate-nesting gaps that
+motivated them no longer exist). Reword the genuine last-resort errors — a non-inner
+join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column
+metadata, or a condition/clause `vs-expression` cannot render — as plain hard
+client-facing errors with no retry. Adopt the governing principle: for each advertised
+capability the adapter MUST always be able to render what Exasol may push, or MUST NOT
+advertise it; "decline at runtime and hope Exasol retries" is not a valid third option.
+Update the `msg.contains("retry")` test to assert the corrected wording.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Purge retry framing; hard error only when truly unrenderable | ✓ Chosen — truthful error semantics; removes a recurring source of "just decline and hope" bugs; the protocol has no decline-and-retry response |
+| Keep the "retry natively" wording | ✗ Rejected — it is false, as ADR-083/085 already established, and the false framing was encoded into a regression test that would need to keep being "fixed" around |
+
+### Consequences
+
+Every remaining hard-error decline site in the join/aggregate pushdown path states
+plainly that it is a hard error with no native retry. The advertised-capability-must-
+render principle applies to all future capability additions, not just joins.

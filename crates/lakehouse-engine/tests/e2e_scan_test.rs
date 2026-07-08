@@ -62,7 +62,7 @@ const SLC_VERSION: &str = "0.20.3";
 /// Name of the Exasol CONNECTION carrying catalog + storage credentials.
 const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 /// Language alias for our SLC. This Exasol is dedicated to lakehouse-engine
-/// (the sibling strata-rs stack is stopped), so we register the canonical RUST
+/// (the sibling stack is stopped), so we register the canonical RUST
 /// alias cleanly rather than coexisting with a foreign RUST= entry.
 const LANG_ALIAS: &str = "RUST";
 

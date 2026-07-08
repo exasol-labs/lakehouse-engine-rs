@@ -69,7 +69,7 @@ test-e2e: cross-musl-udf-build
 
 # Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
 #
-# This Exasol is the dedicated lakehouse-engine stack (the sibling strata-rs stack
+# This Exasol is the dedicated lakehouse-engine stack (the sibling stack
 # is stopped), so we register the canonical RUST alias cleanly. The Rust E2E
 # harness performs the same install in-process via `setup_e2e`; this target is
 # the equivalent manual / convenience path.

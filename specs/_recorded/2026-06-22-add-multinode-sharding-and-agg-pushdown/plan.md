@@ -17,7 +17,7 @@ The existing pushdown layer resolves the Iceberg file list once and drives a sin
 
 The adapter computes file-to-shard assignment in the planning layer and expresses the cross-node fan-out as a single derived-VALUES query that Exasol distributes via IPROC. Each shard carries its own `ScanSpec` (file subset + projection/filter/limit, optionally aggregate instructions). For aggregates, the scan UDF emits one partial-result row per shard and the adapter wraps the fan-out in an outer merge aggregation.
 
-> **Note on the strata-rs reference**: the brief expected an existing IPROC sharding pattern in `strata-rs` to mirror. Exploration found `strata-rs` does **not** shard across nodes — it uses a single-invocation cache-population UDF (`CACHE_QUERY`) with no IPROC/NPROC use. There is no pattern to copy; the IPROC fan-out below is designed from Exasol's `IPROC()`/`NPROC()` SET-UDF distribution idiom.
+> **Note on the sibling-project reference**: the brief expected an existing IPROC sharding pattern in the sibling project to mirror. Exploration found the sibling project does **not** shard across nodes — it uses a single-invocation cache-population UDF (`CACHE_QUERY`) with no IPROC/NPROC use. There is no pattern to copy; the IPROC fan-out below is designed from Exasol's `IPROC()`/`NPROC()` SET-UDF distribution idiom.
 
 #### Architecture
 

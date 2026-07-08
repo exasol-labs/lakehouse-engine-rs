@@ -20,13 +20,13 @@ credentials out of `CREATE VIRTUAL SCHEMA` text by reading an Exasol CONNECTION,
 for data-file access. Separately, the DataFusion memory pool is still hardcoded to the
 0-sentinel (`scan/mod.rs:445`) because the SDK accessor was not yet wired.
 
-- **Goals** — CONNECTION-sourced credentials (mirror strata-rs); SigV4-signed Glue catalog
+- **Goals** — CONNECTION-sourced credentials (mirror the sibling project); SigV4-signed Glue catalog
   access; vended-credential data-file access; real `ctx.memory_limit()` budget; one opt-in
   cloud smoke/perf E2E test that skips when creds are absent.
 - **Non-Goals** — the accurate `ResourcesExhausted` error message and spill-free chunking
   research (explicit follow-up plan, per `next.md`); changing the aggregate
   partial/merge decomposition; changing the capability set; Databricks/Unity vending
-  (strata-rs uses an external binary — not in scope here).
+  (the sibling project uses an external binary — not in scope here).
 
 ### Decision
 
@@ -38,7 +38,7 @@ CREATE VIRTUAL SCHEMA ... WITH CATALOG_CONNECTION = '<conn>'
         ▼
 adapter (createVirtualSchema / pushdown)
   read_connection(ctx, name)  ──►  Resolved { uri, creds: Json }
-        │                               (mirror strata-rs read_connection/storage_block)
+        │                               (mirror the sibling project's read_connection/storage_block)
         ▼
   build signed RestCatalog client (aws-sigv4) when creds.use_sigv4
         │
@@ -66,7 +66,7 @@ on `RestCatalogBuilder` to sign or vend. Unsigned/non-vended paths keep using th
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| CONNECTION → JSON-password credential block | `adapter` (new `connection.rs`) | Mirror strata-rs `read_connection`/`storage_block`; keeps creds out of SQL text |
+| CONNECTION → JSON-password credential block | `adapter` (new `connection.rs`) | Mirror the sibling project's `read_connection`/`storage_block`; keeps creds out of SQL text |
 | Self-signed loadTable GET + `LoadTableResult` parse | `adapter/pushdown.rs` | 0.9.1 has no SigV4 hook and drops `storage_credentials` |
 | `merge_vended_into_storage` shape | `adapter` | Vended STS keys override static; endpoint/region/path_style preserved |
 | Feature-flag default-off (`use_sigv4`, `use_vended_credentials`) | credential block | Local MinIO/REST stacks behave exactly as before |
@@ -109,7 +109,7 @@ on `RestCatalogBuilder` to sign or vend. Unsigned/non-vended paths keep using th
    - [ ] 1.2 Thread `ctx.memory_limit()` from the scan `run()` into `build_session_context` (replace the `scan/mod.rs:445` 0-sentinel; remove the ponytail markers at `scan/mod.rs:438` and `scan/runtime.rs:17`).
    - [ ] 1.3 Unit test: a context reporting a positive limit sizes the pool to 0.6×limit; a 0 limit uses the default budget (extend `scan/runtime.rs` tests + a `build_session_context` seam test).
 
-2. CONNECTION credential source (mirror strata-rs)
+2. CONNECTION credential source (mirror the sibling project)
    - [ ] 2.1 Add `adapter/connection.rs`: `read_connection(ctx, name) -> Resolved {uri, creds}`, `storage_block(creds)`, `catalog_block(creds)`, with `REQUIRED_CRED_KEYS` = warehouse/endpoint/region/access_key/secret_key and credential-safe errors (never echo the password).
    - [ ] 2.2 Replace `extract_connection_props(&Json)` with a CONNECTION-based path; thread `&dyn UdfContext` into both `handle_create_virtual_schema` and `handle_pushdown_request` so they can call `ctx.connection`. Add `CATALOG_CONNECTION` property handling.
    - [ ] 2.3 Unit tests: missing connection name, malformed password, missing required fields, optional-field defaults — all asserting no credential leak.

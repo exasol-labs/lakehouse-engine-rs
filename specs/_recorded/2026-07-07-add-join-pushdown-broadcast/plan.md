@@ -66,7 +66,7 @@ pushdown(join) request
 ## Dependencies
 
 - No new crate dependencies. Reuses `crates/vs-expression`, DataFusion, iceberg-rust, `exasol-udf-sdk` 0.20.2 (`emit-arrow`).
-- GitHub issue: open a tracking issue (`ghbrk gh issue create`) for BL-001 Phase 1 and reference it in the implementing commit (`Closes #<n>`) per project rules.
+- GitHub issue: open a tracking issue (`gh issue create`) for BL-001 Phase 1 and reference it in the implementing commit (`Closes #<n>`) per project rules.
 
 ## Implementation Tasks
 

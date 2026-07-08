@@ -77,10 +77,10 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Build | `rust:1.94-bookworm` (glibc 2.36) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
-> Sibling projects: `strata-rs` (VS adapter + UDF conventions) and `language-container-rs` (the Rust
+> Sibling projects: the sibling project (VS adapter + UDF conventions) and `language-container-rs` (the Rust
 > SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
 > standalone `crates/vs-expression` expression-translation crate is designed to be shared with
-> `strata-rs` and will migrate to a monorepo layout when the projects converge.
+> the sibling project and will migrate to a monorepo layout when the projects converge.
 
 ## Commands
 

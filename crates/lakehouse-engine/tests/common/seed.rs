@@ -124,6 +124,7 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     seed_labels_table(catalog_url, warehouse).await?;
     seed_partitioned(catalog_url, warehouse).await?;
     seed_star_schema(catalog_url, warehouse).await?;
+    seed_multi_table_join_extension(catalog_url, warehouse).await?;
     Ok(events_handle)
 }
 
@@ -890,6 +891,201 @@ fn make_orders_batch(first_key: usize, last_key: usize) -> RecordBatch {
         ],
     )
     .expect("fact_orders RecordBatch construction is infallible")
+}
+
+// ---------------------------------------------------------------------------
+// Star-schema extension (fact_lineitem / dim_supplier) for the N-scan
+// unaccelerated fallback E2E tests (plan `fix-join-decline-hard-fail`, #76)
+// ---------------------------------------------------------------------------
+//
+// `fact_lineitem` extends the `dim_customer ⋈ fact_orders` pair with a genuine
+// foreign key (`L_ORDERKEY` → `O_ORDERKEY`), giving `dim_customer ⋈ fact_orders ⋈
+// fact_lineitem` a real 3-table inner-join shape. `L_SUPPKEY` additionally
+// foreign-keys `dim_supplier`, extending the SAME chain to a 4-table shape
+// (`dim_customer ⋈ fact_orders ⋈ fact_lineitem ⋈ dim_supplier`) for the N=4 case
+// — mirroring TPC-H's LINEITEM, which also carries both L_ORDERKEY and L_SUPPKEY,
+// so these two additional tables are enough to E2E-cover both the 3-table
+// (customer⋈orders⋈lineitem-shaped) and 4-table (NQ3-shaped) N-scan wrapper
+// without seeding a wholly separate PART/PARTSUPP/SUPPLIER/NATION fixture set.
+//
+// | table         | columns                                          | rows | files |
+// |---------------|---------------------------------------------------|------|-------|
+// | fact_lineitem | L_ORDERKEY, L_LINENUMBER, L_SUPPKEY, L_QUANTITY,   | 20   | 2     |
+// |               | L_RETURNFLAG, L_EXTENDEDPRICE                      |      |       |
+// | dim_supplier  | S_SUPPKEY, S_NAME                                  | 3    | 1     |
+//
+// Every line item references a valid order and a valid supplier, so the 3-table
+// and 4-table inner joins both yield every seeded lineitem row.
+//
+// `L_RETURNFLAG` and `L_EXTENDEDPRICE` extend `fact_lineitem` (plan
+// `fix-join-decline-hard-fail`, PR #78 review finding #4) for the
+// scalar-over-aggregate grouped-join E2E tests: a low-cardinality discriminator
+// column (`L_RETURNFLAG`, alternating `'R'`/`'N'`) plus a numeric column
+// (`L_EXTENDEDPRICE`) alongside the existing `L_QUANTITY`, so `SUM`/`AVG`
+// aggregates and a `CASE WHEN L_RETURNFLAG = 'R' ...` discriminator can be
+// grouped and rendered through a scalar function (`ROUND`) wrapping aggregates
+// in a joined, grouped select list.
+
+/// Second fact table name for the multi-table (N≥3) join-pushdown E2E tests.
+pub const E2E_LINEITEM_TABLE: &str = "fact_lineitem";
+/// Second dimension table name for the multi-table (N=4) join-pushdown E2E tests.
+pub const E2E_SUPPLIER_TABLE: &str = "dim_supplier";
+/// Line items written per order (`L_LINENUMBER` cycles `1..=LINES_PER_ORDER`).
+pub const LINES_PER_ORDER: usize = 2;
+/// Total rows in `fact_lineitem` (`FACT_ORDERS_ROWS * LINES_PER_ORDER`).
+pub const LINEITEM_ROWS: usize = FACT_ORDERS_ROWS * LINES_PER_ORDER;
+/// Rows in `dim_supplier` (supplier keys 1..=SUPPLIER_ROWS).
+pub const SUPPLIER_ROWS: usize = 3;
+
+/// The supplier key a line item (by its order key) references:
+/// `((order_key - 1) % SUPPLIER_ROWS) + 1`. Every line item therefore matches
+/// exactly one seeded supplier.
+pub fn line_suppkey(order_key: usize) -> i64 {
+    (((order_key - 1) % SUPPLIER_ROWS) + 1) as i64
+}
+
+/// The `L_RETURNFLAG` a line item (by its global row number `1..=LINEITEM_ROWS`)
+/// carries: alternates `"R"`/`"N"` so a `GROUP BY L_RETURNFLAG` in the
+/// scalar-over-aggregate join E2E tests always sees two non-empty groups. Row 1
+/// is `"R"`.
+pub fn line_returnflag(row: usize) -> &'static str {
+    if row % 2 == 1 { "R" } else { "N" }
+}
+
+/// The `L_EXTENDEDPRICE` a line item (by its global row number
+/// `1..=LINEITEM_ROWS`) carries: a distinct deterministic value per row
+/// (`1000.0 + row * 10.0`) so `AVG(L_EXTENDEDPRICE)` in the
+/// scalar-over-aggregate join E2E tests is computable independently in Rust
+/// from the same formula used to seed it.
+pub fn line_extendedprice(row: usize) -> f64 {
+    1000.0 + (row as f64) * 10.0
+}
+
+/// Seed `fact_lineitem` and `dim_supplier` into the `e2e_lakehouse` namespace,
+/// extending the star schema to a 3-table and 4-table inner-join shape for the
+/// N-scan unaccelerated fallback E2E tests. Idempotent.
+pub async fn seed_multi_table_join_extension(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-multijoin").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for multi-table join extension")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let supplier_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "S_SUPPKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "S_NAME", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build dim_supplier Iceberg schema")?;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_SUPPLIER_TABLE,
+        supplier_schema,
+        vec![vec![make_supplier_batch(1, SUPPLIER_ROWS)]],
+    )
+    .await
+    .context("seed dim_supplier table")?;
+
+    let lineitem_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "L_ORDERKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "L_LINENUMBER", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(3, "L_SUPPKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(4, "L_QUANTITY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(5, "L_RETURNFLAG", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(6, "L_EXTENDEDPRICE", Type::Primitive(PrimitiveType::Double))
+                .into(),
+        ])
+        .build()
+        .context("build fact_lineitem Iceberg schema")?;
+    let mid = LINEITEM_ROWS / 2;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_LINEITEM_TABLE,
+        lineitem_schema,
+        vec![
+            vec![make_lineitem_batch(1, mid)],
+            vec![make_lineitem_batch(mid + 1, LINEITEM_ROWS)],
+        ],
+    )
+    .await
+    .context("seed fact_lineitem table")?;
+    Ok(())
+}
+
+fn make_supplier_batch(first_key: usize, last_key: usize) -> RecordBatch {
+    let keys: Vec<i64> = (first_key as i64..=last_key as i64).collect();
+    let names: Vec<String> = (first_key..=last_key)
+        .map(|k| format!("supplier-{k:02}"))
+        .collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("S_SUPPKEY", DataType::Int64, false),
+        Field::new("S_NAME", DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("dim_supplier RecordBatch construction is infallible")
+}
+
+/// Build a RecordBatch for the inclusive 1-indexed lineitem-row range
+/// `first_row..=last_row`. Row `r`'s order key is `((r - 1) / LINES_PER_ORDER) + 1`
+/// (`LINES_PER_ORDER` consecutive rows per order) and its line number cycles
+/// `1..=LINES_PER_ORDER` within that order.
+fn make_lineitem_batch(first_row: usize, last_row: usize) -> RecordBatch {
+    let order_keys: Vec<i64> = (first_row..=last_row)
+        .map(|r| (((r - 1) / LINES_PER_ORDER) + 1) as i64)
+        .collect();
+    let line_numbers: Vec<i64> = (first_row..=last_row)
+        .map(|r| (((r - 1) % LINES_PER_ORDER) + 1) as i64)
+        .collect();
+    let supp_keys: Vec<i64> = order_keys
+        .iter()
+        .map(|&order_key| line_suppkey(order_key as usize))
+        .collect();
+    let quantities: Vec<i64> = (first_row..=last_row)
+        .map(|r| (r % 10 + 1) as i64)
+        .collect();
+    let return_flags: Vec<&'static str> = (first_row..=last_row).map(line_returnflag).collect();
+    let extended_prices: Vec<f64> = (first_row..=last_row).map(line_extendedprice).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("L_ORDERKEY", DataType::Int64, false),
+        Field::new("L_LINENUMBER", DataType::Int64, false),
+        Field::new("L_SUPPKEY", DataType::Int64, false),
+        Field::new("L_QUANTITY", DataType::Int64, false),
+        Field::new("L_RETURNFLAG", DataType::Utf8, false),
+        Field::new("L_EXTENDEDPRICE", DataType::Float64, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(order_keys)),
+            Arc::new(Int64Array::from(line_numbers)),
+            Arc::new(Int64Array::from(supp_keys)),
+            Arc::new(Int64Array::from(quantities)),
+            Arc::new(StringArray::from(return_flags)),
+            Arc::new(Float64Array::from(extended_prices)),
+        ],
+    )
+    .expect("fact_lineitem RecordBatch construction is infallible")
 }
 
 // ---------------------------------------------------------------------------
