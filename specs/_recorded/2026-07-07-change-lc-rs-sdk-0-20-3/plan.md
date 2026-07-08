@@ -57,7 +57,7 @@ Work happens on the existing `feat/change-lc-rs-sdk-0-20-3` branch (already crea
 `main`). Do not create a different branch.
 
 1. **File the GitHub tracking issue first.** Per this repo's CLAUDE.md "Feature
-   tracking" rule, create a tracking issue via `ghbrk gh issue create` (title e.g.
+   tracking" rule, create a tracking issue via `gh issue create` (title e.g.
    "Bump lc-rs SDK/macros/SLC to 0.20.3 for fast string-block encoding") before starting
    the version-bump edits. Capture the issue number so the implementing commit can
    reference it with `Closes #<n>`. (If the PR pipeline's git-pr-agent files this issue,

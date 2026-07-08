@@ -44,8 +44,8 @@ Date: 2026-06-22
 ### [1] New workspace crate `crates/vs-expression` for expression translation
 
 - **Decision:** Create a standalone workspace crate (`crates/vs-expression`) containing the full serde_json expression-node walker, generalised from `adapter/predicate.rs`. The crate has no lakehouse-engine internals in its API; its only dependencies are `serde_json` and `exasol-udf-sdk` (for `UdfError`). Delete `adapter/predicate.rs` and replace all its callers with `vs_expression::render_df_filter_safe`.
-- **Alternatives:** (a) Keep the walker as an inline module in lakehouse-engine but extend it in place — rejected: blocks sibling strata-rs reuse and keeps a tight coupling between expression logic and engine internals. (b) Introduce a SQL-parser dependency (sqlparser-rs) as the IR — rejected: user explicitly declined; overweight for the narrow translation job; the serde_json walker is already proven.
-- **Rationale:** Standalone crate creates a clean, testable, reusable translation layer. The API surface (three functions: raising, safe, filter-safe) is small and stable. Long-term monorepo convergence with strata-rs becomes trivial.
+- **Alternatives:** (a) Keep the walker as an inline module in lakehouse-engine but extend it in place — rejected: blocks reuse by the sibling project and keeps a tight coupling between expression logic and engine internals. (b) Introduce a SQL-parser dependency (sqlparser-rs) as the IR — rejected: user explicitly declined; overweight for the narrow translation job; the serde_json walker is already proven.
+- **Rationale:** Standalone crate creates a clean, testable, reusable translation layer. The API surface (three functions: raising, safe, filter-safe) is small and stable. Long-term monorepo convergence with the sibling project becomes trivial.
 - **Promotes to ADR:** yes
 
 ### [2] GROUP BY group-key values emitted as plain columns, wrapper groups on column refs

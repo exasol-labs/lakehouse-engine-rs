@@ -29,8 +29,8 @@ scan SET-UDF entry point. crates.io may still show 0.13.1 while 0.14.0 lands; de
 
 - **Decision:** Ship the VS adapter and the DataFusion scan SET UDF as two
   `#[exasol_udf]` entry points in a single `cdylib` crate that builds to one `.so`.
-- **Alternatives:** Two crates → two `.so` files (the pre-0.14.0 `strata-rs` shape),
-  each uploaded and registered separately.
+- **Alternatives:** Two crates → two `.so` files (the sibling project's pre-0.14.0
+  shape), each uploaded and registered separately.
 - **Rationale:** 0.14.0 newly supports multiple entry points per `.so` (commit a11795a,
   live two-entry E2E in d67c977). One artifact means one BucketFS upload and a single
   build target; it also directly exercises the new capability the team wants validated.
@@ -40,7 +40,7 @@ scan SET-UDF entry point. crates.io may still show 0.13.1 while 0.14.0 lands; de
 
 - **Decision:** The adapter's `pushdown` response is SQL that invokes the scan SET UDF
   with an explicit file list; the UDF runs DataFusion and emits rows.
-- **Alternatives:** Mirror `strata-rs`, where the adapter calls a `populate_cache()`
+- **Alternatives:** Mirror the sibling project, where the adapter calls a `populate_cache()`
   library function via connect-back and returns a plain `SELECT` from a cache table.
 - **Rationale:** The PoC hypothesis is DataFusion-in-UDF as the distributed execution
   substrate; caching/materialization are explicit mission non-goals. Execution must run
@@ -100,7 +100,7 @@ scan SET-UDF entry point. crates.io may still show 0.13.1 while 0.14.0 lands; de
 
 ### [8] Mirror sibling Makefile / compose / BucketFS conventions
 
-- **Decision:** Reuse `strata-rs` conventions: `cross-musl-udf-build` (docker
+- **Decision:** Reuse the sibling project's conventions: `cross-musl-udf-build` (docker
   `rust:1.92-bookworm`, persistent cargo registry volume, `-p` crate flag), gated
   `test-e2e`, BucketFS HTTPS upload on port 2581, `SCRIPT_LANGUAGES` registration, all
   DSNs with `validateservercertificate=0`.

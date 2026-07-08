@@ -28,7 +28,7 @@ Date: 2026-06-21
 ### [2] IPROC fan-out via derived VALUES + GROUP BY IPROC(), shard_key
 
 - **Decision:** Express the cross-node fan-out as a single scan-driving query: a derived `VALUES` table of (shard_key, per-shard ScanSpec) rows, with the SET UDF invoked per group under `GROUP BY IPROC(), shard_key`, so Exasol places each shard on a distinct node.
-- **Alternatives:** `UNION ALL` of N separate UDF SELECTs (rejected — does not guarantee node placement, bloats SQL); one UDF row per file (rejected — no node-level batching). The brief assumed a `strata-rs` IPROC pattern to mirror; exploration found none — `strata-rs` uses a single-invocation cache UDF (`CACHE_QUERY`) with zero IPROC/NPROC use, so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
+- **Alternatives:** `UNION ALL` of N separate UDF SELECTs (rejected — does not guarantee node placement, bloats SQL); one UDF row per file (rejected — no node-level batching). The brief assumed an existing IPROC pattern in the sibling project to mirror; exploration found none — the sibling project uses a single-invocation cache UDF (`CACHE_QUERY`) with zero IPROC/NPROC use, so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
 - **Rationale:** `GROUP BY IPROC()` is the idiomatic Exasol mechanism for distributing SET-UDF work across nodes and keeps the whole fan-out in one query the optimizer can place.
 - **Promotes to ADR:** yes
 

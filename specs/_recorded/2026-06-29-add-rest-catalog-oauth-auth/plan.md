@@ -149,7 +149,7 @@ S3 fields to optional only widens what is accepted; it never rejects a previousl
    6.1 Add a token/OAuth catalog-auth E2E entry (gated like the existing Glue vended-credential E2E) that resolves a file list against a REST catalog requiring catalog auth; must fail (not skip) when the DB/catalog is unavailable per project rule.
 
 7. **Docs/tracking**
-   7.1 Open the GitHub issue (`ghbrk gh issue create`) for the feature and reference it in the implementing commit (`Closes #<n>`).
+   7.1 Open the GitHub issue (`gh issue create`) for the feature and reference it in the implementing commit (`Closes #<n>`).
 
 ## Parallelization
 

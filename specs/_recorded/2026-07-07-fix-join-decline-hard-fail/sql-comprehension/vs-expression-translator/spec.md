@@ -4,7 +4,9 @@ A standalone workspace crate (`crates/vs-expression`) that translates Exasol Vir
 
 ## Background
 
+<!-- DELTA:CHANGED -->
 Exasol sends pushdown requests with expression trees expressed as serde_json `Value` objects. Node types include column references, literals, comparison predicates, logical operators, scalar functions, arithmetic operators, CAST, and aggregate function nodes (`function_aggregate`). The crate must translate these trees to DataFusion SQL strings usable in WHERE clauses, GROUP BY clauses, and — via recursion through a scalar function that wraps aggregates — join select-list items, without adding a SQL-parser dependency; only serde_json is used as the IR. An aggregate node is not a translated function: its aggregate name (`SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and the STDDEV/VARIANCE family) is spliced verbatim, and its argument(s) are rendered by recursion — so a scalar expression that wraps aggregates renders in full rather than failing when recursion reaches the nested aggregate.
+<!-- /DELTA:CHANGED -->
 
 The crate is a standalone workspace member with no knowledge of lakehouse-engine internals. It exposes three public entry points: `render_expression` (raising, returns `Err` for unsupported nodes), `render_expression_safe` (returns `None` for unsupported nodes), and `render_df_filter_safe` (same as safe but also suppresses trivially-true results so the adapter can omit no-op filters).
 
@@ -85,6 +87,7 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
 * *AND* the translator SHALL recursively render both operands
 * *AND* a missing operand SHALL cause `render_expression` to return an error in raising mode and `None` in the safe variants
 
+<!-- DELTA:NEW -->
 ### Scenario: Aggregate function nodes render with the aggregate name spliced verbatim
 
 * *GIVEN* a VS expression node of type `function_aggregate` — either standalone (e.g. `SUM(col)`, `COUNT(*)`, `COUNT(DISTINCT col)`, `AVG(col)`) or nested inside a scalar function (e.g. the `SUM(CASE WHEN … END)` and `COUNT(*)` inside `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)`)
@@ -95,3 +98,4 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
 * *AND* each argument SHALL be rendered recursively by the translator (so `CASE`, arithmetic, and column-reference arguments render correctly), and a column argument carrying a `tableAlias` SHALL render table-qualified as `"ALIAS"."COL"`
 * *AND* the translator MUST NOT fall through to the unsupported-node catch-all for a `function_aggregate` node (which previously returned an error in raising mode and `None` in the safe variants, causing a scalar-over-aggregate select item to be wrongly declined)
 * *AND* an aggregate node whose argument cannot be rendered SHALL return an error in raising mode and `None` in the safe variants, consistent with every other node type
+<!-- /DELTA:NEW -->
