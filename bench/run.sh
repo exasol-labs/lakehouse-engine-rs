@@ -178,7 +178,7 @@ EXA_PORT="${LH_EXASOL_PORT:-28563}"
 BFS_PORT="${LH_BUCKETFS_PORT:-22581}"
 TPCH_SCALE="${TPCH_SCALE:-0.3}"
 
-SLC_VERSION="${BENCH_SLC_VERSION:-0.16.0}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
+SLC_VERSION="${BENCH_SLC_VERSION:-0.20.3}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
 # BucketFS object path for the .so, as referenced by %udf_object in CREATE SCRIPT.
 SO_UDF_OBJECT="${BENCH_SO_UDF_OBJECT:-buckets/bfsdefault/default/udf/liblakehouse_engine.so}"
 # Debug level forwarded to the UDF via %udf_debug_level (0.19.0+ live debug surface).
