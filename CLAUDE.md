@@ -25,6 +25,17 @@ Sibling of a sibling VS adapter project (VS adapter conventions) and `language-c
 Rust SLC) — mirror their UDF model, workspace layout, and Makefile/E2E conventions. Likely
 converges with that sibling project (possibly a monorepo) long-term.
 
+## Iceberg specification compliance
+
+Any feature planned via `/speq:plan` that touches scanning, pushdown, or schema/type handling MUST
+be checked against the Apache Iceberg table spec (https://iceberg.apache.org/spec/) during
+planning — quote the relevant normative section, don't rely on memory. A known deviation from the
+spec must either be fixed in the same plan or recorded as an explicit, accurately-scoped tracked
+exception in `specs/backlog.md` (see the #27/#28 pattern in
+`specs/datafusion-scan/scan-execution-field-id-projection/spec.md`); it must never be a silent gap.
+A deviation driven by an Exasol target-type limitation (e.g. no struct/list/map types) is not a
+gap — but it must still be named as a deliberate trade-off in the spec, not left unstated.
+
 ## Exasol / tooling
 
 - Use Exasol Docker images to run Integration and E2E tests; they must **fail**, not skip, if no DB.
