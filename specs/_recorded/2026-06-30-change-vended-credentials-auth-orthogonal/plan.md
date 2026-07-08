@@ -82,7 +82,7 @@ load_table_any_auth(catalog_uri, catalog_props, creds)  ── chooses auth ─�
 
 ## Tracking
 
-- A GitHub issue MUST be created (`ghbrk gh issue create`) at implement time and referenced via `Closes #<n>` in the implementing commit. Not created during planning.
+- A GitHub issue MUST be created (`gh issue create`) at implement time and referenced via `Closes #<n>` in the implementing commit. Not created during planning.
 
 ## Implementation Tasks
 
