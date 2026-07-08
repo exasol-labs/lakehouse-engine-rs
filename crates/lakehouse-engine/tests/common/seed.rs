@@ -910,11 +910,21 @@ fn make_orders_batch(first_key: usize, last_key: usize) -> RecordBatch {
 //
 // | table         | columns                                          | rows | files |
 // |---------------|---------------------------------------------------|------|-------|
-// | fact_lineitem | L_ORDERKEY, L_LINENUMBER, L_SUPPKEY, L_QUANTITY    | 20   | 2     |
+// | fact_lineitem | L_ORDERKEY, L_LINENUMBER, L_SUPPKEY, L_QUANTITY,   | 20   | 2     |
+// |               | L_RETURNFLAG, L_EXTENDEDPRICE                      |      |       |
 // | dim_supplier  | S_SUPPKEY, S_NAME                                  | 3    | 1     |
 //
 // Every line item references a valid order and a valid supplier, so the 3-table
 // and 4-table inner joins both yield every seeded lineitem row.
+//
+// `L_RETURNFLAG` and `L_EXTENDEDPRICE` extend `fact_lineitem` (plan
+// `fix-join-decline-hard-fail`, PR #78 review finding #4) for the
+// scalar-over-aggregate grouped-join E2E tests: a low-cardinality discriminator
+// column (`L_RETURNFLAG`, alternating `'R'`/`'N'`) plus a numeric column
+// (`L_EXTENDEDPRICE`) alongside the existing `L_QUANTITY`, so `SUM`/`AVG`
+// aggregates and a `CASE WHEN L_RETURNFLAG = 'R' ...` discriminator can be
+// grouped and rendered through a scalar function (`ROUND`) wrapping aggregates
+// in a joined, grouped select list.
 
 /// Second fact table name for the multi-table (N≥3) join-pushdown E2E tests.
 pub const E2E_LINEITEM_TABLE: &str = "fact_lineitem";
@@ -932,6 +942,23 @@ pub const SUPPLIER_ROWS: usize = 3;
 /// exactly one seeded supplier.
 pub fn line_suppkey(order_key: usize) -> i64 {
     (((order_key - 1) % SUPPLIER_ROWS) + 1) as i64
+}
+
+/// The `L_RETURNFLAG` a line item (by its global row number `1..=LINEITEM_ROWS`)
+/// carries: alternates `"R"`/`"N"` so a `GROUP BY L_RETURNFLAG` in the
+/// scalar-over-aggregate join E2E tests always sees two non-empty groups. Row 1
+/// is `"R"`.
+pub fn line_returnflag(row: usize) -> &'static str {
+    if row % 2 == 1 { "R" } else { "N" }
+}
+
+/// The `L_EXTENDEDPRICE` a line item (by its global row number
+/// `1..=LINEITEM_ROWS`) carries: a distinct deterministic value per row
+/// (`1000.0 + row * 10.0`) so `AVG(L_EXTENDEDPRICE)` in the
+/// scalar-over-aggregate join E2E tests is computable independently in Rust
+/// from the same formula used to seed it.
+pub fn line_extendedprice(row: usize) -> f64 {
+    1000.0 + (row as f64) * 10.0
 }
 
 /// Seed `fact_lineitem` and `dim_supplier` into the `e2e_lakehouse` namespace,
@@ -974,6 +1001,9 @@ pub async fn seed_multi_table_join_extension(catalog_url: &str, warehouse: &str)
             NestedField::required(2, "L_LINENUMBER", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(3, "L_SUPPKEY", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(4, "L_QUANTITY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(5, "L_RETURNFLAG", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(6, "L_EXTENDEDPRICE", Type::Primitive(PrimitiveType::Double))
+                .into(),
         ])
         .build()
         .context("build fact_lineitem Iceberg schema")?;
@@ -1032,12 +1062,16 @@ fn make_lineitem_batch(first_row: usize, last_row: usize) -> RecordBatch {
     let quantities: Vec<i64> = (first_row..=last_row)
         .map(|r| (r % 10 + 1) as i64)
         .collect();
+    let return_flags: Vec<&'static str> = (first_row..=last_row).map(line_returnflag).collect();
+    let extended_prices: Vec<f64> = (first_row..=last_row).map(line_extendedprice).collect();
 
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("L_ORDERKEY", DataType::Int64, false),
         Field::new("L_LINENUMBER", DataType::Int64, false),
         Field::new("L_SUPPKEY", DataType::Int64, false),
         Field::new("L_QUANTITY", DataType::Int64, false),
+        Field::new("L_RETURNFLAG", DataType::Utf8, false),
+        Field::new("L_EXTENDEDPRICE", DataType::Float64, false),
     ]));
 
     RecordBatch::try_new(
@@ -1047,6 +1081,8 @@ fn make_lineitem_batch(first_row: usize, last_row: usize) -> RecordBatch {
             Arc::new(Int64Array::from(line_numbers)),
             Arc::new(Int64Array::from(supp_keys)),
             Arc::new(Int64Array::from(quantities)),
+            Arc::new(StringArray::from(return_flags)),
+            Arc::new(Float64Array::from(extended_prices)),
         ],
     )
     .expect("fact_lineitem RecordBatch construction is infallible")

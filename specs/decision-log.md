@@ -2492,7 +2492,7 @@ Both join routes now get free Iceberg manifest pruning per side; the two-scan fa
 
 **Date:** 2026-07-07
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Accepted
+**Status:** Superseded by ADR-095
 
 ### Context
 
@@ -2541,7 +2541,7 @@ broadcast N-way join to be built first.
 
 **Date:** 2026-07-07
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Accepted
+**Status:** Superseded by ADR-095
 
 ### Context
 
@@ -2581,7 +2581,7 @@ is reused wholesale, so correctness on shared column names carries over unchange
 
 **Date:** 2026-07-07
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Accepted
+**Status:** Superseded by ADR-095
 
 ### Context
 
@@ -2612,3 +2612,149 @@ change. Future planners extending N-table join behavior should build on the
 `MultiTable`/`plan_multi_table_join`/`build_n_scan_join_sql` path rather than
 re-unifying it with the two-table path, unless a broadcast N-way join is deliberately
 pursued (currently out of scope per the mission's "no N-table broadcast" non-goal).
+
+---
+
+## ADR-095: Single Unified N≥2 Unaccelerated Join Renderer (Supersedes ADR-092, ADR-093, ADR-094)
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+PR #78 code review found that ADR-094's additive design — a frozen two-table path
+(`plan_eligible_join`/`build_unaccelerated_join_sql`/`build_two_scan_join_sql`,
+`LHS_FACT`/`LHS_DIM`) alongside a separate N≥3 path
+(`plan_multi_table_join`/`build_n_scan_join_sql`, `LHS_T0..`) — is architecturally
+unsound: the rendering gap that caused issue #76 existed in BOTH implementations, and
+the first fix touched only one of them. Because the adapter advertises
+`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` statically with no per-query opt-out,
+Exasol pushes every inner equi-join of any arity, so any divergence between the two
+renderers is a latent correctness gap waiting to be hit at whichever arity was not
+fixed.
+
+### Decision
+
+Collapse the two join implementations into one. `detect_join` yields a single join
+shape carrying the N (≥2) resolved involved tables and the N-1 join conditions;
+`handle_pushdown` routes through one `plan_join`, which computes broadcast eligibility
+(N==2, small side ≤ `JOIN_BROADCAST_MAX_BYTES`, no Exasol postprocessing) as a property
+and, when eligible, takes the broadcast fan-out — otherwise calls the SOLE fallback
+renderer `build_n_scan_join_sql` (`LHS_T0..LHS_T{N-1}`, cross-join + conjunctive
+table-qualified WHERE per ADR-093's technique, ADR-091 per-side predicate pushdown,
+ADR-085 qualified rendering). `build_unaccelerated_join_sql`, `build_two_scan_join_sql`,
+`resolve_join_sides`, the `Eligible`/`MultiTable` `JoinShape` split, and the
+`LHS_FACT`/`LHS_DIM` alias scheme are removed. The two-table fallback is now exactly
+N=2, structurally, not by coincidence. This supersedes ADR-092 (outcome retained: a 3+
+table inner join never errors), ADR-093 (rendering technique retained, restated as part
+of the one renderer), and ADR-094 (its "freeze and add additively" decision is
+reversed).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Single unified N≥2 renderer; broadcast an inner optimization | ✓ Chosen — a single renderer cannot diverge from itself; "two-table = N=2" becomes structural |
+| Keep the additive two-path design (ADR-094) | ✗ Rejected — the two copies already drifted and shipped the #76/PR-78 bug; retrofitting the aggregate fix into both would leave the same two-copies risk for the next fix |
+
+### Consequences
+
+There is exactly one unaccelerated join rendering implementation for all inner joins of
+arity N≥2. Existing two-scan tests (`has_two_scan_wrapper`, `LHS_FACT`/`LHS_DIM`)
+migrate to `LHS_T0`/`LHS_T1` aliases; the two-table SQL shape is otherwise unchanged.
+Any future join-rendering fix lands once, not twice.
+
+---
+
+## ADR-096: `vs-expression` Renders Aggregate Function Nodes at the Shared Seam
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+The actual root cause of the PR #78 defect was not join arity: a grouped-aggregate
+select list over a join whose select item is a SCALAR FUNCTION WRAPPING AGGREGATES —
+e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)` —
+declined at every arity (single-table, two-table, N-table).
+`render_selectlist_item_qualified` (`pushdown.rs:4486`) only special-cased a top-level
+`function_aggregate`; anything else recursed into
+`vs_expression::render_expression_safe` → `render_expression_inner`
+(`vs-expression/src/lib.rs:100`), which had a `function_scalar` arm (ROUND, arithmetic,
+CASE) but no `function_aggregate` arm, so recursion into a nested `SUM`/`COUNT` hit the
+unsupported-node catch-all → `Err`/`None` → decline.
+
+### Decision
+
+Add a `function_aggregate` arm to `render_expression_inner`: splice the aggregate
+`name` verbatim (uppercased — not translated like a scalar function), render
+`COUNT(*)` for empty/star arguments, render each argument by recursion, honor
+`distinct: true` → `COUNT(DISTINCT arg)`, and qualify column arguments via the ADR-085
+`tableAlias` annotation. Unify `render_selectlist_item_qualified` and
+`render_aggregate_qualified` (`pushdown.rs`) onto this path so a top-level aggregate and
+a nested aggregate render identically, keeping the top-level output byte-compatible
+with the shapes it already handled.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Aggregate arm at the shared `vs-expression` seam | ✓ Chosen — the seam is shared by all arities and any future caller; one fix repairs single-table, two-table, and N-table simultaneously |
+| Special-case scalar-over-aggregate only in the join select-list path (`pushdown.rs`) | ✗ Rejected — leaves the identical gap for single-table nested aggregates and any future caller of `vs-expression` |
+| Keep declining scalar-over-aggregate select items | ✗ Rejected — it is a valid, expected TPC-H-shaped query and there is no native retry (ADR-097) to fall back on |
+
+### Consequences
+
+A scalar expression wrapping one or more aggregates renders correctly regardless of
+join arity. Top-level and nested aggregate rendering are consistent by construction.
+The single-table partial/merge aggregate decomposition paths (`pushdown-planning`,
+`-count-distinct`, `-expression-aggregate`, `-grouped-agg`) are unaffected: they detect
+a top-level `function_aggregate` before recursing into `vs-expression`, so the new arm
+only changes behavior for aggregates nested inside another expression — exactly the
+case that previously errored.
+
+---
+
+## ADR-097: Advertised Capability Must Render — Purge the Native-Retry Fiction
+
+**Date:** 2026-07-08
+**Plan:** `fix-join-decline-hard-fail`
+**Status:** Accepted
+
+### Context
+
+15 `UdfError::User` join/aggregate decline sites in `pushdown.rs` (lines 2211, 2231,
+2253, 2614, 4161, 4819, 4867, 4883, 5168, 5181, 5277, 5309, 5329, 5358, 5415) were
+framed as "Exasol will retry the query natively." This is false: the
+`exasol-udf-macros` FFI shim erases every `UdfError::User` into a hard
+`F-UDF-CL-RUST-9001` client-facing SQL error; Exasol never re-plans on an adapter error
+(ADR-083, ADR-085 already established this for the two-table case). A unit test at
+`pushdown.rs:7936` asserted `msg.contains("retry")`, encoding the false framing into a
+regression check.
+
+### Decision
+
+Remove the native-retry framing from all 15 sites. Delete the sites whose shapes now
+always render after ADR-095/ADR-096 (the join-arity and aggregate-nesting gaps that
+motivated them no longer exist). Reword the genuine last-resort errors — a non-inner
+join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column
+metadata, or a condition/clause `vs-expression` cannot render — as plain hard
+client-facing errors with no retry. Adopt the governing principle: for each advertised
+capability the adapter MUST always be able to render what Exasol may push, or MUST NOT
+advertise it; "decline at runtime and hope Exasol retries" is not a valid third option.
+Update the `msg.contains("retry")` test to assert the corrected wording.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Purge retry framing; hard error only when truly unrenderable | ✓ Chosen — truthful error semantics; removes a recurring source of "just decline and hope" bugs; the protocol has no decline-and-retry response |
+| Keep the "retry natively" wording | ✗ Rejected — it is false, as ADR-083/085 already established, and the false framing was encoded into a regression test that would need to keep being "fixed" around |
+
+### Consequences
+
+Every remaining hard-error decline site in the join/aggregate pushdown path states
+plainly that it is a hard error with no native retry. The advertised-capability-must-
+render principle applies to all future capability additions, not just joins.
