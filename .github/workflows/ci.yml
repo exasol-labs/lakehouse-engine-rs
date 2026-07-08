@@ -4,8 +4,10 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore: ["specs/**"]
   pull_request:
     branches: [main]
+    paths-ignore: ["specs/**"]
   workflow_dispatch:
 
 # Cancel a superseded run when a PR branch gets a new push (saves CI minutes,
