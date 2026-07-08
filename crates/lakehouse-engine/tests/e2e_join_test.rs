@@ -276,20 +276,21 @@ fn has_broadcast_join_block(pushed_sql: &str) -> bool {
     pushed_sql.contains("\"join\":{")
 }
 
-/// Whether the pushed SQL is the deterministic two-scan fallback: each side its
-/// own sharded fan-out, wrapped in an Exasol-executed `INNER JOIN` with the
-/// `LHS_FACT`/`LHS_DIM` aliases. These aliases appear only in this generated
-/// wrapper, never in a native retry or the broadcast path.
+/// Whether the pushed SQL is the deterministic two-table unaccelerated fallback:
+/// each side its own sharded fan-out, wrapped in an Exasol-executed `INNER JOIN`
+/// with the unified renderer's `LHS_T0`/`LHS_T1` aliases (the two-table case is
+/// simply N = 2 of the single N-scan wrapper; see `has_n_scan_wrapper`). These
+/// aliases appear only in this generated wrapper, never in a native retry or the
+/// broadcast path.
 fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
-    pushed_sql.contains("LHS_FACT") && pushed_sql.contains("LHS_DIM")
+    has_n_scan_wrapper(pushed_sql, 2)
 }
 
 /// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
 /// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
 /// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
 /// aliases (`build_n_scan_alias_map`) are unique to the N-scan wrapper's
-/// generated SQL — never present in a native retry, a broadcast join, or the
-/// two-table `LHS_FACT`/`LHS_DIM` wrapper.
+/// generated SQL — never present in a native retry or a broadcast join.
 fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
     (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))
         && !pushed_sql.contains(&format!(r#"AS "LHS_T{n}""#))
@@ -384,7 +385,7 @@ fn e2e_broadcast_join_pushdown_shape() {
     assert!(
         !has_two_scan_wrapper(&pushed),
         "broadcast join must NOT emit the two-scan Exasol-joined fallback \
-         (LHS_FACT/LHS_DIM):\n{pushed}"
+         (LHS_T0/LHS_T1):\n{pushed}"
     );
 }
 
@@ -420,10 +421,10 @@ fn e2e_broadcast_join_result_correct() {
 
 /// With `JOIN_BROADCAST_MAX_BYTES = '1'` the dimension side exceeds the
 /// threshold, so EXPLAIN VIRTUAL shows the deterministic two-scan fallback (two
-/// independent per-table fan-outs joined by Exasol's core engine): the
-/// `LHS_FACT`/`LHS_DIM` wrapper and TWO scan-UDF invocations. It must NOT be the
-/// broadcast shape and must NOT be a native retry (which would carry no
-/// `LHS_FACT` wrapper).
+/// independent per-table fan-outs joined by Exasol's core engine): the unified
+/// renderer's `LHS_T0`/`LHS_T1` wrapper and TWO scan-UDF invocations. It must
+/// NOT be the broadcast shape and must NOT be a native retry (which would carry
+/// no `LHS_T*` wrapper).
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -433,7 +434,7 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
     assert!(
         has_two_scan_wrapper(&pushed),
         "above-threshold join must emit the deterministic two-scan fallback \
-         (LHS_FACT/LHS_DIM wrapper), not a broadcast join or a native retry:\n{pushed}"
+         (LHS_T0/LHS_T1 wrapper), not a broadcast join or a native retry:\n{pushed}"
     );
     assert!(
         !has_broadcast_join_block(&pushed),
@@ -496,7 +497,7 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     assert!(
         has_two_scan_wrapper(&pushed),
         "aggregate-over-join must emit the two-scan wrapper so Exasol aggregates \
-         over the join (LHS_FACT/LHS_DIM), even on the broadcast VS:\n{pushed}"
+         over the join (LHS_T0/LHS_T1), even on the broadcast VS:\n{pushed}"
     );
     assert!(
         !has_broadcast_join_block(&pushed),
@@ -738,7 +739,7 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
 /// A three-table inner-join pushdown (`dim_customer ⋈ fact_orders ⋈
 /// fact_lineitem`) succeeds end-to-end (no `F-UDF-CL-RUST-9001` — issue #76's
 /// hard failure) via the N-scan unaccelerated wrapper (three distinct `LHS_T*`
-/// aliases), never a broadcast join or the two-table `LHS_FACT`/`LHS_DIM`
+/// aliases), never a broadcast join or the two-table `LHS_T0`/`LHS_T1`
 /// shape, and returns the result computed independently from the un-joined
 /// tables.
 #[test]
@@ -759,7 +760,7 @@ fn e2e_three_table_join_result_correct() {
     );
     assert!(
         !has_two_scan_wrapper(&pushed),
-        "a three-table join must NOT emit the two-table LHS_FACT/LHS_DIM \
+        "a three-table join must NOT emit the two-table LHS_T0/LHS_T1 \
          wrapper:\n{pushed}"
     );
 
@@ -804,7 +805,7 @@ fn e2e_four_table_join_result_correct() {
     );
     assert!(
         !has_two_scan_wrapper(&pushed),
-        "a four-table join must NOT emit the two-table LHS_FACT/LHS_DIM \
+        "a four-table join must NOT emit the two-table LHS_T0/LHS_T1 \
          wrapper:\n{pushed}"
     );
 
@@ -822,6 +823,216 @@ fn e2e_four_table_join_result_correct() {
     assert_eq!(
         actual, expected,
         "four-table N-scan join result must equal the independently computed join.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scalar function wrapping aggregates in a grouped join select list (PR #78
+// review finding #4 / plan `fix-join-decline-hard-fail`, spec scenario "A
+// scalar function wrapping aggregates in a grouped join select list is
+// rendered, not declined"). The reported query is TPC-H-Q1-shaped:
+// `ROUND(100.0 * SUM(CASE WHEN l_returnflag = 'R' THEN 1 ELSE 0 END) /
+// COUNT(*), 2)` alongside plain `SUM`/`AVG` aggregates, `GROUP BY`, `HAVING`,
+// `ORDER BY`, and `LIMIT` — over a JOIN rather than a single table. Before the
+// fix, the join select-list renderer could not recurse a scalar function around
+// a nested `function_aggregate` node and declined the request, which the FFI
+// shim turns into a hard `F-UDF-CL-RUST-9001` client error (`ExaConn::execute`
+// panics on any non-"ok" status, surfacing that error verbatim). The fix routes
+// this rendering through `crates/vs-expression`'s shared aggregate arm, so
+// these tests fail before the fix (query panics with F-UDF-CL-RUST-9001) and
+// pass after.
+//
+// Ground truth: every seeded `fact_lineitem` row matches exactly one order
+// (and, for the three-table case, exactly one customer), so neither join drops
+// nor duplicates a row — the grouped aggregate over either join must equal the
+// SAME select list evaluated directly over the un-joined `fact_lineitem` table.
+// ---------------------------------------------------------------------------
+
+/// The scalar-over-aggregate grouped select list, with each `fact_lineitem`
+/// column referenced through `col_prefix` (a table alias like `"l."`, or `""`
+/// for an unqualified single-table query).
+fn scalar_over_aggregate_select_list(col_prefix: &str) -> String {
+    format!(
+        "{col_prefix}L_RETURNFLAG, \
+         SUM({col_prefix}L_QUANTITY) AS SUM_QTY, \
+         SUM(CASE WHEN {col_prefix}L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) AS RETURN_COUNT, \
+         AVG({col_prefix}L_EXTENDEDPRICE) AS AVG_PRICE, \
+         ROUND(100.0 * SUM(CASE WHEN {col_prefix}L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2) AS RETURN_PCT"
+    )
+}
+
+/// Two-table (N=2) grouped join: `fact_orders ⋈ fact_lineitem` on
+/// `O_ORDERKEY = L_ORDERKEY`.
+fn scalar_over_aggregate_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT {} FROM {} o JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
+         GROUP BY l.L_RETURNFLAG HAVING COUNT(*) > 0 ORDER BY 1 LIMIT 2",
+        scalar_over_aggregate_select_list("l."),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name)
+    )
+}
+
+/// Three-table (N>=3) grouped join: `dim_customer ⋈ fact_orders ⋈
+/// fact_lineitem`, extending [`scalar_over_aggregate_join_query`] with the
+/// customer side exactly as [`three_table_join_query`] extends [`join_query`].
+fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT {} FROM {} c \
+         JOIN {} o ON c.C_CUSTKEY = o.O_CUSTKEY \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
+         GROUP BY l.L_RETURNFLAG HAVING COUNT(*) > 0 ORDER BY 1 LIMIT 2",
+        scalar_over_aggregate_select_list("l."),
+        vs_dim_table(vs_name),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name)
+    )
+}
+
+/// Native (non-virtual) table the ground truth is materialized into — see
+/// [`ensure_ground_truth_lineitem_table`].
+const GROUND_TRUTH_LINEITEM_TABLE: &str = "GROUND_TRUTH_LINEITEM";
+
+/// Materialize the `fact_lineitem` columns the ground truth needs into a
+/// NATIVE Exasol table (in the same schema as the adapter scripts), via a
+/// plain projection over the VS.
+///
+/// This sidesteps a separate, pre-existing single-table limitation that is
+/// explicitly out of scope for this join-focused plan (see its Non-Goals):
+/// the single-table grouped-aggregate pushdown (`detect_group_by_aggregates`)
+/// declines any select list containing a non-`function_aggregate` item — such
+/// as the `ROUND(100.0*SUM(CASE..)/COUNT(*),2)` scalar-over-aggregate used
+/// here — and falls back to a raw full-row scan with the wrong column count,
+/// hard-failing with "Expected number of columns is 5 but pushdown query has
+/// 6" if the scalar-over-aggregate select list were run directly against the
+/// virtual `fact_lineitem` table. Projection pushdown (a plain column list,
+/// no aggregates) over the VS works fine, so once the base columns are
+/// materialized natively, Exasol computes the scalar-over-aggregate itself —
+/// correct, and formatted identically to the join wrapper's Exasol-side
+/// aggregation, so plain string comparison stays valid.
+///
+/// `CREATE OR REPLACE TABLE` is idempotent and always rebuilds from the same
+/// source VS data, so both scalar-over-aggregate tests can safely share and
+/// re-run this under the suite's `--test-threads=1` serial execution.
+fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} AS \
+         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
+        vs_lineitem_table(VS_NAME)
+    ));
+}
+
+/// The same select list evaluated directly over the natively materialized
+/// `fact_lineitem` columns (see [`ensure_ground_truth_lineitem_table`]) — the
+/// ground truth both grouped-join queries above must match, since every
+/// `fact_lineitem` row appears in exactly one result row of either join,
+/// independent of how many tables are joined.
+fn scalar_over_aggregate_ground_truth_query() -> String {
+    format!(
+        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
+         GROUP BY L_RETURNFLAG HAVING COUNT(*) > 0 ORDER BY 1 LIMIT 2",
+        scalar_over_aggregate_select_list("")
+    )
+}
+
+/// Fetch a scalar-over-aggregate query's 5 result columns
+/// (`L_RETURNFLAG, SUM_QTY, RETURN_COUNT, AVG_PRICE, RETURN_PCT`) as a sorted
+/// `Vec<Vec<String>>`, reusing [`fetch_rows_as_vecs`]'s order-independent
+/// row-major comparison shape.
+fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<Vec<String>> {
+    let cols = conn.query_columns(query_sql);
+    assert_eq!(
+        cols.len(),
+        5,
+        "expected 5 result columns (L_RETURNFLAG, SUM_QTY, RETURN_COUNT, AVG_PRICE, \
+         RETURN_PCT), got {}",
+        cols.len()
+    );
+    fetch_rows_as_vecs(&cols)
+}
+
+/// A scalar function wrapping aggregates (`ROUND(100.0 * SUM(CASE …) /
+/// COUNT(*), 2)`) in a grouped two-table join select list is rendered, not
+/// declined: the query succeeds (no `F-UDF-CL-RUST-9001`), the pushed SQL is
+/// the unified N-scan wrapper (N=2, `LHS_T0`/`LHS_T1`) rather than a broadcast
+/// join, and the result equals the same select list evaluated over the
+/// un-joined `fact_lineitem` table.
+#[test]
+fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = scalar_over_aggregate_join_query(VS_NAME);
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a scalar-over-aggregate grouped join must be served by the unified \
+         N-scan wrapper (N=2, LHS_T0/LHS_T1), not declined:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a grouped aggregate cannot ride the broadcast in-UDF join — no \
+         common-blob join block may appear:\n{pushed}"
+    );
+
+    ensure_ground_truth_lineitem_table(&mut conn);
+    let actual = fetch_scalar_over_aggregate_rows(&mut conn, &query);
+    let expected =
+        fetch_scalar_over_aggregate_rows(&mut conn, &scalar_over_aggregate_ground_truth_query());
+
+    assert!(
+        !actual.is_empty(),
+        "expected at least one L_RETURNFLAG group, got none"
+    );
+    assert_eq!(
+        actual, expected,
+        "scalar-over-aggregate grouped two-table join result must equal the \
+         same select list evaluated over the un-joined fact_lineitem table.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// The N>=3-table counterpart of
+/// [`e2e_scalar_over_aggregate_grouped_join_result_correct`]: the identical
+/// scalar-over-aggregate grouped select list over a three-table inner join
+/// (`dim_customer ⋈ fact_orders ⋈ fact_lineitem`) is rendered by the SAME
+/// unified fallback renderer (N=3, `LHS_T0..LHS_T2`), not declined, and returns
+/// the same result as the ground truth (and, transitively, as the two-table
+/// case).
+#[test]
+fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = scalar_over_aggregate_n_table_join_query(VS_NAME);
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 3),
+        "a scalar-over-aggregate grouped join over three tables must be served \
+         by the unified N-scan wrapper (N=3), not declined:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "broadcast stays strictly two-table; a three-table join must never \
+         carry a common-blob join block:\n{pushed}"
+    );
+
+    ensure_ground_truth_lineitem_table(&mut conn);
+    let actual = fetch_scalar_over_aggregate_rows(&mut conn, &query);
+    let expected =
+        fetch_scalar_over_aggregate_rows(&mut conn, &scalar_over_aggregate_ground_truth_query());
+
+    assert!(
+        !actual.is_empty(),
+        "expected at least one L_RETURNFLAG group, got none"
+    );
+    assert_eq!(
+        actual, expected,
+        "scalar-over-aggregate grouped three-table join result must equal the \
+         same select list evaluated over the un-joined fact_lineitem table.\n\
          actual:   {actual:?}\nexpected: {expected:?}"
     );
 }

@@ -2,125 +2,149 @@
 
 ## Summary
 
-Fix issue #76: a pushdown over an inner join spanning three or more tables (Q1 `supplier⋈nation⋈region`, Q2 `customer⋈orders⋈lineitem`, NQ3 `part⋈partsupp⋈supplier⋈nation`) currently hard-fails with `F-UDF-CL-RUST-9001: join pushdown declined: the join spans more than two tables …` instead of falling back to unaccelerated execution. Generalize the already-specified unaccelerated fallback from two tables to N tables so a 3+ table inner join is served by an N-scan wrapper (never an error), closing the spec-vs-implementation gap that PR #70 left open.
+Correct the join-pushdown fix in PR #78. The first cut fixed #76 (3+ table inner joins hard-failing) by adding a *second, additive* N-table join path alongside the existing two-table path. Code review found that fix treats a symptom, not the cause, and leaves three latent defects:
+
+1. **Root cause is in `crates/vs-expression`, not join arity.** A grouped-aggregate select list over a join whose select item is a *scalar function wrapping aggregates* — e.g. `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)` — declines at ALL arities (single-table, two-table, N-table). `render_selectlist_item_qualified` (`pushdown.rs:4486`) only special-cases a *top-level* `function_aggregate`; anything else recurses into `vs_expression::render_expression_safe` → `render_expression_inner` (`vs-expression/src/lib.rs:100`), which has NO `function_aggregate` arm, so a nested `SUM`/`COUNT` hits the catch-all (`lib.rs:728`) → `Err` → swallowed to `None` → decline. The fix belongs at that shared seam.
+2. **Two parallel join implementations, not one.** Two-table (`plan_eligible_join`/`build_unaccelerated_join_sql`/`build_two_scan_join_sql`, `LHS_FACT`/`LHS_DIM`) and N≥3 (`plan_multi_table_join`/`build_n_scan_join_sql`, `LHS_T0..`) render the fallback twice. The bug shipped precisely because the rendering gap was in both and the fix landed in one. Collapse to a SINGLE N≥2 fallback renderer (two-table = N=2); broadcast stays an optimization selected *within* that one path.
+3. **The "Exasol will retry natively" fiction.** 15 constructed `UdfError::User` decline sites in `pushdown.rs` claim Exasol re-plans on an adapter error. It does not (ADR-083, ADR-085; the `exasol-udf-macros` FFI shim erases `UdfError::User` into a hard `F-UDF-CL-RUST-9001`). Purge the framing; where a genuine last-resort error remains, state plainly it is a hard error with no native retry.
+4. **No E2E for the failing shape.** Add end-to-end coverage of the reported scalar-over-aggregate grouped join (with `SUM`, `SUM(CASE …)`, `AVG`, `ROUND(… SUM(…)/COUNT(*) …)`, HAVING, ORDER BY, LIMIT) at BOTH N=2 and N≥3, plus host unit tests for vs-expression aggregate rendering and for `render_selectlist_item_qualified` on a scalar-over-aggregate item.
+
+This plan supersedes the additive-two-path design (ADR-094) with a single unified renderer and moves the correctness fix to its true seam.
 
 ## Design
 
 ### Context
 
-PR #70 (`add-join-pushdown-broadcast`, merged `0e2fe9b`) introduced `JoinShape::Ineligible(IneligibleJoinReason::TooManyTables)`, which `handle_pushdown` (`pushdown.rs:2097`) turns into `Err(ineligible_join_decline(reason))`. Every `UdfError` variant is erased by the `exasol-udf-macros` 0.20.3 FFI shim to return code 1, which the Exasol UDF host surfaces as a hard SQL error — there is **no** code path in this repo or the SDK that makes Exasol retry a declined pushdown natively. This is the exact false premise ADR-083 rejected and ADR-085/086 fixed for the two-table case; the >2-table case was left declining because the fallback builder (`build_unaccelerated_join_sql`, `resolve_join_sides`, `build_two_scan_join_sql`, `build_join_alias_map`) is structurally two-sided.
+The adapter advertises `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` statically, once, at `getCapabilities` (`capabilities.rs:152`). There is no per-query opt-out: once a capability is advertised, Exasol pushes every inner equi-join of any arity and expects the adapter to serve it. There is no protocol response for "decline, run this natively" and no native re-plan on an adapter error — a declined pushdown is a hard client-facing SQL error. The governing principle, which the first cut violated and this plan adopts explicitly:
 
-The feature spec already requires the correct behavior ("spans more than two involved tables … SHALL instead emit the unaccelerated … join SQL when it can build one"). This plan is therefore a `fix-` (spec-vs-implementation mismatch), not new spec authoring — it generalizes the fallback to N tables and closes the runtime-behavior test gap.
+> **For each advertised capability the adapter MUST always be able to render what Exasol may push, or MUST NOT advertise it. "Decline at runtime and hope Exasol retries" is not a valid third option.**
+
+The reported failure is not really about join arity. `render_selectlist_item_qualified` dispatches a top-level `function_aggregate` to `render_aggregate_qualified` (which splices the Exasol aggregate name verbatim and qualifies its column argument), and sends everything else to `render_expression_qualified` → `vs_expression`. `vs_expression` renders `function_scalar` (ROUND, arithmetic, CASE, …) by recursing into its arguments, but has no `function_aggregate` arm — so the moment recursion reaches a nested `SUM`/`COUNT`, it errors. Any select item that is a *scalar expression over aggregates* therefore declines, at every arity. Fixing the seam repairs single-table, two-table, and N-table simultaneously.
 
 - **Goals**
-  - A 3+ table inner-join pushdown returns a valid `{"type":"pushdown","sql":…}` response (an N-scan wrapper), never an `Err`.
-  - The N-scan wrapper's result equals single-node evaluation (correctness-first; "never wrong, only unaccelerated").
-  - Close the test gap: a runtime (E2E) test proving Q1/Q2/NQ3-shape joins succeed and return correct results — not merely asserting the decline message text.
+  - `vs_expression` renders `function_aggregate` nodes (Exasol aggregate name spliced verbatim; argument(s) rendered by recursion; `COUNT(*)`/star and `DISTINCT` handled), so a scalar-function-wrapping-aggregates select item over a join renders instead of declining.
+  - Top-level and nested aggregate rendering are made consistent on the shared `vs_expression` path (no divergence between `render_aggregate_qualified` and the recursive renderer).
+  - ONE unaccelerated join renderer for all inner joins N≥2 (two-table = N=2); broadcast is an optimization chosen inside that single path, not a second implementation.
+  - Every `UdfError::User` join/aggregate decline site states the truth: a hard error with no native retry, raised only when the adapter genuinely cannot render what it advertised.
+  - E2E proof of the reported shape at N=2 and N≥3 (fails before, passes after), plus host unit tests at the seam.
 - **Non-Goals**
-  - No change to the two-table broadcast path or the two-table two-scan fallback (ADR-081..086 behavior stays byte-for-byte; all existing 2-table host + E2E tests keep passing).
-  - No N-table broadcast / node-local N-way DataFusion join (broadcast stays strictly two-table). No BL-001 Phase-2 broadcast work.
-  - No new join capabilities advertised (outer joins stay unadvertised; the capability surface is unchanged).
-  - No unrelated lc-rs/perf content from the sibling PR #74 this branch stacks on.
+  - No new join capabilities advertised (outer joins stay unadvertised; capability surface unchanged).
+  - No node-local N-way DataFusion join / N-table broadcast (broadcast stays strictly two-table, per mission non-goal); the unified fallback makes all inner joins correct, only unaccelerated beyond broadcast.
+  - No change to the single-table partial/merge aggregate decomposition paths (`pushdown-planning`, `-count-distinct`, `-expression-aggregate`, `-grouped-agg`): those detect a top-level `function_aggregate` *before* recursing and remain behavior-compatible. The new `vs_expression` arm only affects aggregates that appear *nested inside another expression*, which previously errored.
+  - No unrelated lc-rs/perf content.
 
 ### Decision
 
-Add an **additive** N-table (N≥3) inner-join fallback path that reuses the ADR-085/086 qualified-rendering machinery wholesale, leaving the two-table path untouched.
+Three coordinated changes, plus tests.
 
-#### Architecture
+#### 1. Render aggregate nodes at the shared seam (root cause)
+
+Add a `function_aggregate` arm to `render_expression_inner` (`vs-expression/src/lib.rs`):
+- Splice the Exasol aggregate `name` verbatim (uppercased; it is not a translated function — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, and the STDDEV/VARIANCE family pass through as-is, matching the existing top-level `render_aggregate_qualified` discipline).
+- `COUNT(*)` (empty `arguments` / star) renders as `COUNT(*)`.
+- Render each argument by recursion (so `SUM(CASE WHEN … END)`, `SUM(a*b)`, `COUNT(expr)` all work).
+- Honor `distinct: true` → `COUNT(DISTINCT <arg>)`.
+- Column arguments carry a `tableAlias` (the ADR-085 alias annotation), so nested aggregate arguments qualify correctly over a join.
+
+Then make `render_selectlist_item_qualified` consistent: a top-level `function_aggregate` and a nested one render through the SAME `vs_expression` aggregate arm. Keep `render_aggregate_qualified`'s observable output identical (it becomes a thin wrapper over — or is unified with — the recursive path) so the existing "Aggregate over a join routes through the qualified wrapper" behavior is byte-compatible for the shapes it already handled.
+
+#### 2. One unified N≥2 unaccelerated join renderer
 
 ```
 handle_pushdown
   └─ detect_join(from tree)
-       ├─ NotAJoin                → single-table path         (unchanged)
-       ├─ Eligible(2-table equi)  → plan_eligible_join         (unchanged: broadcast | 2-scan)
-       ├─ MultiTable(N≥3 inner)   → plan_multi_table_join       ★ NEW
-       └─ Ineligible(reason)      → Err (native retry)          (only genuinely unbuildable)
-
-plan_multi_table_join
-  ├─ resolve each of N sides once  (resolve_one_join_side, side-local pruning)   [reused]
-  ├─ any side empty → shape-correct empty result over combined N-table columns   [generalized]
-  └─ build_n_scan_join_sql
-       ├─ N sharded fan-out subqueries  (build_side_fan_out_sql)                  [reused]
-       ├─ N-entry alias map  LHS_T0..LHS_T{N-1}  (uppercased tableName → alias)   ★ NEW
-       ├─ every join-tree condition + WHERE + select/GROUP BY/HAVING/ORDER BY
-       │   rendered table-qualified   (render_*_qualified, ADR-085/086)          [reused]
-       └─ FROM (fan0) "LHS_T0", …, (fanK) "LHS_TK" WHERE <ANDed conditions + filter>
+       ├─ NotAJoin                     → single-table path            (unchanged)
+       ├─ Join(N≥2, all inner, equi)   → plan_join                     ★ UNIFIED
+       │      ├─ N==2 AND broadcast-eligible AND no Exasol postprocessing
+       │      │        → broadcast fan-out            (optimization, within the one path)
+       │      └─ else  → build_n_scan_join_sql (N≥2)  (single fallback renderer)
+       └─ non-inner node / non-equi / unbuildable → hard Err (no native retry)
 ```
 
-The genuinely new code is confined to (1) walking the nested-join `from` tree in `detect_join` to collect the N leaf tables and every join node's condition while asserting all nodes are inner, and (2) assembling the N-scan wrapper (N-entry alias map + cross-join FROM + conjunctive qualified WHERE). Everything else — per-side resolution, per-side fan-out, and all qualified rendering of conditions/filter/projection/aggregate/GROUP BY/HAVING/ORDER BY/LIMIT — is the existing two-table machinery, which is already alias-map-driven and table-count-agnostic.
+`build_n_scan_join_sql` becomes the ONLY fallback renderer (`LHS_T0..LHS_T{N-1}`, cross-join + conjunctive table-qualified WHERE, per-side sharded fan-out, ADR-091 per-side predicate pushdown, ADR-085 qualified rendering). The two-table case is simply N=2. `build_unaccelerated_join_sql`/`build_two_scan_join_sql`/`resolve_join_sides` and the `LHS_FACT`/`LHS_DIM` two-scan renderer are removed; the `Eligible`/`MultiTable` `JoinShape` split collapses into one join shape carrying the N resolved tables + N-1 conditions, with broadcast eligibility computed as a property inside `plan_join`.
+
+#### 3. Purge the retry fiction
+
+Remove "Exasol will retry natively / retry the query natively" from all 15 sites (`pushdown.rs:2211, 2231, 2253, 2614, 4161, 4819, 4867, 4883, 5168, 5181, 5277, 5309, 5329, 5358, 5415`). Reword the genuine last-resort errors (non-inner join node in the tree, involved table absent from `TABLE_MAP`, involved table carrying no column metadata, a clause the translator cannot render) as plain hard errors with no retry. The sites that vanish because their shape now renders (the aggregate/expression declines fixed by change #1 and the fallback made total by change #2) are deleted, not reworded.
 
 #### Patterns
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| Cross-join + conjunctive qualified WHERE | `build_n_scan_join_sql` FROM/WHERE | For all-inner nodes, `FROM a,b,c WHERE c1 AND c2 AND …` is provably equivalent to a chained `INNER JOIN … ON` tree but is order-agnostic — no ON-scoping bookkeeping across the join tree; Exasol's optimizer turns equi-WHERE into hash joins |
-| Reuse ADR-085 `tableAlias` annotation | N-entry `alias_of` map | The qualified renderers already emit `"ALIAS"."COL"` from a `tableName→alias` map; extending the map to N entries makes shared column names across any pair correct with zero renderer changes |
-| Additive path, two-table path frozen | `JoinShape::MultiTable` + `plan_multi_table_join` | Isolates regression risk; the `LHS_FACT`/`LHS_DIM` two-scan wrapper and all its tests/ADRs are unchanged |
-| Last-resort error only | `detect_join` / `build_n_scan_join_sql` | Matches ADR-083: hard error reserved for a shape whose fallback genuinely cannot be built |
+| Render aggregate at the shared translator seam | `render_expression_inner` `function_aggregate` arm | One fix repairs every arity; nested-in-scalar aggregates were the only gap |
+| Verbatim aggregate-name splice + recursive args | `vs_expression` aggregate arm | Matches existing `render_aggregate_qualified` behavior; keeps the top-level path byte-compatible |
+| Single fallback renderer, broadcast as inner optimization | `plan_join` / `build_n_scan_join_sql` | One implementation cannot drift from the other; the shipped bug was a two-copies divergence |
+| Cross-join + conjunctive qualified WHERE for N≥2 | `build_n_scan_join_sql` | Order-agnostic for all-inner joins; no ON-scope bookkeeping; Exasol optimizes equi-WHERE to hash joins |
+| Advertised capability must render, or not be advertised | all decline sites | There is no native retry; a decline is a hard client error |
 
 ### Consequences
 
 | Decision | Alternatives Considered | Rationale |
 |----------|------------------------|-----------|
-| N-table fallback via cross-join + conjunctive qualified WHERE | Chained `INNER JOIN … ON` reproducing the tree | Cross-join+WHERE is order-agnostic for all-inner joins and sidesteps ON-scope ordering; semantically identical, Exasol optimizes it to hash joins |
-| Add `JoinShape::MultiTable` (N≥3); freeze the two-table path | Retrofit N-tables into `EligibleJoin`/`JoinSides`/`build_unaccelerated_join_sql` | Additive isolation keeps every ADR-081..086 two-table test green and confines the change to new, testable units |
-| Broadcast stays strictly two-table | Node-local N-way DataFusion join in the UDF | Out of scope (BL-001 / mission "join pushdown beyond broadcast is out of scope"); the fallback already makes 3+ table joins correct, just unaccelerated |
-| Error only for non-inner node / missing TABLE_MAP entry / unrenderable clause | Keep declining all `TooManyTables` | The spec already mandates fallback for >2 tables; an all-inner nested tree over resolvable tables is always buildable |
+| Fix aggregate rendering in `vs-expression`, not by arity | Special-case scalar-over-aggregate in `render_selectlist_item_qualified` only | The seam is shared by all arities and by any future caller; fixing only the join select-list path would leave the same gap for single-table nested aggregates |
+| Collapse to one N≥2 renderer; broadcast stays an inner optimization | Keep the additive two-path design (ADR-094) | Two copies drifted and shipped the bug; a single renderer makes "two-table = N=2" structural, not a coincidence. Supersedes ADR-094 |
+| Purge retry framing; hard error only when truly unrenderable | Keep "retry natively" wording | It is false and the codebase already says so (ADR-083/085); the FFI shim makes every decline a hard error |
+| Broadcast stays strictly two-table | N-way node-local join | Out of scope (mission non-goal); the unified fallback already makes all inner joins correct |
+| Existing two-scan tests (`has_two_scan_wrapper`, `LHS_FACT`/`LHS_DIM`) migrate to `LHS_T0`/`LHS_T1` | Keep the old alias names for N=2 | The unified renderer uses one alias scheme; N=2 output changes alias names only, result is identical |
 
 ## Features
 
 | Feature | Status | Spec |
 |---------|--------|------|
 | vs-adapter/pushdown-planning-join | CHANGED | `vs-adapter/pushdown-planning-join/spec.md` |
+| sql-comprehension/vs-expression-translator | CHANGED | `sql-comprehension/vs-expression-translator/spec.md` |
 
-Delta: one CHANGED scenario ("A join outside the broadcast contract is declined safely" — clarifies >2 tables never errors), one NEW scenario ("A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper"), plus one NEW Background bullet.
+- **pushdown-planning-join** delta: CHANGED "A join outside the broadcast contract is declined safely" (single unified path; hard error with NO native retry); CHANGED "A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper" (reframed as the unified N≥2 renderer, N=2 included); CHANGED "Aggregate over a join routes through the qualified … wrapper" (unified wrapper + nested-aggregate rendering via `vs_expression`); NEW "A scalar function wrapping aggregates in a grouped join select list is rendered, not declined"; revised Background bullets for the unified renderer and the capability-must-render principle.
+- **vs-expression-translator** delta: NEW "Aggregate function nodes render with the aggregate name spliced verbatim"; CHANGED Background to list `function_aggregate` among supported node types.
 
 ## Dependencies
 
-None new. Reuses existing `resolve_one_join_side`, `build_side_fan_out_sql`, `build_scan_driving_sql`, `annotate_columns_with_alias`, `render_expression_qualified`, `render_df_filter_qualified`, `qualified_join_select_items`/`_group_by`/`_having`/`_order_by`, `side_local_filter`, `referenced_side_columns`, `involved_table_columns`, `empty_result_sql`. Stacked on branch `feat/change-lc-rs-sdk-0-20-3` (PR #74); touches only join-pushdown code.
+None new. Reuses `resolve_one_join_side`, `build_side_fan_out_sql`, `build_scan_driving_sql`, `annotate_columns_with_alias`, `render_expression_qualified`, `render_df_filter_qualified`, `qualified_join_select_items`/`_group_by`/`_having`/`_order_by`, `side_local_filter`, `referenced_side_columns`, `involved_table_columns`, `empty_result_sql`, and the ADR-091 per-side predicate attribution.
 
 ## Implementation Tasks
 
-1. Detection — generalize `detect_join`
-   - [ ] 1.1 Walk the nested-join `from` tree collecting every base-table leaf (in a stable order) and every join node's `condition`; assert every join node is `join_type = "inner"`. Introduce `JoinShape::MultiTable(MultiTableJoin)` carrying the N involved tables (Exasol name + original-cased `TABLE_MAP` Iceberg ident) and the N-1 collected condition nodes. [expert]
-   - [ ] 1.2 Classify the boundaries: N==2 stays `Eligible`/`Ineligible` exactly as today; N≥3 all-inner → `MultiTable`; a non-inner node in the tree → `Ineligible(NotInnerJoinType)`; a non-table leaf / malformed node → `Ineligible(UnsupportedShape)`; a leaf table absent from `TABLE_MAP` → hard `Err` (stale VS), identical to the two-table path.
-2. Routing — `handle_pushdown`
-   - [ ] 2.1 Add `JoinShape::MultiTable(m) => return plan_multi_table_join(...).await;` next to the existing `Eligible` arm; leave `NotAJoin`, `Eligible`, and `Ineligible` arms unchanged.
-3. N-side resolution — `plan_multi_table_join`
-   - [ ] 3.1 Resolve each of the N sides once via `resolve_one_join_side`, forwarding each side's side-local WHERE conjuncts (`side_local_filter`) for Iceberg pruning, exactly as `resolve_join_sides` does per side.
-   - [ ] 3.2 If ANY side has zero files, emit the shape-correct empty result (`empty_result_sql`) over the combined N-table projected column universe (generalize the two-side `involved_table_columns` extend to N tables). [expert]
-4. N-scan SQL builder — `build_n_scan_join_sql`
-   - [ ] 4.1 Build the N-entry alias map (`LHS_T0..LHS_T{N-1}`, uppercased `tableName` → alias) and render every collected join condition table-qualified via `render_expression_qualified`, AND-conjoining them with the qualified residual WHERE. [expert]
-   - [ ] 4.2 Build one sharded fan-out per side (`build_side_fan_out_sql` with each side's referenced-column narrowing and side-local filter), then assemble `SELECT <qualified select list> FROM (fan0) "LHS_T0", … WHERE <ANDed conditions+filter> [GROUP BY …] [HAVING …] [ORDER BY …] [LIMIT …]`, reusing `qualified_join_select_items`/`_group_by`/`_having`/`_order_by` and an N-table `full_row_qualified_items`. Return `Err` (native retry) only when a condition/clause cannot be rendered or an involved table carries no column metadata. [expert]
-5. Host unit tests (`crates/lakehouse-engine/src/adapter/pushdown.rs` `#[cfg(test)]`)
-   - [ ] 5.1 `detect_join` over a 3-table and a 4-table all-inner nested tree → `MultiTable` with the right table count and condition count; a non-inner node in the tree → `Ineligible(NotInnerJoinType)`; a leaf missing from `TABLE_MAP` → `Err`.
-   - [ ] 5.2 `build_n_scan_join_sql` for the Q1/Q2/NQ3 shapes yields an N-scan wrapper (N distinct `LHS_T*` aliases, all N-1 conditions present, table-qualified) — not an `Err`; a shared-column-name pair across three tables renders qualified (no bare-name ambiguity).
-   - [ ] 5.3 Update `join_outside_contract_declined_safely`: `TooManyTables` is no longer asserted as a decline-to-error (it now routes to `MultiTable`); retire the `TooManyTables` decline facet / dead reason path if `detect_join` no longer produces it.
-6. E2E test (`crates/lakehouse-engine/tests/e2e_join_test.rs`, against local Exasol Docker)
-   - [ ] 6.1 Seed a third (and, for the 4-table shape, fourth) small Iceberg table in the join E2E namespace (extend `tests/common/seed.rs` join fixtures).
-   - [ ] 6.2 Add `e2e_three_table_join_result_correct` (customer⋈orders⋈lineitem or supplier⋈nation⋈region) and `e2e_four_table_join_result_correct` (part⋈partsupp⋈supplier⋈nation): assert the query SUCCEEDS (no `F-UDF-CL-RUST-9001`), the pushed SQL is the N-scan wrapper (multiple `LHS_T*` aliases, not a native decline), and the result equals the same join computed independently — mirroring the existing `e2e_broadcast_join_result_correct` / `has_two_scan_wrapper` helper style.
+1. Root-cause fix — aggregate nodes in `crates/vs-expression`
+   - [ ] 1.1 Add a `"function_aggregate"` arm to `render_expression_inner` (`vs-expression/src/lib.rs`, near the `function_scalar` arm at :346): splice `name` verbatim (uppercased), handle empty-args / star as `COUNT(*)`, render each argument recursively, and honor `distinct: true` → `COUNT(DISTINCT <arg>)`; render column-node `tableAlias` qualification for arguments. Remove the fall-through-to-catch-all for aggregate nodes (`lib.rs:728`). [expert]
+   - [ ] 1.2 Unify `render_selectlist_item_qualified` (`pushdown.rs:4486`) and `render_aggregate_qualified` (`pushdown.rs:4469`) onto the new `vs_expression` aggregate path so a top-level aggregate and a nested one render identically; assert the top-level output is byte-compatible with the pre-change `render_aggregate_qualified` for the shapes it already handled. [expert]
+2. Single unified N≥2 join renderer
+   - [ ] 2.1 Collapse the `JoinShape` variants: fold `Eligible` (2-table) and `MultiTable` (N≥3) into one shape carrying the N resolved involved tables (Exasol name + original-cased `TABLE_MAP` Iceberg ident) and the N-1 join conditions; `detect_join` asserts every join node is `join_type = "inner"` and equi, over N≥2 base-table leaves. [expert]
+   - [ ] 2.2 Route `handle_pushdown` through a single `plan_join`; compute broadcast eligibility (N==2, small side ≤ `JOIN_BROADCAST_MAX_BYTES`, no Exasol postprocessing) as a property *inside* `plan_join`; on eligibility take the broadcast fan-out, otherwise call `build_n_scan_join_sql`.
+   - [ ] 2.3 Make `build_n_scan_join_sql` the sole fallback renderer for N≥2 (`LHS_T0..LHS_T{N-1}`), resolving each side once (ADR-091 per-side predicate pushdown), emitting the shape-correct empty result when any side has zero files, and rendering the whole select/WHERE/GROUP BY/HAVING/ORDER BY/LIMIT table-qualified. Remove `build_unaccelerated_join_sql`, `build_two_scan_join_sql`, `resolve_join_sides`, and the `LHS_FACT`/`LHS_DIM` scheme. [expert]
+3. Purge the "Exasol will retry natively" fiction
+   - [ ] 3.1 Delete the retry framing from all 15 sites (`pushdown.rs:2211, 2231, 2253, 2614, 4161, 4819, 4867, 4883, 5168, 5181, 5277, 5309, 5329, 5358, 5415`). Reword the genuine last-resort errors (non-inner join node, table absent from `TABLE_MAP`, table with no column metadata, unrenderable clause) as hard errors with no native retry; delete the sites whose shape now always renders after tasks 1–2.
+   - [ ] 3.2 Update the unit test asserting `msg.contains("retry")` (`pushdown.rs:7936`) to assert the corrected hard-error wording; retire the `TooManyTables` decline facet / any dead reason path no longer produced.
+4. Host unit tests (`crates/vs-expression/src/lib.rs` + `crates/lakehouse-engine/src/adapter/pushdown.rs` `#[cfg(test)]`)
+   - [ ] 4.1 `vs-expression`: `render_expression` over `SUM(col)`, `COUNT(*)`, `COUNT(DISTINCT col)`, `AVG(col)`, and a scalar-wrapping-aggregate `ROUND(100.0 * SUM(CASE WHEN … END) / COUNT(*), 2)` returns the expected SQL (aggregate name verbatim, args recursed) instead of `None`/`Err`.
+   - [ ] 4.2 `pushdown`: `render_selectlist_item_qualified` on a scalar-over-aggregate item over a join renders table-qualified SQL (not `None`); a top-level bare aggregate still renders byte-identically to the pre-change output.
+   - [ ] 4.3 `pushdown`: `detect_join` over a 2-, 3-, and 4-table all-inner tree yields the unified join shape with the right table/condition counts; a non-inner node → hard `Err` (reworded, no "retry"); a leaf missing from `TABLE_MAP` → hard `Err`. `build_n_scan_join_sql` for N=2/3/4 emits `LHS_T*` aliases with all conditions qualified; a shared-column-name triple renders qualified.
+5. E2E (`crates/lakehouse-engine/tests/e2e_join_test.rs`, local Exasol Docker)
+   - [ ] 5.1 Extend the join E2E seed (`tests/common/seed.rs`) so the scalar-over-aggregate shape can run at N=2 and N≥3 (reuse/extend the existing three/four-table fixtures with the columns the reported query needs, e.g. an `l_returnflag`-like discriminator).
+   - [ ] 5.2 Add `e2e_scalar_over_aggregate_grouped_join_result_correct` at N=2 and `e2e_scalar_over_aggregate_grouped_join_n_table_result_correct` at N≥3: run a grouped join with `SUM(expr)`, `SUM(CASE …)`, `AVG`, `ROUND(100.0 * SUM(…) / COUNT(*), 2)`, plus HAVING, ORDER BY, LIMIT; assert the query SUCCEEDS (no `F-UDF-CL-RUST-9001`), the pushed SQL is the unified N-scan wrapper, and the result equals the same query on a single node. Must fail before the fix, pass after.
 
 ## Parallelization
 
 | Parallel Group | Tasks |
 |----------------|-------|
-| Group A | 1.1, 1.2 (detection) |
-| Group B | 2.1 (routing), 3.1, 3.2 (resolution) |
-| Group C | 4.1, 4.2 (SQL builder) |
-| Group D | 5.1, 5.2, 5.3 (host tests), 6.1 (seed) |
-| Group E | 6.2 (E2E behavior) |
+| Group A | 1.1 (vs-expression aggregate arm), 4.1 (its unit tests) |
+| Group B | 1.2 (seam unification), 4.2 (seam tests) |
+| Group C | 2.1, 2.2, 2.3 (unified join renderer) |
+| Group D | 3.1, 3.2 (purge retry) — after 2.x settles the surviving error sites |
+| Group E | 4.3 (detection/builder host tests), 5.1 (seed) |
+| Group F | 5.2 (E2E behavior) |
 
 Sequential dependencies:
-- Group A → Group B (routing/resolution consume the `MultiTable` shape)
-- Group B → Group C (builder consumes resolved sides)
-- Group C → Group D (host tests exercise detection + builder; 5.1 can start with Group A)
-- Group D → Group E (E2E needs the built path + seeded tables)
+- Group A → Group B (the seam unification consumes the new aggregate arm)
+- Group B, Group C → Group D (retry-site purge follows once the renderer/seam settle which errors survive)
+- Group C → Group E → Group F (E2E needs the unified path + seeded tables)
 
 ## Dead Code Removal
 
 | Type | Location | Reason |
 |------|----------|--------|
-| Enum variant / branch | `IneligibleJoinReason::TooManyTables` and its `detect_join` producers (`pushdown.rs:3546,3583`) | `TooManyTables` no longer routes to a decline; remove the variant (and its `ineligible_join_decline` arm + `join_outside_contract_declined_safely` facet) if `detect_join` stops producing it, or keep it only if still reachable as a genuinely-unbuildable defensive case — the implementer decides during task 5.3 |
+| Function | `build_unaccelerated_join_sql`, `build_two_scan_join_sql`, `resolve_join_sides` (`pushdown.rs`) | Replaced by the single `build_n_scan_join_sql` (N≥2); the two-table fallback is now N=2 |
+| Enum variant | `JoinShape::Eligible` / `JoinShape::MultiTable` split; `IneligibleJoinReason::TooManyTables` | Folded into one join shape; `TooManyTables` no longer a decline reason |
+| Alias scheme | `LHS_FACT` / `LHS_DIM` two-scan rendering | Unified on `LHS_T0..LHS_T{N-1}` |
+| Error framing | "Exasol will retry natively" at 15 sites | False; there is no native retry |
 
 ## Verification
 
@@ -128,20 +152,24 @@ Sequential dependencies:
 
 | Scenario | Test Type | Test Location | Test Name |
 |----------|-----------|---------------|-----------|
-| A join outside the broadcast contract is declined safely (CHANGED) | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `join_outside_contract_declined_safely` |
-| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (NEW) — detection | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `detect_join_multi_table_inner_is_multitable` |
-| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (NEW) — SQL shape | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `build_n_scan_join_sql_renders_qualified_wrapper` |
-| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (NEW) — runtime, 3 tables | Integration (E2E) | `crates/lakehouse-engine/tests/e2e_join_test.rs` | `e2e_three_table_join_result_correct` |
-| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (NEW) — runtime, 4 tables | Integration (E2E) | `crates/lakehouse-engine/tests/e2e_join_test.rs` | `e2e_four_table_join_result_correct` |
+| Aggregate function nodes render with the aggregate name spliced verbatim (NEW, vs-expression) | Unit | `crates/vs-expression/src/lib.rs` | `render_expression_renders_aggregate_nodes` |
+| A scalar function wrapping aggregates in a grouped join select list is rendered, not declined (NEW) — seam | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `render_selectlist_item_qualified_renders_scalar_over_aggregate` |
+| A scalar function wrapping aggregates in a grouped join select list is rendered, not declined (NEW) — runtime N=2 | Integration (E2E) | `crates/lakehouse-engine/tests/e2e_join_test.rs` | `e2e_scalar_over_aggregate_grouped_join_result_correct` |
+| A scalar function wrapping aggregates in a grouped join select list is rendered, not declined (NEW) — runtime N≥3 | Integration (E2E) | `crates/lakehouse-engine/tests/e2e_join_test.rs` | `e2e_scalar_over_aggregate_grouped_join_n_table_result_correct` |
+| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (CHANGED — unified N≥2) — detection | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `detect_join_unifies_two_and_multi_table` |
+| A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper (CHANGED — unified N≥2) — SQL shape | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `build_n_scan_join_sql_renders_qualified_wrapper` |
+| A join outside the broadcast contract is declined safely (CHANGED — no native retry) | Unit | `crates/lakehouse-engine/src/adapter/pushdown.rs` | `join_outside_contract_declined_safely` |
+| Aggregate over a join routes through the qualified wrapper (CHANGED — unified + nested aggregate) | Integration (E2E) | `crates/lakehouse-engine/tests/e2e_join_test.rs` | `e2e_aggregate_over_join_result_correct` |
 
-Existing scenarios (broadcast, threshold, projection/EMITS, condition rendering, shared-column two-scan, aggregate-over-join, capabilities) keep their current passing tests unchanged — this plan must not regress them.
+Existing scenarios (broadcast, threshold, projection/EMITS, condition rendering, shared-column, capabilities; and every single-table aggregate-pushdown scenario in `pushdown-planning`, `-count-distinct`, `-expression-aggregate`, `-grouped-agg`, `-nested-aggregate-fallback`) keep their current passing tests — this plan must not regress them. The two-scan alias assertions migrate from `LHS_FACT`/`LHS_DIM` to `LHS_T0`/`LHS_T1` with identical results.
 
 ### Manual Testing
 
 | Feature | Command | Expected Output |
 |---------|---------|-----------------|
-| vs-adapter/pushdown-planning-join | `EXPLAIN VIRTUAL SELECT n.N_NAME, r.R_NAME FROM VS.SUPPLIER s JOIN VS.NATION n ON s.S_NATIONKEY=n.N_NATIONKEY JOIN VS.REGION r ON n.N_REGIONKEY=r.R_REGIONKEY;` | Pushed SQL is an N-scan wrapper with three `LHS_T*` fan-out subqueries joined by Exasol; no `F-UDF-CL-RUST-9001` error |
-| vs-adapter/pushdown-planning-join | `SELECT COUNT(*) FROM VS.CUSTOMER c JOIN VS.ORDERS o ON c.C_CUSTKEY=o.O_CUSTKEY JOIN VS.LINEITEM l ON o.O_ORDERKEY=l.L_ORDERKEY;` | Query succeeds and returns the same count as the identical join over the source tables (single-node) |
+| pushdown-planning-join | `SELECT l_returnflag, SUM(l_quantity), SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END), AVG(l_extendedprice), ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2) FROM VS.CUSTOMER c JOIN VS.ORDERS o ON c.C_CUSTKEY=o.O_CUSTKEY JOIN VS.LINEITEM l ON o.O_ORDERKEY=l.L_ORDERKEY GROUP BY l_returnflag HAVING COUNT(*) > 0 ORDER BY 1 LIMIT 10;` | Query SUCCEEDS (no `F-UDF-CL-RUST-9001`); result equals the same query over the source tables single-node |
+| pushdown-planning-join | Same query with only `VS.ORDERS o JOIN VS.LINEITEM l` (N=2) | SUCCEEDS; unified N-scan wrapper (`LHS_T0`/`LHS_T1`); result matches single-node |
+| vs-expression | (unit) render `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)` | A DataFusion SQL fragment with `SUM(...)`, `COUNT(*)` spliced verbatim; no `None`/`Err` |
 
 ### Checklist
 
