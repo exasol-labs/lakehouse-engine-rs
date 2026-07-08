@@ -17,15 +17,15 @@ Date: 2026-06-23
 **A:** A feature-gated smoke/performance test against a real Exasol cluster + Glue catalog loaded with meaningful data, runnable from CI or triggered manually. Credentials come from environment variables. Unlike the local Docker E2E (which must FAIL when the stack is down), this cloud test is opt-in: it SKIPS when the AWS creds env vars are absent.
 
 **Q:** Which SDK accessor exposes the CONNECTION and the memory limit?
-**A:** The accessor is `ctx.connection(name) -> ConnectionObject {kind, address, user, password}` (NOT `get_connection()`, not injected via request JSON), and `ctx.memory_limit() -> u64` (0 = unavailable sentinel). Both ship in `exasol-udf-sdk` 0.16.0 behind the already-enabled `connect-back` feature. Mirror the strata-rs CONNECTION convention: `address` = catalog URI, `password` = a JSON object string holding all credentials.
+**A:** The accessor is `ctx.connection(name) -> ConnectionObject {kind, address, user, password}` (NOT `get_connection()`, not injected via request JSON), and `ctx.memory_limit() -> u64` (0 = unavailable sentinel). Both ship in `exasol-udf-sdk` 0.16.0 behind the already-enabled `connect-back` feature. Mirror the sibling project's CONNECTION convention: `address` = catalog URI, `password` = a JSON object string holding all credentials.
 
 ## Design Decisions
 
-### [1] Source credentials from an Exasol CONNECTION object (mirror strata-rs)
+### [1] Source credentials from an Exasol CONNECTION object (mirror the sibling project)
 
 - **Decision:** Read the catalog URI + S3 credentials from `ctx.connection(<CATALOG_CONNECTION>)`: `address` is the URI, `password` is a JSON object parsed for `warehouse`, `endpoint`, `region`, `access_key`, `secret_key`, and optional `session_token`/`path_style`/`use_sigv4`/`use_vended_credentials`. Replace `extract_connection_props`'s plain-property reads. Errors never echo the password.
 - **Alternatives:** Keep reading plain VS properties (rejected — leaks creds into `CREATE VIRTUAL SCHEMA` text and the query profile); inject creds via request JSON (rejected — not how the SDK surfaces them).
-- **Rationale:** CLAUDE.md mandates mirroring strata-rs VS conventions; CONNECTION keeps secrets out of SQL text and lets Exasol access-control them.
+- **Rationale:** CLAUDE.md mandates mirroring the sibling project's VS conventions; CONNECTION keeps secrets out of SQL text and lets Exasol access-control them.
 - **Promotes to ADR:** yes
 
 ### [2] Self-issue a SigV4-signed load_table GET instead of using RestCatalogBuilder for Glue
@@ -42,7 +42,7 @@ Date: 2026-06-23
 - **Rationale:** Both declare MSRV 1.91.1 and build on rustc 1.92; official and maintained. Implementation must still confirm co-resolution with the iceberg-0.9.1 arrow-57 / workspace arrow-58 split and the `fastnum 0.7.4` pin.
 - **Promotes to ADR:** no
 
-### [4] Apply vended creds via the strata-rs `merge_vended_into_storage` shape
+### [4] Apply vended creds via the sibling project's `merge_vended_into_storage` shape
 
 - **Decision:** Extract vended `s3.access-key-id`/`s3.secret-access-key`/`s3.session-token` from the load_table response (`storage_credentials[*].config`, longest-prefix match, with fallback to the flat `config` map), override the static keys in each `ScanSpec.storage`, preserving static endpoint/region/path_style. Resolve once in the planning layer.
 - **Alternatives:** Rely on iceberg-catalog-rest to auto-apply vended creds (rejected — 0.9.1 drops `storage_credentials`); vend per-node in the scan UDF (rejected — violates resolve-once + stateless-UDF invariants).

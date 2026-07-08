@@ -93,7 +93,7 @@ bench/run.sh
    1. 5.1 In `bench/run.sh`, replace the remote target's `VS_EXTRA_PROPS=""` with a block carrying `NR_OF_CORES` + `PARALLELISM_FACTOR` from `BENCH_NR_OF_CORES`/`BENCH_PARALLELISM_FACTOR`, reusing the docker path's defaults (factor the shared `printf` into a helper so docker and remote cannot drift).
 
 6. **Tracking + docs (mechanical)**
-   1. 6.1 Open the GitHub issue for this work (`ghbrk gh issue create`) per project rules and reference it in the implementing commit (`Closes #<n>`).
+   1. 6.1 Open the GitHub issue for this work (`gh issue create`) per project rules and reference it in the implementing commit (`Closes #<n>`).
    2. 6.2 Update `CLAUDE.md` SDK-version and emit-buffering notes if the `emit_batch` adoption changes the documented emit guidance (Emit buffering section).
 
 ## Parallelization

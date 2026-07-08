@@ -8,7 +8,7 @@ Date: 2026-06-24
 **A:** The FULL comparison set: `=`, `<`, `<=`, `BETWEEN`, `IN` (const list), `IS NULL`, `IS NOT NULL`, and `AND`/`OR`/`NOT`. (Exasol pre-normalises `>`→`<` and `>=`→`<=`, so only LESS/LESSEQUAL arrive.) It prunes on partitions AND per-file min/max bounds. Untranslatable conjuncts (LIKE, REGEXP_LIKE, scalar-function predicates) are dropped from the prune filter — never mistranslated.
 
 **Q:** Where should the Iceberg-predicate translator live?
-**A:** A NEW module in lakehouse-engine (e.g. `adapter/iceberg_predicate.rs`), consuming the same Exasol filter JSON the DataFusion path reads. This keeps `iceberg-rust` types out of the shared `vs-expression` crate, preserving its strata-rs-shared design.
+**A:** A NEW module in lakehouse-engine (e.g. `adapter/iceberg_predicate.rs`), consuming the same Exasol filter JSON the DataFusion path reads. This keeps `iceberg-rust` types out of the shared `vs-expression` crate, preserving its cross-project-shared design.
 
 **Q:** Is this plan independent of the multi-table work?
 **A:** No — it is implemented SERIALLY AFTER `change-multi-table-virtual-schema`. Assume multi-table has landed: per-pushdown table identity is derived from `involvedTables[0].name` and the scanned Iceberg `TableIdent` is already resolved into the scan inputs by file-resolution time. Do not re-plan multi-table.
@@ -31,7 +31,7 @@ Date: 2026-06-24
 ### [2] New `adapter/iceberg_predicate.rs` module; `iceberg-rust` types stay out of `vs-expression`
 
 - **Decision:** Author a dedicated lakehouse-engine module that consumes the raw Exasol filter JSON and emits `iceberg::expr::Predicate`. Do not extend the shared `vs-expression` crate.
-- **Alternatives:** Extend `vs-expression` to also emit iceberg predicates — rejected to preserve that crate's strata-rs-shared, iceberg-free design.
+- **Alternatives:** Extend `vs-expression` to also emit iceberg predicates — rejected to preserve that crate's cross-project-shared, iceberg-free design.
 - **Rationale:** Keeps the cross-project crate dependency-clean; the iceberg coupling lives only where iceberg is already a dependency.
 - **Promotes to ADR:** yes
 

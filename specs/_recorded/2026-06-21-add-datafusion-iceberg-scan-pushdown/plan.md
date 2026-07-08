@@ -74,14 +74,14 @@ Iceberg/Parquet files in MinIO  →  rows back to Exasol
 | File-level work assignment | scan UDF receives a file list, never discovers files | Keeps the UDF stateless and shardable later |
 | Batch-and-emit streaming | scan UDF Arrow→`Value` loop | Never materialize full result; rely on 4,000,000-byte auto-flush |
 | Value-only boundary | Arrow→`Value` before `ctx.emit` | Arrow `TypeId`s differ across the `.so`; only SDK `Value` is FFI-safe |
-| Mirror sibling conventions | Makefile, compose overlays, BucketFS port 2581 | `strata-rs` already solved SLC install + E2E; do not reinvent |
+| Mirror sibling conventions | Makefile, compose overlays, BucketFS port 2581 | the sibling project already solved SLC install + E2E; do not reinvent |
 
 ### Consequences
 
 | Decision | Alternatives Considered | Rationale |
 |----------|------------------------|-----------|
 | One crate, two entry points | Two crates / two `.so` (the pre-0.14.0 shape) | 0.14.0 supports multi-entry; one artifact halves deploy surface and matches the new capability under test |
-| Adapter returns SQL that calls the scan SET UDF | Adapter calls a library function directly and selects from a cache (the `strata-rs` shape) | The PoC's hypothesis is DataFusion-in-UDF as the execution substrate; caching is an explicit non-goal, so the scan must run as a UDF, not populate a cache |
+| Adapter returns SQL that calls the scan SET UDF | Adapter calls a library function directly and selects from a cache (the sibling project's shape) | The PoC's hypothesis is DataFusion-in-UDF as the execution substrate; caching is an explicit non-goal, so the scan must run as a UDF, not populate a cache |
 | Pass file list as an explicit UDF argument | Let the UDF re-resolve metadata from the catalog | Mission constraint: resolve once per query; explicit hand-off is the multi-node sharding seam |
 | Iceberg REST catalog + MinIO as first target | Nessie / Polaris / Lakekeeper / real S3+Glue | Interview decision; REST + MinIO is the simplest reproducible Docker target |
 | Depend on 0.14.0 from crates.io, path fallback | Path-depend on local siblings unconditionally | 0.14.0 publish is in flight (crates.io still shows 0.13.1); version dep is cleaner once published, path is the documented fallback |
@@ -102,9 +102,8 @@ Iceberg/Parquet files in MinIO  →  rows back to Exasol
 
 - `exasol-udf-sdk` 0.14.0 (feature `connect-back`) + `exasol-udf-macros` 0.14.0.
   crates.io currently shows 0.13.1 as latest while 0.14.0 lands; **fallback**:
-  path-depend on the local siblings at
-  `/home/talos/code/strata/language-container-rs/crates/exasol-udf-sdk` and
-  `.../exasol-udf-macros` until 0.14.0 is downloadable.
+  path-depend on the sibling project's `exasol-udf-sdk` and `exasol-udf-macros` crates
+  (under its local `language-container-rs` checkout) until 0.14.0 is downloadable.
 - `datafusion` + `arrow`/`parquet` 58 (match the SLC's arrow 58).
 - `iceberg-rust` (Iceberg REST catalog) + an object_store / opendal S3 backend for MinIO.
 - Builder image `rust:1.92-bookworm`; Rust SLC from language-container-rs 0.14.0.
@@ -115,8 +114,8 @@ Iceberg/Parquet files in MinIO  →  rows back to Exasol
 ### Group A — Scaffolding (no dependencies)
 
 - [ ] A.1 Create workspace `Cargo.toml` (edition 2024) and the `lakehouse-engine` `cdylib` crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, and the SDK/macros deps (0.14.0 with documented path fallback).
-- [ ] A.2 Add the Makefile with `cross-musl-udf-build` (docker run in `rust:1.92-bookworm`, `-p lakehouse-engine`, output `target/release/liblakehouse_engine.so`, persistent cargo registry volume) and `test-e2e` (gated `--features exasol-e2e`), mirroring `strata-rs`.
-- [ ] A.3 Add Docker compose overlays for MinIO + Iceberg REST catalog + Exasol on a shared network (BucketFS port 2581, MinIO 9000), mirroring `strata-rs/docker-compose.exasol.yml`.
+- [ ] A.2 Add the Makefile with `cross-musl-udf-build` (docker run in `rust:1.92-bookworm`, `-p lakehouse-engine`, output `target/release/liblakehouse_engine.so`, persistent cargo registry volume) and `test-e2e` (gated `--features exasol-e2e`), mirroring the sibling project.
+- [ ] A.3 Add Docker compose overlays for MinIO + Iceberg REST catalog + Exasol on a shared network (BucketFS port 2581, MinIO 9000), mirroring the sibling project's docker-compose setup.
 
 ### Group B — Two entry points + scan core
 
