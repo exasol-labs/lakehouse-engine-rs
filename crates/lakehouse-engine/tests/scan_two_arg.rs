@@ -144,6 +144,7 @@ fn scan_spec(file_url: String) -> ScanSpec {
         group_keys: None,
         emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
@@ -286,6 +287,7 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
