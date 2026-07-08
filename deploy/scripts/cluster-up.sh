@@ -6,9 +6,12 @@
 #
 #   AWS_PROFILE=spot-strata-deployer ./cluster-up.sh <env_name>
 #
-# Requires the EC2 private key locally (RSA PEM). Override its path with KEY_FILE=... (default
-# ~/.ssh/<key_pair_name>). c4 resolves CCC_HOST_KEY_PAIR_FILE (a bare name) in ~/.ssh, so the key is
-# copied there.
+# Needs the EC2 private key. Override its path with KEY_FILE=... (default ~/.ssh/<key_pair_name>).
+# If it isn't present locally, it is auto-fetched from SSM SecureString at
+# /spot-strata/deploy/ssh_key/<key_pair_name> (the shared cluster key; same source of truth as the
+# cluster passwords) — so a teammate with deployer credentials needs NO manual key-sharing step.
+# Seed/rotate that SSM key with ./rotate-cluster-key.sh. c4 resolves CCC_HOST_KEY_PAIR_FILE (a bare
+# name) in ~/.ssh, so the key is copied there.
 set -euo pipefail
 
 ENV="${1:?usage: cluster-up.sh <env_name>}"
@@ -36,8 +39,30 @@ KEY_NAME="$(jqr '.key_pair_name.value')"
 CL_SSM="$(jqr '.ssm_root.value')"
 NODE1="${EXT_IPS[0]}"
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/${KEY_NAME}}"
+SSH_KEY_SSM="/spot-strata/deploy/ssh_key/${KEY_NAME}"
 
-[ -f "$KEY_FILE" ] || { echo "private key not found: $KEY_FILE (set KEY_FILE=...)"; exit 1; }
+# If the private key isn't present locally, fetch the shared key from SSM SecureString — the same
+# single source of truth as the cluster passwords below, so a teammate with deployer creds needs no
+# manual key-sharing. Security: the key material is written straight into a 0600 file (mktemp always
+# creates mode 0600) and moved atomically into place; it never touches stdout/stderr and is never
+# world/group-readable, even transiently. A failed fetch (missing param / no permission) removes the
+# temp and falls through to the original hard error — the failure is not swallowed.
+if [ ! -f "$KEY_FILE" ]; then
+  echo "==> private key not found locally ($KEY_FILE); fetching shared key from SSM $SSH_KEY_SSM" >&2
+  mkdir -p "$(dirname "$KEY_FILE")"
+  KEY_TMP="$(mktemp "$(dirname "$KEY_FILE")/.ssh-key-fetch.XXXXXX")"
+  if aws ssm get-parameter --with-decryption --name "$SSH_KEY_SSM" \
+        --query 'Parameter.Value' --output text >"$KEY_TMP" 2>/dev/null && [ -s "$KEY_TMP" ]; then
+    chmod 600 "$KEY_TMP"
+    mv -f "$KEY_TMP" "$KEY_FILE"
+    echo "==> fetched shared key from SSM to $KEY_FILE (mode 0600)" >&2
+  else
+    rm -f "$KEY_TMP"
+    echo "==> SSM fetch failed for $SSH_KEY_SSM (parameter missing or no permission)" >&2
+  fi
+fi
+
+[ -f "$KEY_FILE" ] || { echo "private key not found: $KEY_FILE (set KEY_FILE=..., or seed it in SSM at $SSH_KEY_SSM via rotate-cluster-key.sh)"; exit 1; }
 KEY_BASE="$(basename "$KEY_FILE")"
 
 ssm() { aws ssm get-parameter --with-decryption --name "$1" --query 'Parameter.Value' --output text; }
