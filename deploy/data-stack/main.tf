@@ -383,3 +383,13 @@ resource "aws_s3_object" "spark_queries" {
   source = "${path.module}/../scripts/spark_queries.py"
   etag   = filemd5("${path.module}/../scripts/spark_queries.py")
 }
+
+# One-time delete-prep entrypoint (deploy/scripts/make-deletes-remote.sh submits this). Under the same
+# scripts/ prefix the job role's S3ScriptRead statement already covers — no IAM change needed.
+resource "aws_s3_object" "make_deletes_remote" {
+  count  = var.enable_emr_serverless ? 1 : 0
+  bucket = aws_s3_bucket.warehouse.id
+  key    = "scripts/make_deletes_remote.py"
+  source = "${path.module}/../scripts/make_deletes_remote.py"
+  etag   = filemd5("${path.module}/../scripts/make_deletes_remote.py")
+}
