@@ -18,7 +18,7 @@ benefit automatically without code changes.
 
 **Q:** Should a GitHub tracking issue be filed?
 **A:** Yes — project convention (CLAUDE.md "Feature tracking"): file via
-`ghbrk gh issue create` before/at the start of work and reference it with `Closes #<n>`
+`gh issue create` before/at the start of work and reference it with `Closes #<n>`
 in the implementing commit. Include filing it as the first task (or note git-pr-agent
 files it).
 

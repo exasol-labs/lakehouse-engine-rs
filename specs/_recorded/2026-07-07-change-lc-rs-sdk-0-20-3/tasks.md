@@ -1,7 +1,7 @@
 # Tasks: change-lc-rs-sdk-0-20-3
 
 ## Phase 1: Tracking issue
-- [x] 1 File the GitHub tracking issue first (orchestrator: `ghbrk gh issue create`) -> #75
+- [x] 1 File the GitHub tracking issue first (orchestrator: `gh issue create`) -> #75
 
 ## Phase 2: Implementation (Group A — manifest + doc edits + lock refresh)
 - [x] 2 Bump exasol-udf-sdk to 0.20.3 in /Cargo.toml
