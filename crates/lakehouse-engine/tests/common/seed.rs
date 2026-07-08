@@ -202,11 +202,28 @@ where
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
-    // Short-circuit if already populated.
-    if let Some(paths) = existing_data_file_paths(catalog, &ident).await?
-        && !paths.is_empty()
+    // Short-circuit only if the table is already populated AND its persisted
+    // schema still matches the seed's expected schema. The Docker warehouse
+    // outlives individual test runs, so a table seeded by an earlier revision
+    // can carry a stale schema (missing columns a later seed added). Reuse it
+    // only when the schema still matches; otherwise drop it so it is recreated
+    // with the expected schema rather than silently pinning the old columns.
+    if catalog
+        .table_exists(&ident)
+        .await
+        .context("check table exists")?
     {
-        return Ok(false);
+        let table = catalog.load_table(&ident).await.context("load table")?;
+        let populated = !collect_current_snapshot_paths(&table).await?.is_empty();
+        let schema_matches = schema_field_signature(table.metadata().current_schema())
+            == schema_field_signature(&iceberg_schema);
+        if populated && schema_matches {
+            return Ok(false);
+        }
+        catalog
+            .drop_table(&ident)
+            .await
+            .context("drop stale-schema table before reseed")?;
     }
 
     if !catalog
@@ -551,6 +568,20 @@ async fn write_one_data_file<C: Catalog>(
         .into_iter()
         .next()
         .context("data file writer produced no file for the id range")
+}
+
+/// The ordered `(name, type)` signature of an Iceberg schema's top-level fields.
+/// Detects when a persisted table's schema has drifted from the seed's expected
+/// schema (e.g. a seeded table gained columns in a later revision), so a stale
+/// table on the persistent Docker warehouse is dropped and reseeded instead of
+/// silently pinning the old columns.
+fn schema_field_signature(schema: &IcebergSchema) -> Vec<(String, Type)> {
+    schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.name.clone(), (*f.field_type).clone()))
+        .collect()
 }
 
 async fn existing_data_file_paths<C: Catalog>(
