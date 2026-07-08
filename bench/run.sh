@@ -81,6 +81,36 @@ build_conn_password_local() {
   printf '%s' '{"warehouse":"s3://warehouse/","endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","path_style":true,"use_sigv4":false,"use_vended_credentials":false}'
 }
 
+# ---- delete-bearing benchmark (BENCH_WITH_DELETES) pure helpers --------------
+# Kept above the selftest block (like build_conn_password_* / build_vs_extra_props)
+# so `run.sh selftest` can exercise them offline with no DB.
+
+# Report-header annotation: empty when deletes are OFF, a "\ndeletes=on ns=<ns>"
+# line when ON (appended to the namespace= header line).
+delete_header_suffix() {  # with_deletes ns -> "" | "\ndeletes=on ns=<ns>"
+  [ "$1" = "1" ] && printf '\ndeletes=on ns=%s' "$2" || printf ''
+}
+
+# Delete-count sanity: exit 0 iff delete_count/baseline_count is in [0.90, 0.98]
+# (the deterministic 5% modulo deletes applied on read -> ~0.95; guards against
+# deletes being ignored (ratio ~1.0) or over-applied (ratio < 0.90)). Pure/offline
+# (awk only) so the selftest can call it with literal numbers, no DB.
+delete_ratio_ok() {  # delete_count baseline_count -> 0 if ratio in [0.90,0.98]
+  awk -v d="$1" -v b="$2" 'BEGIN{ if (b<=0){exit 1} r=d/b; exit (r>=0.90 && r<=0.98) ? 0 : 1 }'
+}
+
+# Delete-namespace default resolution: an explicit override always wins; otherwise
+# docker derives "<baseline>_deletes" (mirrors the local stack's namespace naming),
+# other targets default to the fixed "tpch_deletes" (remote Glue catalog namespace).
+resolve_delete_ns() {  # target baseline_ns override -> the effective delete namespace
+  local target="$1" baseline="$2" override="$3"
+  if [ -n "$override" ]; then printf '%s' "$override"; return; fi
+  case "$target" in
+    docker) printf '%s_deletes' "$baseline";;
+    *)      printf 'tpch_deletes';;
+  esac
+}
+
 # ---- offline self-check: the only non-trivial string logic (ponytail) --------
 if [ "${1:-}" = "selftest" ]; then
   GLUE_WAREHOUSE="s3://b/w/" AWS_REGION=r AWS_ACCESS_KEY_ID=k \
@@ -109,6 +139,26 @@ if [ "${1:-}" = "selftest" ]; then
   bs_props="$(BENCH_DF_BATCH_SIZE=131072 build_vs_extra_props false 8 8)"
   case "$bs_props" in *"PARALLELISM_FACTOR"*"'8'"*"DATAFUSION_BATCH_SIZE"*"'131072'"*) ;; \
     *) echo "FAIL: DATAFUSION_BATCH_SIZE append shape: $bs_props"; exit 1;; esac
+  # delete_header_suffix: empty when OFF, "deletes=on ns=<ns>" when ON.
+  off_suffix="$(delete_header_suffix 0 anything)"
+  case "$off_suffix" in "") ;; *) echo "FAIL: delete_header_suffix OFF must be empty: $off_suffix"; exit 1;; esac
+  on_suffix="$(delete_header_suffix 1 mydeletens)"
+  case "$on_suffix" in *"deletes=on"*"mydeletens"*) ;; \
+    *) echo "FAIL: delete_header_suffix ON shape: $on_suffix"; exit 1;; esac
+  # delete_ratio_ok: accepts the [0.90,0.98] band (inclusive), rejects below/above it.
+  if ! delete_ratio_ok 95 100; then echo "FAIL: delete_ratio_ok should accept 0.95 ratio"; exit 1; fi
+  if delete_ratio_ok 80 100; then echo "FAIL: delete_ratio_ok should reject 0.80 ratio"; exit 1; fi
+  if delete_ratio_ok 100 100; then echo "FAIL: delete_ratio_ok should reject 1.00 ratio (deletes not applied)"; exit 1; fi
+  if ! delete_ratio_ok 90 100; then echo "FAIL: delete_ratio_ok should accept boundary 0.90"; exit 1; fi
+  if ! delete_ratio_ok 98 100; then echo "FAIL: delete_ratio_ok should accept boundary 0.98"; exit 1; fi
+  # resolve_delete_ns: docker default derives "<baseline>_deletes", other targets
+  # default to "tpch_deletes", and an explicit override always wins.
+  case "$(resolve_delete_ns docker tpch "")" in tpch_deletes) ;; \
+    *) echo "FAIL: resolve_delete_ns docker default: $(resolve_delete_ns docker tpch "")"; exit 1;; esac
+  case "$(resolve_delete_ns remote tpch "")" in tpch_deletes) ;; \
+    *) echo "FAIL: resolve_delete_ns remote default: $(resolve_delete_ns remote tpch "")"; exit 1;; esac
+  case "$(resolve_delete_ns docker tpch mycustomns)" in mycustomns) ;; \
+    *) echo "FAIL: resolve_delete_ns override: $(resolve_delete_ns docker tpch mycustomns)"; exit 1;; esac
   echo "selftest OK"; exit 0
 fi
 
@@ -128,7 +178,7 @@ EXA_PORT="${LH_EXASOL_PORT:-28563}"
 BFS_PORT="${LH_BUCKETFS_PORT:-22581}"
 TPCH_SCALE="${TPCH_SCALE:-0.3}"
 
-SLC_VERSION="${BENCH_SLC_VERSION:-0.16.0}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
+SLC_VERSION="${BENCH_SLC_VERSION:-0.20.3}"  # matches the .so ABI fingerprint; do not "upgrade" blindly
 # BucketFS object path for the .so, as referenced by %udf_object in CREATE SCRIPT.
 SO_UDF_OBJECT="${BENCH_SO_UDF_OBJECT:-buckets/bfsdefault/default/udf/liblakehouse_engine.so}"
 # Debug level forwarded to the UDF via %udf_debug_level (0.19.0+ live debug surface).
@@ -172,6 +222,18 @@ case "$TARGET" in
     ;;
   *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;
 esac
+
+# ---- BENCH_WITH_DELETES: run the suite against a delete-bearing namespace -----
+# OFF (default 0): inert. NAMESPACE stays the baseline resolved in the case block
+# above, and every block gated on WITH_DELETES=1 below is skipped -> the OFF path
+# is byte-for-byte today's behavior. ON: capture the baseline ns and resolve the
+# delete ns (default per mode, override via BENCH_DELETE_NAMESPACE); the actual
+# NAMESPACE swap happens AFTER data load so tpch_loader still populates BASELINE_NS.
+WITH_DELETES="${BENCH_WITH_DELETES:-0}"
+if [ "$WITH_DELETES" = "1" ]; then
+  BASELINE_NS="$NAMESPACE"
+  DELETE_NS="$(resolve_delete_ns "$TARGET" "$BASELINE_NS" "${BENCH_DELETE_NAMESPACE:-}")"
+fi
 
 DSN="exasol://sys:${SYS_PASS}@${HOST}:${EXA_PORT}?validateservercertificate=0"
 mkdir -p "$SCRIPT_DIR/reports"
@@ -229,8 +291,20 @@ if [ "$TARGET" = "docker" ]; then
   echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
   TPCH_SCALE="$TPCH_SCALE" ICEBERG_NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
     cargo test --features exasol-e2e --test tpch_loader -- --nocapture
+  if [ "$WITH_DELETES" = "1" ]; then
+    echo "== authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent) =="
+    "$SCRIPT_DIR/make_deletes_docker.sh" "$BASELINE_NS" "$DELETE_NS"
+  fi
 else
   wait_exasol
+fi
+
+# With deletes ON, everything below (VS build, timed queries, pushdown checks, row
+# counts) targets the delete-bearing namespace; the baseline was just loaded
+# (docker) / pre-exists (remote) and stays reachable via BASELINE_NS for the
+# delete-count sanity check.
+if [ "$WITH_DELETES" = "1" ]; then
+  NAMESPACE="$DELETE_NS"
 fi
 
 # ---- install SLC + upload .so (or skip if already staged in BucketFS) --------
@@ -266,12 +340,24 @@ RETURNS DECIMAL(20,0) AS
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' IDENTIFIED BY '${CONN_PW}'"
-sql "DROP VIRTUAL SCHEMA IF EXISTS ${VS} CASCADE" || true
-sql "CREATE VIRTUAL SCHEMA ${VS}
+# Build a virtual schema against a given namespace (idempotent DROP+CREATE). Called
+# once normally; when BENCH_WITH_DELETES=1 it is called a SECOND time to build a
+# lightweight ${VS}_BASELINE against the untouched baseline ns so the delete-count
+# sanity check can compare LINEITEM row counts. Reuses the same adapter/scan/merge
+# scripts + CATALOG connection + VS_EXTRA_PROPS; only the name + namespace differ.
+build_vs() {  # vs_name namespace
+  sql "DROP VIRTUAL SCHEMA IF EXISTS $1 CASCADE" || true
+  sql "CREATE VIRTUAL SCHEMA $1
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION  = '${CONN}'
-  ICEBERG_NAMESPACE   = '${NAMESPACE}'
+  ICEBERG_NAMESPACE   = '$2'
   SCAN_SCHEMA         = '${SCHEMA}'${VS_EXTRA_PROPS}"
+}
+build_vs "${VS}" "${NAMESPACE}"
+if [ "$WITH_DELETES" = "1" ]; then
+  echo "== building baseline VS '${VS}_BASELINE' (ns '${BASELINE_NS}') for delete-count sanity =="
+  build_vs "${VS}_BASELINE" "${BASELINE_NS}"
+fi
 
 # Telemetry harness hook (Task 6.2): build scripts+VS then stop, so a separate
 # single-leg session can drive queries under a SCRIPT_OUTPUT_ADDRESS redirect
@@ -290,11 +376,26 @@ fi
 
 {
   echo "lakehouse-engine benchmark — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
-  echo "namespace=${NAMESPACE}"
+  printf 'namespace=%s%s\n' "${NAMESPACE}" "$(delete_header_suffix "$WITH_DELETES" "${DELETE_NS:-}")"
   echo
   echo "== tables exposed by ${VS} =="
 } | tee "$REPORT"
 sqlf "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA='${VS}' ORDER BY TABLE_NAME" | tee -a "$REPORT"
+
+# Remote mode never loads data: when BENCH_WITH_DELETES=1 the delete namespace must
+# have been pre-authored (deploy/scripts/make-deletes-remote.sh). Hard-stop if the
+# VS exposes no tables — unlike run_query's soft FAILED, nothing downstream can
+# produce meaningful results against an empty virtual schema.
+if [ "$TARGET" = "remote" ] && [ "$WITH_DELETES" = "1" ]; then
+  ntab="$(query_scalar "SELECT COUNT(*) FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA='${VS}'")"
+  if [ "${ntab:-0}" -gt 0 ] 2>/dev/null; then
+    echo "  OK    delete namespace '${NAMESPACE}' resolves ${ntab} table(s) via ${VS}" | tee -a "$REPORT"
+  else
+    echo "ERROR: BENCH_WITH_DELETES=1 but delete namespace '${NAMESPACE}' exposes no tables via ${VS}." | tee -a "$REPORT"
+    echo "       Author it once first: deploy/scripts/make-deletes-remote.sh (see its header for required env vars)" | tee -a "$REPORT"
+    exit 1
+  fi
+fi
 
 # ---- wiring correctness: per-table row counts (docker = known TPC-H sizes) ----
 check_count() {  # table expected(optional, empty = just assert > 0)
@@ -308,10 +409,33 @@ check_count() {  # table expected(optional, empty = just assert > 0)
     echo "  FAIL  ${t}: got '${n:-<none>}', expected > 0"; FAILED=1
   fi
 }
+# Delete-count sanity (BENCH_WITH_DELETES): compare LINEITEM in the delete ns
+# (${VS}, now the delete ns) against the untouched baseline (${VS}_BASELINE). Mirrors
+# check_count's OK/FAIL + FAILED=1 convention, but runs in the MAIN shell (tee inside,
+# like run_query — NOT a `{ } | tee` subshell) so FAILED actually propagates. The pure
+# bounds test is delete_ratio_ok (offline-selftested).
+check_delete_ratio() {
+  local del base pct
+  { echo; echo "== delete-count sanity (LINEITEM 90-98% of baseline) =="; } | tee -a "$REPORT"
+  del="$(query_scalar "SELECT COUNT(*) FROM ${VS}.LINEITEM")"
+  base="$(query_scalar "SELECT COUNT(*) FROM ${VS}_BASELINE.LINEITEM")"
+  pct="$(awk -v d="${del:-0}" -v b="${base:-0}" 'BEGIN{ if (b>0) printf "%.1f", d/b*100 }')"
+  if delete_ratio_ok "${del:-0}" "${base:-0}"; then
+    echo "  OK    delete-count LINEITEM: ${del} (~${pct}% of baseline ${base})" | tee -a "$REPORT"
+  else
+    echo "  FAIL  delete-count LINEITEM: ${del:-<none>} (${pct:-?}% of baseline ${base:-<none>}); expected 90-98%" | tee -a "$REPORT"
+    FAILED=1
+  fi
+}
 if [ "$TARGET" = "docker" ]; then
   { echo; echo "== row counts (REGION/NATION are scale-independent) =="; } | tee -a "$REPORT"
-  { check_count REGION 5
-    check_count NATION 25
+  # With deletes ON the small dims lose 0-1 rows (R_REGIONKEY 0, N_NATIONKEY 0/20
+  # satisfy key%20=0), so their exact baseline counts no longer hold — assert only
+  # > 0 for them when ON. The cost-dominant tables already assert only > 0.
+  region_exp=5; nation_exp=25
+  if [ "$WITH_DELETES" = "1" ]; then region_exp=""; nation_exp=""; fi
+  { check_count REGION "$region_exp"
+    check_count NATION "$nation_exp"
     check_count SUPPLIER
     check_count CUSTOMER
     check_count PART
@@ -319,6 +443,12 @@ if [ "$TARGET" = "docker" ]; then
     check_count ORDERS
     check_count LINEITEM
   } | tee -a "$REPORT"
+fi
+
+# Delete-count sanity (flag-gated, both modes): LINEITEM in the delete ns must be
+# 90-98% of the baseline ns — proves the 5% position deletes are applied on read.
+if [ "$WITH_DELETES" = "1" ]; then
+  check_delete_ratio
 fi
 
 # ---- TPC-H JOIN query set: plain SELECTs with wall-clock (first perf signal) --
