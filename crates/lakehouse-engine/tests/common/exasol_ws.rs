@@ -1,6 +1,6 @@
 //! Minimal Exasol WebSocket SQL client for E2E tests.
 //!
-//! Mirrors strata-rs/tests/common/exasol_ws.rs but is self-contained.
+//! Mirrors the sibling project's tests/common/exasol_ws.rs but is self-contained.
 //! Implements just enough of the Exasol WebSocket API v3 to authenticate,
 //! execute SQL, and fetch scalar / multi-row results.
 

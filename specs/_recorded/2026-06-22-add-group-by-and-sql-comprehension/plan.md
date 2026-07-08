@@ -23,7 +23,7 @@ Still valid and retained from the prior plan: the `crates/vs-expression` crate (
 - **Non-Goals**
   - HAVING, COUNT(DISTINCT), join pushdown.
   - A file-count or statistics-based cardinality guard (removed — superseded by the memory pool + spill).
-  - Wiring `crates/vs-expression` into sibling strata-rs in this plan.
+  - Wiring `crates/vs-expression` into the sibling project in this plan.
   - Implementing `UdfContext::memory_limit()` itself (owned by `language-container-rs:add-memory-limit-metadata`).
 
 ### Decision
@@ -69,7 +69,7 @@ Two-level grouping composes: the inner `GROUP BY shard_key` parallelizes the sca
 | Partial/merge decomposition | scan/mod.rs grouped path | Same correctness as ADR-008: SUM→SUM, MIN→MIN, MAX→MAX, AVG→(sum,count) pair |
 | Group-key values as plain columns (GK_n) | scan + wrapper | Avoids cross-language expression-rendering mismatch; wrapper groups on column positions |
 | Metadata-sized memory pool + spill backstop | scan/runtime.rs | Bounds per-instance memory under the engine's 80% stall threshold; spill lets high-cardinality grouped queries complete, hardcap fails cleanly instead of OOM |
-| Standalone workspace crate | crates/vs-expression | Decouples translation from engine internals; enables strata-rs reuse |
+| Standalone workspace crate | crates/vs-expression | Decouples translation from engine internals; enables reuse by the sibling project |
 
 #### Memory-safety mechanism (replaces the old file-count guard)
 

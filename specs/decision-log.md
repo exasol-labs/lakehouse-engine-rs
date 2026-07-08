@@ -24,7 +24,7 @@ Ship the VS adapter and the DataFusion scan SET UDF as two `#[exasol_udf]` entry
 | Option | Verdict |
 |--------|---------|
 | One crate / one `.so` with two entry points | ✓ Chosen — 0.14.0 supports it; one artifact halves deploy surface and exercises the new capability under test |
-| Two crates / two `.so` files (pre-0.14.0 strata-rs shape) | ✗ Rejected — doubles BucketFS upload surface; unnecessary given 0.14.0 capability |
+| Two crates / two `.so` files (the sibling project's pre-0.14.0 shape) | ✗ Rejected — doubles BucketFS upload surface; unnecessary given 0.14.0 capability |
 
 ### Consequences
 
@@ -40,7 +40,7 @@ One BucketFS upload suffices for both scripts. The build target is single-crate,
 
 ### Context
 
-The VS adapter must return a pushdown response to Exasol. In the sibling project strata-rs, the adapter calls a `populate_cache()` library function via connect-back and returns a plain `SELECT` from a cache table. The mission explicitly lists caching and materialization as non-goals; the PoC hypothesis is DataFusion-in-UDF as the distributed execution substrate.
+The VS adapter must return a pushdown response to Exasol. In the sibling project, the adapter calls a `populate_cache()` library function via connect-back and returns a plain `SELECT` from a cache table. The mission explicitly lists caching and materialization as non-goals; the PoC hypothesis is DataFusion-in-UDF as the distributed execution substrate.
 
 ### Decision
 
@@ -51,7 +51,7 @@ The adapter's `pushdown` response is SQL that invokes the scan SET UDF with an e
 | Option | Verdict |
 |--------|---------|
 | Adapter returns SQL invoking a DataFusion scan SET UDF | ✓ Chosen — proves the PoC hypothesis; execution lives in DataFusion as intended |
-| Mirror strata-rs: populate_cache() via connect-back, return SELECT from cache | ✗ Rejected — caching/materialization are explicit mission non-goals; would not test DataFusion-in-UDF execution path |
+| Mirror the sibling project: populate_cache() via connect-back, return SELECT from cache | ✗ Rejected — caching/materialization are explicit mission non-goals; would not test DataFusion-in-UDF execution path |
 
 ### Consequences
 
@@ -179,7 +179,7 @@ One connect-back at schema creation time; zero connect-back overhead at pushdown
 
 ### Context
 
-The adapter must distribute N file shards across N Exasol cluster nodes so each node's DataFusion UDF invocation scans only its own shard. Exasol's IPROC() function identifies the current execution node; GROUP BY over IPROC() causes Exasol to route each group to a distinct node when driving a SET UDF. No existing pattern in the sibling project strata-rs covers IPROC-based fan-out (strata-rs uses a single-invocation cache UDF with no IPROC/NPROC use), so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
+The adapter must distribute N file shards across N Exasol cluster nodes so each node's DataFusion UDF invocation scans only its own shard. Exasol's IPROC() function identifies the current execution node; GROUP BY over IPROC() causes Exasol to route each group to a distinct node when driving a SET UDF. No existing pattern in the sibling project covers IPROC-based fan-out (the sibling project uses a single-invocation cache UDF with no IPROC/NPROC use), so the fan-out was designed from Exasol's native SET-UDF distribution idiom.
 
 ### Decision
 
@@ -235,7 +235,7 @@ Network transfer is bounded to one partial-result row per shard, regardless of h
 
 ### Context
 
-The VS adapter needed to translate Exasol pushdown expression-JSON nodes (column references, literals, comparison predicates, logical connectives, arithmetic, CAST, IN, BETWEEN, LIKE, IS NULL) into DataFusion SQL fragments for both filter pushdown and GROUP BY key rendering. The existing walker lived in `adapter/predicate.rs` inside `lakehouse-engine`, tightly coupled to engine internals and unreusable by the sibling `strata-rs` project.
+The VS adapter needed to translate Exasol pushdown expression-JSON nodes (column references, literals, comparison predicates, logical connectives, arithmetic, CAST, IN, BETWEEN, LIKE, IS NULL) into DataFusion SQL fragments for both filter pushdown and GROUP BY key rendering. The existing walker lived in `adapter/predicate.rs` inside `lakehouse-engine`, tightly coupled to engine internals and unreusable by the sibling project.
 
 ### Decision
 
@@ -245,13 +245,13 @@ Create a standalone workspace crate (`crates/vs-expression`) containing the full
 
 | Option | Verdict |
 |--------|---------|
-| Standalone `crates/vs-expression` crate with no engine-internal deps | ✓ Chosen — clean, testable, reusable by strata-rs; supports future monorepo convergence |
-| Extend `adapter/predicate.rs` inline | ✗ Rejected — blocks strata-rs reuse; keeps expression logic coupled to engine internals |
+| Standalone `crates/vs-expression` crate with no engine-internal deps | ✓ Chosen — clean, testable, reusable by the sibling project; supports future monorepo convergence |
+| Extend `adapter/predicate.rs` inline | ✗ Rejected — blocks reuse by the sibling project; keeps expression logic coupled to engine internals |
 | Add a SQL-parser dependency (sqlparser-rs) as the IR | ✗ Rejected — user declined; overweight for a narrow translation job; serde_json walker is proven |
 
 ### Consequences
 
-Expression translation is a separate, testable, reusable unit. The three-function public API (raising, safe, filter-safe) is stable and minimal. Long-term monorepo convergence with strata-rs is straightforward. `adapter/predicate.rs` is deleted; any future predicate coverage goes in `vs-expression`.
+Expression translation is a separate, testable, reusable unit. The three-function public API (raising, safe, filter-safe) is stable and minimal. Long-term monorepo convergence with the sibling project is straightforward. `adapter/predicate.rs` is deleted; any future predicate coverage goes in `vs-expression`.
 
 ---
 
@@ -477,7 +477,7 @@ The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never 
 
 ---
 
-## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror strata-rs)
+## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
 
 **Date:** 2026-06-23
 **Plan:** `add-glue-catalog-sigv4-connection`
@@ -485,7 +485,7 @@ The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never 
 
 ### Context
 
-The engine previously read catalog URI and S3 credentials straight from plain VS properties (`CATALOG_URI`, `ACCESS_KEY`, `SECRET_KEY`, etc.). This means credentials appear in the `CREATE VIRTUAL SCHEMA` SQL text, are visible to anyone who can read the query profile, and cannot be rotated without re-issuing the DDL. The strata-rs sibling project already uses Exasol CONNECTION objects to solve this problem, with `ctx.connection(name)` returning `{address, password}` where the password is a JSON credential block.
+The engine previously read catalog URI and S3 credentials straight from plain VS properties (`CATALOG_URI`, `ACCESS_KEY`, `SECRET_KEY`, etc.). This means credentials appear in the `CREATE VIRTUAL SCHEMA` SQL text, are visible to anyone who can read the query profile, and cannot be rotated without re-issuing the DDL. The sibling project already uses Exasol CONNECTION objects to solve this problem, with `ctx.connection(name)` returning `{address, password}` where the password is a JSON credential block.
 
 ### Decision
 
@@ -495,7 +495,7 @@ Read the catalog URI and all S3/signing credentials from `ctx.connection(<CATALO
 
 | Option | Verdict |
 |--------|---------|
-| CONNECTION object via `ctx.connection` (mirror strata-rs) | ✓ Chosen — keeps secrets out of SQL text; Exasol access-controls the CONNECTION; mirrors the existing sibling convention |
+| CONNECTION object via `ctx.connection` (mirror the sibling project) | ✓ Chosen — keeps secrets out of SQL text; Exasol access-controls the CONNECTION; mirrors the existing sibling convention |
 | Keep reading plain VS properties | ✗ Rejected — leaks credentials into `CREATE VIRTUAL SCHEMA` text and query profile; no rotation without DDL change |
 | Inject credentials via request JSON | ✗ Rejected — not how the SDK surfaces them; would require a custom request-shape convention |
 
@@ -551,7 +551,7 @@ After the self-issued signed `load_table` GET (see ADR-019), the adapter extract
 
 | Option | Verdict |
 |--------|---------|
-| Resolve vended creds once in the planning layer, embed in each ScanSpec | ✓ Chosen — honours resolve-once and stateless-UDF invariants; mirrors strata-rs shape |
+| Resolve vended creds once in the planning layer, embed in each ScanSpec | ✓ Chosen — honours resolve-once and stateless-UDF invariants; mirrors the sibling project's shape |
 | Rely on `iceberg-catalog-rest` to auto-apply vended creds | ✗ Rejected — 0.9.1 silently drops `storage_credentials`; not viable |
 | Re-vend per node inside the scan UDF | ✗ Rejected — violates resolve-once invariant; adds catalog access to the UDF |
 
@@ -809,7 +809,7 @@ Any query with an `OR` involving a non-translatable predicate receives no Iceber
 
 ### Context
 
-Iceberg file-level pruning requires constructing `iceberg::expr::Predicate` values from the Exasol filter JSON. Two candidate homes exist: the shared `crates/vs-expression` crate (already parses and translates Exasol filter JSON for DataFusion) or a new lakehouse-engine-specific module. The `vs-expression` crate is designed to be shared with the sibling `strata-rs` project and is intentionally free of `iceberg-rust` dependencies.
+Iceberg file-level pruning requires constructing `iceberg::expr::Predicate` values from the Exasol filter JSON. Two candidate homes exist: the shared `crates/vs-expression` crate (already parses and translates Exasol filter JSON for DataFusion) or a new lakehouse-engine-specific module. The `vs-expression` crate is designed to be shared with the sibling project and is intentionally free of `iceberg-rust` dependencies.
 
 ### Decision
 
@@ -819,12 +819,12 @@ Author a dedicated `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs` mo
 
 | Option | Verdict |
 |--------|---------|
-| New `adapter/iceberg_predicate.rs` in lakehouse-engine | ✓ Chosen — keeps `iceberg-rust` types out of the strata-rs-shared `vs-expression` crate; iceberg coupling lives only where iceberg is already a dependency |
-| Extend `vs-expression` to also emit `iceberg::expr::Predicate` | ✗ Rejected — would add `iceberg-rust` as a dependency of `vs-expression`, polluting the strata-rs cross-project sharing contract |
+| New `adapter/iceberg_predicate.rs` in lakehouse-engine | ✓ Chosen — keeps `iceberg-rust` types out of the cross-project-shared `vs-expression` crate; iceberg coupling lives only where iceberg is already a dependency |
+| Extend `vs-expression` to also emit `iceberg::expr::Predicate` | ✗ Rejected — would add `iceberg-rust` as a dependency of `vs-expression`, polluting the cross-project sharing contract |
 
 ### Consequences
 
-`vs-expression` remains `iceberg-rust`-free and sharable with `strata-rs` unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future strata-rs project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
+`vs-expression` remains `iceberg-rust`-free and sharable with the sibling project unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future sibling project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
 
 ## ADR-031: Adopt Arrow-IPC `emit_batch` on the Raw-Row Scan Path
 
