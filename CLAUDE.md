@@ -6,7 +6,7 @@ Project mission in: @specs/mission.md
 
 ## Feature tracking
 
-- **New features are tracked as GitHub issues** (`ghbrk gh issue create`) before/at the start of
+- **New features are tracked as GitHub issues** (`gh issue create`) before/at the start of
   work, in addition to speq spec deltas. Reference the issue in the implementing commit
   (`Closes #<n>`) so the work and its tracking stay linked.
 

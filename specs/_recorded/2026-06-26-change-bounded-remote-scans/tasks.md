@@ -17,7 +17,7 @@
 - [x] 2.2 Update emit_stream unit test for IPC batch emit + no-Vec<Value> invariant; repoint/remove dead batch_to_rows on raw path
 
 ## Phase 2: Implementation (Group C — tracking + docs, mechanical)
-- [x] 6.1 Open GitHub issue (ghbrk gh issue create); reference in implementing commit (Closes #n)
+- [x] 6.1 Open GitHub issue (gh issue create); reference in implementing commit (Closes #n)
 - [x] 6.2 Update CLAUDE.md SDK-version + emit-buffering notes for emit_batch guidance
 
 ## Phase 4: Code Review
