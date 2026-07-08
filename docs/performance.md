@@ -4,9 +4,9 @@
 
 # Performance
 
-TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06; lakehouse-engine-rs column re-verified 2026-07-07 post lc-rs 0.20.3 (see §3 below for the A/B), then fully re-run again 2026-07-07 against `test1` on `feat/fix-join-decline-hard-fail` (PR #78) to confirm the #76 join-pushdown-decline fix. Competitor columns (Trino/Athena/Spark) are unchanged from 2026-07-06 — not re-run this pass.
+TPC-H sf=30 (8-table schema, `lineitem` 180M rows, 60 Parquet files, AWS Glue Iceberg catalog), same data for every engine. Live-verified 2026-07-06; lakehouse-engine-rs column re-verified 2026-07-07 post lc-rs 0.20.3 (see §3 below for the A/B), then fully re-run again 2026-07-07 against `test1` on `feat/fix-join-decline-hard-fail` (PR #78) to confirm the #76 join-pushdown-decline fix, and once more 2026-07-08 against a freshly-recreated `test1` cluster on `feat/add-delete-benchmark-flag` (PR #81) as a post-merge regression check — see §7. Competitor columns (Trino/Athena/Spark) are unchanged from 2026-07-06 — not re-run this pass.
 
-Q1, Q2, and NQ3 (previously broken by [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76), fixed in PR #78) re-verified passing as of 2026-07-07 — see §5. The full table below is a fresh clean re-run of all 15 queries on that date, superseding the prior 2026-07-06 lakehouse-engine-rs numbers.
+Q1, Q2, and NQ3 (previously broken by [#76](https://github.com/exasol-labs/lakehouse-engine-rs/issues/76), fixed in PR #78) re-verified passing as of 2026-07-07 — see §5. The full table below is a fresh clean re-run of all 15 queries on that date, superseding the prior 2026-07-06 lakehouse-engine-rs numbers, then superseded again by the 2026-07-08 re-run (§7).
 
 | Engine | Resources |
 |---|---|
@@ -20,21 +20,23 @@ Fastest time per query in **bold**.
 
 | Query | lakehouse-engine-rs | Trino (2-node) | Athena | Spark (EMR Serverless) | IMPORT FROM JDBC (Trino) |
 |---|---|---|---|---|---|
-| Q1 (3-way join, wiring) | **2.31 s** | 2.81 s | 2.43 s | 18.89 s | 3.13 s |
-| Q2 (3-way join, big scan) | 18.45 s | 9.71 s | **2.14 s** | 42.89 s | 8.77 s |
-| Q3 (join + filter + GROUP BY) | 15.55 s | 5.12 s | **2.37 s** | 29.20 s | 4.91 s |
-| Q4 (pricing summary, filter) | 5.56 s | **2.09 s** | 3.43 s | 18.94 s | 3.22 s |
-| Q5 (Q3, no filter) | 17.96 s | 6.63 s | **2.16 s** | 35.38 s | 7.57 s |
-| Q6 (Q4, no filter) | 4.27 s | **1.34 s** | 2.52 s | 16.52 s | 2.62 s |
-| Q7 (high-cardinality GROUP BY) | 6.89 s | **2.04 s** | 2.30 s | 12.15 s | 2.71 s |
-| Q8 (selective filter) | 3.18 s | **0.73 s** | 0.99 s | 4.38 s | 2.22 s |
-| Q9a (narrow projection) | 2.50 s | **0.65 s** | 1.57 s | 4.51 s | 2.15 s |
-| Q9b (wide projection) | **11.22 s** | 11.91 s | 27.93 s | 57.31 s | 12.78 s |
-| NQ1 (arithmetic aggregate: `SUM(price*discount)`) | 3.96 s | **1.91 s** | 2.27 s | 10.72 s | 3.26 s |
-| NQ2 (LIKE + IN filter pushdown) | 4.21 s | **2.38 s** | 2.71 s | 11.45 s | 3.67 s |
-| NQ3 (4-way join, part/partsupp) | 5.12 s | **1.55 s** | 4.45 s | 3.88 s | 2.47 s |
-| NQ4 (ORDER BY + LIMIT top-N) | 2.85 s | **1.62 s** | 2.34 s | 11.18 s | 2.88 s |
-| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.88 s | **0.54 s** | 2.06 s | 5.39 s | 2.18 s |
+| Q1 (3-way join, wiring) | **1.73 s** | 2.81 s | 2.43 s | 18.89 s | 3.13 s |
+| Q2 (3-way join, big scan) | 18.03 s | 9.71 s | **2.14 s** | 42.89 s | 8.77 s |
+| Q3 (join + filter + GROUP BY) | 15.06 s | 5.12 s | **2.37 s** | 29.20 s | 4.91 s |
+| Q4 (pricing summary, filter) | 5.70 s | **2.09 s** | 3.43 s | 18.94 s | 3.22 s |
+| Q5 (Q3, no filter) | 18.44 s | 6.63 s | **2.16 s** | 35.38 s | 7.57 s |
+| Q6 (Q4, no filter) | 4.40 s | **1.34 s** | 2.52 s | 16.52 s | 2.62 s |
+| Q7 (high-cardinality GROUP BY) | 7.27 s | **2.04 s** | 2.30 s | 12.15 s | 2.71 s |
+| Q8 (selective filter) | 3.27 s | **0.73 s** | 0.99 s | 4.38 s | 2.22 s |
+| Q9a (narrow projection) | 2.67 s | **0.65 s** | 1.57 s | 4.51 s | 2.15 s |
+| Q9b (wide projection) | **11.54 s** | 11.91 s | 27.93 s | 57.31 s | 12.78 s |
+| NQ1 (arithmetic aggregate: `SUM(price*discount)`) | 5.22 s | **1.91 s** | 2.27 s | 10.72 s | 3.26 s |
+| NQ2 (LIKE + IN filter pushdown) | 5.18 s | **2.38 s** | 2.71 s | 11.45 s | 3.67 s |
+| NQ3 (4-way join, part/partsupp) | 5.52 s | **1.55 s** | 4.45 s | 3.88 s | 2.47 s |
+| NQ4 (ORDER BY + LIMIT top-N) | 3.53 s | **1.62 s** | 2.34 s | 11.18 s | 2.88 s |
+| NQ5 (tuple GROUP BY + HAVING + AVG) | 2.07 s | **0.54 s** | 2.06 s | 5.39 s | 2.18 s |
+
+*(lakehouse-engine-rs column: 2026-07-08 numbers, §7. Prior 2026-07-07 column preserved in git history if needed for the #76-fix-specific comparison.)*
 
 Reproduce: `RUN_TRINO_COMPARISON=1 bench/compare_all.sh` ([`bench/README.md`](../bench/README.md)).
 
@@ -143,6 +145,42 @@ Also fixed in passing: `deploy/scripts/secrets.sh` still hardcoded the pre-0.20.
 mismatch (expected 0.20.2, `.so` built against 0.20.3) before the join fix could even be
 exercised on a freshly-provisioned `bench/.env`. Bumped to `0.20.3` to match the Makefile
 default and the SDK version this branch actually builds against.
+
+### 7. Post-merge regression re-run on a freshly-recreated `test1` cluster (2026-07-08)
+
+Full clean 15-query re-run against `test1` on `feat/add-delete-benchmark-flag` (PR #81, which merged
+`main` — including the join-pushdown-rendering change in #76's follow-up PR #78/e66b95a — mid-branch).
+Purpose was a general post-merge health check, not an investigation of a specific optimization: confirm
+the engine still performs consistently after the intervening `main` commits and this branch's own
+(bench-harness-only) changes, none of which touch query execution code.
+
+**Numbers are within normal cloud run-to-run noise of the 2026-07-07 baseline** — the same ±10-30%
+spread already characterized in §3's A/B methodology, no query regressed or improved outside that band
+except NQ1/NQ2/NQ4 (~20-32% slower) and NQ5 (~28% faster), all short (2-5s) queries where absolute noise
+dominates the percentage, same caveat as §3's Q9a/NQ4 footnote. No action taken; not a real signal.
+
+**Operational context for these numbers**: this was the first `test1` run after the cluster's EC2 key
+pair private key was discovered lost (nobody had a shared copy — see
+[#89](https://github.com/exasol-labs/lakehouse-engine-rs/issues/89)). The cluster was destroyed and
+recreated with a freshly generated key pair, this time stored in AWS SSM Parameter Store
+(SecureString, `/spot-strata/deploy/ssh_key/spot-strata-key`) so any deployer-credentialed teammate can
+access it going forward — no IAM change needed, `ssm:*` was already granted. Data (the persistent
+`tpch` Glue tables) was untouched by the cluster recreate.
+
+Also found and fixed in the same session, a SEPARATE recurrence of §5's stale-SLC-version bug: this
+time in `bench/run.sh`'s own hardcoded default (`0.16.0`, unrelated to `secrets.sh`'s already-fixed
+default), causing the same `F-UDF-CL-RUST-9001` fingerprint mismatch on any run not explicitly
+overriding `BENCH_SLC_VERSION`. Fixed to `0.20.3` (commit `fe6827b`,
+[#91](https://github.com/exasol-labs/lakehouse-engine-rs/issues/91)) — two independent hardcoded copies
+of this version number drifting independently suggests it may be worth a follow-up to derive both from
+one source instead.
+
+The new `BENCH_WITH_DELETES` flag (this branch's actual feature) was thoroughly verified live in
+**docker mode** (`~95% of baseline` delete-count sanity check passing, full query suite + pushdown
+checks green — see `specs/_plans/add-delete-benchmark-flag/verification-report.md`) but was **not**
+exercised against `test1` in this run — the one-time remote delete-authoring prerequisite
+(`deploy/scripts/make-deletes-remote.sh`) hasn't been run against this cluster's Glue tables yet. Left
+as a follow-up, not a completion gate for PR #81.
 
 ### 6. Small/narrow-result queries (Q8, Q9a, NQ4, NQ5) still lose 2–4x despite trivial output
 
