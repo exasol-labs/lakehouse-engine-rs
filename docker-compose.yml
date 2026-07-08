@@ -1,5 +1,5 @@
 # ponytail: Dedicated host ports so this stack coexists with the sibling stacks
-# (strata-rs: 8563/2581/9000; lc-rs: 18563/12581). All host ports are
+# (sibling stack: 8563/2581/9000; lc-rs: 18563/12581). All host ports are
 # env-overridable so the E2E suite can always pick free ports; the container-
 # internal ports (8563/2581/9000/9001/8181) and the docker-network service
 # names (exasol/minio/iceberg-rest) are unchanged, so a UDF inside Exasol still

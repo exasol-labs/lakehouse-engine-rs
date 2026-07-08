@@ -69,7 +69,7 @@ This is the single expert-critical correctness property; it is unit-tested direc
 
 | Decision | Alternatives Considered | Rationale |
 |----------|------------------------|-----------|
-| New `iceberg_predicate.rs` in lakehouse-engine | Extend `vs-expression` to emit iceberg predicates | Keeps `iceberg-rust` types out of the strata-rs-shared `vs-expression` crate (locked decision 2) |
+| New `iceberg_predicate.rs` in lakehouse-engine | Extend `vs-expression` to emit iceberg predicates | Keeps `iceberg-rust` types out of the cross-project-shared `vs-expression` crate (locked decision 2) |
 | Emit unbound `Predicate`; let `plan_files` bind | Bind in the translator via `predicate.bind(schema, true)` | iceberg 0.9.1 `plan_files` already binds with `case_sensitive: true`; double-binding is redundant and the unbound form is what `with_filter` expects |
 | Build the predicate inside `plan_files_from_table` | Build in `handle_pushdown`, pass `Predicate` down | The Iceberg `Schema` is only assembled where the `Table` is built (both signed/unsigned); passing raw JSON + building at the seam avoids resolving the schema twice |
 | Drop untranslatable conjuncts (sound-partial) | Decline pushdown / error when any node is untranslatable | DataFusion is the correctness backstop; pruning is best-effort optimisation, so less pruning is always safe |

@@ -13,9 +13,9 @@ Project mission in: @specs/mission.md
 `lakehouse-engine` (external repo `lakehouse-engine-rs`; `-rs` = built in Rust) — an in-place
 lakehouse query engine: technically an Exasol Virtual Schema, but it runs the DataFusion engine on
 the node, in place, for querying Iceberg / Databricks from Exasol SQL.
-Sibling of `strata-rs` (VS adapter conventions) and `language-container-rs` (the Rust SLC) — mirror
-their UDF model, workspace layout, and Makefile/E2E conventions. Likely converges with `strata-rs`
-(possibly a monorepo) long-term.
+Sibling of a sibling VS adapter project (VS adapter conventions) and `language-container-rs` (the
+Rust SLC) — mirror their UDF model, workspace layout, and Makefile/E2E conventions. Likely
+converges with that sibling project (possibly a monorepo) long-term.
 
 ## Exasol / tooling
 
