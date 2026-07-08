@@ -2,8 +2,8 @@
 
 ## Phase 2: Implementation (Group A — Scaffolding)
 - [x] 2.A1 Workspace Cargo.toml (edition 2024) + `lakehouse-engine` cdylib crate skeleton; pin arrow/parquet 58, datafusion, iceberg-rust, SDK/macros 0.14.0 (crates.io — published, no path fallback)
-- [x] 2.A2 Makefile: `cross-musl-udf-build` (docker rust:1.92-bookworm, `-p lakehouse-engine`, out `target/release/liblakehouse_engine.so`, persistent cargo vol) + gated `test-e2e`, mirror strata-rs
-- [x] 2.A3 Docker compose: MinIO + Iceberg REST catalog + Exasol, shared network, BucketFS 2581 / MinIO 9000, mirror strata-rs
+- [x] 2.A2 Makefile: `cross-musl-udf-build` (docker rust:1.92-bookworm, `-p lakehouse-engine`, out `target/release/liblakehouse_engine.so`, persistent cargo vol) + gated `test-e2e`, mirror the sibling project
+- [x] 2.A3 Docker compose: MinIO + Iceberg REST catalog + Exasol, shared network, BucketFS 2581 / MinIO 9000, mirror the sibling project
 
 ## Phase 2: Implementation (Group B+C — crate core) [expert]
 - [x] 2.B1 Two `#[exasol_udf]` entry points (adapter via `vs_adapter(fn)` + scan SET UDF) in one crate; one `.so` exports both symbols [expert]

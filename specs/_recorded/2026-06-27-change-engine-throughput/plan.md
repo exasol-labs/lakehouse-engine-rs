@@ -197,7 +197,7 @@ same files the VS reads, parallelized by the Exasol engine, with no UDF subproce
 path. The difference between IMPORT throughput and the VS throughput is the cost of the UDF layer
 (Iceberg metadata, DataFusion, SLC round-trips).
 
-> Pattern from `strata-rs/tests/exasol_import_test.rs` — the query shape is:
+> Pattern from the sibling project's `tests/exasol_import_test.rs` — the query shape is:
 > ```sql
 > IMPORT INTO (<col> <type>, …)
 > FROM PARQUET AT 's3://<bucket>/;Endpoint=<endpoint>'
@@ -210,8 +210,9 @@ path. The difference between IMPORT throughput and the VS throughput is the cost
 
 - [ ] 9.1 Resolve the Parquet file paths for the largest TPC-H table (`lineitem`, scale factor from
   `bench/.env`) via the Iceberg catalog (Glue REST) — the same file list the VS planning layer
-  would produce (predicate-free, all columns). Use the AWS CLI / Glue API or the `strata-core plan`
-  binary if available; record the file count and total uncompressed bytes for the report.
+  would produce (predicate-free, all columns). Use the AWS CLI / Glue API, or an equivalent
+  catalog-listing tool if available; record the file count and total uncompressed bytes for the
+  report.
 - [ ] 9.2 Build the full `IMPORT INTO (...) FROM PARQUET AT '…' USER '…' IDENTIFIED BY '…' FILE '…' …`
   SQL for `lineitem`, using the column schema from the Glue catalog (type mapping follows the Exasol
   IMPORT FROM PARQUET driver: numerics → `DECIMAL`, doubles → `DOUBLE PRECISION`, varchars →
