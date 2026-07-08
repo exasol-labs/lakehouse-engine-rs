@@ -10,6 +10,14 @@ Project mission in: @specs/mission.md
   work, in addition to speq spec deltas. Reference the issue in the implementing commit
   (`Closes #<n>`) so the work and its tracking stay linked.
 
+## PR title convention
+
+PR titles MUST follow Conventional Commits format: `<type>(<scope>): <description>` (scope is
+optional but recommended), using one of: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`,
+`perf`. The title MUST describe the change's target/final state once implemented — not its
+current lifecycle stage. A plan-only PR for a new feature is still `feat(...)`, not a "planning"
+or "spec" prefix, even though only spec deltas are committed so far.
+
 `lakehouse-engine` (external repo `lakehouse-engine-rs`; `-rs` = built in Rust) — an in-place
 lakehouse query engine: technically an Exasol Virtual Schema, but it runs the DataFusion engine on
 the node, in place, for querying Iceberg / Databricks from Exasol SQL.
