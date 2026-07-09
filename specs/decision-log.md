@@ -2761,7 +2761,180 @@ render principle applies to all future capability additions, not just joins.
 
 ---
 
-## ADR-098: Full Push-Down of Grouped Scalar-Over-Aggregate Select Items (Primary), Qualified Wrapper as Residual Fallback
+## ADR-098: Reuse the Iceberg Crate's NameMapping Deserializer
+
+**Date:** 2026-07-08
+**Plan:** `change-name-mapping-fallback`
+**Status:** Accepted
+
+### Context
+
+Resolving the Iceberg `schema.name-mapping.default` table property requires parsing a
+JSON structure with kebab-case `field-id`, an optional `field-id`, and nested `fields`
+child entries with `DefaultOnNull` semantics. The pinned `iceberg` crate (git tag
+`v0.10.0-rc.2`, rev `be6cc96`) already exports `iceberg::spec::{NameMapping,
+MappedField, DEFAULT_SCHEMA_NAME_MAPPING}` implementing exactly this shape.
+
+### Decision
+
+Parse the property with `serde_json::from_str::<iceberg::spec::NameMapping>` rather
+than hand-rolling a bespoke serde struct for the property.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Reuse `iceberg::spec::NameMapping` | ✓ Chosen — the crate ships a spec-accurate, tested deserializer and tracks the Iceberg spec as the pin advances |
+| Hand-rolled serde struct | ✗ Rejected — reinvents a deserializer the pinned dependency already provides correctly |
+
+### Consequences
+
+Parsing correctness for `schema.name-mapping.default` tracks the `iceberg` crate's own
+spec fidelity rather than a separately maintained struct.
+
+---
+
+## ADR-099: Name-Mapping Resolution Slots Strictly Between Embedded Field-Id and Physical-Name Fallback
+
+**Date:** 2026-07-08
+**Plan:** `change-name-mapping-fallback`
+**Status:** Accepted
+
+### Context
+
+Iceberg column-projection rule #2 (`schema.name-mapping.default`) scopes name-mapping
+resolution to data files "without field id information." The existing
+`rename_physical_to_logical` resolver already had an embedded-`PARQUET:field_id` match
+(highest priority) and a physical-name fallback (lowest priority); the new name-mapping
+step needed a precedence rule relative to both.
+
+### Decision
+
+In `rename_physical_to_logical`, the name-mapping step applies ONLY to a physical field
+carrying no embedded `PARQUET:field_id`, is tried AFTER embedded-field-id resolution and
+BEFORE the physical-name fallback, and augments — never replaces — that fallback.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Name-mapping strictly between embedded-id and physical-name fallback | ✓ Chosen — matches Iceberg rule #2's scoping to files lacking field-id information; preserves all current behavior for the no-mapping and uncovered-field cases |
+| Consult name-mapping for every field, including those with an embedded id | ✗ Rejected — an embedded field-id is authoritative under the Iceberg spec |
+| Replace the physical-name fallback entirely with name-mapping | ✗ Rejected — would break the no-mapping and mapping-does-not-cover-this-field cases |
+
+### Consequences
+
+Resolution order for a physical field is fixed as: embedded field-id, then
+name-mapping (if the field has no embedded id), then physical-name match. Existing
+no-mapping and uncovered-field behavior is unchanged.
+
+---
+
+## ADR-100: Parse Only Flat/Top-Level Name-Mapping Entries; Defer Nested Struct/Map/List Entries
+
+**Date:** 2026-07-08
+**Plan:** `change-name-mapping-fallback`
+**Status:** Accepted
+
+### Context
+
+Iceberg's `schema.name-mapping.default` format supports nested `fields` entries for
+struct/map/list children. This engine's Exasol type mapping flattens all nested Iceberg
+types (struct, map, list) to `VARCHAR(2000000)` via JSON rather than exposing real
+nested columns.
+
+### Decision
+
+Parse only the top-level list of `{names, field-id}` mapping objects; do not recurse
+into nested `fields`. A follow-up GitHub issue (#83, "Support nested/struct entries in
+schema.name-mapping.default parsing") tracks the deferred scope.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Flat/top-level entries only | ✓ Chosen — nested entries would never be consulted since nested Iceberg types are already flattened to VARCHAR-via-JSON; parsing them now is dead capability |
+| Recurse into nested `fields` now | ✗ Rejected — no caller can currently use a nested-column name-mapping resolution |
+
+### Consequences
+
+Name-mapping resolution only ever needs a flat `name → field_id` lookup. Nested
+name-mapping support becomes a distinct, separately scoped feature (#83) if the engine
+later exposes real nested columns.
+
+---
+
+## ADR-101: Malformed schema.name-mapping.default Fails the Query at Plan Time
+
+**Date:** 2026-07-08
+**Plan:** `change-name-mapping-fallback`
+**Status:** Accepted
+
+### Context
+
+`schema.name-mapping.default` is an optional table property; when present it must be
+valid name-mapping JSON. Before this plan, there was no rule for what happens if the
+property is present but malformed.
+
+### Decision
+
+When the property is present but is not valid name-mapping JSON, the VS fails the query
+at plan time with a clean, credential-free error naming the property. When the property
+is absent, the threaded name-mapping is simply empty (no error).
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Fail loud at plan time on a malformed property | ✓ Chosen — consistent with the repo's fail-loud-at-plan-time correctness gates (e.g. `ensure_supported_delete_mechanisms`); a malformed mapping is a real config error and should surface once, off the per-shard hot path |
+| Silently ignore a malformed value and fall through to the physical-name fallback | ✗ Rejected — would silently degrade column binding correctness instead of surfacing a real config error |
+
+### Consequences
+
+A malformed `schema.name-mapping.default` is caught once per query in the VS, before
+any UDF is invoked, and never silently degrades to incorrect column binding.
+
+---
+
+## ADR-102: The Drop+Rename-Into-a-Reused-Name Collision Is Unrelated to Name-Mapping
+
+**Date:** 2026-07-08
+**Plan:** `change-name-mapping-fallback`
+**Status:** Accepted
+
+### Context
+
+A comment in `rename_physical_to_logical` claimed that column-name collisions from
+drop+rename-into-a-reused-name were "out of scope and belong to the name-mapping work
+tracked in issue #28." This premise is wrong: `schema.name-mapping.default` maps
+physical column names as they currently appear in a data file to field-ids — it
+reflects only current-state naming, not history, so it cannot retroactively
+disambiguate a dropped column whose old physical name was later reused by an unrelated
+new column.
+
+### Decision
+
+Correct the `rename_physical_to_logical` comment to state plainly that the
+drop+rename-into-a-reused-name collision is a distinct, still-open concern that
+name-mapping support does NOT resolve. Do not attempt to fix the collision itself, and
+no follow-up issue is filed for it.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Correct the comment to remove the false forward-reference | ✓ Chosen — the repo owner confirmed the original premise was wrong; a false forward-reference misleads future planners |
+| Leave the comment implying #28 resolves it | ✗ Rejected — actively misleading once #28 (this plan) ships without touching the collision case |
+
+### Consequences
+
+Future readers of `rename_physical_to_logical` are not misled into believing
+name-mapping support resolves the drop+rename collision. The collision remains an open,
+untracked concern.
+
+---
+
+## ADR-103: Full Push-Down of Grouped Scalar-Over-Aggregate Select Items (Primary), Qualified Wrapper as Residual Fallback
 
 **Date:** 2026-07-08
 **Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
@@ -2809,7 +2982,7 @@ the correct column count instead.
 
 ---
 
-## ADR-099: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
+## ADR-104: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
 
 **Date:** 2026-07-08
 **Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
