@@ -95,4 +95,29 @@ column-count-mismatched bare row scan.
 
 ## Review Findings
 
-<!-- Populated by speq-implement after code review. -->
+Code review (2026-07-09) found **no blocking correctness issues**. The five
+deliberate design choices were all judged sound:
+
+1. **Substitution-based merge renderer** (`render_scalar_over_merge`) is
+   injection- and collision-safe: the double-quoted sentinel `"__LH_AGG_MERGE_{i}__"`
+   with its trailing `__"` delimiter means `_1` is not a substring of `_11`; each
+   sentinel appears exactly once; user string literals render single-quoted and
+   cannot collide. Chosen over mirroring vs-expression's scalar arms to avoid the
+   two-copy drift the decision-log warned about (reuses `render_expression` via
+   substitution) — a deviation from the plan's literal "mirror the arms" wording,
+   same observable behavior.
+2. **Dedup by `AggregatePlan` equality** with `plan_types` 1:1 to `plans`: the
+   declared-type overwrite (top-level `Some` over nested `None`/`DOUBLE PRECISION`)
+   is order-independent; no mis-typing path.
+3. **Qualified single-table fallback** (`build_grouped_qualified_fallback_sql`,
+   join N-scan fallback at N=1): keys/HAVING/ORDER BY/LIMIT in the outer wrapper
+   only; per-shard scan LIMIT-/sort-/agg-free; empty-file shape is selectList-typed.
+4. Rewritten test `..._demotes_to_row_scan` → `..._uses_selectlist_shape` reflects
+   the intended behavior change, not a masked regression.
+5. Nested-only `DOUBLE PRECISION` typing applies only to expression-argument
+   aggregates; column SUMs keep their `DECIMAL(36,s)` widening — overflow discipline
+   preserved.
+
+Non-blocking follow-up note: a `MOD(...)` wrapping an aggregate would render the
+DataFusion `%` operator into Exasol-executed SQL (pre-existing for the HAVING
+catch-all, outside #82's tested surface). Not fixed here; worth a separate issue.

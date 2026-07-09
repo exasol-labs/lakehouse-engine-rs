@@ -2758,3 +2758,94 @@ Update the `msg.contains("retry")` test to assert the corrected wording.
 Every remaining hard-error decline site in the join/aggregate pushdown path states
 plainly that it is a hard error with no native retry. The advertised-capability-must-
 render principle applies to all future capability additions, not just joins.
+
+---
+
+## ADR-098: Full Push-Down of Grouped Scalar-Over-Aggregate Select Items (Primary), Qualified Wrapper as Residual Fallback
+
+**Date:** 2026-07-08
+**Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
+**Status:** Accepted
+
+### Context
+
+Issue #82: a single-table grouped query whose select list contains a scalar function
+wrapping aggregates (e.g. `ROUND(100.0 * SUM(CASE …) / COUNT(*), 2)`) hard-failed
+through the Virtual Schema with a `04000` pushdown column-count mismatch.
+`detect_group_by_aggregates` classified such an item as neither a top-level aggregate,
+a literal, nor a group-key projection, returning `None` and falling through to a bare
+raw full-row scan — which returns the wrong column count for a `group_by` request. Two
+candidate fixes existed: (a) decompose the item's inner aggregates into the existing
+partial `AggregatePlan` machinery and render the scalar wrapper over the merged
+partials in the outer wrapper, reusing the grouped partial/merge architecture and
+`render_having_over_merge`'s aggregate-rewrite machinery; or (b) route the whole
+grouped scalar-over-aggregate through a qualified single-table wrapper (Exasol
+aggregates over a materialized sharded raw scan), analogous to the join fallback.
+
+### Decision
+
+Push down a scalar-over-aggregate grouped select item by folding its inner aggregates
+into the existing partial `AggregatePlan` decomposition and rendering the scalar
+wrapper over the merged partials in the outer wrapper, at the item's original
+`selectList` ordinal. Fall back to a qualified single-table wrapper only when an inner
+aggregate is genuinely undecomposable (`DISTINCT`, a non-numeric stat argument, an
+untranslatable argument, or a non-aggregate/non-group-key node) — never a bare raw
+row scan for a grouped request.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| (a) Full push-down: decompose inner aggregates into partials, render scalar wrapper over merged partials | ✓ Chosen — consistent with the existing grouped partial/merge architecture, reuses `AggregatePlan` decomposition and the scan-UDF layout, and preserves node-local aggregation (mission's minimal-network-transfer requirement) |
+| (b) Route the whole grouped scalar-over-aggregate through the qualified single-table wrapper unconditionally | ✗ Rejected — ships every matching row per group to Exasol, defeating node-local decomposition even for the plain aggregates in the same query; retained only as the residual-shape safety net |
+
+### Consequences
+
+A grouped select item with a scalar wrapping aggregates decomposes and pushes down
+like a top-level aggregate, keeping node-local aggregation for the common case. A
+grouped decline for a genuinely undecomposable shape never emits a
+column-count-mismatched bare row scan — it emits a qualified single-table wrapper with
+the correct column count instead.
+
+---
+
+## ADR-099: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
+
+**Date:** 2026-07-08
+**Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
+**Status:** Accepted
+
+### Context
+
+The existing HAVING merge-rewrite renderer, `render_having_over_merge`, already
+rewrites a top-level `function_aggregate` node to its merged `PARTIAL_*` expression
+matched to the decomposed `AggregatePlan` list. Its gap: `render_having_operand`'s
+catch-all delegated a scalar function or arithmetic node wrapping an aggregate to
+`render_expression`, which renders the nested aggregate verbatim over source columns —
+absent from the outer wrapper — rather than over the merged partials. A grouped
+select-list scalar-over-aggregate item is structurally the same problem: render the
+surrounding scalar/arithmetic structure while rewriting each aggregate leaf to its
+merged `PARTIAL_*` expression.
+
+### Decision
+
+Generalize `render_having_operand` so a `function_scalar`/arithmetic node recurses
+into a merge-aware renderer (`render_scalar_over_merge`) that rewrites every nested
+`function_aggregate` to its merged expression, matched to the `AggregatePlan` list by
+equality (kind + argument), preserving the scalar/arithmetic structure around it. The
+same renderer serves both the grouped select list and HAVING, so a top-level bare
+aggregate and a nested aggregate are rewritten by one consistent path.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Generalize `render_having_over_merge`/`render_having_operand` to descend scalars | ✓ Chosen — one renderer serves both the select list and HAVING, avoiding the two-copy divergence PR #78 diagnosed for the join renderers; fixes a scalar-over-aggregate inside HAVING as a side effect |
+| A new, independent select-list merge renderer parallel to the HAVING one | ✗ Rejected — duplicates the aggregate→merged rewrite logic and risks drift between the two copies |
+
+### Consequences
+
+A scalar function wrapping one or more aggregates, whether in a grouped select list or
+a HAVING clause, is rendered by the same merge-aware path and never references a
+source column absent from the outer wrapper. Top-level and nested aggregate rewriting
+are consistent by construction.

@@ -6,7 +6,8 @@ query, the adapter detects the shape, renders group-key expressions via the VS
 expression translator, builds a grouped common scan spec, and generates fan-out SQL
 that runs DataFusion GROUP BY inside each shard invocation and merges the partials in
 an outer wrapper. The grouped common spec is serialized once (shared by all shards)
-and carries no LIMIT.
+and carries no LIMIT. See `vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate`
+for scalar-function-wrapping-aggregates select items on this same path.
 
 ## Background
 
@@ -32,6 +33,14 @@ and carries no LIMIT.
 * The grouped scan-driving SQL serializes the shard-invariant common spec once and
   carries only each shard's file subset per `VALUES` row, exactly as the row-scan
   fan-out.
+* When a grouped select item cannot be decomposed into supported partials (an inner
+  aggregate that is `DISTINCT`, a SUM/stat over a non-numeric type, an untranslatable
+  argument, or a non-aggregate/non-group-key node), the adapter MUST NOT emit a bare
+  raw full-row scan (whose column count does not match the aggregated query Exasol
+  expects, causing SQL state `04000` "Expected number of columns is N but pushdown
+  query has M"). It falls back to a qualified single-table wrapper that renders the
+  exact grouped select list over a materialized sharded raw scan, analogous to the
+  unified join fallback.
 
 ## Scenarios
 
@@ -94,10 +103,12 @@ and carries no LIMIT.
 * *AND* the outer wrapper SELECT list SHALL place each group-key cast expression and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectList`, so the wrapper's result column order and per-column type match Exasol's positional `selectListDataTypes` validation for ANY interleaving of keys and aggregates, while the inner fan-out EMITS clause and the scan UDF's per-shard SELECT MAY remain keys-first (GK_* then PARTIAL_*) because they are matched only against each other
 * *AND* the merged result per group SHALL equal the result of the same grouped aggregate evaluated over all rows on a single node
 
-### Scenario: Adapter falls back to row scan for unsupported grouped aggregate shape
+### Scenario: Adapter falls back to a qualified single-table wrapper for an undecomposable grouped aggregate shape
 
-* *GIVEN* a pushdown request with `aggregationType: "group_by"` where any select-list item is not a supported aggregate function or a plain group-key column reference
-* *OR* any group-key expression is not translatable by the VS expression translator
+* *GIVEN* a grouped `pushdown` request (`aggregationType: "group_by"`) whose select list contains an item the adapter cannot decompose into supported partials — an inner aggregate that is `DISTINCT`, a SUM/stat aggregate over a non-numeric type, an untranslatable aggregate argument, or a non-aggregate/non-group-key node
 * *WHEN* the adapter processes the request
-* *THEN* the adapter SHALL fall back to row scanning (emitting a row-scan ScanSpec with no aggregates field)
-* *AND* Exasol SHALL apply the aggregate on the returned rows using its own engine
+* *THEN* the adapter MUST NOT emit a bare raw full-row `ScanSpec` for a grouped request (that would return a column count differing from the request's `selectList`, causing a client-facing `04000` "Expected number of columns is N but pushdown query has M")
+* *AND* the adapter SHALL instead render the exact grouped select list, GROUP BY, HAVING, ORDER BY, and LIMIT as ordinary Exasol SQL over a materialized single-table sharded raw scan — a qualified single-table wrapper analogous to the unified join fallback (`SELECT <grouped select list> FROM (<sharded raw fan-out>) GROUP BY ... HAVING ... ORDER BY ... LIMIT ...`) — so Exasol's core engine computes the aggregate over the returned rows
+* *AND* the scalar-over-aggregate select items in that wrapper SHALL be rendered by the `crates/vs-expression` translator (aggregate names spliced verbatim, arguments recursed), since Exasol computes the aggregation over materialized rows rather than over merged partials
+* *AND* the wrapper's result column count and per-column types SHALL match Exasol's positional `selectListDataTypes` validation
+* *AND* the returned result SHALL equal the result of the same grouped query evaluated on a single node
