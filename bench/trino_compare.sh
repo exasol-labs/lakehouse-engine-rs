@@ -56,41 +56,53 @@ REPORT="${1:-bench/reports/trino-compare-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
 
+# BENCH_WITH_DELETES (same flag as bench/run.sh): explicit TRINO_SCHEMA override always wins;
+# otherwise "tpch" (baseline) or "tpch_deletes" (the Glue database
+# deploy/scripts/make-deletes-remote.sh authors) when the flag is on. Shared with
+# import_jdbc_trino.sh (same cluster, same queries).
+WITH_DELETES="${BENCH_WITH_DELETES:-0}"
+if [ -z "${TRINO_SCHEMA:-}" ]; then
+  TRINO_SCHEMA="tpch"
+  [ "$WITH_DELETES" = "1" ] && TRINO_SCHEMA="tpch_deletes"
+fi
+ENGINE_LABEL="trino"
+[ "$WITH_DELETES" = "1" ] && ENGINE_LABEL="trino-deletes"
+
 Q1="SELECT n.n_name, r.r_name, COUNT(*) AS suppliers
-FROM iceberg.tpch.supplier s JOIN iceberg.tpch.nation n ON s.s_nationkey = n.n_nationkey
-JOIN iceberg.tpch.region r ON n.n_regionkey = r.r_regionkey
+FROM iceberg.${TRINO_SCHEMA}.supplier s JOIN iceberg.${TRINO_SCHEMA}.nation n ON s.s_nationkey = n.n_nationkey
+JOIN iceberg.${TRINO_SCHEMA}.region r ON n.n_regionkey = r.r_regionkey
 GROUP BY n.n_name, r.r_name ORDER BY n.n_name"
 
-Q2="SELECT COUNT(*) AS rows_joined FROM iceberg.tpch.customer c
-JOIN iceberg.tpch.orders o ON c.c_custkey = o.o_custkey
-JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
+Q2="SELECT COUNT(*) AS rows_joined FROM iceberg.${TRINO_SCHEMA}.customer c
+JOIN iceberg.${TRINO_SCHEMA}.orders o ON c.c_custkey = o.o_custkey
+JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey"
 
 Q3="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
-FROM iceberg.tpch.orders o JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+FROM iceberg.${TRINO_SCHEMA}.orders o JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey
 WHERE o.o_orderdate >= DATE '1994-01-01' AND o.o_orderdate < DATE '1995-01-01'
 GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
 
 Q4="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
        AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
-FROM iceberg.tpch.lineitem WHERE l_shipdate <= DATE '1998-09-01'
+FROM iceberg.${TRINO_SCHEMA}.lineitem WHERE l_shipdate <= DATE '1998-09-01'
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
 # Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL (dialect-
 # adjusted) in bench/run.sh, bench/athena_compare.sh, deploy/scripts/spark_queries.py.
 Q5="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
-FROM iceberg.tpch.orders o JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+FROM iceberg.${TRINO_SCHEMA}.orders o JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey
 GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
 
 Q6="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
        AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
-FROM iceberg.tpch.lineitem
+FROM iceberg.${TRINO_SCHEMA}.lineitem
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
-Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM iceberg.tpch.lineitem GROUP BY l_orderkey) t"
+Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM iceberg.${TRINO_SCHEMA}.lineitem GROUP BY l_orderkey) t"
 
-Q8="SELECT COUNT(*) FROM iceberg.tpch.lineitem WHERE l_shipdate = DATE '1995-06-15'"
+Q8="SELECT COUNT(*) FROM iceberg.${TRINO_SCHEMA}.lineitem WHERE l_shipdate = DATE '1995-06-15'"
 
-Q9A="SELECT SUM(l_quantity) FROM iceberg.tpch.lineitem"
+Q9A="SELECT SUM(l_quantity) FROM iceberg.${TRINO_SCHEMA}.lineitem"
 
 Q9B="SELECT COUNT(*),
        SUM(l_orderkey), SUM(l_partkey), SUM(l_suppkey), SUM(l_linenumber),
@@ -99,29 +111,29 @@ Q9B="SELECT COUNT(*),
        MIN(l_shipdate), MAX(l_commitdate), MIN(l_receiptdate),
        COUNT(DISTINCT l_shipinstruct), COUNT(DISTINCT l_shipmode),
        SUM(length(l_comment))
-FROM iceberg.tpch.lineitem"
+FROM iceberg.${TRINO_SCHEMA}.lineitem"
 
 # NQ1-NQ5 close the arithmetic-aggregate-pushdown gap + probe LIKE/IN filters, ORDER BY+LIMIT, a
 # 4-way join, and GROUP BY+HAVING — identical SQL (dialect-adjusted) in bench/run.sh,
 # bench/athena_compare.sh, deploy/scripts/spark_queries.py.
-NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM iceberg.tpch.lineitem
+NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM iceberg.${TRINO_SCHEMA}.lineitem
 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
   AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"
 
-NQ2="SELECT COUNT(*) FROM iceberg.tpch.lineitem
+NQ2="SELECT COUNT(*) FROM iceberg.${TRINO_SCHEMA}.lineitem
 WHERE l_shipmode IN ('AIR','REG AIR') AND l_comment LIKE '%late%'"
 
 NQ3="SELECT COUNT(*) AS cnt, SUM(ps.ps_supplycost) AS total_cost
-FROM iceberg.tpch.part p JOIN iceberg.tpch.partsupp ps ON p.p_partkey = ps.ps_partkey
-JOIN iceberg.tpch.supplier s ON ps.ps_suppkey = s.s_suppkey
-JOIN iceberg.tpch.nation n ON s.s_nationkey = n.n_nationkey
+FROM iceberg.${TRINO_SCHEMA}.part p JOIN iceberg.${TRINO_SCHEMA}.partsupp ps ON p.p_partkey = ps.ps_partkey
+JOIN iceberg.${TRINO_SCHEMA}.supplier s ON ps.ps_suppkey = s.s_suppkey
+JOIN iceberg.${TRINO_SCHEMA}.nation n ON s.s_nationkey = n.n_nationkey
 WHERE p.p_size = 15 AND p.p_type LIKE '%BRASS%' AND n.n_name = 'GERMANY'"
 
-NQ4="SELECT l_orderkey, l_extendedprice FROM iceberg.tpch.lineitem
+NQ4="SELECT l_orderkey, l_extendedprice FROM iceberg.${TRINO_SCHEMA}.lineitem
 ORDER BY l_extendedprice DESC LIMIT 20"
 
 NQ5="SELECT o_orderpriority, o_orderstatus, COUNT(*) AS cnt, AVG(o_totalprice) AS avg_price
-FROM iceberg.tpch.orders GROUP BY o_orderpriority, o_orderstatus
+FROM iceberg.${TRINO_SCHEMA}.orders GROUP BY o_orderpriority, o_orderstatus
 HAVING COUNT(*) > 1000000 ORDER BY o_orderpriority, o_orderstatus"
 
 # Names/queries in run order. A leading "warmup" entry (discarded from the report) absorbs the
@@ -141,7 +153,7 @@ for i in "${!NAMES[@]}"; do
 done
 
 echo "== launching persistent Trino CLI batch on worker $TRINO_WORKER_HOST ==" | tee -a "$REPORT"
-echo "trino benchmark (one session via worker ${TRINO_WORKER_HOST}, coordinator ${TRINO_HOST_PRIVATE}:${TRINO_PORT} private) — $(date)" | tee -a "$REPORT"
+echo "trino benchmark (one session via worker ${TRINO_WORKER_HOST}, coordinator ${TRINO_HOST_PRIVATE}:${TRINO_PORT} private) schema=${TRINO_SCHEMA} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
 
 declare -A PENDING
 for name in "${NAMES[@]}"; do PENDING[$name]=1; done
@@ -152,7 +164,7 @@ for name in "${NAMES[@]}"; do PENDING[$name]=1; done
 # shellcheck disable=SC2016
 coproc TRINOOUT {
   ssh $SSHOPTS -i "$KEY_FILE" ubuntu@"$TRINO_WORKER_HOST" \
-    "sudo docker run --rm $TRINO_IMAGE trino --ignore-errors --server http://$TRINO_HOST_PRIVATE:$TRINO_PORT --catalog iceberg --schema tpch --output-format CSV --execute \"$BATCH\"" \
+    "sudo docker run --rm $TRINO_IMAGE trino --ignore-errors --server http://$TRINO_HOST_PRIVATE:$TRINO_PORT --catalog iceberg --schema $TRINO_SCHEMA --output-format CSV --execute \"$BATCH\"" \
     2>&1
 }
 
@@ -167,7 +179,7 @@ while IFS= read -r -t 120 line <&"${TRINOOUT[0]}"; do
       unset "PENDING[$name]"
       [ "$name" = "warmup" ] && continue
       echo "  $name: ${el}s" | tee -a "$REPORT"
-      echo "TIMING trino ${name} ${el}" >> "$REPORT"
+      echo "TIMING ${ENGINE_LABEL} ${name} ${el}" >> "$REPORT"
     fi
   done
   # Overall wall-clock ceiling (15 min) in case the batch stalls without closing the pipe.

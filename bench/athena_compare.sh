@@ -19,7 +19,16 @@ cd "$(dirname "$0")/.."
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 : "${ATHENA_WORKGROUP:?set ATHENA_WORKGROUP (deploy/data-stack: tofu output athena_workgroup)}"
-ATHENA_DATABASE="${ATHENA_DATABASE:-tpch}"
+# BENCH_WITH_DELETES (same flag as bench/run.sh): explicit ATHENA_DATABASE override always wins;
+# otherwise "tpch" (baseline) or "tpch_deletes" (the Glue database
+# deploy/scripts/make-deletes-remote.sh authors) when the flag is on.
+WITH_DELETES="${BENCH_WITH_DELETES:-0}"
+if [ -z "${ATHENA_DATABASE:-}" ]; then
+  ATHENA_DATABASE="tpch"
+  [ "$WITH_DELETES" = "1" ] && ATHENA_DATABASE="tpch_deletes"
+fi
+ENGINE_LABEL="athena"
+[ "$WITH_DELETES" = "1" ] && ENGINE_LABEL="athena-deletes"
 REPORT="${1:-bench/reports/athena-compare-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
@@ -113,10 +122,10 @@ run_timed() {  # name sql
     --query 'QueryExecution.Statistics.EngineExecutionTimeInMillis' --output text)"
   el="$(awk "BEGIN{printf \"%.2f\", ${ms}/1000}")"
   echo "  $name: ${el}s (engine) qid=$qid" | tee -a "$REPORT"
-  echo "TIMING athena ${name} ${el}" >> "$REPORT"
+  echo "TIMING ${ENGINE_LABEL} ${name} ${el}" >> "$REPORT"
 }
 
-echo "athena benchmark — workgroup=${ATHENA_WORKGROUP} database=${ATHENA_DATABASE} — $(date)" | tee -a "$REPORT"
+echo "athena benchmark — workgroup=${ATHENA_WORKGROUP} database=${ATHENA_DATABASE} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
 run_timed "q1" "$Q1"
 run_timed "q2" "$Q2"
 run_timed "q3" "$Q3"
