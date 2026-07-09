@@ -32,6 +32,17 @@ fi
 # script's own bucket, never hardcoded, same "derive don't hardcode" convention as import_ceiling.sh.
 WAREHOUSE_S3_URI="s3://$(printf '%s' "$SPARK_SCRIPT_S3_URI" | sed -E 's#^s3://([^/]+)/.*#\1#')/"
 
+# BENCH_WITH_DELETES (same flag as bench/run.sh): explicit SPARK_NAMESPACE override always wins;
+# otherwise "tpch" (baseline) or "tpch_deletes" (the Glue database
+# deploy/scripts/make-deletes-remote.sh authors) when the flag is on.
+WITH_DELETES="${BENCH_WITH_DELETES:-0}"
+if [ -z "${SPARK_NAMESPACE:-}" ]; then
+  SPARK_NAMESPACE="tpch"
+  [ "$WITH_DELETES" = "1" ] && SPARK_NAMESPACE="tpch_deletes"
+fi
+ENGINE_LABEL="spark"
+[ "$WITH_DELETES" = "1" ] && ENGINE_LABEL="spark-deletes"
+
 REPORT="${1:-bench/reports/spark-compare-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
@@ -40,7 +51,7 @@ mkdir -p "$(dirname "$REPORT")"
 # fetch via Ivy) times out — found live-verifying. Use the release's LOCALLY bundled Iceberg jar
 # instead (per AWS docs: /usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar).
 JOB_DRIVER=$(cat <<EOF
-{"sparkSubmit":{"entryPoint":"${SPARK_SCRIPT_S3_URI}","entryPointArguments":["${WAREHOUSE_S3_URI}"],"sparkSubmitParameters":"--conf spark.executor.cores=2 --conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"}}
+{"sparkSubmit":{"entryPoint":"${SPARK_SCRIPT_S3_URI}","entryPointArguments":["${WAREHOUSE_S3_URI}","${SPARK_NAMESPACE}"],"sparkSubmitParameters":"--conf spark.executor.cores=2 --conf spark.jars=/usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar"}}
 EOF
 )
 CONFIG_OVERRIDES=$(cat <<EOF
@@ -48,7 +59,7 @@ CONFIG_OVERRIDES=$(cat <<EOF
 EOF
 )
 
-echo "spark benchmark (EMR Serverless) — app=${EMR_SERVERLESS_APP_ID} — $(date)" | tee -a "$REPORT"
+echo "spark benchmark (EMR Serverless) — app=${EMR_SERVERLESS_APP_ID} namespace=${SPARK_NAMESPACE} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
 
 JOB_ID="$(aws emr-serverless start-job-run \
   --application-id "$EMR_SERVERLESS_APP_ID" \
@@ -74,8 +85,8 @@ fi
 
 aws s3 cp "${LOG_PREFIX}/stdout.gz" - | gunzip -c > /tmp/lh-spark-driver-stdout.log
 grep -E '^elapsed: ' /tmp/lh-spark-driver-stdout.log | tee -a "$REPORT"
-# Normalize "elapsed: q1 3.21s" -> "TIMING spark q1 3.21"
+# Normalize "elapsed: q1 3.21s" -> "TIMING spark[-deletes] q1 3.21"
 grep -E '^elapsed: ' /tmp/lh-spark-driver-stdout.log \
-  | awk '{name=$2; sec=$3; gsub(/s$/,"",sec); print "TIMING spark " name " " sec}' >> "$REPORT"
+  | awk -v engine="$ENGINE_LABEL" '{name=$2; sec=$3; gsub(/s$/,"",sec); print "TIMING " engine " " name " " sec}' >> "$REPORT"
 
 echo "Done. Report: $REPORT"
