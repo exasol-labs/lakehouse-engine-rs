@@ -79,6 +79,7 @@ fn pruning_spec(file_url: String) -> ScanSpec {
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),

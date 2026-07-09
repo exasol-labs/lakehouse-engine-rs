@@ -280,6 +280,24 @@ pub struct LogicalField {
     pub nullable: bool,
 }
 
+/// One flattened, top-level entry of the Iceberg `schema.name-mapping.default`
+/// table property: a physical column name and the Iceberg field-id it maps to
+/// for data files written without an embedded `PARQUET:field_id`.
+///
+/// This is the FLAT representation the scan-side resolver looks up by physical
+/// name: the VS planning layer parses the property's nested `NameMapping` JSON
+/// once (via the `iceberg` crate's own deserializer) and flattens only the
+/// TOP-LEVEL entries into this shape. Nested `fields` entries (struct/map/list
+/// children) are deliberately never parsed or represented here — out of scope
+/// for this phase (issue #28); see `specs/_plans/change-name-mapping-fallback/plan.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NameMappingEntry {
+    /// The physical (on-disk Parquet) column name.
+    pub name: String,
+    /// The Iceberg field-id this physical name maps to.
+    pub field_id: i32,
+}
+
 /// The kind of join to execute node-locally in the scan UDF.
 ///
 /// This phase supports only `Inner` (inner equi-join); the adapter declines and
@@ -325,6 +343,12 @@ pub struct JoinSpec {
     /// (empty) falls back to first-file schema inference, as on the raw-scan path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
+
+    /// Flattened `schema.name-mapping.default` entries for the dimension table,
+    /// resolved once in the VS alongside `logical_schema`. Empty (the default)
+    /// means no name-mapping property is present, or it was not consulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub name_mapping: Vec<NameMappingEntry>,
 
     /// The join kind. This phase only ever carries [`JoinType::Inner`].
     pub join_type: JoinType,
@@ -537,6 +561,12 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
+    /// Flattened `schema.name-mapping.default` entries, resolved once in the VS
+    /// alongside `logical_schema`. Empty (the default) means no name-mapping
+    /// property is present on the table, or it was not consulted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub name_mapping: Vec<NameMappingEntry>,
+
     /// Broadcast (dimension) side of a pushed-down inner equi-join. `None` (the
     /// default) means a plain single-table scan; absent from JSON when `None` so
     /// every pre-existing non-join spec deserializes unchanged (backward-compatible).
@@ -678,6 +708,18 @@ pub struct ScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
+    /// Flattened `schema.name-mapping.default` entries, resolved once in the VS
+    /// (`resolve_file_list`) alongside `logical_schema` from the Iceberg table
+    /// property of the same name. Consulted by the scan UDF's field-id resolver
+    /// ONLY for a physical field carrying no embedded `PARQUET:field_id` — an
+    /// embedded field-id is authoritative and always wins. Absent (empty, the
+    /// default) for specs that predate this field, or when the table carries no
+    /// such property: the existing physical-name fallback is unaffected
+    /// (backward-compatible). See
+    /// `specs/_plans/change-name-mapping-fallback/plan.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub name_mapping: Vec<NameMappingEntry>,
+
     /// Broadcast (dimension) side of a pushed-down inner equi-join, or `None` (the
     /// default) for a plain single-table scan. Shard-invariant, so it round-trips
     /// through the [`CommonScanSpec`] on the split/merge path. Absent from JSON when
@@ -796,6 +838,7 @@ impl ScanSpec {
             group_keys: self.group_keys.clone(),
             emit_exa_types: self.emit_exa_types.clone(),
             logical_schema: self.logical_schema.clone(),
+            name_mapping: self.name_mapping.clone(),
             join: self.join.clone(),
             storage: self.storage.clone(),
             df_target_partitions: self.df_target_partitions,
@@ -829,6 +872,7 @@ impl ScanSpec {
             group_keys: common.group_keys,
             emit_exa_types: common.emit_exa_types,
             logical_schema: common.logical_schema,
+            name_mapping: common.name_mapping,
             join: common.join,
             storage: common.storage,
             df_target_partitions: common.df_target_partitions,
@@ -897,6 +941,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: StorageProps {
                 endpoint: "http://minio:9000".into(),
@@ -1393,6 +1438,66 @@ mod tests {
         assert!(
             legacy.logical_schema.is_empty(),
             "missing logical_schema must default to empty (backward-compat)"
+        );
+    }
+
+    /// name_mapping round-trips through JSON (spec WITH the field) and
+    /// a legacy spec WITHOUT it deserializes correctly (backward-compatible default).
+    #[test]
+    fn name_mapping_round_trips_and_defaults_to_empty() {
+        // A spec with a populated name_mapping.
+        let mut spec = sample_spec();
+        spec.name_mapping = vec![
+            NameMappingEntry {
+                name: "id".to_string(),
+                field_id: 1,
+            },
+            NameMappingEntry {
+                name: "rating".to_string(),
+                field_id: 2,
+            },
+        ];
+        let json = spec.to_json();
+
+        // The field must appear in the serialized JSON when non-empty.
+        assert!(
+            json.contains("name_mapping"),
+            "non-empty name_mapping must appear in JSON: {json}"
+        );
+
+        // Round-trip: all entries survive.
+        let back = ScanSpec::from_json(&json).unwrap();
+        let entries = &back.name_mapping;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "id");
+        assert_eq!(entries[0].field_id, 1);
+        assert_eq!(entries[1].name, "rating");
+        assert_eq!(entries[1].field_id, 2);
+
+        // A spec without name_mapping must omit the field from JSON.
+        let row_spec = sample_spec();
+        assert!(row_spec.name_mapping.is_empty());
+        let row_json = row_spec.to_json();
+        assert!(
+            !row_json.contains("name_mapping"),
+            "empty name_mapping must be absent from JSON: {row_json}"
+        );
+
+        // A legacy payload without the field deserializes to an empty Vec.
+        let legacy_json = r#"{
+            "files": [["s3://w/f0.parquet", 100]],
+            "projection": [],
+            "storage": {
+                "endpoint": "http://minio:9000",
+                "region": "us-east-1",
+                "access_key": "k",
+                "secret_key": "s"
+            }
+        }"#;
+        let legacy = ScanSpec::from_json(legacy_json).unwrap();
+        assert!(
+            legacy.name_mapping.is_empty(),
+            "missing name_mapping must default to empty (backward-compat)"
         );
     }
 
@@ -1961,6 +2066,7 @@ mod tests {
                 arrow_type: "int64".into(),
                 nullable: false,
             }],
+            name_mapping: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"F_KEY\" = \"D_KEY\"".into(),
         });
