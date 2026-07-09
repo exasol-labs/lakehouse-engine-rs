@@ -194,10 +194,12 @@ fn join_spec(
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: Some(JoinSpec {
             table_root: String::new(),
             files: dim_files.into_iter().map(FileEntry::from).collect(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
         }),

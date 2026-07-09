@@ -22,7 +22,9 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageProps};
+use crate::scan::spec::{
+    DeleteFileContentType, DeleteFileRef, FileEntry, NameMappingEntry, StorageProps,
+};
 use crate::scan::{FieldIdExprAdapterFactory, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
@@ -456,6 +458,7 @@ pub(crate) struct PositionalDeleteScanTable {
     object_store_url: ObjectStoreUrl,
     table_schema: SchemaRef,
     use_field_id_adapter: bool,
+    name_mapping: Vec<NameMappingEntry>,
     files: Vec<FileEntry>,
     table_root: String,
     secrets: Vec<String>,
@@ -468,10 +471,16 @@ impl PositionalDeleteScanTable {
     /// `register_files` behavior: the [`FieldIdExprAdapterFactory`] is attached
     /// only when the adapter supplied a logical schema (field-id binding);
     /// legacy specs that fell back to first-file inference bind by name.
+    /// `name_mapping` is the query's flattened `schema.name-mapping.default`
+    /// entries for this side (fact or dimension), resolved once in the VS
+    /// alongside the logical schema; empty when the table has none. It is
+    /// carried through to the [`FieldIdExprAdapterFactory`] installed in
+    /// [`Self::scan`].
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
         table_schema: SchemaRef,
         use_field_id_adapter: bool,
+        name_mapping: Vec<NameMappingEntry>,
         files: Vec<FileEntry>,
         table_root: String,
         storage: &StorageProps,
@@ -485,6 +494,7 @@ impl PositionalDeleteScanTable {
             object_store_url,
             table_schema,
             use_field_id_adapter,
+            name_mapping,
             files,
             table_root,
             secrets,
@@ -561,9 +571,11 @@ impl TableProvider for PositionalDeleteScanTable {
         let table_schema = TableSchema::from_file_schema(Arc::clone(&self.table_schema));
         let file_source = self.format.file_source(table_schema);
 
-        let expr_adapter = self
-            .use_field_id_adapter
-            .then(|| Arc::new(FieldIdExprAdapterFactory) as Arc<_>);
+        let expr_adapter = self.use_field_id_adapter.then(|| {
+            Arc::new(FieldIdExprAdapterFactory {
+                name_mapping: self.name_mapping.clone(),
+            }) as Arc<_>
+        });
 
         // All assigned files go into ONE file group ⇒ one output partition. With
         // `target_partitions = 1` (the scan default) the plan stays lean: no
