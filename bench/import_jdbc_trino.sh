@@ -64,40 +64,52 @@ exapump bucketfs cp "$JAR_PATH" "drivers/jdbc/TRINO/${JAR_NAME}" "${BFS_ARGS[@]}
 exapump bucketfs cp "$SETTINGS_PATH" "drivers/jdbc/TRINO/settings.cfg" "${BFS_ARGS[@]}" \
   || { echo "ERROR: driver settings.cfg upload failed"; exit 1; }
 
+# BENCH_WITH_DELETES (same flag as bench/run.sh): explicit TRINO_SCHEMA override always wins;
+# otherwise "tpch" (baseline) or "tpch_deletes" (the Glue database
+# deploy/scripts/make-deletes-remote.sh authors) when the flag is on. Shared with
+# trino_compare.sh (same cluster, same queries).
+WITH_DELETES="${BENCH_WITH_DELETES:-0}"
+if [ -z "${TRINO_SCHEMA:-}" ]; then
+  TRINO_SCHEMA="tpch"
+  [ "$WITH_DELETES" = "1" ] && TRINO_SCHEMA="tpch_deletes"
+fi
+ENGINE_LABEL="import-jdbc-trino"
+[ "$WITH_DELETES" = "1" ] && ENGINE_LABEL="import-jdbc-trino-deletes"
+
 # ---- Q1-NQ5, copied verbatim from bench/trino_compare.sh -------------------------------------
 Q1="SELECT n.n_name, r.r_name, COUNT(*) AS suppliers
-FROM iceberg.tpch.supplier s JOIN iceberg.tpch.nation n ON s.s_nationkey = n.n_nationkey
-JOIN iceberg.tpch.region r ON n.n_regionkey = r.r_regionkey
+FROM iceberg.${TRINO_SCHEMA}.supplier s JOIN iceberg.${TRINO_SCHEMA}.nation n ON s.s_nationkey = n.n_nationkey
+JOIN iceberg.${TRINO_SCHEMA}.region r ON n.n_regionkey = r.r_regionkey
 GROUP BY n.n_name, r.r_name ORDER BY n.n_name"
 
-Q2="SELECT COUNT(*) AS rows_joined FROM iceberg.tpch.customer c
-JOIN iceberg.tpch.orders o ON c.c_custkey = o.o_custkey
-JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey"
+Q2="SELECT COUNT(*) AS rows_joined FROM iceberg.${TRINO_SCHEMA}.customer c
+JOIN iceberg.${TRINO_SCHEMA}.orders o ON c.c_custkey = o.o_custkey
+JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey"
 
 Q3="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
-FROM iceberg.tpch.orders o JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+FROM iceberg.${TRINO_SCHEMA}.orders o JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey
 WHERE o.o_orderdate >= DATE '1994-01-01' AND o.o_orderdate < DATE '1995-01-01'
 GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
 
 Q4="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
        AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
-FROM iceberg.tpch.lineitem WHERE l_shipdate <= DATE '1998-09-01'
+FROM iceberg.${TRINO_SCHEMA}.lineitem WHERE l_shipdate <= DATE '1998-09-01'
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
 Q5="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
-FROM iceberg.tpch.orders o JOIN iceberg.tpch.lineitem l ON o.o_orderkey = l.l_orderkey
+FROM iceberg.${TRINO_SCHEMA}.orders o JOIN iceberg.${TRINO_SCHEMA}.lineitem l ON o.o_orderkey = l.l_orderkey
 GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
 
 Q6="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extendedprice) AS sum_base_price,
        AVG(l_discount) AS avg_disc, COUNT(*) AS count_order
-FROM iceberg.tpch.lineitem
+FROM iceberg.${TRINO_SCHEMA}.lineitem
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
-Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM iceberg.tpch.lineitem GROUP BY l_orderkey) t"
+Q7="SELECT COUNT(*) FROM (SELECT l_orderkey, COUNT(*) AS cnt FROM iceberg.${TRINO_SCHEMA}.lineitem GROUP BY l_orderkey) t"
 
-Q8="SELECT COUNT(*) FROM iceberg.tpch.lineitem WHERE l_shipdate = DATE '1995-06-15'"
+Q8="SELECT COUNT(*) FROM iceberg.${TRINO_SCHEMA}.lineitem WHERE l_shipdate = DATE '1995-06-15'"
 
-Q9A="SELECT SUM(l_quantity) FROM iceberg.tpch.lineitem"
+Q9A="SELECT SUM(l_quantity) FROM iceberg.${TRINO_SCHEMA}.lineitem"
 
 Q9B="SELECT COUNT(*),
        SUM(l_orderkey), SUM(l_partkey), SUM(l_suppkey), SUM(l_linenumber),
@@ -106,26 +118,26 @@ Q9B="SELECT COUNT(*),
        MIN(l_shipdate), MAX(l_commitdate), MIN(l_receiptdate),
        COUNT(DISTINCT l_shipinstruct), COUNT(DISTINCT l_shipmode),
        SUM(length(l_comment))
-FROM iceberg.tpch.lineitem"
+FROM iceberg.${TRINO_SCHEMA}.lineitem"
 
-NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM iceberg.tpch.lineitem
+NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM iceberg.${TRINO_SCHEMA}.lineitem
 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
   AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"
 
-NQ2="SELECT COUNT(*) FROM iceberg.tpch.lineitem
+NQ2="SELECT COUNT(*) FROM iceberg.${TRINO_SCHEMA}.lineitem
 WHERE l_shipmode IN ('AIR','REG AIR') AND l_comment LIKE '%late%'"
 
 NQ3="SELECT COUNT(*) AS cnt, SUM(ps.ps_supplycost) AS total_cost
-FROM iceberg.tpch.part p JOIN iceberg.tpch.partsupp ps ON p.p_partkey = ps.ps_partkey
-JOIN iceberg.tpch.supplier s ON ps.ps_suppkey = s.s_suppkey
-JOIN iceberg.tpch.nation n ON s.s_nationkey = n.n_nationkey
+FROM iceberg.${TRINO_SCHEMA}.part p JOIN iceberg.${TRINO_SCHEMA}.partsupp ps ON p.p_partkey = ps.ps_partkey
+JOIN iceberg.${TRINO_SCHEMA}.supplier s ON ps.ps_suppkey = s.s_suppkey
+JOIN iceberg.${TRINO_SCHEMA}.nation n ON s.s_nationkey = n.n_nationkey
 WHERE p.p_size = 15 AND p.p_type LIKE '%BRASS%' AND n.n_name = 'GERMANY'"
 
-NQ4="SELECT l_orderkey, l_extendedprice FROM iceberg.tpch.lineitem
+NQ4="SELECT l_orderkey, l_extendedprice FROM iceberg.${TRINO_SCHEMA}.lineitem
 ORDER BY l_extendedprice DESC LIMIT 20"
 
 NQ5="SELECT o_orderpriority, o_orderstatus, COUNT(*) AS cnt, AVG(o_totalprice) AS avg_price
-FROM iceberg.tpch.orders GROUP BY o_orderpriority, o_orderstatus
+FROM iceberg.${TRINO_SCHEMA}.orders GROUP BY o_orderpriority, o_orderstatus
 HAVING COUNT(*) > 1000000 ORDER BY o_orderpriority, o_orderstatus"
 
 # INTO column lists mirror this repo's Arrow->Exasol type table (strings -> VARCHAR(2000000),
@@ -151,7 +163,7 @@ INTO_NQ3="CNT DECIMAL(20,0), TOTAL_COST DECIMAL(15,2)"
 INTO_NQ4="L_ORDERKEY DECIMAL(20,0), L_EXTENDEDPRICE DECIMAL(15,2)"
 INTO_NQ5="O_ORDERPRIORITY VARCHAR(2000000), O_ORDERSTATUS VARCHAR(2000000), CNT DECIMAL(20,0), AVG_PRICE DECIMAL(15,2)"
 
-JDBC_URL="jdbc:trino://${TRINO_HOST}:${TRINO_PORT}/iceberg/tpch"
+JDBC_URL="jdbc:trino://${TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
 
 import_stmt() {  # into  statement-sql
   local into="$1" stmt="$2"
@@ -175,10 +187,10 @@ run_timed() {  # name  into  statement-sql
   fi
   local rows; rows=$(printf '%s' "$out" | tail -n +2 | wc -l | tr -d '[:space:]')
   echo "  $name: ${el}s  rows=${rows}" | tee -a "$REPORT"
-  echo "TIMING import-jdbc-trino ${name} ${el}" >> "$REPORT"
+  echo "TIMING ${ENGINE_LABEL} ${name} ${el}" >> "$REPORT"
 }
 
-echo "import-jdbc-trino benchmark — ${TRINO_HOST}:${TRINO_PORT} — $(date)" | tee -a "$REPORT"
+echo "import-jdbc-trino benchmark — ${TRINO_HOST}:${TRINO_PORT} schema=${TRINO_SCHEMA} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
 run_timed "q1" "$INTO_Q1" "$Q1"
 run_timed "q2" "$INTO_Q2" "$Q2"
 run_timed "q3" "$INTO_Q3" "$Q3"
