@@ -53,6 +53,14 @@ the live row set by applying Parquet position-delete files during a scan.
   lightweight VS built over the untouched baseline namespace.
 - Deletes are authored by Apache Spark, not PyIceberg/iceberg-rust — see
   `scripts/spark-fixtures/create_tpch_deletes.sql`'s header comment for why.
+- **The flag also gates the 4 competitor scripts** (`athena_compare.sh`, `trino_compare.sh`,
+  `import_jdbc_trino.sh`, `spark_compare.sh` — see "Competitive engine comparison" below): each
+  resolves its own override var the same way as `BENCH_DELETE_NAMESPACE` (explicit override always
+  wins; otherwise `tpch` / `tpch_deletes` when the flag is on) — `ATHENA_DATABASE` (Athena),
+  `TRINO_SCHEMA` (both Trino scripts, shared), `SPARK_NAMESPACE` (Spark, forwarded as
+  `spark_queries.py`'s 2nd argument). All 4 only ever run in remote mode, so there is no docker
+  variant for them, and they read the SAME `tpch_deletes` Glue database this section's remote
+  authoring step already produces — no separate per-engine authoring step needed.
 
 ## What it does
 
@@ -125,6 +133,16 @@ Beyond the native-`IMPORT` ceiling above, the same TPC-H tables/queries can be r
 lakehouse engines people put next to a lakehouse: AWS Athena, Trino, and Spark. All three read the
 SAME Glue Iceberg catalog + S3 data as `remote` mode above. Manually invoked, not CI — same
 convention as the rest of `bench/`.
+
+All four scripts below (`athena_compare.sh`, `trino_compare.sh`, `import_jdbc_trino.sh`,
+`spark_compare.sh`) support `BENCH_WITH_DELETES=1` (see the "Delete-bearing benchmark" section
+above for the override vars and namespace resolution). When on, each appends `-deletes` to its
+`TIMING <engine> <query> <seconds>` engine label (e.g. `athena` → `athena-deletes`) so a
+with-deletes run's results can be told apart from a without-deletes run once hand-curated into
+`docs/performance.md` — `compare_all.sh`'s aggregation is line-based (`grep '^TIMING '`) and
+unaffected by the extra suffix. `compare_all.sh` itself stays single-variant per invocation: run
+it once with `BENCH_WITH_DELETES=0` and once with `=1` to get both tables — it does not
+auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
 
 - **`athena_compare.sh`** — no new infra (the Athena workgroup already exists in
   `deploy/data-stack`). `ATHENA_WORKGROUP=$(cd deploy/data-stack && tofu output -raw
