@@ -2931,3 +2931,79 @@ no follow-up issue is filed for it.
 Future readers of `rename_physical_to_logical` are not misled into believing
 name-mapping support resolves the drop+rename collision. The collision remains an open,
 untracked concern.
+
+---
+
+## ADR-103: Author Delete-Bearing Benchmark Tables via Apache Spark `DELETE FROM` on a v2 Merge-on-Read Table
+
+**Date:** 2026-07-08
+**Plan:** `add-delete-benchmark-flag`
+**Status:** Accepted
+
+### Context
+
+The delete-bearing benchmark variant (`BENCH_WITH_DELETES`) needs a `tpch_deletes` namespace of
+Iceberg v2 merge-on-read TPC-H tables with a deterministic ~5% of rows position-deleted per table,
+so the benchmark measures the engine's merge-on-read read-path cost, not just correctness. Neither
+in-repo Iceberg writer available at the time could author MOR position-delete files.
+
+### Decision
+
+Author the delete-bearing tables with Apache Spark's Iceberg runtime — a plain `DELETE FROM`
+against a `write.delete.mode=merge-on-read` (format-version=2) copy of each TPC-H table, keyed by a
+deterministic `<surrogate_key> % 20 = 0` predicate (~5% for uniform keys). Docker mode reuses the
+`apache/spark:3.5.7` compose fixture image already used elsewhere in the repo; remote mode reuses
+the EMR Serverless application already wired for `spark_compare.sh`.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Apache Spark `DELETE FROM` on a v2 MOR table | ✓ Chosen — the only in-repo mechanism that authors true MOR position-delete files, and already available in both bench modes (docker compose fixture, remote EMR Serverless), so no new dependency or infrastructure |
+| PyIceberg `table.delete()` in `gen_load.py` | ✗ Rejected — PyIceberg's delete path is copy-on-write only; does not author MOR position-delete files |
+| iceberg-rust writer | ✗ Rejected — iceberg-rust 0.10 has no position-delete writer (`apache/iceberg-rust#340`) |
+
+### Consequences
+
+The delete-bearing benchmark variant depends on Spark as an authoring-time tool in both bench
+modes (never at query time — the engine's own merge-on-read read path, already spec'd and
+CI-proven, is what's being measured). `scripts/spark-fixtures/create_tpch_deletes.sql` and
+`deploy/scripts/make_deletes_remote.py` are the two authoring entry points (docker vs. remote).
+
+---
+
+## ADR-104: `deploy/scripts/bench-remote.sh` Wraps the Remote Bench Sequence with an EXIT-Trap Teardown
+
+**Date:** 2026-07-08
+**Plan:** `add-delete-benchmark-flag`
+**Status:** Accepted
+
+### Context
+
+The remote (`test1`) benchmark sequence — `cluster-up.sh` → `secrets.sh` → `make bench` →
+`cluster-down.sh` — was previously run as four manual steps. A live `r8i.2xlarge` × N Exasol
+cluster bills continuously while it exists, and a failure or interrupt partway through the manual
+sequence could leave it running unattended.
+
+### Decision
+
+Add a single `deploy/scripts/bench-remote.sh <env>` wrapper that installs `trap 'cluster-down.sh
+<env>' EXIT` *before* bringing anything up, then runs the four steps in sequence — so teardown
+fires on success, on failure, or on interrupt (Ctrl-C/SIGTERM), and reports the original bench
+exit code rather than swallowing it behind teardown's own result. It forwards any caller-exported
+`BENCH_*`/`LAKEHOUSE_*` env untouched.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| A single wrapper script installing an EXIT trap before bring-up | ✓ Chosen — guarantees teardown runs on every exit path, including mid-sequence failure or an operator's Ctrl-C, which a manual four-command sequence cannot |
+| A Makefile `bench-test1` target | ✗ Rejected — Make cannot cleanly guarantee teardown runs when an earlier recipe line in the same target fails partway through |
+
+### Consequences
+
+`deploy/scripts/bench-remote.sh test1` (optionally prefixed with `BENCH_WITH_DELETES=1`) is now the
+recommended way to run the remote perf test — teardown is guaranteed rather than relying on the
+operator to remember `cluster-down.sh` afterward. The four-step manual sequence still works
+directly for cases needing fine-grained control (e.g. leaving the cluster up between repeated
+`make bench` runs).
