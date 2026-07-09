@@ -12,6 +12,11 @@
 PROMPT.md
 STATE.md
 
+# speq planning scratch: specs/_recorded/'s existing history stays tracked; this just stops NEW
+# entries from being committed going forward. specs/_plans/ is untracked (git rm --cached) but
+# deliberately NOT ignored here, so new plan files still show up as untracked in git status.
+specs/_recorded/
+
 # Benchmark local config + reports
 bench/.env
 bench/reports/
