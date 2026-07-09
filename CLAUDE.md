@@ -31,7 +31,7 @@ Any feature planned via `/speq:plan` that touches scanning, pushdown, or schema/
 be checked against the Apache Iceberg table spec (https://iceberg.apache.org/spec/) during
 planning — quote the relevant normative section, don't rely on memory. A known deviation from the
 spec must either be fixed in the same plan or recorded as an explicit, accurately-scoped tracked
-exception in `specs/backlog.md` (see the #27/#28 pattern in
+exception — a GitHub issue cited inline in the spec (see the `(#27)` pattern in
 `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`); it must never be a silent gap.
 A deviation driven by an Exasol target-type limitation (e.g. no struct/list/map types) is not a
 gap — but it must still be named as a deliberate trade-off in the spec, not left unstated.
