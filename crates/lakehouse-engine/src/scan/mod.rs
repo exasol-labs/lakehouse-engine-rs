@@ -14,7 +14,8 @@ use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{
-    AggKind, AggregatePlan, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
+    AggKind, AggregatePlan, FileEntry, NameMappingEntry, ProjectionItem, ScanSpec,
+    render_order_by_clause,
 };
 use crate::types::mapping::needs_json_fallback;
 use arrow::array::{Array, ListArray};
@@ -317,6 +318,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.files,
         &spec.table_root,
         &spec.logical_schema,
+        &spec.name_mapping,
         &spec.storage,
     )
     .await?;
@@ -326,6 +328,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.files,
         &join.table_root,
         &join.logical_schema,
+        &join.name_mapping,
         &spec.storage,
     )
     .await?;
@@ -1448,6 +1451,7 @@ pub async fn register_files(
         &spec.files,
         &spec.table_root,
         &spec.logical_schema,
+        &spec.name_mapping,
         &spec.storage,
     )
     .await
@@ -1462,8 +1466,11 @@ pub async fn register_files(
 /// paths; a non-empty `logical_schema` registers that schema and installs the
 /// field-id expression adapter (column binding is field-id-first — correct across
 /// Iceberg schema evolution), otherwise one Arrow schema is inferred from the
-/// first file. Read/inference errors route through [`classify_scan_error`] so no
-/// credential value can leak, whichever side's file list is unreadable.
+/// first file. `name_mapping` is threaded alongside `logical_schema` into the
+/// [`PositionalDeleteScanTable`]/[`FieldIdExprAdapterFactory`] for the same side,
+/// shard-invariant like the logical schema itself. Read/inference errors route
+/// through [`classify_scan_error`] so no credential value can leak, whichever
+/// side's file list is unreadable.
 ///
 /// Delete correctness: each side registers through the SAME
 /// [`PositionalDeleteScanTable`] provider, so a data file carrying Iceberg
@@ -1478,6 +1485,7 @@ async fn register_file_list(
     files: &[FileEntry],
     table_root: &str,
     logical_schema: &[crate::scan::spec::LogicalField],
+    name_mapping: &[NameMappingEntry],
     storage: &crate::scan::spec::StorageProps,
 ) -> Result<(), UdfError> {
     let first = files.first().ok_or_else(|| {
@@ -1527,6 +1535,7 @@ async fn register_file_list(
         object_store_url,
         table_schema,
         use_field_id_adapter,
+        name_mapping.to_vec(),
         files.to_vec(),
         table_root.to_string(),
         storage,
@@ -1741,8 +1750,17 @@ fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
 /// `Unable to get field named "rating"`. Renaming the output back to the real
 /// physical name (order is preserved, so the index is already right) makes those
 /// name-based lookups succeed while keeping the field-id binding.
+///
+/// Carries the query's flattened `schema.name-mapping.default` entries
+/// (resolved once in the VS and threaded down via [`register_file_list`] /
+/// [`PositionalDeleteScanTable`]), so [`Self::create`] can hand them to
+/// [`rename_physical_to_logical`] for the no-embedded-field-id resolution step.
+/// Empty when the table has no name-mapping property, in which case resolution
+/// is unchanged from the field-id / physical-name fallback.
 #[derive(Debug)]
-pub(crate) struct FieldIdExprAdapterFactory;
+pub(crate) struct FieldIdExprAdapterFactory {
+    pub(crate) name_mapping: Vec<NameMappingEntry>,
+}
 
 impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
     fn create(
@@ -1755,8 +1773,11 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         // each logical column to the correct physical INDEX (order is preserved by
         // the rename) and applies cast / NULL-fill / required-missing-error against
         // the logical field — the reused behavior.
-        let renamed_physical =
-            rename_physical_to_logical(&logical_file_schema, &physical_file_schema);
+        let renamed_physical = rename_physical_to_logical(
+            &logical_file_schema,
+            &physical_file_schema,
+            &self.name_mapping,
+        );
         let inner = DefaultPhysicalExprAdapterFactory
             .create(logical_file_schema, Arc::clone(&renamed_physical))?;
         Ok(Arc::new(FieldIdExprAdapter {
@@ -1821,17 +1842,28 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
 ///
 /// Resolution per physical field:
 /// 1. If it carries a `PARQUET:field_id` matching a logical field's id → adopt
-///    that logical field's name (this is the rename/field-id binding).
-/// 2. Otherwise (no field-id, or an id absent from the logical schema) → keep the
-///    physical name unchanged, which makes the default adapter's name lookup act
-///    as the physical-name fallback (and leaves dropped columns unreferenced).
+///    that logical field's name (this is the rename/field-id binding). An
+///    embedded field-id is authoritative: if it is absent from the logical
+///    schema the physical name is kept and the name-mapping is NOT consulted.
+/// 2. Else if it carries NO embedded field-id and `name_mapping` maps its
+///    physical name to a field-id present in the logical schema → adopt that
+///    logical field's name (Iceberg column-projection rule #2, honoring
+///    `schema.name-mapping.default`).
+/// 3. Otherwise (no field-id and no covering name-mapping entry, or a mapped
+///    field-id absent from the logical schema) → keep the physical name
+///    unchanged, which makes the default adapter's name lookup act as the
+///    physical-name fallback (and leaves dropped columns unreferenced).
 ///
 /// Assumes that post-rename logical names are unique among the referenced physical
-/// fields. Name collisions from drop+rename-into-a-reused-name are out of scope
-/// and belong to the name-mapping work tracked in issue #28.
+/// fields. Name collisions from drop+rename-into-a-reused-name are a distinct,
+/// still-open concern, NOT resolved by (or in scope for) name-mapping support:
+/// `schema.name-mapping.default` maps CURRENT-state physical names to field-ids,
+/// so it cannot disambiguate a dropped column whose old physical name was later
+/// reused by an unrelated field.
 fn rename_physical_to_logical(
     logical: &arrow::datatypes::Schema,
     physical: &arrow::datatypes::Schema,
+    name_mapping: &[NameMappingEntry],
 ) -> arrow::datatypes::SchemaRef {
     use std::collections::HashMap;
 
@@ -1841,12 +1873,28 @@ fn rename_physical_to_logical(
         .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
         .collect();
 
+    let field_id_by_physical_name: HashMap<&str, i32> = name_mapping
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.field_id))
+        .collect();
+
     let renamed_fields: Vec<arrow::datatypes::FieldRef> = physical
         .fields()
         .iter()
         .map(|physical_field| {
-            match field_id_of(physical_field).and_then(|id| logical_name_by_id.get(&id)) {
-                Some(&logical_name) if logical_name != physical_field.name() => {
+            let logical_name = match field_id_of(physical_field) {
+                // An embedded field-id is authoritative: resolve it, or keep the
+                // physical name if that id is absent from the logical schema. The
+                // name-mapping is never consulted for a field that carries an id.
+                Some(id) => logical_name_by_id.get(&id).copied(),
+                // No embedded field-id: consult the name-mapping (step 2), then
+                // fall back to the physical name (step 3).
+                None => field_id_by_physical_name
+                    .get(physical_field.name().as_str())
+                    .and_then(|id| logical_name_by_id.get(id).copied()),
+            };
+            match logical_name {
+                Some(logical_name) if logical_name != physical_field.name() => {
                     Arc::new(physical_field.as_ref().clone().with_name(logical_name))
                 }
                 _ => Arc::clone(physical_field),
@@ -1934,6 +1982,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
@@ -3514,9 +3563,11 @@ mod tests {
             physical: SchemaRef,
             column: Column,
         ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
-            let adapter = FieldIdExprAdapterFactory
-                .create(logical, physical)
-                .expect("adapter creation");
+            let adapter = FieldIdExprAdapterFactory {
+                name_mapping: Vec::new(),
+            }
+            .create(logical, physical)
+            .expect("adapter creation");
             adapter.rewrite(Arc::new(column))
         }
 
@@ -3636,6 +3687,138 @@ mod tests {
             assert_eq!(rating.data_type(), &DataType::Float64);
             assert!(rating.is_nullable(), "nullable must be preserved");
             assert_eq!(field_id_of(rating), Some(2));
+        }
+
+        /// Scenario: a physical field with NO embedded field-id, whose physical
+        /// name IS covered by a `name_mapping` entry pointing to a field-id that
+        /// IS present in the logical schema, resolves to that logical field's name.
+        #[test]
+        fn name_mapping_resolves_no_field_id_column() {
+            use super::super::rename_physical_to_logical;
+            use crate::scan::spec::NameMappingEntry;
+
+            let logical = Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]);
+            // No embedded field-id: name-mapping maps `score` -> id 2 -> `rating`.
+            let physical = Schema::new(vec![field_no_id("score", DataType::Int64, true)]);
+            let mapping = vec![NameMappingEntry {
+                name: "score".to_string(),
+                field_id: 2,
+            }];
+
+            let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+
+            assert_eq!(
+                renamed.field(0).name(),
+                "rating",
+                "no-id field must resolve via name-mapping"
+            );
+        }
+
+        /// Scenario: a physical field WITH an embedded field-id that resolves via
+        /// `logical_name_by_id` wins over a conflicting name-mapping entry for the
+        /// same physical name pointing at a DIFFERENT field-id; the name-mapping
+        /// is not consulted when an embedded field-id is present.
+        #[test]
+        fn embedded_field_id_wins_over_name_mapping() {
+            use super::super::rename_physical_to_logical;
+            use crate::scan::spec::NameMappingEntry;
+
+            let logical = Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]);
+            let physical = Schema::new(vec![field_with_id("score", DataType::Int64, true, 2)]);
+            let mapping = vec![NameMappingEntry {
+                name: "score".to_string(),
+                field_id: 1,
+            }];
+
+            let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+
+            assert_eq!(
+                renamed.field(0).name(),
+                "rating",
+                "embedded id 2 must win over a mapping to id 1"
+            );
+        }
+
+        /// Scenario: `name_mapping` is empty/absent, so a physical field with no
+        /// embedded field-id keeps its physical name unchanged (today's existing
+        /// fallback, unaffected by name-mapping support).
+        #[test]
+        fn no_name_mapping_falls_back_to_physical_name() {
+            use super::super::rename_physical_to_logical;
+
+            let logical = Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]);
+            let physical = Schema::new(vec![field_no_id("score", DataType::Int64, true)]);
+
+            let renamed = rename_physical_to_logical(&logical, &physical, &[]);
+
+            assert_eq!(
+                renamed.field(0).name(),
+                "score",
+                "no mapping must keep the physical name"
+            );
+        }
+
+        /// Scenario: `name_mapping` has entries, but none cover this particular
+        /// physical field's name, so the physical name is kept unchanged (the
+        /// name-mapping augments but never replaces the fallback).
+        #[test]
+        fn uncovered_name_mapping_falls_back_to_physical_name() {
+            use super::super::rename_physical_to_logical;
+            use crate::scan::spec::NameMappingEntry;
+
+            let logical = Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]);
+            let physical = Schema::new(vec![field_no_id("unknown", DataType::Int64, true)]);
+            let mapping = vec![NameMappingEntry {
+                name: "score".to_string(),
+                field_id: 2,
+            }];
+
+            let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+
+            assert_eq!(
+                renamed.field(0).name(),
+                "unknown",
+                "uncovered field must keep the physical name"
+            );
+        }
+
+        /// Edge case: an embedded field-id that is present but ABSENT from the
+        /// logical schema must NOT fall through to the name-mapping — it keeps
+        /// the physical name, exactly like the no-mapping fallback.
+        #[test]
+        fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
+            use super::super::rename_physical_to_logical;
+            use crate::scan::spec::NameMappingEntry;
+
+            let logical = Schema::new(vec![
+                field_with_id("id", DataType::Int64, false, 1),
+                field_with_id("rating", DataType::Int64, true, 2),
+            ]);
+            let physical = Schema::new(vec![field_with_id("score", DataType::Int64, true, 99)]);
+            let mapping = vec![NameMappingEntry {
+                name: "score".to_string(),
+                field_id: 2,
+            }];
+
+            let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+
+            assert_eq!(
+                renamed.field(0).name(),
+                "score",
+                "an unresolvable embedded id must NOT fall through to the name-mapping"
+            );
         }
 
         /// Scenario: field-id resolution falls back to physical name when a file

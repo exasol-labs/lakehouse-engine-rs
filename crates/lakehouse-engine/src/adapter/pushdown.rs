@@ -1,8 +1,8 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     AggKind, AggregatePlan, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry,
-    JoinSpec, JoinType, LogicalField, ProjectionItem, ScanSpec, SortKey, StorageProps,
-    render_order_by_clause,
+    JoinSpec, JoinType, LogicalField, NameMappingEntry, ProjectionItem, ScanSpec, SortKey,
+    StorageProps, render_order_by_clause,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -2387,7 +2387,7 @@ pub async fn handle_pushdown(
     // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
     // filter_json_raw is forwarded for Iceberg-level file pruning; ScanSpec.filter
     // (DataFusion SQL string) is set separately above and left completely unchanged.
-    let (files, effective_storage, logical_schema, table_root) =
+    let (files, effective_storage, logical_schema, table_root, name_mapping) =
         resolve_file_list(catalog_uri, catalog, storage, creds, filter_json_raw).await?;
     let storage = &effective_storage;
 
@@ -2507,6 +2507,7 @@ pub async fn handle_pushdown(
                 // strict emit_batch IPC path, so no per-column declared types needed.
                 emit_exa_types: Vec::new(),
                 logical_schema: logical_schema.clone(),
+                name_mapping: name_mapping.clone(),
                 join: None,
                 storage: storage.clone(),
                 df_target_partitions,
@@ -2569,6 +2570,7 @@ pub async fn handle_pushdown(
             group_keys: None,
             emit_exa_types: fb_proj_types,
             logical_schema: logical_schema.clone(),
+            name_mapping: name_mapping.clone(),
             join: None,
             storage: storage.clone(),
             df_target_partitions,
@@ -2631,6 +2633,7 @@ pub async fn handle_pushdown(
         // emits via the Value path). Same list the EMITS clause is built from.
         emit_exa_types: proj_types.clone(),
         logical_schema,
+        name_mapping,
         join: None,
         storage: storage.clone(),
         df_target_partitions,
@@ -2710,6 +2713,55 @@ fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
         .collect()
 }
 
+/// Parse the Iceberg `schema.name-mapping.default` table property into the flat
+/// `Vec<NameMappingEntry>` the scan-side resolver looks up by physical name.
+///
+/// `raw` is the property's raw JSON value (`None` when the property is absent).
+///
+/// Behaviour (Iceberg column-projection rule #2 scope — see the plan):
+/// - Absent property (`None`) → an empty `Vec` (NOT an error): a table with no
+///   name-mapping is the common, fully-supported case.
+/// - Present but malformed JSON → a clean, credential-free plan-time `UdfError`
+///   (mirrors the fail-loud discipline of `ensure_supported_delete_mechanisms`;
+///   the property carries only column names + field-ids, never credentials, and
+///   `serde_json`'s error reports only a parse position).
+/// - Present and valid → flatten ONLY the TOP-LEVEL entries: for each top-level
+///   mapping that HAS a `field-id`, emit one `NameMappingEntry { name, field_id }`
+///   per name in its `names` list. Entries without a `field-id` are skipped (they
+///   exist only in the Iceberg schema, not in imported files — nothing to map to).
+///   Nested `fields` (struct/map/list child mappings) are deliberately NOT
+///   recursed into — out of scope for this phase (deferred to issue #83).
+///
+/// Parsed via the `iceberg` crate's own spec-accurate `NameMapping` deserializer
+/// (kebab-case `field-id`, `DefaultOnNull` nested `fields`), never a hand-rolled
+/// struct. Resolved ONCE per query in the VS planning layer.
+fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mapping: iceberg::spec::NameMapping = serde_json::from_str(raw).map_err(|e| {
+        UdfError::User(format!(
+            "failed to parse Iceberg '{}' table property: {e}",
+            iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for field in mapping.fields() {
+        // Skip id-less entries (schema-only, not present in imported files) and do
+        // NOT recurse into `field.fields()` (nested child mappings, out of scope).
+        let Some(field_id) = field.field_id() else {
+            continue;
+        };
+        for name in field.names() {
+            entries.push(NameMappingEntry {
+                name: name.clone(),
+                field_id,
+            });
+        }
+    }
+    Ok(entries)
+}
+
 /// Resolve the data-file list from the Iceberg REST catalog.
 ///
 /// This is the resolve-once seam: called exactly once per pushdown in the
@@ -2733,7 +2785,16 @@ pub async fn resolve_file_list(
     storage: &StorageProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
-) -> Result<(Vec<FileEntry>, StorageProps, Vec<LogicalField>, String), UdfError> {
+) -> Result<
+    (
+        Vec<FileEntry>,
+        StorageProps,
+        Vec<LogicalField>,
+        String,
+        Vec<NameMappingEntry>,
+    ),
+    UdfError,
+> {
     // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
     // catalog-auth mode applies, then derive the effective storage gated SOLELY on
     // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
@@ -2799,6 +2860,19 @@ pub async fn resolve_file_list(
     // Extract the logical schema before `plan_files_from_table` consumes `table`.
     let logical_schema = build_logical_schema(table.metadata().current_schema());
 
+    // Resolve the Iceberg name-mapping fallback (`schema.name-mapping.default`)
+    // ONCE per query here — alongside `logical_schema`, and likewise before
+    // `plan_files_from_table` consumes `table` — so it is resolved in the VS
+    // planning layer, never per UDF invocation. Absent property ⇒ empty; a
+    // present-but-malformed property fails loud with a clean plan-time error.
+    let name_mapping = parse_name_mapping(
+        table
+            .metadata()
+            .properties()
+            .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .map(String::as_str),
+    )?;
+
     // AUTHORITATIVE correctness gate: fail loud at the manifest/`DataFile` level on
     // any delete/data mechanism this engine cannot apply (equality delete, Puffin/v3
     // deletion vector, ORC/Avro data or delete file) BEFORE building any
@@ -2807,7 +2881,13 @@ pub async fn resolve_file_list(
     ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
 
     let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
-    Ok((files, effective_storage, logical_schema, table_root))
+    Ok((
+        files,
+        effective_storage,
+        logical_schema,
+        table_root,
+        name_mapping,
+    ))
 }
 
 /// A data- or delete-file mechanism the lakehouse engine cannot apply on read.
@@ -3924,6 +4004,10 @@ pub(crate) struct ResolvedJoinSide {
     pub files: Vec<FileEntry>,
     /// Full logical schema of this side's Iceberg table at query time.
     pub logical_schema: Vec<LogicalField>,
+    /// This side's flattened Iceberg `schema.name-mapping.default` entries
+    /// (empty when the table has no name-mapping property). Resolved ONCE per
+    /// query on the same `resolve_file_list` path as `logical_schema`.
+    pub name_mapping: Vec<NameMappingEntry>,
     /// Effective storage for this side (vended STS creds when applicable).
     pub effective_storage: StorageProps,
     /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
@@ -3940,6 +4024,7 @@ impl ResolvedJoinSide {
         table_root: String,
         files: Vec<FileEntry>,
         logical_schema: Vec<LogicalField>,
+        name_mapping: Vec<NameMappingEntry>,
         effective_storage: StorageProps,
     ) -> Self {
         let total_bytes = files
@@ -3951,6 +4036,7 @@ impl ResolvedJoinSide {
             table_root,
             files,
             logical_schema,
+            name_mapping,
             effective_storage,
             total_bytes,
         }
@@ -4054,7 +4140,7 @@ async fn resolve_one_join_side(
         table: iceberg_ident.to_string(),
         ..catalog.clone()
     };
-    let (files, effective_storage, logical_schema, table_root) =
+    let (files, effective_storage, logical_schema, table_root, name_mapping) =
         resolve_file_list(catalog_uri, &side_catalog, storage, creds, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
@@ -4062,6 +4148,7 @@ async fn resolve_one_join_side(
         table_root,
         files,
         logical_schema,
+        name_mapping,
         effective_storage,
     ))
 }
@@ -4951,6 +5038,7 @@ fn build_side_fan_out_sql(
         group_keys: None,
         emit_exa_types: proj_types.clone(),
         logical_schema: side.logical_schema.clone(),
+        name_mapping: side.name_mapping.clone(),
         join: None,
         storage: side.effective_storage.clone(),
         df_target_partitions: tuning.df_target_partitions,
@@ -5010,6 +5098,7 @@ fn build_broadcast_join_sql(
         table_root: dimension.table_root.clone(),
         files: relativize_files_to_root(dimension.files.clone(), &dimension.table_root),
         logical_schema: dimension.logical_schema.clone(),
+        name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
     };
@@ -5025,6 +5114,7 @@ fn build_broadcast_join_sql(
         group_keys: None,
         emit_exa_types: rendered.projection_types.clone(),
         logical_schema: fact.logical_schema.clone(),
+        name_mapping: fact.name_mapping.clone(),
         join: Some(join),
         storage: fact.effective_storage.clone(),
         df_target_partitions: tuning.df_target_partitions,
@@ -5615,6 +5705,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -5874,6 +5965,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -5944,6 +6036,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: proj_types.clone(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -6993,6 +7086,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: proj_types.clone(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9234,6 +9328,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9328,6 +9423,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9490,6 +9586,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9559,6 +9656,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9701,6 +9799,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -9749,6 +9848,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -10235,6 +10335,7 @@ mod tests {
             group_keys: Some(result.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -10482,6 +10583,7 @@ mod tests {
                 group_keys: Some(result.group_keys.clone()),
                 emit_exa_types: Vec::new(),
                 logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
                 join: None,
                 storage: sample_storage(),
                 df_target_partitions: 1,
@@ -10764,6 +10866,7 @@ mod tests {
             group_keys: Some(result.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -10878,6 +10981,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -10929,6 +11033,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11012,6 +11117,7 @@ mod tests {
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11116,6 +11222,7 @@ mod tests {
             group_keys: Some(vec!["\"REGION\"".into()]),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11285,6 +11392,7 @@ mod tests {
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11560,6 +11668,7 @@ mod tests {
             group_keys: Some(d.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11812,6 +11921,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: proj_types,
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -11927,6 +12037,7 @@ mod tests {
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -12019,6 +12130,7 @@ mod tests {
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -12108,6 +12220,7 @@ mod tests {
             group_keys: Some(detection.group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -12291,6 +12404,7 @@ mod tests {
             group_keys: Some(group_keys.clone()),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -12743,6 +12857,7 @@ mod tests {
             group_keys: Some(vec![r#""REGION""#.to_string()]),
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -13605,6 +13720,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -14209,6 +14325,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
             logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
             join: None,
             storage: vended_storage,
             df_target_partitions: 1,
@@ -14636,6 +14753,7 @@ mod tests {
             group_keys: None,
             emit_exa_types: Vec::new(),
             logical_schema: logical.clone(),
+            name_mapping: Vec::new(),
             join: None,
             storage: sample_storage(),
             df_target_partitions: 1,
@@ -14695,6 +14813,7 @@ mod tests {
                 arrow_type: "int64".to_string(),
                 nullable: false,
             }],
+            Vec::new(),
             sample_storage(),
         )
     }
@@ -14828,5 +14947,88 @@ mod tests {
         assert_eq!(sides.dimension.table_name, "SELF_A");
         assert_eq!(sides.fact.table_name, "SELF_B");
         assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.2 — `parse_name_mapping` flattens `schema.name-mapping.default`
+    // ---------------------------------------------------------------------------
+
+    /// A representative `schema.name-mapping.default` payload — mirroring the
+    /// Iceberg spec's own example shape — flattens to one `NameMappingEntry` per
+    /// TOP-LEVEL name. Multi-name entries expand to one entry per name (Avro field
+    /// aliases); an entry's nested `fields` children are excluded, but the entry's
+    /// OWN top-level name(s) are still included; an entry with no `field-id` at
+    /// all (schema-only, not present in imported files) is fully excluded.
+    #[test]
+    fn resolves_name_mapping_flat_entries_once() {
+        let raw = r#"
+        [
+            { "field-id": 1, "names": ["id", "record_id"] },
+            {
+                "field-id": 3,
+                "names": ["location"],
+                "fields": [
+                    { "field-id": 4, "names": ["latitude", "lat"] },
+                    { "field-id": 5, "names": ["longitude", "long"] }
+                ]
+            },
+            { "names": ["schema_only_no_field_id"] }
+        ]
+        "#;
+
+        let entries = parse_name_mapping(Some(raw)).expect("valid name-mapping JSON must parse");
+
+        assert_eq!(
+            entries,
+            vec![
+                NameMappingEntry {
+                    name: "id".to_string(),
+                    field_id: 1,
+                },
+                NameMappingEntry {
+                    name: "record_id".to_string(),
+                    field_id: 1,
+                },
+                NameMappingEntry {
+                    name: "location".to_string(),
+                    field_id: 3,
+                },
+            ],
+            "multi-name entry expands per name; nested `fields` children (lat/lat, \
+             long/long) are excluded while the parent's own top-level name is kept; \
+             the id-less entry is fully excluded"
+        );
+    }
+
+    /// An absent `schema.name-mapping.default` property (`None`) yields an empty
+    /// mapping, not an error — a table with no name-mapping is the common,
+    /// fully-supported case.
+    #[test]
+    fn absent_name_mapping_is_empty() {
+        assert_eq!(
+            parse_name_mapping(None).expect("absent property must not error"),
+            Vec::new()
+        );
+    }
+
+    /// A present-but-malformed `schema.name-mapping.default` value fails loud with
+    /// a clean, credential-free plan-time error that names the offending property.
+    #[test]
+    fn malformed_name_mapping_errors_cleanly() {
+        let err = parse_name_mapping(Some("{ not valid json mapping shape"))
+            .expect_err("malformed name-mapping JSON must error");
+
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING),
+            "error must name the offending property: {msg}"
+        );
+        assert!(
+            !msg.contains("access_key") && !msg.contains("secret_key"),
+            "error must not leak credentials: {msg}"
+        );
     }
 }

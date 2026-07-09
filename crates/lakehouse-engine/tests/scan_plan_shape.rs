@@ -71,6 +71,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
@@ -395,6 +396,7 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
         group_keys: None,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: None,
         storage: StorageProps {
             endpoint: "http://localhost:9000".into(),
@@ -520,6 +522,7 @@ fn join_broadcast_fan_out_sql_shape() {
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("data/cust-0.parquet", 4096)],
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
     };
@@ -538,6 +541,7 @@ fn join_broadcast_fan_out_sql_shape() {
         group_keys: None,
         emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
         logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
         join: Some(join),
         storage: test_storage(),
         df_target_partitions: 1,
