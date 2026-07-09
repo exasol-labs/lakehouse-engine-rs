@@ -28,7 +28,7 @@ the actual default-value materialization. See decision [2].
   data file and return a clean error, rather than reconstructing the value from the file's
   partition metadata. The set of identity-partition source field-ids is resolved once per query
   from `TableMetadata` partition specs (`Transform::Identity` → `source_id`) and threaded
-  shard-invariant into the scan spec. Full reconstruction is deferred to issue #98 / backlog BL-003.
+  shard-invariant into the scan spec. Full reconstruction is deferred to issue #99 / backlog BL-003.
 - **Alternatives:** (a) Full rule-#1 reconstruction now — add a per-file partition tuple to
   `FileEntry`, thread the partition spec, and synthesize a typed constant column intercepting the
   default adapter. Rejected for this plan: it is a genuine feature (new per-file wire field +
@@ -78,7 +78,7 @@ the actual default-value materialization. See decision [2].
 
   **BL-003: Identity-partition source column value reconstruction (Iceberg rule #1)**
   Raised by: `fix-iceberg-spec-gaps` (2026-07-09). Status: Open — fail-loud guard shipped by
-  this plan; value reconstruction deferred. Tracks issue #98. Iceberg column-projection rule #1:
+  this plan; value reconstruction deferred. Tracks issue #99. Iceberg column-projection rule #1:
   a field-id absent from a data file whose value is an Identity-Transform partition source SHALL
   be reconstructed from that file's `data_file.partition` struct. Today `FieldEntry` carries only
   `{path, size, deletes}` and `plan_files_from_table` drops the partition tuple, and the scan

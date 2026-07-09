@@ -6,7 +6,7 @@ Close the two remaining Iceberg column-projection missing-field gaps by converti
 cases where the scan silently returns wrong data — an identity-partition source column absent
 from a data file (rule #1) and an added column with a non-null `initial-default` absent from a
 data file (rule #3) — into clean, fail-loud errors via a shard-invariant no-null-fill guard
-resolved once per query; full value reconstruction is deferred and tracked (issue #98 / #27,
+resolved once per query; full value reconstruction is deferred and tracked (issue #99 / #27,
 backlog BL-003 / BL-004).
 
 ## Design
@@ -41,7 +41,7 @@ is deferred with tracking, per the repo's Iceberg-spec-compliance rule.
   mirroring how `logical_schema` and `name_mapping` are threaded. Preserve all current behavior
   when the guard set is empty (the common case).
 - **Non-Goals** — Materializing the correct value: reconstructing the partition value from a
-  file's partition tuple (deferred, #98 / BL-003) or synthesizing the `initial-default` literal
+  file's partition tuple (deferred, #99 / BL-003) or synthesizing the `initial-default` literal
   (deferred, #27 / BL-004). Neither adds per-file partition tuples nor typed-default literals to
   the wire format in this plan. Nested `fields` name-mapping (#83). Non-identity partition
   transforms (only identity is reconstructable by value substitution; others are not affected).
@@ -160,13 +160,13 @@ VS planning (pushdown.rs)                        Scan UDF (scan/mod.rs)
      `field_fill_guards` (assert the scan fails with the accurate, credential-free message) and once
      with an empty guard set (assert the column NULL-fills as today). Cover both reasons.
 5. **Track the deferred value materialization (fail-loud → full-fill follow-ons)**
-   - [ ] 5.1 Add `BL-003` (identity-partition value reconstruction, references new issue #98) and
+   - [ ] 5.1 Add `BL-003` (identity-partition value reconstruction, references new issue #99) and
      `BL-004` (any-nullability `initial-default` materialization, cross-references #27) to
      `specs/backlog.md`, using the entry text recorded in `decision-log.md`.
-   - [ ] 5.2 Create GitHub issue #98 ("feat(scan): reconstruct identity-partition source column values
+   - [ ] 5.2 Create GitHub issue #99 ("feat(scan): reconstruct identity-partition source column values
      from data-file partition metadata — Iceberg rule #1") per the repo's issue-tracking rule, and
      update issue #27's body to broaden its scope from required-only to any-nullability `initial-default`
-     fill. Reference #98 / #27 in the implementing commit. (Read-only-git constraint: issue creation is a
+     fill. Reference #99 / #27 in the implementing commit. (Read-only-git constraint: issue creation is a
      GitHub write performed at implementation start, not during planning.)
 
 ## Parallelization

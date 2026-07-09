@@ -58,7 +58,7 @@ per file without rewriting the schema adapter.
 * Out-of-scope (fail-loud now, full value materialization deferred and tracked):
   reconstructing an identity-partition source column's value from a data file's partition
   metadata when the field-id is absent from the file — Iceberg column-projection rule #1
-  (issue #98, backlog BL-003); and filling ANY added column (optional OR required) from its
+  (issue #99, backlog BL-003); and filling ANY added column (optional OR required) from its
   Iceberg `initial-default` — rule #3 (issue #27, whose scope is broadened here from
   required-only to any-nullability, backlog BL-004). Both cases now return a clean error via
   the no-null-fill guard rather than silently wrong data; materializing the correct value is
