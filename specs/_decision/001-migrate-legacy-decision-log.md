@@ -1,13 +1,8 @@
-# Architecture Decision Records
+# Decisions: migrate-legacy-decision-log
 
-<!-- ADRs are numbered sequentially starting from ADR-001. Never renumber. -->
-<!-- recorder-agent appends new ADRs from plan decision logs. -->
+## ADR: One Crate / One .so with Two Named Entry Points
 
----
-
-## ADR-001: One Crate / One .so with Two Named Entry Points
-
-**Date:** 2026-06-21
+**ID:** one-crate-one-so-with-two-named-entry-points
 **Plan:** `add-datafusion-iceberg-scan-pushdown`
 **Status:** Accepted
 
@@ -32,9 +27,9 @@ One BucketFS upload suffices for both scripts. The build target is single-crate,
 
 ---
 
-## ADR-002: Adapter Drives a Scan SET UDF (Not a Cache-Populating Library Call)
+## ADR: Adapter Drives a Scan SET UDF (Not a Cache-Populating Library Call)
 
-**Date:** 2026-06-21
+**ID:** adapter-drives-a-scan-set-udf-not-a-cache-populating-library-call
 **Plan:** `add-datafusion-iceberg-scan-pushdown`
 **Status:** Accepted
 
@@ -59,9 +54,9 @@ DataFusion runs inside the UDF for every query — no cached results, no backgro
 
 ---
 
-## ADR-003: Resolve Metadata Once in the Adapter; Pass an Explicit File List to the UDF
+## ADR: Resolve Metadata Once in the Adapter; Pass an Explicit File List to the UDF
 
-**Date:** 2026-06-21
+**ID:** resolve-metadata-once-in-the-adapter-pass-an-explicit-file-list-to-the-udf
 **Plan:** `add-datafusion-iceberg-scan-pushdown`
 **Status:** Accepted
 
@@ -86,9 +81,9 @@ Metadata resolution is single-threaded and happens before the scan UDF runs, add
 
 ---
 
-## ADR-004: Value-Only Boundary with Batch-by-Batch Incremental Emit
+## ADR: Value-Only Boundary with Batch-by-Batch Incremental Emit
 
-**Date:** 2026-06-21
+**ID:** value-only-boundary-with-batch-by-batch-incremental-emit
 **Plan:** `add-datafusion-iceberg-scan-pushdown`
 **Status:** Accepted
 
@@ -114,9 +109,9 @@ Peak memory per UDF invocation is bounded by one Arrow batch plus one Value row 
 
 ---
 
-## ADR-005: Single Authoritative DataFusion-to-Exasol Type Mapping with JSON Fallback
+## ADR: Single Authoritative DataFusion-to-Exasol Type Mapping with JSON Fallback
 
-**Date:** 2026-06-21
+**ID:** single-authoritative-datafusion-to-exasol-type-mapping-with-json-fallback
 **Plan:** `add-datafusion-iceberg-scan-pushdown`
 **Status:** Accepted
 
@@ -142,11 +137,11 @@ Every Iceberg column is surfaced in the virtual schema, even complex types. Inco
 
 ---
 
-## ADR-006: Cluster Node Count Captured Once at createVirtualSchema via adapterNotes
+## ADR: Cluster Node Count Captured Once at createVirtualSchema via adapterNotes
 
-**Date:** 2026-06-21
+**ID:** cluster-node-count-captured-once-at-createvirtualschema-via-adapternotes
 **Plan:** `add-multinode-sharding-and-agg-pushdown`
-**Status:** Superseded by ADR-048
+**Status:** Superseded by source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006
 
 ### Context
 
@@ -171,9 +166,9 @@ One connect-back at schema creation time; zero connect-back overhead at pushdown
 
 ---
 
-## ADR-007: IPROC Fan-Out via Derived VALUES + GROUP BY IPROC(), shard_key
+## ADR: IPROC Fan-Out via Derived VALUES + GROUP BY IPROC(), shard_key
 
-**Date:** 2026-06-21
+**ID:** iproc-fan-out-via-derived-values-group-by-iproc-shard-key
 **Plan:** `add-multinode-sharding-and-agg-pushdown`
 **Status:** Accepted
 
@@ -199,9 +194,9 @@ Node placement is guaranteed by Exasol's GROUP BY IPROC() routing. The fan-out i
 
 ---
 
-## ADR-008: Partial/Merge Aggregate Decomposition; AVG as (sum, count) Pair
+## ADR: Partial/Merge Aggregate Decomposition; AVG as (sum, count) Pair
 
-**Date:** 2026-06-21
+**ID:** partial-merge-aggregate-decomposition-avg-as-sum-count-pair
 **Plan:** `add-multinode-sharding-and-agg-pushdown`
 **Status:** Accepted
 
@@ -227,9 +222,9 @@ Network transfer is bounded to one partial-result row per shard, regardless of h
 
 ---
 
-## ADR-009: Standalone `crates/vs-expression` Crate for Expression Translation
+## ADR: Standalone `crates/vs-expression` Crate for Expression Translation
 
-**Date:** 2026-06-22
+**ID:** standalone-crates-vs-expression-crate-for-expression-translation
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
 
@@ -255,9 +250,9 @@ Expression translation is a separate, testable, reusable unit. The three-functio
 
 ---
 
-## ADR-010: GROUP BY Group-Key Values Emitted as Plain Columns; Wrapper Groups on Column Refs
+## ADR: GROUP BY Group-Key Values Emitted as Plain Columns; Wrapper Groups on Column Refs
 
-**Date:** 2026-06-22
+**ID:** group-by-group-key-values-emitted-as-plain-columns-wrapper-groups-on-column-refs
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
 
@@ -283,9 +278,9 @@ The column-value contract between the scan UDF and the outer wrapper is purely p
 
 ---
 
-## ADR-011: Memory Safety via Metadata-Sized DataFusion Pool and Spill-or-Hardcap Backstop
+## ADR: Memory Safety via Metadata-Sized DataFusion Pool and Spill-or-Hardcap Backstop
 
-**Date:** 2026-06-22
+**ID:** memory-safety-via-metadata-sized-datafusion-pool-and-spill-or-hardcap-backstop
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
 
@@ -312,11 +307,12 @@ Memory use is bounded without a heuristic. Spill lets high-cardinality grouped q
 
 ---
 
-## ADR-012: Oversubscribed `GROUP BY shard_key` Work-Unit Sharding (Supersedes ADR-007)
+## ADR: Oversubscribed `GROUP BY shard_key` Work-Unit Sharding (Supersedes ADR-007)
 
-**Date:** 2026-06-22
+**ID:** oversubscribed-group-by-shard-key-work-unit-sharding-supersedes-adr-007
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
+**Supersedes:** iproc-fan-out-via-derived-values-group-by-iproc-shard-key
 
 ### Context
 
@@ -341,9 +337,9 @@ Shard groups spread round-robin across nodes AND multiplex onto each node's core
 
 ---
 
-## ADR-013: Cross-Repo Dependency on `language-container-rs:add-memory-limit-metadata`
+## ADR: Cross-Repo Dependency on `language-container-rs:add-memory-limit-metadata`
 
-**Date:** 2026-06-22
+**ID:** cross-repo-dependency-on-language-container-rs-add-memory-limit-metadata
 **Plan:** `add-group-by-and-sql-comprehension`
 **Status:** Accepted
 
@@ -368,9 +364,9 @@ The live `ctx.memory_limit()` path is gated on a sibling-repo SDK release. Until
 
 ---
 
-## ADR-014: Capability Invariant — Advertise Only What the Engine Can Back Correctly
+## ADR: Capability Invariant — Advertise Only What the Engine Can Back Correctly
 
-**Date:** 2026-06-22
+**ID:** capability-invariant-advertise-only-what-the-engine-can-back-correctly
 **Plan:** `add-capability-alignment`
 **Status:** Accepted
 
@@ -395,9 +391,9 @@ The capability list is now a contract: adding a new `FN_*` entry requires a tran
 
 ---
 
-## ADR-015: Remove FN_PRED_GREATER and FN_PRED_GREATEREQUAL from CAPABILITIES
+## ADR: Remove FN_PRED_GREATER and FN_PRED_GREATEREQUAL from CAPABILITIES
 
-**Date:** 2026-06-22
+**ID:** remove-fn-pred-greater-and-fn-pred-greaterequal-from-capabilities
 **Plan:** `add-capability-alignment`
 **Status:** Accepted
 
@@ -422,9 +418,9 @@ The capability list no longer contains names outside Exasol's vocabulary. The tr
 
 ---
 
-## ADR-016: STDDEV/VARIANCE Pushdown via (count, sum, sum_sq) Sufficient Statistics
+## ADR: STDDEV/VARIANCE Pushdown via (count, sum, sum_sq) Sufficient Statistics
 
-**Date:** 2026-06-22
+**ID:** stddev-variance-pushdown-via-count-sum-sum-sq-sufficient-statistics
 **Plan:** `add-capability-alignment`
 **Status:** Accepted
 
@@ -450,9 +446,9 @@ Statistical aggregates push down correctly across shards. The wrapper SQL is mor
 
 ---
 
-## ADR-017: HAVING Applied in the Outer Merge Wrapper Only
+## ADR: HAVING Applied in the Outer Merge Wrapper Only
 
-**Date:** 2026-06-22
+**ID:** having-applied-in-the-outer-merge-wrapper-only
 **Plan:** `add-capability-alignment`
 **Status:** Accepted
 
@@ -477,9 +473,9 @@ The wrapper SQL carries the HAVING clause; the per-shard partial scan SQL never 
 
 ---
 
-## ADR-018: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
+## ADR: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
 
-**Date:** 2026-06-23
+**ID:** source-credentials-from-an-exasol-connection-object-mirror-the-sibling-project-s-connection-convention
 **Plan:** `add-glue-catalog-sigv4-connection`
 **Status:** Accepted
 
@@ -505,9 +501,9 @@ The `CATALOG_CONNECTION` VS property is now required. The old plain-property cre
 
 ---
 
-## ADR-019: Self-Issue a SigV4-Signed load_table GET Instead of Using RestCatalogBuilder
+## ADR: Self-Issue a SigV4-Signed load_table GET Instead of Using RestCatalogBuilder
 
-**Date:** 2026-06-23
+**ID:** self-issue-a-sigv4-signed-load-table-get-instead-of-using-restcatalogbuilder
 **Plan:** `add-glue-catalog-sigv4-connection`
 **Status:** Accepted
 
@@ -533,9 +529,9 @@ The Glue catalog path does not use `RestCatalogBuilder` for the signed load-tabl
 
 ---
 
-## ADR-020: Apply Vended Credentials via merge_vended_into_storage in the Planning Layer
+## ADR: Apply Vended Credentials via merge_vended_into_storage in the Planning Layer
 
-**Date:** 2026-06-23
+**ID:** apply-vended-credentials-via-merge-vended-into-storage-in-the-planning-layer
 **Plan:** `add-glue-catalog-sigv4-connection`
 **Status:** Accepted
 
@@ -561,9 +557,9 @@ Each `ScanSpec` carries the final storage credentials (static or vended). The sc
 
 ---
 
-## ADR-021: Separate cloud-e2e Cargo Feature with Skip-When-Absent Semantics
+## ADR: Separate cloud-e2e Cargo Feature with Skip-When-Absent Semantics
 
-**Date:** 2026-06-23
+**ID:** separate-cloud-e2e-cargo-feature-with-skip-when-absent-semantics
 **Plan:** `add-glue-catalog-sigv4-connection`
 **Status:** Accepted
 
@@ -588,9 +584,9 @@ Developers must explicitly pass `--features cloud-e2e` to run the Glue smoke tes
 
 ---
 
-## ADR-022: Byte-Balanced Sharding via LPT Greedy Assignment
+## ADR: Byte-Balanced Sharding via LPT Greedy Assignment
 
-**Date:** 2026-06-24
+**ID:** byte-balanced-sharding-via-lpt-greedy-assignment
 **Plan:** `change-shard-parallelism`
 **Status:** Accepted
 
@@ -617,11 +613,11 @@ Shards are balanced by cumulative bytes rather than file count, reducing straggl
 
 ---
 
-## ADR-023: Hardware-Aware Default Parallelism Factor (`max(NR_OF_CORES × 2, 8)`)
+## ADR: Hardware-Aware Default Parallelism Factor (`max(NR_OF_CORES × 2, 8)`)
 
-**Date:** 2026-06-24
+**ID:** hardware-aware-default-parallelism-factor-max-nr-of-cores-2-8
 **Plan:** `change-shard-parallelism`
-**Status:** Accepted (core-count capture superseded by ADR-049; the `max(NR_OF_CORES × 2, 8)` default formula itself is unchanged)
+**Status:** Superseded by source-per-node-core-count-from-available-parallelism-not-the-bogus-param-value-nr-of-cores-connect-back-query-supersedes-the-core-count-capture-in-adr-023
 
 ### Context
 
@@ -646,9 +642,9 @@ The default shard count scales with the cluster's real core pool, making it sens
 
 ---
 
-## ADR-024: Per-Instance CPU Bound via Two Orthogonal VS Properties, Defaulting to 1
+## ADR: Per-Instance CPU Bound via Two Orthogonal VS Properties, Defaulting to 1
 
-**Date:** 2026-06-24
+**ID:** per-instance-cpu-bound-via-two-orthogonal-vs-properties-defaulting-to-1
 **Plan:** `change-shard-parallelism`
 **Status:** Accepted
 
@@ -673,9 +669,11 @@ Expose two independent VS properties — `DATAFUSION_TARGET_PARTITIONS` (→ Dat
 
 By default each scan UDF instance uses exactly one core (one DataFusion partition, one Tokio thread). The cluster-level shard fan-out is the single, predictable source of parallelism and a node is never oversubscribed by default. Operators may raise both settings for workloads that benefit from intra-instance parallelism. The `ScanSpec` fields are optional with serde defaults so pre-existing serialized specs deserialize unchanged (backward-compatible ABI extension).
 
-## ADR-025: Subtract a Constant Container-Overhead Before Applying the Memory-Pool Fraction
+---
 
-**Date:** 2026-06-24
+## ADR: Subtract a Constant Container-Overhead Before Applying the Memory-Pool Fraction
+
+**ID:** subtract-a-constant-container-overhead-before-applying-the-memory-pool-fraction
 **Plan:** `change-memory-pool-sizing`
 **Status:** Accepted
 
@@ -699,9 +697,11 @@ The new positive-limit formula is `budget = max(fraction × (limit − overhead_
 
 The pool budget is `fraction × (limit − overhead)` for any positive-limit invocation. Subtracting overhead can only lower the budget, so the handbrake invariant (`budget < 0.8 × limit`) is preserved for any non-negative overhead. The formula stays correct as the RSS limit scales. The zero-limit fallback (`DEFAULT_BUDGET_BYTES = 1 GiB`) is unchanged. Both inputs are VS-configurable and default-safe.
 
-## ADR-026: Default `INSTANCE_OVERHEAD_MB` to 200 MB
+---
 
-**Date:** 2026-06-24
+## ADR: Default `INSTANCE_OVERHEAD_MB` to 200 MB
+
+**ID:** default-instance-overhead-mb-to-200-mb
 **Plan:** `change-memory-pool-sizing`
 **Status:** Accepted
 
@@ -725,9 +725,11 @@ Default `INSTANCE_OVERHEAD_MB` to `200` MB. This adds a ~50 MB cushion over the 
 
 On the default 4096 MB per-instance limit the new budget is `0.6 × (4096 − 200) = 2338 MB`, versus `0.6 × 4096 = 2458 MB` previously — a ~120 MB reduction, well within the engine's `0.8 × 4096 = 3277 MB` handbrake. Operators may tune `INSTANCE_OVERHEAD_MB` via a VS property if their container footprint is measurably different.
 
-## ADR-027: Confine Multi-Table VS Change to the VS-Adapter Layer; Scan Crate Unchanged
+---
 
-**Date:** 2026-06-24
+## ADR: Confine Multi-Table VS Change to the VS-Adapter Layer; Scan Crate Unchanged
+
+**ID:** confine-multi-table-vs-change-to-the-vs-adapter-layer-scan-crate-unchanged
 **Plan:** `change-multi-table-virtual-schema`
 **Status:** Accepted
 
@@ -750,9 +752,11 @@ Keep `ScanSpec`, `CatalogProps`, the scan UDF, and the sharding/fan-out SQL unch
 
 The scan crate and UDF are unchanged and continue to handle exactly one Iceberg table per invocation. Future multi-table scan pushdown (e.g. DataFusion JOIN) remains a separate plan. The VS-adapter layer alone carries the per-table identity routing.
 
-## ADR-028: Persist Exasol-Name to Iceberg-Identifier Map in adapterNotes (Strategy B)
+---
 
-**Date:** 2026-06-24
+## ADR: Persist Exasol-Name to Iceberg-Identifier Map in adapterNotes (Strategy B)
+
+**ID:** persist-exasol-name-to-iceberg-identifier-map-in-adapternotes-strategy-b
 **Plan:** `change-multi-table-virtual-schema`
 **Status:** Accepted
 
@@ -775,9 +779,11 @@ Use strategy (B): `createVirtualSchema` enumerates the namespace (required regar
 
 `adapterNotes` grows by one `TABLE_MAP` entry (a JSON object mapping Exasol names to Iceberg identifiers). Pushdown never re-lists the catalog; recovery of original casing and multi-level namespace path is exact. `__` name collisions are detected at create time and fail loudly. Iceberg view support remains deferred (iceberg-rust 0.9.1 `Catalog` trait has no `list_views`).
 
-## ADR-029: Sound-Partial Iceberg Predicate Translation — Strict OR/NOT Handling
+---
 
-**Date:** 2026-06-24
+## ADR: Sound-Partial Iceberg Predicate Translation — Strict OR/NOT Handling
+
+**ID:** sound-partial-iceberg-predicate-translation-strict-or-not-handling
 **Plan:** `add-iceberg-predicate-pruning`
 **Status:** Accepted
 
@@ -801,9 +807,11 @@ Translating the Exasol WHERE predicate into an `iceberg::expr::Predicate` for fi
 
 Any query with an `OR` involving a non-translatable predicate receives no Iceberg pruning — it falls back to full file resolution while DataFusion applies the full filter. This is safe and correct. Queries with translatable `AND` conjuncts alongside LIKE predicates do receive pruning on the translatable part. The contract mirrors `render_df_filter_safe`'s existing conservative approach.
 
-## ADR-030: New `adapter/iceberg_predicate.rs` Module; `iceberg-rust` Types Stay out of `vs-expression`
+---
 
-**Date:** 2026-06-24
+## ADR: New `adapter/iceberg_predicate.rs` Module; `iceberg-rust` Types Stay out of `vs-expression`
+
+**ID:** new-adapter-iceberg-predicate-rs-module-iceberg-rust-types-stay-out-of-vs-expression
 **Plan:** `add-iceberg-predicate-pruning`
 **Status:** Accepted
 
@@ -826,9 +834,11 @@ Author a dedicated `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs` mo
 
 `vs-expression` remains `iceberg-rust`-free and sharable with the sibling project unchanged. The Iceberg predicate translation is a lakehouse-engine concern co-located with the rest of the file-resolution path. Any future sibling project needing Iceberg pruning would add its own translator or trigger a monorepo consolidation.
 
-## ADR-031: Adopt Arrow-IPC `emit_batch` on the Raw-Row Scan Path
+---
 
-**Date:** 2026-06-26
+## ADR: Adopt Arrow-IPC `emit_batch` on the Raw-Row Scan Path
+
+**ID:** adopt-arrow-ipc-emit-batch-on-the-raw-row-scan-path
 **Plan:** `change-bounded-remote-scans`
 **Status:** Accepted
 
@@ -852,9 +862,11 @@ Emit each `RecordBatch` via the SDK's `EmitBatch` API (the `emit-arrow` feature,
 
 Peak per-batch memory footprint on the raw-row path is approximately halved (one `RecordBatch` at a time, no simultaneous `Vec<Value>` copy). A `normalize_view_types` pass (Utf8View→Utf8, BinaryView→Binary) is required before `emit_batch` because DataFusion 58 can produce view types that the IPC encoder rejects; this is applied as a pre-emit normalization step.
 
-## ADR-032: Surface `ResourcesExhausted` as a Distinct Clean Error, Not a Storage Error
+---
 
-**Date:** 2026-06-26
+## ADR: Surface `ResourcesExhausted` as a Distinct Clean Error, Not a Storage Error
+
+**ID:** surface-resourcesexhausted-as-a-distinct-clean-error-not-a-storage-error
 **Plan:** `change-bounded-remote-scans`
 **Status:** Accepted
 
@@ -877,9 +889,11 @@ Classify a `ResourcesExhausted` condition before the storage-redaction step and 
 
 Operators running queries that hit the memory pool ceiling on a tmpfs cluster receive a clean error identifying memory/resource exhaustion rather than a confusing storage error. The bounded clean error is the correct backstop when `/tmp` cannot spill; `probe_tmp_spill` returning `NoDisk` for tmpfs remains correct and is not changed.
 
-## ADR-033: Bound Parquet Decode Working Set via `batch_size` in `session_config_for_spec`
+---
 
-**Date:** 2026-06-26
+## ADR: Bound Parquet Decode Working Set via `batch_size` in `session_config_for_spec`
+
+**ID:** bound-parquet-decode-working-set-via-batch-size-in-session-config-for-spec
 **Plan:** `change-bounded-remote-scans`
 **Status:** Accepted
 
@@ -902,9 +916,11 @@ Set `batch_size` in `session_config_for_spec` from a `df_batch_size` field carri
 
 Per-batch peak memory on Parquet decode is bounded by `batch_size` rather than left at the DataFusion default (8192 rows). The conservative default shrinks per-instance footprint at the cost of slightly more DataFusion scheduling overhead per batch. The `df_batch_size` field follows the same JSON round-trip + backward-compat-default pattern as `df_target_partitions`.
 
-## ADR-034: AUTO/FIXED Threading Mode Resolved at the Thin VS; Integers Only to the UDF
+---
 
-**Date:** 2026-06-27
+## ADR: AUTO/FIXED Threading Mode Resolved at the Thin VS; Integers Only to the UDF
+
+**ID:** auto-fixed-threading-mode-resolved-at-the-thin-vs-integers-only-to-the-udf
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -929,9 +945,11 @@ A `DATAFUSION_THREADING_MODE` VS property (values `AUTO` or `FIXED`, default `AU
 
 Operators get a safe default (AUTO) that does not oversubscribe a node and a FIXED lever for benchmark sweeps. The UDF layer is unchanged: it consumes `df_threads_per_udf` and `df_target_partitions` as integers regardless of how they were derived. Note: AUTO's anti-oversubscription premise is most valuable for CPU/memory-bound workloads; I/O-bound far-VPC scans can benefit from deliberate oversubscription (see ADR-038).
 
-## ADR-035: Telemetry Built on Archived Checkpoint Infrastructure; Default OFF
+---
 
-**Date:** 2026-06-27
+## ADR: Telemetry Built on Archived Checkpoint Infrastructure; Default OFF
+
+**ID:** telemetry-built-on-archived-checkpoint-infrastructure-default-off
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -954,9 +972,11 @@ Restore `scan/diagnostics.rs` from `archive/udf-diagnostics-checkpoints` and add
 
 Zero production overhead: final benchmark runs execute with telemetry OFF. The object-storage-import timing becomes the measurement lever for the future S3-in-VPC plan. The archived `diagnostics.rs` checkpoint trail (~170 lines) is restored but has zero production callers beyond the telemetry functions; flagged as trimmable-to-telemetry-only if the dormant checkpoint trail is unwanted (see review findings in the plan decision log).
 
-## ADR-036: Decode-Emit Overlap Buffer Is Conditional / Measure-First; Not Committed
+---
 
-**Date:** 2026-06-27
+## ADR: Decode-Emit Overlap Buffer Is Conditional / Measure-First; Not Committed
+
+**ID:** decode-emit-overlap-buffer-is-conditional-measure-first-not-committed
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -979,9 +999,11 @@ Do NOT build the bounded `DF_MAX_BUFFERED_BATCHES` producer/consumer buffer. The
 
 The streaming discipline (fetch-one / emit / drop) stays intact. Memory is bounded by the `batch_size` lever. The gate result (ADR-037) confirmed this decision: the scan is overwhelmingly import-bound on the far-VPC path; overlapping a ~2ms emit with a ~650ms import yields essentially zero wall-clock gain.
 
-## ADR-037: Scope Split — Engine Features Get Specs; Benchmarks and Sweeps Are Tasks Only
+---
 
-**Date:** 2026-06-27
+## ADR: Scope Split — Engine Features Get Specs; Benchmarks and Sweeps Are Tasks Only
+
+**ID:** scope-split-engine-features-get-specs-benchmarks-and-sweeps-are-tasks-only
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -1004,9 +1026,11 @@ Spec deltas cover only engine feature changes (Threading Mode, On-Demand Phase T
 
 The spec library remains a description of product behavior, not a test harness manifest. Measurement tooling (bench scripts, sweep drivers, report formats) can evolve without requiring spec changes or ADR entries.
 
-## ADR-038: AUTO Threading Default Safe but Not Fastest for I/O-Bound Remote Scans; FIXED Recommended
+---
 
-**Date:** 2026-06-27
+## ADR: AUTO Threading Default Safe but Not Fastest for I/O-Bound Remote Scans; FIXED Recommended
+
+**ID:** auto-threading-default-safe-but-not-fastest-for-i-o-bound-remote-scans-fixed-recommended
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -1030,9 +1054,11 @@ Keep AUTO as the spec'd general safety default (never oversubscribes a CPU-bound
 
 Operators running far-VPC remote scans should set `DATAFUSION_THREADING_MODE=FIXED` with threads=cores for best throughput. The AUTO default remains correct and safe for all other workload shapes. The empirical result (8 instances × 4 threads = 32 concurrent threads on a 4-core node yields best results) documents that the I/O-bound assumption breaks the core-count anti-oversubscription heuristic.
 
-## ADR-039: Throughput Bottleneck Is Far-VPC S3 Read Latency; UDF Engine Is Not the Limiter
+---
 
-**Date:** 2026-06-27
+## ADR: Throughput Bottleneck Is Far-VPC S3 Read Latency; UDF Engine Is Not the Limiter
+
+**ID:** throughput-bottleneck-is-far-vpc-s3-read-latency-udf-engine-is-not-the-limiter
 **Plan:** `change-engine-throughput`
 **Status:** Accepted
 
@@ -1055,9 +1081,11 @@ The engine-side levers in this plan are delivered and measurably improve through
 
 The throughput plan is complete as an engine-side optimization effort. The next throughput action is the S3-in-VPC plan. The UDF layer overhead (vs native IMPORT) is small enough that the VS path is not the bottleneck. The IMPORT FROM PARQUET benchmark result is recorded as the reference ceiling for future comparison.
 
-## ADR-040: Catalog Auth Credentials Live on `ConnectionCreds`, Never on the UDF-Boundary Payload
+---
 
-**Date:** 2026-06-29
+## ADR: Catalog Auth Credentials Live on `ConnectionCreds`, Never on the UDF-Boundary Payload
+
+**ID:** catalog-auth-credentials-live-on-connectioncreds-never-on-the-udf-boundary-payload
 **Plan:** `add-rest-catalog-oauth-auth`
 **Status:** Accepted
 
@@ -1080,9 +1108,11 @@ Carry `token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope` (all `
 
 The "UDFs are stateless and never authenticate to catalogs" architecture boundary holds. A unit test (`scan_spec_carries_no_catalog_auth_props`) guards the invariant that no auth field name or value appears in a serialized scan spec.
 
-## ADR-041: SigV4 and Catalog Token/OAuth Authentication Are Mutually Exclusive, Rejected at Validation
+---
 
-**Date:** 2026-06-29
+## ADR: SigV4 and Catalog Token/OAuth Authentication Are Mutually Exclusive, Rejected at Validation
+
+**ID:** sigv4-and-catalog-token-oauth-authentication-are-mutually-exclusive-rejected-at-validation
 **Plan:** `add-rest-catalog-oauth-auth`
 **Status:** Accepted
 
@@ -1105,9 +1135,11 @@ Reject a CONNECTION that sets `use_sigv4` while also supplying any catalog-auth 
 
 Misconfigured CONNECTIONs fail fast with a clear message. `has_catalog_auth()` returns true even on partial OAuth (lone `client_id`), so a SigV4 + partial-OAuth combo trips this guard rather than the incomplete-OAuth branch.
 
-## ADR-042: Static S3 Fields Are Unconditionally Optional; `warehouse` the Only Always-Required Field
+---
 
-**Date:** 2026-06-29
+## ADR: Static S3 Fields Are Unconditionally Optional; `warehouse` the Only Always-Required Field
+
+**ID:** static-s3-fields-are-unconditionally-optional-warehouse-the-only-always-required-field
 **Plan:** `add-rest-catalog-oauth-auth`
 **Status:** Accepted
 
@@ -1131,9 +1163,11 @@ Reduce base required-field validation to `warehouse` only. The four S3 fields be
 
 Existing static-S3 connections continue to validate and behave identically (they already supply all five fields); only acceptance widens. Backward compatibility is verified by test.
 
-## ADR-043: When SigV4 Is Enabled, `access_key`/`secret_key`/`region` Are Required (Orthogonal to Vending)
+---
 
-**Date:** 2026-06-29
+## ADR: When SigV4 Is Enabled, `access_key`/`secret_key`/`region` Are Required (Orthogonal to Vending)
+
+**ID:** when-sigv4-is-enabled-access-key-secret-key-region-are-required-orthogonal-to-vending
 **Plan:** `add-rest-catalog-oauth-auth`
 **Status:** Accepted
 
@@ -1158,9 +1192,9 @@ Non-SigV4 cases stay as loose as ADR-042 specifies; the SigV4 path keeps its fai
 
 ---
 
-## ADR-044: Unify Table Loading Behind One Auth-Mode-Agnostic Self-Issued `loadTable` GET
+## ADR: Unify Table Loading Behind One Auth-Mode-Agnostic Self-Issued `loadTable` GET
 
-**Date:** 2026-06-30
+**ID:** unify-table-loading-behind-one-auth-mode-agnostic-self-issued-loadtable-get
 **Plan:** `change-vended-credentials-auth-orthogonal`
 **Status:** Accepted
 
@@ -1185,9 +1219,9 @@ Every catalog-auth mode now self-issues the `loadTable` GET and returns the raw 
 
 ---
 
-## ADR-045: Perform the OAuth2 Client-Credentials Grant In-Adapter
+## ADR: Perform the OAuth2 Client-Credentials Grant In-Adapter
 
-**Date:** 2026-06-30
+**ID:** perform-the-oauth2-client-credentials-grant-in-adapter
 **Plan:** `change-vended-credentials-auth-orthogonal`
 **Status:** Accepted
 
@@ -1212,9 +1246,9 @@ The adapter is responsible for the OAuth2 client-credentials round-trip on every
 
 ---
 
-## ADR-046: Field-Id-Based Column Projection via a PhysicalExprAdapter, Not the Iceberg Reader
+## ADR: Field-Id-Based Column Projection via a PhysicalExprAdapter, Not the Iceberg Reader
 
-**Date:** 2026-07-01
+**ID:** field-id-based-column-projection-via-a-physicalexpradapter-not-the-iceberg-reader
 **Plan:** `fix-scan-field-id-projection`
 **Status:** Accepted
 
@@ -1240,9 +1274,9 @@ Field-id projection is correct across Iceberg schema evolution (renamed, dropped
 
 ---
 
-## ADR-047: Override Resolution Only; Reuse DefaultPhysicalExprAdapter for Everything Else
+## ADR: Override Resolution Only; Reuse DefaultPhysicalExprAdapter for Everything Else
 
-**Date:** 2026-07-01
+**ID:** override-resolution-only-reuse-defaultphysicalexpradapter-for-everything-else
 **Plan:** `fix-scan-field-id-projection`
 **Status:** Accepted
 
@@ -1267,11 +1301,12 @@ The `FieldIdExprAdapter` is a thin wrapper: only the resolution mapping changes.
 
 ---
 
-## ADR-048: Source Cluster Node Count from `UdfContext::node_count()`, Not a Connect-Back `SELECT NPROC()` (Supersedes ADR-006)
+## ADR: Source Cluster Node Count from `UdfContext::node_count()`, Not a Connect-Back `SELECT NPROC()` (Supersedes ADR-006)
 
-**Date:** 2026-07-01
+**ID:** source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006
 **Plan:** `fix-createvs-cores-nodecount`
 **Status:** Accepted
+**Supersedes:** cluster-node-count-captured-once-at-createvirtualschema-via-adapternotes
 
 ### Context
 
@@ -1295,11 +1330,12 @@ Read the active node count from `UdfContext::node_count()` in-process, mapping t
 
 ---
 
-## ADR-049: Source Per-Node Core Count from `available_parallelism()`, Not the Bogus `PARAM_VALUE('NR_OF_CORES')` Connect-Back Query (Supersedes the Core-Count Capture in ADR-023)
+## ADR: Source Per-Node Core Count from `available_parallelism()`, Not the Bogus `PARAM_VALUE('NR_OF_CORES')` Connect-Back Query (Supersedes the Core-Count Capture in ADR-023)
 
-**Date:** 2026-07-01
+**ID:** source-per-node-core-count-from-available-parallelism-not-the-bogus-param-value-nr-of-cores-connect-back-query-supersedes-the-core-count-capture-in-adr-023
 **Plan:** `fix-createvs-cores-nodecount`
 **Status:** Accepted
+**Supersedes:** hardware-aware-default-parallelism-factor-max-nr-of-cores-2-8
 
 ### Context
 
@@ -1323,9 +1359,9 @@ Read the per-node core count from `std::thread::available_parallelism()` on the 
 
 ---
 
-## ADR-050: Full Positional Reorder Threading select-list Index Through Grouped-Aggregate Detection
+## ADR: Full Positional Reorder Threading select-list Index Through Grouped-Aggregate Detection
 
-**Date:** 2026-07-01
+**ID:** full-positional-reorder-threading-select-list-index-through-grouped-aggregate-detection
 **Plan:** `fix-grouped-agg-select-order`
 **Status:** Accepted
 
@@ -1350,9 +1386,9 @@ The outer wrapper SELECT, its cast list, and its GROUP BY list now assemble in t
 
 ---
 
-## ADR-051: Keep the Wire Spec (`ScanSpec` / `AggregatePlan`) and Scan UDF Side Unchanged for Grouped-Aggregate Select-List Ordering
+## ADR: Keep the Wire Spec (`ScanSpec` / `AggregatePlan`) and Scan UDF Side Unchanged for Grouped-Aggregate Select-List Ordering
 
-**Date:** 2026-07-01
+**ID:** keep-the-wire-spec-scanspec-aggregateplan-and-scan-udf-side-unchanged-for-grouped-aggregate-select-list-ordering
 **Plan:** `fix-grouped-agg-select-order`
 **Status:** Accepted
 
@@ -1377,9 +1413,9 @@ The scan UDF and the wire contract between it and the adapter are untouched by t
 
 ---
 
-## ADR-052: Two-Argument `LAKEHOUSE_SCAN(common, files)` — Shard-Invariant Spec Emitted Once, Per-Shard Files Only in `VALUES`
+## ADR: Two-Argument `LAKEHOUSE_SCAN(common, files)` — Shard-Invariant Spec Emitted Once, Per-Shard Files Only in `VALUES`
 
-**Date:** 2026-07-02
+**ID:** two-argument-lakehouse-scan-common-files-shard-invariant-spec-emitted-once-per-shard-files-only-in-values
 **Plan:** `fix-scan-spec-shard-dedup`
 **Status:** Accepted
 
@@ -1407,9 +1443,9 @@ The generated fan-out statement carries the shard-invariant payload — includin
 
 ---
 
-## ADR-053: Compact 2-Tuple `(path, size)` Per-Shard File Encoding
+## ADR: Compact 2-Tuple `(path, size)` Per-Shard File Encoding
 
-**Date:** 2026-07-02
+**ID:** compact-2-tuple-path-size-per-shard-file-encoding
 **Plan:** `change-scan-spec-files-payload`
 **Status:** Accepted
 
@@ -1435,9 +1471,9 @@ Every per-shard file entry now carries its byte size alongside its path at no me
 
 ---
 
-## ADR-054: Carry the Iceberg Table Root Once in the Common Spec; Emit Paths Relative
+## ADR: Carry the Iceberg Table Root Once in the Common Spec; Emit Paths Relative
 
-**Date:** 2026-07-02
+**ID:** carry-the-iceberg-table-root-once-in-the-common-spec-emit-paths-relative
 **Plan:** `change-scan-spec-files-payload`
 **Status:** Accepted
 
@@ -1463,9 +1499,9 @@ The common spec grows by one string field, serialized once per query regardless 
 
 ---
 
-## ADR-055: Strip-If-Prefix / Absolute-Passthrough Path Reconstruction
+## ADR: Strip-If-Prefix / Absolute-Passthrough Path Reconstruction
 
-**Date:** 2026-07-02
+**ID:** strip-if-prefix-absolute-passthrough-path-reconstruction
 **Plan:** `change-scan-spec-files-payload`
 **Status:** Accepted
 
@@ -1490,9 +1526,9 @@ Path stripping is conditional and reversible: the reconstructed absolute path al
 
 ---
 
-## ADR-056: Supply File Sizes via a Spec-Backed `ObjectStore` `head()` Wrapper, Keeping `ListingTable` + Field-ID Adapter
+## ADR: Supply File Sizes via a Spec-Backed `ObjectStore` `head()` Wrapper, Keeping `ListingTable` + Field-ID Adapter
 
-**Date:** 2026-07-02
+**ID:** supply-file-sizes-via-a-spec-backed-objectstore-head-wrapper-keeping-listingtable-field-id-adapter
 **Plan:** `change-scan-spec-files-payload`
 **Status:** Accepted
 
@@ -1520,9 +1556,9 @@ The scan UDF issues no per-file object-store `HEAD` before scanning; `scan-execu
 
 ---
 
-## ADR-057: One `S3_MAX_CONNECTIONS` Knob, Not a Dual Per-File/Per-Node Pair
+## ADR: One `S3_MAX_CONNECTIONS` Knob, Not a Dual Per-File/Per-Node Pair
 
-**Date:** 2026-07-02
+**ID:** one-s3-max-connections-knob-not-a-dual-per-file-per-node-pair
 **Plan:** `add-scan-connection-concurrency`
 **Status:** Accepted
 
@@ -1547,9 +1583,9 @@ Establishes the project convention that new tuning axes ship as one operator kno
 
 ---
 
-## ADR-058: Apply the Connection Budget via `object_store` `ClientOptions`, Not DataFusion `target_partitions`
+## ADR: Apply the Connection Budget via `object_store` `ClientOptions`, Not DataFusion `target_partitions`
 
-**Date:** 2026-07-02
+**ID:** apply-the-connection-budget-via-object-store-clientoptions-not-datafusion-target-partitions
 **Plan:** `add-scan-connection-concurrency`
 **Status:** Accepted
 
@@ -1575,9 +1611,9 @@ Records that object-store connection concurrency is a first-class tuning axis di
 
 ---
 
-## ADR-059: Confounded Benchmark Evidence Is Incorporated as Rationale Plus a Named Re-Gate Task, Never Immediate Scope Expansion
+## ADR: Confounded Benchmark Evidence Is Incorporated as Rationale Plus a Named Re-Gate Task, Never Immediate Scope Expansion
 
-**Date:** 2026-07-02
+**ID:** confounded-benchmark-evidence-is-incorporated-as-rationale-plus-a-named-re-gate-task-never-immediate-scope-expansion
 **Plan:** `add-scan-connection-concurrency`
 **Status:** Accepted
 
@@ -1603,9 +1639,9 @@ Codifies the project rule: new benchmark evidence confounded by an in-flight fix
 
 ---
 
-## ADR-060: Advertise `AGGREGATE_GROUP_BY_TUPLE`, Reversing the Prior Exclusion
+## ADR: Advertise `AGGREGATE_GROUP_BY_TUPLE`, Reversing the Prior Exclusion
 
-**Date:** 2026-07-03
+**ID:** advertise-aggregate-group-by-tuple-reversing-the-prior-exclusion
 **Plan:** `fix-multi-column-group-by-pushdown`
 **Status:** Accepted
 
@@ -1630,9 +1666,9 @@ A GROUP BY over two or more keys is now pushed down as node-local partial aggreg
 
 ---
 
-## ADR-061: Verify the N-Key Grouped Pushdown Path Before Trusting the Capability Flag
+## ADR: Verify the N-Key Grouped Pushdown Path Before Trusting the Capability Flag
 
-**Date:** 2026-07-03
+**ID:** verify-the-n-key-grouped-pushdown-path-before-trusting-the-capability-flag
 **Plan:** `fix-multi-column-group-by-pushdown`
 **Status:** Accepted
 
@@ -1657,9 +1693,9 @@ The multi-key grouped-aggregate path is proven correct (ordering, per-key types,
 
 ---
 
-## ADR-062: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
+## ADR: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
 
-**Date:** 2026-07-03
+**ID:** fix-scoped-to-the-constant-projection-over-group-by-shape-not-general-nested-subquery-aggregate-pushdown
 **Plan:** `fix-nested-aggregate-pushdown`
 **Status:** Accepted
 
@@ -1684,9 +1720,9 @@ The adapter gains a targeted guard/fix for the constant-projection-over-`GROUP B
 
 ---
 
-## ADR-063: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
+## ADR: Constant-Projection-Over-`GROUP BY` Placeholder Drives the Existing Grouped Scan Instead of the Row-Scan Path
 
-**Date:** 2026-07-03
+**ID:** constant-projection-over-group-by-placeholder-drives-the-existing-grouped-scan-instead-of-the-row-scan-path
 **Plan:** `fix-nested-aggregate-pushdown`
 **Status:** Accepted
 
@@ -1712,9 +1748,9 @@ Extend `detect_group_by_aggregates`'s non-aggregate `selectList` arm to recogniz
 
 ---
 
-## ADR-064: Expression Aggregate Arguments Carried on a New `arg_expr` Field, Rendered via `render_expression`
+## ADR: Expression Aggregate Arguments Carried on a New `arg_expr` Field, Rendered via `render_expression`
 
-**Date:** 2026-07-03
+**ID:** expression-aggregate-arguments-carried-on-a-new-arg-expr-field-rendered-via-render-expression
 **Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
 **Status:** Accepted
 
@@ -1739,9 +1775,9 @@ Aggregate pushdown now decomposes `COUNT(expr)`/`SUM(expr)`/`MIN(expr)`/`MAX(exp
 
 ---
 
-## ADR-065: COUNT(DISTINCT) Merged by a Scalar UDF Fed via LISTAGG of Per-Shard JSON Arrays
+## ADR: COUNT(DISTINCT) Merged by a Scalar UDF Fed via LISTAGG of Per-Shard JSON Arrays
 
-**Date:** 2026-07-03
+**ID:** count-distinct-merged-by-a-scalar-udf-fed-via-listagg-of-per-shard-json-arrays
 **Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
 **Status:** Accepted
 
@@ -1767,9 +1803,9 @@ Single-group `COUNT(DISTINCT col)` is now pushed down instead of falling back to
 
 ---
 
-## ADR-066: Execution-Time Per-Shard Safety Cap for COUNT(DISTINCT), With a Clean Error on Overflow
+## ADR: Execution-Time Per-Shard Safety Cap for COUNT(DISTINCT), With a Clean Error on Overflow
 
-**Date:** 2026-07-03
+**ID:** execution-time-per-shard-safety-cap-for-count-distinct-with-a-clean-error-on-overflow
 **Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
 **Status:** Accepted
 
@@ -1794,9 +1830,9 @@ A standalone high-cardinality `COUNT(DISTINCT col)` that previously fell to a (s
 
 ---
 
-## ADR-067: Two-Column Arithmetic Aggregate Gap Is Fixed by Capability Advertisement, Not New Machinery
+## ADR: Two-Column Arithmetic Aggregate Gap Is Fixed by Capability Advertisement, Not New Machinery
 
-**Date:** 2026-07-04
+**ID:** two-column-arithmetic-aggregate-gap-is-fixed-by-capability-advertisement-not-new-machinery
 **Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
 **Status:** Accepted
 
@@ -1822,9 +1858,9 @@ Fix the gap by advertising `FN_ADD`/`FN_SUB`/`FN_MULT`/`FN_FLOAT_DIV` and reconc
 
 ---
 
-## ADR-068: Arithmetic Operator-Name Reconciliation Is a Hard Live-Verification Gate, Not an Assumption
+## ADR: Arithmetic Operator-Name Reconciliation Is a Hard Live-Verification Gate, Not an Assumption
 
-**Date:** 2026-07-04
+**ID:** arithmetic-operator-name-reconciliation-is-a-hard-live-verification-gate-not-an-assumption
 **Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
 **Status:** Accepted
 
@@ -1849,9 +1885,9 @@ Live capture (decision-log finding [7]) was structurally unsatisfiable in the li
 
 ---
 
-## ADR-069: Parallelism-Factor Sweep Is Evidence-Gated; a Validated No-Op Is an Acceptable Outcome
+## ADR: Parallelism-Factor Sweep Is Evidence-Gated; a Validated No-Op Is an Acceptable Outcome
 
-**Date:** 2026-07-04
+**ID:** parallelism-factor-sweep-is-evidence-gated-a-validated-no-op-is-an-acceptable-outcome
 **Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
 **Status:** Accepted
 
@@ -1876,9 +1912,9 @@ The sweep (`bench/parallelism_sweep.sh`), run twice against the live test1 clust
 
 ---
 
-## ADR-070: Raw-Scan Projection Gets an Explicit `ProjectionItem` Tag Instead of a Syntactic Heuristic
+## ADR: Raw-Scan Projection Gets an Explicit `ProjectionItem` Tag Instead of a Syntactic Heuristic
 
-**Date:** 2026-07-04
+**ID:** raw-scan-projection-gets-an-explicit-projectionitem-tag-instead-of-a-syntactic-heuristic
 **Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
 **Status:** Accepted
 
@@ -1905,11 +1941,10 @@ Change `ScanSpec.projection` / `CommonScanSpec.projection` from `Vec<String>` to
 
 ---
 
-## ADR-071: Close the NQ4 Top-N Loss by Advertising ORDER_BY_COLUMN + a Partial/Merge Top-N
+## ADR: Close the NQ4 Top-N Loss by Advertising ORDER_BY_COLUMN + a Partial/Merge Top-N
 
-**Date:** 2026-07-04
+**ID:** close-the-nq4-top-n-loss-by-advertising-order-by-column-a-partial-merge-top-n
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -1935,11 +1970,10 @@ NQ4 now flips from lakehouse-engine-rs's largest competitive loss to a win: 12.0
 
 ---
 
-## ADR-072: Whether the Top-N Change Is Pure Optimization or Also a Latent Correctness Fix Is Gated on Live Capture
+## ADR: Whether the Top-N Change Is Pure Optimization or Also a Latent Correctness Fix Is Gated on Live Capture
 
-**Date:** 2026-07-04
+**ID:** whether-the-top-n-change-is-pure-optimization-or-also-a-latent-correctness-fix-is-gated-on-live-capture
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -1963,11 +1997,10 @@ A1 confirmed Exasol structurally withholds `limit` whenever the accompanying `or
 
 ---
 
-## ADR-073: Advertise ORDER_BY_COLUMN Only; ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET Stay Absent
+## ADR: Advertise ORDER_BY_COLUMN Only; ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET Stay Absent
 
-**Date:** 2026-07-04
+**ID:** advertise-order-by-column-only-order-by-expression-and-limit-with-offset-stay-absent
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -1991,11 +2024,10 @@ The capability surface stays exactly as wide as the backing implementation. Unpr
 
 ---
 
-## ADR-074: Never Push a Bare Per-Shard LIMIT Ahead of a Global Sort
+## ADR: Never Push a Bare Per-Shard LIMIT Ahead of a Global Sort
 
-**Date:** 2026-07-04
+**ID:** never-push-a-bare-per-shard-limit-ahead-of-a-global-sort
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -2019,11 +2051,10 @@ Asserted directly as a spec scenario and a unit test (`order_by_present_without_
 
 ---
 
-## ADR-075: Returned SQL for the Matched Top-N Is Self-Contained, Not Dependent on an Exasol Re-Sort Backstop
+## ADR: Returned SQL for the Matched Top-N Is Self-Contained, Not Dependent on an Exasol Re-Sort Backstop
 
-**Date:** 2026-07-04
+**ID:** returned-sql-for-the-matched-top-n-is-self-contained-not-dependent-on-an-exasol-re-sort-backstop
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -2047,11 +2078,10 @@ Live verification (C1) confirmed the outer merge SQL renders its own final `ORDE
 
 ---
 
-## ADR-076: Direction and NULL Placement Must Be Rendered Identically Per-Shard and in the Merge
+## ADR: Direction and NULL Placement Must Be Rendered Identically Per-Shard and in the Merge
 
-**Date:** 2026-07-04
+**ID:** direction-and-null-placement-must-be-rendered-identically-per-shard-and-in-the-merge
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -2075,11 +2105,10 @@ Covered by a dedicated NULL-placement unit test (`ordered_scan_sql_preserves_des
 
 ---
 
-## ADR-077: Decline the Top-N Shape When a Sort Key Column Needs the JSON-Fallback VARCHAR Cast
+## ADR: Decline the Top-N Shape When a Sort Key Column Needs the JSON-Fallback VARCHAR Cast
 
-**Date:** 2026-07-04
+**ID:** decline-the-top-n-shape-when-a-sort-key-column-needs-the-json-fallback-varchar-cast
 **Plan:** `add-topn-pushdown`
-
 **Status:** Accepted
 
 ### Context
@@ -2104,11 +2133,10 @@ Covered by a unit test (`json_fallback_typed_sort_key_declines_topn`). The guard
 
 ---
 
-## ADR-078: Shape-Aware Zero-Files Short-Circuit via a Hoisted Plan Decision
+## ADR: Shape-Aware Zero-Files Short-Circuit via a Hoisted Plan Decision
 
-**Date:** 2026-07-04
+**ID:** shape-aware-zero-files-short-circuit-via-a-hoisted-plan-decision
 **Plan:** `fix-aggregate-pushdown-empty-file-pruning`
-
 **Status:** Accepted
 
 ### Context
@@ -2133,9 +2161,9 @@ Empty and non-empty column shapes can never drift apart, since both derive from 
 
 ---
 
-## ADR-079: Pin iceberg 0.10.0-rc.2 via git tag, not a crates.io exact-version pin
+## ADR: Pin iceberg 0.10.0-rc.2 via git tag, not a crates.io exact-version pin
 
-**Date:** 2026-07-06
+**ID:** pin-iceberg-0-10-0-rc-2-via-git-tag-not-a-crates-io-exact-version-pin
 **Plan:** `change-iceberg-rust-0-10-bump`
 **Status:** Accepted
 
@@ -2161,9 +2189,9 @@ The dependency pin is immutable and self-documenting; bumping to a later RC or t
 
 ---
 
-## ADR-080: Unify the production/iceberg arrow tree on 58; do not bump the workspace arrow major
+## ADR: Unify the production/iceberg arrow tree on 58; do not bump the workspace arrow major
 
-**Date:** 2026-07-06
+**ID:** unify-the-production-iceberg-arrow-tree-on-58-do-not-bump-the-workspace-arrow-major
 **Plan:** `change-iceberg-rust-0-10-bump`
 **Status:** Accepted
 
@@ -2188,9 +2216,9 @@ The arrow-57/58 split that existed solely because of iceberg 0.9.1 is fully elim
 
 ---
 
-## ADR-081: Drop `tpchgen-arrow`; build arrow-58 batches from `tpchgen` core directly
+## ADR: Drop `tpchgen-arrow`; build arrow-58 batches from `tpchgen` core directly
 
-**Date:** 2026-07-06
+**ID:** drop-tpchgen-arrow-build-arrow-58-batches-from-tpchgen-core-directly
 **Plan:** `change-iceberg-rust-0-10-bump`
 **Status:** Accepted
 
@@ -2217,9 +2245,9 @@ The dev/e2e dependency graph collapses onto a single arrow-58 tree — no arrow 
 
 ---
 
-## ADR-082: Reference the Broadcast Join Dimension Side by File List, Not Materialized Rows
+## ADR: Reference the Broadcast Join Dimension Side by File List, Not Materialized Rows
 
-**Date:** 2026-07-06
+**ID:** reference-the-broadcast-join-dimension-side-by-file-list-not-materialized-rows
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
 
@@ -2244,9 +2272,9 @@ Every shard invocation performs its own dimension-side file read, bounded by the
 
 ---
 
-## ADR-083: Ineligible Joins Fall Back to Deterministic Unaccelerated SQL, Not an Error
+## ADR: Ineligible Joins Fall Back to Deterministic Unaccelerated SQL, Not an Error
 
-**Date:** 2026-07-06
+**ID:** ineligible-joins-fall-back-to-deterministic-unaccelerated-sql-not-an-error
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
 
@@ -2271,9 +2299,9 @@ The adapter carries two distinct join-rendering paths (broadcast fan-out and una
 
 ---
 
-## ADR-084: Shard Only the Fact Side; the Large-Side Sharding Model Is Unchanged
+## ADR: Shard Only the Fact Side; the Large-Side Sharding Model Is Unchanged
 
-**Date:** 2026-07-06
+**ID:** shard-only-the-fact-side-the-large-side-sharding-model-is-unchanged
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
 
@@ -2298,11 +2326,12 @@ The existing file-sharding/parallelism model (`parallelism/work-unit-sharding`) 
 
 ---
 
-## ADR-085: Two-Scan Fallback Renders Table-Qualified Columns, Independent of the Disjoint-Column Guard
+## ADR: Two-Scan Fallback Renders Table-Qualified Columns, Independent of the Disjoint-Column Guard
 
-**Date:** 2026-07-07
+**ID:** two-scan-fallback-renders-table-qualified-columns-independent-of-the-disjoint-column-guard
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
+**Supersedes:** ineligible-joins-fall-back-to-deterministic-unaccelerated-sql-not-an-error
 
 ### Context
 
@@ -2325,9 +2354,9 @@ The two-scan fallback renders its own join condition, WHERE filter, select list,
 
 ---
 
-## ADR-086: Aggregate-Over-Join Routes Through the Qualified Two-Scan Path, Not a Decline
+## ADR: Aggregate-Over-Join Routes Through the Qualified Two-Scan Path, Not a Decline
 
-**Date:** 2026-07-07
+**ID:** aggregate-over-join-routes-through-the-qualified-two-scan-path-not-a-decline
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
 
@@ -2349,9 +2378,12 @@ Any join request that carries an aggregate, GROUP BY, ORDER BY, LIMIT, or HAVING
 ### Consequences
 
 Aggregate-over-join, GROUP BY-over-join, ORDER BY-over-join, and LIMIT/HAVING-over-join queries are all served by the qualified two-scan wrapper (ADR-085), never by the broadcast in-UDF join. Both regressions found in this E2E pass (ADR-085 and this one) are covered by new host and E2E tests.
-## ADR-087: Keep DataFusion `ParquetSource`; Apply Positional Deletes via a Per-File Base `ParquetAccessPlan`
 
-**Date:** 2026-07-06
+---
+
+## ADR: Keep DataFusion `ParquetSource`; Apply Positional Deletes via a Per-File Base `ParquetAccessPlan`
+
+**ID:** keep-datafusion-parquetsource-apply-positional-deletes-via-a-per-file-base-parquetaccessplan
 **Plan:** `add-positional-delete-application`
 **Status:** Accepted
 
@@ -2376,9 +2408,9 @@ Positional-delete application composes with all existing pushdown and pruning ra
 
 ---
 
-## ADR-088: Unify the Scan Provider on the Custom `ParquetSource`-Backed `TableProvider`, Gated by a Plan-Shape Test
+## ADR: Unify the Scan Provider on the Custom `ParquetSource`-Backed `TableProvider`, Gated by a Plan-Shape Test
 
-**Date:** 2026-07-06
+**ID:** unify-the-scan-provider-on-the-custom-parquetsource-backed-tableprovider-gated-by-a-plan-shape-test
 **Plan:** `add-positional-delete-application`
 **Status:** Accepted
 
@@ -2403,9 +2435,9 @@ The delete-free scan path now goes through the same provider code as the merge-o
 
 ---
 
-## ADR-089: Plan-Time Fail-Loud at the Manifest / `DataFile` Level Is the Authoritative Correctness Gate for Unsupported Deletes
+## ADR: Plan-Time Fail-Loud at the Manifest / `DataFile` Level Is the Authoritative Correctness Gate for Unsupported Deletes
 
-**Date:** 2026-07-06
+**ID:** plan-time-fail-loud-at-the-manifest-datafile-level-is-the-authoritative-correctness-gate-for-unsupported-deletes
 **Plan:** `add-positional-delete-application`
 **Status:** Accepted
 
@@ -2430,9 +2462,9 @@ An unsupported-delete query now fails immediately, cleanly, and without emitting
 
 ---
 
-## ADR-090: Minimal Scan-Spec Surface for Delete Support — Per-File References Only
+## ADR: Minimal Scan-Spec Surface for Delete Support — Per-File References Only
 
-**Date:** 2026-07-06
+**ID:** minimal-scan-spec-surface-for-delete-support-per-file-references-only
 **Plan:** `add-positional-delete-application`
 **Status:** Accepted
 
@@ -2457,9 +2489,9 @@ The scan spec's delete-related surface stays minimal and backward-compatible: a 
 
 ---
 
-## ADR-091: Per-Side Predicate Pushdown for Joins by `tableName` Conjunct Attribution
+## ADR: Per-Side Predicate Pushdown for Joins by `tableName` Conjunct Attribution
 
-**Date:** 2026-07-07
+**ID:** per-side-predicate-pushdown-for-joins-by-tablename-conjunct-attribution
 **Plan:** `add-join-pushdown-broadcast`
 **Status:** Accepted
 
@@ -2488,11 +2520,11 @@ Both join routes now get free Iceberg manifest pruning per side; the two-scan fa
 
 ---
 
-## ADR-092: N-Table Inner Joins Fall Back to an N-Scan Unaccelerated Wrapper (Generalizes ADR-083 to N Tables)
+## ADR: N-Table Inner Joins Fall Back to an N-Scan Unaccelerated Wrapper (Generalizes ADR-083 to N Tables)
 
-**Date:** 2026-07-07
+**ID:** n-table-inner-joins-fall-back-to-an-n-scan-unaccelerated-wrapper-generalizes-adr-083-to-n-tables
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by ADR-095
+**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
 
 ### Context
 
@@ -2537,11 +2569,11 @@ broadcast N-way join to be built first.
 
 ---
 
-## ADR-093: N-Scan Wrapper Renders as Cross-Join + Conjunctive Table-Qualified WHERE
+## ADR: N-Scan Wrapper Renders as Cross-Join + Conjunctive Table-Qualified WHERE
 
-**Date:** 2026-07-07
+**ID:** n-scan-wrapper-renders-as-cross-join-conjunctive-table-qualified-where
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by ADR-095
+**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
 
 ### Context
 
@@ -2577,11 +2609,11 @@ is reused wholesale, so correctness on shared column names carries over unchange
 
 ---
 
-## ADR-094: Freeze the Two-Table Join Path; Add the N-Table Path Additively
+## ADR: Freeze the Two-Table Join Path; Add the N-Table Path Additively
 
-**Date:** 2026-07-07
+**ID:** freeze-the-two-table-join-path-add-the-n-table-path-additively
 **Plan:** `fix-join-decline-hard-fail`
-**Status:** Superseded by ADR-095
+**Status:** Superseded by single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
 
 ### Context
 
@@ -2615,11 +2647,14 @@ pursued (currently out of scope per the mission's "no N-table broadcast" non-goa
 
 ---
 
-## ADR-095: Single Unified N≥2 Unaccelerated Join Renderer (Supersedes ADR-092, ADR-093, ADR-094)
+## ADR: Single Unified N≥2 Unaccelerated Join Renderer (Supersedes ADR-092, ADR-093, ADR-094)
 
-**Date:** 2026-07-08
+**ID:** single-unified-n-2-unaccelerated-join-renderer-supersedes-adr-092-adr-093-adr-094
 **Plan:** `fix-join-decline-hard-fail`
 **Status:** Accepted
+**Supersedes:** n-table-inner-joins-fall-back-to-an-n-scan-unaccelerated-wrapper-generalizes-adr-083-to-n-tables
+**Supersedes:** n-scan-wrapper-renders-as-cross-join-conjunctive-table-qualified-where
+**Supersedes:** freeze-the-two-table-join-path-add-the-n-table-path-additively
 
 ### Context
 
@@ -2667,9 +2702,9 @@ Any future join-rendering fix lands once, not twice.
 
 ---
 
-## ADR-096: `vs-expression` Renders Aggregate Function Nodes at the Shared Seam
+## ADR: `vs-expression` Renders Aggregate Function Nodes at the Shared Seam
 
-**Date:** 2026-07-08
+**ID:** vs-expression-renders-aggregate-function-nodes-at-the-shared-seam
 **Plan:** `fix-join-decline-hard-fail`
 **Status:** Accepted
 
@@ -2717,9 +2752,9 @@ case that previously errored.
 
 ---
 
-## ADR-097: Advertised Capability Must Render — Purge the Native-Retry Fiction
+## ADR: Advertised Capability Must Render — Purge the Native-Retry Fiction
 
-**Date:** 2026-07-08
+**ID:** advertised-capability-must-render-purge-the-native-retry-fiction
 **Plan:** `fix-join-decline-hard-fail`
 **Status:** Accepted
 
@@ -2761,9 +2796,9 @@ render principle applies to all future capability additions, not just joins.
 
 ---
 
-## ADR-098: Reuse the Iceberg Crate's NameMapping Deserializer
+## ADR: Reuse the Iceberg Crate's NameMapping Deserializer
 
-**Date:** 2026-07-08
+**ID:** reuse-the-iceberg-crate-s-namemapping-deserializer
 **Plan:** `change-name-mapping-fallback`
 **Status:** Accepted
 
@@ -2794,9 +2829,9 @@ spec fidelity rather than a separately maintained struct.
 
 ---
 
-## ADR-099: Name-Mapping Resolution Slots Strictly Between Embedded Field-Id and Physical-Name Fallback
+## ADR: Name-Mapping Resolution Slots Strictly Between Embedded Field-Id and Physical-Name Fallback
 
-**Date:** 2026-07-08
+**ID:** name-mapping-resolution-slots-strictly-between-embedded-field-id-and-physical-name-fallback
 **Plan:** `change-name-mapping-fallback`
 **Status:** Accepted
 
@@ -2830,9 +2865,9 @@ no-mapping and uncovered-field behavior is unchanged.
 
 ---
 
-## ADR-100: Parse Only Flat/Top-Level Name-Mapping Entries; Defer Nested Struct/Map/List Entries
+## ADR: Parse Only Flat/Top-Level Name-Mapping Entries; Defer Nested Struct/Map/List Entries
 
-**Date:** 2026-07-08
+**ID:** parse-only-flat-top-level-name-mapping-entries-defer-nested-struct-map-list-entries
 **Plan:** `change-name-mapping-fallback`
 **Status:** Accepted
 
@@ -2864,9 +2899,9 @@ later exposes real nested columns.
 
 ---
 
-## ADR-101: Malformed schema.name-mapping.default Fails the Query at Plan Time
+## ADR: Malformed schema.name-mapping.default Fails the Query at Plan Time
 
-**Date:** 2026-07-08
+**ID:** malformed-schema-name-mapping-default-fails-the-query-at-plan-time
 **Plan:** `change-name-mapping-fallback`
 **Status:** Accepted
 
@@ -2896,9 +2931,9 @@ any UDF is invoked, and never silently degrades to incorrect column binding.
 
 ---
 
-## ADR-102: The Drop+Rename-Into-a-Reused-Name Collision Is Unrelated to Name-Mapping
+## ADR: The Drop+Rename-Into-a-Reused-Name Collision Is Unrelated to Name-Mapping
 
-**Date:** 2026-07-08
+**ID:** the-drop-rename-into-a-reused-name-collision-is-unrelated-to-name-mapping
 **Plan:** `change-name-mapping-fallback`
 **Status:** Accepted
 
@@ -2934,9 +2969,9 @@ untracked concern.
 
 ---
 
-## ADR-103: Author Delete-Bearing Benchmark Tables via Apache Spark `DELETE FROM` on a v2 Merge-on-Read Table
+## ADR: Author Delete-Bearing Benchmark Tables via Apache Spark `DELETE FROM` on a v2 Merge-on-Read Table
 
-**Date:** 2026-07-08
+**ID:** author-delete-bearing-benchmark-tables-via-apache-spark-delete-from-on-a-v2-merge-on-read-table
 **Plan:** `add-delete-benchmark-flag`
 **Status:** Accepted
 
@@ -2972,9 +3007,9 @@ CI-proven, is what's being measured). `scripts/spark-fixtures/create_tpch_delete
 
 ---
 
-## ADR-104: `deploy/scripts/bench-remote.sh` Wraps the Remote Bench Sequence with an EXIT-Trap Teardown
+## ADR: `deploy/scripts/bench-remote.sh` Wraps the Remote Bench Sequence with an EXIT-Trap Teardown
 
-**Date:** 2026-07-08
+**ID:** deploy-scripts-bench-remote-sh-wraps-the-remote-bench-sequence-with-an-exit-trap-teardown
 **Plan:** `add-delete-benchmark-flag`
 **Status:** Accepted
 
@@ -3010,9 +3045,9 @@ directly for cases needing fine-grained control (e.g. leaving the cluster up bet
 
 ---
 
-## ADR-105: Full Push-Down of Grouped Scalar-Over-Aggregate Select Items (Primary), Qualified Wrapper as Residual Fallback
+## ADR: Full Push-Down of Grouped Scalar-Over-Aggregate Select Items (Primary), Qualified Wrapper as Residual Fallback
 
-**Date:** 2026-07-08
+**ID:** full-push-down-of-grouped-scalar-over-aggregate-select-items-primary-qualified-wrapper-as-residual-fallback
 **Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
 **Status:** Accepted
 
@@ -3058,9 +3093,9 @@ the correct column count instead.
 
 ---
 
-## ADR-106: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
+## ADR: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
 
-**Date:** 2026-07-08
+**ID:** generalize-render-having-over-merge-to-descend-scalars-for-select-list-merge-rendering
 **Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
 **Status:** Accepted
 
@@ -3099,9 +3134,11 @@ a HAVING clause, is rendered by the same merge-aware path and never references a
 source column absent from the outer wrapper. Top-level and nested aggregate rewriting
 are consistent by construction.
 
-## ADR-105: Split Fan-Out Is the Sole Scan Path, Applied Unconditionally
+---
 
-**Date:** 2026-07-09
+## ADR: Split Fan-Out Is the Sole Scan Path, Applied Unconditionally
+
+**ID:** split-fan-out-is-the-sole-scan-path-applied-unconditionally
 **Plan:** `change-scan-fanout-to-scalar-emit`
 **Status:** Accepted
 
@@ -3142,9 +3179,9 @@ Every scan-driving wrapper in the codebase (`vs-adapter/pushdown-planning`,
 fan-out shape, keeping scan-output memory constant instead of growing with data volume,
 at the cost of converting every wrapper in one plan rather than incrementally.
 
-## ADR-106: `LAKEHOUSE_SCAN` Itself Becomes SCALAR — One Scan Entry Point, Not Two
+## ADR: `LAKEHOUSE_SCAN` Itself Becomes SCALAR — One Scan Entry Point, Not Two
 
-**Date:** 2026-07-09
+**ID:** lakehouse-scan-itself-becomes-scalar-one-scan-entry-point-not-two
 **Plan:** `change-scan-fanout-to-scalar-emit`
 **Status:** Accepted
 
@@ -3173,9 +3210,9 @@ do NOT add a second `LAKEHOUSE_SCAN_SCALAR` entry point alongside it.
 script type is retired entirely from the scan path. The scan entry-point symbol name
 is unchanged by the SET→SCALAR conversion.
 
-## ADR-107: The File Distributor Is a LUA SET Script, Not a Rust `.so` Entry Point
+## ADR: The File Distributor Is a LUA SET Script, Not a Rust `.so` Entry Point
 
-**Date:** 2026-07-09
+**ID:** the-file-distributor-is-a-lua-set-script-not-a-rust-so-entry-point
 **Plan:** `change-scan-fanout-to-scalar-emit`
 **Status:** Accepted
 
@@ -3208,9 +3245,9 @@ entry points; `LAKEHOUSE_DISTRIBUTE_FILES` is provisioned as independent DDL tha
 references no `.so` and declares no `%udf_object`, so its footprint is negligible and
 independent of data volume.
 
-## ADR-108: SCALAR Batching Requires a `while ctx.next()` Scan Loop With Once-Per-Batch Runtime
+## ADR: SCALAR Batching Requires a `while ctx.next()` Scan Loop With Once-Per-Batch Runtime
 
-**Date:** 2026-07-09
+**ID:** scalar-batching-requires-a-while-ctx-next-scan-loop-with-once-per-batch-runtime
 **Plan:** `change-scan-fanout-to-scalar-emit`
 **Status:** Accepted
 
@@ -3244,9 +3281,9 @@ A batch of exactly one input row produces byte-identical output to the pre-batch
 single-row scan (the loop is a no-op for that case), while a multi-row batch now scans
 and emits every row's assigned files instead of only the first.
 
-## ADR-109: N-Scan Join Fallback Renders `INNER JOIN … ON` With Greedy-Attach and Per-Leg Filter Pushdown
+## ADR: N-Scan Join Fallback Renders `INNER JOIN … ON` With Greedy-Attach and Per-Leg Filter Pushdown
 
-**Date:** 2026-07-09
+**ID:** n-scan-join-fallback-renders-inner-join-on-with-greedy-attach-and-per-leg-filter-pushdown
 **Plan:** `change-scan-fanout-to-scalar-emit`
 **Status:** Accepted
 
