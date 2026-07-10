@@ -7,6 +7,7 @@ on:
     paths-ignore: ["specs/**"]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, edited]
     paths-ignore: ["specs/**"]
   workflow_dispatch:
 
@@ -37,6 +38,14 @@ jobs:
   build:
     name: Build (warm cache)
     runs-on: ubuntu-latest
+    # A PR base-retarget (e.g. a stacked PR's base branch merging) fires `edited`
+    # with no code change. Only an `edited` event that actually changed `base`
+    # should re-run CI — a plain title/body/label edit should not. Skipping this
+    # job cascades a skip through everything that (transitively) `needs` it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     steps:
       # ubuntu-latest ships only ~21 GB free on /; a cached target/ restore plus
       # a full debug `--all-targets` build of the DataFusion/Arrow/AWS/Iceberg
@@ -95,6 +104,11 @@ jobs:
     # release build). 60 min is a safety backstop against a genuine hang, not
     # a tight budget.
     timeout-minutes: 60
+    # See the `build` job's `if` — same base-retarget-vs-plain-edit guard.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     steps:
       # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
@@ -220,6 +234,11 @@ jobs:
   licenses:
     name: License Check
     runs-on: ubuntu-latest
+    # See the `build` job's `if` — same base-retarget-vs-plain-edit guard.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.action != 'edited' ||
+      github.event.changes.base != null
     steps:
       - uses: actions/checkout@v7
 
