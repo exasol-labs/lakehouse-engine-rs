@@ -50,7 +50,7 @@ scenarios.
 * *WHEN* the harness creates the scan-path scripts
 * *THEN* the harness SHALL create `LAKEHOUSE_SCAN` as a SCALAR SCRIPT (EMITS its dynamic output columns) referencing the uploaded `.so`
 * *AND* the harness SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a LUA SET SCRIPT that passes each shard's `files` VARCHAR through unchanged, referencing no `.so`
-* *AND* an end-to-end projection/filter/aggregate/GROUP BY query over the installed scripts SHALL return results identical to the single-node DataFusion equivalent
+* *AND* an end-to-end projection/filter query over the installed scripts SHALL return results identical to the single-node DataFusion equivalent (grouped/nested-aggregate coverage lives in `packaging/e2e-harness-grouped-agg`)
 * *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
 
 ### Scenario: End-to-end filtered query over a partitioned table returns correct rows with file pruning
