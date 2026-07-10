@@ -35,10 +35,23 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
    files into G oversubscribed work-unit shards (G = node_count × parallelism_factor, capped at 300),
    driven via `GROUP BY shard_key` so Exasol distributes shard groups across nodes and multiplexes
    them onto each node's core pool; no node scans another node's files.
-4. **Pushdown** — required: column projection, filter predicates, LIMIT. Shipped: single-group aggregation and GROUP BY aggregation with partial/merge decomposition (node-local aggregate → Exasol final aggregate) to minimize network transfer.
-5. **Iceberg + Databricks access** — query both Apache Iceberg tables and Databricks-managed Iceberg
-   through the same path.
-6. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool.
+4. **Pushdown** — required: column projection, filter predicates, LIMIT, ORDER BY + LIMIT (TopN).
+   Shipped: single-group aggregation and GROUP BY aggregation with partial/merge decomposition
+   (node-local aggregate → Exasol final aggregate) to minimize network transfer; COUNT(DISTINCT)
+   via per-shard distinct sets with a safety cap; partition-equality and min/max range file pruning
+   at plan time; broadcast-eligible inner equi-join pushdown (small-side broadcast fan-out, planned
+   and executed node-locally) with a safe fallback to an unaccelerated wrapper for joins outside the
+   broadcast contract — general/multi-way joins and query rewriting remain out of scope (see below).
+5. **SQL expression translation** — scalar functions, date functions, and operators are translated
+   into the pushed-down predicate/projection/select-list shapes above, so pushdown reaches
+   real-world SQL expressions rather than only bare column references.
+6. **Correct read path** — applies Iceberg positional/row-level deletes at scan time, so results
+   reflect current table state rather than raw Parquet file content.
+7. **Iceberg + Databricks access** — query both Apache Iceberg tables and Databricks-managed
+   Iceberg through the same path; there is no separate Databricks-specific code path — Databricks
+   tables are reached via their Databricks-managed Iceberg REST catalog through the same Iceberg
+   access capability above.
+8. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool.
 
 ## Out of Scope
 
@@ -46,7 +59,8 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 - Metadata persistence, snapshot tracking, refresh mechanisms
 - Automatic optimization, federated query optimizer
 - Background processes, scheduling, lakehouse serving
-- Join pushdown, complex query rewrites
+- General/multi-way joins and complex query rewrites (only broadcast-eligible inner equi-joins are
+  pushed down — see Core Capability 4)
 - **Explicit non-goals (not building):** Reyden, Lakehouse RT, a DataFusion cluster scheduler, an
   Iceberg cache, a Databricks acceleration layer, a materialized query engine
 
@@ -146,3 +160,7 @@ simultaneously. No state survives query completion.
 | Databricks (Iceberg) | Databricks-managed table access | Databricks queries fail; Iceberg path unaffected |
 | Object storage (S3-compatible) | Parquet file data | Scans fail / stall; this is a measured bottleneck risk |
 | Exasol cluster + Rust SLC (BucketFS) | UDF execution substrate | No execution; the substrate under test |
+
+> Catalog and object-storage access is authenticated (REST-catalog OAuth2/bearer credentials;
+> cloud-native credential mechanisms such as vended/STS credentials for object storage) — an auth
+> failure has the same failure impact as the underlying dependency being unavailable.
