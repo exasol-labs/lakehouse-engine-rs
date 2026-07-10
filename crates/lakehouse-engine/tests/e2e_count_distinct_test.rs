@@ -52,6 +52,9 @@ const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 /// Scalar merge UDF for single-group COUNT(DISTINCT): third entry point in the
 /// same .so, created in the scan schema alongside the adapter and scan scripts.
 const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
+/// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
+/// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
+const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
@@ -175,7 +178,7 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
 /"#
     ));
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
@@ -186,6 +189,17 @@ EMITS (...) AS
         r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}(partials VARCHAR(2000000))
 RETURNS DECIMAL(20,0) AS
 %udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
+    // File distributor — LUA SET SCRIPT, pure passthrough.
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
+EMITS (files VARCHAR(2000000)) AS
+function run(ctx)
+    repeat
+        ctx.emit(ctx.files)
+    until not ctx.next()
+end
 /"#
     ));
 }

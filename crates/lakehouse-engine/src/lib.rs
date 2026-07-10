@@ -4,9 +4,9 @@
 //!   Handles the Exasol Virtual Schema JSON protocol: getCapabilities,
 //!   createVirtualSchema, refreshVirtualSchema, dropVirtualSchema, pushdown.
 //!   Resolves the Iceberg file list ONCE in `pushdown` and returns SQL that
-//!   invokes the scan SET UDF with the explicit file list.
+//!   invokes the scan SCALAR EMIT UDF with the explicit file list.
 //!
-//! Entry point #2: DataFusion scan SET UDF (`__exa_udf_entry_LAKEHOUSE_SCAN`)
+//! Entry point #2: DataFusion scan SCALAR EMIT UDF (`__exa_udf_entry_LAKEHOUSE_SCAN`)
 //!   Reads a ScanSpec JSON from its input column, builds a DataFusion session,
 //!   registers only the assigned files over MinIO, applies projection/filter/limit,
 //!   converts Arrow batches to SDK `Value` rows, and emits them incrementally.
@@ -53,10 +53,10 @@ fn lakehouse_adapter(_ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point #2 — DataFusion Scan SET UDF (SET SCRIPT)
+// Entry point #2 — DataFusion Scan SCALAR EMIT UDF (SCALAR SCRIPT)
 // ---------------------------------------------------------------------------
 
-/// DataFusion scan SET UDF.
+/// DataFusion scan SCALAR EMIT UDF.
 ///
 /// Input: two VARCHAR columns — the shard-invariant common blob JSON (arg 0)
 /// serialized ONCE per fan-out, and the per-shard files JSON array (arg 1).

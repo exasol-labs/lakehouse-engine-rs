@@ -1,16 +1,38 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, extracts the table's current Iceberg schema for field-id-based projection, and emits the SQL that drives the DataFusion scan SET UDF — sharded across cluster nodes — over exactly those files. The scan-driving SQL passes the shard-invariant parts (projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once as the UDF's common argument and each shard's per-file `(path, size)` subset as the per-shard argument. See `vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate sub-select) that don't map onto the source table's own columns. This delta extends the resolve-once seam to also associate each data file's positional-delete files and carry them minimally in the per-shard argument.
+Translates an Exasol query against the virtual schema into a pushdown plan: it resolves
+the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and
+any supported aggregate, extracts the table's current Iceberg schema for field-id-based
+projection, and emits the SQL that drives the DataFusion scan. Cluster fan-out is
+separated from the scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor
+subquery (`GROUP BY shard_key`) spreads each shard's per-file list across nodes, and an
+outer ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list
+node-locally and streams the rows. The scan-driving SQL splices the shard-invariant parts
+(projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once
+as the scalar scan UDF's first-argument common literal and flows each shard's per-file
+subset through the distributor as the second argument. A single-shard plan short-circuits
+the distributor and calls the scalar scan directly on the file-list literal. See
+`vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute
+path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the
+guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate
+sub-select) that don't map onto the source table's own columns. This feature also extends
+the resolve-once seam to associate each data file's positional-delete files and carry them
+minimally in the per-shard argument. Single-group aggregate pushdown (capability
+advertisement, partial-aggregate scan-spec translation, wrapper merge SQL, and AVG
+sum/count decomposition) is covered separately in
+`vs-adapter/pushdown-planning-single-group-agg`.
 
 ## Background
 
 * The data-file list, each file's byte size (from the Iceberg manifest), and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
 * The logical schema carried into the common scan-spec argument identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
-* The scan-driving SQL serializes the shard-invariant common spec once (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) and carries only each shard's per-file `(path, size)` subset per shard.
+* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
+* The outer scalar scan select is never wrapped in a `SELECT * FROM (...)` materialization boundary.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 * The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
+* See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
 
 ## Scenarios
 
@@ -29,16 +51,17 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
-* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the scan SET UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec argument (each serialized once) and the resolved data-file list as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
+* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
+* *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
 
 ### Scenario: Projection is pushed into the scan-driving query
 
 * *GIVEN* a query that selects only some of the table's columns
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF, in the shard-invariant common spec argument shared by all shards
+* *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF, in the shard-invariant common spec spliced once as the scalar scan UDF's first-argument literal shared by all shards
 * *AND* the projected column names SHALL be the current Iceberg logical names carried in the common spec's logical schema, so the UDF's registered table exposes them and the field-id adapter maps each to the correct physical column per file
-* *AND* the UDF's declared EMITS column list SHALL match the projected columns in order and type
+* *AND* the scalar scan UDF's declared EMITS column list SHALL match the projected columns in order and type
 
 ### Scenario: Filter predicate is pushed into the scan spec
 
@@ -52,45 +75,10 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 
 * *GIVEN* a query with a LIMIT clause and NO `order_by` that governs which rows are selected
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the shard-invariant common spec passed to the UDF SHALL carry the row limit
+* *THEN* the shard-invariant common spec spliced into the scalar scan UDF SHALL carry the row limit
 * *AND* because the common spec is shared by every shard, each row-scan shard invocation SHALL observe the same limit
-* *AND* the generated SQL MAY also retain the LIMIT at the Exasol level as a correctness backstop
-* *AND* when the request DOES carry an `order_by`, the per-shard row limit SHALL be governed by `vs-adapter/pushdown-planning-topn` (pushed only alongside the matching per-shard `ORDER BY`), never as a bare per-shard `LIMIT` ahead of a global sort
-
-### Scenario: Adapter advertises aggregate pushdown for supported functions
-
-* *GIVEN* an Exasol session that has installed the VS adapter script
-* *WHEN* Exasol sends a `getCapabilities` request to the adapter
-* *THEN* the capabilities list SHALL include single-group aggregate pushdown for `COUNT`/`COUNT(*)`/`SUM`/`MIN`/`MAX`/`AVG`, `AGGREGATE_GROUP_BY_COLUMN`/`AGGREGATE_GROUP_BY_EXPRESSION`/`AGGREGATE_GROUP_BY_TUPLE`/`AGGREGATE_HAVING`, the decomposable statistical aggregates `FN_AGG_STDDEV`/`FN_AGG_STDDEV_POP`/`FN_AGG_STDDEV_SAMP`/`FN_AGG_VARIANCE`/`FN_AGG_VAR_POP`/`FN_AGG_VAR_SAMP`, single-group `FN_AGG_COUNT_DISTINCT`, and (still) column projection, scalar select-list expressions, filter predicates, and LIMIT
-* *AND* the adapter SHALL advertise `AGGREGATE_GROUP_BY_TUPLE` only because the grouped-aggregate detection and scan-driving SQL builder handle an arbitrary number of group keys (see `vs-adapter/pushdown-planning-grouped-agg`), so a GROUP BY over two or more keys is pushed down as node-local partial aggregation rather than falling back to a raw row scan that Exasol aggregates itself
-* *AND* the adapter SHALL advertise `FN_AGG_COUNT_DISTINCT` because a single-group `COUNT(DISTINCT col)` is decomposed via per-shard local distinct sets merged by a scalar merge UDF (see `vs-adapter/pushdown-planning-count-distinct`); a `COUNT(DISTINCT ...)` inside a GROUP BY request still falls back to row scanning
-* *AND* the adapter SHALL advertise the inner equi-join capabilities `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI` (see `vs-adapter/pushdown-planning-join`), while the outer/all-condition join capabilities and any Cartesian-product capability remain absent
-* *AND* the capabilities list MUST NOT include `FN_AGG_MEDIAN`, `FN_AGG_APPROXIMATE_COUNT_DISTINCT`, `FN_AGG_GROUP_CONCAT*`/`FN_AGG_LISTAGG`, `JOIN_TYPE_LEFT_OUTER`/`JOIN_TYPE_RIGHT_OUTER`/`JOIN_TYPE_FULL_OUTER`, or `JOIN_CONDITION_ALL`
-
-### Scenario: Aggregate query is translated into a partial-aggregate scan spec
-
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
-* *AND* a query whose select list is one or more supported aggregate functions over the whole table
-* *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL recognise the request as an aggregate query and resolve the data-file list exactly once
-* *AND* the adapter SHALL build a scan spec carrying, for each requested aggregate, its function kind and target column (the wildcard for `COUNT(*)`), plus any pushed-down filter so the partial aggregate covers filtered rows only
-* *AND* the adapter MUST NOT push down an aggregate the scan UDF cannot compute, falling back to row scanning for that query instead
-
-### Scenario: Aggregate wrapper SQL merges per-shard partial results
-
-* *GIVEN* an aggregate pushdown over a file list partitioned into one or more shards
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL drive the scan SET UDF to emit one partial-aggregate row per shard
-* *AND* the SQL SHALL wrap those partial rows in an outer aggregation that merges them into the final result: `SUM` over per-shard partial counts for `COUNT`, `SUM` over partial sums for `SUM`, `MIN`/`MAX` over partial extrema for `MIN`/`MAX`
-* *AND* the merged result SHALL equal the result of the same aggregate evaluated over all rows on a single node
-
-### Scenario: AVG is pushed down as a sum/count pair and divided in the wrapper
-
-* *GIVEN* a query selecting `AVG(col)` over the table
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the scan spec SHALL instruct the scan UDF to emit a partial `SUM(col)` and a partial `COUNT(col)` pair rather than a per-shard average
-* *AND* the wrapper SQL SHALL compute the final average as `SUM(partial_sum) / SUM(partial_count)`
-* *AND* the wrapper SQL SHALL yield NULL when the total partial count is zero, never dividing by zero
+* *AND* the generated SQL SHALL attach the `LIMIT` DIRECTLY to the outer ungrouped scalar scan select (over the distributor subquery, or the from-less single-shard select) as a correctness backstop, with no `SELECT * FROM (...)` wrapper
+* *AND* when the request DOES carry an `order_by`, the per-shard row limit SHALL be governed by ordered top-N (pushed only alongside the matching per-shard `ORDER BY`), never as a bare per-shard `LIMIT` ahead of a global sort
 
 ### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
 

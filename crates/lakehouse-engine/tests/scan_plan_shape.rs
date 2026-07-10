@@ -471,6 +471,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         &["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_MERGE",
+        "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
     // Partial column widened from the declared type (NOT recomputed from operands).
@@ -496,6 +497,146 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     );
 }
 
+/// A minimal row-scan (no-aggregate) spec template — `aggregates: None` drives the
+/// row-scan branch of `build_scan_driving_sql`. Callers set `order_by`/`limit`.
+fn row_scan_spec() -> ScanSpec {
+    ScanSpec {
+        table_root: String::new(),
+        files: Vec::new(),
+        projection: Vec::new(),
+        filter: None,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        emit_exa_types: Vec::new(),
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join: None,
+        storage: test_storage(),
+        df_target_partitions: 1,
+        df_batch_size: 8192,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 200,
+        s3_max_connections: 8,
+    }
+}
+
+/// work-unit-sharding "Scan-driving query fans out via a nested distributor over a
+/// scalar scan UDF": a multi-shard raw row scan (no aggregates) is driven by the
+/// OUTER ungrouped scalar `LAKEHOUSE_SCAN(...)` select itself — never a `SELECT *
+/// FROM (...)` materializing wrapper — with the `LAKEHOUSE_DISTRIBUTE_FILES`
+/// distributor and its `GROUP BY shard_key` fan-out nested inside that outer
+/// select's FROM clause (decision [1]/[5]).
+#[test]
+fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
+    let proj = vec![ProjectionItem::Column("L_ORDERKEY".into())];
+    let types = vec!["DECIMAL(20,0)".to_string()];
+    let spec = row_scan_spec();
+
+    let shards = vec![
+        vec![("data/part-0.parquet".to_string(), 1000u64)],
+        vec![("data/part-1.parquet".to_string(), 1000u64)],
+    ];
+    let sql = build_scan_driving_sql(
+        &spec,
+        &shards,
+        &proj,
+        &types,
+        None,
+        &[],
+        &[],
+        "LAKEHOUSE_SCAN",
+        "LAKEHOUSE_MERGE",
+        "LAKEHOUSE_DISTRIBUTE_FILES",
+    );
+
+    // The outer ungrouped scalar scan IS the top-level driving query.
+    assert!(
+        sql.starts_with("SELECT LAKEHOUSE_SCAN("),
+        "row scan must be driven directly by the outer scalar scan:\n{sql}"
+    );
+    // The distributor + its GROUP BY shard_key fan-out are nested inside the outer
+    // scan's FROM clause, not the other way around.
+    assert!(
+        sql.contains("FROM (SELECT LAKEHOUSE_DISTRIBUTE_FILES(files) FROM (VALUES"),
+        "the distributor subquery must be nested inside the outer scan's FROM:\n{sql}"
+    );
+    assert!(
+        sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+        "GROUP BY shard_key must be nested inside the distributor, not top-level:\n{sql}"
+    );
+    // No materializing `SELECT * FROM (...)` wrapper anywhere.
+    assert!(
+        !sql.contains("SELECT * FROM"),
+        "row scan must not have a SELECT * materializing wrapper:\n{sql}"
+    );
+    // Both shards' files travel through the distributor's VALUES rows.
+    assert!(
+        sql.contains("data/part-0.parquet") && sql.contains("data/part-1.parquet"),
+        "both shards' files must appear in the distributor's VALUES list:\n{sql}"
+    );
+}
+
+/// pushdown-planning-topn "Ordered top-N over a projected column is pushed down":
+/// with `order_by` + `limit` set on a multi-shard row-scan spec, `ORDER BY … LIMIT n`
+/// attaches DIRECTLY to the outer ungrouped scalar select — after the nested
+/// distributor's fan-out closes, never inside the distributor's own `GROUP BY
+/// shard_key` subquery, and with no `SELECT * FROM (...)` wrapper in between.
+#[test]
+fn topn_order_by_limit_attaches_to_outer_scalar_select() {
+    let proj = vec![ProjectionItem::Column("L_EXTENDEDPRICE".into())];
+    let types = vec!["DECIMAL(18,2)".to_string()];
+    let mut spec = row_scan_spec();
+    spec.order_by = vec![SortKey {
+        column: "L_EXTENDEDPRICE".into(),
+        ascending: false,
+        nulls_last: true,
+    }];
+    spec.limit = Some(20);
+
+    let shards = vec![
+        vec![("data/part-0.parquet".to_string(), 1000u64)],
+        vec![("data/part-1.parquet".to_string(), 1000u64)],
+    ];
+    let sql = build_scan_driving_sql(
+        &spec,
+        &shards,
+        &proj,
+        &types,
+        Some(20),
+        &[],
+        &[],
+        "LAKEHOUSE_SCAN",
+        "LAKEHOUSE_MERGE",
+        "LAKEHOUSE_DISTRIBUTE_FILES",
+    );
+
+    let fan_out_close = sql
+        .find("GROUP BY shard_key)")
+        .expect("the distributor's GROUP BY shard_key fan-out must close before ORDER BY");
+    let order_by_pos = sql
+        .find("ORDER BY")
+        .expect("the outer scalar select must carry an ORDER BY");
+    assert!(
+        order_by_pos > fan_out_close,
+        "ORDER BY must attach AFTER the nested distributor's fan-out closes, not inside it:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
+        "ORDER BY must render direction + NULL placement and precede LIMIT:\n{sql}"
+    );
+    assert!(
+        sql.trim_end().ends_with("LIMIT 20"),
+        "LIMIT must be the final clause of the outer scalar select:\n{sql}"
+    );
+    assert!(
+        !sql.contains("SELECT * FROM"),
+        "ordered top-N must not have a SELECT * materializing wrapper:\n{sql}"
+    );
+}
+
 /// Minimal MinIO-style storage for spec construction (no secrets asserted here).
 fn test_storage() -> StorageProps {
     StorageProps {
@@ -513,10 +654,11 @@ fn test_storage() -> StorageProps {
 /// broadcast fan-out". The broadcast plan shards ONLY the fact side and carries the
 /// dimension side's FULL file list once in the shard-invariant common blob's join
 /// block (`ScanSpec.join`), so the generated fan-out is exactly the single-table
-/// `GROUP BY shard_key` fan-out with the join block riding along in the common blob:
-/// every shard invocation re-scans the same dimension side and joins it node-locally.
+/// nested-distributor + scalar-scan fan-out (decision [1]/[5]) with the join block
+/// riding along in the common blob: every shard invocation re-scans the same
+/// dimension side and joins it node-locally. No `SELECT * FROM (...)` wrapper.
 #[test]
-fn join_broadcast_fan_out_sql_shape() {
+fn broadcast_fact_side_uses_distributor_scalar_scan() {
     // Dimension side: full file list, carried once (shard-invariant) in the join block.
     let join = JoinSpec {
         table_root: "s3://warehouse/lh/customer".to_string(),
@@ -569,12 +711,24 @@ fn join_broadcast_fan_out_sql_shape() {
         &[],
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_MERGE",
+        "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
-    // The fan-out is the single-table GROUP BY shard_key shape.
+    // The fact side's fan-out is the nested-distributor + outer scalar-scan shape:
+    // the outer ungrouped scalar scan IS the top-level query, with the
+    // `GROUP BY shard_key` distribution nested inside the distributor subquery.
     assert!(
-        sql.contains("GROUP BY shard_key") && sql.contains("AS shards(shard_key, files)"),
-        "broadcast join must drive the fact side through the GROUP BY shard_key fan-out:\n{sql}"
+        sql.starts_with("SELECT LAKEHOUSE_SCAN("),
+        "broadcast join must drive the fact side through the outer ungrouped scalar scan:\n{sql}"
+    );
+    assert!(
+        sql.contains("FROM (SELECT LAKEHOUSE_DISTRIBUTE_FILES(files) FROM (VALUES")
+            && sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+        "the fact side's GROUP BY shard_key fan-out must be nested inside the distributor subquery:\n{sql}"
+    );
+    assert!(
+        !sql.contains("SELECT * FROM"),
+        "no materializing SELECT * wrapper over the broadcast fan-out:\n{sql}"
     );
     // EMITS the cross-table projection in order and type.
     assert!(
