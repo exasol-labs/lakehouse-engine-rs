@@ -20,10 +20,10 @@
 mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_EVO_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_NEW_COL,
-    EVO_TOTAL_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
-    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, seed_events, seed_renamed_column,
+    E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
+    EVO_NEW_COL, EVO_TOTAL_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events, seed_renamed_column,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -263,6 +263,14 @@ fn vs_table() -> String {
 
 fn vs_labels_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE_2.to_uppercase())
+}
+
+/// `fact_lineitem` — seeded by `seed_events` (via `seed_multi_table_join_extension`)
+/// alongside the `events`/`labels` tables, so it is already available under this
+/// file's `VS_NAME` without any extra setup. See `common/seed.rs` for its columns
+/// (`L_RETURNFLAG`, `L_QUANTITY`, `L_EXTENDEDPRICE`, ...) and row layout.
+fn vs_lineitem_table() -> String {
+    format!("{VS_NAME}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -2278,6 +2286,241 @@ fn test_high_cardinality_multi_key_group_by_spill() {
             id % 2,
             "MOD(id,2) at position {pos} (id={id}) must be {}, got {m}",
             id % 2
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan `fix-scalar-over-aggregate-grouped-pushdown` (#82) — single-table
+// scalar-over-aggregate GROUP BY E2E tests
+//
+// `fact_lineitem` (seeded by `seed_events`, see `common/seed.rs`): 20 rows
+// across 2 files, `L_RETURNFLAG` alternating "R"/"N" (row 1 = "R", so 10 R
+// rows + 10 N rows), `L_QUANTITY` and `L_EXTENDEDPRICE` deterministic per row.
+//
+// Before the fix, a single-table grouped select list containing a scalar
+// function wrapping aggregates (e.g. `ROUND(100.0 * SUM(CASE …)/COUNT(*), 2)`)
+// made `detect_group_by_aggregates` decline the whole request, falling through
+// to a bare raw row-scan that hard-fails with SQL state 04000 ("Expected
+// number of columns is N but pushdown query has M"). These tests exercise
+// that exact shape end-to-end through the VS and check the result against a
+// native (non-virtual) ground-truth table built from the same source columns.
+// ---------------------------------------------------------------------------
+
+/// Native (non-virtual) table the ground truth is materialized into — see
+/// [`ensure_ground_truth_lineitem_table`]. Named distinctly from
+/// `e2e_join_test.rs`'s own ground-truth table (same schema, different test
+/// binary) to keep the two files' fixtures unambiguous.
+const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
+
+/// Materialize the `fact_lineitem` columns the scalar-over-aggregate ground
+/// truth needs into a NATIVE Exasol table (in the same schema as the adapter
+/// scripts), via a plain projection over the virtual `fact_lineitem` table.
+///
+/// `CREATE OR REPLACE TABLE` is idempotent, so both tests below can safely
+/// share and re-run this under the suite's `--test-threads=1` serial
+/// execution.
+fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
+         SELECT L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
+        vs_lineitem_table()
+    ));
+}
+
+/// #82's exact select list: a plain group key, two plain aggregates, and a
+/// scalar function (`ROUND`) wrapping a `SUM(CASE …)` and a `COUNT(*)`.
+fn scalar_over_aggregate_round_select_list() -> &'static str {
+    "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
+     ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
+}
+
+/// Collects the distinct `{i}` suffixes following `marker` in `haystack` (e.g.
+/// every distinct index `i` in occurrences of `"PARTIAL_count_{i}"`), without
+/// pulling in a regex dependency for a single fixed-prefix scan.
+fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::BTreeSet<String> {
+    let mut indices = std::collections::BTreeSet::new();
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(marker) {
+        let after = &rest[pos + marker.len()..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            indices.insert(digits.clone());
+        }
+        rest = &after[digits.len().max(1)..];
+    }
+    indices
+}
+
+/// #82's query — a single-table grouped select list with a scalar function
+/// (`ROUND`) wrapping a `SUM(CASE …)` and a `COUNT(*)` — runs green through
+/// the VS (no `04000` column-count-mismatch hard-fail) and pushes down as the
+/// merged grouped partial/merge wrapper (`assert_group_by_pushed_down`: no
+/// `SELECT * FROM (…)` row-scan wrapper), matching the same select list
+/// evaluated over a native (non-virtual) copy of the same `fact_lineitem`
+/// columns.
+#[test]
+fn test_group_by_scalar_over_aggregate_round() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT {} FROM {} GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
+        scalar_over_aggregate_round_select_list(),
+        vs_lineitem_table()
+    );
+
+    // Pushdown-occurred assertion: the scalar-over-aggregate item must not
+    // send the grouped path down the bare-row-scan fallback (the pre-fix
+    // 04000 bug) — it must be the merged grouped partial/merge wrapper.
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let actual = conn.query_columns(&sql);
+    assert_eq!(
+        actual.len(),
+        4,
+        "expected 4 columns (L_RETURNFLAG, SUM_QTY, AVG_PRICE, RETURN_PCT): {actual:?}"
+    );
+    assert_eq!(
+        actual[0].len(),
+        2,
+        "GROUP BY L_RETURNFLAG must return exactly 2 groups (R, N): {actual:?}"
+    );
+
+    ensure_ground_truth_lineitem_table(&mut conn);
+    let ground_truth_sql = format!(
+        "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
+         GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
+        scalar_over_aggregate_round_select_list()
+    );
+    let expected = conn.query_columns(&ground_truth_sql);
+    assert_eq!(
+        expected[0].len(),
+        2,
+        "ground truth must have 2 groups: {expected:?}"
+    );
+
+    for i in 0..2 {
+        let actual_flag = actual[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("L_RETURNFLAG not a string: {:?}", actual[0][i]));
+        let expected_flag = expected[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("L_RETURNFLAG not a string: {:?}", expected[0][i]));
+        assert_eq!(
+            actual_flag, expected_flag,
+            "row {i}: L_RETURNFLAG must match the native ground truth"
+        );
+
+        let actual_sum_qty = parse_numeric(&actual[1][i]);
+        let expected_sum_qty = parse_numeric(&expected[1][i]);
+        assert!(
+            (actual_sum_qty - expected_sum_qty).abs() < 0.001,
+            "row {i} ({actual_flag}): SUM(L_QUANTITY) must be {expected_sum_qty}, got {actual_sum_qty}"
+        );
+
+        let actual_avg_price = parse_numeric(&actual[2][i]);
+        let expected_avg_price = parse_numeric(&expected[2][i]);
+        assert!(
+            (actual_avg_price - expected_avg_price).abs() < 0.001,
+            "row {i} ({actual_flag}): AVG(L_EXTENDEDPRICE) must be {expected_avg_price}, got {actual_avg_price}"
+        );
+
+        let actual_pct = parse_numeric(&actual[3][i]);
+        let expected_pct = parse_numeric(&expected[3][i]);
+        assert!(
+            (actual_pct - expected_pct).abs() < 0.001,
+            "row {i} ({actual_flag}): ROUND(...) return-pct must be {expected_pct}, got {actual_pct}"
+        );
+    }
+}
+
+/// A grouped select list carrying BOTH a bare `COUNT(*)` and a scalar function
+/// wrapping a `COUNT(*)` (`ROUND(100.0 * SUM(CASE …)/COUNT(*), 2)`) must
+/// decompose the shared `COUNT(*)` into exactly ONE deduplicated partial
+/// column (one `PARTIAL_count_{i}` index across the whole pushed SQL) rather
+/// than one partial column per occurrence — and must still compute the
+/// correct result, matching the native ground truth.
+#[test]
+fn test_group_by_shared_inner_aggregate_dedup() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT L_RETURNFLAG, COUNT(*), \
+         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         FROM {} GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG",
+        vs_lineitem_table()
+    );
+
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    let count_indices = distinct_numeric_suffixes(&pushed_sql, "PARTIAL_count_");
+    assert_eq!(
+        count_indices.len(),
+        1,
+        "the bare COUNT(*) and the COUNT(*) nested inside ROUND(...) must \
+         dedup to exactly ONE PARTIAL_count_{{i}} index, got indices \
+         {count_indices:?} in:\n{pushed_sql}"
+    );
+
+    let actual = conn.query_columns(&sql);
+    assert_eq!(
+        actual.len(),
+        3,
+        "expected 3 columns (L_RETURNFLAG, COUNT(*), RETURN_PCT): {actual:?}"
+    );
+    assert_eq!(
+        actual[0].len(),
+        2,
+        "GROUP BY L_RETURNFLAG must return exactly 2 groups (R, N): {actual:?}"
+    );
+
+    let total_count: i64 = actual[1].iter().map(parse_int).sum();
+    assert_eq!(
+        total_count, LINEITEM_ROWS as i64,
+        "total COUNT(*) across both groups must be {LINEITEM_ROWS}, got {total_count}"
+    );
+
+    ensure_ground_truth_lineitem_table(&mut conn);
+    let ground_truth_sql = format!(
+        "SELECT L_RETURNFLAG, COUNT(*), \
+         ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2) \
+         FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} \
+         GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG"
+    );
+    let expected = conn.query_columns(&ground_truth_sql);
+    assert_eq!(
+        expected[0].len(),
+        2,
+        "ground truth must have 2 groups: {expected:?}"
+    );
+
+    for i in 0..2 {
+        let actual_flag = actual[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("L_RETURNFLAG not a string: {:?}", actual[0][i]));
+        let expected_flag = expected[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("L_RETURNFLAG not a string: {:?}", expected[0][i]));
+        assert_eq!(
+            actual_flag, expected_flag,
+            "row {i}: L_RETURNFLAG must match the native ground truth"
+        );
+
+        let actual_count = parse_int(&actual[1][i]);
+        let expected_count = parse_int(&expected[1][i]);
+        assert_eq!(
+            actual_count, expected_count,
+            "row {i} ({actual_flag}): COUNT(*) must be {expected_count}, got {actual_count}"
+        );
+
+        let actual_pct = parse_numeric(&actual[2][i]);
+        let expected_pct = parse_numeric(&expected[2][i]);
+        assert!(
+            (actual_pct - expected_pct).abs() < 0.001,
+            "row {i} ({actual_flag}): ROUND(...) return-pct must be {expected_pct}, got {actual_pct}"
         );
     }
 }
