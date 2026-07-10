@@ -58,7 +58,7 @@ CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
-CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(spec VARCHAR(2000000))
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
@@ -73,7 +73,9 @@ end
 /
 ```
 
-`EMITS (...)` is a placeholder — the adapter supplies concrete output columns per query.
+`LAKEHOUSE_SCAN` takes two `VARCHAR` arguments: `common` is the shard-invariant scan-spec blob
+(shared across all shards) and `files` is the per-shard file list; `EMITS (...)` is a placeholder —
+the adapter supplies concrete output columns per query.
 `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough LUA SET script (not a Rust entry point) that
 does the cross-node `GROUP BY shard_key` fan-out of the per-shard file lists ahead of the scalar
 scan.
