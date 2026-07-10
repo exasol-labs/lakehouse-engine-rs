@@ -33,7 +33,7 @@ Default host ports (override via env): Exasol SQL `28563`, BucketFS `22581`, Min
 make cross-musl-udf-build      # → target/release/liblakehouse_engine.so
 ```
 
-Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both** entry points (VS adapter + scan SET UDF).
+Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both** entry points (VS adapter + scan SCALAR UDF). The `LAKEHOUSE_DISTRIBUTE_FILES` distributor is a separate LUA SET script created by plain DDL — no `.so` symbol.
 
 ## 2. Register the Rust SLC
 
@@ -58,13 +58,27 @@ CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
-CREATE OR REPLACE RUST SET SCRIPT LHVS.LAKEHOUSE_SCAN(spec VARCHAR(2000000))
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
+
+CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
+EMITS (files VARCHAR(2000000)) AS
+function run(ctx)
+    repeat
+        ctx.emit(ctx.files)
+    until not ctx.next()
+end
+/
 ```
 
-`EMITS (...)` is a placeholder — the adapter supplies concrete output columns per query.
+`LAKEHOUSE_SCAN` takes two `VARCHAR` arguments: `common` is the shard-invariant scan-spec blob
+(shared across all shards) and `files` is the per-shard file list; `EMITS (...)` is a placeholder —
+the adapter supplies concrete output columns per query.
+`LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough LUA SET script (not a Rust entry point) that
+does the cross-node `GROUP BY shard_key` fan-out of the per-shard file lists ahead of the scalar
+scan.
 
 ## 5. Create the catalog CONNECTION
 
@@ -159,7 +173,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 |---|---|---|
 | `CATALOG_CONNECTION` | yes | Name of the CONNECTION object from step 5 |
 | `ICEBERG_NAMESPACE` | yes | Iceberg namespace; **every table in it** is exposed as a virtual table |
-| `SCAN_SCHEMA` | yes | Schema holding the `LAKEHOUSE_SCAN` SET script |
+| `SCAN_SCHEMA` | yes | Schema holding the `LAKEHOUSE_SCAN` scalar script and the `LAKEHOUSE_DISTRIBUTE_FILES` distributor |
 | `ALLOW_HTTP` | no | `'true'` to allow plain-HTTP catalog/S3 (e.g. local MinIO) |
 | `PARALLELISM_FACTOR` | no | Work-unit oversubscription multiplier (G = node_count × factor, capped 300) |
 | `DATAFUSION_TARGET_PARTITIONS` | no | DataFusion target partition count per UDF |

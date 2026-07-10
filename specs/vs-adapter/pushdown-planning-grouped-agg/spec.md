@@ -3,11 +3,14 @@
 Extends `vs-adapter/pushdown-planning` with the GROUP BY aggregate detection and
 scan-driving SQL generation scenarios. When Exasol delegates a `GROUP BY` aggregate
 query, the adapter detects the shape, renders group-key expressions via the VS
-expression translator, builds a grouped common scan spec, and generates fan-out SQL
-that runs DataFusion GROUP BY inside each shard invocation and merges the partials in
-an outer wrapper. The grouped common spec is serialized once (shared by all shards)
-and carries no LIMIT. See `vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate`
-for scalar-function-wrapping-aggregates select items on this same path.
+expression translator, builds a grouped common scan spec spliced once as the scalar
+scan UDF's first argument, and generates fan-out SQL that runs DataFusion GROUP BY
+inside each scalar-scan invocation and merges the partials in an outer wrapper.
+Cluster fan-out (`GROUP BY shard_key`) lives inside the nested
+`LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the outer wrapper re-groups the
+scalar scan's emitted partial rows on the user group keys. See
+`vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate` for
+scalar-function-wrapping-aggregates select items on this same path.
 
 ## Background
 
@@ -20,19 +23,15 @@ for scalar-function-wrapping-aggregates select items on this same path.
   mode); any failure on ANY element causes the adapter to fall back to row scanning.
 * Each group-key element is rendered independently, so a multi-key GROUP BY MAY mix
   plain column references and scalar expressions in any combination.
-* The inner `GROUP BY shard_key` parallelizes the scan; DataFusion performs the user
-  GROUP BY inside each shard invocation, emitting per-user-group partials with
-  group-key values as plain columns (GK_0..GK_{n-1}); the outer wrapper re-groups on
-  those columns and merges the partials.
-* LIMIT is never pushed into the per-shard grouped scan; the shared common spec is
-  built with no LIMIT, so no shard observes one — it appears only in the outer
-  wrapper.
+* DataFusion performs the user GROUP BY inside each scalar-scan invocation, emitting
+  one partial-aggregate row per distinct user group per shard; the outer wrapper
+  merges those partials on the user group keys with the same SUM/MIN/MAX/AVG-pair
+  decomposition as the single-group path.
+* LIMIT is never pushed into the per-shard grouped scan; the grouped common spec carries
+  no LIMIT, so no shard observes one — it appears only in the outer wrapper.
 * Exasol validates the outer wrapper SELECT's column types positionally against
   `selectListDataTypes`, so the wrapper SELECT must list its items in the user's
   `selectList` order.
-* The grouped scan-driving SQL serializes the shard-invariant common spec once and
-  carries only each shard's file subset per `VALUES` row, exactly as the row-scan
-  fan-out.
 * When a grouped select item cannot be decomposed into supported partials (an inner
   aggregate that is `DISTINCT`, a SUM/stat over a non-numeric type, an untranslatable
   argument, or a non-aggregate/non-group-key node), the adapter MUST NOT emit a bare
@@ -71,13 +70,13 @@ for scalar-function-wrapping-aggregates select items on this same path.
 * *AND* the scan UDF MUST use the same rendered expressions in its per-shard DataFusion GROUP BY clause
 * *AND* the adapter SHALL resolve each group-key expression's Exasol-declared result type from the `selectListDataTypes` entry at the group-key item's own `selectList` index, so an expression key whose rendered SQL differs in whitespace or casing between `groupBy` and `selectList` still receives its correct declared type and CAST rather than silently defaulting to `VARCHAR(2000000)`
 
-### Scenario: Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units
+### Scenario: Grouped scan-driving SQL fans out via a nested shard_key distributor over G work units
 
 * *GIVEN* a grouped aggregate pushdown over a file list partitioned into G work-unit shards
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL group the per-shard rows on `shard_key` (one group per shard), NOT on `IPROC()`
-* *AND* G SHALL be `CLUSTER_NODES × PARALLELISM_FACTOR` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes and multiplex onto each node's core pool
-* *AND* the scan SET UDF SHALL be invoked once per shard with the shard-invariant common spec serialized once as its first argument and that shard's file subset as its second argument
+* *THEN* the generated SQL SHALL place the `GROUP BY shard_key` (one group per shard) INSIDE the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery, NOT at the outer merge level and NOT on `IPROC()`
+* *AND* G SHALL be `node_count × parallelism_factor` capped at 300 and clamped to the file count, so the shard groups distribute round-robin across nodes and multiplex onto each node's core pool
+* *AND* the `LAKEHOUSE_SCAN` SCALAR EMIT UDF SHALL be invoked over each distributed shard row with the shard-invariant grouped common spec spliced once as its first-argument literal and that shard's file subset as its second argument
 
 ### Scenario: LIMIT is NOT pushed into per-shard scan for a grouped query
 
@@ -96,11 +95,11 @@ for scalar-function-wrapping-aggregates select items on this same path.
 
 ### Scenario: Grouped aggregate wrapper SQL re-groups partial results per user group key
 
-* *GIVEN* a grouped aggregate pushdown fanned out over G shards via `GROUP BY shard_key`
+* *GIVEN* a grouped aggregate pushdown fanned out over G shards via the nested `shard_key` distributor
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the inner `shard_key` grouping SHALL parallelize the scan while DataFusion performs the user GROUP BY inside each shard invocation, emitting one partial-aggregate row per distinct user group per shard
-* *AND* the outer wrapper SQL SHALL GROUP BY the user group-key columns and merge the per-shard partials using the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path
-* *AND* the outer wrapper SELECT list SHALL place each group-key cast expression and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectList`, so the wrapper's result column order and per-column type match Exasol's positional `selectListDataTypes` validation for ANY interleaving of keys and aggregates, while the inner fan-out EMITS clause and the scan UDF's per-shard SELECT MAY remain keys-first (GK_* then PARTIAL_*) because they are matched only against each other
+* *THEN* the inner distributor's `shard_key` grouping SHALL parallelize the scan across nodes while the scalar scan UDF performs the user GROUP BY inside each shard invocation, emitting one partial-aggregate row per distinct user group per shard
+* *AND* the outer wrapper SQL SHALL GROUP BY the user group-key columns over the scalar scan select and merge the per-shard partials using the same SUM/MIN/MAX/AVG-pair decomposition as the single-group path, with no `SELECT * FROM (...)` wrapper between the merge and the scalar scan
+* *AND* the outer wrapper SELECT list SHALL place each group-key cast expression and each merged-aggregate expression at the same ordinal position that item occupied in the user's `selectListDataTypes`, so the wrapper's result column order and per-column type match Exasol's positional pushdown validation for ANY interleaving of keys and aggregates, while the inner scalar scan's per-shard EMITS clause MAY remain keys-first (GK_* then PARTIAL_*) because it is matched only against the scan UDF's own output
 * *AND* the merged result per group SHALL equal the result of the same grouped aggregate evaluated over all rows on a single node
 
 ### Scenario: Adapter falls back to a qualified single-table wrapper for an undecomposable grouped aggregate shape

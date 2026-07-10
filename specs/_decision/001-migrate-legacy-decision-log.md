@@ -3135,3 +3135,188 @@ source column absent from the outer wrapper. Top-level and nested aggregate rewr
 are consistent by construction.
 
 ---
+
+## ADR: Split Fan-Out Is the Sole Scan Path, Applied Unconditionally
+
+**ID:** split-fan-out-is-the-sole-scan-path-applied-unconditionally
+**Plan:** `change-scan-fanout-to-scalar-emit`
+**Status:** Accepted
+
+### Context
+
+The prior `GROUP BY shard_key` raw-row emit fan-out is always materialized by Exasol
+into a temp-DB-RAM `tmp_subselect` on the transparent VS path, growing with scanned
+data volume rather than staying constant. A spike proved a nested `LAKEHOUSE_DISTRIBUTE_FILES`
+LUA SET distributor (`GROUP BY shard_key`) driving an outer ungrouped scalar
+`LAKEHOUSE_SCAN` EMIT UDF keeps memory constant (~2.5 GB) instead of growing (22 GB+).
+The temp-DB-RAM materialization is universal to raw-row emit under `GROUP BY shard_key`,
+not specific to any one wrapper (raw scan, partial-aggregate merge, grouped-aggregate,
+top-N, broadcast join, N-scan join fallback) — every wrapper that drove the old SET scan
+needed the same conversion.
+
+### Decision
+
+The nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor + scalar `LAKEHOUSE_SCAN` is the
+ONLY scan path, with no flag, VS property, or planner mode branch, applied uniformly
+across every wrapper (raw scan, single-group aggregate, grouped aggregate, ordered
+top-N, broadcast join, and the N-scan join fallback). The existing merge/group/join
+logic moves to the OUTER (ungrouped) query over the scalar scan's emitted partial rows.
+Single-shard plans short-circuit the distributor and call the scalar scan directly,
+uniformly across all wrappers.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Split fan-out as the sole, unconditional scan path | ✓ Chosen — the materialization problem is universal to raw-row emit under `GROUP BY shard_key`; a single path avoids divergence risk across wrappers |
+| Keep the spike's temporary local A/B flag | ✗ Rejected — diagnostic scaffolding, not a shipping surface; a flag is dead weight once the fix is proven |
+| A per-query mode switch | ✗ Rejected — adds a branch and a maintenance burden with no benefit once the split shape is universally correct |
+
+### Consequences
+
+Every scan-driving wrapper in the codebase (`vs-adapter/pushdown-planning`,
+`-single-group-agg`, `-grouped-agg`, `-topn`, `-join`, `-join-fallback`) now shares one
+fan-out shape, keeping scan-output memory constant instead of growing with data volume,
+at the cost of converting every wrapper in one plan rather than incrementally.
+
+## ADR: `LAKEHOUSE_SCAN` Itself Becomes SCALAR — One Scan Entry Point, Not Two
+
+**ID:** lakehouse-scan-itself-becomes-scalar-one-scan-entry-point-not-two
+**Plan:** `change-scan-fanout-to-scalar-emit`
+**Status:** Accepted
+
+### Context
+
+Making the scan output streaming-only (not materialized) requires the scan UDF to run
+as a SCALAR EMIT script rather than a SET script. The compiled scan logic (DataFusion
+session, projection/filter/LIMIT, Arrow IPC emit) is identical between a SET and a
+SCALAR invocation; only the DDL script type and the per-invocation run loop differ.
+
+### Decision
+
+Convert the existing `LAKEHOUSE_SCAN` symbol's DDL script type SET → SCALAR in place;
+do NOT add a second `LAKEHOUSE_SCAN_SCALAR` entry point alongside it.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Convert `LAKEHOUSE_SCAN`'s DDL type SET → SCALAR in place | ✓ Chosen — the scan logic is identical; a single `.so` symbol keeps packaging and fingerprinting unchanged |
+| Add a separate `LAKEHOUSE_SCAN_SCALAR` script alongside the existing SET scan | ✗ Rejected — two entry points for the same logic doubles the packaging/fingerprint surface and the two would inevitably drift |
+
+### Consequences
+
+`LAKEHOUSE_SCAN` has one `.so` symbol and one DDL script (now SCALAR EMIT); the SET
+script type is retired entirely from the scan path. The scan entry-point symbol name
+is unchanged by the SET→SCALAR conversion.
+
+## ADR: The File Distributor Is a LUA SET Script, Not a Rust `.so` Entry Point
+
+**ID:** the-file-distributor-is-a-lua-set-script-not-a-rust-so-entry-point
+**Plan:** `change-scan-fanout-to-scalar-emit`
+**Status:** Accepted
+
+### Context
+
+Cluster fan-out still needs a `GROUP BY shard_key` relation to make Exasol distribute
+shard groups round-robin across nodes, but that relation no longer scans data — it only
+needs to re-emit each shard's file-list string so the outer scalar scan can be invoked
+once per distributed row. This passthrough re-emit needs no DataFusion, no Parquet
+access, and no Rust scan logic at all.
+
+### Decision
+
+`LAKEHOUSE_DISTRIBUTE_FILES` is implemented as a pure LUA SET passthrough script,
+created by its own DDL and schema-qualified like the scan and distinct-merge scripts.
+It carries no scan logic and no data-file access, and is NOT one of the crate's Rust
+`.so` entry points.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| A standalone LUA SET passthrough script | ✓ Chosen — a passthrough re-emit needs no Rust; keeps the `.so` build/fingerprint surface untouched and makes the fan-out a plain DDL artifact |
+| A third Rust entry point in the `.so` | ✗ Rejected — adds Rust/packaging/fingerprint surface for logic that is a pure re-emit with no data access |
+
+### Consequences
+
+The `.so` continues to export exactly the adapter, scan, and scalar distinct-merge
+entry points; `LAKEHOUSE_DISTRIBUTE_FILES` is provisioned as independent DDL that
+references no `.so` and declares no `%udf_object`, so its footprint is negligible and
+independent of data volume.
+
+## ADR: SCALAR Batching Requires a `while ctx.next()` Scan Loop With Once-Per-Batch Runtime
+
+**ID:** scalar-batching-requires-a-while-ctx-next-scan-loop-with-once-per-batch-runtime
+**Plan:** `change-scan-fanout-to-scalar-emit`
+**Status:** Accepted
+
+### Context
+
+As a SCALAR EMIT UDF, Exasol may batch multiple input rows into one `run()` call. A
+naive single-`ctx.next()` read processes only the first row and silently drops every
+row past it — the spike observed 108M of 210M rows returned. Building and tearing down
+a DataFusion runtime per row would instead race object_store's detached background
+tasks and pay setup cost N times per batch.
+
+### Decision
+
+`run_scan` loops `while ctx.next()` over the whole batch, scanning each row's assigned
+file list and emitting that row's surviving output. The DataFusion runtime is built
+ONCE from the first row's (shard-invariant) thread configuration, reused across every
+row in the batch, and torn down deterministically exactly once after the batch is
+drained, preserving the `run_on_runtime` / `shutdown_timeout` teardown discipline.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `while ctx.next()` loop with a once-per-batch runtime build/teardown | ✓ Chosen — correct (no row dropped) and cheap (one runtime per batch, not per row) |
+| Keep the single-`ctx.next()` read | ✗ Rejected — silently drops every row past the first; observed dropping ~50% of rows in the spike |
+| Build/tear down a runtime per row | ✗ Rejected — races object_store's detached background tasks and wastes setup cost per row |
+
+### Consequences
+
+A batch of exactly one input row produces byte-identical output to the pre-batching
+single-row scan (the loop is a no-op for that case), while a multi-row batch now scans
+and emits every row's assigned files instead of only the first.
+
+## ADR: N-Scan Join Fallback Renders `INNER JOIN … ON` With Greedy-Attach and Per-Leg Filter Pushdown
+
+**ID:** n-scan-join-fallback-renders-inner-join-on-with-greedy-attach-and-per-leg-filter-pushdown
+**Plan:** `change-scan-fanout-to-scalar-emit`
+**Status:** Accepted
+
+### Context
+
+The unified unaccelerated join fallback previously rendered its FROM clause as a comma
+cross-join with one flat WHERE. Converting every leg to the nested-distributor +
+scalar-scan fan-out was an opportunity to also render the FROM as the join shape
+Exasol's optimizer plans best, and to push each side's own filter conjuncts into that
+side's fan-out leg so DataFusion prunes and filters per leg rather than Exasol filtering
+after a full cross-product-shaped reconstruction.
+
+### Decision
+
+Render the fallback FROM as a left-to-right `INNER JOIN … ON` chain: attach each join
+condition to the earliest join point at which every table it references is in scope,
+deciding scope by the SET of `tableName`s a condition touches (never by column name, so
+shared column names across sides stay correctly qualified) — a join point with no
+resolvable condition renders `ON 1=1`. Push each side's side-local WHERE conjuncts
+(referencing only that one table) into that side's fan-out leg as a DataFusion filter;
+only residual (cross-table, OR-spanning, or untagged) conjuncts remain in the outer
+WHERE.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| `INNER JOIN … ON` chain with greedy table-name-set attach and per-leg WHERE pushdown | ✓ Chosen — matches the shape Exasol's optimizer plans best and lets DataFusion prune/filter per leg instead of Exasol filtering post-hoc |
+| Keep the comma cross-join + flat WHERE | ✗ Rejected — already correct and order-agnostic, but leaves every side-local filter unpushed and gives Exasol's optimizer a less favorable shape |
+
+### Consequences
+
+The N-scan fallback's rendered SQL is a proper `INNER JOIN … ON` chain for any N ≥ 2,
+attached correctly under shared column names by construction (scope decided by
+`tableName` set, never by column name), with side-local filters pruning and filtering
+at the DataFusion level per leg instead of after full materialization.
