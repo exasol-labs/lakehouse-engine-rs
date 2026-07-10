@@ -1,17 +1,19 @@
 # Feature: Work-Unit File Sharding
 
-Partitions the once-resolved Iceberg data-file list into G oversubscribed work
-units ("shards") and drives them as one scan query that Exasol distributes
-across the cluster. Rather than sharding one-per-node, the adapter sizes G to
-oversubscribe the cluster (`G = node_count × parallelism_factor`, capped so the
-group set stays in Exasol's round-robin distribution regime) and emits a
-`GROUP BY shard_key` fan-out. Exasol spreads the shard groups across nodes and
-multiplexes them onto each node's fixed per-node VM pool (sized to
-`NR_OF_CORES`), so a single node's cores are all exploited. Work assignment is
-computed entirely in the planning layer; each scan UDF invocation reads only its
-own shard of files and no file is scanned twice. The fan-out serializes the
-shard-invariant common spec (including the Iceberg table root) once and carries
-only each shard's per-file `(path, size)` subset per `VALUES` row.
+Partitions the once-resolved Iceberg data-file list into G oversubscribed work-units
+("shards") and drives them across the cluster. Rather than sharding one-per-node, the
+adapter sizes G to oversubscribe the cluster (G = node_count × parallelism_factor,
+capped so the group set stays in Exasol's round-robin distribution regime) and emits a
+fan-out. Cluster fan-out is separated from the scan itself: a tiny `LAKEHOUSE_DISTRIBUTE_FILES`
+LUA SET script re-emits each shard's per-file list once per `shard_key` group so
+`GROUP BY shard_key` distributes the assignments round-robin across nodes, and the
+`LAKEHOUSE_SCAN` scalar EMIT UDF then scans each distributed file list node-locally
+and STREAMS its rows. Because the scan is scalar (no top-level `GROUP BY`), Exasol does
+not materialize the scan output. The shard-invariant common spec (including the Iceberg
+table root) is serialized ONCE as the scalar scan's first-argument literal; only each
+shard's per-file subset flows through the distributor. Work assignment is computed
+entirely in the planning layer; each scan invocation reads only its own shard of files
+and no file is scanned twice.
 
 ## Background
 
@@ -35,19 +37,20 @@ only each shard's per-file `(path, size)` subset per `VALUES` row.
   lands in: a shard is a list of `(path, size)` entries, not bare paths, so the
   size the adapter already resolved travels into the per-shard payload rather
   than being dropped.
-* The fan-out groups on a per-shard key (`GROUP BY shard_key`), NOT on `IPROC()`.
-  Each shard is its own group; Exasol assigns groups to nodes and runs each as a
-  scan UDF invocation. Groups drive UDF invocations, not OS processes — actual
-  concurrency on a node is bounded by that node's VM pool, and the engine
-  multiplexes the shard groups onto it.
+* Cluster fan-out is separated from the scan: a `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET
+  distributor does the `GROUP BY shard_key` cross-node distribution (grouping on a
+  per-shard key, NOT on `IPROC()`), and the `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans
+  each distributed file list node-locally and streams its rows, so scan output is
+  not materialized into temp DB RAM. Groups drive distributor invocations, not OS
+  processes — actual concurrency on a node is bounded by that node's VM pool, and
+  the engine multiplexes the shard groups onto it.
 * File-to-shard assignment is computed once in the adapter; the scan UDF receives
   an explicit file list per invocation and never discovers files itself. No node
   scans another node's files.
-* The generated fan-out SQL serializes the shard-invariant common spec (including
-  the Iceberg table root) exactly once as the scan SET UDF's first argument (a
-  shared SELECT-list literal), and carries only each shard's `(path, size)`
-  subset as the second (per-shard) argument in the `VALUES` rows. Credentials
-  MUST NOT appear repeated per shard; they live once in the common spec literal.
+* The shard-invariant common spec is serialized once as the scalar scan's
+  first-argument literal; only each shard's per-file subset flows through the
+  distributor. Credentials MUST NOT appear repeated per shard; they live once in
+  the common spec literal.
 
 ## Scenarios
 
@@ -77,19 +80,29 @@ only each shard's per-file `(path, size)` subset per `VALUES` row.
 * *AND* the adapter SHALL produce exactly one shard per file
 * *AND* the adapter MUST NOT emit a scan invocation for an empty file shard
 
-### Scenario: Scan-driving query fans the SET UDF across shards via GROUP BY shard_key
+### Scenario: Scan-driving query fans out via a nested distributor over a scalar scan UDF
 
 * *GIVEN* a file list partitioned into more than one shard
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the generated SQL SHALL invoke the scan SET UDF once per shard, serializing the shard-invariant common spec (including the Iceberg table root) EXACTLY ONCE as a single SQL string literal in the SET UDF's first (SELECT-list) argument shared by every shard invocation, rather than repeating it per shard
-* *AND* the SQL SHALL carry ONLY each shard's `(path, size)` subset as that invocation's second (per-shard) argument, placed in the `VALUES` rows, grouping the shard rows on a per-shard `shard_key` (NOT on `IPROC()`) so Exasol distributes shard groups across nodes and multiplexes them onto each node's core pool
-* *AND* the table root SHALL NOT appear in any per-shard argument, appearing only once in the shared common spec literal
-* *AND* the union of all shard outputs SHALL be identical in row content to the equivalent single-shard scan
+* *THEN* the generated SQL SHALL nest a `GROUP BY shard_key` distributor subquery — a `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET UDF invoked over a `VALUES` relation of `(shard_key, files)` rows grouped on `shard_key` (NOT on `IPROC()`) — inside an outer ungrouped select that invokes the `LAKEHOUSE_SCAN` scalar EMIT UDF once per distributed row
+* *AND* the shard-invariant common spec (including the Iceberg table root) SHALL be serialized EXACTLY ONCE as a single SQL string literal spliced as the scalar scan UDF's first argument, shared by every shard invocation, rather than repeated per shard and rather than flowed through the distributor
+* *AND* only each shard's per-file `files` subset SHALL flow through the distributor's `VALUES` rows as the scalar scan UDF's second argument, and the table root SHALL NOT appear in any per-shard argument
+* *AND* the outer scalar select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary, so the scalar scan streams its rows rather than Exasol buffering them into a temp table
+* *AND* the union of all shard outputs SHALL be identical as an order-independent multiset to the equivalent single-shard scan
 
-### Scenario: Single node with G collapsing to one preserves the single-invocation query
+### Scenario: File distributor is a passthrough LUA SET script that re-emits each shard's file list
 
-* *GIVEN* a `CLUSTER_NODES` value of one and a configuration where G resolves to 1 (single file, or a parallelism factor of 1 on a single file)
+* *GIVEN* the fan-out distributor subquery driving cluster distribution
+* *WHEN* the `LAKEHOUSE_DISTRIBUTE_FILES` SET UDF is invoked for one `shard_key` group
+* *THEN* the distributor SHALL be a pure LUA SET script (created by its own DDL, carrying NO scan logic and NO data-file access) that re-emits the group's `files` VARCHAR value unchanged, one output row per `shard_key` group
+* *AND* the distributor MUST NOT be a Rust entry point in the scan `.so` and MUST NOT open, resolve, or read any data file — it moves only the per-shard file-list string, so its buffered footprint is negligible and independent of the data volume scanned
+* *AND* `GROUP BY shard_key` over the distributor SHALL cause Exasol to distribute the shard groups round-robin across nodes (for G ≤ 300) so each distributed file list is scanned on the node it lands on
+
+### Scenario: Single shard short-circuits the distributor and calls the scalar scan directly
+
+* *GIVEN* a `parallelism_factor` and file list where G resolves to 1 (single file, a parallelism factor of 1 on a single file, or any plan resolving to one shard)
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL emit a single scan SET UDF invocation carrying the common spec argument and the whole file list as the per-shard argument
-* *AND* the generated SQL MUST be behaviourally identical to the pre-sharding single-invocation execution path
-* *AND* the common spec literal SHALL appear exactly once, and the file-list literal exactly once
+* *THEN* the adapter SHALL OMIT the `LAKEHOUSE_DISTRIBUTE_FILES` distributor and the inner `GROUP BY shard_key` entirely, emitting a from-less scalar `LAKEHOUSE_SCAN` invocation whose first argument is the common spec literal and whose second argument is the whole file-list literal
+* *AND* a scalar EMIT UDF over constant-literal arguments SHALL fire exactly once, so no driving relation is required
+* *AND* the common spec literal SHALL appear exactly once and the file-list literal exactly once
+* *AND* the generated SQL SHALL be behaviourally identical (as an order-independent multiset) to the multi-shard fan-out collapsed to one shard
