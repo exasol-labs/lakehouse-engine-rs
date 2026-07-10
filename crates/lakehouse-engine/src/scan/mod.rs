@@ -1,4 +1,4 @@
-/// DataFusion scan SET UDF — reconstitutes a ScanSpec from its TWO input
+/// DataFusion scan SCALAR EMIT UDF — reconstitutes a ScanSpec from its TWO input
 /// arguments (the shard-invariant common blob at column 0, serialized once per
 /// fan-out, and the per-shard files JSON array at column 1), builds a DataFusion
 /// SessionContext, registers ONLY the assigned files over MinIO, applies
@@ -164,60 +164,107 @@ pub fn read_scan_spec(ctx: &dyn UdfContext) -> Result<ScanSpec, UdfError> {
     ScanSpec::from_parts_json(common_json, files_json).map_err(UdfError::User)
 }
 
-/// Entry point for the LAKEHOUSE_SCAN SET UDF.
+/// Entry point for the LAKEHOUSE_SCAN SCALAR EMIT UDF.
 ///
-/// Reconstitutes the scan spec from the two input columns (the common blob at
-/// column 0 and the per-shard files JSON at column 1), builds a DataFusion
-/// session, scans the assigned files, and emits rows.
+/// Exasol batches multiple input rows into ONE scalar `run()` call. Each row
+/// carries the shard-invariant common blob (column 0, spliced once as the scalar
+/// first-argument literal) and that row's per-shard files JSON (column 1).
+/// `run_scan` loops over EVERY row in the batch (see [`run_scan_batch`]),
+/// reconstitutes the row's spec, and scans its assigned files — reading only the
+/// first row would silently drop every later row's shard.
+///
+/// The Tokio runtime is built ONCE from the first row's thread configuration
+/// (shard-invariant — carried in the common blob) and reused across the whole
+/// batch, then torn down deterministically ONCE via `run_on_runtime`. A per-row
+/// build/teardown would race object_store's detached hyper tasks and waste setup
+/// cost. `run_scan_batch`'s future owns no async resources at return (each row's
+/// `SessionContext` and streams are dropped inside the future before the next
+/// row), so `run_on_runtime`'s abort-free teardown contract holds.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
-    // Advance to the first (and only) input row.
-    let has_row = ctx.next()?;
-    if !has_row {
-        // No input row — nothing to scan.
+    // Advance to the first input row. An empty batch means nothing to scan.
+    if !ctx.next()? {
         return Ok(());
     }
 
-    // Reconstitute the spec from the two arguments BEFORE building the runtime:
-    // the runtime kind depends on spec.df_threads_per_udf, so we must
-    // deserialize first. NULL in either argument is a user error.
-    let spec = read_scan_spec(ctx)?;
+    // Reconstitute the FIRST row's spec BEFORE building the runtime: the runtime
+    // kind depends on spec.df_threads_per_udf, which is shard-invariant (carried
+    // in the common blob), so the first row's config governs the whole batch.
+    // NULL in either argument is a user error.
+    let first_spec = read_scan_spec(ctx)?;
 
-    // Build the Tokio runtime according to the spec's thread configuration.
-    // A fresh runtime per call is correct for a stateless disposable UDF.
-    let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
+    // Build the Tokio runtime once for the whole batch.
+    let rt = build_scan_runtime(first_spec.df_threads_per_udf).map_err(UdfError::User)?;
 
-    // Run on the runtime and tear it down deterministically. The implicit `drop(rt)`
-    // path raced object_store's detached hyper tasks at end-of-life and aborted the
-    // VM after the final flush (err_zombie, no panic text); `run_on_runtime` drives
-    // shutdown via `shutdown_timeout` from this synchronous context instead.
-    // run_scan_async returns a value owning no async resources (the SessionContext,
-    // streams, and object store are all dropped inside the future), satisfying
-    // run_on_runtime's contract.
-    run_on_runtime(rt, async { run_scan_async(ctx, &spec).await })
+    // Run the batch on the runtime and tear it down deterministically. The
+    // implicit `drop(rt)` path raced object_store's detached hyper tasks at
+    // end-of-life and aborted the VM after the final flush (err_zombie, no panic
+    // text); `run_on_runtime` drives shutdown via `shutdown_timeout` from this
+    // synchronous context instead. Production builds each row's session via
+    // `build_session_context`.
+    run_on_runtime(rt, run_scan_batch(ctx, first_spec, build_session_context))
 }
 
-async fn run_scan_async(ctx: &mut dyn UdfContext, spec: &ScanSpec) -> Result<(), UdfError> {
-    // Phase telemetry (Task 4): the startup clock starts at scan-body entry and
-    // is sealed at the first batch fetch inside emit_stream. Always measured
-    // (monotonic-clock arithmetic is cheap); emission is gated on the debug
-    // level so production at the default `info` level stays silent.
+/// Scan every row in the scalar input batch, reusing one Tokio runtime.
+///
+/// `first_spec` is the already-read first row's spec; each subsequent row is
+/// advanced to via `ctx.next()` and reconstituted via [`read_scan_spec`]. A
+/// per-row [`SessionContext`] is built through `build_session` and its streams
+/// are fully drained and dropped before the next iteration, so no async resource
+/// outlives the future — preserving [`run_on_runtime`]'s abort-free teardown
+/// contract (the whole batch runs inside a single `block_on`, torn down once).
+///
+/// `build_session` is injected so a host test can supply a local-file session
+/// (no S3), exactly as [`run_raw_scan_with_session`] is exposed for host tests;
+/// production passes [`build_session_context`].
+pub async fn run_scan_batch(
+    ctx: &mut dyn UdfContext,
+    first_spec: ScanSpec,
+    build_session: impl Fn(&ScanSpec, u64) -> Result<SessionContext, UdfError>,
+) -> Result<(), UdfError> {
+    let mut spec = first_spec;
+    loop {
+        let memory_limit_bytes = ctx.memory_limit();
+        let session_ctx = build_session(&spec, memory_limit_bytes)?;
+        run_scan_dispatch(ctx, &session_ctx, &spec).await?;
+        // Drop the per-row session (and its object store / any residual handles)
+        // before advancing — one row's async resources never overlap the next's.
+        drop(session_ctx);
+
+        if !ctx.next()? {
+            break;
+        }
+        spec = read_scan_spec(ctx)?;
+    }
+    Ok(())
+}
+
+/// Scan one reconstituted spec over an already-built session, dispatching to the
+/// join / partial-aggregate / raw-row path. All streams are drained and dropped
+/// before it returns, so the caller's future owns no async resources.
+async fn run_scan_dispatch(
+    ctx: &mut dyn UdfContext,
+    session_ctx: &SessionContext,
+    spec: &ScanSpec,
+) -> Result<(), UdfError> {
+    // Phase telemetry: the startup clock starts at scan-body entry and is sealed
+    // at the first batch fetch inside emit_stream. Always measured (monotonic-clock
+    // arithmetic is cheap); emission is gated on the debug level so production at
+    // the default `info` level stays silent.
     let mut timers = diagnostics::PhaseTimers::start();
 
-    let memory_limit_bytes = ctx.memory_limit();
-    let session_ctx = build_session_context(spec, memory_limit_bytes)?;
     if spec.join.is_some() {
         // A join spec drives the two-table broadcast inner equi-join path: register
         // the sharded fact side and the full dimension side in one session, join
         // node-locally, and stream joined batches. Takes precedence over the
         // aggregate/raw dispatch (the VS never combines a join with aggregates).
-        run_join_scan_with_session(ctx, &session_ctx, spec, &mut timers).await
+        run_join_scan_with_session(ctx, session_ctx, spec, &mut timers).await
     } else if spec.aggregates.is_some() {
         // Partial-aggregate paths emit a single summary row; phase telemetry
         // targets the raw-row streaming path where startup / import / send-back
         // are the throughput question. Leave the aggregate path unchanged.
-        run_partial_aggregate(ctx, &session_ctx, spec).await
+        run_partial_aggregate(ctx, session_ctx, spec).await
     } else {
-        run_raw_scan_with_session(ctx, &session_ctx, spec, &mut timers).await
+        run_raw_scan_with_session(ctx, session_ctx, spec, &mut timers).await
     }
 }
 

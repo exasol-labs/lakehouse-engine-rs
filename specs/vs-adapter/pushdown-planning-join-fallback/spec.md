@@ -1,23 +1,33 @@
 # Feature: Pushdown Planning — Unified Unaccelerated Join Fallback
 
-Extends pushdown planning (`vs-adapter/pushdown-planning`, `vs-adapter/pushdown-planning-join`) with the SINGLE unified renderer that serves every inner equi-join outside the two-table broadcast contract. Every join whose smaller side exceeds the broadcast threshold, whose select list needs Exasol postprocessing, whose shape falls outside the broadcast contract, or that spans three or more involved tables is executed WITHOUT broadcast through this one per-table-scan fallback renderer (each involved table scanned independently, all N reconstructed by Exasol's core engine), so a join is never wrong, only sometimes unaccelerated. The unaccelerated fallback has exactly one implementation for all N ≥ 2 involved tables; the two-involved-table case is simply N = 2.
+Extends pushdown planning with the SINGLE unified renderer that serves every inner
+equi-join outside the two-table broadcast contract. Each involved table is scanned
+independently through its own sharded fan-out subquery — nested `LAKEHOUSE_DISTRIBUTE_FILES`
+distributor over an ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF — and all N legs are
+reconstructed into the original inner join by Exasol's core engine. The FROM clause is
+rendered as a left-to-right `INNER JOIN … ON` chain (not a comma cross-join with one flat
+`WHERE`): each join condition attaches to the `ON` of the join point at which every table
+it references is in scope, and each side's side-local `WHERE` conjuncts are pushed into
+that side's fan-out leg so DataFusion prunes and filters per leg. The unaccelerated
+fallback has exactly one implementation for all N ≥ 2 involved tables.
 
 ## Background
 
 * The adapter advertises exactly `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` (`vs-adapter/pushdown-planning-join`); there is no per-query opt-out, so Exasol pushes every inner equi-join of any arity and expects this fallback (or the broadcast path) to serve it.
 * Each involved table's Iceberg snapshot, data-file list, and logical schema are resolved exactly once per pushdown, in the planning layer, recovering each table's original-cased Iceberg identifier from `TABLE_MAP` by its involved-table name; no scan UDF invocation discovers files itself.
-* The unaccelerated fallback is a SINGLE unified renderer for every inner join with N ≥ 2 involved tables: the two-involved-table case is exactly N = 2, and there is only one implementation. Each involved table is scanned through its own sharded scan-UDF fan-out subquery, and all N subquery results are reconstructed into the original inner join by Exasol's core engine. Broadcast (strictly two-table, node-local in the scan UDF, `vs-adapter/pushdown-planning-join`) is an optimization SELECTED WITHIN the one join path, not a second rendering implementation; when broadcast is unavailable for a two-table join it takes the same N = 2 unified fallback.
+* The unaccelerated fallback is a SINGLE unified renderer for every inner join with N ≥ 2 involved tables: the two-involved-table case is exactly N = 2, and there is only one implementation. Each involved table is scanned through its own nested-distributor + scalar-scan fan-out subquery, and all N subquery results are reconstructed into the original inner join by Exasol's core engine. Broadcast (strictly two-table, node-local in the scan UDF, `vs-adapter/pushdown-planning-join`) is an optimization SELECTED WITHIN the one join path, not a second rendering implementation; when broadcast is unavailable for a two-table join it takes the same N = 2 unified fallback.
 * Because each advertised capability is served statically and Exasol never re-plans on an adapter error (a declined pushdown is erased by the `exasol-udf-macros` FFI shim into a hard `F-UDF-CL-RUST-9001` SQL error — there is NO native-retry response in the protocol), an advertised join capability MUST always be renderable by the join path: either by broadcast or by the unified unaccelerated fallback. "Decline at runtime and let Exasol retry natively" is not an available behavior. A hard error is a genuine last resort, raised ONLY for a shape the adapter cannot render at all — a non-inner join node in the tree, an involved table absent from `TABLE_MAP` or carrying no column metadata, or a join condition/clause the translator cannot render — and it is a hard client-facing error, not a retry.
+* Every clause the wrapper renders (join conditions, WHERE, select list, GROUP BY, HAVING, ORDER BY) uses table-qualified column references resolved from each `column` node's `tableName`, so the wrapper is correct whether or not two involved tables share a column name.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 
 ## Scenarios
 
 ### Scenario: Join above the broadcast threshold falls back to the unified unaccelerated wrapper
 
-* *GIVEN* an inner equi-join `pushdown` request over two involved tables whose smaller side exceeds `JOIN_BROADCAST_MAX_BYTES`
+* *GIVEN* an inner equi-join `pushdown` request over two involved tables whose smaller side exceeds the broadcast threshold
 * *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL emit SQL through the SINGLE unified N-scan fallback renderer with N = 2 — scanning each table independently through its own sharded scan-UDF fan-out subquery and reconstructing the inner join over both subquery results in Exasol's core engine
-* *AND* the two-involved-table case SHALL use the identical fallback code path as the three-or-more-table case (there is exactly one unaccelerated join renderer), differing only in the number of scanned sides
+* *THEN* the adapter SHALL emit SQL through the SINGLE unified N-scan fallback renderer with N = 2 — scanning each table independently through its own nested-distributor + scalar-scan fan-out subquery and reconstructing the inner join over both subquery results with an `INNER JOIN … ON` chain in Exasol's core engine
+* *AND* the two-involved-table case SHALL use the identical fallback code path as the three-or-more-table case, differing only in the number of scanned sides
 * *AND* the returned result SHALL equal the result of the same inner equi-join evaluated on a single node
 * *AND* the adapter MUST NOT push either side's rows through a broadcast replication for this shape
 
@@ -33,15 +43,25 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`, `vs-adapter/pushdown-
 
 ### Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
 
-* *GIVEN* a `pushdown` request whose `from` clause is a nested inner-join tree over three or more involved tables (e.g. `supplier ⋈ nation ⋈ region`, `customer ⋈ orders ⋈ lineitem`, or `part ⋈ partsupp ⋈ supplier ⋈ nation`), every join node of which is `join_type = "inner"`
+* *GIVEN* a `pushdown` request whose `from` clause is a nested inner-join tree over three or more involved tables, every join node of which is inner
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL NOT return an error and SHALL NOT emit a broadcast plan for that request
 * *AND* the adapter SHALL serve the request through the SAME single unified fallback renderer used for the two-table (N = 2) case, differing only in the number of involved tables
-* *AND* the adapter SHALL resolve each involved table's Iceberg snapshot, data-file list, and logical schema exactly once — recovering each table's original-cased Iceberg identifier from `TABLE_MAP` by its involved-table name — and SHALL treat an involved table absent from `TABLE_MAP` as the same stale-virtual-schema hard error the single-table path reports
-* *AND* the adapter SHALL emit SQL that scans EACH involved table independently through its own sharded scan-UDF fan-out subquery and reconstructs the original inner join over all N subquery results in Exasol's core engine, carrying every one of the tree's join conditions AND-conjoined in a table-qualified WHERE
+* *AND* the adapter SHALL resolve each involved table's Iceberg snapshot, data-file list, and logical schema exactly once — recovering each table's original-cased Iceberg identifier from the schema-metadata mapping by its involved-table name — and SHALL treat an involved table absent from the mapping as the same stale-virtual-schema hard error the single-table path reports
+* *AND* the adapter SHALL emit SQL that scans EACH involved table independently through its own nested-distributor + scalar-scan fan-out subquery and reconstructs the original inner join over all N subquery results with a left-to-right `INNER JOIN … ON` chain in Exasol's core engine, each join condition attached to the `ON` of the join point at which every table it references is in scope
 * *AND* every join condition, WHERE filter, select-list item, GROUP BY, HAVING, and ORDER BY the wrapper renders SHALL use table-qualified column references resolved from each `column` node's `tableName` against the involved table that owns it, so the wrapper is correct whether or not any two involved tables share a column name
 * *AND* the returned result SHALL equal — as an order-independent multiset — the result of the same inner join evaluated on a single node
 * *AND* the adapter MUST NOT read any involved table's Parquet row data in the planning layer — only file-level metadata crosses into each side's scan spec
+
+### Scenario: Join conditions attach greedily by table-name set and side-local filters push into each leg
+
+* *GIVEN* a unified unaccelerated fallback over N ≥ 2 involved tables with a set of join conditions and a WHERE filter
+* *WHEN* the adapter renders the `INNER JOIN … ON` chain
+* *THEN* the adapter SHALL attach each join condition to the earliest join point in the left-to-right chain at which every table the condition references is in scope, deciding scope by the SET of `tableName`s the condition touches — NEVER by column name, so shared column names across sides stay correctly qualified
+* *AND* a join point at which no not-yet-attached condition becomes resolvable SHALL be rendered with `ON 1=1`
+* *AND* each side's SIDE-LOCAL WHERE conjuncts (referencing only that one table) SHALL be pushed INTO that side's fan-out leg as a DataFusion filter, so DataFusion performs row-group pruning and row filtering per leg
+* *AND* only the RESIDUAL WHERE conjuncts — cross-table, OR-spanning, or untagged — SHALL remain in the outer wrapper's `WHERE`
+* *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node, for any assignment of conditions to join points
 
 ### Scenario: Shared-column-name join uses qualified rendering, not bare-name broadcast rendering
 
