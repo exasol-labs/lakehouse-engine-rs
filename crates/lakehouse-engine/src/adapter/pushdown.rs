@@ -19,11 +19,11 @@ use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::sync::Arc;
 /// Pushdown planning: resolve the Iceberg file list ONCE and build the
-/// scan-driving SQL that invokes the LAKEHOUSE_SCAN SET UDF.
+/// scan-driving SQL that invokes the LAKEHOUSE_SCAN SCALAR EMIT UDF.
 ///
 /// Architecture invariants:
 /// - File list resolved exactly ONCE here, in the planning layer.
-/// - The scan SET UDF receives the explicit file list; it NEVER discovers files.
+/// - The scan SCALAR EMIT UDF receives the explicit file list; it NEVER discovers files.
 /// - A predicate the adapter cannot translate is OMITTED from the spec
 ///   (correctness backstop: Exasol keeps the predicate at its own level).
 /// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
@@ -630,7 +630,7 @@ pub fn merge_vended_into_storage(
     }
 }
 
-/// The registered SQL name of the scan SET UDF entry point.
+/// The registered SQL name of the scan SCALAR EMIT UDF entry point.
 const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 
 /// The registered SQL name of the scalar distinct-merge UDF entry point.
@@ -638,6 +638,14 @@ const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
 /// per-shard JSON-array partials into this scalar UDF (via `LISTAGG`); like the
 /// scan UDF it must be schema-qualified so it resolves outside the adapter schema.
 const DISTINCT_MERGE_UDF_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
+
+/// The registered SQL name of the file-distributor LUA SET script.
+/// The nested fan-out subquery groups the per-shard file-list rows by `shard_key`
+/// through this passthrough distributor so Exasol spreads the work units across
+/// nodes; the outer ungrouped scalar scan then streams over the distributed rows.
+/// Like the scan/merge scripts it must be schema-qualified to resolve outside the
+/// adapter schema.
+const DISTRIBUTE_FILES_UDF_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
 /// Maximum shard count: Exasol distributes groups round-robin below this threshold;
 /// above it Exasol hash-partitions them (no longer balanced).
@@ -1381,12 +1389,13 @@ fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {
 
 /// Build the scan-driving SQL from a resolved file list partitioned into shards.
 ///
-/// **Row queries** (no aggregates in spec):
-/// - Single shard: `SELECT * FROM (SELECT {udf}({spec}) EMITS ({emits})) LIMIT n`
-/// - Multi-shard: `SELECT * FROM (fan-out with GROUP BY shard_key) LIMIT n`
+/// **Row queries** (no aggregates in spec) — the outer ungrouped scalar scan is the
+/// top-level query; no `SELECT * FROM (...)` materialization wrapper (decision [5]):
+/// - Single shard: `SELECT {udf}('{common}', '{files}') EMITS ({emits}) [ORDER BY …] [LIMIT n]`
+/// - Multi-shard: `SELECT {udf}('{common}', files) EMITS ({emits}) FROM (distributor with GROUP BY shard_key) [ORDER BY …] [LIMIT n]`
 ///
 /// **Aggregate queries** (spec carries `aggregates`, no `group_keys`):
-/// - Always wraps the fan-out in an outer merge aggregation (never SELECT *).
+/// - The outer merge SELECT sits directly over the scalar scan (never SELECT *).
 /// - The EMITS clause and the outer merge follow the COLUMN CONTRACT from
 ///   `crate::scan::build_partial_agg_sql`.
 ///
@@ -1399,7 +1408,6 @@ fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> String {
 /// `aggregate_types` holds the Exasol-declared result type of each aggregate (from
 /// `aggregate_exasol_types`); the single-group merge casts each item to its declared
 /// type. Pass `&[]` to emit uncast merge items (row scans never read it).
-// ponytail: 8 args is one over the lint threshold; matches the sibling grouped builder.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -1411,6 +1419,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     aggregate_types: &[String],
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     if let Some(aggregates) = spec_template.aggregates.as_deref() {
         build_aggregate_scan_sql(
@@ -1421,6 +1430,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             aggregate_types,
             udf_name,
             merge_udf_name,
+            distribute_udf_name,
         )
     } else {
         build_row_scan_sql(
@@ -1430,23 +1440,27 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             proj_types,
             limit,
             udf_name,
+            distribute_udf_name,
         )
     }
 }
 
-/// Build the row-scan SQL (no aggregates).
+/// Build the row-scan SQL (no aggregates) as an OUTER UNGROUPED scalar scan over the
+/// nested distributor — no `SELECT * FROM (...)` materialization wrapper (decision
+/// [5]). Result-equivalence (decision [7]): with no outer GROUP BY the returned rows
+/// are exactly the union of every shard's rows.
 ///
 /// ## Ordered top-N
 ///
 /// When `spec_template.order_by` is non-empty the query is a matched ordered
-/// top-N: the outer wrapper carries `ORDER BY <keys> LIMIT n` so the returned SQL
-/// is self-contained (it does not depend on Exasol re-applying the ordering). Each
-/// shard's common blob carries the SAME `order_by` keys (and `limit`), which the
-/// scan UDF renders as a per-shard bounded `ORDER BY … LIMIT n` (a DataFusion
-/// TopK). The outer merge `ORDER BY` and the per-shard `ORDER BY` render through
-/// the one shared [`render_order_by_clause`] seam, so they agree on direction and
-/// NULL placement — the correctness-critical invariant. `order_by` is empty for
-/// plain (unordered) row scans, leaving that path byte-identical to before.
+/// top-N: the outer scalar select carries `ORDER BY <keys> LIMIT n` so the returned
+/// SQL is self-contained (it does not depend on Exasol re-applying the ordering).
+/// Each shard's common blob carries the SAME `order_by` keys (and `limit`), which the
+/// scan UDF renders as a per-shard bounded `ORDER BY … LIMIT n` (a DataFusion TopK).
+/// The outer merge `ORDER BY` and the per-shard `ORDER BY` render through the one
+/// shared [`render_order_by_clause`] seam, so they agree on direction and NULL
+/// placement — the correctness-critical invariant. `order_by` is empty for plain
+/// (unordered) row scans.
 fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
@@ -1454,6 +1468,7 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     proj_types: &[String],
     limit: Option<u64>,
     udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     let emits = proj_cols
         .iter()
@@ -1462,44 +1477,38 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Outer merge ORDER BY, rendered once (empty when not a matched top-N). SQL
-    // requires ORDER BY before LIMIT, so it is appended ahead of the LIMIT clause.
-    let order_by = if spec_template.order_by.is_empty() {
-        String::new()
-    } else {
-        format!(
+    // The fan-out primitive returns the OUTER UNGROUPED scalar scan directly (with
+    // the `GROUP BY shard_key` fan-out nested inside the distributor, or a from-less
+    // scalar call on literals for a single shard). No `SELECT * FROM (...)` wrapper:
+    // that was the un-flattenable materialization boundary this change removes
+    // (decision [5]). Result-equivalence (decision [7]): with no outer GROUP BY the
+    // returned rows are exactly the union of every shard's rows.
+    let mut sql = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
+
+    // Outer merge ORDER BY, rendered once (empty when not a matched top-N), attached
+    // DIRECTLY to the outer scalar select. SQL requires ORDER BY before LIMIT, so it
+    // is appended ahead of the LIMIT clause. The per-shard common blob carries the
+    // same keys so each shard runs the same bounded sort; this outer ORDER BY merges
+    // the per-shard partial orderings.
+    if !spec_template.order_by.is_empty() {
+        sql.push_str(&format!(
             " ORDER BY {}",
             render_order_by_clause(&spec_template.order_by)
-        )
-    };
-
-    let inner = if shards.len() == 1 {
-        let files = &shards[0];
-        let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&shard_files_json(files));
-        format!(
-            "SELECT {udf}({common}, {files}) EMITS ({emits})",
-            udf = udf_name,
-            common = common_literal,
-            files = files_literal,
-            emits = emits,
-        )
-    } else {
-        build_fan_out_inner(spec_template, shards, &emits, udf_name)
-    };
-
-    let mut sql = format!("SELECT * FROM ({inner}){order_by}");
+        ));
+    }
     if let Some(n) = limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
     sql
 }
 
-/// Build the aggregate scan SQL: fan-out EMITS partial columns, outer merge aggregates them.
+/// Build the aggregate scan SQL: the outer merge SELECT aggregates the per-shard
+/// partial columns DIRECTLY over the scalar scan (no `SELECT * FROM (...)` wrapper).
 ///
 /// The EMITS clause names and types follow the COLUMN CONTRACT defined in
 /// `crate::scan::build_partial_agg_sql`.  The outer merge SELECT consumes those
 /// exact column names.
+#[allow(clippy::too_many_arguments)]
 fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
@@ -1508,25 +1517,19 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregate_types: &[String],
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     let emits_items = partial_emits_items(aggregates, col_types, aggregate_types);
     let emits = emits_items.join(", ");
     let merge_select = cast_merge_items(aggregates, aggregate_types, merge_udf_name).join(", ");
 
-    let fan_out = if shards.len() == 1 {
-        let files = &shards[0];
-        let common_literal = sql_string_literal(&spec_template.to_common_json());
-        let files_literal = sql_string_literal(&shard_files_json(files));
-        format!(
-            "SELECT {udf}({common}, {files}) EMITS ({emits})",
-            udf = udf_name,
-            common = common_literal,
-            files = files_literal,
-            emits = emits,
-        )
-    } else {
-        build_fan_out_inner(spec_template, shards, &emits, udf_name)
-    };
+    // The outer merge SELECT sits DIRECTLY over the scalar scan — no
+    // `SELECT * FROM (...)` between them (decision [5]). The primitive short-circuits
+    // to a from-less scalar call for a single shard; for multi-shard it nests the
+    // `GROUP BY shard_key` fan-out in the distributor. Either way the scalar scan
+    // fires once per shard (one partial-agg row per shard), so the outer merge over
+    // those partials equals the single-node aggregate (result-equivalence, [7]).
+    let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
     format!("SELECT {merge_select} FROM ({fan_out})")
 }
@@ -1650,6 +1653,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     col_types: &[(String, String)],
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
     having: Option<&str>,
     order_by: Option<&str>,
 ) -> String {
@@ -1724,22 +1728,18 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // ONCE with `limit = None`: this structurally guarantees the "LIMIT never in a
     // per-shard partial" invariant (partial groups from every shard must be emitted
     // and merged by the outer wrapper). There is no per-shard spec left to strip.
+    // The primitive nests the `GROUP BY shard_key` fan-out in the distributor (or
+    // short-circuits to a from-less scalar call for a single shard); the outer wrapper
+    // below re-groups the emitted per-shard partials on the user's group keys.
     let mut common_template = spec_template.clone();
     common_template.limit = None;
-    let fan_out = if shards.len() == 1 {
-        let files = &shards[0];
-        let common_literal = sql_string_literal(&common_template.to_common_json());
-        let files_literal = sql_string_literal(&shard_files_json(files));
-        format!(
-            "SELECT {udf}({common}, {files}) EMITS ({emits})",
-            udf = udf_name,
-            common = common_literal,
-            files = files_literal,
-            emits = emits,
-        )
-    } else {
-        build_fan_out_inner(&common_template, shards, &emits, udf_name)
-    };
+    let fan_out = build_fan_out_inner(
+        &common_template,
+        shards,
+        &emits,
+        udf_name,
+        distribute_udf_name,
+    );
 
     let mut sql =
         format!("SELECT {outer_select_str} FROM ({fan_out}) GROUP BY {outer_group_by_str}");
@@ -2192,27 +2192,49 @@ fn cast_to_declared_type(expr: &str, declared_type: &str) -> String {
 
 /// Builds the shard fan-out SELECT that Exasol distributes across nodes.
 ///
-/// Uses `GROUP BY shard_key` (NOT `IPROC()`) so work units spread round-robin
-/// across nodes (G ≤ 300) and multiplex onto each node's core pool.
+/// Emits a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor — which does the
+/// `GROUP BY shard_key` fan-out (NOT `IPROC()`) so work units spread round-robin
+/// across nodes (G ≤ 300) and multiplex onto each node's core pool — wrapped by an
+/// outer UNGROUPED scalar `LAKEHOUSE_SCAN('{common}', files)` scan. Separating the
+/// fan-out from the scan is what lets Exasol STREAM the scan output: with no
+/// top-level `GROUP BY`, the scalar scan's emitted rows are not buffered into a
+/// materializing `tmp_subselect` temp table.
 ///
 /// The shard-INVARIANT common blob (credentials, projection, filter, aggregates,
-/// tuning knobs) is serialized ONCE via `to_common_json()` as the UDF's first
-/// argument literal; only the per-shard files list varies across the `VALUES`
-/// rows (arg 1). Because the common blob is emitted once instead of per shard, the
-/// credential/tuning payload no longer repeats up to ~300 times in one statement.
+/// tuning knobs) is serialized ONCE via `to_common_json()` as the outer scalar
+/// scan's first-argument literal; only the per-shard files list flows through the
+/// distributor (one `VALUES` row per shard). Because the fan-out carries only the
+/// file-list strings, its payload is independent of the data volume scanned.
 ///
-/// Callers wrap the result in `SELECT * FROM (...)` for row scans or an outer merge
-/// aggregation for aggregate pushdown. Callers that must exclude the LIMIT from the
-/// shard scan (grouped aggregates) pass a `spec_template` whose `limit` is already
-/// `None`, so the shared common blob carries no LIMIT for every shard by construction.
+/// A single-shard plan short-circuits the distributor entirely: a from-less scalar
+/// call on literals (`SELECT {udf}('{common}', '{files}') EMITS (...)`) — a scalar
+/// EMIT UDF over constant literals fires exactly once, so no driving relation is
+/// needed. Callers attach `ORDER BY`/`LIMIT` or an outer merge directly to the
+/// returned bare SELECT.
 pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     emits: &str,
     udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     // Serialize the shard-invariant common blob exactly once.
     let common_literal = sql_string_literal(&spec_template.to_common_json());
+
+    // Single-shard short-circuit: a from-less scalar call on literals. A scalar EMIT
+    // UDF over constant literals fires exactly once, so the distributor and the inner
+    // GROUP BY are unnecessary.
+    if shards.len() == 1 {
+        let files_literal = sql_string_literal(&shard_files_json(&shards[0]));
+        return format!(
+            "SELECT {udf}({common}, {files}) EMITS ({emits})",
+            udf = udf_name,
+            common = common_literal,
+            files = files_literal,
+            emits = emits,
+        );
+    }
+
     let values: Vec<String> = shards
         .iter()
         .enumerate()
@@ -2222,11 +2244,17 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
         })
         .collect();
     let values_list = values.join(",");
+    // The distributor is a LUA SET script with a STATIC `EMITS (files VARCHAR(...))`
+    // definition, so its call MUST NOT carry a query-side `EMITS` clause — supplying
+    // one is rejected by Exasol ("static return argument definition. Dynamic return
+    // arguments are not supported in this case"). Only the scan (dynamic-output SCALAR)
+    // carries a query-side EMITS.
     format!(
-        "SELECT {udf}({common}, files) EMITS ({emits}) FROM (VALUES {values}) AS shards(shard_key, files) GROUP BY shard_key",
+        "SELECT {udf}({common}, files) EMITS ({emits}) FROM (SELECT {distribute}(files) FROM (VALUES {values}) AS shards(shard_key, files) GROUP BY shard_key)",
         udf = udf_name,
         common = common_literal,
         emits = emits,
+        distribute = distribute_udf_name,
         values = values_list,
     )
 }
@@ -2410,6 +2438,7 @@ pub async fn handle_pushdown(
     // resolve ("function or script LAKEHOUSE_SCAN not found").
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
     let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
+    let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
 
     // The raw HAVING node (for grouped aggregate queries). Rendered against the
     // merge decomposition in the grouped branch below (its aggregates reference
@@ -2535,6 +2564,7 @@ pub async fn handle_pushdown(
                 &col_types,
                 &udf_name,
                 &merge_udf_name,
+                &distribute_udf_name,
                 having.as_deref(),
                 grouped_order_by.as_deref(),
             );
@@ -2587,6 +2617,7 @@ pub async fn handle_pushdown(
             &shards,
             &udf_name,
             &merge_udf_name,
+            &distribute_udf_name,
         )?;
         return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
     }
@@ -2655,6 +2686,7 @@ pub async fn handle_pushdown(
         &aggregate_types,
         &udf_name,
         &merge_udf_name,
+        &distribute_udf_name,
     );
 
     // Row-scan DECLINE path (add-topn-pushdown B6): an ORDER BY was pushed but the
@@ -4483,6 +4515,34 @@ fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
     }
 }
 
+/// The cross-side residual sub-predicate of `filter`: the AND of exactly those
+/// top-level conjuncts that are NOT side-local to a single table — i.e. cross-table,
+/// OR-spanning, untagged, or column-free conjuncts (`conjunct_single_side` is
+/// `None`). `None` when every conjunct is side-local.
+///
+/// This is the exact set-complement of the per-side [`side_local_filter`] slices:
+/// every conjunct is either side-local to exactly one table (pushed into that side's
+/// fan-out leg) or cross-side residual (kept here, in the outer wrapper's WHERE), so
+/// the partition is total and disjoint — no conjunct is dropped or double-applied
+/// (decision-log [7]).
+fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
+    let mut conjuncts = Vec::new();
+    flatten_conjuncts(filter, &mut conjuncts);
+    let mut kept: Vec<Json> = conjuncts
+        .into_iter()
+        .filter(|c| conjunct_single_side(c).is_none())
+        .cloned()
+        .collect();
+    match kept.len() {
+        0 => None,
+        1 => kept.pop(),
+        _ => Some(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": kept,
+        })),
+    }
+}
+
 /// Deep-clone `expr` with every `tableAlias` key removed, so the reused
 /// `vs-expression` translator renders BARE column names.
 ///
@@ -4718,6 +4778,7 @@ async fn plan_join(
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
     let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
+    let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
     let tuning = JoinScanTuning {
         cluster_nodes,
         parallelism_factor,
@@ -4748,6 +4809,7 @@ async fn plan_join(
                 &tuning,
                 &udf_name,
                 &merge_udf_name,
+                &distribute_udf_name,
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
@@ -4761,6 +4823,7 @@ async fn plan_join(
         &tuning,
         &udf_name,
         &merge_udf_name,
+        &distribute_udf_name,
     )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
@@ -4777,6 +4840,80 @@ fn build_n_scan_alias_map(
         .zip(aliases)
         .map(|(side, alias)| (side.table_name.to_ascii_uppercase(), alias.clone()))
         .collect()
+}
+
+/// Render the N-scan fallback's FROM as a left-to-right `INNER JOIN … ON` chain and
+/// return it together with any join conditions that could not be attached to a join
+/// point (untagged, or referencing no known leg). Those unattachable conditions
+/// become outer-WHERE residual conjuncts — for an inner join a condition in the
+/// WHERE is result-equivalent to the same condition in an `ON` clause, so this is a
+/// safe last-resort backstop (decision-log [7]).
+///
+/// `conditions[i]` is the pre-rendered, table-qualified SQL for `raw_conditions[i]`.
+/// Each condition GREEDILY attaches to the earliest join point where every table it
+/// touches is in scope — the join point that brings its highest-indexed leg in.
+/// Scope is resolved by the SET of `tableName`s the raw condition references
+/// (via [`collect_column_tables`]), NEVER by column name, so two legs sharing a
+/// column name can never fool the attachment. A join point with no attached
+/// condition renders `ON 1=1`.
+fn build_n_scan_join_from(
+    fan_outs: &[String],
+    aliases: &[String],
+    raw_conditions: &[Json],
+    conditions: &[String],
+    sides: &[ResolvedJoinSide],
+) -> (String, Vec<String>) {
+    let leg_index: HashMap<String, usize> = sides
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.table_name.to_ascii_uppercase(), i))
+        .collect();
+    let last_join_point = aliases.len().saturating_sub(1);
+
+    let mut on_at: Vec<Vec<String>> = vec![Vec::new(); aliases.len()];
+    let mut residual: Vec<String> = Vec::new();
+    for (raw, rendered) in raw_conditions.iter().zip(conditions) {
+        let mut tables = std::collections::HashSet::new();
+        let mut has_untagged = false;
+        let mut any_column = false;
+        collect_column_tables(raw, &mut tables, &mut has_untagged, &mut any_column);
+        let resolvable =
+            any_column && !has_untagged && tables.iter().all(|t| leg_index.contains_key(t));
+        match resolvable
+            .then(|| tables.iter().map(|t| leg_index[t]).max())
+            .flatten()
+        {
+            // The earliest join point in scope is the one bringing the
+            // highest-indexed leg in; clamp to a real join point (≥ 1, ≤ last).
+            // Guard `last_join_point >= 1` (i.e. at least one join exists) first:
+            // with a single leg there is no join point to attach to (and
+            // `clamp(1, 0)` would panic since min > max), so fall through to
+            // residual; behavior for N≥2 is unchanged.
+            Some(m) if last_join_point >= 1 => {
+                on_at[m.clamp(1, last_join_point)].push(rendered.clone())
+            }
+            _ => residual.push(rendered.clone()),
+        }
+    }
+
+    let mut from = format!("({}) AS {}", fan_outs[0], quote_ident(&aliases[0]));
+    for k in 1..aliases.len() {
+        let on = if on_at[k].is_empty() {
+            "1=1".to_string()
+        } else {
+            on_at[k]
+                .iter()
+                .map(|c| format!("({c})"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+        from.push_str(&format!(
+            " INNER JOIN ({}) AS {} ON {on}",
+            fan_outs[k],
+            quote_ident(&aliases[k])
+        ));
+    }
+    (from, residual)
 }
 
 /// Every column of all involved tables as a table-qualified projection item, in
@@ -4826,9 +4963,9 @@ fn n_scan_join_select_items(
 
 /// Build the N-scan (N ≥ 2) unaccelerated inner-join SQL — the SOLE unaccelerated
 /// fallback renderer (the two-involved-table case is simply N = 2). Each involved
-/// table is scanned through its own sharded fan-out, cross-joined, and reconstructed
-/// into the original inner join by Exasol's core engine via a conjunctive
-/// table-qualified WHERE.
+/// table is scanned through its own sharded fan-out and reconstructed into the
+/// original inner join by Exasol's core engine via a left-to-right `INNER JOIN … ON`
+/// chain.
 ///
 /// Each side emits its full column set (narrowed to the columns the wrapper actually
 /// references across all clauses), so the outer wrapper's SELECT, every join
@@ -4837,16 +4974,23 @@ fn n_scan_join_select_items(
 /// each `column` node's `tableName`, so the wrapper is correct whether or not any
 /// two involved tables share a column name (decision-log [2]).
 ///
-/// For an all-inner join, `FROM a, b, c WHERE c1 AND c2 AND <filter>` is equivalent
-/// to any chained `INNER JOIN … ON` ordering and is order-agnostic, so no per-node
-/// ON-scope bookkeeping is needed; Exasol's optimizer turns the equi-conditioned
-/// cross join into hash joins. Each WHERE part is parenthesized so a top-level `OR`
-/// in any condition or in the residual filter cannot bind across the ANDs.
+/// The FROM is a left-to-right `INNER JOIN … ON` chain (decision-log [6]): each join
+/// condition greedily attaches to the earliest join point where every table it
+/// touches is in scope, resolved by the SET of `tableName`s the condition references
+/// (never by column name, so shared column names cannot misroute scope); a join
+/// point with no newly-resolvable condition renders `ON 1=1`. Each side's side-local
+/// WHERE conjuncts are pushed into that side's fan-out leg; only cross-table /
+/// OR-spanning / untagged residual conjuncts (and any untaggable join condition)
+/// remain in the outer WHERE, each parenthesized so a top-level `OR` cannot bind
+/// across the ANDs. For an inner join this is result-equivalent to single-node
+/// evaluation, independent of join order and of shared column names (decision-log
+/// [7]).
 ///
 /// Returns an `Err` (a hard client-facing error, no native re-plan) only when the
 /// wrapper genuinely cannot be built: an involved table carries no column metadata,
 /// or a join condition (or a pushed select/GROUP BY/HAVING/ORDER BY element) cannot
 /// be rendered at all.
+#[allow(clippy::too_many_arguments)]
 fn build_n_scan_join_sql(
     request: &Json,
     pushdown_req: &Json,
@@ -4855,6 +4999,7 @@ fn build_n_scan_join_sql(
     tuning: &JoinScanTuning,
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let cols_per_side: Vec<Vec<(String, String)>> = sides
         .iter()
@@ -4887,10 +5032,15 @@ fn build_n_scan_join_sql(
         conditions.push(rendered);
     }
 
+    // Task 4.2: the outer WHERE keeps ONLY the residual conjuncts NOT side-local to a
+    // single leg (cross-table, OR-spanning, or untagged); every side-local conjunct
+    // is pushed into its leg's fan-out below and never re-applied here. The partition
+    // is exact and total (see `side_local_filter` vs `cross_side_residual_filter`).
     let filter = pushdown_req
         .get("filter")
         .filter(|f| !f.is_null())
-        .and_then(|f| render_df_filter_qualified(f, &alias_of));
+        .and_then(cross_side_residual_filter)
+        .and_then(|residual| render_df_filter_qualified(&residual, &alias_of));
 
     let select_items = n_scan_join_select_items(pushdown_req, &alias_of, &aliases, &cols_per_side)?;
     let group_by = qualified_join_group_by(pushdown_req, &alias_of)?;
@@ -4923,11 +5073,13 @@ fn build_n_scan_join_sql(
             tuning,
             udf_name,
             merge_udf_name,
+            distribute_udf_name,
         ));
     }
 
-    // Assemble the cross-join wrapper. FROM is the comma-joined aliased fan-outs;
-    // WHERE is every join condition AND-conjoined with the qualified residual filter.
+    // Assemble the INNER JOIN … ON chain (decision-log [6]). FROM is the chain of
+    // aliased fan-out legs with each condition greedily attached by table-name set;
+    // the outer WHERE carries the residual filter plus any untaggable join condition.
     let select = if select_items.is_empty() {
         "*".to_string()
     } else {
@@ -4937,19 +5089,21 @@ fn build_n_scan_join_sql(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let from = fan_outs
+    let (from, residual_conditions) =
+        build_n_scan_join_from(&fan_outs, &aliases, &join.conditions, &conditions, sides);
+
+    let mut where_parts: Vec<String> = residual_conditions
         .iter()
-        .zip(&aliases)
-        .map(|(fan, alias)| format!("({fan}) AS {}", quote_ident(alias)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut where_parts: Vec<String> = conditions.iter().map(|c| format!("({c})")).collect();
+        .map(|c| format!("({c})"))
+        .collect();
     if let Some(f) = &filter {
         where_parts.push(format!("({f})"));
     }
-    let where_clause = where_parts.join(" AND ");
 
-    let mut sql = format!("SELECT {select} FROM {from} WHERE {where_clause}");
+    let mut sql = format!("SELECT {select} FROM {from}");
+    if !where_parts.is_empty() {
+        sql.push_str(&format!(" WHERE {}", where_parts.join(" AND ")));
+    }
     if let Some(clause) = group_by {
         sql.push_str(&format!(" GROUP BY {clause}"));
     }
@@ -4989,7 +5143,9 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
         .unwrap_or_default()
 }
 
-/// Build one side's single-table sharded fan-out SQL (`SELECT * FROM (fan-out)`),
+/// Build one side's single-table sharded fan-out SQL (an outer ungrouped scalar
+/// `LAKEHOUSE_SCAN` over the nested distributor, or a from-less scalar call on
+/// literals for a single shard — no `SELECT * FROM (...)` wrapper, decision [5]),
 /// emitting the columns the outer wrapper references for this side and pushing this
 /// side's SIDE-LOCAL WHERE conjuncts down as a DataFusion filter. No join block, no
 /// limit push. Used for BOTH sides of the unaccelerated fallback: the outer Exasol
@@ -5006,6 +5162,7 @@ fn build_side_fan_out_sql(
     tuning: &JoinScanTuning,
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     let proj_cols: Vec<ProjectionItem> = columns
         .iter()
@@ -5058,6 +5215,7 @@ fn build_side_fan_out_sql(
         &[],
         udf_name,
         merge_udf_name,
+        distribute_udf_name,
     )
 }
 
@@ -5082,6 +5240,7 @@ fn build_broadcast_join_sql(
     tuning: &JoinScanTuning,
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> String {
     let fact = &sides.fact;
     let dimension = &sides.dimension;
@@ -5135,6 +5294,7 @@ fn build_broadcast_join_sql(
         &[],
         udf_name,
         merge_udf_name,
+        distribute_udf_name,
     )
 }
 
@@ -5260,6 +5420,7 @@ fn build_grouped_qualified_fallback_sql<E: Clone + Into<FileEntry>>(
     shards: &[Vec<E>],
     udf_name: &str,
     merge_udf_name: &str,
+    distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     const ALIAS: &str = "LHS_T0";
 
@@ -5312,6 +5473,7 @@ fn build_grouped_qualified_fallback_sql<E: Clone + Into<FileEntry>>(
         &[],
         udf_name,
         merge_udf_name,
+        distribute_udf_name,
     );
 
     let select = if select_items.is_empty() {
@@ -5851,6 +6013,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
             sql.contains("del-0.parquet"),
@@ -5864,6 +6027,84 @@ mod tests {
         assert!(
             !common.contains("BoundPredicate") && !common.contains("bound_predicate"),
             "common blob must carry no serialized iceberg predicate: {common}"
+        );
+    }
+
+    /// The shared fan-out primitive emits a nested `LAKEHOUSE_DISTRIBUTE_FILES`
+    /// distributor (`GROUP BY shard_key` over the per-shard file lists) wrapped by an
+    /// outer UNGROUPED scalar `LAKEHOUSE_SCAN('{common}', files)` select. The
+    /// shard-invariant common blob is spliced exactly ONCE (the outer scalar's first
+    /// argument); only the per-shard `files` strings flow through the distributor, so
+    /// the fan-out payload is data-volume-independent.
+    #[test]
+    fn fan_out_primitive_wraps_distributor_in_ungrouped_scalar_scan() {
+        let spec = delete_spec_template();
+        let shards = vec![
+            vec![FileEntry::new("data/part-0.parquet", 1000)],
+            vec![FileEntry::new("data/part-1.parquet", 2000)],
+        ];
+        let emits = r#""ID" DECIMAL(20,0)"#;
+        let sql = build_fan_out_inner(&spec, &shards, emits, "SCAN", "DISTRIBUTE");
+
+        assert!(
+            sql.contains("DISTRIBUTE(files) FROM (VALUES"),
+            "distributor passthrough is called bare (its LUA EMITS is static): {sql}"
+        );
+        assert!(
+            !sql.contains("DISTRIBUTE(files) EMITS"),
+            "the statically-defined distributor call MUST NOT carry a query-side EMITS: {sql}"
+        );
+        assert!(
+            sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
+            "the GROUP BY shard_key fan-out must live in the distributor subquery: {sql}"
+        );
+        assert!(
+            sql.contains(&format!(
+                "SELECT SCAN('{}",
+                spec.to_common_json().replace('\'', "''")
+            )),
+            "the outer scalar scan splices the common blob as its first-arg literal: {sql}"
+        );
+        assert!(
+            sql.contains(", files) EMITS ("),
+            "the outer scalar scan reads the bare distributed files column, not a literal: {sql}"
+        );
+        // The common blob (which carries table_root) appears exactly once: in the
+        // outer scalar's first argument, never repeated per shard in the distributor.
+        assert_eq!(
+            sql.matches("s3://warehouse/db/table").count(),
+            1,
+            "common blob must be spliced exactly once, not per shard: {sql}"
+        );
+    }
+
+    /// A single-shard plan short-circuits the distributor entirely: a from-less scalar
+    /// `LAKEHOUSE_SCAN('{common}', '{files}')` call on literals (no distributor, no
+    /// inner `GROUP BY`, no `VALUES` driving relation).
+    #[test]
+    fn single_shard_short_circuits_distributor_fromless() {
+        let spec = delete_spec_template();
+        let shards = vec![vec![FileEntry::new("data/part-0.parquet", 1000)]];
+        let emits = r#""ID" DECIMAL(20,0)"#;
+        let sql = build_fan_out_inner(&spec, &shards, emits, "SCAN", "DISTRIBUTE");
+
+        assert!(
+            sql.starts_with("SELECT SCAN("),
+            "from-less scalar call: {sql}"
+        );
+        assert!(
+            !sql.contains("DISTRIBUTE"),
+            "no distributor for one shard: {sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY shard_key"),
+            "no shard_key grouping for one shard: {sql}"
+        );
+        assert!(!sql.contains("VALUES"), "no driving VALUES relation: {sql}");
+        let files_literal = sql_string_literal(&shard_files_json(&shards[0]));
+        assert!(
+            sql.contains(&format!(", {files_literal}) EMITS (")),
+            "the single shard's files must be spliced as a literal: {sql}"
         );
     }
 
@@ -5989,6 +6230,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         )
     }
 
@@ -6060,6 +6302,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         )
     }
 
@@ -6312,10 +6555,11 @@ mod tests {
             sql.contains("part-00001.parquet"),
             "SQL must carry both files: {sql}"
         );
-        // Must be a SELECT (scan-driving query, not an empty stub).
+        // Must be the outer ungrouped scalar scan itself (no SELECT * wrapper).
         assert!(
-            sql.starts_with("SELECT * FROM"),
-            "must be a real query: {sql}"
+            sql.starts_with(&format!("SELECT {SCAN_UDF_NAME}("))
+                && !sql.contains("SELECT * FROM ("),
+            "must be a real scalar scan-driving query, no materializing wrapper: {sql}"
         );
     }
 
@@ -6324,7 +6568,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn projection_in_common_arg_emits_match() {
+    fn projection_carried_in_common_literal_and_emits() {
         let sql = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["A".into(), "B".into()],
@@ -7110,6 +7354,7 @@ mod tests {
             &aggregate_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         // Mirror handle_pushdown's row-scan DECLINE wrapping (add-topn-pushdown B6).
         let declined_order_by =
@@ -8004,10 +8249,10 @@ mod tests {
     }
 
     /// The unified fallback (N = 2): each side scanned through its own sharded
-    /// fan-out, cross-joined with a table-qualified conjunctive WHERE (the join
-    /// condition AND-conjoined with the residual filter), projecting the qualified
-    /// select list. The two-table case uses the SAME `LHS_T*` renderer as N ≥ 3 —
-    /// never `INNER JOIN ... ON`.
+    /// fan-out, joined by an `INNER JOIN … ON` chain (the join condition on the join
+    /// point), projecting the qualified select list. The single ORDERS-side-local
+    /// filter is pushed into the ORDERS leg, so the outer WHERE has no residual. The
+    /// two-table case uses the SAME `LHS_T*` renderer as N ≥ 3.
     #[test]
     fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
         let mut request = join_request(Json::Null, equi_condition());
@@ -8029,6 +8274,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("the two-table unified fallback must build");
 
@@ -8039,22 +8285,25 @@ mod tests {
             );
         }
         assert!(
-            sql.contains(r#"("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")"#),
-            "the equi-condition must be table-qualified in the WHERE: {sql}"
+            sql.contains(r#"AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
+            "the equi-condition must attach table-qualified as the join point's ON clause: {sql}"
         );
         assert!(
             sql.contains(r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM"#),
             "the cross-table projection must drive the outer SELECT in order: {sql}"
         );
+        // The lone ORDERS-side-local filter is pushed into the ORDERS leg, so no
+        // residual conjunct remains and there is no outer WHERE.
         assert!(
-            sql.contains(" WHERE ")
-                && sql.contains(" AND ")
-                && sql.contains(r#""LHS_T1"."O_ORDERDATE""#),
-            "the condition AND the residual filter must render qualified in the WHERE: {sql}"
+            sql.contains("'1995-01-01'"),
+            "the ORDERS-side-local filter must be pushed into that leg's fan-out: {sql}"
         );
-        // The unified fallback is a cross-join + WHERE, never `INNER JOIN ... ON`, and
-        // never a broadcast join block.
-        assert!(!sql.contains("INNER JOIN"), "{sql}");
+        assert!(
+            !sql.contains(" WHERE "),
+            "every side-local filter is pushed into its leg, so no residual outer WHERE: {sql}"
+        );
+        // The unified fallback is an INNER JOIN chain, never a broadcast join block.
+        assert!(sql.contains("INNER JOIN"), "{sql}");
         assert!(
             !sql.contains("\"join\":{"),
             "the fallback must not embed a broadcast join block: {sql}"
@@ -8136,6 +8385,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("the qualified unified fallback must build despite the column-name collision");
 
@@ -8147,15 +8397,15 @@ mod tests {
             sql.contains(r#""LHS_T0"."ID""#) && sql.contains(r#""LHS_T1"."LABEL""#),
             "the projection must be table-qualified per owning side: {sql}"
         );
-        assert!(!sql.contains("INNER JOIN"), "{sql}");
+        assert!(sql.contains("INNER JOIN"), "{sql}");
     }
 
-    /// The N-scan (N≥3) builder produces a cross-join + conjunctive table-qualified
-    /// WHERE wrapper — N distinct `LHS_T*` fan-out aliases, every one of the N-1 join
-    /// conditions rendered table-qualified, and the select list qualified to its
-    /// owning side — never an `Err` for an all-inner tree over resolvable tables
-    /// (pushdown-planning-join "A three-or-more-table inner join falls back to an
-    /// N-scan unaccelerated wrapper").
+    /// The N-scan (N≥3) builder produces an `INNER JOIN … ON` chain — N distinct
+    /// `LHS_T*` fan-out aliases, every one of the N-1 join conditions rendered
+    /// table-qualified and greedily attached to its join point, and the select list
+    /// qualified to its owning side — never an `Err` for an all-inner tree over
+    /// resolvable tables (pushdown-planning-join "A three-or-more-table inner join
+    /// falls back to an N-scan unaccelerated wrapper").
     #[test]
     fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
         let request = three_table_join_request();
@@ -8176,6 +8426,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("an all-inner N-scan wrapper must build, never Err");
 
@@ -8193,9 +8444,10 @@ mod tests {
             sql.contains(r#""LHS_T1"."O_ORDERKEY" = "LHS_T2"."L_ORDERKEY""#),
             "second join condition must be table-qualified: {sql}"
         );
-        assert!(
-            sql.contains(" WHERE ") && sql.contains(" AND "),
-            "conditions must be AND-conjoined in a WHERE (cross-join reconstruction): {sql}"
+        assert_eq!(
+            sql.matches("INNER JOIN").count(),
+            2,
+            "conditions must attach across a two-hop INNER JOIN … ON chain: {sql}"
         );
         assert!(
             sql.contains(r#""LHS_T0"."C_NAME""#) && sql.contains(r#""LHS_T2"."L_QUANTITY""#),
@@ -8226,6 +8478,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
 
@@ -8270,6 +8523,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
 
@@ -8351,6 +8605,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("three tables sharing an ID column must still build, never Err");
 
@@ -8368,6 +8623,197 @@ mod tests {
         assert!(
             sql.starts_with(r#"SELECT "LHS_T0"."ID", "LHS_T1"."LABEL", "LHS_T2"."TAG_NAME" FROM "#),
             "the outer SELECT list must qualify the shared ID column, never bare: {sql}"
+        );
+    }
+
+    /// Group D (task 4.1): the two-table above-broadcast-threshold fallback renders
+    /// its FROM as a left-to-right `INNER JOIN … ON` chain (not a comma cross-join +
+    /// flat WHERE). The single equi-condition attaches as the join point's `ON`
+    /// clause, table-qualified, at the point that brings the second leg into scope.
+    #[test]
+    fn above_threshold_join_falls_back_inner_join_on() {
+        let request = join_request(Json::Null, equi_condition());
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+            "DISTRIBUTE",
+        )
+        .expect("the above-threshold two-table fallback must build");
+
+        assert!(
+            sql.contains("INNER JOIN"),
+            "the fallback FROM must be an INNER JOIN chain, not a comma cross-join: {sql}"
+        );
+        assert!(
+            sql.contains(r#"AS "LHS_T0" INNER JOIN"#),
+            "the first leg must be the left side of the INNER JOIN chain: {sql}"
+        );
+        assert!(
+            sql.contains(r#"AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
+            "the equi-condition must attach table-qualified as the join point's ON clause: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"AS "LHS_T0", "#),
+            "the legacy comma cross-join between legs must be gone: {sql}"
+        );
+    }
+
+    /// Group D (task 4.1): a three-table inner join renders a two-hop
+    /// `INNER JOIN … ON` chain, each condition greedily attached at the earliest
+    /// join point where all its tables are in scope (by table-name set). No residual
+    /// filter → no outer WHERE.
+    #[test]
+    fn three_table_join_inner_join_on_chain() {
+        let request = three_table_join_request();
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+            resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 500)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+            "DISTRIBUTE",
+        )
+        .expect("the three-table inner-join chain must build");
+
+        assert_eq!(
+            sql.matches("INNER JOIN").count(),
+            2,
+            "N=3 tables → a two-hop INNER JOIN chain: {sql}"
+        );
+        assert!(
+            sql.contains(r#"AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
+            "the first condition attaches at the join point bringing LHS_T1 into scope: {sql}"
+        );
+        assert!(
+            sql.contains(r#"AS "LHS_T2" ON (("LHS_T1"."O_ORDERKEY" = "LHS_T2"."L_ORDERKEY"))"#),
+            "the second condition attaches at the join point bringing LHS_T2 into scope: {sql}"
+        );
+        assert!(
+            !sql.contains(" WHERE "),
+            "every condition lives in an ON clause and there is no residual filter, so no \
+             outer WHERE: {sql}"
+        );
+    }
+
+    /// Group D (tasks 4.1 + 4.2): greedy-attach by table-name set AND the WHERE split.
+    /// A star shape `(N1 ⋈ (N2 ⋈ FACT))` where BOTH conditions reference FACT (the
+    /// deepest leaf, `LHS_T2`): both attach at the last join point, so the middle
+    /// join point (bringing `LHS_T2`'s sibling `LHS_T1` into scope) has no
+    /// newly-resolvable condition and renders `ON 1=1`. A CUSTOMER-side-local WHERE
+    /// conjunct is pushed into that leg's fan-out (never re-applied in the outer
+    /// WHERE); only the cross-table residual conjunct survives in the outer WHERE.
+    #[test]
+    fn join_conditions_greedy_attach_and_side_local_pushdown() {
+        let cond_n2_fact = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "N2_KEY", "tableName": "N2"},
+            "right": {"type": "column", "name": "F_N2KEY", "tableName": "FACT"}});
+        let cond_n1_fact = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "N1_KEY", "tableName": "N1"},
+            "right": {"type": "column", "name": "F_N1KEY", "tableName": "FACT"}});
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "N1", "columns": [
+                    {"name": "N1_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "N1_NAME", "dataType": {"type": "varchar", "size": 100}}]},
+                {"name": "N2", "columns": [
+                    {"name": "N2_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+                {"name": "FACT", "columns": [
+                    {"name": "F_N1KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "F_N2KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "F_VALUE", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            ],
+            "pushdownRequest": {
+                "type": "select",
+                "from": {"type": "join", "join_type": "inner",
+                    "left": {"name": "N1", "type": "table"},
+                    "right": {"type": "join", "join_type": "inner",
+                        "left": {"name": "N2", "type": "table"},
+                        "right": {"name": "FACT", "type": "table"},
+                        "condition": cond_n2_fact},
+                    "condition": cond_n1_fact},
+                "selectList": [
+                    {"type": "column", "name": "N1_NAME", "tableName": "N1"},
+                    {"type": "column", "name": "F_VALUE", "tableName": "FACT"}],
+                "filter": {"type": "predicate_and", "expressions": [
+                    {"type": "predicate_equal",
+                     "left": {"type": "column", "name": "N1_NAME", "tableName": "N1"},
+                     "right": {"type": "literal_string", "value": "ACME"}},
+                    {"type": "predicate_greater",
+                     "left": {"type": "column", "name": "F_VALUE", "tableName": "FACT"},
+                     "right": {"type": "column", "name": "N1_KEY", "tableName": "N1"}}]},
+            },
+            "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+                serde_json::json!({"TABLE_MAP":
+                    {"N1": "lh.n1", "N2": "lh.n2", "FACT": "lh.fact"}})
+                    .to_string()},
+        });
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("N1", vec![("s3://w/n1-0.parquet", 10)]),
+            resolved_side("N2", vec![("s3://w/n2-0.parquet", 10)]),
+            resolved_side("FACT", vec![("s3://w/f-0.parquet", 500)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+            "DISTRIBUTE",
+        )
+        .expect("the star-shape greedy-attach fallback must build");
+
+        // The middle join point brings N2 (LHS_T1) into scope but neither condition is
+        // resolvable there (both also need FACT / LHS_T2) → ON 1=1.
+        assert!(
+            sql.contains(r#"AS "LHS_T1" ON 1=1"#),
+            "a join point with no newly-resolvable condition must render ON 1=1: {sql}"
+        );
+        // Both conditions greedily attach at the last join point (LHS_T2), AND-conjoined.
+        assert!(
+            sql.contains(r#"AS "LHS_T2" ON (("LHS_T1"."N2_KEY" = "LHS_T2"."F_N2KEY")) AND (("LHS_T0"."N1_KEY" = "LHS_T2"."F_N1KEY"))"#),
+            "both FACT-touching conditions must attach greedily at the final join point: {sql}"
+        );
+
+        // Task 4.2: the N1-side-local conjunct is pushed into N1's fan-out leg…
+        assert!(
+            sql.contains("'ACME'"),
+            "the side-local conjunct must be pushed into its leg's fan-out: {sql}"
+        );
+        // …and NOT re-applied in the outer WHERE, which keeps only the cross-table residual.
+        let where_clause = &sql[sql
+            .find(" WHERE ")
+            .expect("the cross-table residual must remain in an outer WHERE")..];
+        assert!(
+            !where_clause.contains("ACME"),
+            "the side-local conjunct must NOT be duplicated in the outer WHERE: {sql}"
+        );
+        assert!(
+            where_clause.contains(r#""LHS_T2"."F_VALUE""#)
+                && where_clause.contains(r#""LHS_T0"."N1_KEY""#),
+            "the cross-table residual conjunct must render qualified in the outer WHERE: {sql}"
         );
     }
 
@@ -8403,6 +8849,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("aggregate-over-join must build the unified wrapper");
 
@@ -8416,8 +8863,8 @@ mod tests {
             "the outer SELECT must be exactly the two aggregate columns: {sql}"
         );
         assert!(
-            !sql.contains("INNER JOIN") && !sql.contains("\"join\":{"),
-            "aggregate-over-join is a cross-join + WHERE fallback, never a broadcast block: {sql}"
+            sql.contains("INNER JOIN") && !sql.contains("\"join\":{"),
+            "aggregate-over-join is an INNER JOIN chain fallback, never a broadcast block: {sql}"
         );
     }
 
@@ -8539,6 +8986,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("ordered unified wrapper must build");
         assert!(
@@ -8812,6 +9260,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         );
         let common = common_arg_literal(&sql_with);
         assert!(
@@ -8824,12 +9273,98 @@ mod tests {
             "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
         );
 
-        let sql_without =
-            build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "MERGE");
+        let sql_without = build_side_fan_out_sql(
+            &side,
+            &cols,
+            None,
+            &two_scan_tuning(),
+            "SCAN",
+            "MERGE",
+            "DISTRIBUTE",
+        );
         let common_none = common_arg_literal(&sql_without);
         assert!(
             !common_none.contains("\"filter\""),
             "no side-local filter ⇒ no filter field in the common blob: {common_none}"
+        );
+    }
+
+    /// A multi-shard join leg routes through the new distributor + scalar scan
+    /// primitive: the fan-out `GROUP BY shard_key` lives in the distributor and the
+    /// outer scalar `SCAN` is ungrouped, with NO `SELECT * FROM (...)` materialization
+    /// wrapper (decision [5]). The leg is a bare subquery the outer join wrapper reads.
+    #[test]
+    fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
+        let side = resolved_side(
+            "ORDERS",
+            vec![("s3://w/o-0.parquet", 100), ("s3://w/o-1.parquet", 100)],
+        );
+        let cols = vec![("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string())];
+        // Force two shards: two nodes × factor 1 over two files.
+        let tuning = JoinScanTuning {
+            cluster_nodes: 2,
+            parallelism_factor: 1,
+            ..two_scan_tuning()
+        };
+        let sql =
+            build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "the leg must not use a SELECT * materialization wrapper: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT SCAN("),
+            "the leg is the outer ungrouped scalar scan itself: {sql}"
+        );
+        assert!(
+            sql.contains("DISTRIBUTE(files) FROM (VALUES")
+                && sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
+            "the leg's fan-out GROUP BY shard_key must live in the distributor: {sql}"
+        );
+    }
+
+    /// The broadcast fact side routes through the same distributor + scalar scan
+    /// primitive (task 3.4): a multi-file fact side fans out via the nested
+    /// distributor under an outer ungrouped scalar `SCAN`, with no `SELECT * FROM
+    /// (...)` wrapper; the dimension side rides once in the common blob's join block.
+    #[test]
+    fn broadcast_fact_side_uses_distributor_scalar_scan() {
+        let fact = resolved_side(
+            "LINEITEM",
+            vec![("s3://w/l-0.parquet", 1000), ("s3://w/l-1.parquet", 1000)],
+        );
+        let dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
+        let sides = JoinSides {
+            fact,
+            dimension,
+            broadcast_eligible: true,
+        };
+        let rendered = RenderedJoinPushdown {
+            condition: r#""L_ORDERKEY" = "O_ORDERKEY""#.to_string(),
+            filter: None,
+            projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
+            projection_types: vec!["DECIMAL(20,0)".to_string()],
+        };
+        let tuning = JoinScanTuning {
+            cluster_nodes: 2,
+            parallelism_factor: 1,
+            ..two_scan_tuning()
+        };
+        let sql =
+            build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "the broadcast fact side must not use a SELECT * wrapper: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT SCAN("),
+            "the fact side is the outer ungrouped scalar scan itself: {sql}"
+        );
+        assert!(
+            sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
+            "the fact side fans out via the nested shard_key distributor: {sql}"
         );
     }
 
@@ -8860,8 +9395,10 @@ mod tests {
 
     /// End-to-end fallback wiring: the unified wrapper prunes each leg (side-local
     /// filter pushed into BOTH fan-out common blobs) AND narrows each leg's
-    /// projection (an involved column referenced nowhere in the wrapper is dropped),
-    /// while the outer WHERE still applies the full predicate as the backstop.
+    /// projection (an involved column referenced nowhere in the wrapper is dropped).
+    /// Here BOTH filter conjuncts are side-local (one per leg), so — under the task
+    /// 4.2 split — the outer WHERE has no residual conjunct and is omitted entirely;
+    /// the join condition attaches to the INNER JOIN's ON clause instead.
     #[test]
     fn unified_join_prunes_and_narrows_each_leg() {
         let request = serde_json::json!({
@@ -8912,6 +9449,7 @@ mod tests {
             &two_scan_tuning(),
             "SCAN",
             "MERGE",
+            "DISTRIBUTE",
         )
         .expect("unified wrapper must build");
 
@@ -8932,15 +9470,21 @@ mod tests {
             "both fan-out legs must carry a side-local ScanSpec.filter: {sql}"
         );
 
-        // Outer WHERE (the correctness backstop) still applies the full predicate,
-        // table-qualified, over the materialized join.
+        // Both side-local conjuncts are pushed into their legs' common blobs; the
+        // outer WHERE keeps only cross-table residual, of which there is none here.
         assert!(
-            sql.contains("WHERE")
-                && sql.contains(r#""LHS_T0"."C_NAME""#)
-                && sql.contains(r#""LHS_T1"."O_ORDERDATE""#),
-            "the outer WHERE must still render the full predicate qualified: {sql}"
+            sql.contains("'ACME'") && sql.contains("'1995-01-01'"),
+            "each leg's side-local conjunct must be pushed into its fan-out: {sql}"
         );
-        assert!(!sql.contains("INNER JOIN"), "{sql}");
+        assert!(
+            !sql.contains(" WHERE "),
+            "no cross-table residual conjunct remains, so the outer WHERE is omitted: {sql}"
+        );
+        // The join condition attaches to the INNER JOIN chain's ON clause.
+        assert!(
+            sql.contains(r#"ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
+            "the equi-condition attaches to the join point's ON clause: {sql}"
+        );
     }
 
     /// B3b correctness guard: a sort key whose column requires the JSON-fallback
@@ -9355,6 +9899,7 @@ mod tests {
             &aggregate_types,
             r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
             r#""VS_SCHEMA".LAKEHOUSE_DISTINCT_MERGE_COUNT"#,
+            r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
         );
 
         // Partial column contract: one VARCHAR JSON-array column per distinct agg.
@@ -9369,6 +9914,19 @@ mod tests {
                 r#"CAST("VS_SCHEMA".LAKEHOUSE_DISTINCT_MERGE_COUNT('[' || LISTAGG("PARTIAL_cd_0", ',') || ']') AS DECIMAL(18,0))"#
             ),
             "outer wrapper must call the schema-qualified merge UDF via LISTAGG and cast to the declared type: {sql}"
+        );
+        // The count-distinct aggregate shares the nested-distributor + scalar-scan
+        // fan-out (decision [1]/[5]): the two-shard GROUP BY shard_key fan-out lives
+        // inside the distributor subquery, and the merge sits directly over the
+        // scalar scan with no `SELECT * FROM (...)` materializing wrapper.
+        assert!(
+            sql.contains(r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES(files) FROM (VALUES"#)
+                && sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+            "count-distinct's fan-out must nest the distributor's GROUP BY shard_key: {sql}"
+        );
+        assert!(
+            !sql.contains("SELECT * FROM"),
+            "count-distinct merge must not sit behind a SELECT * materializing wrapper: {sql}"
         );
     }
 
@@ -9447,6 +10005,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
 
         // The spec JSON is embedded in the SQL literal; extract and parse it.
@@ -9622,6 +10181,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
 
         let needle = format!("\"s3_max_connections\":{distinctive_s3_max_connections}");
@@ -9680,6 +10240,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         )
     }
 
@@ -9777,6 +10338,73 @@ mod tests {
         );
     }
 
+    /// The outer single-group merge SELECT sits DIRECTLY over the scalar scan — no
+    /// `SELECT * FROM (...)` between the merge and the scan (decision [5]). The scalar
+    /// scan fires once per shard (the distributor emits one row per shard), so one
+    /// partial-agg row per shard is produced and the outer SUM/MIN/MAX merge over
+    /// those partials equals the single-node aggregate (result-equivalence, [7]).
+    #[test]
+    fn aggregate_merge_over_scalar_scan_no_wrapper() {
+        let plans = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+        ];
+        // Multi-shard: a genuine distributor fan-out under the merge.
+        let sql = build_agg_sql(
+            plans,
+            vec!["s3://w/f0.parquet".into(), "s3://w/f1.parquet".into()],
+            2,
+        );
+
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "no materializing wrapper between merge and scan: {sql}"
+        );
+        // The merge is the outer SELECT; the scalar scan is the subquery it reads.
+        assert!(
+            sql.starts_with("SELECT ") && sql.contains(&format!("FROM (SELECT {SCAN_UDF_NAME}(")),
+            "the outer merge SELECT must read directly from the scalar scan subquery: {sql}"
+        );
+        // The `GROUP BY shard_key` fan-out lives in the distributor, not the outer merge.
+        assert!(
+            sql.contains("GROUP BY shard_key"),
+            "the fan-out GROUP BY shard_key must live inside the distributor: {sql}"
+        );
+    }
+
+    /// Single-shard aggregate: the merge SELECT sits directly over a from-less scalar
+    /// scan on literals — no distributor, no `SELECT * FROM (...)` wrapper.
+    #[test]
+    fn aggregate_single_shard_merge_over_fromless_scalar_scan() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }];
+        let sql = build_agg_sql(plans, vec!["s3://w/only.parquet".into()], 1);
+
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "single-shard aggregate must not use a materializing wrapper: {sql}"
+        );
+        assert!(
+            !sql.contains("VALUES") && !sql.contains("GROUP BY shard_key"),
+            "single-shard aggregate short-circuits the distributor: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("FROM (SELECT {SCAN_UDF_NAME}(")),
+            "the merge reads directly from the from-less scalar scan: {sql}"
+        );
+    }
+
     /// Single-group merge casts each aggregate to its Exasol-declared result type.
     /// `SELECT COUNT(score)` merges as `SUM("PARTIAL_count_0")` (DECIMAL(31,0)); Exasol
     /// declared DECIMAL(18,0) for the column and strictly validates the adapter's output
@@ -9822,6 +10450,7 @@ mod tests {
             &aggregate_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
             sql.contains(r#"CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))"#),
@@ -9869,6 +10498,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
             sql.contains(r#"SUM("PARTIAL_count_0")"#) && !sql.contains("CAST(SUM"),
@@ -10163,9 +10793,81 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Row scan — outer ungrouped scalar scan, no SELECT * materialization wrapper
+    // (decision [5]); ORDER BY/LIMIT attach directly to the outer scalar select.
+    // ---------------------------------------------------------------------------
+
+    /// A multi-shard row scan drives an OUTER UNGROUPED scalar `LAKEHOUSE_SCAN` over
+    /// the nested distributor — with NO `SELECT * FROM (...)` materialization wrapper
+    /// (decision [5]). The scan itself is the top-level SELECT; the distributor
+    /// subquery does the `GROUP BY shard_key` fan-out. Result-equivalence (decision
+    /// [7]): the returned rows are the union of every shard's rows (no outer GROUP BY,
+    /// so no dedup/aggregation).
+    #[test]
+    fn pushdown_builds_scalar_scan_driving_sql() {
+        let sql = build_sql_for_fixture_n(
+            vec!["s3://w/f0.parquet".into(), "s3://w/f1.parquet".into()],
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            None,
+            None,
+            2,
+        );
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "the materializing SELECT * wrapper must be gone: {sql}"
+        );
+        assert!(
+            sql.starts_with(&format!("SELECT {SCAN_UDF_NAME}(")),
+            "the outer query is the ungrouped scalar scan itself: {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY shard_key"),
+            "the fan-out GROUP BY shard_key must live inside the distributor: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("{DISTRIBUTE_FILES_UDF_NAME}(files)")),
+            "the distributor subquery must carry only the files column: {sql}"
+        );
+    }
+
+    /// LIMIT attaches DIRECTLY to the outer ungrouped scalar select (after the
+    /// distributor subquery closes), not to a `SELECT * FROM (...)` wrapper
+    /// (decision [5]).
+    #[test]
+    fn limit_attaches_directly_to_outer_scalar_select() {
+        let sql = build_sql_for_fixture_n(
+            vec!["s3://w/f0.parquet".into(), "s3://w/f1.parquet".into()],
+            vec!["ID".into()],
+            vec!["DECIMAL(20,0)".into()],
+            None,
+            Some(7),
+            2,
+        );
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "no materializing wrapper between LIMIT and the scan: {sql}"
+        );
+        assert!(
+            sql.trim_end().ends_with("LIMIT 7"),
+            "LIMIT appends to the outer scalar select: {sql}"
+        );
+        // The LIMIT must sit OUTSIDE the distributor subquery — after its closing paren.
+        let limit_pos = sql.rfind("LIMIT 7").expect("LIMIT present");
+        let close_pos = sql[..limit_pos]
+            .rfind(')')
+            .expect("distributor subquery closes");
+        assert!(
+            close_pos < limit_pos,
+            "LIMIT must follow the distributor subquery's closing paren: {sql}"
+        );
+    }
+
     /// Single-shard SQL uses the two-argument form `{udf}('<common>', '<files>')`:
-    /// the common blob and the whole-file-list literal each appear exactly once, and
-    /// the SQL keeps the `SELECT * FROM (SELECT …)` wrapper with no fan-out markers.
+    /// the common blob and the whole-file-list literal each appear exactly once. The
+    /// scalar scan is a from-less call on literals with no fan-out markers and no
+    /// `SELECT * FROM (...)` materialization wrapper (decision [5]).
     #[test]
     fn single_shard_two_arg_common_and_files_once() {
         let files = vec![
@@ -10195,10 +10897,12 @@ mod tests {
             "single-shard SQL must not contain GROUP BY: {sql}"
         );
 
-        // Must keep the SELECT * FROM (SELECT …) wrapper and invoke the scan UDF.
+        // Must be the from-less scalar scan itself (no SELECT * materialization
+        // wrapper) and invoke the scan UDF.
         assert!(
-            sql.starts_with("SELECT * FROM (SELECT "),
-            "must start with SELECT * FROM (SELECT ...: {sql}"
+            sql.starts_with(&format!("SELECT {SCAN_UDF_NAME}("))
+                && !sql.contains("SELECT * FROM ("),
+            "single-shard SQL must be the from-less scalar scan, no wrapper: {sql}"
         );
         assert!(sql.contains("EMITS"), "must have EMITS clause: {sql}");
         assert!(
@@ -10393,6 +11097,7 @@ mod tests {
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             Some("1 ASC NULLS LAST"),
         );
@@ -10603,6 +11308,7 @@ mod tests {
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         );
@@ -10889,6 +11595,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         );
@@ -11002,6 +11709,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
             !sql.contains("IPROC()"),
@@ -11054,6 +11762,7 @@ mod tests {
             &[],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
             !sql.contains("IPROC()"),
@@ -11068,8 +11777,9 @@ mod tests {
             "single-shard SQL must not contain GROUP BY: {sql}"
         );
         assert!(
-            sql.starts_with("SELECT * FROM (SELECT "),
-            "must start with SELECT * FROM (SELECT ...: {sql}"
+            sql.starts_with(&format!("SELECT {SCAN_UDF_NAME}("))
+                && !sql.contains("SELECT * FROM ("),
+            "single-shard SQL must be the from-less scalar scan, no wrapper: {sql}"
         );
     }
 
@@ -11143,6 +11853,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         )
@@ -11200,6 +11911,84 @@ mod tests {
         }
     }
 
+    /// The `GROUP BY shard_key` fan-out lives INSIDE the distributor subquery, while
+    /// the OUTER wrapper re-groups the per-shard partials on the user's group keys
+    /// (`GROUP BY "GK_0"`) over the scalar scan (decision [5]/[7]). The two GROUP BYs
+    /// are at different query levels: shard_key groups the fan-out `VALUES` rows for
+    /// round-robin distribution; GK_* re-groups the partial groups every shard emits.
+    #[test]
+    fn grouped_group_by_shard_key_inside_distributor() {
+        let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
+        let g = shard_count(2, 1, files.len());
+        let sql = build_grouped_agg_sql(
+            vec!["\"REGION\"".into()],
+            vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            files,
+            g,
+        );
+
+        // The distributor carries the shard_key fan-out.
+        assert!(
+            sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
+            "the shard_key fan-out must live in the distributor subquery: {sql}"
+        );
+        // The outer wrapper re-groups on the user key staging column.
+        assert!(
+            sql.trim_end().ends_with(r#"GROUP BY "GK_0""#),
+            "the outer wrapper must re-group on the user group key GK_0: {sql}"
+        );
+        // The shard_key GROUP BY is nested strictly BEFORE the outer GK_0 GROUP BY:
+        // the distributor's grouping is not the outer one.
+        let shard_gb = sql
+            .find("GROUP BY shard_key")
+            .expect("shard_key GROUP BY present");
+        let gk_gb = sql
+            .find(r#"GROUP BY "GK_0""#)
+            .expect("GK_0 GROUP BY present");
+        assert!(
+            shard_gb < gk_gb,
+            "shard_key GROUP BY (distributor) must precede the outer GK_0 GROUP BY: {sql}"
+        );
+        // No materializing SELECT * wrapper between the outer re-group and the scan.
+        assert!(
+            !sql.contains("SELECT * FROM ("),
+            "grouped wrapper must not use a SELECT * materialization boundary: {sql}"
+        );
+    }
+
+    /// Single-shard grouped: the outer re-group sits over a from-less scalar scan on
+    /// literals — the distributor short-circuits (no `VALUES`, no shard_key grouping).
+    #[test]
+    fn grouped_single_shard_short_circuits_distributor() {
+        let sql = build_grouped_agg_sql(
+            vec!["\"REGION\"".into()],
+            vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            vec!["s3://w/only.parquet".into()],
+            1,
+        );
+
+        assert!(
+            !sql.contains("VALUES") && !sql.contains("shard_key"),
+            "single-shard grouped must short-circuit the distributor: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("FROM (SELECT {SCAN_UDF_NAME}(")),
+            "the outer re-group reads directly from the from-less scalar scan: {sql}"
+        );
+        assert!(
+            sql.trim_end().ends_with(r#"GROUP BY "GK_0""#),
+            "the outer wrapper still re-groups on the user group key GK_0: {sql}"
+        );
+    }
+
     /// LIMIT is NOT pushed into the shard scan for a grouped query. The shared common
     /// blob (arg 0) must not carry "limit"; only the outer wrapper may apply LIMIT.
     #[test]
@@ -11249,6 +12038,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         );
@@ -11415,6 +12205,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             having,
             None,
         )
@@ -11690,6 +12481,7 @@ mod tests {
             &soa_col_types(),
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         )
@@ -11938,6 +12730,7 @@ mod tests {
             &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
         )
         .expect("qualified fallback must build");
 
@@ -12060,6 +12853,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             Some(&having),
             None,
         );
@@ -12153,6 +12947,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
         );
@@ -12248,6 +13043,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             Some(&having),
             None,
         );
@@ -12888,6 +13684,7 @@ mod tests {
             &col_types,
             SCAN_UDF_NAME,
             DISTINCT_MERGE_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
             having_filter.as_deref(),
             None,
         );

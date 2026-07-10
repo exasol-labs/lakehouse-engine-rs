@@ -9,8 +9,9 @@
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
 //! 2. Install SLC 0.20.3 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
-//! 3. Create the LAKEHOUSE_ADAPTER script, the LAKEHOUSE_SCAN SET script, and
-//!    the LAKEHOUSE_DISTINCT_MERGE_COUNT scalar merge script (all from the same .so).
+//! 3. Create the LAKEHOUSE_ADAPTER script, the LAKEHOUSE_SCAN SCALAR script, the
+//!    LAKEHOUSE_DISTINCT_MERGE_COUNT scalar merge script (all from the same .so),
+//!    and the LAKEHOUSE_DISTRIBUTE_FILES LUA SET passthrough distributor.
 //! 4. Create the LHVS Virtual Schema over the seeded table.
 //!
 //! The VS properties carry UDF-internal URLs (docker-network names) for the
@@ -51,6 +52,9 @@ const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 /// Scalar merge UDF for single-group COUNT(DISTINCT): third entry point in the
 /// same .so, created in the scan schema alongside the adapter and scan scripts.
 const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
+/// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
+/// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
+const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 /// BucketFS path for the .so (as PUT target).
 const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the .so as referenced in %udf_object (without leading /).
@@ -196,7 +200,8 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
 /"#
     ));
 
-    // Scan SET script — RUST SET SCRIPT.
+    // Scan script — RUST SCALAR SCRIPT (streams rows node-locally, no
+    // materializing SET/GROUP BY on the scan itself).
     // Input: two VARCHAR columns — arg0 is the common ScanSpec blob (shared
     // across all shards, serialized once via `ScanSpec::to_common_json()`),
     // arg1 is the per-shard files JSON list (via `ScanSpec::files_json()`).
@@ -205,9 +210,23 @@ fn create_schema_and_scripts(conn: &mut ExaConn) {
     // (`... EMITS (col TYPE, ...)`).
     // No %main — the SLC selects __exa_udf_entry_LAKEHOUSE_SCAN by script name.
     conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SET SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
+
+    // File distributor — LUA SET SCRIPT, pure passthrough. Not a Rust entry
+    // point: does the cross-node `GROUP BY shard_key` fan-out for the
+    // shard-invariant `files` list only, carrying no row data.
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
+EMITS (files VARCHAR(2000000)) AS
+function run(ctx)
+    repeat
+        ctx.emit(ctx.files)
+    until not ctx.next()
+end
 /"#
     ));
 
