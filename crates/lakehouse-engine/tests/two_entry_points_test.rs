@@ -27,7 +27,7 @@ fn so_path() -> PathBuf {
 }
 
 #[test]
-fn so_exports_adapter_scan_and_distinct_merge_symbols() {
+fn so_exports_scan_symbol_and_no_distributor_symbol() {
     let so = so_path();
     assert!(
         so.exists(),
@@ -60,5 +60,13 @@ fn so_exports_adapter_scan_and_distinct_merge_symbols() {
         symbols.contains("__exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"),
         "the .so must export the scalar distinct-merge entry symbol \
          __exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"
+    );
+    // The file distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a plain LUA SET script
+    // created by its own DDL — it carries no Rust logic and is NOT a `.so` entry
+    // point, so no `__exa_udf_entry_LAKEHOUSE_DISTRIBUTE_FILES` symbol may exist.
+    assert!(
+        !symbols.contains("__exa_udf_entry_LAKEHOUSE_DISTRIBUTE_FILES"),
+        "the .so must NOT export a distributor entry symbol — \
+         LAKEHOUSE_DISTRIBUTE_FILES is a LUA SET script, not a Rust `.so` entry point"
     );
 }

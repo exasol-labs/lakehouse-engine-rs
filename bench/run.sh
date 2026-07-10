@@ -23,6 +23,7 @@ SCHEMA=LHVS
 ADAPTER=LAKEHOUSE_ADAPTER
 SCAN=LAKEHOUSE_SCAN
 MERGE=LAKEHOUSE_DISTINCT_MERGE_COUNT
+DISTRIBUTOR=LAKEHOUSE_DISTRIBUTE_FILES
 CONN=LAKEHOUSE_CATALOG_CREDS
 VS=TPCH
 # NB: BucketFS-path / SLC / skip-upload settings are env-overridable, so they are
@@ -326,18 +327,29 @@ sql "CREATE OR REPLACE RUST ADAPTER SCRIPT ${SCHEMA}.${ADAPTER} AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
-sql "CREATE OR REPLACE RUST SET SCRIPT ${SCHEMA}.${SCAN}(common VARCHAR(2000000), files VARCHAR(2000000))
+sql "CREATE OR REPLACE RUST SCALAR SCRIPT ${SCHEMA}.${SCAN}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
 # Scalar distinct-merge script — third entry point in the same .so, created in
-# ${SCHEMA} so the pushdown wrapper SQL resolves it schema-qualified like the SET
-# script. Unions per-shard COUNT(DISTINCT) local sets and returns the cardinality.
+# ${SCHEMA} so the pushdown wrapper SQL resolves it schema-qualified like the
+# scan script. Unions per-shard COUNT(DISTINCT) local sets and returns the cardinality.
 sql "CREATE OR REPLACE RUST SCALAR SCRIPT ${SCHEMA}.${MERGE}(partials VARCHAR(2000000))
 RETURNS DECIMAL(20,0) AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
+/"
+# File distributor — LUA SET SCRIPT, pure passthrough. Not a Rust entry point:
+# does the cross-node GROUP BY shard_key fan-out for the shard-invariant files
+# list only, carrying no row data.
+sql "CREATE OR REPLACE LUA SET SCRIPT ${SCHEMA}.${DISTRIBUTOR}(files VARCHAR(2000000))
+EMITS (files VARCHAR(2000000)) AS
+function run(ctx)
+    repeat
+        ctx.emit(ctx.files)
+    until not ctx.next()
+end
 /"
 sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' IDENTIFIED BY '${CONN_PW}'"
 # Build a virtual schema against a given namespace (idempotent DROP+CREATE). Called
