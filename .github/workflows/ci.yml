@@ -274,7 +274,13 @@ jobs:
     name: E2E
     runs-on: ubuntu-latest
     needs: [build-so, lint, unit-tests, licenses]
-    timeout-minutes: 30
+    # Observed 16-20 min end-to-end historically, but pre-test setup (disk
+    # cleanup + image loads) has grown slower as the hosted runner image
+    # bundles more pre-installed content to prune through — one run burned
+    # ~22 min on setup alone and got killed mid-suite at the old 30 min cap.
+    # 45 min is a safety backstop against a genuine hang, not a tight budget
+    # (same rationale as build-so's timeout).
+    timeout-minutes: 45
     env:
       # Standard GitHub-hosted runners have 2 vCPUs; docker-compose.yml's
       # exasol service default (4) exceeds what Docker will accept ("range of
