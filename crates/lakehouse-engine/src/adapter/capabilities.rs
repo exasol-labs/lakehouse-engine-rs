@@ -49,6 +49,12 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_SUB",
     "FN_MULT",
     "FN_FLOAT_DIV",
+    // Unary negation (issue #105): composes inside aggregates (e.g. SUM(-col)).
+    "FN_NEG",
+    // Type conversion (issue #104): CAST over its faithful target-type set
+    // (VARCHAR/CHAR/DECIMAL(p,s)/DOUBLE/BOOLEAN/DATE/TIMESTAMP); declines (falls
+    // back) for INTERVAL/GEOMETRY/HASHTYPE/TIMESTAMP WITH LOCAL TIME ZONE.
+    "FN_CAST",
     // Math scalar functions
     "FN_ABS",
     "FN_ACOS",
@@ -115,6 +121,9 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_TO_DATE",
     "FN_TO_TIMESTAMP",
     "FN_YEAR",
+    // ISO-8601 week number (issue #107): renders date_part('week', <arg>), verified
+    // to match Exasol WEEK including year-boundary dates.
+    "FN_WEEK",
     // Conditional scalar functions
     "FN_CASE",
     "FN_GREATEST",
@@ -284,6 +293,46 @@ mod tests {
             assert!(
                 cap_strs.contains(name),
                 "{name} must be advertised: {cap_strs:?}"
+            );
+        }
+
+        // --- conversion, unary-negation, and ISO-week capabilities (issues #104, #105, #107) ---
+        for name in &["FN_CAST", "FN_NEG", "FN_WEEK"] {
+            assert!(
+                cap_strs.contains(name),
+                "{name} must be advertised: {cap_strs:?}"
+            );
+        }
+
+        // --- declined translations must stay unadvertised ---
+        for name in &[
+            "FN_DIV",
+            "FN_TO_CHAR",
+            "FN_TO_NUMBER",
+            "FN_REGEXP_REPLACE",
+            "FN_REGEXP_SUBSTR",
+            "FN_REGEXP_INSTR",
+            "FN_REGEXP_COUNT",
+            "FN_ADD_DAYS",
+            "FN_ADD_HOURS",
+            "FN_ADD_MINUTES",
+            "FN_ADD_SECONDS",
+            "FN_ADD_WEEKS",
+            "FN_ADD_MONTHS",
+            "FN_ADD_YEARS",
+            "FN_DAYS_BETWEEN",
+            "FN_HOURS_BETWEEN",
+            "FN_MINUTES_BETWEEN",
+            "FN_SECONDS_BETWEEN",
+            "FN_MONTHS_BETWEEN",
+            "FN_YEARS_BETWEEN",
+            "FN_DAYOFWEEK",
+            "FN_LAST_DAY",
+            "FN_CONVERT_TZ",
+        ] {
+            assert!(
+                !cap_strs.contains(name),
+                "{name} must NOT be advertised: {cap_strs:?}"
             );
         }
 
@@ -612,6 +661,29 @@ mod tests {
         assert!(
             cap_strs.contains(&"AGGREGATE_SINGLE_GROUP"),
             "single-group COUNT(DISTINCT) requires AGGREGATE_SINGLE_GROUP: {cap_strs:?}"
+        );
+    }
+
+    /// Scenarios (vs-adapter/pushdown-planning-capability-extensions): advertising
+    /// `FN_CAST`, `FN_NEG`, and `FN_WEEK` (issues #104, #105, #107) introduces no
+    /// additional join or cross-join capability — the join capability set stays
+    /// exactly `JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, unchanged by this
+    /// diff.
+    #[test]
+    fn cast_neg_week_introduce_no_join_capability() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        let join_caps: Vec<&&str> = cap_strs.iter().filter(|c| c.starts_with("JOIN")).collect();
+        assert_eq!(
+            join_caps,
+            vec![&"JOIN", &"JOIN_TYPE_INNER", &"JOIN_CONDITION_EQUI"],
+            "join capability set must remain exactly the inner equi-join contract: {cap_strs:?}"
+        );
+        assert!(
+            !has_disallowed_join_capability(&cap_strs),
+            "outer/all-condition/Cartesian join capabilities must not be advertised: {cap_strs:?}"
         );
     }
 

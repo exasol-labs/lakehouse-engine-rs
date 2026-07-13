@@ -12,6 +12,13 @@ a documented set needs explicit aliasing: `SIGN`→`signum`, `LENGTH`→`charact
 `MOD`→`%` operator, `INSTR`/`LOCATE`→`strpos` (with operand reorder), `UNICODE`→`ascii`,
 `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
+The scalar regexp functions (`REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT`)
+are deliberately not translated. DataFusion 54 runs the Rust `regex` crate, whose dialect rejects
+the pattern backreferences and lookaround Exasol's PCRE dialect accepts; DataFusion 54 has no
+`regexp_substr`; and Exasol's position, occurrence, and return-option arguments have no matching
+DataFusion argument shape. This is separate from the `FN_PRED_REGEXP_LIKE` predicate, which stays
+advertised and is out of scope here.
+
 ## Scenarios
 
 ### Scenario: Math scalar functions translate to DataFusion math calls
@@ -56,3 +63,12 @@ a documented set needs explicit aliasing: `SIGN`→`signum`, `LENGTH`→`charact
 * *WHEN* `render_expression` processes the node
 * *THEN* `NULLIFZERO` SHALL render as `nullif(<arg>, 0)`
 * *AND* `ZEROIFNULL` SHALL render as `coalesce(<arg>, 0)`
+
+### Scenario: Regexp scalar functions are deliberately not translated
+
+* *GIVEN* a VS expression node of type `function_scalar` named `REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, or `REGEXP_COUNT`
+* *WHEN* `render_expression` processes the node in raising mode
+* *THEN* the translator SHALL return an error naming the function as unsupported
+* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
+* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, so `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, and `FN_REGEXP_COUNT` remain unadvertised
+* *AND* the exclusion MUST NOT alter the pre-existing `FN_PRED_REGEXP_LIKE` predicate advertisement

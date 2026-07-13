@@ -20,6 +20,12 @@ arithmetic, string, and conditional functions.
   that depend on Exasol session state or whose DataFusion equivalent diverges in result are left
   unsupported (the node returns an error in raising mode, `None` in the safe variants), so the
   adapter omits them and Exasol post-processes them as a correctness backstop.
+* `WEEK` is translated because Exasol `WEEK` and DataFusion 54 `date_part('week', …)` are both
+  ISO-8601. The date-arithmetic (`ADD_*`), date-difference (`*_BETWEEN`), month/year arithmetic
+  (`ADD_MONTHS`, `ADD_YEARS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`), `DAYOFWEEK`, `LAST_DAY`, and
+  `CONVERT_TZ` functions are not: DataFusion 54 lacks these builtins, its variable×INTERVAL scaling
+  is unverified, its `date_part('dow')` numbers Sunday as 0, and `CONVERT_TZ` is session-timezone
+  dependent.
 
 ## Scenarios
 
@@ -58,10 +64,18 @@ arithmetic, string, and conditional functions.
 * *THEN* `TO_DATE` SHALL render as `to_date(<args>)` and `TO_TIMESTAMP` SHALL render as `to_timestamp(<args>)` over the recursively rendered arguments
 * *AND* when a format argument is present it SHALL be forwarded as the corresponding DataFusion format argument
 
+### Scenario: WEEK translates to the DataFusion date_part('week') ISO-8601 call
+
+* *GIVEN* a VS expression node of type `function_scalar` named `WEEK` with a single datetime argument
+* *WHEN* `render_expression` processes the node
+* *THEN* the translator SHALL return `date_part('week', <arg_sql>)` with the argument rendered recursively
+* *AND* the rendered call SHALL yield the ISO-8601 week number (1-53, weeks beginning Monday, week 1 containing the year's first Thursday) matching Exasol `WEEK`, including at year boundaries
+* *AND* `FN_WEEK` (advertised per `vs-adapter/pushdown-planning-capability-extensions`) SHALL be advertised only while this ISO-8601 parity holds; if a year-boundary case diverges, the `WEEK` arm SHALL be withdrawn and `FN_WEEK` left unadvertised
+
 ### Scenario: Unsupported date functions fall through as unsupported nodes
 
-* *GIVEN* a VS expression node of type `function_scalar` named with an Exasol date function this feature does not translate (e.g. `ADD_DAYS`, `DAYS_BETWEEN`, `CONVERT_TZ`, `POSIX_TIME`)
+* *GIVEN* a VS expression node of type `function_scalar` named with an Exasol date function this feature does not translate — the date-arithmetic functions (`ADD_DAYS`, `ADD_HOURS`, `ADD_MINUTES`, `ADD_SECONDS`, `ADD_WEEKS`, `ADD_MONTHS`, `ADD_YEARS`), the date-difference functions (`DAYS_BETWEEN`, `HOURS_BETWEEN`, `MINUTES_BETWEEN`, `SECONDS_BETWEEN`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`), or the other date scalars (`DAYOFWEEK`, `LAST_DAY`, `CONVERT_TZ`, `POSIX_TIME`)
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return an error naming the unsupported function
 * *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
-* *AND* the adapter SHALL therefore omit the function from the scan spec and let Exasol post-process it
+* *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because their DataFusion 54 equivalents diverge from Exasol (see Background)
