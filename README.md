@@ -23,8 +23,7 @@ Once deployed (see [Install](docs/install.md)), create a Virtual Schema and quer
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
-  ICEBERG_NAMESPACE  = 'default'
-  SCAN_SCHEMA        = 'LHVS';
+  ICEBERG_NAMESPACE  = 'default';
 
 SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 ```
