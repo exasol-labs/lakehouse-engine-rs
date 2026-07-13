@@ -32,6 +32,7 @@ sum/count decomposition) is covered separately in
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 * The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
+* The `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and distinct-merge UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan, distributor, and distinct-merge scripts are co-deployed in the adapter script's schema, so this single source qualifies all three.
 * See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
 
 ## Scenarios
@@ -94,3 +95,12 @@ sum/count decomposition) is covered separately in
 * *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
 * *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
 * *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
+
+### Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
+
+* *GIVEN* a virtual schema whose adapter script, `LAKEHOUSE_SCAN` scan script, `LAKEHOUSE_DISTRIBUTE_FILES` distributor, and distinct-merge script are all deployed in one Exasol schema
+* *AND* a `CREATE VIRTUAL SCHEMA` statement that carries NO `SCAN_SCHEMA` property
+* *WHEN* Exasol sends a `pushdown` request and the adapter builds the scan-driving SQL
+* *THEN* the adapter SHALL qualify the `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and distinct-merge UDF names with the schema reported by the running adapter script's UDF handshake (`ctx.script_schema()`), and MUST NOT read any VS property to obtain that schema
+* *AND* because those scripts are co-deployed in the adapter script's schema, the qualified names SHALL resolve when the scan-driving SQL executes outside the adapter script's own schema context
+* *AND* when `ctx.script_schema()` reports an empty schema, the adapter SHALL emit the `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and distinct-merge UDF names unqualified, relying on the session's current schema to resolve them
