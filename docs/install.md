@@ -80,6 +80,10 @@ the adapter supplies concrete output columns per query.
 does the cross-node `GROUP BY shard_key` fan-out of the per-shard file lists ahead of the scalar
 scan.
 
+`LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and the distinct-merge script MUST be created in
+the same schema as `LAKEHOUSE_ADAPTER` (here, `LHVS`) — the adapter qualifies its calls to them
+using its own running-script schema, not a configured property.
+
 ## 5. Create the catalog CONNECTION
 
 Catalog URI goes in `TO`; S3 + warehouse credentials go in the `IDENTIFIED BY` JSON password.
@@ -165,7 +169,6 @@ CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
   ICEBERG_NAMESPACE  = 'default'
-  SCAN_SCHEMA        = 'LHVS'
   ALLOW_HTTP         = 'true';
 ```
 
@@ -173,7 +176,6 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 |---|---|---|
 | `CATALOG_CONNECTION` | yes | Name of the CONNECTION object from step 5 |
 | `ICEBERG_NAMESPACE` | yes | Iceberg namespace; **every table in it** is exposed as a virtual table |
-| `SCAN_SCHEMA` | yes | Schema holding the `LAKEHOUSE_SCAN` scalar script and the `LAKEHOUSE_DISTRIBUTE_FILES` distributor |
 | `ALLOW_HTTP` | no | `'true'` to allow plain-HTTP catalog/S3 (e.g. local MinIO) |
 | `PARALLELISM_FACTOR` | no | Work-unit oversubscription multiplier (G = node_count × factor, capped 300) |
 | `DATAFUSION_TARGET_PARTITIONS` | no | DataFusion target partition count per UDF |

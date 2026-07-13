@@ -45,7 +45,6 @@ recreate_vs() {  # batch_size
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION    = '${CONN}'
   ICEBERG_NAMESPACE     = '${NS}'
-  SCAN_SCHEMA           = '${SCHEMA}'
   NR_OF_CORES           = '${CORES}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${bs}'" | exapump sql -d "$DSN" >/dev/null 2>&1

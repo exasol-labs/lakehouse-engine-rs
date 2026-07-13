@@ -30,10 +30,6 @@ const PROP_ICEBERG_NAMESPACE: &str = "ICEBERG_NAMESPACE";
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 // Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-// Schema that holds the LAKEHOUSE_SCAN SET script. The pushdown SQL must
-// reference the scan UDF schema-qualified, because it executes outside the
-// adapter script's schema context. Optional: unqualified when unset.
-const PROP_SCAN_SCHEMA: &str = "SCAN_SCHEMA";
 // Key written into the createVirtualSchema response under
 // schemaMetadata.adapterNotes (a stringified JSON object) so that subsequent
 // requests (pushdown, refresh) can read the resolved node count back from
@@ -147,16 +143,20 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // Resolve credentials synchronously before entering the async runtime.
             // ctx.connection() is a synchronous call that must not be invoked inside
             // an async context (it may block on the UDF host). Mirror the pattern
-            // used by resolve_cluster_nodes.
+            // used by resolve_cluster_nodes. ctx.script_schema() is likewise a
+            // synchronous handshake read, and is the schema that qualifies the
+            // scan/distributor/merge UDF names in the generated pushdown SQL.
             let props = get_properties(request);
             let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
+            let script_schema = ctx.script_schema();
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
             rt.block_on(async {
-                handle_pushdown_request(request, &catalog_uri, &storage, &creds).await
+                handle_pushdown_request(request, &catalog_uri, &storage, &creds, &script_schema)
+                    .await
             })
         }
         other => Err(UdfError::User(format!(
@@ -303,9 +303,8 @@ async fn handle_pushdown_request(
     catalog_uri: &str,
     storage: &StorageProps,
     creds: &ConnectionCreds,
+    script_schema: &str,
 ) -> Result<Json, UdfError> {
-    let props = get_properties(request);
-    let scan_schema = str_prop(&props, PROP_SCAN_SCHEMA).map(|s| s.to_string());
     // CLUSTER_NODES and PARALLELISM_FACTOR are carried in adapterNotes (persisted
     // by Exasol), NOT in properties (dropped by Exasol). Read them from
     // schemaMetadataInfo.adapterNotes; default to safe values when absent.
@@ -354,7 +353,7 @@ async fn handle_pushdown_request(
         catalog_uri,
         storage,
         &catalog,
-        scan_schema.as_deref(),
+        Some(script_schema),
         cluster_nodes,
         parallelism_factor,
         df_target_partitions,
