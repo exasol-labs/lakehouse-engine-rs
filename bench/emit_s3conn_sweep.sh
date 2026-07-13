@@ -38,7 +38,6 @@ recreate_vs() {  # s3conn ("AUTO" => omit property, let it AUTO-derive)
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION    = '${CONN}'
   ICEBERG_NAMESPACE     = '${NS}'
-  SCAN_SCHEMA           = '${SCHEMA}'
   NR_OF_CORES           = '${CORES}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${BS}'${s3line}" | exapump sql -d "$DSN" >/dev/null 2>&1
