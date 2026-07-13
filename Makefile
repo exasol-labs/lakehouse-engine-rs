@@ -31,11 +31,20 @@ VS_SRCS := $(shell find crates/lakehouse-engine/src crates/vs-expression/src -na
 # the next build.
 UDF_CARGO_VOL ?= lakehouse-engine-rs-udf-cargo-registry
 
+# Runs as the host UID:GID so target/release/** lands host-owned, not root-owned
+# (root-owned artifacts break a plain host `cargo clean`). The registry volume
+# outlives this recipe and may carry root-owned content from before this fix
+# (or from the image's own default ownership on first use) — normalize it to
+# the host user before the real build, regardless of the volume's history.
 $(VS_SO): $(VS_SRCS)
+	docker run --rm -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
+	  $(UDF_BUILDER_IMAGE) chown -R $(shell id -u):$(shell id -g) /usr/local/cargo/registry
 	docker run --rm \
 	  -v $(LAKEHOUSE_ENGINE_DIR):/build/lakehouse-engine \
 	  -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
 	  -w /build/lakehouse-engine \
+	  --user $(shell id -u):$(shell id -g) \
+	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
 	  cargo build --release -p lakehouse-engine
 
