@@ -230,7 +230,6 @@ fn create_virtual_schema(
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
   ICEBERG_NAMESPACE  = '{E2E_NAMESPACE}'
-  SCAN_SCHEMA        = '{SCHEMA_NAME}'
   ALLOW_HTTP         = 'true'{join_threshold_prop}"#
     ));
 }

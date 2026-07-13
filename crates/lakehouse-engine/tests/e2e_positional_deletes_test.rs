@@ -245,7 +245,6 @@ fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, parallelism_factor: 
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
   ICEBERG_NAMESPACE   = '{NAMESPACE}'
-  SCAN_SCHEMA         = '{SCHEMA_NAME}'
   ALLOW_HTTP          = 'true'{parallelism_clause}"#
     ));
 }
