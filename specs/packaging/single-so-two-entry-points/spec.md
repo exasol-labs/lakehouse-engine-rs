@@ -33,7 +33,7 @@ script references it.
 * *GIVEN* the UDF crate declaring a scalar distinct-merge entry point (used by the outer wrapper SQL to merge per-shard `COUNT(DISTINCT)` local distinct sets)
 * *WHEN* the crate is built in the builder image and a SCALAR SCRIPT referencing that `%udf_object` is created
 * *THEN* the scalar-script invocation SHALL run the distinct-merge entry point from the same uploaded `.so`, requiring no second uploaded artifact
-* *AND* the pushdown wrapper SQL SHALL reference that scalar script schema-qualified so it resolves outside the adapter script's schema context, using the same scan-UDF schema resolution the SET script uses
+* *AND* the pushdown wrapper SQL SHALL reference that scalar script schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the `LAKEHOUSE_SCAN` scalar script uses — the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
 
 ### Scenario: Both scripts resolve from the same uploaded artifact
 
@@ -49,7 +49,7 @@ script references it.
 * *GIVEN* the deployment DDL that creates the scan scripts
 * *WHEN* the fan-out distributor is provisioned
 * *THEN* the deployment SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a standalone LUA SET SCRIPT (a pure passthrough re-emitting its `files` input, one row per group), independent of the uploaded `.so`
-* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan and distinct-merge scripts use
+* *AND* the pushdown wrapper SQL SHALL reference `LAKEHOUSE_DISTRIBUTE_FILES` schema-qualified so it resolves outside the adapter script's schema context, using the same schema resolution the scan and distinct-merge scripts use — the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`, NOT a VS property
 * *AND* the distributor DDL MUST NOT reference the uploaded scan `.so` and MUST NOT declare a Rust `%udf_object` entry point
 
 ### Scenario: Host release build of the .so is rejected by convention
