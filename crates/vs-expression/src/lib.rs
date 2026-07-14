@@ -85,11 +85,45 @@ fn render_cast_target(data_type: &Json) -> Result<String, UdfError> {
         "DOUBLE" | "DOUBLE PRECISION" => Ok("DOUBLE".to_string()),
         "BOOLEAN" => Ok("BOOLEAN".to_string()),
         "DATE" => Ok("DATE".to_string()),
-        "TIMESTAMP" => Ok("TIMESTAMP".to_string()),
+        "TIMESTAMP" => {
+            // Exasol serialises TIMESTAMP WITH LOCAL TIME ZONE as type "TIMESTAMP"
+            // with `withLocalTimeZone: true` (not a distinct type string). WLTZ
+            // carries session-timezone / UTC-normalisation semantics that
+            // DataFusion's plain TIMESTAMP does not reproduce, so it is not a
+            // faithful target: decline it and let Exasol evaluate the CAST.
+            if data_type.get("withLocalTimeZone").and_then(|v| v.as_bool()) == Some(true) {
+                Err(UdfError::User(
+                    "unsupported CAST target type: TIMESTAMP WITH LOCAL TIME ZONE".into(),
+                ))
+            } else {
+                Ok("TIMESTAMP".to_string())
+            }
+        }
         other => Err(UdfError::User(format!(
             "unsupported CAST target type: {other}"
         ))),
     }
+}
+
+/// Render a CAST node body to `CAST(<expr> AS <target>)`.
+///
+/// Shared by both CAST encodings (see the `function_scalar_cast` top-level arm
+/// and the defensive nested `function_scalar`+name=CAST arm) so the target-type
+/// faithfulness rules in `render_cast_target` are applied identically on both
+/// paths and cannot drift.
+fn render_cast(
+    args: Option<&Vec<Json>>,
+    data_type: Option<&Json>,
+) -> Result<Option<String>, UdfError> {
+    let args = args.ok_or_else(|| UdfError::User("CAST missing 'arguments'".into()))?;
+    if args.is_empty() {
+        return Err(UdfError::User("CAST requires 1 argument".into()));
+    }
+    let inner = render_expression_inner(&args[0])?
+        .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
+    let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
+    let target_type = render_cast_target(data_type)?;
+    Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
 /// Internal recursive translator.
@@ -343,6 +377,17 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             sql.push_str(" END");
             Ok(Some(format!("({sql})")))
         }
+        // Exasol sends CAST as its own top-level node type carrying the target
+        // in `dataType` (verified against the engine source
+        // `[redacted]` — `[redacted]`
+        // is the sole CAST emitter):
+        //   {"type":"function_scalar_cast","name":"CAST","dataType":{...},"arguments":[<src>]}
+        // This is the shape real Exasol traffic hits; the nested
+        // `function_scalar`+name=CAST arm below is a defensive alternate encoding.
+        "function_scalar_cast" => {
+            let args = value("arguments").and_then(|a| a.as_array());
+            render_cast(args, value("dataType"))
+        }
         "function_scalar" => {
             let fn_name = value("name")
                 .and_then(|n| n.as_str())
@@ -396,24 +441,13 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                         .ok_or_else(|| UdfError::User("NEG operand is null".into()))?;
                     Ok(Some(format!("(-{operand})")))
                 }
-                // CAST
-                "CAST" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar CAST missing 'arguments'".into())
-                    })?;
-                    if args.is_empty() {
-                        return Err(UdfError::User(
-                            "function_scalar CAST requires 1 argument".into(),
-                        ));
-                    }
-                    let inner = render_expression_inner(&args[0])?
-                        .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
-                    let data_type = value("dataType").ok_or_else(|| {
-                        UdfError::User("function_scalar CAST missing 'dataType'".into())
-                    })?;
-                    let target_type = render_cast_target(data_type)?;
-                    Ok(Some(format!("CAST({inner} AS {target_type})")))
-                }
+                // CAST as a function_scalar (defensive alternate encoding).
+                // Real Exasol traffic emits CAST as the top-level
+                // `function_scalar_cast` node handled above (engine source
+                // `[redacted]` emits CAST exclusively that way); this arm is kept
+                // defensively — like the REGEXP_LIKE alternate encoding below — and
+                // shares the same body via `render_cast`.
+                "CAST" => render_cast(args, value("dataType")),
                 // REGEXP_LIKE as a function_scalar (alternate encoding)
                 "REGEXP_LIKE" => {
                     let args = args.ok_or_else(|| {
@@ -674,6 +708,27 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                     let src = render_expression_inner(&args[0])?
                         .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
                     Ok(Some(format!("date_part('{fn_name}', {src})")))
+                }
+                // WEEK(datetime) → date_part('week', datetime). Both Exasol WEEK
+                // and DataFusion 54 date_part('week') are ISO-8601 (weeks begin
+                // Monday, week 1 contains the year's first Thursday, range 1-53):
+                // DataFusion maps 'week' → IntervalUnit::Week → DatePart::Week →
+                // chrono iso_week().week(), so year-boundary weeks agree. Only the
+                // parity target is rendered; the other Exasol date functions
+                // diverge and fall through as unsupported (see date-fns spec).
+                "WEEK" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar WEEK missing 'arguments'".into())
+                    })?;
+                    if args.len() != 1 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar WEEK requires 1 argument, got {}",
+                            args.len()
+                        )));
+                    }
+                    let src = render_expression_inner(&args[0])?
+                        .ok_or_else(|| UdfError::User("WEEK argument is null".into()))?;
+                    Ok(Some(format!("date_part('week', {src})")))
                 }
                 // DATE_TRUNC(unit, source) — note: Exasol arg order matches DataFusion
                 "DATE_TRUNC" => {
@@ -1209,12 +1264,38 @@ mod tests {
         assert_eq!(render_expression(&expr).unwrap(), r#"(-"A")"#);
     }
 
+    #[test]
+    fn neg_composes_with_aggregate_decomposition() {
+        // SUM(-col): the NEG arm must render correctly as an aggregate argument,
+        // not only standalone. `function_aggregate` recurses into its argument
+        // (the same arithmetic-aggregate decomposition path exercised by
+        // `render_expression_renders_scalar_wrapping_aggregates`), so a NEG node
+        // nested under SUM must flow through unchanged.
+        let sum_neg = json!({
+            "type": "function_aggregate",
+            "name": "SUM",
+            "arguments": [{
+                "type": "function_scalar",
+                "name": "NEG",
+                "arguments": [{"type": "column", "name": "col"}]
+            }],
+            "distinct": false
+        });
+        assert_eq!(render_expression(&sum_neg).unwrap(), r#"SUM((-"COL"))"#);
+    }
+
     // --- CAST ---
+    //
+    // Fixtures use the real Exasol wire shape `{"type":"function_scalar_cast",
+    // "name":"CAST","dataType":{...},"arguments":[...]}` — the shape the engine
+    // actually emits (verified against `[redacted]` `[redacted]`
+    // `[redacted]`), NOT the earlier `{"type":"function_scalar",...}`
+    // shape whose mismatch let a dispatch bug hide (CAST never reached its arm).
 
     #[test]
     fn renders_cast_varchar() {
         let expr = json!({
-            "type": "function_scalar",
+            "type": "function_scalar_cast",
             "name": "CAST",
             "arguments": [{"type": "column", "name": "x"}],
             "dataType": {"type": "VARCHAR", "size": 100}
@@ -1225,7 +1306,7 @@ mod tests {
     #[test]
     fn renders_cast_decimal() {
         let expr = json!({
-            "type": "function_scalar",
+            "type": "function_scalar_cast",
             "name": "CAST",
             "arguments": [{"type": "column", "name": "x"}],
             "dataType": {"type": "DECIMAL", "precision": 10, "scale": 2}
@@ -1239,7 +1320,7 @@ mod tests {
     #[test]
     fn renders_cast_double() {
         let expr = json!({
-            "type": "function_scalar",
+            "type": "function_scalar_cast",
             "name": "CAST",
             "arguments": [{"type": "column", "name": "x"}],
             "dataType": {"type": "DOUBLE"}
@@ -1250,12 +1331,105 @@ mod tests {
     #[test]
     fn renders_cast_date() {
         let expr = json!({
-            "type": "function_scalar",
+            "type": "function_scalar_cast",
             "name": "CAST",
             "arguments": [{"type": "column", "name": "x"}],
             "dataType": {"type": "DATE"}
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS DATE)"#);
+    }
+
+    #[test]
+    fn renders_cast_char_as_varchar() {
+        // Exasol sends CHAR as {"type":"CHAR","size":n,"characterSet":...}. This
+        // project maps CHAR to VARCHAR everywhere (see mission data-type table),
+        // so the CAST target renders as VARCHAR, consistent with that mapping.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    }
+
+    #[test]
+    fn renders_cast_boolean() {
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "BOOLEAN"}
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS BOOLEAN)"#);
+    }
+
+    #[test]
+    fn renders_cast_timestamp_without_local_time_zone() {
+        // Plain TIMESTAMP: Exasol sends {"type":"TIMESTAMP","withLocalTimeZone":false}.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": false, "fractionalSecondsPrecision": 3}
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"CAST("X" AS TIMESTAMP)"#
+        );
+    }
+
+    #[test]
+    fn cast_to_unsupported_target_falls_back() {
+        // Exasol CAST targets with no faithful DataFusion 54 equivalent. Each is
+        // sent with the dataType descriptor shape shown (verified against the
+        // Exasol virtual-schema data-types API). The translator must decline
+        // (Err in raising mode, None in safe mode) so the adapter omits the CAST
+        // and Exasol evaluates it as a correctness backstop.
+        //
+        // TIMESTAMP WITH LOCAL TIME ZONE is the trap: Exasol serialises it as
+        // type "TIMESTAMP" with `withLocalTimeZone: true` — NOT a distinct type
+        // string — so a naive "TIMESTAMP" arm would silently render it as plain
+        // TIMESTAMP and drop its session-timezone/UTC-normalisation semantics.
+        let unsupported = [
+            json!({"type": "INTERVAL", "fromTo": "YEAR TO MONTH", "precision": 2}),
+            json!({"type": "INTERVAL", "fromTo": "DAY TO SECONDS", "precision": 2, "fraction": 2}),
+            json!({"type": "GEOMETRY", "srid": 4326}),
+            json!({"type": "HASHTYPE", "bytesize": 16}),
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": true, "fractionalSecondsPrecision": 9}),
+        ];
+        for data_type in unsupported {
+            let expr = json!({
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "arguments": [{"type": "column", "name": "x"}],
+                "dataType": data_type.clone()
+            });
+            assert!(
+                render_expression(&expr).is_err(),
+                "CAST to {data_type} must raise in raising mode"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "CAST to {data_type} must be None in safe mode"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_cast_nested_function_scalar_defensive() {
+        // Defensive alternate encoding: CAST nested inside a generic
+        // `function_scalar` node. Real Exasol traffic uses `function_scalar_cast`
+        // (see the fixtures above), but the nested arm is kept — like the
+        // REGEXP_LIKE alternate encoding — and must still render identically via
+        // the shared `render_cast` body.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "VARCHAR", "size": 100}
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
     }
 
     // --- Error / safe-mode ---
@@ -1860,11 +2034,210 @@ mod tests {
         );
     }
 
+    // --- WEEK (ISO-8601) ---
+
+    #[test]
+    fn renders_week_as_iso_date_part() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "WEEK",
+            "arguments": [{"type": "column", "name": "d"}]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_part('week', "D")"#
+        );
+    }
+
+    #[test]
+    fn renders_week_at_year_boundary_dates() {
+        // ISO-8601 parity is what gates FN_WEEK. The translator emits
+        // date_part('week', <arg>); DataFusion 54 maps 'week' → DatePart::Week →
+        // chrono iso_week().week(), and Exasol WEEK is documented ISO-8601, so the
+        // two agree at year boundaries. Verified by executing the rendered call in
+        // DataFusion 54 for these boundary dates:
+        //   2021-01-01 (Fri) → 53   (ISO week 53 of 2020)
+        //   2020-12-31 (Thu) → 53
+        //   2019-12-30 (Mon) → 1    (ISO week 1 of 2020)
+        //   2023-01-01 (Sun) → 52   (ISO week 52 of 2022)
+        // The translator itself only renders the call; this test pins the
+        // rendering for boundary-date arguments so the parity target stays fixed.
+        let boundary_dates = ["2021-01-01", "2020-12-31", "2019-12-30", "2023-01-01"];
+        for date in boundary_dates {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": "WEEK",
+                "arguments": [{"type": "literal_date", "value": date}]
+            });
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!("date_part('week', DATE '{date}')"),
+                "failed for boundary date {date}"
+            );
+        }
+    }
+
+    #[test]
+    fn week_with_wrong_arity_falls_back() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "WEEK",
+            "arguments": [
+                {"type": "column", "name": "d"},
+                {"type": "column", "name": "e"}
+            ]
+        });
+        assert!(render_expression(&expr).is_err());
+        assert!(render_expression_safe(&expr).is_none());
+    }
+
+    // --- Integer division DIV is deliberately not translated ---
+
+    #[test]
+    fn div_falls_through_as_unsupported() {
+        // Exasol DIV is floor division; DataFusion 54 `/` truncates integer
+        // division toward zero (diverges on negative operands) and has no `div`
+        // function. DIV must therefore decline so Exasol evaluates it.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "DIV",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        let err = render_expression(&expr).unwrap_err();
+        assert!(
+            err.to_string().contains("DIV"),
+            "error must name DIV as unsupported: {err}"
+        );
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "DIV must be None in safe mode without panicking"
+        );
+    }
+
+    // --- Conversion format functions TO_CHAR/TO_NUMBER are deliberately not translated ---
+
+    #[test]
+    fn to_char_and_to_number_fall_through_as_unsupported() {
+        // DataFusion 54 `to_char` uses strftime masks (not Exasol's Oracle-style
+        // format models) and rejects numeric formatting; DataFusion 54 has no
+        // `to_number` at all. Both must therefore decline so Exasol evaluates
+        // them; a no-format string-to-number conversion stays reachable via CAST.
+        let unsupported = ["TO_CHAR", "TO_NUMBER"];
+        for name in unsupported {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "literal_string", "value": "999.99"}
+                ]
+            });
+            let err = render_expression(&expr).unwrap_err();
+            assert!(
+                err.to_string().contains(name),
+                "error must name the unsupported function '{name}': {err}"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "{name} must be None in safe mode without panicking"
+            );
+        }
+    }
+
+    // --- Regexp scalar functions are deliberately not translated ---
+
+    #[test]
+    fn regexp_scalar_functions_fall_through() {
+        // The Rust `regex` crate (DataFusion 54) rejects backreferences and
+        // lookaround that Exasol's PCRE dialect accepts, lacks regexp_substr, and
+        // its argument shapes differ from Exasol's position/occurrence/return
+        // options — so all four scalar regexp functions decline.
+        let unsupported = [
+            "REGEXP_REPLACE",
+            "REGEXP_SUBSTR",
+            "REGEXP_INSTR",
+            "REGEXP_COUNT",
+        ];
+        for name in unsupported {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "s"},
+                    {"type": "literal_string", "value": "a+"}
+                ]
+            });
+            let err = render_expression(&expr).unwrap_err();
+            assert!(
+                err.to_string().contains(name),
+                "error must name the unsupported function '{name}': {err}"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "{name} must be None in safe mode without panicking"
+            );
+        }
+    }
+
+    #[test]
+    fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
+        // The scalar-regexp exclusion must not affect the REGEXP_LIKE predicate
+        // path (FN_PRED_REGEXP_LIKE stays advertised): both encodings still render.
+        let predicate = json!({
+            "type": "predicate_like_regexp",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "^A.*"}
+        });
+        assert_eq!(
+            render_expression(&predicate).unwrap(),
+            r#"regexp_like("NAME", '^A.*')"#
+        );
+        let scalar = json!({
+            "type": "function_scalar",
+            "name": "REGEXP_LIKE",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "literal_string", "value": "^B.*"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&scalar).unwrap(),
+            r#"regexp_like("NAME", '^B.*')"#
+        );
+    }
+
     // --- Unsupported date functions return an error ---
 
     #[test]
     fn unsupported_date_fn_falls_through() {
-        let unsupported = ["ADD_DAYS", "DAYS_BETWEEN", "CONVERT_TZ", "POSIX_TIME"];
+        // Full excluded set per the date-fns spec Background: date-arithmetic,
+        // date-difference, and the other date scalars whose DataFusion 54
+        // equivalents diverge from Exasol (or don't exist at all).
+        let unsupported = [
+            // Date-arithmetic
+            "ADD_DAYS",
+            "ADD_HOURS",
+            "ADD_MINUTES",
+            "ADD_SECONDS",
+            "ADD_WEEKS",
+            "ADD_MONTHS",
+            "ADD_YEARS",
+            // Date-difference
+            "DAYS_BETWEEN",
+            "HOURS_BETWEEN",
+            "MINUTES_BETWEEN",
+            "SECONDS_BETWEEN",
+            "MONTHS_BETWEEN",
+            "YEARS_BETWEEN",
+            // Other date scalars
+            "DAYOFWEEK",
+            "LAST_DAY",
+            "CONVERT_TZ",
+            "POSIX_TIME",
+        ];
         for name in unsupported {
             let expr = json!({
                 "type": "function_scalar",

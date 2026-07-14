@@ -16150,4 +16150,14 @@ mod tests {
             "error must not leak credentials: {msg}"
         );
     }
+
+    /// A non-empty schema quote-qualifies the UDF name; an empty string or `None`
+    /// (the handshake's own no-schema case) falls back to the bare, unqualified
+    /// name with no new conditional.
+    #[test]
+    fn qualify_udf_uses_schema_and_falls_back_when_empty() {
+        assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
+        assert_eq!(qualify_udf(Some(""), "UDF"), "UDF");
+        assert_eq!(qualify_udf(None, "UDF"), "UDF");
+    }
 }
