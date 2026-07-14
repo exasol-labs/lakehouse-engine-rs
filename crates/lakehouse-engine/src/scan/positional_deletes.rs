@@ -22,10 +22,8 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
-use crate::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, NameMappingEntry, StorageProps,
-};
-use crate::scan::{FieldIdExprAdapterFactory, reconstruct_abs_uri};
+use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageProps};
+use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -458,7 +456,7 @@ pub(crate) struct PositionalDeleteScanTable {
     object_store_url: ObjectStoreUrl,
     table_schema: SchemaRef,
     use_field_id_adapter: bool,
-    name_mapping: Vec<NameMappingEntry>,
+    field_id_resolution: FieldIdResolution,
     files: Vec<FileEntry>,
     table_root: String,
     secrets: Vec<String>,
@@ -471,16 +469,19 @@ impl PositionalDeleteScanTable {
     /// `register_files` behavior: the [`FieldIdExprAdapterFactory`] is attached
     /// only when the adapter supplied a logical schema (field-id binding);
     /// legacy specs that fell back to first-file inference bind by name.
-    /// `name_mapping` is the query's flattened `schema.name-mapping.default`
-    /// entries for this side (fact or dimension), resolved once in the VS
-    /// alongside the logical schema; empty when the table has none. It is
-    /// carried through to the [`FieldIdExprAdapterFactory`] installed in
-    /// [`Self::scan`].
+    /// `field_id_resolution` groups the query's flattened
+    /// `schema.name-mapping.default` entries for this side (fact or
+    /// dimension) together with the reconstructed Iceberg `initial-default`
+    /// values keyed by field-id — both resolved once in the VS alongside the
+    /// logical schema, and empty when the table has neither. It is carried
+    /// through unchanged to the [`FieldIdExprAdapterFactory`] installed in
+    /// [`Self::scan`] for name-mapping resolution and the absent-with-default
+    /// fill respectively.
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
         table_schema: SchemaRef,
         use_field_id_adapter: bool,
-        name_mapping: Vec<NameMappingEntry>,
+        field_id_resolution: FieldIdResolution,
         files: Vec<FileEntry>,
         table_root: String,
         storage: &StorageProps,
@@ -494,7 +495,7 @@ impl PositionalDeleteScanTable {
             object_store_url,
             table_schema,
             use_field_id_adapter,
-            name_mapping,
+            field_id_resolution,
             files,
             table_root,
             secrets,
@@ -573,7 +574,8 @@ impl TableProvider for PositionalDeleteScanTable {
 
         let expr_adapter = self.use_field_id_adapter.then(|| {
             Arc::new(FieldIdExprAdapterFactory {
-                name_mapping: self.name_mapping.clone(),
+                name_mapping: self.field_id_resolution.name_mapping.clone(),
+                defaults: self.field_id_resolution.defaults.clone(),
             }) as Arc<_>
         });
 

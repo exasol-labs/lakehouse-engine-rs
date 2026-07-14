@@ -190,12 +190,14 @@ fn logical_schema() -> Vec<LogicalField> {
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
+            initial_default: None,
         },
         LogicalField {
             field_id: 2,
             name: "new_col".to_string(),
             arrow_type: "int64".to_string(),
             nullable: true,
+            initial_default: None,
         },
     ]
 }
