@@ -362,8 +362,7 @@ build_vs() {  # vs_name namespace
   sql "CREATE VIRTUAL SCHEMA $1
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION  = '${CONN}'
-  ICEBERG_NAMESPACE   = '$2'
-  SCAN_SCHEMA         = '${SCHEMA}'${VS_EXTRA_PROPS}"
+  ICEBERG_NAMESPACE   = '$2'${VS_EXTRA_PROPS}"
 }
 build_vs "${VS}" "${NAMESPACE}"
 if [ "$WITH_DELETES" = "1" ]; then

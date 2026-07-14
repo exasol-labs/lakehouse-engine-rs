@@ -2,7 +2,8 @@
 //!
 //! Exercises the full advertised → translated → executed path for each newly
 //! advertised capability group: math/string/date scalar functions in filters,
-//! REGEXP_LIKE, scalar select-list expressions, HAVING, and STDDEV/VARIANCE.
+//! REGEXP_LIKE, scalar select-list expressions, HAVING, STDDEV/VARIANCE, and
+//! CAST / unary-minus (NEG) / WEEK (#104, #105, #107).
 //!
 //! Shares the same Exasol + MinIO + Iceberg stack and seed table as
 //! `e2e_scan_test.rs`.  The setup (SLC install, BucketFS upload, VS creation)
@@ -206,7 +207,6 @@ fn create_virtual_schema(conn: &mut ExaConn) {
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CATALOG_CONN_NAME}'
   ICEBERG_NAMESPACE  = '{E2E_NAMESPACE}'
-  SCAN_SCHEMA        = '{SCHEMA_NAME}'
   ALLOW_HTTP         = 'true'"#
     ));
 }
@@ -681,4 +681,174 @@ fn e2e_stddev_variance_pushdown() {
         rel_err_var_pop < tol,
         "VAR_POP(score) must be ≈{expected_var_pop:.6}, got {var_pop:.6} (rel_err={rel_err_var_pop:.2e})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8.9  Filter-pushdown alignment helper (CAST / NEG / WEEK)
+// ---------------------------------------------------------------------------
+
+/// Asserts the pushed scan spec carries a non-empty `filter` field — proof
+/// the WHERE predicate was translated and pushed into the DataFusion scan
+/// (`CommonScanSpec::filter`), rather than falling back to Exasol evaluating
+/// the whole WHERE clause itself over an unfiltered raw-row scan (which would
+/// omit the `filter` field entirely: it is `#[serde(skip_serializing_if =
+/// "Option::is_none")]`).
+///
+/// Each caller below uses a query whose WHERE clause is a single CAST / NEG /
+/// WEEK expression, so field presence alone attributes the pushdown to that
+/// expression: if its translation had declined, the whole top-level filter
+/// would be dropped (there is nothing else in the clause to push instead).
+fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
+    let pushed_sql = explain_virtual_sql(conn, query_sql);
+    assert!(
+        pushed_sql.contains("\"filter\":\""),
+        "EXPLAIN VIRTUAL output must contain a non-empty 'filter' field in the \
+         scan spec (predicate pushdown occurred), not a raw row-scan fallback, \
+         got:\n{pushed_sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.10  CAST in a WHERE filter (#104)
+// ---------------------------------------------------------------------------
+
+/// `CAST(id AS VARCHAR(2000000))` in a WHERE filter pushes down and returns
+/// the correct row.
+///
+/// `id` is DECIMAL(20,0) in Exasol; `CAST(id AS VARCHAR(2000000)) = '15'`
+/// matches only id=15 (score = 5.0*15 = 75.0). Exasol's CAST grammar requires
+/// an explicit length for VARCHAR (this project's own data-type convention:
+/// VARCHAR(n≤2,000,000)); the DataFusion-facing translation in
+/// `render_cast_target` ignores the length and always renders the bare
+/// DataFusion `VARCHAR` type, so this is purely an Exasol-facing SQL detail,
+/// not a translator concern.
+#[test]
+fn e2e_cast_in_filter() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, score FROM {} WHERE CAST(id AS VARCHAR(2000000)) = '15' ORDER BY id",
+        vs_table()
+    );
+    assert_filter_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "CAST(id AS VARCHAR(2000000)) = '15' must return exactly 1 row, got {}",
+        cols[0].len()
+    );
+    assert_eq!(
+        parse_int(&cols[0][0]),
+        15,
+        "the matched row must have id=15"
+    );
+
+    let score = parse_numeric(&cols[1][0]);
+    assert!(
+        (score - 75.0).abs() < 0.001,
+        "id=15 must have score=75.0 (5.0*15), got {score}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.11  Unary minus (NEG) in a WHERE filter (#105)
+// ---------------------------------------------------------------------------
+
+/// Unary minus in a WHERE filter pushes down and returns the correct rows.
+///
+/// `-score < -50.0` is equivalent to `score > 50.0`. Scores are 5.0*id for
+/// id=1..20 (5,10,…,100), so score > 50.0 -> id > 10 -> ids 11..20 -> 10 rows.
+#[test]
+fn e2e_unary_minus_in_filter() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, score FROM {} WHERE -score < -50.0 ORDER BY id",
+        vs_table()
+    );
+    assert_filter_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+
+    // ids 11..20 inclusive -> 10 rows.
+    let expected_count = 10i64;
+    assert_eq!(
+        cols[0].len() as i64,
+        expected_count,
+        "-score < -50.0 must return {expected_count} rows, got {}",
+        cols[0].len()
+    );
+
+    // IDs must be 11..20 in order.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    for (pos, &id) in ids.iter().enumerate() {
+        let expected = 11 + pos as i64;
+        assert_eq!(
+            id, expected,
+            "id at position {pos} must be {expected}, got {id}"
+        );
+    }
+
+    // Every returned score must satisfy score > 50.0.
+    for v in &cols[1] {
+        let s = parse_numeric(v);
+        assert!(s > 50.0, "filter violated: score {s} must be > 50.0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.12  WEEK in a WHERE filter (#107)
+// ---------------------------------------------------------------------------
+
+/// `WEEK(event_date)` in a WHERE filter pushes down and returns the correct
+/// ISO-8601 week's rows.
+///
+/// Seed dates: `event_date` = 2024-01-01 + (id-1) days, so day-of-month = id
+/// for every row (id 1..20, all January 2024). 2024-01-01 is a Monday, so
+/// ISO-8601 week 1 = Jan 1..7 (id 1..7), week 2 = Jan 8..14 (id 8..14), week 3
+/// = Jan 15..21 (id 15..20, truncated at the seed's last row). Verified with
+/// `date -d 2024-01-08 +%V` = 02 and `date -d 2024-01-14 +%V` = 02 (both
+/// Monday-start ISO week 2). `WEEK(event_date) = 2` -> id 8..14 -> 7 rows.
+#[test]
+fn e2e_week_in_filter() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, event_date FROM {} WHERE WEEK(event_date) = 2 ORDER BY id",
+        vs_table()
+    );
+    assert_filter_pushed_down(&mut conn, &sql);
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 columns (id, event_date): {cols:?}"
+    );
+
+    // id 8..14 -> 7 rows.
+    let expected_count = 7i64;
+    assert_eq!(
+        cols[0].len() as i64,
+        expected_count,
+        "WEEK(event_date) = 2 must return {expected_count} rows, got {}",
+        cols[0].len()
+    );
+
+    // IDs must be 8..14 in order.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    for (pos, &id) in ids.iter().enumerate() {
+        let expected = 8 + pos as i64;
+        assert_eq!(
+            id, expected,
+            "id at position {pos} must be {expected}, got {id}"
+        );
+    }
 }
