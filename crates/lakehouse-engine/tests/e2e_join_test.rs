@@ -62,7 +62,7 @@ const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
 const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-const SLC_VERSION: &str = "0.20.3";
+const SLC_VERSION: &str = "0.21.0";
 const LANG_ALIAS: &str = "RUST";
 const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 

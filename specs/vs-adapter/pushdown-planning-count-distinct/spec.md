@@ -25,6 +25,8 @@ wire value.
 * Execution is bounded: a per-shard distinct set that exceeds the safety cap MUST produce a
   clean bounded-resource error, never an OOM crash or a silently truncated (wrong) value.
 * Credentials MUST NOT appear in any returned SQL or error message.
+* The scalar merge UDF `LAKEHOUSE_DISTINCT_MERGE_COUNT` is declared `RETURNS DECIMAL(20,0)`;
+  under SDK-0.21.0 it MUST produce its result through the RETURNS path, not `ctx.emit`.
 
 ## Scenarios
 
@@ -60,3 +62,11 @@ wire value.
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL assign each distinct aggregate its own per-shard VARCHAR partial column and its own scalar-merge call in the outer wrapper, so each `COUNT(DISTINCT)` is merged independently
 * *AND* each merged distinct count SHALL equal the corresponding `COUNT(DISTINCT col)` evaluated over all rows on a single node
+
+### Scenario: Distinct-merge UDF returns its count via the RETURNS path without emitting
+
+* *GIVEN* the `LAKEHOUSE_DISTINCT_MERGE_COUNT` scalar UDF declared `RETURNS DECIMAL(20,0)` in its DDL, fed the concatenation of the per-shard distinct-set JSON arrays for one `COUNT(DISTINCT col)`
+* *WHEN* the merge UDF computes the global distinct cardinality for its one input value
+* *THEN* the UDF SHALL produce its result through the SDK-0.21.0 RETURNS path as `Ok(Some(count))` and MUST NOT call `ctx.emit`, which the SDK-0.21.0 runtime rejects in RETURNS (`ExactlyOnce`) context
+* *AND* a SQL NULL input (a `LISTAGG` over zero shard rows) SHALL return `Ok(Some(0))`, a distinct count of zero
+* *AND* the merged distinct count SHALL remain byte-identical to the value the prior EMITS-based implementation produced, so the conformance fix changes the output mechanism, not the result
