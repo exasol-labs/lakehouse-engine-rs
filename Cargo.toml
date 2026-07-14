@@ -17,7 +17,7 @@ license = "MIT"
 # Shared single-version pins. Member crates reference these with
 # `{ workspace = true }`, optionally adding per-crate features.
 
-# Arrow ecosystem: pin to 58 to match exasol-udf-sdk 0.14.0 and datafusion 54.
+# Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
 arrow   = { version = "58", default-features = false }
 parquet = { version = "58", features = ["async"] }
 
@@ -52,7 +52,7 @@ iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", tag 
 # points; full feature set available behind the exasol-e2e feature.
 tokio = { version = "1", features = ["rt", "macros"] }
 
-exasol-udf-sdk = { version = "0.20.3", features = ["emit-arrow"] }
+exasol-udf-sdk = { version = "0.21.0", features = ["emit-arrow"] }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }

@@ -24,6 +24,9 @@ or pin exact values.
   the parallelism.
 * The ScanSpec fields are resolved before the Tokio runtime is constructed, so the
   runtime kind is chosen from the spec value.
+* Under SDK-0.21.0 per-row scalar dispatch the scan `run()` is invoked once per input row,
+  so runtime construction now happens per call rather than once per batch; see
+  `datafusion-scan/scan-execution` for the per-row dispatch contract.
 * The thread/partition budget is selected by a `DATAFUSION_THREADING_MODE`
   VS/connection property with two values, `AUTO` and `FIXED`, resolved in the
   adapter at `createVirtualSchema` time and recorded in `adapterNotes`. The mode
@@ -103,3 +106,11 @@ or pin exact values.
 * *WHEN* the adapter resolves the DataFusion threading configuration
 * *THEN* the adapter SHALL select `AUTO` mode and derive the thread/partition budget per the AUTO scenario
 * *AND* the adapter SHALL record `DATAFUSION_THREADING_MODE: AUTO` in the `createVirtualSchema` response `adapterNotes`
+
+### Scenario: Scan constructs the Tokio runtime per scalar run() call and never caches it across calls
+
+* *GIVEN* a scan spec whose `df_threads_per_udf` value arrives as a per-call UDF input parameter, carried in the `ScanSpec` reconstituted from that `run()` call's two VARCHAR arguments
+* *WHEN* the scan UDF builds the Tokio runtime that drives one `run()` call's DataFusion scan
+* *THEN* the UDF SHALL construct a fresh runtime sized from THAT call's `df_threads_per_udf` (current-thread when `1`, multi-thread with that many workers otherwise) and tear it down deterministically via `run_on_runtime` before the call returns
+* *AND* the UDF MUST NOT reuse a runtime cached at process or `static` scope (for example via `OnceLock`) across `run()` calls
+* *AND* because Exasol pools and reuses a UDF VM process across invocations that MAY belong to different queries carrying different `df_threads_per_udf` values, a process-cached runtime would apply stale sizing — so a resource whose construction depends on a per-call `UdfContext` input parameter MUST be rebuilt every call, preserving the stateless, no-cross-call-state UDF invariant
