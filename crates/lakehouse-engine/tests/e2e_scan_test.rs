@@ -22,9 +22,11 @@ mod common;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
+    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
     EVO_NEW_COL, EVO_TOTAL_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
     PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events, seed_renamed_column,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns, seed_added_columns_initial_default,
+    seed_events, seed_renamed_column,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -678,6 +680,120 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
             "row {i}: expected rating = 10 * {id} = {}, got {rating}",
             10 * id
         );
+    }
+}
+
+/// Added columns absent from a pre-existing data file return their Iceberg
+/// `initial-default`; the same columns return real values where they are present.
+///
+/// Scenario (seeded by `seed_added_columns_initial_default`), Iceberg
+/// column-projection rule (3):
+///   - file A: ids `EVO_INITDEF_PRE_ADD_IDS`, physical parquet has only `id`
+///   - catalog `add-schema`: one column per primitive type (field-ids 2..=11),
+///     each with an `initial-default`; `c_bool` REQUIRED, the rest NULLABLE
+///   - file B: ids `EVO_INITDEF_POST_ADD_IDS`, all columns with real values
+///
+/// `PARALLELISM_FACTOR = 1` forces one shard, so both files land in one
+/// `ListingTable`. The per-file field-id adapter must, for the pre-add file, fill
+/// each absent added column with its `initial-default` (required AND nullable),
+/// and for the post-add file bind the real written values — never defaulting a
+/// present field. Asserted across ALL added primitive types.
+#[test]
+fn e2e_added_columns_initial_default_fill_all_types() {
+    setup_e2e();
+
+    // Seed the dedicated initdef table: create + file A (id only) + add-columns +
+    // file B (all columns with real values).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        seed_added_columns_initial_default(&iceberg_catalog_url(), "s3://warehouse/")
+            .await
+            .expect("seed initdef (all-types initial-default) table");
+    });
+
+    let mut conn = exa_conn();
+
+    // A dedicated VS created AFTER initdef exists so the adapter enumerates it.
+    // PARALLELISM_FACTOR = 1 forces a single shard (G = 1 on this 1-node cluster),
+    // so both parquet files are scanned together in one ListingTable.
+    let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS INITDEF_VS CASCADE");
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA INITDEF_VS
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
+  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
+  SCAN_SCHEMA         = '{SCHEMA_NAME}'
+  PARALLELISM_FACTOR  = '1'
+  ALLOW_HTTP          = 'true'"#
+    ));
+
+    let columns = initdef_columns();
+    let col_list = columns
+        .iter()
+        .map(|c| c.name.to_uppercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, {col_list} FROM INITDEF_VS.{} ORDER BY id",
+        EVO_INITDEF_TABLE.to_uppercase()
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        columns.len() + 1,
+        "expected id + {} added columns, got {} columns: {cols:?}",
+        columns.len(),
+        cols.len()
+    );
+
+    let ids = &cols[0];
+    let row_count = ids.len();
+    assert_eq!(
+        row_count, EVO_INITDEF_TOTAL_ROWS,
+        "field-id scan must return all {EVO_INITDEF_TOTAL_ROWS} rows across the \
+         pre-add and post-add files; got {row_count}"
+    );
+
+    let (pre0, pre1) = EVO_INITDEF_PRE_ADD_IDS;
+    let (post0, post1) = EVO_INITDEF_POST_ADD_IDS;
+
+    for (r, id_val) in ids.iter().enumerate() {
+        let id = id_val
+            .as_i64()
+            .or_else(|| id_val.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("row {r}: id must be an integer, got {id_val:?}"));
+
+        let pre_add = (pre0..=pre1).contains(&id);
+        let post_add = (post0..=post1).contains(&id);
+        assert!(
+            pre_add ^ post_add,
+            "row {r}: id {id} is outside both seeded ranges \
+             {EVO_INITDEF_PRE_ADD_IDS:?} / {EVO_INITDEF_POST_ADD_IDS:?}"
+        );
+
+        for (c, col) in columns.iter().enumerate() {
+            let actual = &cols[c + 1][r];
+            let expected = if pre_add { &col.default } else { &col.real };
+            let phase = if pre_add {
+                "pre-add row must carry the column's initial-default"
+            } else {
+                "post-add row must carry the real written value"
+            };
+            let kind = if col.required {
+                "required-with-default"
+            } else {
+                "nullable-with-default"
+            };
+            assert!(
+                expected.matches(actual),
+                "row {r} (id {id}), column '{}' [{kind}]: {phase} — got {actual:?}",
+                col.name
+            );
+        }
     }
 }
 
