@@ -13,6 +13,10 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * An aggregate is pushed down only when it decomposes into a shard-associative
   partial/merge plan; otherwise the adapter falls back to row scanning.
 * Credentials MUST NOT appear in any returned SQL or error message.
+* A scalar-function capability is advertised only once a `crates/vs-expression` arm renders it and
+  the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
+  `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, and the divergent date
+  functions do not and stay unadvertised.
 
 ## Scenarios
 
@@ -83,3 +87,28 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL fall back to the pre-existing scan plan for that shape without pushing a per-shard row limit ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
 * *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows, exactly as it already retains a `LIMIT` and a `HAVING` it pushed as a correctness backstop
+
+### Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
+
+* *GIVEN* the adapter's advertised capability set
+* *WHEN* Exasol requests `getCapabilities`
+* *THEN* the response SHALL advertise `FN_CAST` and `FN_NEG`, each backed by a `crates/vs-expression` translator arm (the CAST arm over its faithful target-type set and the unary-negation arm), so no advertised capability is one the translator would decline for a shape Exasol expects it to handle
+* *AND* a CAST to an unsupported target type SHALL fall back — the adapter omits the CAST and Exasol evaluates it — rather than producing an incorrect result
+* *AND* `FN_TO_CHAR`, `FN_TO_NUMBER`, and `FN_DIV` SHALL remain absent
+* *AND* Cartesian-product capabilities SHALL remain absent and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised, so advertising `FN_CAST` and `FN_NEG` introduces no additional join or cross-join capability
+
+### Scenario: ISO week capability is advertised so WEEK expressions push down
+
+* *GIVEN* the adapter's advertised capability set
+* *WHEN* Exasol requests `getCapabilities`
+* *THEN* the response SHALL advertise `FN_WEEK`, backed by the `crates/vs-expression` `WEEK` arm rendering `date_part('week', …)`, whose ISO-8601 result matches Exasol `WEEK` (see `sql-comprehension/vs-expression-translator-date-fns`)
+* *AND* `FN_ADD_DAYS`, `FN_ADD_HOURS`, `FN_ADD_MINUTES`, `FN_ADD_SECONDS`, `FN_ADD_WEEKS`, `FN_ADD_MONTHS`, `FN_ADD_YEARS`, `FN_DAYS_BETWEEN`, `FN_HOURS_BETWEEN`, `FN_MINUTES_BETWEEN`, `FN_SECONDS_BETWEEN`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, `FN_LAST_DAY`, and `FN_CONVERT_TZ` SHALL remain absent
+* *AND* Cartesian-product capabilities SHALL remain absent and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`) SHALL be advertised, so advertising `FN_WEEK` introduces no additional join or cross-join capability
+
+### Scenario: Regexp scalar function capabilities remain absent
+
+* *GIVEN* the adapter's advertised capability set
+* *WHEN* Exasol requests `getCapabilities`
+* *THEN* the response SHALL NOT advertise `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`
+* *AND* Exasol SHALL post-process regexp scalar functions rather than pushing them to the node-local scan, because DataFusion 54's Rust `regex` dialect, its missing `regexp_substr`, and its differing argument shapes make a faithful translation impossible (see `sql-comprehension/vs-expression-translator-scalar-fns`)
+* *AND* the pre-existing `FN_PRED_REGEXP_LIKE` predicate advertisement SHALL remain unchanged
