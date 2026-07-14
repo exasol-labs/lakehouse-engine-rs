@@ -5,11 +5,11 @@ registers exactly the Iceberg/Parquet data files assigned to its shard, sizes it
 DataFusion `RuntimeEnv` memory pool from the per-instance memory limit reported in UDF
 metadata, applies the pushed-down projection, filter, and LIMIT, and streams the matching
 rows back as Arrow IPC batches. It holds no state and discovers no files of its own. As a
-SCALAR EMIT UDF, Exasol may batch MULTIPLE input rows into one `run()` call, so the UDF
-loops over the batch, scanning each row's assigned file list. The UDF receives its scan
-spec as TWO VARCHAR arguments — a shard-invariant common spec serialized once for the
-whole fan-out (including the Iceberg table root), and a per-shard `(path, size)` file
-list — which it merges back into one `ScanSpec` per input row.
+SCALAR EMIT UDF under SDK 0.21.0, the framework invokes `run()` ONCE per input row, so the
+UDF scans exactly one row's assigned file list per call and never iterates the input with
+`ctx.next()`. The UDF receives its scan spec as TWO VARCHAR arguments — a shard-invariant
+common spec serialized once for the whole fan-out (including the Iceberg table root), and a
+per-shard `(path, size)` file list — which it merges back into one `ScanSpec` per call.
 
 ## Background
 
@@ -59,17 +59,19 @@ list — which it merges back into one `ScanSpec` per input row.
 * See `datafusion-scan/scan-execution-positional-deletes` for delete-application scenarios
   (base `ParquetAccessPlan` attachment, delete-set composition with pushdown, and the
   read-time backstop for unsupported delete mechanisms).
+* Per-call Tokio runtime construction and the no-process-caching rule for the scan runtime
+  are owned by `datafusion-scan/scan-execution-threading`.
 
 ## Scenarios
 
-### Scenario: Scan loops over a batched scalar input and scans every assigned file list once
+### Scenario: Scan handles one input row per scalar run() call and never iterates with ctx.next()
 
-* *GIVEN* a SCALAR EMIT scan invocation whose `run()` call carries MULTIPLE input rows, each row holding the same shard-invariant common spec argument and its own per-shard files argument
-* *WHEN* the scan UDF runs for that batch
-* *THEN* the UDF SHALL loop `while ctx.next()` over every input row in the batch and scan each row's assigned file list, emitting that row's surviving output rows, so NO input row past the first is silently dropped
-* *AND* the DataFusion runtime SHALL be built ONCE from the first row's (shard-invariant) thread configuration and reused across every row in the batch, then torn down deterministically exactly once after the batch is drained (preserving the `run_on_runtime` / `shutdown_timeout` teardown discipline that otherwise races detached object-store background tasks)
-* *AND* a batch of exactly one input row SHALL produce byte-identical output to the pre-batching single-row scan, so the loop is a no-op for the would-be single-row call
-* *AND* only serialized bytes (VARCHAR JSON arguments in, Arrow IPC bytes out) SHALL cross the `.so` boundary, unchanged by the batch loop
+* *GIVEN* the SDK-0.21.0 runtime invokes the SCALAR EMIT scan `run()` ONCE per input row, each call carrying that row's shard-invariant common spec argument (column 0) and its own per-shard files argument (column 1)
+* *WHEN* the scan UDF runs for one such call
+* *THEN* the UDF SHALL reconstitute exactly that one row's `ScanSpec`, register and scan only that row's assigned file list, and emit that row's surviving output rows
+* *AND* the UDF MUST NOT call `ctx.next()`, which the SDK-0.21.0 runtime rejects with an error in scalar (`ExactlyOnce`) context
+* *AND* across a multi-shard fan-out whose distributed rows each drive a SEPARATE `run()` call, every shard's rows SHALL be emitted, so NO shard is silently dropped (the regression the removed batch loop was hand-rolling around), and the DataFusion runtime SHALL be built and torn down once per call per `datafusion-scan/scan-execution-threading`
+* *AND* only serialized bytes (VARCHAR JSON arguments in, Arrow IPC bytes out) SHALL cross the `.so` boundary
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 

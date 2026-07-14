@@ -218,7 +218,6 @@ fn join_spec(
 fn run_join(spec: &ScanSpec) -> Vec<RecordBatch> {
     block_on(async {
         let mut ctx = FakeCtx::new();
-        assert!(ctx.next().expect("next"), "one input row");
         let session = SessionContext::new_with_config(session_config_for_spec(spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(&mut ctx, &session, spec, &mut timers)
@@ -500,7 +499,6 @@ fn join_unreadable_file_errors_without_secrets() {
 
     let err = block_on(async {
         let mut ctx = FakeCtx::new();
-        assert!(ctx.next().expect("next"), "one input row");
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(&mut ctx, &session, &spec, &mut timers)

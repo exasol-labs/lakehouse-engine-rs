@@ -249,7 +249,6 @@ async fn try_run_scan_with_store(
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
     let mut ctx = FakeCtx::new();
-    assert!(ctx.next().expect("next"), "one input row");
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
     Ok(ctx.emitted)
