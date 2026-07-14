@@ -7,9 +7,11 @@
 //!   invokes the scan SCALAR EMIT UDF with the explicit file list.
 //!
 //! Entry point #2: DataFusion scan SCALAR EMIT UDF (`__exa_udf_entry_LAKEHOUSE_SCAN`)
-//!   Reads a ScanSpec JSON from its input column, builds a DataFusion session,
-//!   registers only the assigned files over MinIO, applies projection/filter/limit,
-//!   converts Arrow batches to SDK `Value` rows, and emits them incrementally.
+//!   Invoked once per input row (SDK 0.21.0 scalar dispatch). Each call reads one
+//!   row's ScanSpec, builds a DataFusion session on a fresh per-call Tokio runtime,
+//!   registers only that row's assigned files over MinIO, applies
+//!   projection/filter/limit, converts Arrow batches to SDK `Value` rows, and emits
+//!   them incrementally. The union of all per-row calls covers every shard.
 //!
 //! Entry point #3: distinct-merge SCALAR UDF (`__exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT`)
 //!   Merges per-shard `COUNT(DISTINCT col)` local distinct sets. The outer wrapper
@@ -30,7 +32,7 @@ use std::collections::HashSet;
 use exasol_udf_macros::exasol_udf;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use exasol_udf_sdk::value::{Decimal, Value};
+use exasol_udf_sdk::value::Decimal;
 
 pub mod adapter;
 pub mod scan;
@@ -62,6 +64,11 @@ fn lakehouse_adapter(_ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 /// serialized ONCE per fan-out, and the per-shard files JSON array (arg 1).
 /// Emits: the projected columns declared in the adapter's EMITS clause.
 ///
+/// Exasol drives this scalar UDF once per input row (SDK 0.21.0): each `run()`
+/// call handles exactly one row's shard on its own fresh Tokio runtime and never
+/// iterates with `ctx.next()` (now a runtime-enforced error in scalar context).
+/// The dispatch/runtime contract lives in [`scan::run_scan`].
+///
 /// The `emits(...)` annotation is omitted because the actual EMITS are
 /// declared dynamically in the SQL string the adapter returns from pushdown —
 /// Exasol injects the EMITS at script execution time from the SQL. The macro
@@ -91,6 +98,13 @@ fn lakehouse_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 /// NULL — that is treated as a distinct count of zero. Only the SDK `Value`
 /// crosses the `.so` boundary.
 ///
+/// This is a RETURNS-style UDF: the function returns its result
+/// (`Ok(Some(Decimal))`) rather than calling `ctx.emit` — the
+/// `#[exasol_udf]`-generated wrapper delivers it via `ctx.set_return`.
+/// `language-container-rs` v0.21.0 runtime-enforces this and rejects a
+/// `ctx.emit` call from a RETURNS-shaped UDF, so this function must never
+/// call `ctx.emit`.
+///
 /// The exported symbol is `__exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT`.
 #[exasol_udf(
     name = "LAKEHOUSE_DISTINCT_MERGE_COUNT",
@@ -99,19 +113,20 @@ fn lakehouse_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // reports the return column as `RETURN` at the handshake. The annotated name
     // must match that verbatim (the runtime's schema check is an exact,
     // case-sensitive, positional name+type match), so annotate `RETURN` rather
-    // than a made-up name. This keeps the Numeric type-check safety net (catches
-    // a future DDL/type drift from DECIMAL(20,0)) while fixing the name mismatch.
+    // than a made-up name. This is kept verbatim as a load-time safety net (catches
+    // a future DDL/type drift from DECIMAL(20,0)) even though the macro can infer
+    // RETURNS from the `Option<Decimal>` return type below.
     emits(RETURN: Decimal)
 )]
-fn lakehouse_distinct_merge_count(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
+fn lakehouse_distinct_merge_count(ctx: &mut dyn UdfContext) -> Result<Option<Decimal>, UdfError> {
     let count = match ctx.get_string(0)? {
         Some(partials) => merge_distinct_count(partials)?,
         None => 0,
     };
-    ctx.emit(&[Value::Numeric(Decimal {
+    Ok(Some(Decimal {
         unscaled: i128::from(count),
         scale: 0,
-    })])
+    }))
 }
 
 /// Union per-shard local distinct sets into a global distinct count.
@@ -196,5 +211,68 @@ mod distinct_merge_tests {
     fn merge_distinct_count_rejects_malformed_json() {
         assert!(merge_distinct_count("not json").is_err());
         assert!(merge_distinct_count(r#"{"a":1}"#).is_err());
+    }
+}
+
+#[cfg(test)]
+mod distinct_merge_returns_tests {
+    use super::{Decimal, lakehouse_distinct_merge_count};
+    use exasol_udf_sdk::context::UdfContext;
+    use exasol_udf_sdk::error::UdfError;
+    use exasol_udf_sdk::value::Value;
+
+    /// Minimal fake `UdfContext` serving one VARCHAR column via `get_string`,
+    /// mirroring the `FakeCtx` pattern used by the `scan_*.rs` integration tests.
+    struct FakeCtx {
+        column: Option<String>,
+    }
+
+    impl UdfContext for FakeCtx {
+        fn num_columns(&self) -> usize {
+            1
+        }
+
+        fn get(&self, _col: usize) -> Result<&Value, UdfError> {
+            Err(UdfError::User("FakeCtx uses get_string only".into()))
+        }
+
+        fn get_string(&self, _col: usize) -> Result<Option<&str>, UdfError> {
+            Ok(self.column.as_deref())
+        }
+
+        fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
+            Err(UdfError::User(
+                "RETURNS-style UDF must not call ctx.emit".into(),
+            ))
+        }
+
+        fn next(&mut self) -> Result<bool, UdfError> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn distinct_merge_returns_option_decimal() {
+        let mut ctx = FakeCtx {
+            column: Some(r#"[["F","N"],["N","O"]]"#.to_string()),
+        };
+        let result = lakehouse_distinct_merge_count(&mut ctx).unwrap();
+        assert_eq!(
+            result,
+            Some(Decimal {
+                unscaled: 3,
+                scale: 0,
+            })
+        );
+
+        let mut null_ctx = FakeCtx { column: None };
+        let null_result = lakehouse_distinct_merge_count(&mut null_ctx).unwrap();
+        assert_eq!(
+            null_result,
+            Some(Decimal {
+                unscaled: 0,
+                scale: 0,
+            })
+        );
     }
 }

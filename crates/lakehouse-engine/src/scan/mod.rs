@@ -88,7 +88,11 @@ fn run_on_runtime<T>(
 /// runtime is created with exactly `threads` worker threads, which is only
 /// correct when the operator has explicitly widened the thread budget via the
 /// `DATAFUSION_THREADS_PER_UDF` VS property.
-fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
+///
+/// Exposed publicly so a host integration test can count real per-call runtime
+/// constructions and assert each scalar `run()` builds its OWN runtime rather
+/// than reusing a cached/static one whose sizing would then be stale.
+pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
     if threads <= 1 {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -164,77 +168,69 @@ pub fn read_scan_spec(ctx: &dyn UdfContext) -> Result<ScanSpec, UdfError> {
     ScanSpec::from_parts_json(common_json, files_json).map_err(UdfError::User)
 }
 
-/// Entry point for the LAKEHOUSE_SCAN SCALAR EMIT UDF.
+/// Entry point for the LAKEHOUSE_SCAN SCALAR EMIT UDF — handles exactly ONE row.
 ///
-/// Exasol batches multiple input rows into ONE scalar `run()` call. Each row
-/// carries the shard-invariant common blob (column 0, spliced once as the scalar
-/// first-argument literal) and that row's per-shard files JSON (column 1).
-/// `run_scan` loops over EVERY row in the batch (see [`run_scan_batch`]),
-/// reconstitutes the row's spec, and scans its assigned files — reading only the
-/// first row would silently drop every later row's shard.
+/// Under SDK 0.21.0 Exasol drives a scalar `run()` once per input row, and
+/// `ctx.next()` in scalar context is now a runtime-enforced error rather than a
+/// loop advance. So `run_scan` reconstitutes exactly one row's `ScanSpec` (via
+/// [`read_scan_spec`], with no `ctx.next()` call), scans that row's assigned
+/// files, and returns; Exasol invokes it again for the next row. Each row carries
+/// the shard-invariant common blob (column 0) and that row's per-shard files JSON
+/// (column 1). The "no dropped rows" guarantee is preserved by construction: the
+/// UNION of every per-row `run()` call covers every shard, so no batch loop is
+/// needed — and none is legal.
 ///
-/// The Tokio runtime is built ONCE from the first row's thread configuration
-/// (shard-invariant — carried in the common blob) and reused across the whole
-/// batch, then torn down deterministically ONCE via `run_on_runtime`. A per-row
-/// build/teardown would race object_store's detached hyper tasks and waste setup
-/// cost. `run_scan_batch`'s future owns no async resources at return (each row's
-/// `SessionContext` and streams are dropped inside the future before the next
-/// row), so `run_on_runtime`'s abort-free teardown contract holds.
+/// The Tokio runtime is built fresh from THIS call's `df_threads_per_udf` and
+/// torn down before returning; it is NEVER cached at `static`/process scope. Its
+/// sizing derives from a per-call input parameter, so a runtime cached on a
+/// pooled VM process (reused across queries) would silently apply stale sizing to
+/// a later query with a different value — the exact reason the runtime is rebuilt
+/// per call. Teardown goes through [`run_on_runtime`],
+/// whose abort-free contract holds because [`run_scan_one`]'s future drops its
+/// `SessionContext` and every stream before it resolves, owning no async resource
+/// at return. Production builds the session via `build_session_context`.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
-    // Advance to the first input row. An empty batch means nothing to scan.
-    if !ctx.next()? {
-        return Ok(());
-    }
+    // One run() call = one row (SDK 0.21.0 scalar dispatch — no ctx.next()).
+    // Reconstitute this row's spec BEFORE building the runtime: the runtime kind
+    // depends on spec.df_threads_per_udf. NULL in either argument is a user error.
+    let spec = read_scan_spec(ctx)?;
 
-    // Reconstitute the FIRST row's spec BEFORE building the runtime: the runtime
-    // kind depends on spec.df_threads_per_udf, which is shard-invariant (carried
-    // in the common blob), so the first row's config governs the whole batch.
-    // NULL in either argument is a user error.
-    let first_spec = read_scan_spec(ctx)?;
+    // Build a fresh Tokio runtime for this row, sized from this call's config.
+    let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
 
-    // Build the Tokio runtime once for the whole batch.
-    let rt = build_scan_runtime(first_spec.df_threads_per_udf).map_err(UdfError::User)?;
-
-    // Run the batch on the runtime and tear it down deterministically. The
+    // Run this row's scan on the runtime and tear it down deterministically. The
     // implicit `drop(rt)` path raced object_store's detached hyper tasks at
     // end-of-life and aborted the VM after the final flush (err_zombie, no panic
     // text); `run_on_runtime` drives shutdown via `shutdown_timeout` from this
-    // synchronous context instead. Production builds each row's session via
+    // synchronous context instead. Production builds the session via
     // `build_session_context`.
-    run_on_runtime(rt, run_scan_batch(ctx, first_spec, build_session_context))
+    run_on_runtime(rt, run_scan_one(ctx, spec, build_session_context))
 }
 
-/// Scan every row in the scalar input batch, reusing one Tokio runtime.
+/// Scan exactly ONE reconstituted spec: build its session, dispatch, drop it.
 ///
-/// `first_spec` is the already-read first row's spec; each subsequent row is
-/// advanced to via `ctx.next()` and reconstituted via [`read_scan_spec`]. A
-/// per-row [`SessionContext`] is built through `build_session` and its streams
-/// are fully drained and dropped before the next iteration, so no async resource
-/// outlives the future — preserving [`run_on_runtime`]'s abort-free teardown
-/// contract (the whole batch runs inside a single `block_on`, torn down once).
+/// One `run()` call handles one row (SDK 0.21.0 scalar dispatch), so there is no
+/// loop: this builds a [`SessionContext`] for the row via `build_session`,
+/// dispatches to the join / partial-aggregate / raw-row path through
+/// [`run_scan_dispatch`], and drops the session (with its object store and any
+/// residual handles) before returning. Because the session and every stream are
+/// dropped inside this future before it resolves, no async resource outlives the
+/// future — preserving [`run_on_runtime`]'s abort-free teardown contract.
 ///
 /// `build_session` is injected so a host test can supply a local-file session
 /// (no S3), exactly as [`run_raw_scan_with_session`] is exposed for host tests;
 /// production passes [`build_session_context`].
-pub async fn run_scan_batch(
+pub async fn run_scan_one(
     ctx: &mut dyn UdfContext,
-    first_spec: ScanSpec,
+    spec: ScanSpec,
     build_session: impl Fn(&ScanSpec, u64) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
-    let mut spec = first_spec;
-    loop {
-        let memory_limit_bytes = ctx.memory_limit();
-        let session_ctx = build_session(&spec, memory_limit_bytes)?;
-        run_scan_dispatch(ctx, &session_ctx, &spec).await?;
-        // Drop the per-row session (and its object store / any residual handles)
-        // before advancing — one row's async resources never overlap the next's.
-        drop(session_ctx);
-
-        if !ctx.next()? {
-            break;
-        }
-        spec = read_scan_spec(ctx)?;
-    }
+    let memory_limit_bytes = ctx.memory_limit();
+    let session_ctx = build_session(&spec, memory_limit_bytes)?;
+    run_scan_dispatch(ctx, &session_ctx, &spec).await?;
+    // Drop this row's session (and its object store / any residual handles)
+    // before returning — no async resource may outlive run_on_runtime's future.
+    drop(session_ctx);
     Ok(())
 }
 

@@ -170,8 +170,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
 /// path: the whole spec parsed up front, then the unchanged downstream scan.
 async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
     let mut ctx = FakeCtx::new(vec![Some(spec.to_json())]);
-    // Advance to the single input row, exactly as run_scan does.
-    assert!(ctx.next().expect("next"), "one input row");
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
@@ -189,8 +187,6 @@ async fn run_two_arg(common_json: &str, files_json: &str) -> Vec<RecordBatch> {
         Some(common_json.to_string()),
         Some(files_json.to_string()),
     ]);
-    // Advance to the single input row, exactly as run_scan does.
-    assert!(ctx.next().expect("next"), "one input row");
     // Production two-argument reconstitution (the code under test).
     let spec = read_scan_spec(&ctx).expect("reconstitute spec from two args");
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));

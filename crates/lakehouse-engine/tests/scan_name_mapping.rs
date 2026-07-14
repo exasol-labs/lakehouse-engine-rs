@@ -221,7 +221,6 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
         Arc::new(LocalFileSystem::new()),
     );
     let mut ctx = FakeCtx::new();
-    assert!(ctx.next().expect("next"), "one input row");
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
         .await

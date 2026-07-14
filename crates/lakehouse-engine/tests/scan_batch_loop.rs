@@ -1,20 +1,31 @@
-//! Batch-loop coverage for the SCALAR-EMIT scan (task 1.2).
+//! Per-row scalar-dispatch coverage for the SCALAR-EMIT scan.
 //!
-//! Exasol batches multiple input rows into ONE scalar `run()` call. `run_scan`
-//! must loop over EVERY row and scan each row's assigned file list; reading only
-//! the first row silently drops every later shard (the spike observed 108M of
-//! 210M rows returned). These tests drive the production batch loop
-//! ([`run_scan_batch`]) against a multi-row fake `UdfContext` backed by local
-//! `file://` Parquet, injecting a local-file `SessionContext` builder so the loop
-//! is exercised without an S3 / MinIO stack — the same seam
-//! [`run_raw_scan_with_session`] already exposes for host tests.
+//! Under SDK 0.21.0 Exasol drives a scalar `run()` once PER ROW — it does NOT
+//! hand a whole multi-row batch to one call, and `ctx.next()` in scalar context
+//! is now a runtime error rather than a loop advance. So the scan reconstitutes
+//! exactly one row's `ScanSpec` (via [`read_scan_spec`], no `ctx.next()`), scans
+//! that row's assigned file list, and returns; Exasol invokes it again for the
+//! next row. The "no dropped rows" guarantee is therefore an emergent property of
+//! the fan-out: the UNION of every per-row [`run_scan_one`] call must cover every
+//! shard. (An earlier batch-loop bug silently dropped every shard past the first,
+//! returning 108M of 210M rows — the exact regression these tests guard.)
 //!
-//! - A multi-row batch scans every row: the emitted rows are the UNION of all
-//!   rows' file contents, not just the first row's.
-//! - A single-row batch is byte-for-byte identical to the pre-batching output
-//!   (the unchanged downstream [`run_raw_scan_with_session`] path over one spec).
+//! These tests drive [`run_scan_one`] once per row against a single-row fake
+//! `UdfContext` backed by local `file://` Parquet, injecting a local-file
+//! `SessionContext` builder so the path runs without an S3 / MinIO stack — the
+//! same seam [`run_raw_scan_with_session`] already exposes for host tests.
+//!
+//! - `per_row_calls_emit_union_of_all_shards`: N independent per-row calls emit
+//!   the UNION of all shards' disjoint file contents — not just the first row's.
+//! - `run_scan_one_builds_and_tears_down_runtime_per_call`: each per-row call
+//!   constructs its OWN fresh Tokio runtime and tears it down; nothing is cached
+//!   or reused across calls.
+//! - `single_row_call_is_byte_identical_to_direct_raw_scan`: one row through the
+//!   per-row seam is byte-for-byte identical to the unchanged downstream
+//!   [`run_raw_scan_with_session`] path over the same spec.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, Decimal128Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -26,57 +37,51 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{
-    read_scan_spec, run_raw_scan_with_session, run_scan_batch, session_config_for_spec,
+    build_scan_runtime, read_scan_spec, run_raw_scan_with_session, run_scan_one,
+    session_config_for_spec,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// A fake `UdfContext` serving several input rows, each with its own column
-/// values, and capturing every `emit_batch` as a decoded `RecordBatch`.
+/// A fake `UdfContext` serving exactly ONE input row (its two column values) and
+/// capturing every `emit_batch` as a decoded `RecordBatch`.
 ///
-/// Models the SCALAR batch: `next()` advances across rows, `get_string(col)`
-/// reads the CURRENT row's column. Before the first `next()` the cursor is unset;
-/// once exhausted it stays past the end (no current row).
-struct BatchCtx {
-    rows: Vec<Vec<Option<String>>>,
-    cursor: Option<usize>,
+/// Models SDK 0.21.0 scalar dispatch: one `run()` call sees one row, so
+/// `get_string(col)` reads that row's column directly with no cursor. `next()` is
+/// a hard error — a scalar `run()` iterating with `ctx.next()` is exactly the
+/// illegal batch-loop behavior these tests guard against, so any call to it fails
+/// the test loudly rather than silently masking a regression.
+struct RowCtx {
+    row: Vec<Option<String>>,
     emitted: Vec<RecordBatch>,
 }
 
-impl BatchCtx {
-    fn new(rows: Vec<Vec<Option<String>>>) -> Self {
+impl RowCtx {
+    fn new(row: Vec<Option<String>>) -> Self {
         Self {
-            rows,
-            cursor: None,
+            row,
             emitted: Vec::new(),
         }
     }
-
-    fn current(&self) -> Option<&Vec<Option<String>>> {
-        self.cursor.and_then(|i| self.rows.get(i))
-    }
 }
 
-impl UdfContext for BatchCtx {
+impl UdfContext for RowCtx {
     fn num_columns(&self) -> usize {
-        self.current().map(|r| r.len()).unwrap_or(0)
+        self.row.len()
     }
     fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("BatchCtx uses get_string only".into()))
+        Err(UdfError::User("RowCtx uses get_string only".into()))
     }
     fn get_string(&self, col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(self
-            .current()
-            .and_then(|r| r.get(col))
-            .and_then(|c| c.as_deref()))
+        Ok(self.row.get(col).and_then(|c| c.as_deref()))
     }
     fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
         Err(UdfError::User("raw path must use emit_batch".into()))
     }
     fn next(&mut self) -> Result<bool, UdfError> {
-        let next_idx = self.cursor.map(|i| i + 1).unwrap_or(0);
-        self.cursor = Some(next_idx);
-        Ok(next_idx < self.rows.len())
+        Err(UdfError::User(
+            "scalar run() handles exactly one row; ctx.next() must never be called".into(),
+        ))
     }
     fn debug_level(&self) -> tracing::Level {
         tracing::Level::INFO
@@ -166,8 +171,8 @@ fn spec_for_file(file_url: String) -> ScanSpec {
     }
 }
 
-/// Split a spec into one batch row: `[common blob, files JSON]`, exactly as the
-/// adapter splices the scalar scan's two arguments.
+/// Build one scalar-input row for `spec`: `[common blob, files JSON]`, exactly as
+/// the adapter splices the scalar scan's two arguments for a single fan-out row.
 fn row_for_spec(spec: &ScanSpec) -> Vec<Option<String>> {
     vec![
         Some(spec.to_common_json()),
@@ -221,24 +226,52 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     out
 }
 
-/// Drive the production batch loop over `specs` (one batch row per spec) and
-/// return the decoded emitted batches. Replicates `run_scan`'s prologue (advance
-/// to the first row, read its spec, build the runtime) but injects a local-file
-/// session so the loop runs without S3.
-fn drive_batch(specs: &[ScanSpec]) -> Vec<RecordBatch> {
-    let rows: Vec<Vec<Option<String>>> = specs.iter().map(row_for_spec).collect();
-    let mut ctx = BatchCtx::new(rows);
-    assert!(ctx.next().expect("first next"), "at least one input row");
-    let first_spec = read_scan_spec(&ctx).expect("reconstitute first spec");
-    block_on(run_scan_batch(&mut ctx, first_spec, local_session)).expect("batch scan");
+/// Build a fresh Tokio runtime for one per-row scan by calling the PRODUCTION
+/// runtime builder [`build_scan_runtime`], recording the construction in `built`.
+/// Every per-row call routes through here, so `built` counts exactly how many
+/// independent production runtimes were constructed — the observable that proves
+/// the runtime is never cached or reused across calls. Because it counts the real
+/// builder (not a test-local lookalike), the assertion genuinely exercises the
+/// scan path: a cached/static runtime reintroduced there would drive this count
+/// below the row count and fail the test. `threads` comes from the row's
+/// `df_threads_per_udf`, so the runtime kind matches what production would size
+/// for this row.
+fn counting_build_runtime(threads: usize, built: &AtomicUsize) -> tokio::runtime::Runtime {
+    built.fetch_add(1, Ordering::SeqCst);
+    build_scan_runtime(threads).expect("build per-row runtime")
+}
+
+/// Drive ONE scalar `run()` call for a single shard: reconstitute the row's spec
+/// (proving the read-one-row-no-`next()` contract), build a fresh runtime, run
+/// [`run_scan_one`] to completion on it, then tear that runtime down explicitly —
+/// mirroring production `run_scan` for a single row. Returns the emitted batches.
+fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
+    let mut ctx = RowCtx::new(row_for_spec(spec));
+    // Reconstitute this row's spec from the two scalar arguments, exactly as
+    // production does — reading only columns 0 and 1, never calling ctx.next().
+    let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
+    let rt = counting_build_runtime(reconstituted.df_threads_per_udf, built);
+    let result = rt.block_on(run_scan_one(&mut ctx, reconstituted, local_session));
+    result.expect("per-row scan");
+    // Explicit, deterministic teardown of THIS call's runtime — the runtime is a
+    // call-local value consumed here, never hoisted out of the per-row loop.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
     ctx.emitted
 }
 
-/// A multi-row batch scans EVERY row: the emitted rows are the union of all three
-/// files' disjoint id ranges — not just the first row's (the drop-past-first bug).
+/// Drive one independent scalar `run()` call per shard spec and concatenate the
+/// emitted batches across all N calls. This concatenation IS the fan-out UNION the
+/// regression guard asserts against.
+fn run_all_rows(specs: &[ScanSpec], built: &AtomicUsize) -> Vec<RecordBatch> {
+    specs.iter().flat_map(|s| run_one_row(s, built)).collect()
+}
+
+/// N independent per-row `run()` calls emit the UNION of every shard: the three
+/// files' disjoint id ranges, all present — not just the first row's (the
+/// drop-past-first bug that returned 108M of 210M rows).
 #[test]
-fn multi_row_batch_scans_every_shard_row() {
-    let dir = std::env::temp_dir().join(format!("lh_batch_multi_{}", std::process::id()));
+fn per_row_calls_emit_union_of_all_shards() {
+    let dir = std::env::temp_dir().join(format!("lh_perrow_multi_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     // Three shards, disjoint id ranges: 0..10, 100..110, 200..210.
@@ -248,41 +281,77 @@ fn multi_row_batch_scans_every_shard_row() {
         spec_for_file(write_parquet_ids(&dir, "f2.parquet", 200, 10)),
     ];
 
-    let emitted = drive_batch(&specs);
+    let built = AtomicUsize::new(0);
+    let emitted = run_all_rows(&specs, &built);
 
     assert_eq!(
         total_rows(&emitted),
         30,
-        "all three shard rows must be scanned (10 each); dropping rows past the first \
-         would yield only 10"
+        "every shard is scanned by its own run() call (10 rows each); dropping any \
+         shard's call would leave fewer than 30 rows"
     );
     let mut expected: Vec<i64> = (0..10).chain(100..110).chain(200..210).collect();
     expected.sort_unstable();
     assert_eq!(
         ids_of(&emitted),
         expected,
-        "emitted ids must be the union of every shard's file contents"
+        "emitted ids must be the UNION of every per-row call's file contents"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A single-row batch is byte-for-byte identical to the pre-batching output: the
+/// Each scalar `run()` call constructs its OWN fresh Tokio runtime and tears it
+/// down; nothing is cached or reused across calls. Driving N shards constructs
+/// exactly N runtimes.
+#[test]
+fn run_scan_one_builds_and_tears_down_runtime_per_call() {
+    let dir = std::env::temp_dir().join(format!("lh_perrow_rt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let specs = vec![
+        spec_for_file(write_parquet_ids(&dir, "r0.parquet", 0, 10)),
+        spec_for_file(write_parquet_ids(&dir, "r1.parquet", 50, 10)),
+        spec_for_file(write_parquet_ids(&dir, "r2.parquet", 100, 10)),
+    ];
+
+    let built = AtomicUsize::new(0);
+    let emitted = run_all_rows(&specs, &built);
+
+    assert_eq!(
+        built.load(Ordering::SeqCst),
+        specs.len(),
+        "each per-row call must build its OWN runtime (one fresh runtime per row, \
+         never a cached/reused one hoisted across calls)"
+    );
+    // Sanity: with one fresh runtime per call, every shard still emits its rows —
+    // teardown of each call-local runtime does not drop the next call's output.
+    assert_eq!(
+        total_rows(&emitted),
+        30,
+        "every per-row call scans its shard even though its runtime is torn down \
+         before the next call builds a fresh one"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A single row through the per-row seam is byte-for-byte identical to the
 /// unchanged downstream `run_raw_scan_with_session` path over the same one spec.
 #[test]
-fn single_row_batch_is_byte_identical_to_pre_batching_output() {
-    let dir = std::env::temp_dir().join(format!("lh_batch_single_{}", std::process::id()));
+fn single_row_call_is_byte_identical_to_direct_raw_scan() {
+    let dir = std::env::temp_dir().join(format!("lh_perrow_single_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let spec = spec_for_file(write_parquet_ids(&dir, "only.parquet", 0, 200));
 
-    // Batched path: one input row through the production batch loop.
-    let batched = drive_batch(std::slice::from_ref(&spec));
+    // Per-row path: one scalar run() call through the production per-row seam.
+    let built = AtomicUsize::new(0);
+    let per_row = run_one_row(&spec, &built);
 
-    // Pre-batching reference: drive the unchanged downstream raw-scan path over
-    // the same spec, with an equivalent local session.
+    // Reference: drive the unchanged downstream raw-scan path over the same spec,
+    // with an equivalent local session.
     let reference = block_on(async {
-        let mut ctx = BatchCtx::new(vec![row_for_spec(&spec)]);
-        assert!(ctx.next().expect("next"), "one row");
+        let mut ctx = RowCtx::new(row_for_spec(&spec));
         let session = local_session(&spec, 0).expect("session");
         let mut timers = PhaseTimers::start();
         run_raw_scan_with_session(&mut ctx, &session, &spec, &mut timers)
@@ -291,10 +360,11 @@ fn single_row_batch_is_byte_identical_to_pre_batching_output() {
         ctx.emitted
     });
 
-    assert_eq!(total_rows(&batched), 200, "single-row batch scans all rows");
+    assert_eq!(total_rows(&per_row), 200, "single-row call scans all rows");
     assert_eq!(
-        batched, reference,
-        "a single-row batch must emit rows byte-for-byte identical to the pre-batching path"
+        per_row, reference,
+        "a single per-row call must emit rows byte-for-byte identical to the direct \
+         raw-scan path"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
