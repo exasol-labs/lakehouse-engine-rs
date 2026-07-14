@@ -2727,7 +2727,7 @@ pub async fn handle_pushdown(
 /// Iterates over the top-level struct fields of `schema` and maps each to a
 /// `LogicalField` carrying its Iceberg field-id, current name, Arrow type tag,
 /// and nullability (required → `false`, optional → `true`).
-fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
+pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
     schema
         .as_struct()
         .fields()
@@ -2740,9 +2740,61 @@ fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
                 name: f.name.clone(),
                 arrow_type,
                 nullable: !f.required,
+                initial_default: encode_initial_default(f),
             }
         })
         .collect()
+}
+
+/// Encode a field's Iceberg `initial-default` as the raw primitive scalar in
+/// plain text, or `None` when there is nothing to carry.
+///
+/// Reads `initial_default` ONLY (never `write_default`, which governs writes,
+/// not reads). Returns `None` when the field has no `initial-default`, when the
+/// default is non-primitive (struct/list/map — `as_primitive_literal` yields
+/// `None`), or when the field's `PrimitiveType` reaches only the JSON-fallback
+/// `"utf8"` path (`uuid`/`time`/`fixed`/`binary`/oversized `decimal`).
+///
+/// The `(PrimitiveType, PrimitiveLiteral)` match is deliberately gated on the
+/// PrimitiveType, NOT on the computed Arrow tag: several distinct primitives
+/// collapse onto the `"utf8"` tag, and the scan-side reconstruction dispatches
+/// on that tag alone — so encoding a non-`String` value under `"utf8"` would be
+/// misread. Only the exact set that maps to a first-class Arrow tag in
+/// `iceberg_primitive_to_arrow` is encoded, mirroring the `PrimitiveType`
+/// dispatch in `iceberg_predicate::literal_to_datum`. Temporals carry their raw
+/// integer (days / micros / nanos) and a decimal carries its `i128` unscaled
+/// mantissa, so the scan side reconstructs a `ScalarValue` against the Arrow tag
+/// with no second temporal/decimal parse. The encoded text is a bare scalar, so
+/// it is inherently credential-free.
+fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> {
+    use iceberg::spec::{PrimitiveLiteral, PrimitiveType};
+
+    let primitive = field.field_type.as_primitive_type()?;
+    let literal = field.initial_default.as_ref()?.as_primitive_literal()?;
+
+    let encoded = match (primitive, &literal) {
+        (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v)) => v.to_string(),
+        (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => v.to_string(),
+        (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => v.to_string(),
+        (PrimitiveType::Float, PrimitiveLiteral::Float(v)) => v.0.to_string(),
+        (PrimitiveType::Double, PrimitiveLiteral::Double(v)) => v.0.to_string(),
+        (PrimitiveType::String, PrimitiveLiteral::String(v)) => v.clone(),
+        (PrimitiveType::Date, PrimitiveLiteral::Int(days)) => days.to_string(),
+        (
+            PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestamptzNs,
+            PrimitiveLiteral::Long(v),
+        ) => v.to_string(),
+        (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(v))
+            if *precision <= 36 && *scale <= 36 =>
+        {
+            v.to_string()
+        }
+        _ => return None,
+    };
+    Some(encoded)
 }
 
 /// Parse the Iceberg `schema.name-mapping.default` table property into the flat
@@ -5704,9 +5756,16 @@ fn exasol_type_from_json(dt: &Json) -> String {
         }
         "double" => "DOUBLE PRECISION".to_string(),
         "date" => "DATE".to_string(),
-        "timestamp" => "TIMESTAMP".to_string(),
-        "timestamp with local time zone" | "timestampwithlocaltime zone" => {
-            "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
+        "timestamp" => {
+            let with_local_time_zone = dt
+                .get("withLocalTimeZone")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if with_local_time_zone {
+                "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
+            } else {
+                "TIMESTAMP".to_string()
+            }
         }
         _ => {
             // VARCHAR, CHAR, and all others.
@@ -5738,6 +5797,24 @@ mod tests {
     use crate::scan::spec::StorageProps;
     use iceberg::spec::{DataContentType, DataFileFormat};
     use vs_expression::render_df_filter_safe;
+
+    /// `exasol_type_from_json` must read the `withLocalTimeZone` flag back off a
+    /// `{"type":"timestamp", ...}` dataType JSON (the shape Exasol echoes back in
+    /// `involvedTables[].columns[].dataType` for a VS column declared via
+    /// `exasol_type_to_json`), not just the bare `"type"` string — otherwise a
+    /// TIMESTAMP WITH LOCAL TIME ZONE column round-trips back into the pushdown
+    /// path as plain TIMESTAMP and Exasol rejects the EMITS type mismatch.
+    #[test]
+    fn exasol_type_from_json_reads_with_local_time_zone_flag() {
+        let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
+        assert_eq!(
+            exasol_type_from_json(&tstz),
+            "TIMESTAMP WITH LOCAL TIME ZONE"
+        );
+
+        let ts = serde_json::json!({"type": "timestamp"});
+        assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
+    }
 
     // ---------------------------------------------------------------------------
     // Task 1.3 — fail-loud on unsupported delete/data mechanisms (manifest level)
@@ -7388,12 +7465,14 @@ mod tests {
                 name: "L_ORDERKEY".into(),
                 arrow_type: "decimal128(20,0)".into(),
                 nullable: true,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 2,
                 name: "L_EXTENDEDPRICE".into(),
                 arrow_type: "decimal128(18,2)".into(),
                 nullable: true,
+                initial_default: None,
             },
         ]
     }
@@ -9522,12 +9601,14 @@ mod tests {
                 name: "L_ORDERKEY".into(),
                 arrow_type: "decimal128(20,0)".into(),
                 nullable: true,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 2,
                 name: "L_EXTENDEDPRICE".into(),
                 arrow_type: "decimal128(40,6)".into(),
                 nullable: true,
+                initial_default: None,
             },
         ];
         assert!(
@@ -9547,6 +9628,7 @@ mod tests {
             name: "L_ORDERKEY".into(),
             arrow_type: "decimal128(20,0)".into(),
             nullable: true,
+            initial_default: None,
         }];
         assert!(
             detect_topn(&request, &pd(&request), &projected, &missing_schema).is_none(),
@@ -15581,6 +15663,245 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // Task 3.1 — build_logical_schema encodes the Iceberg initial-default
+    // (Iceberg column-projection rule 3), once per query, into the scan spec.
+    // ---------------------------------------------------------------------------
+
+    /// The VS encodes each field's Iceberg `initial-default` once per query into
+    /// the scan spec: a PRIMITIVE required-with-default and a PRIMITIVE
+    /// nullable-with-default each carry their default as the raw scalar text keyed
+    /// to the field's Arrow-type tag.
+    #[test]
+    fn build_logical_schema_encodes_primitive_initial_default() {
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                // Required (nullable=false) Long with an initial-default.
+                Arc::new(
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
+                        .with_initial_default(Literal::long(7)),
+                ),
+                // Nullable (optional) String with an initial-default.
+                Arc::new(
+                    NestedField::optional(2, "note", Type::Primitive(PrimitiveType::String))
+                        .with_initial_default(Literal::string("hi")),
+                ),
+            ])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+
+        assert_eq!(logical.len(), 2);
+
+        // Required-with-default encodes the raw i64 scalar as decimal text.
+        assert_eq!(logical[0].field_id, 1);
+        assert!(!logical[0].nullable, "required field must be non-nullable");
+        assert_eq!(logical[0].arrow_type, "int64");
+        assert_eq!(
+            logical[0].initial_default.as_deref(),
+            Some("7"),
+            "required-with-default must encode its default"
+        );
+
+        // Nullable-with-default encodes the string value verbatim.
+        assert_eq!(logical[1].field_id, 2);
+        assert!(logical[1].nullable, "optional field must be nullable");
+        assert_eq!(logical[1].arrow_type, "utf8");
+        assert_eq!(
+            logical[1].initial_default.as_deref(),
+            Some("hi"),
+            "nullable-with-default must encode its default"
+        );
+    }
+
+    /// A field with NO `initial-default` encodes no default (`None`).
+    #[test]
+    fn build_logical_schema_omits_default_for_no_default_field() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "plain",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+
+        assert_eq!(logical.len(), 1);
+        assert!(
+            logical[0].initial_default.is_none(),
+            "a field without an initial-default must encode None"
+        );
+    }
+
+    /// A NON-primitive (struct) `initial-default` encodes NO default: Exasol has no
+    /// struct type (it surfaces as JSON-fallback VARCHAR), so the default is dropped
+    /// and the column falls through to NULL / required-error downstream — a
+    /// deliberate trade-off, not a silent gap.
+    #[test]
+    fn build_logical_schema_omits_non_primitive_default() {
+        use iceberg::spec::{
+            Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
+        };
+        use std::sync::Arc;
+
+        let struct_type = Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
+            100,
+            "x",
+            Type::Primitive(PrimitiveType::Int),
+        ))]));
+        let struct_default = Literal::Struct(Struct::from_iter([Some(Literal::int(7))]));
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(
+                NestedField::optional(1, "meta", struct_type).with_initial_default(struct_default),
+            )])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+
+        assert_eq!(logical.len(), 1);
+        assert_eq!(
+            logical[0].arrow_type, "utf8",
+            "a struct maps to the JSON-fallback utf8 tag"
+        );
+        assert!(
+            logical[0].initial_default.is_none(),
+            "a non-primitive struct initial-default must encode NO default"
+        );
+    }
+
+    /// `write-default` is never read: a field carrying ONLY a `write-default`
+    /// (no `initial-default`) encodes `None` — writes are irrelevant to reads.
+    #[test]
+    fn build_logical_schema_ignores_write_default() {
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(
+                NestedField::optional(1, "w", Type::Primitive(PrimitiveType::Int))
+                    .with_write_default(Literal::int(5)),
+            )])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+
+        assert_eq!(logical.len(), 1);
+        assert!(
+            logical[0].initial_default.is_none(),
+            "write-default must never be read into initial_default"
+        );
+    }
+
+    /// The encoded default form is credential-free: it is a bare scalar value, so
+    /// the serialized `LogicalField` carrying it contains no storage credential.
+    #[test]
+    fn build_logical_schema_default_encoding_is_credential_free() {
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(
+                NestedField::optional(1, "label", Type::Primitive(PrimitiveType::String))
+                    .with_initial_default(Literal::string("plain-default")),
+            )])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+        assert_eq!(logical[0].initial_default.as_deref(), Some("plain-default"));
+
+        // Serializing the default carrier introduces no credential material — the
+        // encoding is a bare scalar, never a connection/storage blob.
+        let json = serde_json::to_string(&logical).unwrap();
+        for marker in ["access_key", "secret_key", "session_token", "endpoint"] {
+            assert!(
+                !json.contains(marker),
+                "encoded default carrier must be credential-free, found '{marker}': {json}"
+            );
+        }
+    }
+
+    /// A default-less schema round-trips unchanged: every `LogicalField` carries
+    /// `None`, the field is absent from the serialized JSON, and a spec authored
+    /// before the field existed deserializes identically (backward-compatible).
+    #[test]
+    fn build_logical_schema_default_less_spec_round_trips_unchanged() {
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+
+        let logical = build_logical_schema(&schema);
+        assert!(
+            logical.iter().all(|f| f.initial_default.is_none()),
+            "a default-less schema must encode no defaults"
+        );
+
+        let spec = ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            emit_exa_types: Vec::new(),
+            logical_schema: logical.clone(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        };
+        let json = spec.to_json();
+        assert!(
+            !json.contains("initial_default"),
+            "absent defaults must be omitted from JSON: {json}"
+        );
+        let back = ScanSpec::from_json(&json).unwrap();
+        assert_eq!(
+            back.logical_schema, logical,
+            "a default-less spec must round-trip unchanged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // Join side selection + broadcast threshold: `select_broadcast_sides`.
     // The pure core of the two-table broadcast role/threshold decision — exercised
     // without a live Iceberg catalog. `plan_join` resolves each side via
@@ -15609,6 +15930,7 @@ mod tests {
                 name: format!("{table_name}_KEY"),
                 arrow_type: "int64".to_string(),
                 nullable: false,
+                initial_default: None,
             }],
             Vec::new(),
             sample_storage(),
