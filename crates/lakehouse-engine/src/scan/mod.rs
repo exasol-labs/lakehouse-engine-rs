@@ -90,9 +90,11 @@ fn run_on_runtime<T>(
 /// correct when the operator has explicitly widened the thread budget via the
 /// `DATAFUSION_THREADS_PER_UDF` VS property.
 ///
-/// Exposed publicly so a host integration test can count real per-call runtime
-/// constructions and assert each scalar `run()` builds its OWN runtime rather
-/// than reusing a cached/static one whose sizing would then be stale.
+/// Exposed publicly so a host integration test can wrap this builder to count
+/// how many runtimes its own per-row harness constructs. Note: since `run_scan`
+/// calls this function directly (not through an injected seam), such a test
+/// exercises the harness's own call discipline, not `run_scan` itself — it
+/// cannot catch a future regression that caches a runtime inside `run_scan`.
 pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, String> {
     if threads <= 1 {
         tokio::runtime::Builder::new_current_thread()
