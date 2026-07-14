@@ -28,7 +28,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    Date32Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use futures::TryStreamExt;
@@ -36,8 +37,8 @@ use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
 };
 use iceberg::spec::{
-    DataFileFormat, Literal, NestedField, PrimitiveType, Schema as IcebergSchema, Struct,
-    Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+    DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveType, Schema as IcebergSchema,
+    Struct, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -1405,7 +1406,7 @@ pub async fn seed_renamed_column(catalog_url: &str, warehouse: &str) -> Result<(
         .await
         .context("reload evo before rename")?;
     let current_schema_id = table.metadata().current_schema_id();
-    rest_rename_column(
+    rest_replace_current_schema(
         catalog_url,
         E2E_NAMESPACE,
         E2E_EVO_TABLE,
@@ -1476,6 +1477,458 @@ fn make_evo_batch(first_id: i64, last_id: i64, col2: &str) -> RecordBatch {
         ],
     )
     .expect("evo RecordBatch construction is infallible")
+}
+
+// ---------------------------------------------------------------------------
+// All-types initial-default schema-evolution table (initdef) — issue #27
+// ---------------------------------------------------------------------------
+//
+// Exercises Iceberg column-projection rule (3): a field added AFTER a data file
+// was written reads as ABSENT from that file and MUST return the field's
+// `initial-default`. One column per Iceberg-expressible primitive type is added
+// via a single out-of-band REST `add-schema` + `set-current-schema` commit
+// (`rest_replace_current_schema`), each carrying an `initial-default`. File A is
+// written under the pre-add (id-only) schema; file B under the post-add schema
+// with real written values. A field-id scan of both files in one shard must
+// return each added column's `initial-default` for file-A rows and its real
+// written value for file-B rows.
+//
+// ns-precision timestamps are NOT Iceberg-expressible in this catalog version;
+// they are covered exhaustively by the unit round-trip test (plan task 3.3).
+//
+// timestamptz is likewise EXCLUDED from this fixture: Exasol rejects TIMESTAMP
+// WITH LOCAL TIME ZONE as a UDF EMITS output type (sqlCode 22002), so a
+// timestamptz value cannot cross the scan emit boundary. Its initial-default
+// logic stays fully covered by the unit round-trip test; only the E2E emit path
+// is out of reach (tracked exception, #118).
+
+/// Table name for the all-types initial-default schema-evolution fixture (#27).
+pub const EVO_INITDEF_TABLE: &str = "initdef";
+/// Inclusive id range written BEFORE the columns were added (file A, id-only).
+pub const EVO_INITDEF_PRE_ADD_IDS: (i64, i64) = (1, 3);
+/// Inclusive id range written AFTER the columns were added (file B, all columns).
+pub const EVO_INITDEF_POST_ADD_IDS: (i64, i64) = (4, 6);
+/// Total rows a field-id scan must return across both files.
+pub const EVO_INITDEF_TOTAL_ROWS: usize = 6;
+
+/// Boolean column, added REQUIRED-with-default (exercises the required branch of
+/// rule (3): an absent required field returns its default rather than erroring).
+pub const EVO_INITDEF_COL_BOOL: &str = "c_bool";
+/// Int (32-bit) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_INT: &str = "c_int";
+/// Long (64-bit) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_LONG: &str = "c_long";
+/// Float (32-bit) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_FLOAT: &str = "c_float";
+/// Double (64-bit) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_DOUBLE: &str = "c_double";
+/// String column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_STRING: &str = "c_string";
+/// Date column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_DATE: &str = "c_date";
+/// Timestamp (no zone) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_TS: &str = "c_ts";
+/// Decimal(9,2) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_DECIMAL: &str = "c_decimal";
+
+/// `c_long` initial-default (chosen > i32::MAX so a Long/Int mix-up is caught).
+const INITDEF_LONG_DEFAULT: i64 = 4_200_000_000;
+/// `c_decimal` initial-default unscaled mantissa: 12345 at scale 2 == 123.45.
+const INITDEF_DECIMAL_DEFAULT_UNSCALED: i128 = 12_345;
+/// `c_decimal` real written value unscaled mantissa: 67890 at scale 2 == 678.90.
+const INITDEF_DECIMAL_REAL_UNSCALED: i128 = 67_890;
+/// `c_date` real written value: 2024-07-01 (BASE_DATE + 182 days).
+const INITDEF_REAL_DATE_DAYS: i32 = BASE_DATE + 182;
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+const MICROS_PER_HOUR: i64 = 3_600_000_000;
+/// `c_ts` initial-default: 2024-01-01T12:00:00Z. Noon (not midnight)
+/// so a session-timezone offset cannot roll the calendar date the test asserts.
+const INITDEF_DEFAULT_TS_MICROS: i64 = BASE_TS_MICROS + 12 * MICROS_PER_HOUR;
+/// `c_ts` real written value: 2024-07-01T12:00:00Z.
+const INITDEF_REAL_TS_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 * MICROS_PER_HOUR;
+
+/// The value a field-id scan is expected to return for one added column, matched
+/// tolerantly against the JSON the Exasol result set delivers.
+pub enum ExpectedValue {
+    /// Exasol BOOLEAN (JSON bool, or a `1`/`0` / `"true"` fallback form).
+    Bool(bool),
+    /// Any numeric Exasol type (DECIMAL/DOUBLE), compared as `f64` within 1e-6,
+    /// accepting either the JSON-number or JSON-string encoding.
+    Num(f64),
+    /// Exasol VARCHAR, compared exactly.
+    Text(&'static str),
+    /// Exasol DATE / TIMESTAMP / TIMESTAMP WITH LOCAL TIME ZONE, matched by the
+    /// leading `YYYY-MM-DD` calendar-date substring (robust to fractional-second
+    /// and session-timezone rendering differences).
+    DatePrefix(&'static str),
+}
+
+impl ExpectedValue {
+    /// True when `actual` (a value from the Exasol result set) matches self.
+    pub fn matches(&self, actual: &serde_json::Value) -> bool {
+        match self {
+            ExpectedValue::Bool(b) => {
+                actual.as_bool() == Some(*b)
+                    || actual.as_i64().map(|i| (i != 0) == *b).unwrap_or(false)
+                    || actual
+                        .as_str()
+                        .map(|s| (s.eq_ignore_ascii_case("true") || s == "1") == *b)
+                        .unwrap_or(false)
+            }
+            ExpectedValue::Num(n) => actual
+                .as_f64()
+                .or_else(|| actual.as_str().and_then(|s| s.parse::<f64>().ok()))
+                .map(|g| (g - n).abs() < 1e-6)
+                .unwrap_or(false),
+            ExpectedValue::Text(t) => actual.as_str() == Some(*t),
+            ExpectedValue::DatePrefix(p) => {
+                actual.as_str().map(|s| s.starts_with(p)).unwrap_or(false)
+            }
+        }
+    }
+}
+
+/// One added column in the initdef fixture: its name, whether it was added as
+/// REQUIRED (vs nullable), and the value a field-id scan must return for pre-add
+/// (file A → `default`) vs post-add (file B → `real`) rows.
+pub struct InitDefColumn {
+    pub name: &'static str,
+    pub required: bool,
+    pub default: ExpectedValue,
+    pub real: ExpectedValue,
+}
+
+/// The added columns in field-id order (field-ids 2..=10), each paired with its
+/// expected `initial-default` (file-A rows) and real written value (file-B rows).
+/// `c_bool` is the REQUIRED-with-default column; the rest are NULLABLE-with-default.
+pub fn initdef_columns() -> Vec<InitDefColumn> {
+    vec![
+        InitDefColumn {
+            name: EVO_INITDEF_COL_BOOL,
+            required: true,
+            default: ExpectedValue::Bool(true),
+            real: ExpectedValue::Bool(false),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_INT,
+            required: false,
+            default: ExpectedValue::Num(42.0),
+            real: ExpectedValue::Num(7.0),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_LONG,
+            required: false,
+            default: ExpectedValue::Num(INITDEF_LONG_DEFAULT as f64),
+            real: ExpectedValue::Num(99.0),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_FLOAT,
+            required: false,
+            default: ExpectedValue::Num(1.5),
+            real: ExpectedValue::Num(2.5),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_DOUBLE,
+            required: false,
+            default: ExpectedValue::Num(2.5),
+            real: ExpectedValue::Num(9.75),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_STRING,
+            required: false,
+            default: ExpectedValue::Text("dflt"),
+            real: ExpectedValue::Text("realv"),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_DATE,
+            required: false,
+            default: ExpectedValue::DatePrefix("2024-01-01"),
+            real: ExpectedValue::DatePrefix("2024-07-01"),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_TS,
+            required: false,
+            default: ExpectedValue::DatePrefix("2024-01-01"),
+            real: ExpectedValue::DatePrefix("2024-07-01"),
+        },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_DECIMAL,
+            required: false,
+            default: ExpectedValue::Num(123.45),
+            real: ExpectedValue::Num(678.90),
+        },
+    ]
+}
+
+/// Seed the `initdef` table for all-types initial-default schema evolution (#27).
+///
+/// Sequence (mirrors `seed_renamed_column`):
+///   1. create `initdef` with only `id` (field-id 1) — the pre-add schema
+///   2. append file A: ids `EVO_INITDEF_PRE_ADD_IDS`, physical parquet has `id` only
+///   3. REST commit: add one column per primitive type (field-ids 2..=10), each
+///      with an `initial-default`; `c_bool` REQUIRED, the rest NULLABLE
+///   4. append file B: ids `EVO_INITDEF_POST_ADD_IDS`, all columns with real values
+///
+/// A field-id scan returns `EVO_INITDEF_TOTAL_ROWS` rows: file-A rows carry each
+/// added column's `initial-default`; file-B rows carry the real written values.
+///
+/// Not idempotent: drops and recreates `initdef` so every run starts clean.
+pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-initdef").await?;
+
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let ident = TableIdent::new(ns.clone(), EVO_INITDEF_TABLE.to_string());
+
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for initdef")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    if catalog
+        .table_exists(&ident)
+        .await
+        .context("check initdef table exists")?
+    {
+        catalog
+            .drop_table(&ident)
+            .await
+            .context("drop existing initdef table")?;
+    }
+
+    // 1. Create `initdef` with the pre-add (id-only) schema at format-version 3.
+    // Iceberg requires v3 for non-null `initial-default` values (see the add-schema
+    // commit in step 3); `Schema.checkCompatibility` rejects them on a v2 table.
+    //
+    // NOTE: against the Iceberg REST catalog, `TableCreation::format_version(V3)` is a
+    // no-op (iceberg-rust 0.10.0-rc.2 does not send it in a form the server honors); the
+    // REST create-table protocol derives the format-version from the `format-version`
+    // TABLE PROPERTY (iceberg-java `TableProperties.FORMAT_VERSION`). We set the property
+    // so the server actually creates a v3 table, and assert the result below so this can
+    // never silently regress to v2.
+    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+    let creation = TableCreation::builder()
+        .name(EVO_INITDEF_TABLE.to_string())
+        .schema(initdef_pre_add_schema()?)
+        .partition_spec(partition_spec)
+        .properties(HashMap::from([(
+            "format-version".to_string(),
+            "3".to_string(),
+        )]))
+        .format_version(FormatVersion::V3)
+        .build();
+    let table = catalog
+        .create_table(&ns, creation)
+        .await
+        .context("create initdef table")?;
+    assert_eq!(
+        table.metadata().format_version(),
+        FormatVersion::V3,
+        "initdef table was not created at format-version 3 (non-null initial-default \
+         requires v3); the REST catalog ignored the format-version request"
+    );
+
+    // 2. Append file A under the pre-add schema (only `id` is present).
+    let (a0, a1) = EVO_INITDEF_PRE_ADD_IDS;
+    write_one_file_append(
+        &catalog,
+        &table,
+        EVO_INITDEF_TABLE,
+        [make_initdef_id_only_batch(a0, a1)],
+    )
+    .await
+    .context("append initdef file A (pre-add)")?;
+
+    // 3. Add all primitive-typed columns (field-ids 2..=11) via a raw REST commit.
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .context("reload initdef before add-columns")?;
+    let current_schema_id = table.metadata().current_schema_id();
+    rest_replace_current_schema(
+        catalog_url,
+        E2E_NAMESPACE,
+        EVO_INITDEF_TABLE,
+        current_schema_id,
+        initdef_post_add_schema(current_schema_id + 1)?,
+    )
+    .await
+    .context("REST add-columns commit for initdef")?;
+
+    // 4. Append file B under the post-add schema (real values for every column).
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .context("reload initdef after add-columns")?;
+    assert_eq!(
+        table
+            .metadata()
+            .current_schema()
+            .field_by_id(2)
+            .map(|f| f.name.as_str()),
+        Some(EVO_INITDEF_COL_BOOL),
+        "REST add-columns did not take effect: field-id 2 is not '{EVO_INITDEF_COL_BOOL}'"
+    );
+    let (b0, b1) = EVO_INITDEF_POST_ADD_IDS;
+    write_one_file_append(
+        &catalog,
+        &table,
+        EVO_INITDEF_TABLE,
+        [make_initdef_full_batch(b0, b1)],
+    )
+    .await
+    .context("append initdef file B (post-add)")?;
+
+    Ok(())
+}
+
+/// Pre-add initdef schema: only field-id 1 = `id` (Long).
+fn initdef_pre_add_schema() -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .context("build initdef pre-add Iceberg schema")
+}
+
+/// Post-add initdef schema: `id` plus one column per primitive type (field-ids
+/// 2..=10), each carrying its `initial-default`. `c_bool` is REQUIRED-with-default
+/// (rule (3)'s required branch); the rest are NULLABLE-with-default.
+fn initdef_post_add_schema(schema_id: i32) -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(
+                2,
+                EVO_INITDEF_COL_BOOL,
+                Type::Primitive(PrimitiveType::Boolean),
+            )
+            .with_initial_default(Literal::bool(true))
+            .into(),
+            NestedField::optional(3, EVO_INITDEF_COL_INT, Type::Primitive(PrimitiveType::Int))
+                .with_initial_default(Literal::int(42))
+                .into(),
+            NestedField::optional(
+                4,
+                EVO_INITDEF_COL_LONG,
+                Type::Primitive(PrimitiveType::Long),
+            )
+            .with_initial_default(Literal::long(INITDEF_LONG_DEFAULT))
+            .into(),
+            NestedField::optional(
+                5,
+                EVO_INITDEF_COL_FLOAT,
+                Type::Primitive(PrimitiveType::Float),
+            )
+            .with_initial_default(Literal::float(1.5f32))
+            .into(),
+            NestedField::optional(
+                6,
+                EVO_INITDEF_COL_DOUBLE,
+                Type::Primitive(PrimitiveType::Double),
+            )
+            .with_initial_default(Literal::double(2.5f64))
+            .into(),
+            NestedField::optional(
+                7,
+                EVO_INITDEF_COL_STRING,
+                Type::Primitive(PrimitiveType::String),
+            )
+            .with_initial_default(Literal::string("dflt"))
+            .into(),
+            NestedField::optional(
+                8,
+                EVO_INITDEF_COL_DATE,
+                Type::Primitive(PrimitiveType::Date),
+            )
+            .with_initial_default(Literal::date(BASE_DATE))
+            .into(),
+            NestedField::optional(
+                9,
+                EVO_INITDEF_COL_TS,
+                Type::Primitive(PrimitiveType::Timestamp),
+            )
+            .with_initial_default(Literal::timestamp(INITDEF_DEFAULT_TS_MICROS))
+            .into(),
+            NestedField::optional(
+                10,
+                EVO_INITDEF_COL_DECIMAL,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                }),
+            )
+            .with_initial_default(Literal::decimal(INITDEF_DECIMAL_DEFAULT_UNSCALED))
+            .into(),
+        ])
+        .build()
+        .context("build initdef post-add Iceberg schema")
+}
+
+/// File A batch: only the `id` column (pre-add physical layout).
+fn make_initdef_id_only_batch(first_id: i64, last_id: i64) -> RecordBatch {
+    let ids: Vec<i64> = (first_id..=last_id).collect();
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids))])
+        .expect("initdef id-only RecordBatch construction is infallible")
+}
+
+/// File B batch: `id` plus every added column carrying its real written value.
+/// Arrow types and nullability mirror the post-add Iceberg schema exactly so the
+/// Iceberg parquet writer accepts the batch (decimal is scale-2 Decimal128).
+fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
+    let ids: Vec<i64> = (first_id..=last_id).collect();
+    let n = ids.len();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(EVO_INITDEF_COL_BOOL, DataType::Boolean, false),
+        Field::new(EVO_INITDEF_COL_INT, DataType::Int32, true),
+        Field::new(EVO_INITDEF_COL_LONG, DataType::Int64, true),
+        Field::new(EVO_INITDEF_COL_FLOAT, DataType::Float32, true),
+        Field::new(EVO_INITDEF_COL_DOUBLE, DataType::Float64, true),
+        Field::new(EVO_INITDEF_COL_STRING, DataType::Utf8, true),
+        Field::new(EVO_INITDEF_COL_DATE, DataType::Date32, true),
+        Field::new(
+            EVO_INITDEF_COL_TS,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(EVO_INITDEF_COL_DECIMAL, DataType::Decimal128(9, 2), true),
+    ]));
+
+    let decimals = Decimal128Array::from(vec![INITDEF_DECIMAL_REAL_UNSCALED; n])
+        .with_precision_and_scale(9, 2)
+        .expect("initdef decimal precision/scale is valid");
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(BooleanArray::from(vec![false; n])),
+            Arc::new(Int32Array::from(vec![7i32; n])),
+            Arc::new(Int64Array::from(vec![99i64; n])),
+            Arc::new(Float32Array::from(vec![2.5f32; n])),
+            Arc::new(Float64Array::from(vec![9.75f64; n])),
+            Arc::new(StringArray::from(vec!["realv"; n])),
+            Arc::new(Date32Array::from(vec![INITDEF_REAL_DATE_DAYS; n])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                INITDEF_REAL_TS_MICROS;
+                n
+            ])),
+            Arc::new(decimals),
+        ],
+    )
+    .expect("initdef full RecordBatch construction is infallible")
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,18 +2137,21 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
     .expect("high_card_probe RecordBatch construction is infallible")
 }
 
-/// Apply a column rename to an existing table via a raw Iceberg REST commit.
+/// Replace a table's current schema via a raw Iceberg REST commit.
 ///
-/// A rename is expressed as `add-schema` (a new schema whose renamed field keeps
-/// its field-id) + `set-current-schema` (`schema-id: -1` = the just-added schema),
-/// guarded by an `assert-current-schema-id` requirement. iceberg-rust 0.9.1 has
-/// no public API to build a `TableCommit`, so we POST the commit body directly.
-async fn rest_rename_column(
+/// Expressed as `add-schema` (the new schema, field-ids preserved for stable
+/// fields) + `set-current-schema` (`schema-id: -1` = the just-added schema),
+/// guarded by an `assert-current-schema-id` requirement. iceberg-rust exposes no
+/// public API to build a `TableCommit`, so we POST the commit body directly. This
+/// is the generic schema-evolution primitive behind both the column-rename repro
+/// (`seed_renamed_column`) and the add-columns initial-default fixture
+/// (`seed_added_columns_initial_default`).
+async fn rest_replace_current_schema(
     catalog_url: &str,
     namespace: &str,
     table_name: &str,
     current_schema_id: i32,
-    renamed_schema: IcebergSchema,
+    new_schema: IcebergSchema,
 ) -> Result<()> {
     let base = catalog_url.trim_end_matches('/');
     let client = reqwest::Client::new();
@@ -1727,9 +2183,7 @@ async fn rest_rename_column(
 
     let requirements = vec![TableRequirement::CurrentSchemaIdMatch { current_schema_id }];
     let updates = vec![
-        TableUpdate::AddSchema {
-            schema: renamed_schema,
-        },
+        TableUpdate::AddSchema { schema: new_schema },
         TableUpdate::SetCurrentSchema { schema_id: -1 },
     ];
     let body = serde_json::json!({
@@ -1745,11 +2199,11 @@ async fn rest_rename_column(
         .body(body)
         .send()
         .await
-        .context("POST rename commit to REST catalog")?;
+        .context("POST schema-replace commit to REST catalog")?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("REST rename commit failed ({status}): {text}");
+        anyhow::bail!("REST schema-replace commit failed ({status}): {text}");
     }
     Ok(())
 }
