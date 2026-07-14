@@ -268,6 +268,38 @@ pub struct CatalogProps {
 /// - Timestamps: `"timestamp_us"`, `"timestamp_ns"`,
 ///   `"timestamptz_us"`, `"timestamptz_ns"`
 /// - Decimal: `"decimal128(p,s)"` (e.g. `"decimal128(18,4)"`)
+///
+/// # `initial_default`
+///
+/// Carries the field's Iceberg `initial-default` (the value an absent field
+/// reads for rows written before the field existed — Iceberg column-projection
+/// rule 3), encoded as the RAW primitive scalar in plain text and reconstructed
+/// on the scan side against this same `arrow_type` tag. The encoding is
+/// per-tag; the scan-side reconstruction dispatches on `arrow_type`:
+///
+/// | `arrow_type` | encoded text of `initial_default` |
+/// |---|---|
+/// | `"bool"` | `"true"` / `"false"` |
+/// | `"int32"` | decimal `i32` |
+/// | `"int64"` | decimal `i64` |
+/// | `"float32"` | `f32` in Rust `Display` form (round-trippable) |
+/// | `"float64"` | `f64` in Rust `Display` form (round-trippable) |
+/// | `"utf8"` | the string value verbatim |
+/// | `"date32"` | `i32` days since the Unix epoch |
+/// | `"timestamp_us"` / `"timestamptz_us"` | `i64` microseconds |
+/// | `"timestamp_ns"` / `"timestamptz_ns"` | `i64` nanoseconds |
+/// | `"decimal128(p,s)"` | `i128` unscaled mantissa |
+///
+/// The raw integer (days / micros / nanos) and the `i128` mantissa are stored
+/// directly — NOT Iceberg's canonical single-value strings — so the scan side
+/// reconstructs a `ScalarValue` against the Arrow tag with no second
+/// temporal/decimal parse. A default is present ONLY for a field whose
+/// `PrimitiveType` maps to one of the first-class tags above; a non-primitive
+/// (struct/list/map) default, and a primitive that only reaches the
+/// JSON-fallback `"utf8"` path (`uuid`/`time`/`fixed`/`binary`/oversized
+/// `decimal`), both encode nothing (`None`) and fall through to NULL /
+/// required-error downstream. The encoded text is a bare scalar value, so it is
+/// inherently credential-free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalField {
     /// Iceberg field-id for this column.
@@ -278,6 +310,13 @@ pub struct LogicalField {
     pub arrow_type: String,
     /// Whether the column is nullable (`optional` in Iceberg terms).
     pub nullable: bool,
+    /// Encoded Iceberg `initial-default` for this field (see struct doc for the
+    /// per-tag encoding). `None` (the default) when the field has no
+    /// `initial-default`, the default is non-primitive, or the primitive type
+    /// only reaches the JSON-fallback path. Absent from JSON when `None`, so
+    /// every spec authored before this field existed deserializes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_default: Option<String>,
 }
 
 /// One flattened, top-level entry of the Iceberg `schema.name-mapping.default`
@@ -1363,30 +1402,35 @@ mod tests {
                 name: "id".to_string(),
                 arrow_type: "int32".to_string(),
                 nullable: false,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 2,
                 name: "rating".to_string(),
                 arrow_type: "float64".to_string(),
                 nullable: true,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 3,
                 name: "label".to_string(),
                 arrow_type: "utf8".to_string(),
                 nullable: true,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 4,
                 name: "ts".to_string(),
                 arrow_type: "timestamp_us".to_string(),
                 nullable: true,
+                initial_default: None,
             },
             LogicalField {
                 field_id: 5,
                 name: "amount".to_string(),
                 arrow_type: "decimal128(18,4)".to_string(),
                 nullable: false,
+                initial_default: None,
             },
         ];
         let json = spec.to_json();
@@ -2065,6 +2109,7 @@ mod tests {
                 name: "d_key".into(),
                 arrow_type: "int64".into(),
                 nullable: false,
+                initial_default: None,
             }],
             name_mapping: Vec::new(),
             join_type: JoinType::Inner,
