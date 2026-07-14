@@ -852,7 +852,7 @@ fn exasol_type_to_json(exasol_type: &str) -> Json {
         return json!({"type": "timestamp"});
     }
     if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
-        return json!({"type": "timestamp with local time zone"});
+        return json!({"type": "timestamp", "withLocalTimeZone": true});
     }
     if let Some(inner) = upper
         .strip_prefix("DECIMAL(")
@@ -945,6 +945,18 @@ mod tests {
         let dec = exasol_type_to_json("DECIMAL(18,4)");
         assert_eq!(dec["precision"].as_u64().unwrap(), 18);
         assert_eq!(dec["scale"].as_u64().unwrap(), 4);
+    }
+
+    #[test]
+    fn exasol_type_to_json_timestamp_with_local_time_zone() {
+        let tstz = exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE");
+        assert_eq!(
+            tstz,
+            serde_json::json!({"type": "timestamp", "withLocalTimeZone": true})
+        );
+
+        let ts = exasol_type_to_json("TIMESTAMP");
+        assert_eq!(ts, serde_json::json!({"type": "timestamp"}));
     }
 
     // Minimal UdfContext for dispatch tests that need no I/O. Its `node_count()`
