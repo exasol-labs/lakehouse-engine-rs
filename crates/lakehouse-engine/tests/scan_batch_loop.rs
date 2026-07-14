@@ -13,13 +13,18 @@
 //! These tests drive [`run_scan_one`] once per row against a single-row fake
 //! `UdfContext` backed by local `file://` Parquet, injecting a local-file
 //! `SessionContext` builder so the path runs without an S3 / MinIO stack — the
-//! same seam [`run_raw_scan_with_session`] already exposes for host tests.
+//! same seam [`run_raw_scan_with_session`] already exposes for host tests. This
+//! harness mirrors `run_scan`'s structure (reconstitute spec, build runtime,
+//! run, tear down) but calls [`run_scan_one`] and [`build_scan_runtime`]
+//! directly rather than through `run_scan` itself, so it checks the harness's
+//! own call discipline rather than exercising `run_scan` end to end.
 //!
 //! - `per_row_calls_emit_union_of_all_shards`: N independent per-row calls emit
 //!   the UNION of all shards' disjoint file contents — not just the first row's.
-//! - `run_scan_one_builds_and_tears_down_runtime_per_call`: each per-row call
-//!   constructs its OWN fresh Tokio runtime and tears it down; nothing is cached
-//!   or reused across calls.
+//! - `run_scan_one_builds_and_tears_down_runtime_per_call`: this harness builds
+//!   and tears down its own fresh Tokio runtime per row (mirroring `run_scan`'s
+//!   structure); it does not exercise `run_scan` itself, which calls
+//!   `build_scan_runtime` directly rather than through an injected seam.
 //! - `single_row_call_is_byte_identical_to_direct_raw_scan`: one row through the
 //!   per-row seam is byte-for-byte identical to the unchanged downstream
 //!   [`run_raw_scan_with_session`] path over the same spec.
@@ -226,16 +231,15 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     out
 }
 
-/// Build a fresh Tokio runtime for one per-row scan by calling the PRODUCTION
+/// Build a fresh Tokio runtime for one per-row scan by calling the real
 /// runtime builder [`build_scan_runtime`], recording the construction in `built`.
-/// Every per-row call routes through here, so `built` counts exactly how many
-/// independent production runtimes were constructed — the observable that proves
-/// the runtime is never cached or reused across calls. Because it counts the real
-/// builder (not a test-local lookalike), the assertion genuinely exercises the
-/// scan path: a cached/static runtime reintroduced there would drive this count
-/// below the row count and fail the test. `threads` comes from the row's
-/// `df_threads_per_udf`, so the runtime kind matches what production would size
-/// for this row.
+/// This harness calls the builder once per row by construction, so `built`
+/// counts this test's own call discipline — it does NOT exercise `run_scan`
+/// (the actual UDF entry point), which calls `build_scan_runtime` directly
+/// rather than through an injected seam. A future regression that cached a
+/// runtime inside `run_scan` itself would not be caught by this counter.
+/// `threads` comes from the row's `df_threads_per_udf`, so the runtime kind
+/// matches what production would size for this row.
 fn counting_build_runtime(threads: usize, built: &AtomicUsize) -> tokio::runtime::Runtime {
     built.fetch_add(1, Ordering::SeqCst);
     build_scan_runtime(threads).expect("build per-row runtime")
@@ -301,9 +305,10 @@ fn per_row_calls_emit_union_of_all_shards() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Each scalar `run()` call constructs its OWN fresh Tokio runtime and tears it
-/// down; nothing is cached or reused across calls. Driving N shards constructs
-/// exactly N runtimes.
+/// This harness's `run_one_row` builds and tears down its own fresh Tokio
+/// runtime per row (mirroring `run_scan`'s structure). Driving N shards
+/// constructs exactly N runtimes in the harness — this does not exercise
+/// `run_scan` itself; see [`counting_build_runtime`].
 #[test]
 fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_rt_{}", std::process::id()));
@@ -321,8 +326,8 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     assert_eq!(
         built.load(Ordering::SeqCst),
         specs.len(),
-        "each per-row call must build its OWN runtime (one fresh runtime per row, \
-         never a cached/reused one hoisted across calls)"
+        "harness must build one fresh runtime per row (this checks the harness's own \
+         call discipline, not run_scan's)"
     );
     // Sanity: with one fresh runtime per call, every shard still emits its rows —
     // teardown of each call-local runtime does not drop the next call's output.

@@ -247,7 +247,9 @@ mod distinct_merge_returns_tests {
         }
 
         fn next(&mut self) -> Result<bool, UdfError> {
-            Ok(false)
+            Err(UdfError::User(
+                "RETURNS-style UDF must not call ctx.next()".into(),
+            ))
         }
     }
 
