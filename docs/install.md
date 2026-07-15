@@ -141,13 +141,10 @@ Continue with [step 2](#2-create-the-scripts).
 ## 2. Create the scripts
 
 All four entry points come from the one `.so` (three RUST scripts) plus one plain LUA passthrough
-script; the SLC dispatches the RUST ones by script name. Point `%udf_object` at wherever your
-`.so` landed in step 1:
+script; the SLC dispatches the RUST ones by script name. `%udf_object` depends on where your
+`.so` landed in step 1 — use whichever block below matches:
 
-| Step 1 path | `%udf_object` |
-|---|---|
-| 1a Automated, or 1b via BucketFS UI / raw HTTP PUT | `buckets/bfsdefault/default/udf/liblakehouse_engine.so` |
-| 1b via Exasol SaaS REST API | `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so` |
+### If you used 1a, or 1b via BucketFS UI / raw HTTP PUT
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS LHVS;
@@ -164,6 +161,37 @@ EMITS (...) AS
 CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_DISTINCT_MERGE_COUNT(partials VARCHAR(2000000))
 RETURNS DECIMAL(20,0) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+/
+
+CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
+EMITS (files VARCHAR(2000000)) AS
+function run(ctx)
+    repeat
+        ctx.emit(ctx.files)
+    until not ctx.next()
+end
+/
+```
+
+### If you used 1b via Exasol SaaS REST API
+
+Same DDL, `%udf_object` points at the SaaS extracted path instead:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS LHVS;
+
+CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
+%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
+/
+
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
+EMITS (...) AS
+%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
+/
+
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_DISTINCT_MERGE_COUNT(partials VARCHAR(2000000))
+RETURNS DECIMAL(20,0) AS
+%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
 /
 
 CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
