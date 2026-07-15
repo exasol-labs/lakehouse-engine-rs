@@ -554,6 +554,19 @@ jobs:
         with:
           name: lakehouse-engine-so
 
+      # Manual-install users (e.g. Exasol SaaS, no BucketFS network access)
+      # download this straight off the release page and PUT/UI-upload it
+      # as-is — no local build, no repackaging. The `udf/` layout is what
+      # BucketFS extracts the tarball into; chmod before archiving so the
+      # extracted .so is already executable.
+      - name: Package release tarball
+        if: steps.gate.outputs.release == 'true'
+        run: |
+          mkdir -p pkg/udf
+          cp liblakehouse_engine.so pkg/udf/
+          chmod 755 pkg/udf/liblakehouse_engine.so
+          tar -czf lakehouse-engine.tar.gz -C pkg udf
+
       - name: Install Rust 1.94
         if: steps.gate.outputs.release == 'true'
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
@@ -591,5 +604,5 @@ jobs:
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
           files: |
-            liblakehouse_engine.so
+            lakehouse-engine.tar.gz
             THIRD-PARTY-LICENSES.md
