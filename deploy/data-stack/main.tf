@@ -5,8 +5,8 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   bucket     = "${local.prefix}-lakehouse-${local.account_id}"
   glue_uri   = "https://glue.${var.region}.amazonaws.com/iceberg"
-  # Glue's Iceberg REST endpoint requires the warehouse as 'catalogs/{accountId}'.
-  glue_warehouse = "catalogs/${local.account_id}"
+  # Bare AWS account id; the adapter derives the 'catalogs/{accountId}' REST prefix internally.
+  glue_warehouse = local.account_id
   ssm_root       = "/spot-strata/${var.env_name}"
 }
 
