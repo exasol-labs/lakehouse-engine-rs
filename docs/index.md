@@ -13,7 +13,7 @@ stateless — no caching, no materialization, no data movement.
 
 ## Guides
 
-- [Install](install.md) — build the `.so`, register the Rust SLC, deploy the scripts + CONNECTION (local / Glue / Databricks) + Virtual Schema, run E2E
+- [Install](install.md) — build the `.so`, register the Rust SLC, deploy the scripts + CONNECTION (local / Glue / Databricks) + Virtual Schema, run E2E — plus a fully manual path (curl/SQL, no `exapump` BucketFS access) for platforms like Exasol SaaS
 - [Capabilities](capabilities.md) — pushdown support matrix — what runs in DataFusion vs. Exasol
 - [Architecture](architecture.md) — parallelism, sharding & how pushdown combines with parent-level Exasol execution
 - [Performance](performance.md) — benchmark results
