@@ -134,7 +134,8 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 ### Production (AWS Glue + S3)
 
 The validated production path. Catalog is the Glue Iceberg REST endpoint; `warehouse` is the
-AWS **account id** (not an `s3://` path); SigV4 and vended credentials are on.
+AWS **account id** (not an `s3://` path); SigV4 and vended credentials are on. The adapter
+derives Glue's `catalogs/{account-id}` REST prefix internally — supply only the bare account id.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
