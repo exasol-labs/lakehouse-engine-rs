@@ -42,7 +42,7 @@ starts from source metadata and leaves nothing behind.
 ## Documentation
 
 - [**docs/**](docs/index.md) — documentation index
-- [Install & deploy](docs/install.md) — build the `.so`, register the SLC, create scripts + CONNECTION + VS
+- [Install & deploy](docs/install.md) — build the `.so`, register the SLC, create scripts + CONNECTION + VS. If `exapump`/curl can't reach BucketFS directly (e.g. Exasol SaaS), see [Install](docs/install.md) for a fully manual path — curl/UI upload plus hand-run SQL, no Docker required
 - [Capabilities](docs/capabilities.md) — projection / filter / LIMIT / aggregation pushdown matrix
 - [`specs/`](specs/) — design source of truth (spec-driven development via the `speq` skill)
 
