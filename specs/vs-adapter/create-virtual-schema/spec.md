@@ -25,6 +25,11 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
   to error.
 * Cluster configuration and the Exasol-name to Iceberg-identifier map are recorded in
   `adapterNotes` per `vs-adapter/create-virtual-schema-adapter-notes`.
+* On the SigV4/Glue path the namespace/table enumeration requests address the
+  catalog under the `catalogs/{account-id}` REST prefix derived per
+  `vs-adapter/pushdown-planning-cloud-credentials` — the same derivation used by the
+  `loadTable` path. This enumeration path is the one that produced the Glue
+  `400 "Prefix must follow the 'catalogs/{catalogId}' format."` error (#123).
 
 ## Scenarios
 
@@ -42,6 +47,7 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
 * *AND* a `createVirtualSchema` request that supplies an `ICEBERG_NAMESPACE` property naming an Iceberg namespace (one or more dot-separated levels, e.g. `finance` or `prod.finance`)
 * *WHEN* Exasol sends the `createVirtualSchema` request
 * *THEN* the adapter SHALL list every table contained in that namespace and in each of its descendant namespaces, resolving credentials via `CATALOG_CONNECTION` and SigV4-signing the catalog requests when enabled
+* *AND* when SigV4 is enabled, the adapter SHALL address the namespace and table list requests under the `catalogs/{warehouse}` REST prefix derived per `vs-adapter/pushdown-planning-cloud-credentials`, so a bare-account-id `warehouse` produces the Glue-required `catalogs/{account-id}` prefix
 * *AND* the adapter SHALL return a JSON response describing one virtual table per discovered Iceberg table, whose Exasol name is the namespace segments below the configured namespace plus the table name joined with `__` and uppercased, mapping each Iceberg field to an Exasol SQL type per the type-mapping table and declaring any incompatible type as VARCHAR rather than failing
 * *AND* the adapter MUST NOT persist any catalog metadata between requests other than the table-name map recorded in `adapterNotes`
 
