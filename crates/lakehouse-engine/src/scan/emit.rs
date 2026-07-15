@@ -941,6 +941,67 @@ mod tests {
         );
     }
 
+    /// Scenario (#118): a timezone-aware `Timestamp(Microsecond, Some("UTC"))`
+    /// column declared `EMITS "TIMESTAMP"` is coerced to `Timestamp(Microsecond,
+    /// None)` with the underlying UTC epoch value preserved bit-for-bit — no shift.
+    ///
+    /// This is the emit-boundary half of the Iceberg-timestamptz → plain Exasol
+    /// TIMESTAMP fix: `iceberg_primitive_to_exasol` now declares timestamptz as
+    /// "TIMESTAMP", so `exasol_type_to_arrow("TIMESTAMP")` = `Timestamp(us, None)`
+    /// is the coercion target. An Iceberg timestamptz is a UTC instant (stored as
+    /// UTC, not retaining a source zone), so stripping the timezone must keep the
+    /// instant unchanged rather than localizing it.
+    #[test]
+    fn coerce_timestamptz_column_to_plain_timestamp_preserves_utc() {
+        use arrow::array::{Array, TimestampMicrosecondArray};
+        use arrow::datatypes::{Field, TimeUnit};
+
+        // Raw micros-since-epoch values, treated as UTC instants. Includes the
+        // Iceberg-spec example instant (2017-11-17 01:10:34 UTC), the epoch, and a
+        // pre-epoch value so any spurious timezone shift would move a value.
+        let raw_micros: Vec<i64> = vec![1_510_881_034_000_000, 0, -1_000_000];
+
+        let src_arr = TimestampMicrosecondArray::from(raw_micros.clone()).with_timezone("UTC");
+        assert_eq!(
+            src_arr.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "source column must be a tz-aware UTC timestamp"
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(src_arr)]).unwrap();
+
+        // Declared EMITS type is plain "TIMESTAMP" (the post-fix timestamptz mapping).
+        let exa_types = vec!["TIMESTAMP".to_string()];
+        let coerced = coerce_batch_to_exa_types(batch, &exa_types)
+            .expect("timestamptz→TIMESTAMP coercion must succeed");
+
+        // The coerced column must be timezone-naive Timestamp(Microsecond, None).
+        assert_eq!(
+            coerced.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            "column must be stripped to a timezone-naive TIMESTAMP"
+        );
+
+        // The underlying epoch values must be preserved bit-for-bit (no shift).
+        let out = coerced
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("coerced column must be a TimestampMicrosecondArray");
+        for (i, &expected) in raw_micros.iter().enumerate() {
+            assert_eq!(
+                out.value(i),
+                expected,
+                "raw micros value at row {i} must be identical after the tz-strip cast"
+            );
+        }
+    }
+
     /// Scenario: emit_stream coerces each column to its declared EMITS ExaType
     /// before emit_batch — end-to-end through the IPC round-trip.
     ///
