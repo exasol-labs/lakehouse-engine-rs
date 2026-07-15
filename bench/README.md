@@ -247,7 +247,7 @@ a fresh path forces a clean fetch.
 
 ## Remote Glue (AWS) gotchas
 
-- `GLUE_WAREHOUSE` must be the REST prefix Glue's `/v1/config` reports —
-  `catalogs/<account-id>`, NOT an `s3://` path and NOT the bare account id.
+- `GLUE_WAREHOUSE` is the bare account id (matches `.env.example` and `install.md`), NOT
+  an `s3://` path. The adapter derives the `catalogs/<account-id>` REST prefix internally.
 - The S3 data endpoint defaults to `https://s3.$AWS_REGION.amazonaws.com`; the scan
   derives the virtual-hosted bucket URL from the region (no explicit endpoint).
