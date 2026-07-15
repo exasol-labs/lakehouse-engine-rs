@@ -114,9 +114,10 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
             let raw = timestamp_to_micros(col, row, unit);
             let ndt = micros_to_naive_datetime(raw);
             if tz_opt.is_some() {
-                // TIMESTAMP WITH LOCAL TIME ZONE — Exasol expects UTC normalised value
-                // represented as a NaiveDateTime (it applies the session TZ itself).
-                // We store the UTC NaiveDateTime.
+                // Iceberg timestamptz feeds Exasol plain TIMESTAMP (Exasol rejects
+                // TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type). The
+                // Arrow value is already the UTC instant; normalise it to a
+                // NaiveDateTime carrying that same UTC wall-clock value.
                 let utc: DateTime<Utc> = Utc.from_utc_datetime(&ndt);
                 Value::Timestamp(utc.naive_utc())
             } else {
@@ -380,6 +381,24 @@ mod tests {
             ),
             "incompatible type must not produce numeric/bool Value, got {v:?}"
         );
+    }
+
+    /// Scenario: a timezone-aware `Timestamp(Microsecond, Some("UTC"))` column (the
+    /// internal Arrow representation of an Iceberg timestamptz) converts to a
+    /// `Value::Timestamp` at the correct UTC wall-clock instant — the value Exasol
+    /// receives as plain TIMESTAMP.
+    #[test]
+    fn tz_aware_timestamp_converts_to_utc_instant_value() {
+        // 2024-01-01T00:00:00Z, a known UTC instant, in epoch microseconds.
+        let epoch_micros: i64 = 1_704_067_200_000_000;
+        let arr = TimestampMicrosecondArray::from(vec![Some(epoch_micros)]).with_timezone("UTC");
+        let batch = single_col_batch("ts", Arc::new(arr));
+        let rows = batch_to_rows(&batch);
+        let expected = NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        assert_eq!(rows[0][0], Value::Timestamp(expected));
     }
 
     #[test]

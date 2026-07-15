@@ -45,12 +45,14 @@ column is nullable and defines no default.
   error. This is a deliberate trade-off: Exasol has no struct / list / map types (those
   columns surface only as JSON-fallback VARCHAR), and the Iceberg spec itself requires
   columns of `unknown`, `variant`, `geometry`, and `geography` types to default to null.
-* Timestamptz is excluded from the all-types E2E fixture: Exasol rejects `TIMESTAMP WITH
-  LOCAL TIME ZONE` as a UDF `EMITS` output type (`sqlCode 22002: Column type not supported`),
-  so a timestamptz value cannot cross the scan UDF emit boundary. This is a scan-emit
-  limitation, not an initial-default-logic gap — timestamptz initial-default reconstruction
-  stays fully covered by the unit round-trip test (the `timestamptz_us` / `timestamptz_ns`
-  tags in the round-trip scenario). Tracked as an accurately-scoped exception (#118).
+* Timestamptz IS covered by the all-types initial-default E2E fixture: an Iceberg
+  `timestamptz` column is declared and emitted as plain Exasol `TIMESTAMP` (see
+  `datafusion-scan/type-mapping`) carrying the UTC-instant value, so it crosses the scan UDF
+  emit boundary like any other primitive. Micros-precision `timestamptz` is exercised
+  end-to-end by the fixture; nanosecond-precision `timestamptz_ns` (like `timestamp_ns`) is
+  not Iceberg-expressible in this catalog version and stays covered by the unit round-trip
+  test (the `timestamptz_us` / `timestamptz_ns` tags in the round-trip scenario). The former
+  `TIMESTAMP WITH LOCAL TIME ZONE` emit exclusion is closed (#118).
 * The adapter delegates type divergence → cast and, for an absent field with no encoded
   default, null-fill (nullable) or required-missing → clean error to
   `DefaultPhysicalExprAdapter`. The `initial-default` fill intercepts the absent-field case
@@ -155,6 +157,7 @@ column is nullable and defines no default.
 * *AND* the UDF SHALL emit the real physical values for those columns for rows from the file that carries the field-id, so the default fill is decided per file from that file's present field-ids
 * *AND* a column whose field-id DOES resolve to a physical column (by embedded field-id or by name-mapping) SHALL bind to that column's real values and MUST NOT be replaced by its `initial-default`
 * *AND* the UDF MUST NOT consult `write-default` for any column
+* *AND* this resolution SHALL hold for every supported primitive type in the all-types fixture, including an Iceberg `timestamptz` column declared and emitted as plain Exasol `TIMESTAMP` (see `datafusion-scan/type-mapping`), which MUST cross the scan UDF emit boundary without a `sqlCode 22002` type error
 
 ### Scenario: Added required column absent from a file with no initial-default errors cleanly
 
