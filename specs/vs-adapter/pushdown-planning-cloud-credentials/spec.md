@@ -7,6 +7,17 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * SigV4 signing and credential vending are opt-in per CONNECTION (`use_sigv4`,
   `use_vended_credentials`); both default to false so existing MinIO/REST stacks
   behave exactly as before.
+* On the SigV4/Glue path the adapter derives the REST catalog prefix by
+  unconditionally prepending `catalogs/` to the configured bare-account-id
+  `warehouse`, because AWS Glue's Iceberg REST catalog requires the prefix in the
+  `catalogs/{catalogId}` form. The user-facing `warehouse` remains the bare AWS
+  account id; the adapter appends `catalogs/` so the user never supplies it. This
+  derivation extends the deliberate SigV4 `/v1/config` short-circuit already
+  recorded in `specs/_decision/001-migrate-legacy-decision-log.md`; the
+  `catalogs/{id}` shape is a Glue-proprietary convention, not an Apache Iceberg
+  REST spec requirement. The derivation applies only to Glue — `CatalogAuth::Sigv4`
+  is today exclusively the Glue path — and does NOT generalize to other SigV4-style
+  catalogs such as S3 Tables (#123).
 * **`use_vended_credentials` is orthogonal to catalog authentication.** Vended S3
   credential extraction is gated SOLELY on `use_vended_credentials`, never on the
   catalog-auth mode. It applies identically across all four auth modes: no-auth,
@@ -89,3 +100,12 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL place the static `access_key`, `secret_key`, and optional `session_token` from the CONNECTION into each scan spec storage block
 * *AND* the adapter MUST NOT attempt to read vended credentials from the `loadTable` response on any catalog-auth mode
+
+### Scenario: SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request
+
+* *GIVEN* a virtual schema whose CONNECTION credentials set `use_sigv4` to true and set `warehouse` to a bare AWS account id (e.g. `123456789012`)
+* *WHEN* the adapter issues a self-issued catalog HTTP request under SigV4 — the `loadTable` GET that resolves the file list during `pushdown`, or the namespace/table list GETs that enumerate tables during `createVirtualSchema`
+* *THEN* the adapter SHALL address the catalog under the REST prefix `catalogs/{warehouse}`, derived by unconditionally prepending `catalogs/` to the configured `warehouse`, so account id `123456789012` yields the path segment `catalogs/123456789012`
+* *AND* the adapter SHALL apply this identical derived prefix on both the `loadTable` path and the namespace/table enumeration path, from one shared derivation
+* *AND* the adapter MUST NOT contact the `/v1/config` endpoint to resolve the prefix on the SigV4/Glue path
+* *AND* the SigV4 signing keys MUST NOT appear in any returned SQL string or error message
