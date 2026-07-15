@@ -28,8 +28,12 @@ pub fn arrow_to_exasol_type(dt: &DataType) -> String {
 
         DataType::Date32 => "DATE".to_string(),
 
-        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
+        // Both timezone-naive and timezone-aware timestamps map to plain Exasol
+        // TIMESTAMP: Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS
+        // output type, and an Iceberg timestamptz is a UTC instant, so the emitted
+        // value is unchanged. The internal tz-aware Arrow label is preserved
+        // elsewhere (arrow_type_to_tag / exasol_type_to_arrow).
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
 
         DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
             format!("DECIMAL({p},{s})")
@@ -191,8 +195,12 @@ pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String 
         Date => "DATE".to_string(),
         // Time has no Exasol equivalent → VARCHAR via JSON
         Time => "VARCHAR(2000000)".to_string(),
-        Timestamp | TimestampNs => "TIMESTAMP".to_string(),
-        Timestamptz | TimestamptzNs => "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
+        // timestamptz collapses to plain Exasol TIMESTAMP alongside timestamp:
+        // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type,
+        // and an Iceberg timestamptz is a UTC instant, so the emitted value is
+        // unchanged. The internal tz-aware Arrow representation is kept in
+        // iceberg_primitive_to_arrow.
+        Timestamp | TimestampNs | Timestamptz | TimestamptzNs => "TIMESTAMP".to_string(),
         String | Uuid => "VARCHAR(2000000)".to_string(),
         // Fixed-width binary and arbitrary binary → VARCHAR via JSON
         Fixed(_) | Binary => "VARCHAR(2000000)".to_string(),
@@ -351,7 +359,7 @@ mod tests {
                 TimeUnit::Microsecond,
                 Some("UTC".into())
             )),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
+            "TIMESTAMP"
         );
     }
 
@@ -469,7 +477,7 @@ mod tests {
         );
         assert_eq!(
             iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamptz)),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
+            "TIMESTAMP"
         );
         // in-range decimal
         assert_eq!(
@@ -796,10 +804,7 @@ mod tests {
         assert!(!needs_json_fallback(&ts_no_tz));
 
         let ts_tz = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-        assert_eq!(
-            arrow_to_exasol_type(&ts_tz),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
-        );
+        assert_eq!(arrow_to_exasol_type(&ts_tz), "TIMESTAMP");
         assert!(!needs_json_fallback(&ts_tz));
     }
 }
