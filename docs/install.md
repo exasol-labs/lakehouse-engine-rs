@@ -43,7 +43,7 @@ Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both
 ## 2. Register the Rust SLC
 
 ```sh
-make install-slc               # downloads lc-rust 0.20.3, uploads to BucketFS, sets the RUST alias
+make install-slc               # downloads lc-rust 0.21.0, uploads to BucketFS, sets the RUST alias
 ```
 
 Uploads the SLC to BucketFS `/default/slc/` and registers `SCRIPT_LANGUAGES` with a `RUST=` alias (replacing any existing one).
