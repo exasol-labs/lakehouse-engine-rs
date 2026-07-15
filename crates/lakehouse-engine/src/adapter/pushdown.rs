@@ -193,22 +193,22 @@ fn build_s3_file_io(storage: &StorageProps) -> iceberg::io::FileIO {
 }
 
 /// Build the `loadTable` REST URL matching iceberg-catalog-rest's `table_endpoint` pattern:
-/// `{catalog_uri}/v1/{warehouse?}/namespaces/{ns_url}/tables/{table_name}`
+/// `{catalog_uri}/v1/{prefix?}/namespaces/{ns_url}/tables/{table_name}`
 ///
-/// The `warehouse` parameter acts as the URL prefix (matching `props["prefix"]` in the
-/// iceberg-catalog-rest config map). For AWS Glue, this is the catalog ID / warehouse ARN;
-/// for a plain REST catalog it is typically the warehouse name. When empty, the prefix is
-/// omitted and the URL reduces to `{catalog_uri}/v1/namespaces/{ns}/tables/{table}`.
+/// The `warehouse` parameter is the already-resolved URL prefix string (matching
+/// `props["prefix"]` in the iceberg-catalog-rest config map); the name is historical —
+/// the caller passes the resolved prefix, not a raw connection warehouse.
+/// `resolve_load_table_prefix` produces it upstream: for SigV4/Glue the derived
+/// `catalogs/{account-id}` segment (via `glue_catalog_prefix`), for Databricks-style
+/// catalogs the `overrides.prefix` fetched from `GET {catalog_uri}/v1/config?warehouse=…`,
+/// and for plain REST catalogs typically empty. When empty, the prefix is omitted and the
+/// URL reduces to `{catalog_uri}/v1/namespaces/{ns}/tables/{table}`.
 ///
-/// The caller passes the resolved URL prefix as `warehouse`: either the raw
-/// connection warehouse, or the `overrides.prefix` fetched from
-/// `GET {catalog_uri}/v1/config?warehouse=…` by `resolve_load_table_prefix` for
-/// Databricks-style catalogs that address tables under a config-supplied prefix.
-///
-/// ponytail: For AWS Glue the warehouse value is a catalog ARN
-/// (`arn:aws:glue:region:acct:catalog`) and is inserted verbatim into the URL path — no
-/// URL-encoding. This works because the Glue Iceberg REST endpoint expects the ARN
-/// unencoded in that path segment. Non-ASCII prefixes are not URL-encoded here.
+/// The prefix is inserted verbatim — no URL-encoding — so a multi-segment prefix such as
+/// the Glue `catalogs/{account-id}` form keeps its `/` literal, and any reserved characters
+/// pass through unchanged. This is a low-level, format-agnostic builder: it inserts whatever
+/// prefix string it is given and does not interpret its shape. Non-ASCII prefixes are not
+/// URL-encoded here.
 fn build_load_table_url(catalog_uri: &str, warehouse: &str, ns: &str, table_name: &str) -> String {
     let base = format!("{catalog_uri}/v1");
     if warehouse.is_empty() {
@@ -443,6 +443,20 @@ async fn authed_get_json<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Derive the AWS Glue Iceberg REST catalog prefix path segment from a
+/// bare-account-id `warehouse` value.
+///
+/// AWS Glue's Iceberg REST catalog requires the REST prefix in the form
+/// `catalogs/{catalogId}` — the bare AWS account id is the correct
+/// user-facing `warehouse` value (standard Iceberg clients derive
+/// `catalogs/{account-id}` internally). This is a Glue-proprietary
+/// convention: `CatalogAuth::Sigv4` is exclusively the Glue path today, so
+/// this derivation is applied unconditionally here rather than gated on a
+/// separate auth check.
+fn glue_catalog_prefix(warehouse: &str) -> String {
+    format!("catalogs/{warehouse}")
+}
+
 /// Resolve the `loadTable` URL prefix from the catalog config endpoint.
 ///
 /// `GET {catalog_uri}/v1/config?warehouse=<warehouse>` → `overrides.prefix`.
@@ -455,18 +469,18 @@ async fn authed_get_json<T: serde::de::DeserializeOwned>(
 /// Inserting the warehouse as a path segment would yield a malformed URL
 /// (e.g. `/v1/s3://warehouse//namespaces/…` → HTTP 400).
 ///
-/// The SigV4/Glue path short-circuits immediately: the warehouse is an ARN used
-/// verbatim in the URL path (no config round-trip), preserving byte-identical
-/// behaviour with the pre-unification `load_table_signed` function.
+/// The SigV4/Glue path short-circuits immediately: the prefix is derived from
+/// the warehouse via `glue_catalog_prefix` (`catalogs/{warehouse}`, AWS Glue's
+/// required REST prefix format) — no config round-trip.
 async fn resolve_load_table_prefix(
     catalog_uri: &str,
     warehouse: &str,
     auth: &CatalogAuth,
     creds: &ConnectionCreds,
 ) -> String {
-    // SigV4/Glue: the warehouse ARN is used directly — no /v1/config round-trip.
+    // SigV4/Glue: the prefix is derived from the warehouse — no /v1/config round-trip.
     if let CatalogAuth::Sigv4 = auth {
-        return warehouse.to_string();
+        return glue_catalog_prefix(warehouse);
     }
     let encoded_warehouse: String =
         url::form_urlencoded::byte_serialize(warehouse.as_bytes()).collect();
@@ -3263,7 +3277,9 @@ pub async fn resolve_table_schema(
 /// Enumerate every `TableIdent` in the configured namespace and all descendants.
 ///
 /// Branches on `creds.use_sigv4`: unsigned path uses `RestCatalog::list_namespaces`
-/// and `list_tables`; signed path issues SigV4-signed GETs directly.
+/// and `list_tables`; signed path issues SigV4-signed GETs directly against the
+/// `catalogs/{warehouse}` prefix derived by `glue_catalog_prefix` (AWS Glue's
+/// required REST prefix format).
 ///
 /// The configured namespace is passed as split segments (e.g. `["prod","finance"]`).
 /// Credentials NEVER appear in returned errors.
@@ -3282,7 +3298,8 @@ pub async fn list_namespace_tables(
     })?;
 
     if creds.use_sigv4 {
-        list_in_namespace_signed(catalog_uri, &ns_ident, &creds.warehouse, creds).await
+        let prefix = glue_catalog_prefix(&creds.warehouse);
+        list_in_namespace_signed(catalog_uri, &ns_ident, &prefix, creds).await
     } else {
         list_namespace_tables_unsigned(catalog_uri, &ns_ident, &creds.warehouse, storage, creds)
             .await
@@ -13819,29 +13836,60 @@ mod tests {
         );
     }
 
-    /// Scenario: build_load_table_url inserts an ARN-shaped warehouse verbatim.
+    /// Scenario: build_load_table_url inserts an already-resolved prefix verbatim,
+    /// with no URL-encoding of reserved characters or path separators.
     ///
-    /// For AWS Glue the warehouse value is a catalog ARN
-    /// (`arn:aws:glue:region:acct:catalog`). The current implementation places it
-    /// verbatim in the URL path — no URL-encoding, no config-endpoint round-trip.
-    /// This test pins that behaviour so a future refactor (config-endpoint prefix
-    /// fetch or URL-encoding) does not regress silently.
+    /// This low-level builder inserts whatever prefix string it is given exactly as-is:
+    /// reserved characters (`:`) and internal separators (`/`) are NOT percent-encoded.
+    /// The invariant guards the derived Glue `catalogs/{account-id}` prefix — whose `/`
+    /// must stay literal — against a future URL-encoding refactor regressing it silently.
+    /// (`build_load_table_url_with_warehouse_prefix` exercises only an all-digit prefix,
+    /// which URL-encoding would leave unchanged, so it cannot catch such a regression.)
     #[test]
-    fn build_load_table_url_with_arn_shaped_warehouse() {
-        let arn = "arn:aws:glue:us-east-1:123456789012:catalog";
+    fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
+        let prefix = "raw:prefix/extra";
         let url = build_load_table_url(
             "https://glue.us-east-1.amazonaws.com/iceberg",
-            arn,
+            prefix,
             "mydb",
             "orders",
         );
-        // The ARN appears verbatim between /v1/ and /namespaces/.
         assert_eq!(
             url,
             format!(
-                "https://glue.us-east-1.amazonaws.com/iceberg/v1/{arn}/namespaces/mydb/tables/orders"
+                "https://glue.us-east-1.amazonaws.com/iceberg/v1/{prefix}/namespaces/mydb/tables/orders"
             ),
-            "ARN must be inserted verbatim (ponytail: no URL-encoding; upgrade path is config-endpoint fetch)"
+            "prefix must be inserted verbatim — `:` and `/` left unencoded"
+        );
+    }
+
+    /// Scenario: glue_catalog_prefix derives the `catalogs/{warehouse}` segment
+    /// AWS Glue's Iceberg REST catalog requires as its prefix path segment.
+    #[test]
+    fn glue_catalog_prefix_derives_catalogs_segment() {
+        assert_eq!(
+            glue_catalog_prefix("123456789012"),
+            "catalogs/123456789012",
+            "Glue prefix must be catalogs/{{warehouse}}"
+        );
+    }
+
+    /// Scenario: end-to-end — the `catalogs/{account-id}` prefix `glue_catalog_prefix`
+    /// derives flows through `build_load_table_url` into the actual `loadTable` URL,
+    /// landing in the `{uri}/v1/{prefix}/namespaces/{ns}/tables/{table}` slot.
+    #[test]
+    fn build_load_table_url_glue_carries_catalogs_prefix() {
+        let prefix = glue_catalog_prefix("123456789012");
+        let url = build_load_table_url(
+            "https://glue.us-east-1.amazonaws.com/iceberg",
+            &prefix,
+            "db",
+            "events",
+        );
+        assert_eq!(
+            url,
+            "https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/123456789012/namespaces/db/tables/events",
+            "derived catalogs/{{account-id}} prefix must appear verbatim in the loadTable URL: {url}"
         );
     }
 
@@ -15325,26 +15373,29 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // R1 — SigV4 skips /v1/config round-trip, uses warehouse directly
+    // R1 — SigV4 skips /v1/config round-trip, derives the catalogs/{account-id} prefix
     // ---------------------------------------------------------------------------
 
     /// Scenario: The SigV4 path short-circuits `resolve_load_table_prefix` and
-    /// returns the warehouse ARN unchanged, even when the catalog server would
-    /// return a DIFFERENT prefix.
+    /// returns the derived `catalogs/{warehouse}` prefix (AWS Glue's required
+    /// REST prefix form), even when the catalog server would return a DIFFERENT
+    /// prefix.
     ///
     /// A local HTTP server is started that responds with `overrides.prefix` =
     /// `"server-returned-prefix"`. For non-SigV4, that prefix would be used.
-    /// For SigV4, the function must return the original warehouse ARN WITHOUT
+    /// For SigV4, the function must return `catalogs/{warehouse}` WITHOUT
     /// contacting the server — proved by the contrast with the paired non-SigV4
-    /// test `non_sigv4_config_prefix_resolution_uses_config_endpoint`.
+    /// test `non_sigv4_config_prefix_resolution_uses_config_endpoint`. `warehouse`
+    /// is the bare AWS account id (the documented input shape) rather than an
+    /// ARN — an ARN-shaped warehouse is not a supported input.
     #[tokio::test]
-    async fn sigv4_skips_config_prefix_lookup_uses_warehouse_directly() {
+    async fn sigv4_resolve_prefix_derives_catalogs_segment() {
         use std::net::SocketAddr;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
         // Bind a local server that returns a DIFFERENT prefix. If SigV4 contacted
-        // it, the result would differ from the warehouse ARN.
+        // it, the result would differ from the derived catalogs/{warehouse} prefix.
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
         let addr: SocketAddr = listener.local_addr().expect("local_addr");
         let port = addr.port();
@@ -15367,17 +15418,18 @@ mod tests {
         });
 
         let catalog_uri = format!("http://127.0.0.1:{port}");
-        let warehouse_arn = "arn:aws:glue:us-east-1:123456789012:catalog";
+        let warehouse = "123456789012";
 
         let mut creds = base_creds();
         creds.use_sigv4 = true;
         let auth = CatalogAuth::Sigv4;
 
-        let result = resolve_load_table_prefix(&catalog_uri, warehouse_arn, &auth, &creds).await;
+        let result = resolve_load_table_prefix(&catalog_uri, warehouse, &auth, &creds).await;
 
         assert_eq!(
-            result, warehouse_arn,
-            "SigV4 path must return the warehouse ARN directly, \
+            result,
+            format!("catalogs/{warehouse}"),
+            "SigV4 path must return the derived catalogs/{{warehouse}} prefix, \
              ignoring the server-side overrides.prefix"
         );
         assert_ne!(
@@ -15429,6 +15481,91 @@ mod tests {
         assert_eq!(
             result, resolved_prefix,
             "non-SigV4 path must use the prefix from /v1/config overrides"
+        );
+    }
+
+    /// Scenario: end-to-end — `list_namespace_tables`'s SigV4 enumeration path
+    /// (`list_in_namespace_signed` / `build_list_tables_url`) signs its
+    /// `list_tables` request against the derived `catalogs/{account-id}` prefix,
+    /// not the bare warehouse. This path bypasses `resolve_load_table_prefix`
+    /// entirely (it is `create-virtual-schema`'s namespace-enumeration path), so
+    /// it needs its own proof that `glue_catalog_prefix` reached it too.
+    ///
+    /// A local HTTP server captures the raw request line of the `list_tables`
+    /// GET. Any follow-up `list_namespaces?parent=` request (child-namespace
+    /// recursion) is left unanswered — `list_in_namespace_signed` treats that as
+    /// a flat catalog (no children) and returns, matching AWS Glue's actual
+    /// behavior of rejecting nested-namespace listing.
+    #[tokio::test]
+    async fn list_tables_signed_url_carries_catalogs_prefix() {
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        let captured_request_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured = captured_request_line.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let request_line = request.lines().next().unwrap_or("").to_string();
+
+                // Only the list_tables request (never the list_namespaces
+                // recursion request) gets a reply — an AWS Glue-shaped flat
+                // catalog. See `list_in_namespace_signed`'s "ponytail" fallback.
+                if !request_line.contains("?parent=") {
+                    *captured.lock().unwrap() = Some(request_line);
+                    let body = r#"{"identifiers":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let storage = static_storage();
+        let mut creds = base_creds();
+        creds.use_sigv4 = true;
+        creds.warehouse = "123456789012".into();
+
+        let result =
+            list_namespace_tables(&catalog_uri, &["db".to_string()], &storage, &creds).await;
+
+        assert!(
+            result.is_ok(),
+            "expected the enumeration to succeed: {:?}",
+            result.err()
+        );
+
+        let request_line = captured_request_line
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the list_tables request must have been captured");
+        assert!(
+            request_line.contains("/v1/catalogs/123456789012/namespaces/db/tables"),
+            "signed list_tables URL must carry the derived catalogs/{{account-id}} prefix: {request_line}"
+        );
+        assert!(
+            !request_line.contains("/v1/123456789012/namespaces"),
+            "signed list_tables URL must NOT use the bare warehouse as the prefix: {request_line}"
         );
     }
 
