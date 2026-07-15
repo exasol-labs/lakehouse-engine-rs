@@ -4,10 +4,10 @@
 
 # Install & Deploy
 
-Build the UDF `.so`, register the Rust SLC, upload the binary, then create the scripts,
-the catalog CONNECTION, and the Virtual Schema. The `make` targets below automate the
-build/upload steps against the bundled Docker stack; the SQL steps run on any Exasol
-cluster.
+With the Rust SLC already installed and registered (see [Prerequisites](#prerequisites)),
+build the UDF `.so`, upload the binary, then create the scripts, the catalog CONNECTION, and
+the Virtual Schema. The `make` targets below automate the build/upload steps against the
+bundled Docker stack; the SQL steps run on any Exasol cluster.
 
 | Path | When to use |
 |---|---|
@@ -19,6 +19,11 @@ cluster.
 - **Docker** — the `.so` is built inside `rust:1.94-bookworm` (glibc 2.36) to match the SLC.
 - **Rust toolchain** — host unit tests only (`cargo test`, debug). Never `cargo build --release` on the host: a host-glibc `.so` fails to load inside Exasol.
 - **[`exapump`](https://github.com/exasol-labs/exapump)** — Exasol/BucketFS CLI used by the `make` targets.
+- **The Rust SLC installed and registered** — see
+  [language-container-rs](https://github.com/exasol-labs/language-container-rs) for install
+  instructions. The installed SLC version must match this project's `exasol-udf-sdk` /
+  `exasol-udf-macros` version (see `Cargo.toml`) — a mismatch fails the fingerprint smoke test
+  below.
 - **An Exasol cluster + BucketFS**, an **Iceberg REST catalog**, and **S3-compatible storage**.
 - All DSNs include `validateservercertificate=0` (self-signed Docker cert).
 
@@ -40,21 +45,13 @@ make cross-musl-udf-build      # → target/release/liblakehouse_engine.so
 
 Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both** entry points (VS adapter + scan SCALAR UDF). The `LAKEHOUSE_DISTRIBUTE_FILES` distributor is a separate LUA SET script created by plain DDL — no `.so` symbol.
 
-## 2. Register the Rust SLC
-
-```sh
-make install-slc               # downloads lc-rust 0.21.0, uploads to BucketFS, sets the RUST alias
-```
-
-Uploads the SLC to BucketFS `/default/slc/` and registers `SCRIPT_LANGUAGES` with a `RUST=` alias (replacing any existing one).
-
-## 3. Upload the `.so`
+## 2. Upload the `.so`
 
 ```sh
 make bucketfs-upload-so         # → BucketFS /default/udf/liblakehouse_engine.so
 ```
 
-## 4. Create the scripts
+## 3. Create the scripts
 
 All four entry points come from the one `.so` (three RUST scripts) plus one plain LUA passthrough
 script; the SLC dispatches the RUST ones by script name.
@@ -97,7 +94,7 @@ All three RUST scripts and `LAKEHOUSE_DISTRIBUTE_FILES` MUST be created in the s
 `LAKEHOUSE_ADAPTER` (here, `LHVS`) — the adapter qualifies its calls to them using its own
 running-script schema, not a configured property.
 
-## 5. Create the catalog CONNECTION
+## 4. Create the catalog CONNECTION
 
 Catalog URI goes in `TO`; S3 + warehouse credentials go in the `IDENTIFIED BY` JSON password.
 The fields are the same across backends; only their values and a few flags differ.
@@ -175,7 +172,7 @@ exact endpoint/auth shape for a Databricks workspace is not yet exercised by the
 this repo — treat the Glue recipe as the template and adjust the catalog URI and credential
 flags to the Databricks endpoint.
 
-## 6. Create the Virtual Schema
+## 5. Create the Virtual Schema
 
 ```sql
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
@@ -187,7 +184,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 | Property | Required | Meaning |
 |---|---|---|
-| `CATALOG_CONNECTION` | yes | Name of the CONNECTION object from step 5 |
+| `CATALOG_CONNECTION` | yes | Name of the CONNECTION object from step 4 |
 | `ICEBERG_NAMESPACE` | yes | Iceberg namespace; **every table in it** is exposed as a virtual table |
 | `ALLOW_HTTP` | no | `'true'` to allow plain-HTTP catalog/S3 (e.g. local MinIO) |
 | `PARALLELISM_FACTOR` | no | Work-unit oversubscription multiplier (G = node_count × factor, capped 300) |
@@ -196,7 +193,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 | `MEMORY_POOL_FRACTION` | no | Fraction of the per-instance memory limit given to the DataFusion pool |
 | `INSTANCE_OVERHEAD_MB` | no | Reserved non-pool overhead per instance, in MB |
 
-## 7. Query
+## 6. Query
 
 ```sql
 SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
@@ -209,57 +206,45 @@ Projection, filter predicates, `LIMIT`, and aggregation are pushed down. See
 
 Use this path when `exapump`/curl can't reach BucketFS directly — e.g. **Exasol SaaS**, which
 exposes only a BucketFS upload UI and a presigned-URL REST API, never the raw BucketFS ports.
-Every step below is a plain `curl`/SQL command (or a UI action) — no Docker or `exapump` BucketFS
-access required. It replaces steps 2-3 above (SLC registration + `.so` upload); steps 5-7
-(catalog CONNECTION, Virtual Schema, query) are unchanged and unaffected by which path you took.
+No Docker, no Rust toolchain, no local build — every step below is either downloading a prebuilt
+release artifact, a plain `curl`/SQL command, or a UI action. It replaces steps 1-2 above (build +
+`.so` upload); steps 4-6 (catalog CONNECTION, Virtual Schema, query) are unchanged and unaffected
+by which path you took. The Rust SLC itself is a [prerequisite](#prerequisites) — install and
+register it via [language-container-rs](https://github.com/exasol-labs/language-container-rs)
+before starting here.
 
-### Step 1 — Package the artifacts
+### Step 1 — Download the release tarball
 
-The SLC tarball is already a `.tar.gz` — download it straight from GitHub Releases (same URL
-`make install-slc` uses; `SLC_VERSION` must be pinned to match the `exasol-udf-sdk`/
-`exasol-udf-macros` version in `Cargo.toml` — a mismatch fails the fingerprint smoke test in
-step 5 below):
-
-```bash
-curl -fsSL -o rustslc.tar.gz \
-  https://github.com/exasol-labs/language-container-rs/releases/download/v<SLC_VERSION>/lc-rust-<SLC_VERSION>.tar.gz
-```
-
-The `.so` is built the same way as step 1 above (`make cross-musl-udf-build` →
-`target/release/liblakehouse_engine.so`) — building never needs BucketFS/network access. Some
-upload channels (the SaaS file API, confirmed against the staging cluster) reject raw
-extension-less binaries, so package it into a tarball first:
+Every [GitHub Release](https://github.com/exasol-labs/lakehouse-engine-rs/releases) ships a
+prebuilt `lakehouse-engine.tar.gz`, already laid out as `udf/liblakehouse_engine.so` (executable
+bit set) — download it as-is, no repackaging needed:
 
 ```bash
-mkdir -p pkg/udf
-cp target/release/liblakehouse_engine.so pkg/udf/
-chmod 755 pkg/udf/liblakehouse_engine.so
-tar -czf lakehouse-engine.tar.gz -C pkg udf
+curl -fsSL -o lakehouse-engine.tar.gz \
+  https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine.tar.gz
 ```
 
-This `udf/liblakehouse_engine.so` layout is what determines the extracted path referenced in
-step 4's `%udf_object` below — keep it as-is unless you have a reason to rename.
+Pin `<VERSION>` to the release you intend to run — e.g. `0.26.1` for the version this checkout's
+`Cargo.toml` is at. The `udf/liblakehouse_engine.so` layout inside the tarball is what determines
+the extracted path referenced in step 3's `%udf_object` below.
 
-### Step 2 — Upload both tarballs to BucketFS
+### Step 2 — Upload the tarball to BucketFS
 
 Pick whichever channel your platform exposes:
 
 #### a) BucketFS upload UI
 
-Any platform with a BucketFS file browser (e.g. Exasol SaaS's "Files" tab): drop `rustslc.tar.gz`
-and `lakehouse-engine.tar.gz` at the bucket root. BucketFS auto-extracts recognized archives on
+Any platform with a BucketFS file browser (e.g. Exasol SaaS's "Files" tab): drop
+`lakehouse-engine.tar.gz` at the bucket root. BucketFS auto-extracts recognized archives on
 upload, so there's no separate "extract" step.
 
 #### b) Raw HTTP PUT
 
 For an on-prem/Docker BucketFS that's reachable over the network, but without `exapump` or Docker
-installed locally — this is the same mechanism `make install-slc`/`bucketfs-upload-so` use under
-the hood, given here Makefile-independent:
+installed locally — this is the same mechanism `bucketfs-upload-so` uses under the hood, given
+here Makefile-independent:
 
 ```bash
-curl -X PUT -T rustslc.tar.gz \
-  "https://w:<BFS_WRITE_PASSWORD>@<HOST>:<BUCKETFS_PORT>/default/slc/rustslc.tar.gz" --insecure
-
 curl -X PUT -T lakehouse-engine.tar.gz \
   "https://w:<BFS_WRITE_PASSWORD>@<HOST>:<BUCKETFS_PORT>/default/udf/lakehouse-engine.tar.gz" --insecure
 ```
@@ -282,7 +267,7 @@ UI. A couple of SaaS-specific things to know first:
   ```
   Use `cloud-staging.exasol.com` instead of `cloud.exasol.com` on the staging environment.
 
-Upload is a two-step presigned-URL dance, once per tarball:
+Upload is a two-step presigned-URL dance:
 
 ```bash
 curl -X POST -H "Authorization: Bearer <PAT>" \
@@ -292,38 +277,18 @@ curl -X POST -H "Authorization: Bearer <PAT>" \
 curl -X PUT --upload-file lakehouse-engine.tar.gz "<presigned PUT URL>"
 ```
 
-Repeat for `rustslc.tar.gz`. The presigned URL expires in ~600s and is signed for `host` only —
-don't add extra headers, and run both commands back-to-back.
+The presigned URL expires in ~600s and is signed for `host` only — don't add extra headers, and
+run both commands back-to-back.
 
-Verify with `GET .../files` (both tarballs should be listed). **Extracted path differs from the
+Verify with `GET .../files` (the tarball should be listed). **Extracted path differs from the
 on-prem default**: SaaS lands an uploaded `<name>.tar.gz` at
 `/buckets/uploads/default/<name>/...` — e.g. `lakehouse-engine.tar.gz` extracts to
 `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so` — instead of the on-prem
 default bucket's `/buckets/bfsdefault/default/...`.
 
-### Step 3 — Register the SLC via plain SQL
+### Step 3 — Create the scripts
 
-This step only needs DB SQL access — any SQL client works (`exapump sql`, JDBC/ODBC, etc.), and
-it's unaffected by which BucketFS channel you used in step 2. Read the current value first so you
-don't clobber another alias sharing the same system variable — **some platforms (including some
-Exasol SaaS instances) may already have a `RUST=` alias pre-provisioned and shared**, so check
-before overwriting it:
-
-```sql
-SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES';
-```
-
-Then set it, preserving any other language aliases and pointing the `RUST=` entry at wherever
-step 2 uploaded the SLC (SaaS path shown; swap in the on-prem `bfsdefault` path if you used
-channel a/b):
-
-```sql
-ALTER SYSTEM SET SCRIPT_LANGUAGES = '<preserved aliases...> RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#buckets/uploads/default/rustslc/exaudf/exaudfclient';
-```
-
-### Step 4 — Create the scripts
-
-Same DDL as [step 4 above](#4-create-the-scripts), just point `%udf_object` at your platform's
+Same DDL as [step 3 above](#3-create-the-scripts), just point `%udf_object` at your platform's
 extracted path — SaaS example:
 
 ```sql
@@ -353,7 +318,7 @@ end
 /
 ```
 
-### Step 5 — Fingerprint smoke test
+### Step 4 — Fingerprint smoke test
 
 No catalog credentials needed — this alone proves the `.so` loaded and its `exasol-udf-sdk`/rustc
 build matches the SLC:
@@ -363,13 +328,14 @@ SELECT LHVS.LAKEHOUSE_SCAN('x', 'y') EMITS (r VARCHAR(2000000)) FROM (SELECT 1);
 ```
 
 - `F-UDF-CL-RUST-9001: Fingerprint mismatch: expected <sdk>:rustc_<ver>, found <sdk>:rustc_<ver>`
-  → the SLC and the `exasol-udf-sdk` version this `.so` was built against don't match; re-check
-  the `SLC_VERSION` pin against `Cargo.toml`'s `exasol-udf-sdk`/`exasol-udf-macros` version.
+  → the registered SLC and this project's `exasol-udf-sdk`/`exasol-udf-macros` version (see
+  `Cargo.toml`) don't match; re-check the SLC version installed per the
+  [Prerequisites](#prerequisites).
 - Any other error (e.g. a scan-spec deserialization error) → a match — the placeholder arguments
   just aren't a valid scan spec, which is expected.
 
-From here, continue with **steps 5-7 above** (catalog CONNECTION, Virtual Schema, query) —
-unchanged regardless of how the SLC/`.so` got onto BucketFS.
+From here, continue with **steps 4-6 above** (catalog CONNECTION, Virtual Schema, query) —
+unchanged regardless of how the `.so` got onto BucketFS.
 
 ## End-to-end tests
 
