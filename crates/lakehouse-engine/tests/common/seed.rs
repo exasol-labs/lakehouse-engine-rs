@@ -1921,9 +1921,15 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             true,
         ),
         Field::new(EVO_INITDEF_COL_DECIMAL, DataType::Decimal128(9, 2), true),
+        // The timezone label MUST be "+00:00" (iceberg-rust's `UTC_TIME_ZONE`),
+        // not "UTC": the Iceberg parquet writer derives its target Arrow schema
+        // from the Iceberg schema and validates the input batch by strict
+        // DataType equality, so a "UTC" label here is rejected as an incompatible
+        // type. (The read/emit path is tz-label-agnostic; only this write path
+        // demands the exact label.)
         Field::new(
             EVO_INITDEF_COL_TSTZ,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             true,
         ),
     ]));
@@ -1950,7 +1956,7 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             Arc::new(decimals),
             Arc::new(
                 TimestampMicrosecondArray::from(vec![INITDEF_REAL_TSTZ_MICROS; n])
-                    .with_timezone("UTC"),
+                    .with_timezone("+00:00"),
             ),
         ],
     )
