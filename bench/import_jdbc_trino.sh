@@ -163,6 +163,11 @@ INTO_NQ3="CNT DECIMAL(20,0), TOTAL_COST DECIMAL(15,2)"
 INTO_NQ4="L_ORDERKEY DECIMAL(20,0), L_EXTENDEDPRICE DECIMAL(15,2)"
 INTO_NQ5="O_ORDERPRIORITY VARCHAR(2000000), O_ORDERSTATUS VARCHAR(2000000), CNT DECIMAL(20,0), AVG_PRICE DECIMAL(15,2)"
 
+# Raw column-type list for the full-table streaming scan below (§ raw scan), copied verbatim from
+# bench/import_ceiling.sh's INTO — same lineitem columns, already live-verified on test1 (including
+# the BIGINT-sum DECIMAL gotcha noted on INTO_Q9B above), just untransformed rather than aggregated.
+INTO_RAW="L_ORDERKEY DECIMAL(20,0), L_PARTKEY DECIMAL(20,0), L_SUPPKEY DECIMAL(20,0), L_LINENUMBER DECIMAL(20,0), L_QUANTITY DECIMAL(15,2), L_EXTENDEDPRICE DECIMAL(15,2), L_DISCOUNT DECIMAL(15,2), L_TAX DECIMAL(15,2), L_RETURNFLAG VARCHAR(2000000), L_LINESTATUS VARCHAR(2000000), L_SHIPDATE DATE, L_COMMITDATE DATE, L_RECEIPTDATE DATE, L_SHIPINSTRUCT VARCHAR(2000000), L_SHIPMODE VARCHAR(2000000), L_COMMENT VARCHAR(2000000)"
+
 JDBC_URL="jdbc:trino://${TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
 
 import_stmt() {  # into  statement-sql
@@ -190,6 +195,22 @@ run_timed() {  # name  into  statement-sql
   echo "TIMING ${ENGINE_LABEL} ${name} ${el}" >> "$REPORT"
 }
 
+# Materializing load (real IMPORT INTO <table>, not a client-side derived-table SELECT) — same
+# apples-to-apples methodology as import_ceiling.sh's run_timed_load, so 180M rows never round-trip
+# through the exapump CSV client. Row count is read back from the target table, not parsed from
+# import output (IMPORT INTO returns no result set).
+run_timed_load() {  # label  target_table  sql
+  local label="$1" tbl="$2" sql="$3" t0 t1 out rc el cnt rps
+  t0=$(date +%s.%N)
+  out=$(printf '%s' "$sql" | timeout 600 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
+  t1=$(date +%s.%N)
+  el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; return; fi
+  cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
+  rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
+  echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s" | tee -a "$REPORT"
+}
+
 echo "import-jdbc-trino benchmark — ${TRINO_HOST}:${TRINO_PORT} schema=${TRINO_SCHEMA} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
 run_timed "q1" "$INTO_Q1" "$Q1"
 run_timed "q2" "$INTO_Q2" "$Q2"
@@ -206,4 +227,20 @@ run_timed "nq2" "$INTO_NQ2" "$NQ2"
 run_timed "nq3" "$INTO_NQ3" "$NQ3"
 run_timed "nq4" "$INTO_NQ4" "$NQ4"
 run_timed "nq5" "$INTO_NQ5" "$NQ5"
+
+# ---- raw streaming full-table scan: no aggregation, no filter — measures pure data-movement
+# throughput over the single JDBC connection, to compare against import_ceiling.sh's VS-path
+# CTAS (bench/import_ceiling.sh's vs_ctas_run*) at the same node count.
+echo "=== raw full-table scan: IMPORT INTO (JDBC), SELECT * FROM lineitem, 3x ===" | tee -a "$REPORT"
+printf '%s' "CREATE SCHEMA IF NOT EXISTS BENCH" | exapump sql -d "$DSN" >/dev/null 2>&1 || true
+printf '%s' "CREATE OR REPLACE TABLE BENCH.LINEITEM_JDBC (${INTO_RAW})" | exapump sql -d "$DSN" >/dev/null 2>&1
+for i in 1 2 3; do
+  if ! printf '%s' "TRUNCATE TABLE BENCH.LINEITEM_JDBC" | exapump sql -d "$DSN" >/dev/null 2>&1; then
+    echo "  jdbc_raw_scan_run$i: SKIPPED (TRUNCATE failed — would inflate rows/throughput on a re-run)" | tee -a "$REPORT"
+    continue
+  fi
+  run_timed_load "jdbc_raw_scan_run$i" "BENCH.LINEITEM_JDBC" \
+    "IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem'"
+done
+
 echo "Done. Report: $REPORT"
