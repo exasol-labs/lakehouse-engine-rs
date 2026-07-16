@@ -49,7 +49,13 @@ echo "==> [1/2] trino-up.sh $TRINO_ENV" >&2
 "$HERE/trino-up.sh" "$TRINO_ENV"
 TRINO_HOST="$(cd "$HERE/../trino-stack" && tofu output -raw trino_coordinator_host)"
 [ -n "$TRINO_HOST" ] || { echo "ERROR: tofu output trino_coordinator_host was empty" >&2; exit 1; }
-export TRINO_HOST
+# import_jdbc_trino.sh's JDBC connection originates FROM the Exasol node (same VPC as Trino), so it
+# must use the coordinator's PRIVATE ip, not its public one — see outputs.tf's
+# trino_coordinator_private_ip comment. TRINO_HOST (public) still flows through for anything else
+# that might read it (logging, back-compat with bench/trino_compare.sh's own convention).
+TRINO_JDBC_HOST="$(cd "$HERE/../trino-stack" && tofu output -raw trino_coordinator_private_ip)"
+[ -n "$TRINO_JDBC_HOST" ] || { echo "ERROR: tofu output trino_coordinator_private_ip was empty" >&2; exit 1; }
+export TRINO_HOST TRINO_JDBC_HOST
 
 read -r -a COUNTS <<<"$NODE_COUNTS"
 echo "==> [2/2] node-count trials: ${COUNTS[*]}" >&2
@@ -60,8 +66,8 @@ for i in "${!COUNTS[@]}"; do
   # tears down, so the next trial's tofu apply never mutates a still-live cluster out from under it.
   TRIAL_KEEP_ALIVE=0
   [ "$i" -eq "$LAST_IDX" ] && TRIAL_KEEP_ALIVE="${KEEP_ALIVE:-0}"
-  echo "==> Trial: node_count=$N (exasol_env=$EXASOL_ENV, trino_host=$TRINO_HOST, keep_alive=$TRIAL_KEEP_ALIVE)" >&2
-  BENCH_RUN_CEILING=1 NODE_COUNT="$N" TRINO_HOST="$TRINO_HOST" KEEP_ALIVE="$TRIAL_KEEP_ALIVE" \
+  echo "==> Trial: node_count=$N (exasol_env=$EXASOL_ENV, trino_host=$TRINO_HOST, trino_jdbc_host=$TRINO_JDBC_HOST, keep_alive=$TRIAL_KEEP_ALIVE)" >&2
+  BENCH_RUN_CEILING=1 NODE_COUNT="$N" TRINO_HOST="$TRINO_HOST" TRINO_JDBC_HOST="$TRINO_JDBC_HOST" KEEP_ALIVE="$TRIAL_KEEP_ALIVE" \
     "$HERE/bench-remote.sh" "$EXASOL_ENV"
 done
 
