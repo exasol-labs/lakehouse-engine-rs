@@ -1495,12 +1495,8 @@ fn make_evo_batch(first_id: i64, last_id: i64, col2: &str) -> RecordBatch {
 //
 // ns-precision timestamps are NOT Iceberg-expressible in this catalog version;
 // they are covered exhaustively by the unit round-trip test (plan task 3.3).
-//
-// timestamptz is likewise EXCLUDED from this fixture: Exasol rejects TIMESTAMP
-// WITH LOCAL TIME ZONE as a UDF EMITS output type (sqlCode 22002), so a
-// timestamptz value cannot cross the scan emit boundary. Its initial-default
-// logic stays fully covered by the unit round-trip test; only the E2E emit path
-// is out of reach (tracked exception, #118).
+// This includes ns-precision timestamptz: its initial-default logic stays
+// covered by the unit round-trip test only.
 
 /// Table name for the all-types initial-default schema-evolution fixture (#27).
 pub const EVO_INITDEF_TABLE: &str = "initdef";
@@ -1530,6 +1526,8 @@ pub const EVO_INITDEF_COL_DATE: &str = "c_date";
 pub const EVO_INITDEF_COL_TS: &str = "c_ts";
 /// Decimal(9,2) column, added NULLABLE-with-default.
 pub const EVO_INITDEF_COL_DECIMAL: &str = "c_decimal";
+/// Timestamptz (micros, UTC) column, added NULLABLE-with-default.
+pub const EVO_INITDEF_COL_TSTZ: &str = "c_tstz";
 
 /// `c_long` initial-default (chosen > i32::MAX so a Long/Int mix-up is caught).
 const INITDEF_LONG_DEFAULT: i64 = 4_200_000_000;
@@ -1546,6 +1544,12 @@ const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const INITDEF_DEFAULT_TS_MICROS: i64 = BASE_TS_MICROS + 12 * MICROS_PER_HOUR;
 /// `c_ts` real written value: 2024-07-01T12:00:00Z.
 const INITDEF_REAL_TS_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 * MICROS_PER_HOUR;
+/// `c_tstz` initial-default: 2024-01-01T12:00:00Z (same UTC instant as `c_ts`'s
+/// default — timestamptz stores a UTC instant, so reusing the calendar day is
+/// deliberate, not an oversight).
+const INITDEF_DEFAULT_TSTZ_MICROS: i64 = BASE_TS_MICROS + 12 * MICROS_PER_HOUR;
+/// `c_tstz` real written value: 2024-07-01T12:00:00Z.
+const INITDEF_REAL_TSTZ_MICROS: i64 = BASE_TS_MICROS + 182 * MICROS_PER_DAY + 12 * MICROS_PER_HOUR;
 
 /// The value a field-id scan is expected to return for one added column, matched
 /// tolerantly against the JSON the Exasol result set delivers.
@@ -1598,7 +1602,7 @@ pub struct InitDefColumn {
     pub real: ExpectedValue,
 }
 
-/// The added columns in field-id order (field-ids 2..=10), each paired with its
+/// The added columns in field-id order (field-ids 2..=11), each paired with its
 /// expected `initial-default` (file-A rows) and real written value (file-B rows).
 /// `c_bool` is the REQUIRED-with-default column; the rest are NULLABLE-with-default.
 pub fn initdef_columns() -> Vec<InitDefColumn> {
@@ -1657,6 +1661,12 @@ pub fn initdef_columns() -> Vec<InitDefColumn> {
             default: ExpectedValue::Num(123.45),
             real: ExpectedValue::Num(678.90),
         },
+        InitDefColumn {
+            name: EVO_INITDEF_COL_TSTZ,
+            required: false,
+            default: ExpectedValue::DatePrefix("2024-01-01"),
+            real: ExpectedValue::DatePrefix("2024-07-01"),
+        },
     ]
 }
 
@@ -1665,7 +1675,7 @@ pub fn initdef_columns() -> Vec<InitDefColumn> {
 /// Sequence (mirrors `seed_renamed_column`):
 ///   1. create `initdef` with only `id` (field-id 1) — the pre-add schema
 ///   2. append file A: ids `EVO_INITDEF_PRE_ADD_IDS`, physical parquet has `id` only
-///   3. REST commit: add one column per primitive type (field-ids 2..=10), each
+///   3. REST commit: add one column per primitive type (field-ids 2..=11), each
 ///      with an `initial-default`; `c_bool` REQUIRED, the rest NULLABLE
 ///   4. append file B: ids `EVO_INITDEF_POST_ADD_IDS`, all columns with real values
 ///
@@ -1796,7 +1806,7 @@ fn initdef_pre_add_schema() -> Result<IcebergSchema> {
 }
 
 /// Post-add initdef schema: `id` plus one column per primitive type (field-ids
-/// 2..=10), each carrying its `initial-default`. `c_bool` is REQUIRED-with-default
+/// 2..=11), each carrying its `initial-default`. `c_bool` is REQUIRED-with-default
 /// (rule (3)'s required branch); the rest are NULLABLE-with-default.
 fn initdef_post_add_schema(schema_id: i32) -> Result<IcebergSchema> {
     IcebergSchema::builder()
@@ -1865,6 +1875,13 @@ fn initdef_post_add_schema(schema_id: i32) -> Result<IcebergSchema> {
             )
             .with_initial_default(Literal::decimal(INITDEF_DECIMAL_DEFAULT_UNSCALED))
             .into(),
+            NestedField::optional(
+                11,
+                EVO_INITDEF_COL_TSTZ,
+                Type::Primitive(PrimitiveType::Timestamptz),
+            )
+            .with_initial_default(Literal::timestamptz(INITDEF_DEFAULT_TSTZ_MICROS))
+            .into(),
         ])
         .build()
         .context("build initdef post-add Iceberg schema")
@@ -1904,6 +1921,17 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             true,
         ),
         Field::new(EVO_INITDEF_COL_DECIMAL, DataType::Decimal128(9, 2), true),
+        // The timezone label MUST be "+00:00" (iceberg-rust's `UTC_TIME_ZONE`),
+        // not "UTC": the Iceberg parquet writer derives its target Arrow schema
+        // from the Iceberg schema and validates the input batch by strict
+        // DataType equality, so a "UTC" label here is rejected as an incompatible
+        // type. (The read/emit path is tz-label-agnostic; only this write path
+        // demands the exact label.)
+        Field::new(
+            EVO_INITDEF_COL_TSTZ,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            true,
+        ),
     ]));
 
     let decimals = Decimal128Array::from(vec![INITDEF_DECIMAL_REAL_UNSCALED; n])
@@ -1926,6 +1954,10 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
                 n
             ])),
             Arc::new(decimals),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![INITDEF_REAL_TSTZ_MICROS; n])
+                    .with_timezone("+00:00"),
+            ),
         ],
     )
     .expect("initdef full RecordBatch construction is infallible")
