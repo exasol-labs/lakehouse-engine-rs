@@ -1923,7 +1923,7 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
         Field::new(EVO_INITDEF_COL_DECIMAL, DataType::Decimal128(9, 2), true),
         Field::new(
             EVO_INITDEF_COL_TSTZ,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             true,
         ),
     ]));
@@ -1950,7 +1950,7 @@ fn make_initdef_full_batch(first_id: i64, last_id: i64) -> RecordBatch {
             Arc::new(decimals),
             Arc::new(
                 TimestampMicrosecondArray::from(vec![INITDEF_REAL_TSTZ_MICROS; n])
-                    .with_timezone("+00:00"),
+                    .with_timezone("UTC"),
             ),
         ],
     )
