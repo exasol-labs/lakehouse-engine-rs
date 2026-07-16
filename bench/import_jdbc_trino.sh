@@ -173,7 +173,12 @@ INTO_NQ5="O_ORDERPRIORITY VARCHAR(2000000), O_ORDERSTATUS VARCHAR(2000000), CNT 
 # the BIGINT-sum DECIMAL gotcha noted on INTO_Q9B above), just untransformed rather than aggregated.
 INTO_RAW="L_ORDERKEY DECIMAL(20,0), L_PARTKEY DECIMAL(20,0), L_SUPPKEY DECIMAL(20,0), L_LINENUMBER DECIMAL(20,0), L_QUANTITY DECIMAL(15,2), L_EXTENDEDPRICE DECIMAL(15,2), L_DISCOUNT DECIMAL(15,2), L_TAX DECIMAL(15,2), L_RETURNFLAG VARCHAR(2000000), L_LINESTATUS VARCHAR(2000000), L_SHIPDATE DATE, L_COMMITDATE DATE, L_RECEIPTDATE DATE, L_SHIPINSTRUCT VARCHAR(2000000), L_SHIPMODE VARCHAR(2000000), L_COMMENT VARCHAR(2000000)"
 
-JDBC_URL="jdbc:trino://${TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
+# TRINO_JDBC_HOST (private IP, same VPC as Exasol) if set, else TRINO_HOST (public IP). The JDBC
+# connection here originates FROM the Exasol node, not the operator's machine — connecting to
+# another same-VPC instance's PUBLIC IP round-trips through the IGW, which is unreliable for a
+# long-lived paginated result fetch (live-verified: every query failed at "fetching next" after
+# ~2 minutes/4 attempts, even with the SG opened to the whole VPC on port 8080).
+JDBC_URL="jdbc:trino://${TRINO_JDBC_HOST:-$TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
 
 import_stmt() {  # into  statement-sql
   local into="$1" stmt="$2"
