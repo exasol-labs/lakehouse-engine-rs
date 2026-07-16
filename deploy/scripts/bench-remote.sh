@@ -71,27 +71,36 @@ echo "==> [3/4] secrets.sh $ENV" >&2
 "$HERE/secrets.sh" "$ENV"
 
 echo "==> [4/4] make bench" >&2
-(cd "$HERE/../.." && make bench)
+bench_failed=0
+(cd "$HERE/../.." && make bench) || {
+  rc=$?
+  echo "==> WARN: make bench failed (rc=$rc) — docs/performance.md documents a known-benign flake in" >&2
+  echo "==> run.sh's TRAILING pushdown-check block (EXPLAIN VIRTUAL, after all timed queries) that fails" >&2
+  echo "==> the exit code without affecting the 15 queries' own correctness/timing. Not swallowed: still" >&2
+  echo "==> counted as this trial's failure below, but doesn't block BENCH_RUN_CEILING's legs from running." >&2
+  bench_failed=1
+}
 
 # Opt-in: also run the native-reader/JDBC ceiling comparisons while the cluster is still up, inside
 # the same guaranteed-teardown window (TRINO_HOST must already be exported for import_jdbc_trino.sh
 # to run; it SKIPs cleanly on its own if unset). Off by default so ordinary bench-remote.sh usage
-# keeps its existing cost/time profile. Each leg runs even if the OTHER one hard-errors (e.g.
-# import_ceiling.sh's missing-report-file checks) — JDBC runs first since it's the one this
-# experiment actually needs; import_ceiling.sh's VS-path numbers are the free bonus. But if EITHER
-# leg failed, this run must NOT report success: both scripts now track their own FAILED flag and
-# exit non-zero on a real failure (not just "the script ran"), so propagate that here — otherwise
-# a caller sweeping multiple node counts (jdbc-parallelism-sweep.sh) would have no signal to stop
-# after a doomed trial and would burn more real AWS time on a config that's already broken.
+# keeps its existing cost/time profile. Runs even if `make bench` itself failed above (see the flake
+# note) — these are independent data collections, not a continuation of make bench. Each leg here
+# also runs even if the OTHER one hard-errors (e.g. import_ceiling.sh's missing-report-file checks).
+ceiling_failed=0
 if [ "${BENCH_RUN_CEILING:-0}" = "1" ]; then
   echo "==> BENCH_RUN_CEILING=1: running import_jdbc_trino.sh + import_ceiling.sh" >&2
-  ceiling_failed=0
   (cd "$HERE/../.." && bench/import_jdbc_trino.sh) || { echo "==> WARN: import_jdbc_trino.sh failed (rc=$?)" >&2; ceiling_failed=1; }
   (cd "$HERE/../.." && bench/import_ceiling.sh) || { echo "==> WARN: import_ceiling.sh failed (rc=$?)" >&2; ceiling_failed=1; }
-  if [ "$ceiling_failed" -ne 0 ]; then
-    echo "==> BENCH_RUN_CEILING=1: at least one leg failed — reporting this trial as failed." >&2
-    exit 1
-  fi
+fi
+
+# Both scripts/make bench now track their own FAILED flag and exit non-zero on a REAL failure (not
+# just "the script ran"), so propagate the worst of them here — otherwise a caller sweeping multiple
+# node counts (jdbc-parallelism-sweep.sh) would have no signal to stop after a doomed trial and
+# would burn more real AWS time on a config that's already broken.
+if [ "$bench_failed" -ne 0 ] || [ "$ceiling_failed" -ne 0 ]; then
+  echo "==> This trial had at least one failed leg (make bench / ceiling) — reporting as failed." >&2
+  exit 1
 fi
 
 echo "==> Bench sequence complete for '$ENV'; teardown (trap EXIT) follows." >&2
