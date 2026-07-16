@@ -5,14 +5,15 @@
 # prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does NOT create catalog objects.
 #
 # Distributed one-liner (piped into bash over stdin):
-#   gh api -H "Accept: application/vnd.github.raw" \
-#     repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
+#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+#     -H "Accept: application/vnd.github.raw" \
+#     https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
 #   | EXASOL_PAT=$PAT bash -s -- --account-id $ACC --database-id $DB --profile staging
 #
 # The file is sourceable: its functions can be sourced and unit-tested without running the
 # installer, because `main` runs only when the file is executed or piped, never when sourced.
 #
-# Bash 3.2+ (stock macOS). No jq. Every subprocess (gh/curl/exapump) reads stdin from /dev/null
+# Bash 3.2+ (stock macOS). No jq. Every subprocess (curl/exapump) reads stdin from /dev/null
 # so a subprocess cannot consume the remaining piped script body.
 
 # --- Constants ---------------------------------------------------------------
@@ -29,6 +30,7 @@ RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#b
 ARG_ACCOUNT_ID=""
 ARG_DATABASE_ID=""
 ARG_PAT=""
+ARG_GITHUB_TOKEN=""
 ARG_PROFILE=""
 ARG_DSN=""
 ARG_HOST=""
@@ -85,6 +87,69 @@ extract_json_string_field() {
   return 1
 }
 
+# Given a GitHub release JSON blob (as returned by GET /releases/latest or /releases/tags/<tag>)
+# and an asset file name, prints that asset's numeric id. Returns 1 if the asset is absent.
+#
+# No jq: GitHub's REST API stably pretty-prints its JSON with a fixed 2-space indent, so each
+# element of the "assets" array is delimited by a line that is exactly a 4-space-indented "{" /
+# "}," pair, and the asset's OWN fields sit at 6-space indent -- one level shallower than a
+# nested object's fields (e.g. "uploader", 8-space indent). Scanning strictly at the 6-space
+# depth means a nested object's own "id" (every asset carries an "uploader" with its own numeric
+# "id") is never mistaken for the asset's id. The scan is bounded to the "assets": [ ... ] block
+# -- entered on the 2-space "assets": [ line and exited on its matching 2-space "]" close --
+# rather than scanning the whole response, so it can't misfire on some other, unrelated
+# array-of-objects field the release schema might grow in the future. Because both
+# "id" and "name" are captured independently per asset block, field order within the block and
+# the order of assets within the array are both irrelevant to correctness.
+extract_asset_id_by_name() {
+  local json="$1" target="$2"
+  local in_assets=0 in_asset=0 id="" name="" line
+  local assets_start_re='^  "assets": \[[[:space:]]*$'
+  local assets_end_re='^  \],?[[:space:]]*$'
+  local asset_open_re='^    \{[[:space:]]*$'
+  local asset_close_re='^    \},?[[:space:]]*$'
+  local id_field_re='^      "id"[[:space:]]*:[[:space:]]*([0-9]+),?[[:space:]]*$'
+  local name_field_re='^      "name"[[:space:]]*:[[:space:]]*"([^"]*)",?[[:space:]]*$'
+
+  while IFS= read -r line; do
+    if [[ "$in_assets" -eq 0 ]]; then
+      [[ "$line" =~ $assets_start_re ]] && in_assets=1
+      continue
+    fi
+    if [[ "$in_asset" -eq 0 ]]; then
+      if [[ "$line" =~ $assets_end_re ]]; then
+        in_assets=0
+        continue
+      fi
+      if [[ "$line" =~ $asset_open_re ]]; then
+        in_asset=1
+        id=""
+        name=""
+      fi
+      continue
+    fi
+    if [[ "$line" =~ $asset_close_re ]]; then
+      if [[ -n "$name" && "$name" == "$target" && -n "$id" ]]; then
+        printf '%s\n' "$id"
+        return 0
+      fi
+      in_asset=0
+      continue
+    fi
+    if [[ "$line" =~ $id_field_re ]]; then
+      id="${BASH_REMATCH[1]}"
+      continue
+    fi
+    if [[ "$line" =~ $name_field_re ]]; then
+      name="${BASH_REMATCH[1]}"
+      continue
+    fi
+  done <<EOF_ASSETS
+$json
+EOF_ASSETS
+  return 1
+}
+
 usage() {
   cat <<'USAGE'
 install-saas.sh - install lakehouse-engine onto an Exasol SaaS database.
@@ -93,6 +158,8 @@ Required:
   --account-id <id>        SaaS account id (from the SaaS web console)
   --database-id <id>       SaaS database id (from the SaaS web console)
   --pat <token>            SaaS personal access token (or set EXASOL_PAT)
+  --github-token <token>   GitHub token with read access to the private lakehouse-engine-rs
+                           repo (or set GITHUB_TOKEN)
 
 Connectivity (exactly one mode):
   --profile <name>         exapump named profile
@@ -118,6 +185,7 @@ parse_args() {
   ARG_ACCOUNT_ID=""
   ARG_DATABASE_ID=""
   ARG_PAT="${EXASOL_PAT:-}"
+  ARG_GITHUB_TOKEN="${GITHUB_TOKEN:-}"
   ARG_PROFILE=""
   ARG_DSN="${EXAPUMP_DSN:-}"
   ARG_HOST=""
@@ -134,7 +202,7 @@ parse_args() {
     case "$flag" in
       --staging) ARG_STAGING=1; shift; continue ;;
       --help|-h) ARG_HELP=1; shift; continue ;;
-      --account-id|--database-id|--pat|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
+      --account-id|--database-id|--pat|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
       *) err "unknown argument: $flag"; return 1 ;;
     esac
     if [[ $# -lt 2 ]]; then
@@ -146,6 +214,7 @@ parse_args() {
       --account-id)        ARG_ACCOUNT_ID="$value" ;;
       --database-id)       ARG_DATABASE_ID="$value" ;;
       --pat)               ARG_PAT="$value" ;;
+      --github-token)      ARG_GITHUB_TOKEN="$value" ;;
       --profile)           ARG_PROFILE="$value" ;;
       --dsn)               ARG_DSN="$value" ;;
       --host)              ARG_HOST="$value" ;;
@@ -172,6 +241,10 @@ validate_required() {
   fi
   if [[ -z "$ARG_PAT" ]]; then
     err "missing SaaS PAT: pass --pat or set EXASOL_PAT (create a personal access token in the Exasol SaaS web console)"
+    missing=1
+  fi
+  if [[ -z "$ARG_GITHUB_TOKEN" ]]; then
+    err "missing GitHub token: pass --github-token or set GITHUB_TOKEN (a token with read access to the private $ENGINE_REPO repository)"
     missing=1
   fi
   [[ "$missing" -eq 0 ]]
@@ -206,17 +279,9 @@ validate_connectivity() {
 
 check_prereqs() {
   local ok=1
-  have_cmd gh      || { err "required tool 'gh' (GitHub CLI) not found on PATH. Install it: https://cli.github.com/"; ok=0; }
   have_cmd exapump || { err "required tool 'exapump' not found on PATH. Install it: https://github.com/exasol-labs/exapump"; ok=0; }
   have_cmd curl    || { err "required tool 'curl' not found on PATH. Install it via your OS package manager: https://curl.se/"; ok=0; }
   [[ "$ok" -eq 1 ]]
-}
-
-check_gh_auth() {
-  if ! gh auth status </dev/null >/dev/null 2>&1; then
-    err "GitHub CLI is not authenticated. Run: gh auth login  (needed for private $ENGINE_REPO release access)."
-    return 1
-  fi
 }
 
 # --- Target base -------------------------------------------------------------
@@ -247,8 +312,8 @@ resolve_versions() {
     RESOLVED_ENGINE_TAG="$(version_to_tag "$ARG_LAKEHOUSE_VERSION")"
   else
     local ej
-    if ! ej="$(gh api "repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
-      err "could not resolve the latest $ENGINE_REPO release via 'gh api'. Ensure gh is authenticated and has access to the private repo."
+    if ! ej="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
+      err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API. Ensure GITHUB_TOKEN/--github-token has read access to the private repo."
       return 1
     fi
     if ! RESOLVED_ENGINE_TAG="$(extract_json_string_field "$ej" "tag_name")"; then
@@ -262,8 +327,8 @@ resolve_versions() {
     RESOLVED_SLC_TAG="$(version_to_tag "$ARG_SLC_VERSION")"
   else
     local sj
-    if ! sj="$(gh api "repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
-      err "could not resolve the latest $SLC_REPO release via 'gh api'."
+    if ! sj="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
+      err "could not resolve the latest $SLC_REPO release via the GitHub REST API."
       return 1
     fi
     if ! RESOLVED_SLC_TAG="$(extract_json_string_field "$sj" "tag_name")"; then
@@ -434,12 +499,43 @@ smoke_test_sql() {
 }
 
 # --- Install steps -----------------------------------------------------------
-download_slc() {
-  local asset="lc-rust-$RESOLVED_SLC_VERSION.tar.gz"
-  if ! gh release download "$RESOLVED_SLC_TAG" --repo "$SLC_REPO" --pattern "$asset" --dir "$WORKDIR" --clobber </dev/null >/dev/null 2>&1; then
-    err "failed to download $asset (tag $RESOLVED_SLC_TAG) from $SLC_REPO via gh."
+# Downloads a named release asset for $repo at $tag into $dest_path via the authenticated
+# GitHub REST API: resolve the release-by-tag JSON, look up the asset id by name (no jq --
+# see extract_asset_id_by_name), then GET the asset binary by id.
+#
+# Uses plain -L, never --location-trusted: the assets endpoint authenticates the API call with
+# our Authorization header, then 302s to a signed, host-authenticated storage URL that rejects a
+# second auth mechanism. curl's default behavior since 7.58 is to strip Authorization across a
+# cross-host redirect -- exactly what's needed here. --location-trusted would force the header
+# through the redirect and break the signed URL.
+download_release_asset() {
+  local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
+  local release_json asset_id dl_err
+
+  if ! release_json="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" \
+      "https://api.github.com/repos/$repo/releases/tags/$tag" </dev/null 2>&1)"; then
+    err "could not fetch release '$tag' from $repo via the GitHub REST API."
     return 1
   fi
+
+  if ! asset_id="$(extract_asset_id_by_name "$release_json" "$asset_name")"; then
+    err "asset '$asset_name' not found in $repo release '$tag'."
+    return 1
+  fi
+
+  if ! dl_err="$(curl -fsSL -H "Authorization: Bearer $ARG_GITHUB_TOKEN" \
+      -H "Accept: application/octet-stream" \
+      -o "$dest_path" \
+      "https://api.github.com/repos/$repo/releases/assets/$asset_id" </dev/null 2>&1)"; then
+    err "failed to download asset '$asset_name' (id $asset_id) from $repo release '$tag': $dl_err"
+    return 1
+  fi
+  return 0
+}
+
+download_slc() {
+  local asset="lc-rust-$RESOLVED_SLC_VERSION.tar.gz"
+  download_release_asset "$SLC_REPO" "$RESOLVED_SLC_TAG" "$asset" "$WORKDIR/$asset" || return 1
   if ! mv -f "$WORKDIR/$asset" "$WORKDIR/rustslc.tar.gz"; then
     err "failed to rename $asset to rustslc.tar.gz."
     return 1
@@ -447,10 +543,7 @@ download_slc() {
 }
 
 download_engine() {
-  if ! gh release download "$RESOLVED_ENGINE_TAG" --repo "$ENGINE_REPO" --pattern "$ENGINE_ASSET" --dir "$WORKDIR" --clobber </dev/null >/dev/null 2>&1; then
-    err "failed to download $ENGINE_ASSET (tag $RESOLVED_ENGINE_TAG) from $ENGINE_REPO via gh."
-    return 1
-  fi
+  download_release_asset "$ENGINE_REPO" "$RESOLVED_ENGINE_TAG" "$ENGINE_ASSET" "$WORKDIR/$ENGINE_ASSET" || return 1
 }
 
 register_slc() {
@@ -574,7 +667,6 @@ main() {
   fi
 
   check_prereqs || exit 1
-  check_gh_auth || exit 1
   saas_db_reachable || exit 1
 
   if ! WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lhvs-install.XXXXXX" 2>/dev/null)"; then

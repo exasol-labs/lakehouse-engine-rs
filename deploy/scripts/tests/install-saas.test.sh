@@ -5,11 +5,11 @@
 # SC2030/SC2031: PATH/env changes are deliberately scoped to a subshell per test run, by design.
 # Test harness for deploy/scripts/install-saas.sh. Plain bash, no framework, no jq.
 #
-# It stubs gh/exapump/curl as fake executables on a temp PATH (recording their argv to a log
+# It stubs exapump/curl as fake executables on a temp PATH (recording their argv to a log
 # and returning canned output per scenario), sources the installer's pure functions directly for
 # unit checks, and drives the full installer through BOTH a saved-file invocation and the
 # stdin-piped `cat install-saas.sh | bash -s -- ...` form. Covers every scenario in
-# specs/_plans/add-saas-install-script/packaging/saas-install-script/spec.md.
+# specs/_plans/change-saas-install-github-token/packaging/saas-install-script/spec.md.
 #
 # Run: bash deploy/scripts/tests/install-saas.test.sh
 
@@ -48,53 +48,13 @@ SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
 STUBDIR="$SANDBOX/stubs"
-MISSING_GH_DIR="$SANDBOX/missing-gh"
+MISSING_CURL_DIR="$SANDBOX/missing-curl"
 MISSING_EXAPUMP_DIR="$SANDBOX/missing-exapump"
-mkdir -p "$STUBDIR" "$MISSING_GH_DIR" "$MISSING_EXAPUMP_DIR"
+mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR"
 
 STUB_LOG="$SANDBOX/stub.log"
 export STUB_LOG
 : > "$STUB_LOG"
-
-write_gh_stub() {
-  cat > "$1/gh" <<'STUB'
-#!/usr/bin/env bash
-printf 'gh %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
-if [[ "${STUB_REPORT_STDIN:-0}" == "1" ]]; then _sd="$(cat)"; [[ -n "$_sd" ]] && printf 'STDIN_LEAK[gh %s]\n' "$*" >> "${STUB_LOG:-/dev/null}"; fi
-cmd="${1:-}"
-case "$cmd" in
-  auth)
-    if [[ "${GH_AUTH_FAIL:-0}" == "1" ]]; then
-      echo "You are not logged into any GitHub hosts. Run gh auth login to authenticate." >&2
-      exit 1
-    fi
-    exit 0 ;;
-  api)
-    path="${2:-}"
-    case "$path" in
-      *language-container-rs*) printf '{"tag_name":"%s","name":"slc"}\n' "${GH_SLC_TAG:-v0.21.0}" ;;
-      *)                       printf '{"tag_name":"%s","name":"engine"}\n' "${GH_ENGINE_TAG:-v0.26.3}" ;;
-    esac
-    exit 0 ;;
-  release)
-    shift 2
-    dir="."
-    pattern=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --dir) dir="${2:-.}"; shift 2 ;;
-        --pattern) pattern="${2:-}"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    if [[ "${GH_DOWNLOAD_FAIL:-0}" == "1" ]]; then echo "release download failed" >&2; exit 1; fi
-    [[ -n "$pattern" ]] && printf 'stub-artifact\n' > "$dir/$pattern"
-    exit 0 ;;
-  *) exit 0 ;;
-esac
-STUB
-  chmod +x "$1/gh"
-}
 
 write_exapump_stub() {
   cat > "$1/exapump" <<'STUB'
@@ -144,12 +104,16 @@ printf 'curl %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 if [[ "${STUB_REPORT_STDIN:-0}" == "1" ]]; then _sd="$(cat)"; [[ -n "$_sd" ]] && printf 'STDIN_LEAK[curl %s]\n' "$*" >> "${STUB_LOG:-/dev/null}"; fi
 method="GET"
 has_upload=0
+outfile=""
+prev=""
 for a in "$@"; do
+  if [[ "$prev" == "-o" ]]; then outfile="$a"; fi
   case "$a" in
     POST) method="POST" ;;
     PUT) method="PUT" ;;
     --upload-file|-T) has_upload=1 ;;
   esac
+  prev="$a"
 done
 url="${!#}"
 if [[ "$has_upload" -eq 1 || "$method" == "PUT" ]]; then
@@ -171,6 +135,33 @@ else
         printf '{"files":["lakehouse-engine.tar.gz","rustslc.tar.gz"]}\n'
       fi
       exit 0 ;;
+    */releases/latest)
+      # GET /repos/<repo>/releases/latest -> {"tag_name": "...", ...}
+      case "$url" in
+        *language-container-rs*) printf '{\n  "tag_name": "%s",\n  "name": "slc"\n}\n' "${GH_SLC_TAG:-v0.21.0}" ;;
+        *)                       printf '{\n  "tag_name": "%s",\n  "name": "engine"\n}\n' "${GH_ENGINE_TAG:-v0.26.3}" ;;
+      esac
+      exit 0 ;;
+    */releases/tags/*)
+      # GET /repos/<repo>/releases/tags/<tag> -> release JSON with an "assets" array, indented
+      # exactly as extract_asset_id_by_name expects (2-space "assets", 4-space object braces,
+      # 6-space "id"/"name" fields).
+      asset_name="lakehouse-engine.tar.gz"
+      case "$url" in
+        *language-container-rs*)
+          ver="${GH_SLC_TAG:-v0.21.0}"; ver="${ver#v}"
+          asset_name="lc-rust-$ver.tar.gz"
+          ;;
+      esac
+      if [[ "${GH_ASSET_MISSING:-0}" == "1" ]]; then
+        asset_name="does-not-match-any-asset.tar.gz"
+      fi
+      printf '{\n  "assets": [\n    {\n      "id": 555,\n      "name": "%s"\n    }\n  ]\n}\n' "$asset_name"
+      exit 0 ;;
+    */releases/assets/*)
+      # GET /repos/<repo>/releases/assets/<id> (Accept: octet-stream) -> writes bytes to -o path.
+      [[ -n "$outfile" ]] && printf 'stub-asset-bytes\n' > "$outfile"
+      exit 0 ;;
     *)
       if [[ "${CURL_DB_UNREACHABLE:-0}" == "1" ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
       printf '{"id":"stub-db","name":"stub"}\n'
@@ -181,23 +172,22 @@ STUB
   chmod +x "$1/curl"
 }
 
-write_gh_stub "$STUBDIR"
 write_exapump_stub "$STUBDIR"
 write_curl_stub "$STUBDIR"
-# missing-gh dir: exapump + curl only (no gh)
-write_exapump_stub "$MISSING_GH_DIR"
-write_curl_stub "$MISSING_GH_DIR"
-# missing-exapump dir: gh + curl only (no exapump)
-write_gh_stub "$MISSING_EXAPUMP_DIR"
+# missing-curl dir: exapump only (no curl)
+write_exapump_stub "$MISSING_CURL_DIR"
+# missing-exapump dir: curl only (no exapump)
 write_curl_stub "$MISSING_EXAPUMP_DIR"
 
 RUN_PATH="$STUBDIR:$ORIG_PATH"
 
 reset_env() {
-  unset GH_AUTH_FAIL GH_DOWNLOAD_FAIL GH_ENGINE_TAG GH_SLC_TAG 2>/dev/null || true
+  unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_PUT_FAIL CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXASOL_PAT EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
+  # Stub non-empty token so happy-path runs don't each have to set it individually.
+  export GITHUB_TOKEN="STUBGHTOKEN123"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
 }
@@ -231,13 +221,12 @@ HAPPY_ARGS=(--account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile sta
 test_missing_prereq_fails_fast() {
   echo "== test_missing_prereq_fails_fast =="
   reset_env
-  RUN_PATH="$MISSING_GH_DIR"
+  RUN_PATH="$MISSING_CURL_DIR"
   run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
-  assert_rc_nonzero "missing gh: nonzero exit" "$LAST_RC"
-  assert_contains "missing gh: names gh" "$LAST_OUT" "gh"
-  assert_contains "missing gh: gives install URL" "$LAST_OUT" "https://cli.github.com"
-  assert_not_contains "missing gh: does not offer to auto-install" "$LAST_OUT" "installing gh"
-  assert_eq "missing gh: no network/SQL call made" "" "$(log_content)"
+  assert_rc_nonzero "missing curl: nonzero exit" "$LAST_RC"
+  assert_contains "missing curl: names curl" "$LAST_OUT" "curl"
+  assert_contains "missing curl: gives install URL" "$LAST_OUT" "https://curl.se"
+  assert_eq "missing curl: no network/SQL call made" "" "$(log_content)"
 
   reset_env
   RUN_PATH="$MISSING_EXAPUMP_DIR"
@@ -247,14 +236,15 @@ test_missing_prereq_fails_fast() {
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
 }
 
-test_unauthenticated_gh_fails_fast() {
-  echo "== test_unauthenticated_gh_fails_fast =="
+test_missing_github_token_fails_fast() {
+  echo "== test_missing_github_token_fails_fast =="
   reset_env
-  export GH_AUTH_FAIL=1
+  unset GITHUB_TOKEN
   run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
-  assert_rc_nonzero "unauth gh: nonzero exit" "$LAST_RC"
-  assert_contains "unauth gh: instructs gh auth login" "$LAST_OUT" "gh auth login"
-  assert_not_contains "unauth gh: no release download attempted" "$(log_content)" "release download"
+  assert_rc_nonzero "missing github token: nonzero exit" "$LAST_RC"
+  assert_contains "missing github token: names GITHUB_TOKEN" "$LAST_OUT" "GITHUB_TOKEN"
+  assert_contains "missing github token: names --github-token" "$LAST_OUT" "--github-token"
+  assert_eq "missing github token: no network/SQL call made before failing" "" "$(log_content)"
 }
 
 test_connectivity_mode_either_or() {
@@ -328,6 +318,7 @@ test_version_resolution_default_and_override() {
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_SLC_TAG="v4.5.6"
     source "$INSTALLER"
+    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
     resolve_versions
   )"
@@ -335,10 +326,15 @@ test_version_resolution_default_and_override() {
   assert_contains "default: resolves latest SLC tag" "$out" "4.5.6"
   assert_contains "default: prints engine version line" "$out" "Resolved lakehouse-engine version"
   assert_contains "default: prints SLC version line" "$out" "Resolved language-container (SLC) version"
+  local log; log="$(log_content)"
+  assert_contains "default: curl hits the releases/latest endpoint" "$log" "releases/latest"
+  assert_contains "default: curl sends the Bearer token header" "$log" "Authorization: Bearer STUBGHTOKEN123"
 
+  reset_env
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_SLC_TAG="v4.5.6"
     source "$INSTALLER"
+    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION="9.9.9"; ARG_SLC_VERSION="8.8.8"
     resolve_versions
   )"
@@ -346,6 +342,8 @@ test_version_resolution_default_and_override() {
   assert_contains "override: uses SLC override" "$out" "8.8.8"
   assert_not_contains "override: ignores latest engine tag" "$out" "1.2.3"
   assert_not_contains "override: ignores latest SLC tag" "$out" "4.5.6"
+  log="$(log_content)"
+  assert_not_contains "override: skips the releases/latest fetch entirely" "$log" "releases/latest"
 }
 
 test_script_languages_append_preserves_existing() {
@@ -395,7 +393,8 @@ test_presigned_upload_dance() {
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "upload: install succeeds" "$LAST_RC"
   local log; log="$(log_content)"
-  assert_contains "upload: gh downloads engine asset" "$log" "gh release download"
+  assert_contains "upload: resolves release-by-tag JSON for the asset id lookup" "$log" "releases/tags/"
+  assert_contains "upload: downloads the asset via the authenticated octet-stream GET" "$log" "releases/assets/"
   assert_contains "upload: SLC renamed to rustslc.tar.gz (POST key)" "$log" "/files/rustslc.tar.gz"
   assert_contains "upload: engine POST key" "$log" "/files/lakehouse-engine.tar.gz"
   assert_contains "upload: POST to obtain presigned url" "$log" "-X POST"
@@ -404,6 +403,99 @@ test_presigned_upload_dance() {
   local put_lines
   put_lines="$(printf '%s\n' "$log" | grep -- '--upload-file' || true)"
   assert_not_contains "upload: PUT adds no Authorization header" "$put_lines" "Authorization"
+}
+
+test_release_asset_download_via_rest() {
+  echo "== test_release_asset_download_via_rest =="
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "asset rest: install succeeds" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "asset rest: id-lookup step (release-by-tag GET) happens" "$log" "releases/tags/"
+  local dl_lines
+  dl_lines="$(printf '%s\n' "$log" | grep -- 'releases/assets/' || true)"
+  assert_contains "asset rest: final download follows redirects (-L within the -fsSL cluster)" "$dl_lines" "-fsSL"
+  assert_contains "asset rest: final download sends the octet-stream accept header" "$dl_lines" "Accept: application/octet-stream"
+  assert_not_contains "asset rest: final download never escalates to --location-trusted" "$dl_lines" "--location-trusted"
+
+  reset_env
+  export GH_ASSET_MISSING=1
+  local out rc
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ASSET_MISSING
+    source "$INSTALLER"
+    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
+    download_release_asset "$ENGINE_REPO" "v1.2.3" "$ENGINE_ASSET" "$SANDBOX/does-not-matter" 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "asset rest: missing/non-matching asset name fails non-zero" "$rc"
+  assert_contains "asset rest: error names the repo" "$out" "exasol-labs/lakehouse-engine-rs"
+  assert_contains "asset rest: error names the tag" "$out" "v1.2.3"
+  assert_contains "asset rest: error names the asset" "$out" "lakehouse-engine.tar.gz"
+}
+
+test_extract_asset_id_by_name_realistic() {
+  echo "== test_extract_asset_id_by_name_realistic =="
+  # Direct unit test of the no-jq asset-id lookup against a realistic GitHub release JSON
+  # (2-space pretty-print). Harder than the stub fixtures: two assets with the TARGET NOT first,
+  # each asset's "name" ordered BEFORE its "id", and each carrying a nested "uploader" object with
+  # its OWN numeric "id" at deeper (8-space) indent. A trailing "mentions" array AFTER the assets
+  # block carries a name absent from assets, to prove the scan is bounded to the assets block and
+  # cannot misfire on a later array-of-objects field.
+  local fixture id rc first_id mentions_only rc2 none rc3
+  fixture="$(cat <<'JSON'
+{
+  "tag_name": "v1.2.3",
+  "assets": [
+    {
+      "url": "https://api.github.com/repos/x/y/releases/assets/111",
+      "name": "other-asset.tar.gz",
+      "id": 111,
+      "uploader": {
+        "login": "octocat",
+        "id": 9001
+      }
+    },
+    {
+      "url": "https://api.github.com/repos/x/y/releases/assets/222",
+      "name": "lakehouse-engine.tar.gz",
+      "id": 222,
+      "uploader": {
+        "login": "hubot",
+        "id": 9002
+      }
+    }
+  ],
+  "mentions": [
+    {
+      "name": "only-in-mentions.tar.gz",
+      "id": 7777
+    }
+  ]
+}
+JSON
+)"
+
+  id="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "lakehouse-engine.tar.gz" )"
+  rc=$?
+  assert_rc_zero "extract: target present (not first) resolves" "$rc"
+  assert_eq "extract: resolves the target asset's own id (222), not its uploader id (9002) or the wrong asset" "222" "$id"
+
+  first_id="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "other-asset.tar.gz" )"
+  assert_eq "extract: first asset resolves to its own id (111), uploader id (9001) ignored" "111" "$first_id"
+
+  # Bounded to the assets block: a name present ONLY in the trailing "mentions" array must NOT
+  # resolve to that later array's id (the pre-fix scan-to-EOF false positive).
+  mentions_only="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "only-in-mentions.tar.gz" )"
+  rc2=$?
+  assert_rc_nonzero "extract: name found only outside the assets block never matches" "$rc2"
+  assert_eq "extract: no id printed for a name outside the assets block" "" "$mentions_only"
+
+  # Non-matching name against the rich fixture still fails cleanly.
+  none="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "no-such-asset.tar.gz" )"
+  rc3=$?
+  assert_rc_nonzero "extract: non-matching name returns failure" "$rc3"
+  assert_eq "extract: no id printed for a non-matching name" "" "$none"
 }
 
 test_saas_verify_listed_quoted_match() {
@@ -564,6 +656,9 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_contains "stdin-piped: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
   # If any subprocess had consumed the piped body, execution would truncate before these.
+  assert_contains "stdin-piped: GitHub release resolved (releases/latest reached)" "$log" "releases/latest"
+  assert_contains "stdin-piped: release-by-tag asset id lookup reached (releases/tags)" "$log" "releases/tags/"
+  assert_contains "stdin-piped: release asset downloaded (releases/assets)" "$log" "releases/assets/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
   assert_contains "stdin-piped: four scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_SCAN('x', 'y')"
@@ -583,7 +678,7 @@ test_stdin_piped_invocation_no_body_consumption() {
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
-  test_unauthenticated_gh_fails_fast
+  test_missing_github_token_fails_fast
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials
@@ -593,6 +688,8 @@ main() {
   test_script_languages_replace_rust_idempotent
   test_empty_script_languages_read_hard_fails
   test_presigned_upload_dance
+  test_release_asset_download_via_rest
+  test_extract_asset_id_by_name_realistic
   test_saas_verify_listed_quoted_match
   test_four_scripts_ddl_saas_path_types
   test_fingerprint_smoke_pass_and_fail

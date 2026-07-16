@@ -14,7 +14,7 @@ either way and run on any Exasol cluster.
 |---|---|
 | [1a. Automated](#1a-automated-build-and-upload) | `exapump`/curl has direct network access to both BucketFS and the DB SQL port (e.g. the bundled Docker stack, or an on-prem cluster reachable from your machine). One command per artifact. |
 | [1b. Manual](#1b-manual-download-and-upload) | No direct BucketFS network access — e.g. Exasol SaaS, which exposes only a BucketFS upload UI and REST API, not the raw BucketFS ports. Every step is a `curl`/SQL command or a UI action, no Docker or `exapump` BucketFS access required. |
-| [1c. Automated (SaaS)](#1c-automated-saas-one-command) | **Exasol SaaS, one command.** Fetch `install-saas.sh` via `gh` and pipe it to bash: it automates all of 1b **plus** [step 2](#2-create-the-scripts) and the [fingerprint smoke test](#fingerprint-smoke-test-optional), then stops and prints the step 3/4 template. Needs `gh`/`exapump`/`curl` and a SaaS PAT. |
+| [1c. Automated (SaaS)](#1c-automated-saas-one-command) | **Exasol SaaS, one command.** Fetch `install-saas.sh` via an authenticated `curl` request and pipe it to bash: it automates all of 1b **plus** [step 2](#2-create-the-scripts) and the [fingerprint smoke test](#fingerprint-smoke-test-optional), then stops and prints the step 3/4 template. Needs a `GITHUB_TOKEN`, `exapump`/`curl`, and a SaaS PAT. |
 
 ## Prerequisites
 
@@ -152,19 +152,37 @@ into one idempotent command. It stops at a query-ready product install and print
 [step 3](#3-create-the-catalog-connection) / [step 4](#4-create-the-virtual-schema) SQL as a
 template; it does **not** create the CONNECTION or Virtual Schema (those are dataset-specific).
 
-Run it straight from the private repo through the authenticated `gh` CLI, piped into bash:
+Run it straight from the private repo through an authenticated `curl` request, piped into bash:
 
 ```bash
-gh api -H "Accept: application/vnd.github.raw" \
-  repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
+export GITHUB_TOKEN=<your PAT>
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
   | EXASOL_PAT=$PAT bash -s -- --account-id $ACC --database-id $DB --profile staging
 ```
 
+`GITHUB_TOKEN` must be `export`ed on its own line — unlike `EXASOL_PAT` (inlined as
+`EXASOL_PAT=$PAT` on the piped `bash` command, scoped to that child process only), `curl` in the
+same pipeline needs `GITHUB_TOKEN` visible as a shell variable to read it into the `Authorization`
+header. Folding it into the same line as `curl` (or leaving it implicit) silently sends an empty
+token and fails confusingly downstream.
+
+To pin a specific script version instead of the default branch, append `?ref=<version>` (a tag,
+branch, or commit SHA) to the Contents API URL, e.g. `.../install-saas.sh?ref=v0.26.3` — the
+reason this uses the GitHub Contents API rather than a plain release-asset URL is exactly to keep
+this pinning capability available.
+
 Prerequisites:
 
-- **`gh`**, authenticated (`gh auth login`) — the lakehouse-engine-rs repo is private, so both the
-  script fetch and the engine release download go through `gh`. (The SLC repo is public.)
-- **`exapump`** and **`curl`** on `PATH`.
+- A **GitHub personal access token** (`GITHUB_TOKEN` or `--github-token`) with read access to the
+  private lakehouse-engine-rs repo — both the script fetch and the engine release download
+  authenticate through it. (The SLC repo is public, so its release lookup doesn't strictly need a
+  token — but the installer sends the same authenticated `curl` call for both, which is simpler
+  than branching on repo visibility.)
+- **`exapump`** and **`curl`** on `PATH`. A reasonably modern `curl` (>= 7.58, i.e. any release from
+  2018 onward) is required: the private-repo release-asset download relies on curl's default
+  behavior of stripping the `Authorization` header on a cross-host redirect.
 - A **SaaS PAT** (`EXASOL_PAT` or `--pat`) with the `databases:use`, `users:read`, and
   `filemanage:write` scopes, plus your SaaS `--account-id` and `--database-id` — get all three from
   the SaaS web console (there is no API to discover the ids).

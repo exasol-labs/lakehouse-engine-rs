@@ -11,13 +11,16 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
 ## Background
 
 * The script is a single POSIX-compatible Bash file targeting Bash 3.2+ (stock macOS)
-  and stock Linux; it uses only `bash`, `curl`, `gh`, and `exapump` — no assumed package
-  manager and no `jq`.
-* `gh`, `exapump`, and `curl` are stated prerequisites, not bootstrapped by the script;
-  a missing or unauthenticated prerequisite is a fail-fast error, never a silent skip.
+  and stock Linux; it uses only `bash`, `curl`, and `exapump` — no assumed package
+  manager, no `jq`, and no `gh` CLI.
+* `exapump` and `curl` are stated prerequisites, not bootstrapped by the script; a missing
+  prerequisite is a fail-fast error, never a silent skip.
 * The lakehouse-engine-rs repository is private (INTERNAL); every access to its release
-  assets or contents goes through the pre-authenticated `gh` CLI. The language-container-rs
-  repository is public; its release download needs no authentication.
+  assets or contents goes through the GitHub REST API over `curl`, authenticated with a
+  GitHub token supplied as `GITHUB_TOKEN` (or `--github-token`) in an `Authorization` bearer
+  header. The language-container-rs repository is public; the installer sends the same token
+  header to it (harmless for a public repo), so there is exactly one authenticated code path
+  and no dependency on the `gh` CLI.
 * SaaS control-plane REST calls authenticate with a SaaS personal access token (PAT)
   passed as `EXASOL_PAT` (or `--pat`); `--account-id` and `--database-id` are required
   inputs because the SaaS API exposes no route to discover them.
@@ -32,19 +35,19 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
 
 ### Scenario: Missing prerequisite fails fast with a remediation pointer
 
-* *GIVEN* `gh`, `exapump`, or `curl` is absent from `PATH`
+* *GIVEN* `exapump` or `curl` is absent from `PATH`
 * *WHEN* the script runs
 * *THEN* the script MUST exit non-zero before making any network call or SQL statement
 * *AND* the script MUST print which tool is missing and the URL of its install instructions
 * *AND* the script MUST NOT attempt to install the missing tool itself
 
-### Scenario: Unauthenticated GitHub CLI fails fast
+### Scenario: Missing GitHub token fails fast
 
-* *GIVEN* `gh` is present on `PATH`
-* *AND* `gh auth status` reports no authenticated account
+* *GIVEN* neither the `GITHUB_TOKEN` environment variable nor the `--github-token` flag supplies a non-empty token
 * *WHEN* the script runs
-* *THEN* the script MUST exit non-zero before downloading any release asset
-* *AND* the script MUST instruct the user to run `gh auth login`
+* *THEN* the script MUST exit non-zero before making any GitHub REST call or downloading any release asset
+* *AND* the error message MUST name both `GITHUB_TOKEN` and `--github-token`, and state the token is required for private lakehouse-engine-rs access
+* *AND* the script MUST NOT print the token value
 
 ### Scenario: Connectivity mode is a validated either/or
 
@@ -65,8 +68,8 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
 
 * *GIVEN* no version flags are supplied
 * *WHEN* the script resolves artifact versions
-* *THEN* the script SHALL resolve the latest lakehouse-engine-rs release tag through the authenticated `gh` CLI
-* *AND* the script SHALL resolve the latest language-container-rs (public repo) release tag through the same `gh` invocation session already required for the private lakehouse-engine-rs repo, adding no additional authentication step or prerequisite of its own
+* *THEN* the script SHALL resolve the latest lakehouse-engine-rs release tag through the GitHub REST API over `curl` (`GET https://api.github.com/repos/<repo>/releases/latest` with the `GITHUB_TOKEN` bearer `Authorization` header), parsing `tag_name` with the existing no-jq bash-regex field extractor
+* *AND* the script SHALL resolve the latest language-container-rs (public repo) release tag through the same `curl` GitHub REST API path and the same token header, adding no additional authentication step or prerequisite of its own
 * *AND* WHEN `--lakehouse-version` or `--slc-version` is supplied THEN the script SHALL use that exact version instead of resolving the latest
 * *AND* the script SHALL print the resolved engine and SLC versions before uploading
 
@@ -77,3 +80,4 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
 * *THEN* the script SHALL address `https://cloud.exasol.com`
 * *AND* WHEN `--staging` is supplied THEN the script SHALL address `https://cloud-staging.exasol.com` for every SaaS REST call
 * *AND* the script SHALL accept no arbitrary base-URL override; `--staging` toggles between exactly these two targets
+</content>

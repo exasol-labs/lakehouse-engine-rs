@@ -15,10 +15,10 @@ read-modify-write that runs before this stage.
 ## Background
 
 * The distributed one-liner pipes the installer body into `bash` over stdin. Every subprocess
-  the installer spawns — `gh api`, `gh release download`, `curl`, `exapump sql` — MUST take all
-  input through arguments, flags, or files, and MUST run with stdin redirected from `/dev/null`
-  (or otherwise closed), so no subprocess consumes the remaining piped script body and truncates
-  or corrupts the install.
+  the installer spawns — `curl` (GitHub REST for release downloads, SaaS REST for the file API)
+  and `exapump sql` — MUST take all input through arguments, flags, or files, and MUST run with
+  stdin redirected from `/dev/null` (or otherwise closed), so no subprocess consumes the
+  remaining piped script body and truncates or corrupts the install.
 * Uploaded tarballs land under `uploads/default`: the engine at
   `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so` and the SLC under
   `/buckets/uploads/default/rustslc/`.
@@ -45,9 +45,18 @@ read-modify-write that runs before this stage.
 
 * *GIVEN* resolved engine and SLC versions and a reachable SaaS database
 * *WHEN* the script uploads each tarball
-* *THEN* the script SHALL download the engine `lakehouse-engine.tar.gz` through the authenticated `gh` CLI and the public `lc-rust-<version>.tar.gz`, renaming the SLC tarball to `rustslc.tar.gz` before upload
+* *THEN* the script SHALL download the engine `lakehouse-engine.tar.gz` and the public `lc-rust-<version>.tar.gz` through the GitHub REST API over `curl` (the release-asset download flow below), renaming the SLC tarball to `rustslc.tar.gz` before upload
 * *AND* for each tarball the script SHALL POST to the SaaS files endpoint to obtain a presigned URL and then PUT the tarball to that URL back-to-back, adding no extra headers to the PUT
 * *AND* the script SHALL confirm each uploaded file is listed by the SaaS files API before proceeding
+
+### Scenario: Release assets download through the authenticated GitHub REST API
+
+* *GIVEN* a resolved release tag for a repository (private lakehouse-engine-rs or public language-container-rs) and a non-empty GitHub token
+* *WHEN* the script downloads a release asset
+* *THEN* the script SHALL fetch the release JSON for that tag from the GitHub REST API over `curl` (stdin from `/dev/null`, `GITHUB_TOKEN` bearer `Authorization` header), locate the target asset by matching its `name`, and extract the asset's numeric `id` with a no-jq bash-regex helper
+* *AND* the script SHALL download the asset bytes through `GET https://api.github.com/repos/<repo>/releases/assets/<id>` sending both the header `Accept: application/octet-stream` and the `GITHUB_TOKEN` bearer `Authorization` header
+* *AND* the script SHALL follow the GitHub redirect to the signed storage host with curl `-L`, and MUST NOT forward the `Authorization` header to that host (curl's default `-L` behavior, never `--location-trusted`), because the signed URL carries its own credentials and rejects a second authentication mechanism
+* *AND* WHEN the asset `name` is absent from the release JSON, or the asset download fails, THEN the script MUST exit non-zero with a message naming the repository, the tag, and the asset
 
 ### Scenario: Four scripts are created at the SaaS path with correct script types
 
@@ -86,8 +95,9 @@ read-modify-write that runs before this stage.
 ### Scenario: Installer survives being piped to bash over stdin
 
 * *GIVEN* the installer is invoked through the distributed one-liner form, piped into `bash -s --` over stdin rather than saved and executed as a local file
-* *WHEN* the installer spawns its `gh`, `curl`, and `exapump sql` subprocesses
+* *WHEN* the installer spawns its `curl` and `exapump sql` subprocesses
 * *THEN* every subprocess MUST receive its input through arguments, flags, or files, never through inherited stdin
 * *AND* every subprocess MUST run with stdin redirected from `/dev/null` so it cannot consume the remaining piped script body
 * *AND* the install MUST run to completion without truncation or corruption of the script body
 * *AND* the test harness MUST exercise the installer through this stdin-piped invocation path, not only as a locally saved and executed file
+</content>

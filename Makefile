@@ -55,7 +55,8 @@ test:
 	cargo test
 
 # Unit-test the SaaS one-command installer (deploy/scripts/install-saas.sh). Pure bash: it
-# stubs gh/exapump/curl on a temp PATH, so no Exasol, network, or SaaS credentials are needed.
+# stubs exapump/curl (including the GitHub REST calls) on a temp PATH, so no Exasol, network, or
+# SaaS credentials are needed.
 test-install-saas:
 	bash deploy/scripts/tests/install-saas.test.sh
 
