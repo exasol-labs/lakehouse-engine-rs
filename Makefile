@@ -54,6 +54,11 @@ cross-musl-udf-build: $(VS_SO)
 test:
 	cargo test
 
+# Unit-test the SaaS one-command installer (deploy/scripts/install-saas.sh). Pure bash: it
+# stubs gh/exapump/curl on a temp PATH, so no Exasol, network, or SaaS credentials are needed.
+test-install-saas:
+	bash deploy/scripts/tests/install-saas.test.sh
+
 # Host ports of the dedicated lakehouse-engine compose stack. Overridable so the
 # suite can always pick free ports; defaults match docker-compose.yml.
 # Exasol host. Defaults to localhost (Docker stack); the bench script
@@ -164,4 +169,4 @@ lint:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench
+.PHONY: cross-musl-udf-build test test-install-saas test-e2e install-slc bucketfs-upload-so fmt lint bench

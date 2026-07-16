@@ -14,6 +14,7 @@ either way and run on any Exasol cluster.
 |---|---|
 | [1a. Automated](#1a-automated-build-and-upload) | `exapump`/curl has direct network access to both BucketFS and the DB SQL port (e.g. the bundled Docker stack, or an on-prem cluster reachable from your machine). One command per artifact. |
 | [1b. Manual](#1b-manual-download-and-upload) | No direct BucketFS network access — e.g. Exasol SaaS, which exposes only a BucketFS upload UI and REST API, not the raw BucketFS ports. Every step is a `curl`/SQL command or a UI action, no Docker or `exapump` BucketFS access required. |
+| [1c. Automated (SaaS)](#1c-automated-saas-one-command) | **Exasol SaaS, one command.** Fetch `install-saas.sh` via `gh` and pipe it to bash: it automates all of 1b **plus** [step 2](#2-create-the-scripts) and the [fingerprint smoke test](#fingerprint-smoke-test-optional), then stops and prints the step 3/4 template. Needs `gh`/`exapump`/`curl` and a SaaS PAT. |
 
 ## Prerequisites
 
@@ -60,6 +61,10 @@ Use this path when `exapump`/curl can't reach BucketFS directly — e.g. **Exaso
 exposes only a BucketFS upload UI and a presigned-URL REST API, never the raw BucketFS ports.
 No Docker, no Rust toolchain, no local build — every step below is either downloading a prebuilt
 release artifact, a plain `curl` command, or a UI action.
+
+> On SaaS, [**1c. Automated (SaaS)**](#1c-automated-saas-one-command) runs this whole sequence
+> (plus [step 2](#2-create-the-scripts) and the smoke test) as one command. The manual steps here
+> remain the reference for what that script automates and the fallback when you can't run it.
 
 #### Download the release tarball
 
@@ -137,6 +142,49 @@ other channels above**: SaaS lands an uploaded `<name>.tar.gz` at `/buckets/uplo
 `buckets/bfsdefault/default/udf/liblakehouse_engine.so`.
 
 Continue with [step 2](#2-create-the-scripts).
+
+### 1c. Automated (SaaS): one command
+
+On Exasol SaaS, [`deploy/scripts/install-saas.sh`](../deploy/scripts/install-saas.sh) collapses the
+entire 1b flow — SLC registration, the presigned-URL upload of both tarballs, the four-script DDL at
+the SaaS `%udf_object` path, and the [fingerprint smoke test](#fingerprint-smoke-test-optional) —
+into one idempotent command. It stops at a query-ready product install and prints the
+[step 3](#3-create-the-catalog-connection) / [step 4](#4-create-the-virtual-schema) SQL as a
+template; it does **not** create the CONNECTION or Virtual Schema (those are dataset-specific).
+
+Run it straight from the private repo through the authenticated `gh` CLI, piped into bash:
+
+```bash
+gh api -H "Accept: application/vnd.github.raw" \
+  repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
+  | EXASOL_PAT=$PAT bash -s -- --account-id $ACC --database-id $DB --profile staging
+```
+
+Prerequisites:
+
+- **`gh`**, authenticated (`gh auth login`) — the lakehouse-engine-rs repo is private, so both the
+  script fetch and the engine release download go through `gh`. (The SLC repo is public.)
+- **`exapump`** and **`curl`** on `PATH`.
+- A **SaaS PAT** (`EXASOL_PAT` or `--pat`) with the `databases:use`, `users:read`, and
+  `filemanage:write` scopes, plus your SaaS `--account-id` and `--database-id` — get all three from
+  the SaaS web console (there is no API to discover the ids).
+
+Defaults and flags:
+
+- Targets `https://cloud.exasol.com` and installs the **latest** lakehouse-engine and SLC releases.
+  `--staging` switches to `https://cloud-staging.exasol.com`; `--lakehouse-version` / `--slc-version`
+  pin exact versions.
+- SQL connectivity is exactly one of `--profile <name>`, `--dsn`/`EXAPUMP_DSN`, or
+  `--host`/`--user`/`--password`. `--host` MUST include the port (e.g. `myhost:8563`) — there is
+  no separate `--port` flag; the value is assembled into `exasol://user:pwd@host:port`.
+  `--schema` overrides the default `LHVS`.
+- `--help` lists every flag.
+
+Re-runs are safe (idempotent): `CREATE OR REPLACE`, `CREATE SCHEMA IF NOT EXISTS`, an in-place
+`RUST=` `SCRIPT_LANGUAGES` swap, and same-key SaaS re-uploads. On any failure it exits non-zero with
+an actionable message and never reports success.
+
+Once it prints the template, continue with [step 3](#3-create-the-catalog-connection).
 
 ## 2. Create the scripts
 
