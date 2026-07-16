@@ -73,7 +73,8 @@ run_timed_load() {  # label  target_table  sql
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
   if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; return; fi
   cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
-  echo "  $label: ${el}s  rows=${cnt}" | tee -a "$REPORT"
+  local rps; rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
+  echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s" | tee -a "$REPORT"
 }
 
 echo "=== data-intensive setup: schema + native IMPORT target table ===" | tee -a "$REPORT"
