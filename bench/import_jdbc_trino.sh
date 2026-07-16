@@ -243,10 +243,21 @@ run_timed "nq3" "$INTO_NQ3" "$NQ3"
 run_timed "nq4" "$INTO_NQ4" "$NQ4"
 run_timed "nq5" "$INTO_NQ5" "$NQ5"
 
-# ---- raw streaming full-table scan: no aggregation, no filter — measures pure data-movement
-# throughput over the single JDBC connection, to compare against import_ceiling.sh's VS-path
-# CTAS (bench/import_ceiling.sh's vs_ctas_run*) at the same node count.
-echo "=== raw full-table scan: IMPORT INTO (JDBC), SELECT * FROM lineitem, 3x ===" | tee -a "$REPORT"
+# ---- raw streaming scan: no aggregation, no filter — measures pure data-movement throughput
+# over the single JDBC connection, to compare against import_ceiling.sh's VS-path CTAS
+# (bench/import_ceiling.sh's vs_ctas_run*) at the same node count.
+#
+# Bounded to JDBC_RAW_SCAN_LIMIT rows (default 1,000,000 — large enough to reach steady-state
+# throughput past connection/setup overhead), NOT the full 180M-row table: Exasol's JDBC ETL
+# bridge has a per-statement execution ceiling around 300s that live-verified testing showed is
+# NOT the SQL-level QUERY_TIMEOUT session parameter (ALTER SESSION SET QUERY_TIMEOUT=1800 had no
+# effect — the full-table version of this query failed identically at exactly 300000ms both
+# with and without it) and isn't exposed as a configurable settings.cfg property either. rows/sec
+# from a fixed, timeout-safe sample is what the node-count-scaling hypothesis actually needs — if
+# JDBC's single connection doesn't scale with Exasol's node count, that shows up in this bounded
+# throughput number just as clearly as it would in an unbounded one.
+JDBC_RAW_SCAN_LIMIT="${JDBC_RAW_SCAN_LIMIT:-1000000}"
+echo "=== raw scan: IMPORT INTO (JDBC), SELECT * FROM lineitem LIMIT ${JDBC_RAW_SCAN_LIMIT}, 3x ===" | tee -a "$REPORT"
 printf '%s' "CREATE SCHEMA IF NOT EXISTS BENCH" | exapump sql -d "$DSN" >/dev/null 2>&1 || true
 printf '%s' "CREATE OR REPLACE TABLE BENCH.LINEITEM_JDBC (${INTO_RAW})" | exapump sql -d "$DSN" >/dev/null 2>&1
 for i in 1 2 3; do
@@ -255,11 +266,8 @@ for i in 1 2 3; do
     FAILED=1
     continue
   fi
-  # QUERY_TIMEOUT must be raised IN THE SAME SESSION as the IMPORT itself (each exapump invocation
-  # is its own session, so a separate ALTER SESSION call wouldn't carry over) — Exasol's 300s
-  # default is well under how long a full 180M-row transfer over a single JDBC connection takes.
   run_timed_load "jdbc_raw_scan_run$i" "BENCH.LINEITEM_JDBC" \
-    "ALTER SESSION SET QUERY_TIMEOUT=1800; IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem'"
+    "IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem LIMIT ${JDBC_RAW_SCAN_LIMIT}'"
 done
 
 if [ "$FAILED" -ne 0 ]; then
