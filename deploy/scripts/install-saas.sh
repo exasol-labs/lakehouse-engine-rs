@@ -56,6 +56,23 @@ err()  { printf 'ERROR: %s\n' "$*" >&2; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Percent-encodes a string for safe inclusion in a DSN's userinfo component (RFC 3986 unreserved
+# set only: A-Za-z0-9-_.~). --user/--password may contain reserved URI characters (@, :, /, ?, #)
+# that would otherwise corrupt or change the meaning of the exasol:// DSN built by string
+# interpolation.
+url_encode() {
+  local s="$1" i c out=""
+  local len=${#s}
+  for ((i = 0; i < len; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [A-Za-z0-9.~_-]) out+="$c" ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s\n' "$out"
+}
+
 # --- JSON helpers ------------------------------------------------------------
 # Extracts a top-level JSON string field by name (no jq; bash regex). Returns 1 if absent.
 extract_json_string_field() {
@@ -178,6 +195,10 @@ validate_connectivity() {
       err "host connectivity mode requires all of --host, --user, and --password"
       return 1
     fi
+    if [[ ! "$ARG_HOST" =~ ^[^[:space:]]+:[0-9]+$ ]]; then
+      err "--host must be host:port (e.g. myhost:8563); got '$ARG_HOST' with no port. There is no separate --port flag."
+      return 1
+    fi
   fi
   printf '%s\n' "$chosen"
   return 0
@@ -277,7 +298,9 @@ saas_verify_listed() {
   if ! resp="$(curl -fsS -H "Authorization: Bearer $ARG_PAT" "$url" </dev/null 2>&1)"; then
     return 1
   fi
-  [[ "$resp" == *"$filename"* ]]
+  # Match the quoted JSON string, not a bare substring: without the quote boundary,
+  # "rustslc.tar.gz" would also match a longer stored name like "rustslc.tar.gz.bak".
+  [[ "$resp" == *"\"$filename\""* ]]
 }
 
 # Atomic POST-presigned-then-PUT upload; verifies the file is listed afterwards.
@@ -544,7 +567,10 @@ main() {
     exit 1
   fi
   if [[ "$CONNECTIVITY_MODE" == "host" ]]; then
-    HOST_DSN="exasol://$ARG_USER:$ARG_PASSWORD@$ARG_HOST?validateservercertificate=0"
+    local enc_user enc_password
+    enc_user="$(url_encode "$ARG_USER")"
+    enc_password="$(url_encode "$ARG_PASSWORD")"
+    HOST_DSN="exasol://$enc_user:$enc_password@$ARG_HOST?validateservercertificate=0"
   fi
 
   check_prereqs || exit 1

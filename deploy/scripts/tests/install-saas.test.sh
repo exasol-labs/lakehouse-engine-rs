@@ -163,7 +163,13 @@ elif [[ "$method" == "POST" ]]; then
 else
   case "$url" in
     */files)
-      if [[ "${CURL_LIST_MISSING:-0}" == "1" ]]; then printf '{"files":[]}\n'; else printf '{"files":["lakehouse-engine.tar.gz","rustslc.tar.gz"]}\n'; fi
+      if [[ "${CURL_LIST_MISSING:-0}" == "1" ]]; then
+        printf '{"files":[]}\n'
+      elif [[ "${CURL_LIST_SUFFIX_ONLY:-0}" == "1" ]]; then
+        printf '{"files":["rustslc.tar.gz.bak"]}\n'
+      else
+        printf '{"files":["lakehouse-engine.tar.gz","rustslc.tar.gz"]}\n'
+      fi
       exit 0 ;;
     *)
       if [[ "${CURL_DB_UNREACHABLE:-0}" == "1" ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
@@ -190,7 +196,7 @@ RUN_PATH="$STUBDIR:$ORIG_PATH"
 reset_env() {
   unset GH_AUTH_FAIL GH_DOWNLOAD_FAIL GH_ENGINE_TAG GH_SLC_TAG 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
-  unset CURL_POST_FAIL CURL_PUT_FAIL CURL_LIST_MISSING CURL_DB_UNREACHABLE 2>/dev/null || true
+  unset CURL_POST_FAIL CURL_PUT_FAIL CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXASOL_PAT EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
@@ -267,6 +273,32 @@ test_connectivity_mode_either_or() {
   reset_env
   run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
   assert_rc_zero "single mode proceeds to success" "$LAST_RC"
+}
+
+test_host_mode_requires_port() {
+  echo "== test_host_mode_requires_port =="
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost --user u --password p
+  assert_rc_nonzero "host no port: nonzero exit" "$LAST_RC"
+  assert_contains "host no port: message mentions port" "$LAST_OUT" "port"
+  assert_eq "host no port: no network call made" "" "$(log_content)"
+
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost:8563 --user u --password p
+  assert_rc_zero "host with port: proceeds" "$LAST_RC"
+}
+
+test_host_dsn_percent_encodes_credentials() {
+  echo "== test_host_dsn_percent_encodes_credentials =="
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 \
+    --host myhost:8563 --user 'us:er@x' --password 'p@ss/word?#'
+  assert_rc_zero "encode: host-mode install still succeeds" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "encode: DSN carries percent-encoded user" "$log" "us%3Aer%40x"
+  assert_contains "encode: DSN carries percent-encoded password" "$log" "p%40ss%2Fword%3F%23"
+  assert_not_contains "encode: raw reserved-char user:password sequence absent from DSN" \
+    "$log" "us:er@x:p@ss"
 }
 
 test_missing_required_ids_fail_fast() {
@@ -372,6 +404,28 @@ test_presigned_upload_dance() {
   local put_lines
   put_lines="$(printf '%s\n' "$log" | grep -- '--upload-file' || true)"
   assert_not_contains "upload: PUT adds no Authorization header" "$put_lines" "Authorization"
+}
+
+test_saas_verify_listed_quoted_match() {
+  echo "== test_saas_verify_listed_quoted_match =="
+  reset_env
+  local no_match
+  no_match="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG CURL_LIST_SUFFIX_ONLY=1
+    source "$INSTALLER"
+    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 ARG_PAT=SECRETPAT123 ARG_STAGING=0
+    if saas_verify_listed "rustslc.tar.gz"; then echo yes; else echo no; fi
+  )"
+  assert_eq "suffix collision: does not false-positive on a longer stored name" "no" "$no_match"
+
+  local exact_match
+  exact_match="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG
+    source "$INSTALLER"
+    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 ARG_PAT=SECRETPAT123 ARG_STAGING=0
+    if saas_verify_listed "rustslc.tar.gz"; then echo yes; else echo no; fi
+  )"
+  assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
 }
 
 test_four_scripts_ddl_saas_path_types() {
@@ -531,12 +585,15 @@ main() {
   test_missing_prereq_fails_fast
   test_unauthenticated_gh_fails_fast
   test_connectivity_mode_either_or
+  test_host_mode_requires_port
+  test_host_dsn_percent_encodes_credentials
   test_missing_required_ids_fail_fast
   test_version_resolution_default_and_override
   test_script_languages_append_preserves_existing
   test_script_languages_replace_rust_idempotent
   test_empty_script_languages_read_hard_fails
   test_presigned_upload_dance
+  test_saas_verify_listed_quoted_match
   test_four_scripts_ddl_saas_path_types
   test_fingerprint_smoke_pass_and_fail
   test_stops_at_product_prints_template
