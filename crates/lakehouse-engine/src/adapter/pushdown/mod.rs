@@ -13,7 +13,9 @@ use serde_json::Value as Json;
 /// - A predicate the adapter cannot translate is OMITTED from the spec
 ///   (correctness backstop: Exasol keeps the predicate at its own level).
 /// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-/// - Credentials NEVER appear in any returned SQL string or error message.
+/// - Catalog/connection auth credentials (OAuth token, bearer, etc.) NEVER appear
+///   in any returned SQL string or error message. Storage (S3) credentials are a
+///   documented exception — see `handle_pushdown`'s doc comment.
 use vs_expression::render_df_filter_safe;
 
 mod support;
