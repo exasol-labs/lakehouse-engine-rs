@@ -147,3 +147,107 @@ showed the expected `... AS shards(shard_key, files) GROUP BY shard_key` shape w
 files correctly paired per data file). The 15 query results and timings above are unaffected — only
 the harness's own trailing pushdown-check block flaked both times. `bench/run.sh`'s `pushdown_check`
 has no retry, so one transient EXPLAIN failure fails the whole run; worth hardening separately.
+
+## Raw streaming scan & IMPORT FROM JDBC parallelism
+
+### Hypothesis
+
+lakehouse-engine-rs scales a scan across the Exasol cluster by sharding the Iceberg file list into
+`GROUP BY shard_key` work units and multiplexing them onto every node's core pool (mission Core
+Capability #3), so a scan's throughput should grow when the cluster gains nodes. Exasol's native
+`IMPORT FROM PARQUET` reader is likewise cluster-parallel (MPP). Exasol's native `IMPORT FROM JDBC`,
+by contrast, pulls its entire result set through a **single JDBC connection** on one node with no
+equivalent cluster-side fan-out — so the hypothesis is that JDBC throughput should stay **flat** as
+Exasol node count rises, while the VS path and native Parquet path both scale. This matters because
+`IMPORT FROM JDBC` (here against a Trino coordinator) is the natural "just federate it" alternative a
+user would reach for instead of the VS, and its throughput ceiling is invisible until the cluster is
+scaled up and it fails to move.
+
+### What was measured
+
+A raw, unaggregated streaming scan of the same TPC-H sf=30 `lineitem` table (180M rows, same
+Iceberg/Glue data as §a/§b) run three ways, at **2 and 4 Exasol nodes** (`test1`, 2×/4×
+`r8i.2xlarge`), 3× each, through one automated pipeline
+(`deploy/scripts/jdbc-parallelism-sweep.sh` → `deploy/scripts/bench-remote.sh`) live on 2026-07-16,
+torn down immediately after:
+
+1. **lakehouse-engine-rs VS** — `CREATE OR REPLACE TABLE BENCH.LINEITEM_VS AS SELECT * FROM
+   TPCH.LINEITEM` (`import_ceiling.sh` `vs_ctas_run*`), full 180M rows.
+2. **Native `IMPORT FROM PARQUET`** — `IMPORT INTO BENCH.LINEITEM_IMPORT FROM PARQUET ...`
+   (`import_ceiling.sh` `import_into_run*`), full 180M rows. Exasol's own MPP Parquet reader —
+   context, not part of the hypothesis, but a corroborating cluster-parallel baseline.
+3. **Native `IMPORT FROM JDBC`** — `IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' ...
+   STATEMENT 'SELECT * FROM lineitem LIMIT 1000000'` (`import_jdbc_trino.sh` `jdbc_raw_scan_run*`),
+   bounded to **1,000,000 rows** (not the full 180M). Trino is fixed at 2 nodes for both trials — the
+   hypothesis is about Exasol's node count, not Trino's.
+
+**Why the JDBC scan is bounded to 1M rows (load-bearing, not a footnote).** Live testing found
+Exasol's JDBC ETL bridge has an apparent **~300-second per-statement execution ceiling**: a
+full-table JDBC IMPORT failed at exactly 300000 ms. This is **not** the SQL-level `QUERY_TIMEOUT`
+session parameter — `ALTER SESSION SET QUERY_TIMEOUT=N` was verified to work for ordinary queries
+(a 27 s query was killed at ~1 s locally) yet had **zero** effect on the JDBC IMPORT, which still
+failed identically at 300000 ms with or without it — and it is not exposed as a configurable JDBC
+driver / `settings.cfg` property either (searched the exasol-db engine source, including
+`JavaModules`/`ETLjdbc`, no configurable override found). 1,000,000 rows was chosen as large enough
+to reach steady-state throughput past connection/setup overhead while completing safely under that
+ceiling. Because throughput (rows/s) is the scaling metric, the different row count vs. paths 1–2
+does not affect the node-count comparison — what matters is whether a path's rows/s moves when nodes
+double.
+
+### Results
+
+Throughput in rows/s, averaged over the successful runs of each 3× trial; scaling = 4-node avg ÷
+2-node avg (higher is better; ~2.0× is ideal linear scaling for a 2× node increase).
+
+| Scan path | 2-node (rows/s) | 4-node (rows/s) | Scaling (4n ÷ 2n) | Scales with nodes? |
+|---|---|---|---|---|
+| lakehouse-engine-rs VS (`SELECT *` CTAS) | 736,796 | 1,355,173 | **1.84×** | Yes |
+| Native `IMPORT FROM PARQUET` | 2,224,790 | 4,402,954 | **1.98×** | Yes |
+| Native `IMPORT FROM JDBC` (Trino, 1M rows) | 60,583 | 60,206 | **0.99×** | No (flat) |
+
+Per-run figures (rows/s): VS 2-node 735,167 / 738,425 (run 3 not counted — see caveats); VS 4-node
+1,342,570 / 1,356,738 / 1,366,212. Native Parquet 2-node 2,217,002 / 2,222,751 / 2,234,617; 4-node
+4,361,482 / 4,410,644 / 4,436,736. JDBC 2-node 60,680 / 60,241 / 60,827
+([`import-jdbc-trino-20260716-212055.txt`](../bench/reports/import-jdbc-trino-20260716-212055.txt));
+JDBC 4-node 59,952 / 60,132 / 60,533
+([`import-jdbc-trino-20260716-214746.txt`](../bench/reports/import-jdbc-trino-20260716-214746.txt)).
+
+### Verdict: CONFIRMED
+
+`IMPORT FROM JDBC` throughput is **flat** across the node doubling — 60,583 → 60,206 rows/s, a 0.99×
+ratio (i.e. no gain; the tiny dip is run-to-run noise). Both cluster-parallel paths scale roughly
+with node count over the same doubling: the lakehouse-engine-rs VS at 1.84× and native
+`IMPORT FROM PARQUET` at 1.98×. The single-JDBC-connection design is the throughput bottleneck it was
+predicted to be: adding Exasol nodes does nothing for it, whereas the file-sharded VS path turns
+those nodes into more scan parallelism. In absolute terms the VS path already moves raw rows ~12×
+faster than JDBC at 2 nodes (737K vs. 61K rows/s) and ~22× faster at 4 nodes (1.36M vs. 60K rows/s),
+and the gap widens with every node added.
+
+The intra-trial run-to-run spread is tight for all three paths (VS ≤1.7%, native ≤1.7%, JDBC ≤1.0%),
+and a separate earlier 2-node provisioning of the same code paths reproduced the JDBC and native
+figures closely (JDBC 59,524 / 59,844 / 61,237 rows/s ≈ 60.2K avg; native 2,211,826 / 2,210,468 /
+2,257,599 rows/s; VS 733,370 rows/s on its one completed run before the same license cap below),
+corroborating the result.
+
+### Caveats
+
+- **VS 2-node is 2 of 3 runs, not 3 of 3.** The third VS CTAS run at 2 nodes hit the test cluster's
+  license ceiling ("cumulative database raw sizes ... exceeded license limit", SQL state R0010)
+  before completing — a constraint of the `test1` license, unrelated to the hypothesis, not a slow
+  result. The 2-node VS average is over the two runs that completed (735,167 / 738,425 rows/s, which
+  agree to 0.4%, so the missing run is unlikely to move it materially). All three 4-node VS runs
+  completed. The earlier cross-check 2-node run hit the identical cap after one completed run.
+- **The JDBC path measures 1M rows, not the full 180M table** (see methodology above). It is a
+  steady-state throughput sample bounded under the ~300 s ETL-bridge ceiling, not a full-table load,
+  so it is a fair rows/s comparison but not a full-table wall-clock comparison against paths 1–2.
+- **Trino is held at 2 nodes throughout**, deliberately — the variable under test is Exasol's node
+  count, so the JDBC producer is kept constant. This means the flat JDBC line reflects the Exasol-side
+  single-connection ceiling, not a Trino-side limit; a larger Trino would not change the conclusion
+  because the bottleneck is the single JDBC connection into Exasol, not Trino's ability to produce
+  rows.
+- **The 15-query q1–nq5 timings in both JDBC reports are ordinary IMPORT-FROM-JDBC query runs**
+  (e.g. q9b ~13 s, the widest projection), not part of the raw-scan scaling measurement; they are
+  the same competitor path already shown in §a/§b and are not re-analyzed here.
+- **Native `IMPORT FROM PARQUET` reads raw Parquet directly** and applies no Iceberg position-deletes
+  (same reason it is excluded from §b); it is included here only as a cluster-parallel scaling
+  baseline, not as a like-for-like correctness-equivalent path to the VS.
