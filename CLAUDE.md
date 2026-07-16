@@ -185,10 +185,12 @@ conversion):
 | Float32/Float64 | DOUBLE PRECISION |
 | Utf8/LargeUtf8 | VARCHAR(2000000) |
 | Date32 | DATE |
-| Timestamp(_, None) | TIMESTAMP |
-| Timestamp(_, Some(_)) | TIMESTAMP WITH LOCAL TIME ZONE |
+| Timestamp(_, _) | TIMESTAMP |
 | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) |
 | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON |
+
+Iceberg `timestamptz` maps to plain `TIMESTAMP`, not `TIMESTAMP WITH LOCAL TIME ZONE`: Exasol
+rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output type (`sqlCode 22002`).
 
 **Incompatible types → `VARCHAR(2000000)` via JSON serialization:** List, LargeList,
 FixedSizeList, Struct, Map, Union, Binary, LargeBinary, FixedSizeBinary, Duration, Time32,

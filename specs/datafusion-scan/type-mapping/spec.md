@@ -14,7 +14,9 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * Exasol's representable types are: BOOLEAN, DECIMAL(p≤36, s≤36), DOUBLE PRECISION,
   VARCHAR(n≤2,000,000), CHAR(n≤2,000), DATE, TIMESTAMP(p≤9), TIMESTAMP WITH LOCAL TIME
   ZONE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, HASHTYPE. Exasol has
-  no array, list, struct, or map type.
+  no array, list, struct, or map type. `TIMESTAMP WITH LOCAL TIME ZONE` is a valid Exasol
+  column type but NOT a valid UDF `EMITS` output type — Exasol rejects it at scan-script
+  compile time (`sqlCode 22002: Column type not supported`) — so this mapping never targets it.
 * The mapping is applied in three places that MUST stay consistent: the adapter's
   `createVirtualSchema` schema declaration (Arrow type → declared Exasol column type),
   the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
@@ -33,11 +35,25 @@ carried into the scan spec, keeping declared and emitted types in agreement.
   | Float32 / Float64 | DOUBLE PRECISION | `Value::Double` |
   | Utf8 / LargeUtf8 | VARCHAR(2000000) | `Value::String` |
   | Date32 | DATE | date |
-  | Timestamp(_, None) | TIMESTAMP | timestamp |
-  | Timestamp(_, Some(_)) | TIMESTAMP WITH LOCAL TIME ZONE | timestamp |
+  | Timestamp(_, _) | TIMESTAMP | timestamp |
   | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) | numeric |
   | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON | `Value::String` |
 
+* Both timezone-naive (`Timestamp(_, None)`) and timezone-aware (`Timestamp(_, Some(_))`)
+  Arrow timestamps map to plain Exasol `TIMESTAMP`. An Iceberg `timestamptz` /
+  `timestamptz_ns` column is registered internally as the timezone-aware Arrow
+  `Timestamp(_, Some("UTC"))` — so DataFusion's timestamp comparisons, date-function
+  evaluation, and predicate binding stay timezone-correct — but is declared to Exasol and
+  emitted as plain `TIMESTAMP` carrying the UTC-instant value. The Iceberg table spec
+  defines a `timestamptz` value as an instant whose values "are stored as UTC and do not
+  retain a source time zone" (`2017-11-16 17:10:34 PST` is stored/retrieved as
+  `2017-11-17 01:10:34 UTC` and these values are considered identical), so no per-value
+  timezone information exists to lose. Mapping to plain `TIMESTAMP` is a deliberate, named
+  Exasol target-type trade-off: because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as
+  a UDF `EMITS` output type, the declared Exasol column type cannot distinguish
+  `timestamptz` from `timestamp` at the Exasol SQL surface. This is analogous to the
+  struct/list/map JSON-`VARCHAR` trade-off — a target-type limitation, not a change to any
+  emitted value.
 * Incompatible Arrow types — List, LargeList, FixedSizeList, Struct, Map, Union, Binary,
   LargeBinary, FixedSizeBinary, Duration, Time32, Time64, Interval, Decimal256 — have no
   Exasol equivalent. They are serialized to a JSON string in the scan UDF (via DataFusion
@@ -92,3 +108,12 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * *THEN* each Iceberg field SHALL map to the Arrow `DataType` the scan UDF registers for that column, consistent with the existing Iceberg-to-Exasol mapping (primitive types to their direct Arrow equivalents; complex and out-of-range types to a string-family Arrow type that surfaces as JSON `VARCHAR`)
 * *AND* each mapped field SHALL preserve the source Iceberg field-id and its required/optional nullability
 * *AND* the mapping used for the logical schema SHALL agree with the `createVirtualSchema` schema declaration so the declared Exasol column type and the registered Arrow type stay in agreement
+
+### Scenario: Iceberg timestamptz maps to plain Exasol TIMESTAMP
+
+* *GIVEN* an Iceberg `timestamptz` or `timestamptz_ns` column, whose values the Iceberg spec stores as UTC with no retained source time zone
+* *WHEN* the adapter resolves the column's Exasol type for the `createVirtualSchema` declaration and the scan `EMITS` clause, and the scan coerces the column at the emit boundary
+* *THEN* the resolver SHALL return Exasol `TIMESTAMP` and MUST NOT return `TIMESTAMP WITH LOCAL TIME ZONE`, because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output type (`sqlCode 22002: Column type not supported`)
+* *AND* the scan UDF SHALL register the column as the timezone-aware Arrow `Timestamp(_, Some("UTC"))`, so DataFusion timestamp comparisons, date-function evaluation, and predicate binding stay timezone-correct
+* *AND* the emit-boundary coercion SHALL cast that column to `Timestamp(_, None)` preserving the underlying UTC-instant value, so the emitted `TIMESTAMP` is the UTC wall-clock instant and no value is shifted
+* *AND* the declared Exasol column type MUST NOT distinguish `timestamptz` from `timestamp` at the Exasol SQL surface — a deliberate, named target-type trade-off, not a change to any emitted value
