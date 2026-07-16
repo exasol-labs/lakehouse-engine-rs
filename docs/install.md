@@ -72,7 +72,7 @@ curl -fsSL -o lakehouse-engine.tar.gz \
   https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine.tar.gz
 ```
 
-Pin `<VERSION>` to the release you intend to run — e.g. `0.26.3` for the version this checkout's
+Pin `<VERSION>` to the release you intend to run — e.g. `0.26.4` for the version this checkout's
 `Cargo.toml` is at. The `udf/liblakehouse_engine.so` layout inside the tarball is what determines
 the extracted path used for `%udf_object` in [step 2](#2-create-the-scripts).
 
