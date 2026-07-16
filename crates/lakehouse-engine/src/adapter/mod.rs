@@ -6,6 +6,8 @@ pub mod capabilities;
 pub mod connection;
 pub mod iceberg_predicate;
 pub mod pushdown;
+#[cfg(test)]
+mod pushdown_surface_probe;
 pub mod sharding;
 pub mod sigv4;
 pub mod tables;
