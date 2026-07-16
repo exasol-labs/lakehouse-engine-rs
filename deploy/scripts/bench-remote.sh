@@ -76,14 +76,22 @@ echo "==> [4/4] make bench" >&2
 # Opt-in: also run the native-reader/JDBC ceiling comparisons while the cluster is still up, inside
 # the same guaranteed-teardown window (TRINO_HOST must already be exported for import_jdbc_trino.sh
 # to run; it SKIPs cleanly on its own if unset). Off by default so ordinary bench-remote.sh usage
-# keeps its existing cost/time profile. Each leg is `|| echo ... WARN` under this script's
-# `set -e` so one leg's hard-error exit (e.g. import_ceiling.sh's missing-report-file checks) can't
-# silently drop the OTHER leg's data — JDBC runs first since it's the one this experiment actually
-# needs; import_ceiling.sh's VS-path numbers are the free bonus.
+# keeps its existing cost/time profile. Each leg runs even if the OTHER one hard-errors (e.g.
+# import_ceiling.sh's missing-report-file checks) — JDBC runs first since it's the one this
+# experiment actually needs; import_ceiling.sh's VS-path numbers are the free bonus. But if EITHER
+# leg failed, this run must NOT report success: both scripts now track their own FAILED flag and
+# exit non-zero on a real failure (not just "the script ran"), so propagate that here — otherwise
+# a caller sweeping multiple node counts (jdbc-parallelism-sweep.sh) would have no signal to stop
+# after a doomed trial and would burn more real AWS time on a config that's already broken.
 if [ "${BENCH_RUN_CEILING:-0}" = "1" ]; then
   echo "==> BENCH_RUN_CEILING=1: running import_jdbc_trino.sh + import_ceiling.sh" >&2
-  (cd "$HERE/../.." && bench/import_jdbc_trino.sh) || echo "==> WARN: import_jdbc_trino.sh failed (rc=$?) — continuing" >&2
-  (cd "$HERE/../.." && bench/import_ceiling.sh) || echo "==> WARN: import_ceiling.sh failed (rc=$?) — continuing" >&2
+  ceiling_failed=0
+  (cd "$HERE/../.." && bench/import_jdbc_trino.sh) || { echo "==> WARN: import_jdbc_trino.sh failed (rc=$?)" >&2; ceiling_failed=1; }
+  (cd "$HERE/../.." && bench/import_ceiling.sh) || { echo "==> WARN: import_ceiling.sh failed (rc=$?)" >&2; ceiling_failed=1; }
+  if [ "$ceiling_failed" -ne 0 ]; then
+    echo "==> BENCH_RUN_CEILING=1: at least one leg failed — reporting this trial as failed." >&2
+    exit 1
+  fi
 fi
 
 echo "==> Bench sequence complete for '$ENV'; teardown (trap EXIT) follows." >&2
