@@ -13,7 +13,7 @@ use arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use exasol_udf_sdk::value::{Decimal, Value};
 
 /// Convert a single Arrow column value at row `row` to an SDK Value.
@@ -110,19 +110,13 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
             };
             Value::Date(date)
         }
-        DataType::Timestamp(unit, tz_opt) => {
+        DataType::Timestamp(unit, _tz_opt) => {
+            // Iceberg timestamptz feeds Exasol plain TIMESTAMP (Exasol rejects
+            // TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type). The
+            // Arrow value is already the UTC instant as a NaiveDateTime, so
+            // tz-aware and tz-naive timestamps emit identically.
             let raw = timestamp_to_micros(col, row, unit);
-            let ndt = micros_to_naive_datetime(raw);
-            if tz_opt.is_some() {
-                // Iceberg timestamptz feeds Exasol plain TIMESTAMP (Exasol rejects
-                // TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type). The
-                // Arrow value is already the UTC instant; normalise it to a
-                // NaiveDateTime carrying that same UTC wall-clock value.
-                let utc: DateTime<Utc> = Utc.from_utc_datetime(&ndt);
-                Value::Timestamp(utc.naive_utc())
-            } else {
-                Value::Timestamp(ndt)
-            }
+            Value::Timestamp(micros_to_naive_datetime(raw))
         }
         DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
             let arr = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
