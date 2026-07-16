@@ -87,19 +87,25 @@ bench_failed=0
 # keeps its existing cost/time profile. Runs even if `make bench` itself failed above (see the flake
 # note) — these are independent data collections, not a continuation of make bench. Each leg here
 # also runs even if the OTHER one hard-errors (e.g. import_ceiling.sh's missing-report-file checks).
-ceiling_failed=0
+jdbc_failed=0
 if [ "${BENCH_RUN_CEILING:-0}" = "1" ]; then
   echo "==> BENCH_RUN_CEILING=1: running import_jdbc_trino.sh + import_ceiling.sh" >&2
-  (cd "$HERE/../.." && bench/import_jdbc_trino.sh) || { echo "==> WARN: import_jdbc_trino.sh failed (rc=$?)" >&2; ceiling_failed=1; }
-  (cd "$HERE/../.." && bench/import_ceiling.sh) || { echo "==> WARN: import_ceiling.sh failed (rc=$?)" >&2; ceiling_failed=1; }
+  (cd "$HERE/../.." && bench/import_jdbc_trino.sh) || { echo "==> WARN: import_jdbc_trino.sh failed (rc=$?)" >&2; jdbc_failed=1; }
+  # import_ceiling.sh's failure is logged but NOT propagated as fatal: live-verified, its own
+  # pre-existing 3x native-IMPORT + 3x VS-CTAS full-180M-row-materialization loop can trip this
+  # cluster's "cumulative database raw sizes exceeded license limit" cap (SQL state R0010) partway
+  # through — a license constraint of the test cluster, unrelated to node count or this experiment's
+  # actual subject (the JDBC path). Its numbers are the "free bonus" (per the comment above); losing
+  # them shouldn't cost the sweep a whole node-count trial of the data it actually needs.
+  (cd "$HERE/../.." && bench/import_ceiling.sh) || echo "==> WARN: import_ceiling.sh failed (rc=$?) — not fatal, see comment" >&2
 fi
 
-# Both scripts/make bench now track their own FAILED flag and exit non-zero on a REAL failure (not
-# just "the script ran"), so propagate the worst of them here — otherwise a caller sweeping multiple
+# make bench / import_jdbc_trino.sh now track their own FAILED flag and exit non-zero on a REAL
+# failure (not just "the script ran"), so propagate that here — otherwise a caller sweeping multiple
 # node counts (jdbc-parallelism-sweep.sh) would have no signal to stop after a doomed trial and
 # would burn more real AWS time on a config that's already broken.
-if [ "$bench_failed" -ne 0 ] || [ "$ceiling_failed" -ne 0 ]; then
-  echo "==> This trial had at least one failed leg (make bench / ceiling) — reporting as failed." >&2
+if [ "$bench_failed" -ne 0 ] || [ "$jdbc_failed" -ne 0 ]; then
+  echo "==> This trial had at least one failed leg (make bench / JDBC) — reporting as failed." >&2
   exit 1
 fi
 
