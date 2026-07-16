@@ -117,12 +117,21 @@ for a in "$@"; do
 done
 url="${!#}"
 if [[ "$has_upload" -eq 1 || "$method" == "PUT" ]]; then
-  if [[ "${CURL_PUT_FAIL:-0}" == "1" ]]; then echo "curl: (22) PUT failed" >&2; exit 22; fi
+  if [[ "${CURL_PUT_TRANSPORT_FAIL:-0}" == "1" ]]; then echo "curl: (7) Failed to connect: PUT transport failed" >&2; exit 7; fi
+  # Mimic real curl's `-o <file> -w '%{http_code}'`: the body goes to -o's file, the status
+  # code alone is printed to stdout, and curl itself exits 0 for any completed HTTP response
+  # (2xx or not) since the real script deliberately omits -f on this call.
+  [[ -n "$outfile" ]] && printf '%s' "${CURL_PUT_BODY:-}" > "$outfile"
+  printf '%s' "${CURL_PUT_HTTP_CODE:-200}"
   exit 0
 elif [[ "$method" == "POST" ]]; then
   if [[ "${CURL_POST_FAIL:-0}" == "1" ]]; then echo "curl: (22) POST failed" >&2; exit 22; fi
   fname="${url##*/}"
-  printf '{"url":"https://presigned.example.com/put/%s?X-Amz-Signature=abc&exp=600"}\n' "$fname"
+  if [[ "${CURL_POST_URL_ESCAPED:-0}" == "1" ]]; then
+    printf '{"url":"https://presigned.example.com/put/%s?X-Amz-Algorithm=AWS4-HMAC-SHA256\u0026X-Amz-Signature=abc\u0026exp=600"}\n' "$fname"
+  else
+    printf '{"url":"https://presigned.example.com/put/%s?X-Amz-Signature=abc&exp=600"}\n' "$fname"
+  fi
   exit 0
 else
   case "$url" in
@@ -184,7 +193,7 @@ RUN_PATH="$STUBDIR:$ORIG_PATH"
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
-  unset CURL_POST_FAIL CURL_PUT_FAIL CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
+  unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXASOL_PAT EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
   # Stub non-empty token so happy-path runs don't each have to set it individually.
   export GITHUB_TOKEN="STUBGHTOKEN123"
@@ -405,6 +414,36 @@ test_presigned_upload_dance() {
   assert_not_contains "upload: PUT adds no Authorization header" "$put_lines" "Authorization"
 }
 
+test_presigned_url_json_unescaping() {
+  echo "== test_presigned_url_json_unescaping =="
+  # Direct unit test: some SaaS-backend JSON encoders (notably Go's encoding/json, which
+  # HTML-escapes '&', '<', '>' by default) return the presigned URL with its '&'
+  # query-parameter separators as the 6-character numeric escape rather than a literal '&'.
+  # extract_json_string_field must un-escape that back to a real '&', or every parameter after
+  # the first collapses into the previous one's value -- exactly the live failure mode seen
+  # against Exasol SaaS staging (HTTP 400 AuthorizationQueryParametersError on the PUT).
+  local raw escaped_url
+  raw="$(printf '{"url":"https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256%su0026X-Amz-Credential=abc%su0026X-Amz-Signature=xyz"}' '\' '\')"
+  escaped_url="$(
+    export PATH="$STUBDIR:$ORIG_PATH"
+    source "$INSTALLER"
+    extract_json_string_field "$raw" "url"
+  )"
+  assert_eq "unescape: numeric-escaped ampersands become real '&' separators" \
+    "https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=abc&X-Amz-Signature=xyz" \
+    "$escaped_url"
+
+  # Integration: the full installer must still succeed end-to-end when the SaaS files POST
+  # response itself carries an escaped presigned URL, and the PUT curl invocation actually
+  # logged must carry the real, un-escaped '&'-joined query string.
+  reset_env
+  export CURL_POST_URL_ESCAPED=1
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "unescape: install still succeeds against an escaped presigned URL" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "unescape: PUT hits the URL with a real '&' between params" "$log" "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc"
+}
+
 test_release_asset_download_via_rest() {
   echo "== test_release_asset_download_via_rest =="
   reset_env
@@ -619,12 +658,36 @@ test_external_failure_actionable() {
   assert_contains "db 404: names the reachability step" "$LAST_OUT" "not reachable"
   assert_not_contains "db 404: no success reported" "$LAST_OUT" "query-ready"
 
-  # Presigned upload failure
+  # Presigned upload failure (POST for the presigned URL fails)
   reset_env
   export CURL_POST_FAIL=1
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_nonzero "upload fail: nonzero exit" "$LAST_RC"
   assert_contains "upload fail: names upload step" "$LAST_OUT" "upload"
+  assert_contains "upload fail: surfaces curl's own diagnostic" "$LAST_OUT" "POST failed"
+
+  # Presigned upload failure (PUT never completes -- transport error, no HTTP response at all):
+  # curl's own stderr must surface in the error message rather than being discarded, since it is
+  # the only source of the actual cause (DNS, TLS, connection refused, ...).
+  reset_env
+  export CURL_PUT_TRANSPORT_FAIL=1
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "put transport fail: nonzero exit" "$LAST_RC"
+  assert_contains "put transport fail: names upload step" "$LAST_OUT" "upload"
+  assert_contains "put transport fail: surfaces curl's own diagnostic" "$LAST_OUT" "PUT transport failed"
+
+  # Presigned upload failure (PUT completes but the host rejects it, e.g. HTTP 400/403): the
+  # response BODY -- not just the status code -- must surface, since the storage host's own
+  # error detail is the only way to tell a signature mismatch from an expired URL from anything
+  # else. This is the exact shape hit live against Exasol SaaS staging (HTTP 400).
+  reset_env
+  export CURL_PUT_HTTP_CODE=400
+  export CURL_PUT_BODY='<Error><Code>InvalidArgument</Code><Message>bad request</Message></Error>'
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "put http fail: nonzero exit" "$LAST_RC"
+  assert_contains "put http fail: names upload step" "$LAST_OUT" "upload"
+  assert_contains "put http fail: reports the HTTP status" "$LAST_OUT" "400"
+  assert_contains "put http fail: surfaces the response body detail" "$LAST_OUT" "InvalidArgument"
 
   # exapump ALTER SYSTEM privilege failure
   reset_env
@@ -688,6 +751,7 @@ main() {
   test_script_languages_replace_rust_idempotent
   test_empty_script_languages_read_hard_fails
   test_presigned_upload_dance
+  test_presigned_url_json_unescaping
   test_release_asset_download_via_rest
   test_extract_asset_id_by_name_realistic
   test_saas_verify_listed_quoted_match

@@ -76,12 +76,53 @@ url_encode() {
 }
 
 # --- JSON helpers ------------------------------------------------------------
-# Extracts a top-level JSON string field by name (no jq; bash regex). Returns 1 if absent.
+# Un-escapes a raw JSON string value: the \\uXXXX numeric escape (ASCII range only -- sufficient
+# for the presigned URLs and tags this script extracts, which are pure ASCII) plus the common
+# single-char escapes. Needed because some backends (notably Go's encoding/json, which
+# HTML-escapes '&', '<', '>' by default) return presigned URLs with their '&' query-parameter
+# separators replaced by the literal six-character escape sequence for '&' -- collapsing every
+# parameter after the first into one unparsable blob. That surfaces as S3 rejecting the request
+# with AuthorizationQueryParametersError ("X-Amz-Algorithm only supports ..."), because the value
+# curl actually sends for X-Amz-Algorithm ends up being "AWS4-HMAC-SHA256" concatenated with the
+# rest of the still-escaped query string, rather than the bare algorithm name.
+json_unescape() {
+  local rest="$1" out="" chunk hex dec ch
+  while [[ "$rest" == *'\'* ]]; do
+    chunk="${rest%%\\*}"
+    out+="$chunk"
+    rest="${rest#*\\}"
+    case "$rest" in
+      u[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*)
+        hex="${rest:1:4}"
+        rest="${rest:5}"
+        dec=$((16#$hex))
+        if [[ "$dec" -lt 128 ]]; then
+          ch="$(printf "\\$(printf '%03o' "$dec")")"
+        else
+          ch="?"
+        fi
+        out+="$ch"
+        ;;
+      \"*) out+='"'; rest="${rest:1}" ;;
+      \\*) out+='\'; rest="${rest:1}" ;;
+      /*)  out+='/'; rest="${rest:1}" ;;
+      n*)  out+=$'\n'; rest="${rest:1}" ;;
+      t*)  out+=$'\t'; rest="${rest:1}" ;;
+      r*)  out+=$'\r'; rest="${rest:1}" ;;
+      *)   out+="\\${rest:0:1}"; rest="${rest:1}" ;;
+    esac
+  done
+  out+="$rest"
+  printf '%s\n' "$out"
+}
+
+# Extracts a top-level JSON string field by name (no jq; bash regex), un-escaping its value.
+# Returns 1 if absent.
 extract_json_string_field() {
   local json="$1" field="$2"
   local re="\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
   if [[ "$json" =~ $re ]]; then
-    printf '%s\n' "${BASH_REMATCH[1]}"
+    json_unescape "${BASH_REMATCH[1]}"
     return 0
   fi
   return 1
@@ -374,15 +415,26 @@ saas_upload_file() {
   base="$(resolve_saas_base)"
   url="$base/api/v1/accounts/$ARG_ACCOUNT_ID/databases/$ARG_DATABASE_ID/files/$filename"
   if ! resp="$(curl -fsS -X POST -H "Authorization: Bearer $ARG_PAT" "$url" </dev/null 2>&1)"; then
-    err "SaaS upload of $filename failed: could not obtain a presigned URL (POST files endpoint). Check the account/database id and PAT scopes."
+    err "SaaS upload of $filename failed: could not obtain a presigned URL (POST files endpoint). Check the account/database id and PAT scopes. curl said: $resp"
     return 1
   fi
   if ! presigned="$(extract_json_string_field "$resp" "url")"; then
-    err "SaaS upload of $filename failed: the files endpoint response contained no presigned 'url' field."
+    err "SaaS upload of $filename failed: the files endpoint response contained no presigned 'url' field. Response: $resp"
     return 1
   fi
-  if ! curl -fsS -X PUT --upload-file "$local_path" "$presigned" </dev/null >/dev/null 2>&1; then
-    err "SaaS upload of $filename failed: PUT to the presigned URL failed (the URL expires ~600s and is host-signed)."
+  # No -f here: on a non-2xx response we need the response BODY (the storage host's own error
+  # detail, e.g. an S3 <Error><Code>/<Message> block) to know WHY the PUT was rejected -- -f
+  # would suppress that body along with the status line. -w prints just the status code to
+  # stdout once the body itself is diverted to a file, and stderr is captured separately for a
+  # transport-level failure (connection refused, timeout, ...) that never got an HTTP response.
+  local put_body_file="$WORKDIR/${filename}.put-response" put_err_file="$WORKDIR/${filename}.put-stderr"
+  local put_http_code
+  if ! put_http_code="$(curl -sS -o "$put_body_file" -w '%{http_code}' -X PUT --upload-file "$local_path" "$presigned" </dev/null 2>"$put_err_file")"; then
+    err "SaaS upload of $filename failed: PUT to the presigned URL failed before completing (transport error). curl said: $(cat "$put_err_file" 2>/dev/null)"
+    return 1
+  fi
+  if [[ "$put_http_code" != 2* ]]; then
+    err "SaaS upload of $filename failed: PUT to the presigned URL returned HTTP $put_http_code (the URL expires ~600s and is host-signed). Response body: $(tr -d '\n' <"$put_body_file" 2>/dev/null | cut -c1-2000)"
     return 1
   fi
   if ! saas_verify_listed "$filename"; then

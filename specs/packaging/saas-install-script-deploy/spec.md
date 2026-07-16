@@ -38,6 +38,15 @@ read-modify-write that runs before this stage.
   (RUST ADAPTER), `LAKEHOUSE_SCAN` (RUST SCALAR, dynamic `EMITS (...)`),
   `LAKEHOUSE_DISTINCT_MERGE_COUNT` (RUST SCALAR, `RETURNS DECIMAL(20,0)`), and
   `LAKEHOUSE_DISTRIBUTE_FILES` (LUA SET passthrough).
+* CONFIRMED LIVE (against Exasol SaaS staging): the SaaS files-endpoint POST response
+  HTML-escapes the presigned URL's `&` query-parameter separators as their JSON numeric escape
+  sequence, the same default behavior as Go's `encoding/json` `Marshal`. The no-jq, bash-regex
+  `extract_json_string_field` helper MUST un-escape a JSON string value it extracts (at minimum
+  the numeric escape for `&`, `<`, `>`, plus the standard single-character escapes) before
+  handing a `url` field to `curl`, or the unescaped literal six-character sequence collapses
+  every query parameter after the first into the previous parameter's value — surfacing as the
+  storage host rejecting the PUT with an `AuthorizationQueryParametersError` ("X-Amz-Algorithm
+  only supports ..."), not as a signature or expiry problem.
 
 ## Scenarios
 
@@ -47,6 +56,7 @@ read-modify-write that runs before this stage.
 * *WHEN* the script uploads each tarball
 * *THEN* the script SHALL download the engine `lakehouse-engine.tar.gz` and the public `lc-rust-<version>.tar.gz` through the GitHub REST API over `curl` (the release-asset download flow below), renaming the SLC tarball to `rustslc.tar.gz` before upload
 * *AND* for each tarball the script SHALL POST to the SaaS files endpoint to obtain a presigned URL and then PUT the tarball to that URL back-to-back, adding no extra headers to the PUT
+* *AND* the script's JSON-field extraction MUST un-escape the presigned URL value it reads from the POST response (JSON numeric escapes, plus the standard single-character escapes) before passing it to `curl`, because a backend that HTML-escapes `&` in its JSON response (e.g. Go's `encoding/json` default) would otherwise hand curl a URL whose query-parameter separators are the literal escape text rather than `&`
 * *AND* the script SHALL confirm each uploaded file is listed by the SaaS files API before proceeding
 
 ### Scenario: Release assets download through the authenticated GitHub REST API
@@ -89,6 +99,8 @@ read-modify-write that runs before this stage.
 * *GIVEN* the script is executing an external step
 * *WHEN* a SaaS REST call returns 404 for the account or database id, a presigned upload fails, or an `exapump sql` statement errors
 * *THEN* the script MUST exit non-zero with a message naming the failed step and the likely cause
+* *AND* WHEN the failed step is the presigned-URL POST THEN the error message MUST include curl's own diagnostic text (its stderr) rather than discarding it
+* *AND* WHEN the failed step is the PUT upload THEN the script MUST distinguish a transport-level failure (no HTTP response at all -- surface curl's stderr) from a completed non-2xx HTTP response (surface both the status code AND the response body), because the storage host's own error detail in the body -- e.g. an S3 `<Error><Code>/<Message>` block -- is the only way to tell an expired URL from a signature mismatch from any other rejection reason; a `curl -f`-only PUT that discards the body on non-2xx defeats this
 * *AND* the script MUST NOT report install success after any such failure
 * *AND* the script MUST NOT print the PAT or any connection password in its output
 
