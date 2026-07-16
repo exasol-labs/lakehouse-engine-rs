@@ -1,0 +1,1403 @@
+use crate::adapter::connection::ConnectionCreds;
+use crate::scan::spec::{
+    AggKind, AggregatePlan, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry,
+    LogicalField, NameMappingEntry, ProjectionItem, StorageProps,
+};
+use exasol_udf_sdk::error::UdfError;
+use futures::TryStreamExt;
+use iceberg::TableIdent;
+use serde_json::Value as Json;
+
+use super::credentials::{
+    build_s3_file_io, extract_vended_keys, extract_vended_region, load_table_any_auth,
+    merge_vended_into_storage,
+};
+use super::grouped_agg::{group_key_exasol_types, select_item_index};
+use super::namespace::parse_table_ident;
+use super::support::{
+    aggregate_exasol_types, exasol_type_from_json, quote_ident, redact_catalog_error,
+};
+use super::{
+    GroupedSelectItem, build_logical_schema, detect_aggregates, detect_group_by_aggregates,
+    validate_agg_col_types,
+};
+
+/// Emit a file path relative to `table_root` when the file lives under it,
+/// otherwise pass the absolute path through unchanged.
+///
+/// Stripping happens ONLY at a real path-segment boundary: the root must be a
+/// prefix AND either end with `/` or be followed by a `/` in the path. A path that
+/// merely shares the root as a bare string prefix (e.g. `<root>-archive/...`,
+/// `<root>2/...`) or one exactly equal to the root does NOT match, so it stays
+/// absolute — this keeps the round-trip with the scan UDF's single-`/` join lossless
+/// and avoids emitting an empty relative entry. After a boundary match the root
+/// prefix and then a single leading `/` are stripped, so the relative path has no
+/// leading slash. An empty `table_root` (legacy / no resolved root) always yields an
+/// absolute path.
+fn relativize_path_to_root(path: &str, table_root: &str) -> String {
+    let at_segment_boundary = !table_root.is_empty()
+        && path.starts_with(table_root)
+        && (table_root.ends_with('/') || path[table_root.len()..].starts_with('/'));
+    if at_segment_boundary {
+        let rest = &path[table_root.len()..];
+        rest.strip_prefix('/').unwrap_or(rest).to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Strip `table_root` from every under-root file path in each shard (see
+/// [`relativize_path_to_root`]) while preserving byte sizes and shard membership.
+/// Paths not under the root stay absolute.
+///
+/// Each data file's associated positional-delete file paths are relativized by
+/// the SAME [`relativize_path_to_root`] rule as the data-file path, so the scan
+/// UDF rejoins them onto `table_root` identically (delete files written by the
+/// same engine live under the same table root). Delete byte sizes and content
+/// types are preserved unchanged.
+pub(super) fn relativize_shards_to_root(
+    shards: Vec<Vec<FileEntry>>,
+    table_root: &str,
+) -> Vec<Vec<FileEntry>> {
+    shards
+        .into_iter()
+        .map(|shard| {
+            shard
+                .into_iter()
+                .map(|mut entry| {
+                    entry.path = relativize_path_to_root(&entry.path, table_root);
+                    for delete in &mut entry.deletes {
+                        delete.path = relativize_path_to_root(&delete.path, table_root);
+                    }
+                    entry
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Encode a field's Iceberg `initial-default` as the raw primitive scalar in
+/// plain text, or `None` when there is nothing to carry.
+///
+/// Reads `initial_default` ONLY (never `write_default`, which governs writes,
+/// not reads). Returns `None` when the field has no `initial-default`, when the
+/// default is non-primitive (struct/list/map — `as_primitive_literal` yields
+/// `None`), or when the field's `PrimitiveType` reaches only the JSON-fallback
+/// `"utf8"` path (`uuid`/`time`/`fixed`/`binary`/oversized `decimal`).
+///
+/// The `(PrimitiveType, PrimitiveLiteral)` match is deliberately gated on the
+/// PrimitiveType, NOT on the computed Arrow tag: several distinct primitives
+/// collapse onto the `"utf8"` tag, and the scan-side reconstruction dispatches
+/// on that tag alone — so encoding a non-`String` value under `"utf8"` would be
+/// misread. Only the exact set that maps to a first-class Arrow tag in
+/// `iceberg_primitive_to_arrow` is encoded, mirroring the `PrimitiveType`
+/// dispatch in `iceberg_predicate::literal_to_datum`. Temporals carry their raw
+/// integer (days / micros / nanos) and a decimal carries its `i128` unscaled
+/// mantissa, so the scan side reconstructs a `ScalarValue` against the Arrow tag
+/// with no second temporal/decimal parse. The encoded text is a bare scalar, so
+/// it is inherently credential-free.
+pub(super) fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> {
+    use iceberg::spec::{PrimitiveLiteral, PrimitiveType};
+
+    let primitive = field.field_type.as_primitive_type()?;
+    let literal = field.initial_default.as_ref()?.as_primitive_literal()?;
+
+    let encoded = match (primitive, &literal) {
+        (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(v)) => v.to_string(),
+        (PrimitiveType::Int, PrimitiveLiteral::Int(v)) => v.to_string(),
+        (PrimitiveType::Long, PrimitiveLiteral::Long(v)) => v.to_string(),
+        (PrimitiveType::Float, PrimitiveLiteral::Float(v)) => v.0.to_string(),
+        (PrimitiveType::Double, PrimitiveLiteral::Double(v)) => v.0.to_string(),
+        (PrimitiveType::String, PrimitiveLiteral::String(v)) => v.clone(),
+        (PrimitiveType::Date, PrimitiveLiteral::Int(days)) => days.to_string(),
+        (
+            PrimitiveType::Timestamp
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestamptzNs,
+            PrimitiveLiteral::Long(v),
+        ) => v.to_string(),
+        (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(v))
+            if *precision <= 36 && *scale <= 36 =>
+        {
+            v.to_string()
+        }
+        _ => return None,
+    };
+    Some(encoded)
+}
+
+/// Parse the Iceberg `schema.name-mapping.default` table property into the flat
+/// `Vec<NameMappingEntry>` the scan-side resolver looks up by physical name.
+///
+/// `raw` is the property's raw JSON value (`None` when the property is absent).
+///
+/// Behaviour (Iceberg column-projection rule #2 scope — see the plan):
+/// - Absent property (`None`) → an empty `Vec` (NOT an error): a table with no
+///   name-mapping is the common, fully-supported case.
+/// - Present but malformed JSON → a clean, credential-free plan-time `UdfError`
+///   (mirrors the fail-loud discipline of `ensure_supported_delete_mechanisms`;
+///   the property carries only column names + field-ids, never credentials, and
+///   `serde_json`'s error reports only a parse position).
+/// - Present and valid → flatten ONLY the TOP-LEVEL entries: for each top-level
+///   mapping that HAS a `field-id`, emit one `NameMappingEntry { name, field_id }`
+///   per name in its `names` list. Entries without a `field-id` are skipped (they
+///   exist only in the Iceberg schema, not in imported files — nothing to map to).
+///   Nested `fields` (struct/map/list child mappings) are deliberately NOT
+///   recursed into — out of scope for this phase (deferred to issue #83).
+///
+/// Parsed via the `iceberg` crate's own spec-accurate `NameMapping` deserializer
+/// (kebab-case `field-id`, `DefaultOnNull` nested `fields`), never a hand-rolled
+/// struct. Resolved ONCE per query in the VS planning layer.
+fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mapping: iceberg::spec::NameMapping = serde_json::from_str(raw).map_err(|e| {
+        UdfError::User(format!(
+            "failed to parse Iceberg '{}' table property: {e}",
+            iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING
+        ))
+    })?;
+    let mut entries = Vec::new();
+    for field in mapping.fields() {
+        // Skip id-less entries (schema-only, not present in imported files) and do
+        // NOT recurse into `field.fields()` (nested child mappings, out of scope).
+        let Some(field_id) = field.field_id() else {
+            continue;
+        };
+        for name in field.names() {
+            entries.push(NameMappingEntry {
+                name: name.clone(),
+                field_id,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+/// Resolve the data-file list from the Iceberg REST catalog.
+///
+/// This is the resolve-once seam: called exactly once per pushdown in the
+/// adapter; the file list is passed explicitly to the scan UDF.
+///
+/// The catalog load_table request is self-issued via `load_table_any_auth`, which
+/// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
+/// none). Vended-credential extraction is gated SOLELY on
+/// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it
+/// is true the returned `StorageProps` carries the vended STS keys (merged over
+/// the static `storage` props, and the vended `client.region` when present) so
+/// every per-shard `ScanSpec.storage` uses the vended creds. When it is false,
+/// returns `(files, storage.clone())` — byte-identical to the no-vending behaviour
+/// on every auth mode.
+///
+/// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
+/// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
+pub async fn resolve_file_list(
+    catalog_uri: &str,
+    catalog_props: &CatalogProps,
+    storage: &StorageProps,
+    creds: &ConnectionCreds,
+    filter_json: Option<&Json>,
+) -> Result<
+    (
+        Vec<FileEntry>,
+        StorageProps,
+        Vec<LogicalField>,
+        String,
+        Vec<NameMappingEntry>,
+    ),
+    UdfError,
+> {
+    // Single auth-mode-agnostic path: self-issue the loadTable GET under whatever
+    // catalog-auth mode applies, then derive the effective storage gated SOLELY on
+    // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
+    // from the response metadata so plan_files() can read manifests from S3.
+    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
+
+    // Resolve the effective storage (vended or static).
+    // The longest-prefix anchor for storage_credentials matching must be an S3
+    // URI. Use the table's own S3 location from the parsed metadata (this is what
+    // storage_credentials[*].prefix matches against). Fall back to the warehouse
+    // (also an S3 URI) when absent. The catalog REST URI is an HTTPS endpoint and
+    // can never match an S3 prefix — do NOT use it here.
+    let table_s3_location = result.metadata.location();
+    // Own the table root before `result.metadata` is moved into the table builder
+    // below. Returned so the adapter can carry it once in the common blob and emit
+    // per-shard file paths relative to it (empty ⇒ every path stays absolute).
+    let table_root = table_s3_location.to_string();
+    let anchor: &str = if !table_s3_location.is_empty() {
+        table_s3_location
+    } else {
+        &catalog_props.warehouse
+    };
+    let effective_storage = if creds.use_vended_credentials {
+        let (ak, sk, st) = extract_vended_keys(&result, anchor);
+        let mut merged = merge_vended_into_storage(storage, &ak, &sk, st.as_deref());
+        // Adopt the vended region only when the response advertises one; otherwise
+        // preserve the static region.
+        if let Some(region) = extract_vended_region(&result, anchor) {
+            merged.region = region;
+        }
+        merged
+    } else {
+        storage.clone()
+    };
+
+    // Build the iceberg Table so plan_files() can read manifests from S3.
+    let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
+    let table_ident = TableIdent::new(namespace, table_name);
+    let file_io = build_s3_file_io(&effective_storage);
+    let runtime = iceberg::Runtime::try_current().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+    let table_builder = iceberg::table::Table::builder()
+        .identifier(table_ident)
+        .file_io(file_io)
+        .runtime(runtime)
+        .metadata(result.metadata);
+    let table = if let Some(loc) = result.metadata_location {
+        table_builder.metadata_location(loc).build()
+    } else {
+        table_builder.build()
+    }
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    // Extract the logical schema before `plan_files_from_table` consumes `table`.
+    let logical_schema = build_logical_schema(table.metadata().current_schema());
+
+    // Resolve the Iceberg name-mapping fallback (`schema.name-mapping.default`)
+    // ONCE per query here — alongside `logical_schema`, and likewise before
+    // `plan_files_from_table` consumes `table` — so it is resolved in the VS
+    // planning layer, never per UDF invocation. Absent property ⇒ empty; a
+    // present-but-malformed property fails loud with a clean plan-time error.
+    let name_mapping = parse_name_mapping(
+        table
+            .metadata()
+            .properties()
+            .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .map(String::as_str),
+    )?;
+
+    // AUTHORITATIVE correctness gate: fail loud at the manifest/`DataFile` level on
+    // any delete/data mechanism this engine cannot apply (equality delete, Puffin/v3
+    // deletion vector, ORC/Avro data or delete file) BEFORE building any
+    // scan-driving SQL. This must run before `plan_files_from_table` so the deletes
+    // it associates are guaranteed to be applicable Parquet positional deletes.
+    ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
+
+    let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
+    Ok((
+        files,
+        effective_storage,
+        logical_schema,
+        table_root,
+        name_mapping,
+    ))
+}
+
+/// A data- or delete-file mechanism the lakehouse engine cannot apply on read.
+///
+/// This engine applies ONLY Parquet positional deletes over Parquet data files.
+/// Every other mechanism must fail loud at plan time — invalid results must never
+/// be returned (mission: "correctness and safety are first-class"). The variant is
+/// used solely to name the mechanism in a clean, credential-free error; it never
+/// carries a file path or any secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsupportedDeleteMechanism {
+    /// Iceberg equality deletes (`DataContentType::EqualityDeletes`).
+    EqualityDelete,
+    /// Iceberg v3 Puffin deletion vector (position delete stored as a Puffin blob).
+    DeletionVector,
+    /// An ORC data file (`DataFileFormat::Orc`).
+    OrcDataFile,
+    /// An Avro data file (`DataFileFormat::Avro`).
+    AvroDataFile,
+    /// An ORC positional-delete file.
+    OrcDeleteFile,
+    /// An Avro positional-delete file.
+    AvroDeleteFile,
+    /// A data file in a format this engine does not read as columnar Parquet.
+    NonParquetDataFile,
+}
+
+impl UnsupportedDeleteMechanism {
+    /// A stable, credential-free English name for the mechanism, spliced into the
+    /// plan-time fail-loud error. Never includes a file path or any secret value.
+    fn describe(self) -> &'static str {
+        match self {
+            UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
+            UnsupportedDeleteMechanism::DeletionVector => "Iceberg v3 Puffin deletion vectors",
+            UnsupportedDeleteMechanism::OrcDataFile => "ORC data files",
+            UnsupportedDeleteMechanism::AvroDataFile => "Avro data files",
+            UnsupportedDeleteMechanism::OrcDeleteFile => "ORC delete files",
+            UnsupportedDeleteMechanism::AvroDeleteFile => "Avro delete files",
+            UnsupportedDeleteMechanism::NonParquetDataFile => "non-Parquet data files",
+        }
+    }
+}
+
+/// Classify one manifest `DataFile` by its content type and file format, at the
+/// authoritative manifest level (where the Puffin discriminator and file format
+/// are still visible — `plan_files` drops them, so a deletion vector would be
+/// indistinguishable from a Parquet positional delete at read time).
+///
+/// Returns `Ok(())` ONLY for the two mechanisms this engine can apply correctly:
+/// a Parquet DATA file and a Parquet POSITION-DELETE file. Every other
+/// (content, format) combination returns the specific unsupported mechanism so
+/// the caller can fail loud before building any scan-driving SQL.
+fn classify_manifest_file(
+    content: iceberg::spec::DataContentType,
+    format: iceberg::spec::DataFileFormat,
+) -> Result<(), UnsupportedDeleteMechanism> {
+    use UnsupportedDeleteMechanism as U;
+    use iceberg::spec::DataContentType::{Data, EqualityDeletes, PositionDeletes};
+    use iceberg::spec::DataFileFormat::{Avro, Orc, Parquet, Puffin};
+    match content {
+        Data => match format {
+            Parquet => Ok(()),
+            Orc => Err(U::OrcDataFile),
+            Avro => Err(U::AvroDataFile),
+            Puffin => Err(U::NonParquetDataFile),
+        },
+        PositionDeletes => match format {
+            Parquet => Ok(()),
+            // A position delete stored as a Puffin blob IS a v3 deletion vector.
+            Puffin => Err(U::DeletionVector),
+            Orc => Err(U::OrcDeleteFile),
+            Avro => Err(U::AvroDeleteFile),
+        },
+        EqualityDeletes => Err(U::EqualityDelete),
+    }
+}
+
+/// Build the plan-time fail-loud error for an unsupported delete mechanism.
+///
+/// The message names ONLY the mechanism (never a file path, which could in
+/// principle embed a presigned credential) and is defensively passed through
+/// [`redact_catalog_error`] so no secret can survive into surfaced SQL/error text.
+fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
+    let msg = format!(
+        "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
+         cannot apply on read (only Parquet positional deletes are supported); \
+         this is a hard error, not a native re-plan",
+        table_name,
+        mechanism.describe(),
+    );
+    UdfError::User(redact_catalog_error(&msg))
+}
+
+/// Fail loud at plan time if the table's current snapshot uses ANY delete/data
+/// mechanism this engine cannot apply, detected at the manifest/`DataFile` level.
+///
+/// This is the AUTHORITATIVE correctness gate (invalid results must never be
+/// returned). It enumerates the current snapshot's manifest list, loads each
+/// manifest, and classifies every ALIVE `DataFile` (both data and delete
+/// manifests) via [`classify_manifest_file`]. Detection happens here — before any
+/// scan-driving SQL is built — because `plan_files` collapses each task to a bare
+/// path and drops the Puffin discriminator and file format needed to tell a
+/// Parquet positional delete from a deletion vector.
+///
+/// A table with no current snapshot (empty table) trivially passes.
+async fn ensure_supported_delete_mechanisms(
+    table: &iceberg::table::Table,
+    table_name: &str,
+) -> Result<(), UdfError> {
+    let metadata = table.metadata();
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return Ok(());
+    };
+    let file_io = table.file_io();
+
+    let manifest_list_bytes = file_io
+        .new_input(snapshot.manifest_list())
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to open Iceberg manifest list for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?
+        .read()
+        .await
+        .map_err(|e| {
+            UdfError::User(format!(
+                "failed to read Iceberg manifest list for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?;
+
+    let manifest_list = iceberg::spec::ManifestList::parse_with_version(
+        &manifest_list_bytes,
+        metadata.format_version(),
+    )
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to parse Iceberg manifest list for '{}': {}",
+            table_name,
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+            UdfError::User(format!(
+                "failed to load Iceberg manifest for '{}': {}",
+                table_name,
+                redact_catalog_error(&e.to_string())
+            ))
+        })?;
+        for entry in manifest.entries() {
+            // Skip entries removed in this snapshot: a DELETED manifest entry no
+            // longer applies, so failing on it would spuriously reject queries.
+            if !entry.is_alive() {
+                continue;
+            }
+            let data_file = entry.data_file();
+            classify_manifest_file(data_file.content_type(), data_file.file_format())
+                .map_err(|mechanism| unsupported_delete_error(mechanism, table_name))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Drive the iceberg scan and collect the data-file paths with their sizes.
+///
+/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
+/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
+/// remains the row-level correctness backstop; this is pruning-only.
+/// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
+///
+/// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
+/// ([`ensure_supported_delete_mechanisms`]) has already rejected any table that
+/// uses equality deletes or Puffin deletion vectors, so every `PositionDeletes`
+/// task delete is guaranteed to be a Parquet positional delete. The other arms
+/// are mapped honestly for defense-in-depth: they can only be produced if a
+/// mechanism somehow slips past the gate, and the scan reader's read-time backstop
+/// then rejects them cleanly. `Data` never appears in a task's delete list; it is
+/// mapped to a non-positional sentinel so it is likewise rejected rather than
+/// silently applied.
+fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileContentType {
+    match t {
+        iceberg::spec::DataContentType::PositionDeletes => DeleteFileContentType::PositionDeletes,
+        iceberg::spec::DataContentType::EqualityDeletes => DeleteFileContentType::EqualityDeletes,
+        iceberg::spec::DataContentType::Data => DeleteFileContentType::EqualityDeletes,
+    }
+}
+
+async fn plan_files_from_table(
+    table: iceberg::table::Table,
+    table_name: &str,
+    filter_json: Option<&Json>,
+) -> Result<Vec<FileEntry>, UdfError> {
+    let mut scan_builder = table.scan();
+    if let Some(fj) = filter_json {
+        let schema = table.metadata().current_schema();
+        if let Some(pred) = crate::adapter::iceberg_predicate::to_iceberg_predicate(fj, schema) {
+            scan_builder = scan_builder.with_filter(pred);
+        }
+    }
+    let scan = scan_builder
+        .select_all()
+        .build()
+        .map_err(|e| UdfError::User(format!("failed to build Iceberg scan: {e}")))?;
+
+    let task_stream = scan.plan_files().await.map_err(|e| {
+        UdfError::User(format!(
+            "failed to plan Iceberg files for '{}': {}",
+            table_name,
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
+        UdfError::User(format!(
+            "failed to collect Iceberg file tasks: {}",
+            redact_catalog_error(&e.to_string())
+        ))
+    })?;
+
+    // Associate each data file's Parquet positional-delete files into its entry.
+    // The plan-time fail-loud gate (`ensure_supported_delete_mechanisms`) has
+    // already run, so any `.deletes` present here are applicable Parquet
+    // positional deletes. Absolute delete paths are relativized later, in
+    // `relativize_shards_to_root`, EXACTLY like the data-file path.
+    Ok(tasks
+        .into_iter()
+        .map(|t| {
+            let deletes: Vec<DeleteFileRef> = t
+                .deletes
+                .iter()
+                .map(|d| DeleteFileRef {
+                    path: d.file_path.clone(),
+                    size: d.file_size_in_bytes,
+                    content_type: map_delete_content_type(d.file_type),
+                })
+                .collect();
+            FileEntry::with_deletes(
+                t.data_file_path().to_string(),
+                t.file_size_in_bytes,
+                deletes,
+            )
+        })
+        .collect())
+}
+
+/// Resolve the Iceberg table schema for `createVirtualSchema`.
+///
+/// Returns (field_name, exasol_type_string) pairs. The table metadata is loaded
+/// via the unified `load_table_any_auth` (SigV4 | bearer | OAuth2-bearer | none).
+/// Schema resolution only reads `table.metadata().current_schema()` — no S3
+/// manifest access is needed, so vended credentials do not affect this path.
+pub async fn resolve_table_schema(
+    catalog_uri: &str,
+    catalog_props: &CatalogProps,
+    creds: &ConnectionCreds,
+) -> Result<Vec<(String, String)>, UdfError> {
+    // Load the table metadata via the unified auth-mode-agnostic loader. Schema
+    // resolution reads only `current_schema()`; vended credentials never affect it.
+    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
+    let table_metadata = result.metadata;
+
+    let schema = table_metadata.current_schema();
+    let fields = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| {
+            let exasol_ty = crate::types::mapping::iceberg_type_to_exasol(&f.field_type);
+            // Declare columns in Exasol's canonical (uppercase) identifier casing
+            // so unquoted user SQL (`SELECT id` → `ID`) resolves. The scan maps
+            // projection names back to the Parquet field casing case-insensitively.
+            (f.name.to_uppercase(), exasol_ty)
+        })
+        .collect();
+
+    Ok(fields)
+}
+
+/// Build the shape-correct empty-result response for a fully-pruned file list.
+///
+/// The request-shape decision is hoisted ahead of the zero-files short-circuit
+/// and mirrors the non-empty dispatch priority — grouped aggregate, then
+/// single-group aggregate, then row scan. Both aggregate branches are gated on
+/// the same `validate_agg_col_types` check the non-empty path applies: a
+/// non-numeric aggregate demotes to the next shape, so the empty response's
+/// positional column shape always equals what the non-empty path would have
+/// committed to. A non-numeric grouped aggregate carrying a HAVING is declined
+/// with the same `Err` the non-empty path returns (a hard error, no native re-plan),
+/// because the adapter advertises AGGREGATE_HAVING and dropping the HAVING would
+/// yield wrong results. No scan or distinct-merge UDF is referenced: with zero
+/// files there is nothing to scan or merge.
+pub(super) fn empty_result_sql(
+    pushdown_req: &Json,
+    proj_cols: &[ProjectionItem],
+    proj_types: &[String],
+    col_types: &[(String, String)],
+) -> Result<Json, UdfError> {
+    if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
+        if validate_agg_col_types(&detection.plans, col_types) {
+            let group_key_types = group_key_exasol_types(
+                pushdown_req,
+                &detection.group_keys,
+                &detection.select_items,
+            );
+            // Per-plan declared types, aligned 1:1 with `detection.plans` (includes
+            // aggregates nested inside a scalar-over-aggregate item) — the same
+            // aligned source the non-empty grouped path now uses.
+            return Ok(empty_grouped_sql(
+                &group_key_types,
+                &detection.plan_types,
+                &detection.select_items,
+            ));
+        }
+        // Gate failed. The non-empty grouped path declines with an Err when a
+        // HAVING is present (advertised AGGREGATE_HAVING → Exasol will not
+        // re-apply it); mirror that so the empty path declines identically.
+        if pushdown_req
+            .get("having")
+            .filter(|h| !h.is_null())
+            .is_some()
+        {
+            return Err(UdfError::User(
+                "grouped aggregate pushdown declined: HAVING present but aggregate \
+                 column type is non-numeric; this is a hard error, not a native re-plan"
+                    .into(),
+            ));
+        }
+        // No HAVING: fall through to the group_by qualified-wrapper shape below,
+        // exactly as the non-empty path routes such a request.
+    }
+    // A GROUP BY request that declined grouped detection (or the non-numeric-no-HAVING
+    // fall-through above) routes, on the non-empty path, to the qualified single-table
+    // wrapper whose output columns ARE the `selectList` items. Mirror that shape here
+    // with a zero-row result typed from `selectListDataTypes`, so the empty and
+    // non-empty column shapes never diverge (never a full-row `04000` mismatch).
+    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by")
+        && let Some(sql) = empty_select_list_typed_sql(pushdown_req)
+    {
+        return Ok(sql);
+    }
+    if let Some(aggregates) =
+        detect_aggregates(pushdown_req).filter(|plans| validate_agg_col_types(plans, col_types))
+    {
+        return Ok(empty_agg_sql(
+            &aggregates,
+            &aggregate_exasol_types(pushdown_req),
+        ));
+    }
+    Ok(empty_pushdown_sql(proj_cols, proj_types))
+}
+
+/// A zero-row result whose columns are `CAST(NULL AS <ty>)` for each
+/// `selectListDataTypes` entry, in order — the empty-result shape matching the
+/// grouped qualified-wrapper fallback (whose output columns are the `selectList`
+/// items). `None` when `selectListDataTypes` is absent or empty (the caller then
+/// falls back to the full-row empty shape).
+fn empty_select_list_typed_sql(pushdown_req: &Json) -> Option<Json> {
+    let types = pushdown_req
+        .get("selectListDataTypes")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())?;
+    let items: Vec<String> = types
+        .iter()
+        .map(|dt| format!("CAST(NULL AS {})", exasol_type_from_json(dt)))
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
+    Some(serde_json::json!({"type": "pushdown", "sql": sql}))
+}
+
+/// The empty-result literal for an aggregate evaluated over zero input rows.
+///
+/// The COUNT family yields `0`; every other kind yields `NULL` — single-node SQL
+/// semantics over zero rows, mirroring the zero-count NULL guard (ADR-008).
+fn empty_agg_literal(kind: &AggKind) -> &'static str {
+    match kind {
+        AggKind::Count | AggKind::CountCol | AggKind::CountDistinct => "0",
+        AggKind::Sum
+        | AggKind::Min
+        | AggKind::Max
+        | AggKind::Avg
+        | AggKind::VarPop
+        | AggKind::VarSamp
+        | AggKind::StddevPop
+        | AggKind::StddevSamp => "NULL",
+    }
+}
+
+/// Build the single-group aggregate empty-result response: exactly one row whose
+/// columns are the per-`AggKind` empty literals cast to their declared result
+/// types (from `aggregate_exasol_types`/`selectListDataTypes`), in select-list
+/// order. `FROM DUAL` alone already yields one row, so no `WHERE` is emitted.
+///
+/// The cast decision mirrors `cast_merge_items` (cast when a declared type is
+/// present and not the `VARCHAR(2000000)` default) so the empty column types can
+/// never drift from the non-empty single-group shape.
+fn empty_agg_sql(aggregates: &[AggregatePlan], aggregate_types: &[String]) -> Json {
+    let items: Vec<String> = aggregates
+        .iter()
+        .enumerate()
+        .map(|(i, plan)| {
+            let literal = empty_agg_literal(&plan.kind);
+            match aggregate_types.get(i) {
+                Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({literal} AS {ty})"),
+                _ => literal.to_string(),
+            }
+        })
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL", items.join(", "));
+    serde_json::json!({"type": "pushdown", "sql": sql})
+}
+
+/// Build the grouped aggregate empty-result response: zero rows
+/// (`FROM DUAL WHERE 1=0`) whose columns are the full grouped output shape —
+/// group-key, merged-aggregate, and constant-projection columns assembled in the
+/// user's select-list order via `select_items`, exactly as the non-empty grouped
+/// merge assembles its outer SELECT.
+///
+/// Group-key and aggregate columns are `CAST(NULL AS <declared-type>)` (types from
+/// `group_key_exasol_types` / `aggregate_exasol_types`); a constant projection
+/// reuses its already-rendered, type-cast expression. A zero-row result satisfies
+/// any HAVING / ORDER BY / LIMIT, so none of those need rendering.
+fn empty_grouped_sql(
+    group_key_types: &[String],
+    aggregate_types: &[String],
+    select_items: &[GroupedSelectItem],
+) -> Json {
+    let mut ordered = select_items.to_vec();
+    ordered.sort_by_key(select_item_index);
+    let items: Vec<String> = ordered
+        .iter()
+        .filter_map(|item| match item {
+            GroupedSelectItem::GroupKey { group_key_slot, .. } => group_key_types
+                .get(*group_key_slot)
+                .map(|ty| format!("CAST(NULL AS {ty})")),
+            GroupedSelectItem::Aggregate { plan_slot, .. } => aggregate_types
+                .get(*plan_slot)
+                .map(|ty| format!("CAST(NULL AS {ty})")),
+            GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
+            // A scalar-over-aggregate column is NULL over zero rows, typed to the
+            // item's own declared type (mirrors the group-key/aggregate cast so the
+            // empty grouped shape never drifts from the non-empty wrapper).
+            GroupedSelectItem::ScalarOverAggregate { declared_type, .. } => {
+                Some(if declared_type != "VARCHAR(2000000)" {
+                    format!("CAST(NULL AS {declared_type})")
+                } else {
+                    "NULL".to_string()
+                })
+            }
+        })
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
+    serde_json::json!({"type": "pushdown", "sql": sql})
+}
+
+/// Build a pushdown response with an empty result (no matching files).
+fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Json {
+    let items: Vec<String> = proj_cols
+        .iter()
+        .zip(proj_types.iter())
+        .map(|(item, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(item.emit_name())))
+        .collect();
+    let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
+    serde_json::json!({"type": "pushdown", "sql": sql})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::support::DISTINCT_MERGE_UDF_NAME;
+    use super::super::test_support::*;
+    use super::*;
+    use iceberg::spec::{DataContentType, DataFileFormat};
+
+    // ---------------------------------------------------------------------------
+    // Task 1.3 — fail-loud on unsupported delete/data mechanisms (manifest level)
+    // ---------------------------------------------------------------------------
+
+    /// The two mechanisms this engine CAN apply — a Parquet data file and a
+    /// Parquet positional-delete file — classify as supported (`Ok`).
+    #[test]
+    fn classify_accepts_parquet_data_and_parquet_positional_delete() {
+        assert!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Parquet).is_ok(),
+            "Parquet data file must be supported"
+        );
+        assert!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Parquet)
+                .is_ok(),
+            "Parquet positional delete must be supported"
+        );
+    }
+
+    /// Equality deletes fail loud regardless of file format.
+    #[test]
+    fn classify_rejects_equality_deletes() {
+        for fmt in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+        ] {
+            assert_eq!(
+                classify_manifest_file(DataContentType::EqualityDeletes, fmt),
+                Err(UnsupportedDeleteMechanism::EqualityDelete),
+                "equality delete ({fmt:?}) must fail loud"
+            );
+        }
+    }
+
+    /// A position delete stored as a Puffin blob is a v3 deletion vector — the
+    /// exact case indistinguishable from a Parquet positional delete once
+    /// `plan_files` has dropped the format discriminator, so it MUST be caught at
+    /// the manifest level.
+    #[test]
+    fn classify_rejects_puffin_deletion_vector() {
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Puffin),
+            Err(UnsupportedDeleteMechanism::DeletionVector),
+            "Puffin position delete (deletion vector) must fail loud"
+        );
+    }
+
+    /// ORC/Avro data and delete files fail loud.
+    #[test]
+    fn classify_rejects_orc_and_avro_data_and_delete_files() {
+        assert_eq!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Orc),
+            Err(UnsupportedDeleteMechanism::OrcDataFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::Data, DataFileFormat::Avro),
+            Err(UnsupportedDeleteMechanism::AvroDataFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Orc),
+            Err(UnsupportedDeleteMechanism::OrcDeleteFile),
+        );
+        assert_eq!(
+            classify_manifest_file(DataContentType::PositionDeletes, DataFileFormat::Avro),
+            Err(UnsupportedDeleteMechanism::AvroDeleteFile),
+        );
+    }
+
+    /// The fail-loud error names the mechanism, names the table, and leaks no
+    /// credential (defensively redacted).
+    #[test]
+    fn unsupported_delete_error_names_mechanism_and_redacts() {
+        let err = unsupported_delete_error(
+            UnsupportedDeleteMechanism::DeletionVector,
+            "db.mor_dv_table",
+        );
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains("Iceberg v3 Puffin deletion vectors"),
+            "error must name the mechanism: {msg}"
+        );
+        assert!(
+            msg.contains("db.mor_dv_table"),
+            "error must name the offending table: {msg}"
+        );
+        // No credential label may survive the defensive redaction.
+        assert!(
+            !msg.contains("access_key"),
+            "must not leak access_key: {msg}"
+        );
+        assert!(
+            !msg.contains("secret_key"),
+            "must not leak secret_key: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
+    // ---------------------------------------------------------------------------
+
+    /// `map_delete_content_type` maps the iceberg task-level content type onto the
+    /// wire enum honestly (position → position; equality → equality).
+    #[test]
+    fn map_delete_content_type_maps_position_and_equality() {
+        use iceberg::spec::DataContentType;
+        assert_eq!(
+            map_delete_content_type(DataContentType::PositionDeletes),
+            DeleteFileContentType::PositionDeletes
+        );
+        assert_eq!(
+            map_delete_content_type(DataContentType::EqualityDeletes),
+            DeleteFileContentType::EqualityDeletes
+        );
+    }
+
+    /// A data file's associated positional-delete file paths are relativized by
+    /// the SAME rule as the data-file path: an under-root path is stripped to a
+    /// root-relative path, a path not under the root stays absolute. Delete size
+    /// and content type are preserved.
+    #[test]
+    fn delete_file_paths_use_relative_absolute_encoding() {
+        let root = "s3://warehouse/db/table";
+        let entry = FileEntry::with_deletes(
+            format!("{root}/data/part-0.parquet"),
+            1000,
+            vec![
+                // under the table root — must relativize exactly like the data path
+                pos_delete(&format!("{root}/data/deletes/del-0.parquet"), 50),
+                // not under the root — must stay absolute
+                pos_delete("s3://other-bucket/del-x.parquet", 60),
+            ],
+        );
+        let shards = relativize_shards_to_root(vec![vec![entry]], root);
+        let e = &shards[0][0];
+        assert_eq!(e.path, "data/part-0.parquet", "data path must relativize");
+        assert_eq!(
+            e.deletes[0].path, "data/deletes/del-0.parquet",
+            "under-root delete path must relativize EXACTLY like the data path"
+        );
+        assert_eq!(e.deletes[0].size, 50, "delete size preserved");
+        assert_eq!(
+            e.deletes[0].content_type,
+            DeleteFileContentType::PositionDeletes,
+            "delete content type preserved"
+        );
+        assert_eq!(
+            e.deletes[1].path, "s3://other-bucket/del-x.parquet",
+            "a delete path not under the root must stay absolute"
+        );
+    }
+
+    /// Mirror of the scan UDF's `reconstruct_abs_uri` join rule, so the round-trip
+    /// invariant can be asserted here without a cross-crate dependency: an entry that
+    /// already carries a scheme (`"://"`) is absolute and returned unchanged; any
+    /// other entry is joined onto the root with exactly one `/`.
+    fn reconstruct_abs_uri_mirror(entry_path: &str, table_root: &str) -> String {
+        if entry_path.contains("://") {
+            return entry_path.to_string();
+        }
+        let root = table_root.strip_suffix('/').unwrap_or(table_root);
+        let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
+        format!("{root}/{rel}")
+    }
+
+    /// A path that shares the table root only as a bare STRING prefix (no `/`
+    /// segment boundary) must NOT be relativized: stripping it and rejoining with a
+    /// single `/` corrupts the URI (finding R.1). Only true under-root paths are
+    /// stripped; everything else stays absolute and round-trips to itself.
+    #[test]
+    fn sibling_prefix_paths_are_not_relativized() {
+        let root = "s3://w/db/events";
+
+        // A genuine under-root path IS relativized (existing behavior preserved).
+        let under = format!("{root}/data/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&under, root),
+            "data/f.parquet",
+            "under-root path must be relativized"
+        );
+
+        // Sibling directories that share the root as a bare prefix but break at no
+        // `/` boundary stay ABSOLUTE (not stripped).
+        let archive = format!("{root}-archive/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&archive, root),
+            archive,
+            "sibling '-archive' path must stay absolute"
+        );
+        let sibling2 = format!("{root}2/data/f.parquet");
+        assert_eq!(
+            relativize_path_to_root(&sibling2, root),
+            sibling2,
+            "sibling '2' path must stay absolute"
+        );
+
+        // A path exactly equal to the root stays absolute (no empty entry).
+        assert_eq!(
+            relativize_path_to_root(root, root),
+            root,
+            "path equal to the root must stay absolute, not become an empty entry"
+        );
+
+        // Every case round-trips back to the original absolute path through the
+        // scan UDF's reconstruct rule.
+        for original in [&under, &archive, &sibling2, &root.to_string()] {
+            let emitted = relativize_path_to_root(original, root);
+            assert_eq!(
+                reconstruct_abs_uri_mirror(&emitted, root),
+                *original,
+                "round-trip must be identity for {original}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pre-existing helpers tests (unchanged)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn empty_file_list_returns_empty_select() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let resp = empty_pushdown_sql(&proj, &types);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(sql.contains("WHERE 1=0"));
+        assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
+    }
+
+    /// Single-group empty result: one row, per-`AggKind` literal cast to its
+    /// declared type — COUNT → `0`, SUM → `NULL` — with no `WHERE 1=0` (a bare
+    /// `FROM DUAL` already yields exactly one row).
+    #[test]
+    fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
+        let aggregates = vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("AMOUNT".into()),
+                arg_expr: None,
+            },
+        ];
+        let types = vec!["DECIMAL(18,0)".to_string(), "DECIMAL(36,2)".to_string()];
+        let resp = empty_agg_sql(&aggregates, &types);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(sql.contains("FROM DUAL"), "must select from DUAL: {sql}");
+        assert!(
+            !sql.contains("WHERE 1=0"),
+            "single-group empty is one row, not zero rows: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(0 AS DECIMAL(18,0))"),
+            "COUNT empty literal must be 0 cast to declared type: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(36,2))"),
+            "SUM empty literal must be NULL cast to declared type: {sql}"
+        );
+    }
+
+    /// COUNT(DISTINCT) empty result is `0`, and references neither the scalar
+    /// distinct-merge UDF nor a `LISTAGG` union — with zero files there is nothing
+    /// to merge.
+    #[test]
+    fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
+        let aggregates = vec![AggregatePlan {
+            kind: AggKind::CountDistinct,
+            column: Some("ID".into()),
+            arg_expr: None,
+        }];
+        let types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_agg_sql(&aggregates, &types);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(
+            sql.contains("CAST(0 AS DECIMAL(18,0))"),
+            "COUNT(DISTINCT) empty literal must be 0: {sql}"
+        );
+        assert!(
+            !sql.contains(DISTINCT_MERGE_UDF_NAME),
+            "empty result must not reference the distinct-merge UDF: {sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("LISTAGG"),
+            "empty result must not emit a LISTAGG union: {sql}"
+        );
+    }
+
+    /// Every non-COUNT `AggKind` maps to the `NULL` empty literal — single-node
+    /// SQL semantics over zero rows (only the COUNT family yields `0`).
+    #[test]
+    fn empty_agg_literal_maps_non_count_kinds_to_null() {
+        for kind in [
+            AggKind::Sum,
+            AggKind::Min,
+            AggKind::Max,
+            AggKind::Avg,
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            assert_eq!(
+                empty_agg_literal(&kind),
+                "NULL",
+                "{kind:?} empty literal must be NULL"
+            );
+        }
+        for kind in [AggKind::Count, AggKind::CountCol, AggKind::CountDistinct] {
+            assert_eq!(
+                empty_agg_literal(&kind),
+                "0",
+                "{kind:?} empty literal must be 0"
+            );
+        }
+    }
+
+    /// Grouped empty result: zero rows (`WHERE 1=0`) with one `CAST(NULL AS <ty>)`
+    /// per grouped output column, assembled in select-list order.
+    #[test]
+    fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
+        let select_items = vec![
+            GroupedSelectItem::GroupKey {
+                group_key_slot: 0,
+                select_index: 0,
+            },
+            GroupedSelectItem::Aggregate {
+                plan_slot: 0,
+                select_index: 1,
+            },
+        ];
+        let group_key_types = vec!["DECIMAL(20,0)".to_string()];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
+        let sql = resp["sql"].as_str().unwrap();
+        assert!(
+            sql.contains("WHERE 1=0"),
+            "grouped empty is zero rows: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(20,0))"),
+            "group-key column typed from group_key_types: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS DECIMAL(18,0))"),
+            "aggregate column typed from aggregate_types: {sql}"
+        );
+        let select_clause = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM").next())
+            .unwrap();
+        assert_eq!(
+            select_clause.matches("CAST(NULL AS").count(),
+            2,
+            "one output column per grouped select item: {sql}"
+        );
+    }
+
+    /// A `GroupedSelectItem::Constant` (Exasol's "count the groups" literal
+    /// rewrite) reuses its already-rendered projection expression verbatim,
+    /// slotted into select-list order alongside the group-key and aggregate
+    /// columns — it contributes no aggregate plan and is not re-typed here.
+    #[test]
+    fn empty_grouped_sql_includes_constant_projection_column() {
+        let select_items = vec![
+            GroupedSelectItem::GroupKey {
+                group_key_slot: 0,
+                select_index: 0,
+            },
+            GroupedSelectItem::Constant {
+                select_index: 1,
+                projection: "CAST(NULL AS BOOLEAN)".to_string(),
+            },
+            GroupedSelectItem::Aggregate {
+                plan_slot: 0,
+                select_index: 2,
+            },
+        ];
+        let group_key_types = vec!["DECIMAL(20,0)".to_string()];
+        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+        let resp = empty_grouped_sql(&group_key_types, &aggregate_types, &select_items);
+        let sql = resp["sql"].as_str().unwrap();
+        let select_clause = sql
+            .strip_prefix("SELECT ")
+            .and_then(|s| s.split(" FROM").next())
+            .unwrap();
+        let columns: Vec<&str> = select_clause.split(", ").collect();
+        assert_eq!(
+            columns,
+            vec![
+                "CAST(NULL AS DECIMAL(20,0))",
+                "CAST(NULL AS BOOLEAN)",
+                "CAST(NULL AS DECIMAL(18,0))",
+            ],
+            "constant column is reused verbatim in select-list order: {sql}"
+        );
+    }
+
+    /// Dispatch priority mirrors the non-empty path: grouped first, then
+    /// single-group aggregate (only when `validate_agg_col_types` passes), then
+    /// row scan.
+    #[test]
+    fn empty_result_sql_dispatches_by_plan_shape() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(18,2)".to_string())];
+
+        let grouped = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("COUNT", None, false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 18, "scale": 0},
+            ],
+        });
+        let grouped_sql =
+            empty_result_sql(&grouped, &proj, &proj_types, &col_types).unwrap()["sql"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert!(
+            grouped_sql.contains("WHERE 1=0"),
+            "grouped shape is zero rows: {grouped_sql}"
+        );
+
+        let single = serde_json::json!({
+            "selectList": [agg_item("SUM", Some("amount"), false)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+        });
+        let single_sql = empty_result_sql(&single, &proj, &proj_types, &col_types).unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            single_sql.contains("FROM DUAL") && !single_sql.contains("WHERE 1=0"),
+            "single-group shape is one row: {single_sql}"
+        );
+        assert!(single_sql.contains("CAST(NULL AS DECIMAL(36,2))"));
+
+        // Non-numeric SUM target demotes to the row-scan empty shape (gate honored).
+        let non_numeric = serde_json::json!({
+            "selectList": [agg_item("SUM", Some("name"), false)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+        });
+        let non_numeric_col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+        let row_sql = empty_result_sql(&non_numeric, &proj, &proj_types, &non_numeric_col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            row_sql.contains("CAST(NULL AS DECIMAL(20,0))") && row_sql.contains(&quote_ident("ID")),
+            "non-numeric single-group aggregate must fall through to the row-scan shape: {row_sql}"
+        );
+    }
+
+    /// A grouped aggregate over a non-numeric column with all files pruned no longer
+    /// demotes to the full-row empty shape: since issue #82's fix, a grouped request
+    /// that cannot push down (here, a non-numeric SUM with no HAVING) routes on the
+    /// NON-empty path to the qualified single-table wrapper, whose output columns are
+    /// the `selectList` items. The empty path must MIRROR that shape — a zero-row
+    /// result typed per `selectListDataTypes` (the `selectList` column count/types),
+    /// NOT the full base row — so the empty and non-empty shapes never diverge.
+    #[test]
+    fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let grouped_non_numeric = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("SUM", Some("name"), false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 36, "scale": 2},
+            ],
+        });
+
+        let row_sql = empty_result_sql(&grouped_non_numeric, &proj, &proj_types, &col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            row_sql,
+            "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS DECIMAL(36,2)) FROM DUAL WHERE 1=0",
+            "declined grouped aggregate over zero files must produce the selectList-typed \
+             empty shape (matching the qualified wrapper), not the full base row"
+        );
+    }
+
+    /// A non-numeric grouped aggregate that also carries a HAVING cannot silently
+    /// demote (AGGREGATE_HAVING is advertised, so Exasol will not re-apply it):
+    /// the empty path must decline with the same `Err` the non-empty path returns.
+    #[test]
+    fn empty_files_grouped_non_numeric_aggregate_with_having_declines() {
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
+        let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let grouped_having = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "K"}],
+            "selectList": [
+                {"type": "column", "name": "K"},
+                agg_item("SUM", Some("name"), false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 20, "scale": 0},
+                {"type": "decimal", "precision": 36, "scale": 2},
+            ],
+            "having": {"type": "predicate_greater"},
+        });
+
+        let err = empty_result_sql(&grouped_having, &proj, &proj_types, &col_types).unwrap_err();
+        match err {
+            UdfError::User(msg) => assert!(
+                msg.contains("HAVING present"),
+                "decline message must name the HAVING conflict: {msg}"
+            ),
+            other => panic!("expected UdfError::User, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.2 — `parse_name_mapping` flattens `schema.name-mapping.default`
+    // ---------------------------------------------------------------------------
+
+    /// A representative `schema.name-mapping.default` payload — mirroring the
+    /// Iceberg spec's own example shape — flattens to one `NameMappingEntry` per
+    /// TOP-LEVEL name. Multi-name entries expand to one entry per name (Avro field
+    /// aliases); an entry's nested `fields` children are excluded, but the entry's
+    /// OWN top-level name(s) are still included; an entry with no `field-id` at
+    /// all (schema-only, not present in imported files) is fully excluded.
+    #[test]
+    fn resolves_name_mapping_flat_entries_once() {
+        let raw = r#"
+        [
+            { "field-id": 1, "names": ["id", "record_id"] },
+            {
+                "field-id": 3,
+                "names": ["location"],
+                "fields": [
+                    { "field-id": 4, "names": ["latitude", "lat"] },
+                    { "field-id": 5, "names": ["longitude", "long"] }
+                ]
+            },
+            { "names": ["schema_only_no_field_id"] }
+        ]
+        "#;
+
+        let entries = parse_name_mapping(Some(raw)).expect("valid name-mapping JSON must parse");
+
+        assert_eq!(
+            entries,
+            vec![
+                NameMappingEntry {
+                    name: "id".to_string(),
+                    field_id: 1,
+                },
+                NameMappingEntry {
+                    name: "record_id".to_string(),
+                    field_id: 1,
+                },
+                NameMappingEntry {
+                    name: "location".to_string(),
+                    field_id: 3,
+                },
+            ],
+            "multi-name entry expands per name; nested `fields` children (lat/lat, \
+             long/long) are excluded while the parent's own top-level name is kept; \
+             the id-less entry is fully excluded"
+        );
+    }
+
+    /// An absent `schema.name-mapping.default` property (`None`) yields an empty
+    /// mapping, not an error — a table with no name-mapping is the common,
+    /// fully-supported case.
+    #[test]
+    fn absent_name_mapping_is_empty() {
+        assert_eq!(
+            parse_name_mapping(None).expect("absent property must not error"),
+            Vec::new()
+        );
+    }
+
+    /// A present-but-malformed `schema.name-mapping.default` value fails loud with
+    /// a clean, credential-free plan-time error that names the offending property.
+    #[test]
+    fn malformed_name_mapping_errors_cleanly() {
+        let err = parse_name_mapping(Some("{ not valid json mapping shape"))
+            .expect_err("malformed name-mapping JSON must error");
+
+        let msg = match err {
+            UdfError::User(m) => m,
+            other => panic!("expected UdfError::User, got {other:?}"),
+        };
+        assert!(
+            msg.contains(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING),
+            "error must name the offending property: {msg}"
+        );
+        assert!(
+            !msg.contains("access_key") && !msg.contains("secret_key"),
+            "error must not leak credentials: {msg}"
+        );
+    }
+}
