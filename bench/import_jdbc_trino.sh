@@ -213,7 +213,11 @@ run_timed() {  # name  into  statement-sql
 run_timed_load() {  # label  target_table  sql
   local label="$1" tbl="$2" sql="$3" t0 t1 out rc el cnt rps
   t0=$(date +%s.%N)
-  out=$(printf '%s' "$sql" | timeout 600 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
+  # 1800s client-side, matching the ALTER SESSION QUERY_TIMEOUT set before this loop runs: a raw
+  # full-table (180M row) transfer over a single JDBC connection is the slow path THIS SCRIPT EXISTS
+  # TO MEASURE, so it must be allowed to actually finish rather than be cut off at Exasol's 300s
+  # default (live-verified: every run hit "Query timeout after 300000ms" before this was raised).
+  out=$(printf '%s' "$sql" | timeout 1800 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
   t1=$(date +%s.%N)
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
   if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
@@ -251,8 +255,11 @@ for i in 1 2 3; do
     FAILED=1
     continue
   fi
+  # QUERY_TIMEOUT must be raised IN THE SAME SESSION as the IMPORT itself (each exapump invocation
+  # is its own session, so a separate ALTER SESSION call wouldn't carry over) — Exasol's 300s
+  # default is well under how long a full 180M-row transfer over a single JDBC connection takes.
   run_timed_load "jdbc_raw_scan_run$i" "BENCH.LINEITEM_JDBC" \
-    "IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem'"
+    "ALTER SESSION SET QUERY_TIMEOUT=1800; IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem'"
 done
 
 if [ "$FAILED" -ne 0 ]; then
