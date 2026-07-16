@@ -28,6 +28,11 @@ DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?
 REPORT="${1:-bench/reports/import-jdbc-trino-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
+# Same FAILED convention as bench/run.sh: this script otherwise always exits 0 (its last command
+# is a plain echo) regardless of how many queries inside failed, so a caller chaining this in
+# (bench-remote.sh's BENCH_RUN_CEILING) would have no way to detect "every query failed" and would
+# silently proceed as if the run succeeded.
+FAILED=0
 
 # ---- register the Trino JDBC driver in BucketFS (idempotent: just re-upload every run) --------
 CACHE_DIR="bench/.cache"
@@ -188,6 +193,7 @@ run_timed() {  # name  into  statement-sql
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
   if [ $rc -ne 0 ]; then
     echo "  $name: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"
+    FAILED=1
     return
   fi
   local rows; rows=$(printf '%s' "$out" | tail -n +2 | wc -l | tr -d '[:space:]')
@@ -205,7 +211,7 @@ run_timed_load() {  # label  target_table  sql
   out=$(printf '%s' "$sql" | timeout 600 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
   t1=$(date +%s.%N)
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
-  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; return; fi
+  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
   cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
   rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
   echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s" | tee -a "$REPORT"
@@ -237,10 +243,15 @@ printf '%s' "CREATE OR REPLACE TABLE BENCH.LINEITEM_JDBC (${INTO_RAW})" | exapum
 for i in 1 2 3; do
   if ! printf '%s' "TRUNCATE TABLE BENCH.LINEITEM_JDBC" | exapump sql -d "$DSN" >/dev/null 2>&1; then
     echo "  jdbc_raw_scan_run$i: SKIPPED (TRUNCATE failed — would inflate rows/throughput on a re-run)" | tee -a "$REPORT"
+    FAILED=1
     continue
   fi
   run_timed_load "jdbc_raw_scan_run$i" "BENCH.LINEITEM_JDBC" \
     "IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem'"
 done
 
+if [ "$FAILED" -ne 0 ]; then
+  echo "IMPORT-JDBC-TRINO BENCHMARK FAILED (see FAILED entries above). Report: ${REPORT}"
+  exit 1
+fi
 echo "Done. Report: $REPORT"

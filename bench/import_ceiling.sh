@@ -16,6 +16,10 @@ DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?
 ENDPOINT="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
 REPORT="${1:-/tmp/lh-import-ceiling.txt}"
 : > "$REPORT"
+# Same FAILED convention as bench/run.sh: without this the script always exits 0 (last command is
+# a plain echo) regardless of internal query failures, so a caller chaining this in
+# (bench-remote.sh's BENCH_RUN_CEILING) has no way to detect a fully-broken run.
+FAILED=0
 
 # lineitem data files from the newest resolved scan spec. Since the scan-spec-files-payload
 # change, the report embeds a table_root ("s3://bucket/.../lineitem") and per-file paths
@@ -48,7 +52,7 @@ run_timed() {  # label  sql
   t1=$(date +%s.%N)
   local el; el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
   local cnt; cnt=$(printf '%s' "$out" | tail -n +2 | head -1 | tr -d '"[:space:]')
-  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"
+  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1
   else echo "  $label: ${el}s  count=${cnt}" | tee -a "$REPORT"; fi
 }
 
@@ -71,7 +75,7 @@ run_timed_load() {  # label  target_table  sql
   out=$(printf '%s' "$sql" | timeout 600 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
   t1=$(date +%s.%N)
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
-  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; return; fi
+  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
   cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
   local rps; rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
   echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s" | tee -a "$REPORT"
@@ -94,4 +98,8 @@ for i in 1 2 3; do
     "CREATE OR REPLACE TABLE BENCH.LINEITEM_VS AS SELECT * FROM TPCH.LINEITEM"
 done
 
+if [ "$FAILED" -ne 0 ]; then
+  echo "IMPORT-CEILING BENCHMARK FAILED (see FAILED entries above). Report: ${REPORT}"
+  exit 1
+fi
 echo "=== DONE ===" | tee -a "$REPORT"
