@@ -410,6 +410,9 @@ pub(super) fn project_columns(
                         needs_full_fallback = true;
                     }
                     "function_scalar"
+                    | "function_scalar_cast"
+                    | "function_scalar_extract"
+                    | "function_scalar_case"
                     | "predicate_equal"
                     | "predicate_less"
                     | "predicate_lessequal"
@@ -517,7 +520,15 @@ pub(super) fn exasol_type_from_json(dt: &Json) -> String {
             // VARCHAR, CHAR, and all others.
             let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
             let capped = size.min(2000000);
-            format!("VARCHAR({capped})")
+            let is_ascii = dt
+                .get("characterSet")
+                .and_then(|v| v.as_str())
+                .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
+            if is_ascii {
+                format!("VARCHAR({capped}) ASCII")
+            } else {
+                format!("VARCHAR({capped})")
+            }
         }
     }
 }
@@ -586,6 +597,24 @@ mod tests {
 
         let ts = serde_json::json!({"type": "timestamp"});
         assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
+    }
+
+    /// `exasol_type_from_json` must read the `characterSet` field back off a
+    /// `{"type":"varchar", ...}` dataType JSON (Exasol's wire format for CHAR/VARCHAR
+    /// select-list items, e.g. `{"type":"CHAR","size":3,"characterSet":"ASCII"}` as
+    /// confirmed by `vs-expression`'s `renders_cast_char_as_varchar` test) and append
+    /// `" ASCII"` when it is `"ASCII"` (case-insensitively) — otherwise a CASE/literal
+    /// expression Exasol declares as `VARCHAR(n) ASCII` round-trips back through our
+    /// EMITS clause as bare `VARCHAR(n)`, which Exasol's type checker treats as
+    /// `VARCHAR(n) UTF8` by default, causing a "Data type mismatch" pushdown error
+    /// (issue #136 follow-up).
+    #[test]
+    fn exasol_type_from_json_propagates_ascii_character_set() {
+        let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
+        assert_eq!(exasol_type_from_json(&ascii), "VARCHAR(4) ASCII");
+
+        let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
+        assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
     }
 
     // ---------------------------------------------------------------------------
@@ -2372,6 +2401,175 @@ mod tests {
         );
         // Type for an expression falls back to VARCHAR(2000000)
         assert_eq!(proj_types[0], "VARCHAR(2000000)");
+    }
+
+    /// A `function_scalar_cast` in the select list (the real Exasol wire node
+    /// type for CAST — distinct from the generic `function_scalar`) renders as
+    /// a `ProjectionItem::Expr`, not the full-base-row fallback (issue #136).
+    #[test]
+    fn selectlist_cast_node_rendered_in_emits() {
+        let cast_expr = serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "ID"}],
+            "dataType": {"type": "VARCHAR", "size": 100}
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [cast_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a function_scalar_cast select-list item must not fall back to the full \
+             base row: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a rendered CAST expression must be an Expr projection item: {proj_cols:?}"
+        );
+        let rendered = proj_cols[0].emit_name();
+        assert!(
+            rendered.contains(r#"CAST("ID" AS VARCHAR)"#),
+            "projection must contain the rendered CAST expression: {proj_cols:?}"
+        );
+    }
+
+    /// A `function_scalar_extract` in the select list (the real Exasol wire node
+    /// type for EXTRACT) renders as a `ProjectionItem::Expr`, not the
+    /// full-base-row fallback (issue #136).
+    #[test]
+    fn selectlist_extract_node_rendered_in_emits() {
+        let extract_expr = serde_json::json!({
+            "type": "function_scalar_extract",
+            "name": "EXTRACT",
+            "toExtract": "YEAR",
+            "arguments": [{"type": "column", "name": "EVENT_DATE"}]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "EVENT_DATE", "dataType": {"type": "DATE"}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [extract_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a function_scalar_extract select-list item must not fall back to the full \
+             base row: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a rendered EXTRACT expression must be an Expr projection item: {proj_cols:?}"
+        );
+        let rendered = proj_cols[0].emit_name();
+        assert!(
+            rendered.contains("date_part"),
+            "projection must contain the rendered EXTRACT expression: {proj_cols:?}"
+        );
+    }
+
+    /// A `function_scalar_case` in the select list (the real Exasol wire node
+    /// type for CASE) renders as a `ProjectionItem::Expr`, not the
+    /// full-base-row fallback (issue #136).
+    #[test]
+    fn selectlist_case_node_rendered_in_emits() {
+        // Searched CASE (no `basis`): WHEN arguments are boolean predicates.
+        let case_expr = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {"type": "predicate_less",
+                 "left": {"type": "column", "name": "SCORE"},
+                 "right": {"type": "literal_exactnumeric", "value": "50"}}
+            ],
+            "results": [
+                {"type": "literal_string", "value": "low"},
+                {"type": "literal_string", "value": "high"}
+            ]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "SCORE", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [case_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a function_scalar_case select-list item must not fall back to the full \
+             base row: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a rendered CASE expression must be an Expr projection item: {proj_cols:?}"
+        );
+        let rendered = proj_cols[0].emit_name();
+        assert!(
+            rendered.contains("CASE"),
+            "projection must contain the rendered CASE expression: {proj_cols:?}"
+        );
+    }
+
+    /// A CAST to an unsupported target type (e.g. TIMESTAMP WITH LOCAL TIME
+    /// ZONE, which `render_cast_target` deliberately declines — see
+    /// `crates/vs-expression/src/lib.rs`) still falls back to the full base
+    /// row: the `None` untranslatable branch is untouched by the #136 fix.
+    #[test]
+    fn selectlist_untranslatable_cast_falls_back_to_full_row() {
+        let cast_expr = serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "ID"}],
+            "dataType": {"type": "TIMESTAMP", "withLocalTimeZone": true}
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [cast_expr],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        // Full base row fallback: both table columns, as bare Column items —
+        // not the single rendered expression.
+        assert_eq!(
+            proj_cols,
+            vec![
+                ProjectionItem::Column("ID".into()),
+                ProjectionItem::Column("NAME".into()),
+            ],
+            "an untranslatable CAST target must fall back to the full base row: {proj_cols:?}"
+        );
+        assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
     }
 
     /// An untranslatable select-list item falls back to the bare column.
