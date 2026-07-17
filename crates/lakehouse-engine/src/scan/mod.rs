@@ -21,6 +21,7 @@ use crate::types::mapping::needs_json_fallback;
 use arrow::array::{Array, ListArray};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use datafusion::common::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
@@ -1486,6 +1487,31 @@ async fn build_dataframe(
 /// `scan_target` before asking [`build_raw_scan_physical_plan`] for the committed
 /// pipeline — the built-in `SessionContext::register_parquet` shortcut never
 /// attaches an access plan and so cannot exercise the delete-carrying path.
+/// Time unit INT96 timestamps are coerced to: microseconds. Matches Iceberg's own
+/// readers, which always read the legacy INT96 physical type as microseconds.
+const INT96_COERCE_TIME_UNIT: &str = "us";
+/// Timezone applied to coerced INT96 timestamps: an INT96 instant is UTC.
+const INT96_COERCE_TZ: &str = "UTC";
+
+/// The [`ParquetFormat`] every scan data-file read uses, coercing Parquet INT96
+/// timestamps to microsecond resolution as UTC instants (`coerce_int96 = "us"`,
+/// `coerce_int96_tz = "UTC"`).
+///
+/// arrow-rs otherwise decodes INT96 as `Timestamp(Nanosecond)`, whose i64 range
+/// (1677..=2262) overflows on the far-future values legacy writers such as
+/// Fivetran emit — the plain-`SELECT *` overflow of issue #143. This is the
+/// single source of truth for that coercion so the schema-inference site
+/// ([`register_file_list`]) and the decode site
+/// ([`crate::scan::positional_deletes::PositionalDeleteScanTable`]) cannot drift:
+/// a divergence between inferred `Timestamp(Nanosecond)` and decoded
+/// `Timestamp(Microsecond)` would be a schema mismatch.
+pub fn int96_coerced_parquet_format() -> ParquetFormat {
+    let mut options = TableParquetOptions::default();
+    options.global.coerce_int96 = Some(INT96_COERCE_TIME_UNIT.to_string());
+    options.global.coerce_int96_tz = Some(INT96_COERCE_TZ.to_string());
+    ParquetFormat::default().with_options(options)
+}
+
 pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,
@@ -1566,7 +1592,7 @@ async fn register_file_list(
     let table_schema = if use_field_id_adapter {
         build_logical_arrow_schema(logical_schema)
     } else {
-        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        let listing_options = ListingOptions::new(Arc::new(int96_coerced_parquet_format()))
             .with_file_extension(".parquet")
             .with_collect_stat(false);
         let first_url = ListingTableUrl::parse(&first_abs)
@@ -1684,10 +1710,25 @@ async fn build_scan_sql(
     // and the aggregate `arg_expr`; quoting it as an identifier would build a
     // phantom column name that has no matching field. Emission is positional, so
     // projection order — not name — carries through to EMITS.
+    //
+    // Every `Expr` item gets an explicit positional alias. Without one,
+    // DataFusion derives its schema name from the expression text, and a bare
+    // column projected alongside an unaliased CAST/EXTRACT/CASE of that SAME
+    // column can derive an equal name (e.g. `ID` and `CAST(ID AS Utf8View)`),
+    // which DataFusion's planner rejects as a duplicate projection name (issue
+    // #136 follow-up). The alias text is never read — only position carries
+    // through to EMITS — so any unique-per-position identifier is safe. `Column`
+    // items keep their un-aliased form: a bare column's derived name is always
+    // its own quoted identifier, which `project_columns` already deduplicates
+    // by name upstream, so two `Column` items can never collide with each
+    // other — only an `Expr` wrapping a projected column can collide with it.
     let select_items: Vec<String> = proj_items
         .iter()
-        .map(|item| match item {
-            ProjectionItem::Expr { expr } => expr.clone(),
+        .enumerate()
+        .map(|(i, item)| match item {
+            ProjectionItem::Expr { expr } => {
+                format!("{expr} AS {}", quote_ident(&format!("_LH_PROJ_{i}")))
+            }
             ProjectionItem::Column(col_name) => {
                 let col_lower = col_name.to_lowercase();
                 let needs_cast = schema
@@ -2209,6 +2250,31 @@ mod tests {
     use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
     use object_store::ClientConfigKey;
+
+    // ---------------------------------------------------------------------------
+    // int96_coerced_parquet_format — no-drift regression guard for task 3.1
+    // ---------------------------------------------------------------------------
+
+    /// Both INT96 call sites (`positional_deletes.rs`'s decode path and this
+    /// module's legacy schema-inference branch) build their `ParquetFormat` via
+    /// the SAME shared [`int96_coerced_parquet_format`] helper, so asserting the
+    /// helper's own output once is sufficient to guard against the two sites
+    /// drifting apart (a divergence between inferred and decoded time units would
+    /// be a schema mismatch).
+    #[test]
+    fn both_parquet_format_sites_coerce_int96_us_utc() {
+        let format = int96_coerced_parquet_format();
+        assert_eq!(
+            format.coerce_int96(),
+            Some("us".to_string()),
+            "coerce_int96 must coerce INT96 timestamps to microsecond resolution"
+        );
+        assert_eq!(
+            format.options().global.coerce_int96_tz,
+            Some("UTC".to_string()),
+            "coerce_int96_tz must treat coerced INT96 instants as UTC"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // build_session_context memory pool sizing — seam tests for task 1.3
@@ -4244,6 +4310,63 @@ mod tests {
             assert!(
                 sql.contains(r#""ID""#) && sql.contains(r#""RATING""#),
                 "outer projection must use uppercase aliases: {sql}"
+            );
+        }
+
+        /// A bare column projected alongside an unaliased `CAST` of that SAME
+        /// column (e.g. `SELECT id, CAST(id AS VARCHAR(2000000)) ...`, issue
+        /// #136's select-list shape) must not trip DataFusion's "duplicate
+        /// projection name" check — each `build_scan_sql` select item carries
+        /// its own explicit positional alias precisely to prevent this.
+        #[tokio::test]
+        async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
+            use super::super::build_scan_sql;
+            use crate::scan::spec::ProjectionItem;
+            use datafusion::arrow::array::Int64Array;
+            use datafusion::datasource::MemTable;
+            use datafusion::execution::context::SessionContext;
+
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new(
+                    "id",
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            let ctx = SessionContext::new();
+            let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            ctx.register_table("scan_target", Arc::new(table)).unwrap();
+
+            let mut spec = super::minimal_spec();
+            spec.projection = vec![
+                ProjectionItem::Column("ID".into()),
+                ProjectionItem::Expr {
+                    expr: r#"CAST("ID" AS VARCHAR)"#.into(),
+                },
+            ];
+
+            let sql = build_scan_sql(&ctx, "scan_target", &spec)
+                .await
+                .expect("build_scan_sql");
+            let df = ctx
+                .sql(&sql)
+                .await
+                .expect("plan scan SQL must not hit a duplicate projection name");
+            let batches = df.collect().await.expect("collect");
+            assert!(
+                batches.iter().any(|b| b.num_rows() > 0),
+                "test must exercise at least one actual row"
+            );
+            assert!(
+                batches
+                    .iter()
+                    .all(|b| b.column(0).as_any().downcast_ref::<Int64Array>().is_some()),
+                "column 0 must remain the bare ID column, unaffected by the alias"
             );
         }
 
