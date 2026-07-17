@@ -2,7 +2,7 @@
 //!
 //! Entry point #1: VS adapter (`__exa_udf_entry_LAKEHOUSE_ADAPTER`)
 //!   Handles the Exasol Virtual Schema JSON protocol: getCapabilities,
-//!   createVirtualSchema, refreshVirtualSchema, dropVirtualSchema, pushdown.
+//!   createVirtualSchema, refresh, setProperties, dropVirtualSchema, pushdown.
 //!   Resolves the Iceberg file list ONCE in `pushdown` and returns SQL that
 //!   invokes the scan SCALAR EMIT UDF with the explicit file list.
 //!
