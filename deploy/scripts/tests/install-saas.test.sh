@@ -190,13 +190,26 @@ write_curl_stub "$MISSING_EXAPUMP_DIR"
 
 RUN_PATH="$STUBDIR:$ORIG_PATH"
 
+EXAPUMP_CONFIG_FIXTURE="$SANDBOX/exapump-config.toml"
+cat > "$EXAPUMP_CONFIG_FIXTURE" <<'TOML'
+[other]
+host = "decoy"
+password = "DECOY_SHOULD_NEVER_BE_USED"
+
+[staging]
+host = "decoy-host"
+password = "SECRETPAT123"
+TOML
+
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
-  unset EXASOL_PAT EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
+  unset EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
   # Stub non-empty token so happy-path runs don't each have to set it individually.
   export GITHUB_TOKEN="STUBGHTOKEN123"
+  # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
+  export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
 }
@@ -221,7 +234,7 @@ run_file_with_stdin() {
 log_content() { printf '%s' "$(<"$STUB_LOG")"; }
 
 # Common valid arguments for a happy-path run (profile connectivity mode).
-HAPPY_ARGS=(--account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging)
+HAPPY_ARGS=(--account-id ACC1 --database-id DB1 --profile staging)
 
 # ============================================================================
 # Scenario tests
@@ -231,7 +244,7 @@ test_missing_prereq_fails_fast() {
   echo "== test_missing_prereq_fails_fast =="
   reset_env
   RUN_PATH="$MISSING_CURL_DIR"
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
+  run_file --account-id ACC1 --database-id DB1 --profile staging
   assert_rc_nonzero "missing curl: nonzero exit" "$LAST_RC"
   assert_contains "missing curl: names curl" "$LAST_OUT" "curl"
   assert_contains "missing curl: gives install URL" "$LAST_OUT" "https://curl.se"
@@ -239,7 +252,7 @@ test_missing_prereq_fails_fast() {
 
   reset_env
   RUN_PATH="$MISSING_EXAPUMP_DIR"
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
+  run_file --account-id ACC1 --database-id DB1 --profile staging
   assert_rc_nonzero "missing exapump: nonzero exit" "$LAST_RC"
   assert_contains "missing exapump: names exapump" "$LAST_OUT" "exapump"
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
@@ -249,7 +262,7 @@ test_missing_github_token_fails_fast() {
   echo "== test_missing_github_token_fails_fast =="
   reset_env
   unset GITHUB_TOKEN
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
+  run_file --account-id ACC1 --database-id DB1 --profile staging
   assert_rc_nonzero "missing github token: nonzero exit" "$LAST_RC"
   assert_contains "missing github token: names GITHUB_TOKEN" "$LAST_OUT" "GITHUB_TOKEN"
   assert_contains "missing github token: names --github-token" "$LAST_OUT" "--github-token"
@@ -259,38 +272,38 @@ test_missing_github_token_fails_fast() {
 test_connectivity_mode_either_or() {
   echo "== test_connectivity_mode_either_or =="
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging --host h --user u --password p
+  run_file --account-id ACC1 --database-id DB1 --profile staging --host h --user u --password p
   assert_rc_nonzero "both modes: nonzero exit" "$LAST_RC"
   assert_contains "both modes: states exactly one mode" "$LAST_OUT" "exactly one connectivity mode"
   assert_eq "both modes: no network call made" "" "$(log_content)"
 
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123
+  run_file --account-id ACC1 --database-id DB1
   assert_rc_nonzero "no mode: nonzero exit" "$LAST_RC"
   assert_contains "no mode: states exactly one mode" "$LAST_OUT" "exactly one connectivity mode"
 
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging
+  run_file --account-id ACC1 --database-id DB1 --profile staging
   assert_rc_zero "single mode proceeds to success" "$LAST_RC"
 }
 
 test_host_mode_requires_port() {
   echo "== test_host_mode_requires_port =="
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost --user u --password p
+  run_file --account-id ACC1 --database-id DB1 --host myhost --user u --password p
   assert_rc_nonzero "host no port: nonzero exit" "$LAST_RC"
   assert_contains "host no port: message mentions port" "$LAST_OUT" "port"
   assert_eq "host no port: no network call made" "" "$(log_content)"
 
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost:8563 --user u --password p
+  run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user u --password p
   assert_rc_zero "host with port: proceeds" "$LAST_RC"
 }
 
 test_host_dsn_percent_encodes_credentials() {
   echo "== test_host_dsn_percent_encodes_credentials =="
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 \
+  run_file --account-id ACC1 --database-id DB1 \
     --host myhost:8563 --user 'us:er@x' --password 'p@ss/word?#'
   assert_rc_zero "encode: host-mode install still succeeds" "$LAST_RC"
   local log; log="$(log_content)"
@@ -300,22 +313,150 @@ test_host_dsn_percent_encodes_credentials() {
     "$log" "us:er@x:p@ss"
 }
 
+test_dsn_mode_happy_path() {
+  echo "== test_dsn_mode_happy_path =="
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --dsn "exasol://user:SECRETPAT123@dsnhost:8563"
+  assert_rc_zero "dsn mode: install succeeds" "$LAST_RC"
+}
+
+test_url_decode_roundtrip() {
+  echo "== test_url_decode_roundtrip =="
+  local decoded
+  decoded="$( source "$INSTALLER"; url_decode "p%40ss%2Fword%3F%23" )"
+  assert_eq "url_decode: reverses url_encode's percent-encoding" "p@ss/word?#" "$decoded"
+
+  decoded="$( source "$INSTALLER"; url_decode "abc%" )"
+  assert_eq "url_decode: a trailing bare '%' passes through literally" "abc%" "$decoded"
+
+  decoded="$( source "$INSTALLER"; url_decode "abc%4" )"
+  assert_eq "url_decode: a truncated '%4' (one hex digit) passes through literally" "abc%4" "$decoded"
+}
+
+test_extract_dsn_password() {
+  echo "== test_extract_dsn_password =="
+  local pw rc
+  pw="$( source "$INSTALLER"; extract_dsn_password "exasol://user:SECRETPAT123@host:8563" )"
+  assert_eq "extract_dsn_password: returns the still-encoded password segment" "SECRETPAT123" "$pw"
+
+  pw="$( source "$INSTALLER"; extract_dsn_password "exasol://host:8563" )"
+  rc=$?
+  assert_rc_nonzero "extract_dsn_password: no ':password@' segment fails" "$rc"
+  assert_eq "extract_dsn_password: no output when password segment absent" "" "$pw"
+
+  pw="$( source "$INSTALLER"; extract_dsn_password "exasol://user:pass@word@host:8563" )"
+  assert_eq "extract_dsn_password: a raw '@' inside the password is preserved" "pass@word" "$pw"
+
+  pw="$( source "$INSTALLER"; extract_dsn_password "exasol://user:p%40ss@host:8563" )"
+  assert_eq "extract_dsn_password: an already-percent-encoded segment is returned as-is" "p%40ss" "$pw"
+
+  pw="$( source "$INSTALLER"; extract_dsn_password "exasol://user:@host:8563" )"
+  rc=$?
+  assert_rc_zero "extract_dsn_password: an empty password segment still succeeds" "$rc"
+  assert_eq "extract_dsn_password: empty password segment yields empty output" "" "$pw"
+}
+
+test_read_profile_password() {
+  echo "== test_read_profile_password =="
+  local pw rc
+
+  pw="$( source "$INSTALLER"; read_profile_password "staging" "$EXAPUMP_CONFIG_FIXTURE" )"
+  assert_eq "read_profile_password: resolves staging's password" "SECRETPAT123" "$pw"
+  assert_not_contains "read_profile_password: never returns the other section's decoy" \
+    "$pw" "DECOY_SHOULD_NEVER_BE_USED"
+
+  pw="$( source "$INSTALLER"; read_profile_password "no-such-profile" "$EXAPUMP_CONFIG_FIXTURE" )"
+  rc=$?
+  assert_rc_nonzero "read_profile_password: unknown profile fails" "$rc"
+  assert_eq "read_profile_password: no output for unknown profile" "" "$pw"
+
+  pw="$( source "$INSTALLER"; read_profile_password "staging" "$SANDBOX/does-not-exist.toml" )"
+  rc=$?
+  assert_rc_nonzero "read_profile_password: nonexistent config file fails" "$rc"
+  assert_eq "read_profile_password: no output for nonexistent config file" "" "$pw"
+
+  local no_password_fixture="$SANDBOX/no-password-config.toml"
+  cat > "$no_password_fixture" <<'TOML'
+[nopass]
+host = "some-host"
+
+[staging]
+host = "decoy-host"
+password = "SECRETPAT123"
+TOML
+  pw="$( source "$INSTALLER"; read_profile_password "nopass" "$no_password_fixture" )"
+  rc=$?
+  assert_rc_nonzero "read_profile_password: section with no password key before the next section fails" "$rc"
+  assert_eq "read_profile_password: no output when the password key is missing" "" "$pw"
+}
+
+test_resolve_pat_per_mode() {
+  echo "== test_resolve_pat_per_mode =="
+  local result rc
+
+  result="$(
+    source "$INSTALLER"
+    CONNECTIVITY_MODE="host"
+    ARG_PASSWORD="SECRETPW456"
+    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+  )"
+  assert_eq "resolve_pat: host mode derives from ARG_PASSWORD" "ok:SECRETPW456" "$result"
+
+  result="$(
+    source "$INSTALLER"
+    CONNECTIVITY_MODE="dsn"
+    ARG_DSN="exasol://user:SECRETPAT123@host:8563"
+    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+  )"
+  assert_eq "resolve_pat: dsn mode derives from the DSN password segment" "ok:SECRETPAT123" "$result"
+
+  result="$(
+    source "$INSTALLER"
+    CONNECTIVITY_MODE="profile"
+    ARG_PROFILE="staging"
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+  )"
+  assert_eq "resolve_pat: profile mode derives from the exapump config fixture" "ok:SECRETPAT123" "$result"
+
+  local dsn_err
+  dsn_err="$(
+    source "$INSTALLER"
+    CONNECTIVITY_MODE="dsn"
+    ARG_DSN="exasol://host:8563"
+    resolve_pat 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "resolve_pat: dsn mode fails without a password segment" "$rc"
+  assert_not_contains "resolve_pat: dsn failure message names no credential value" "$dsn_err" "SECRETPAT123"
+
+  local profile_err
+  profile_err="$(
+    source "$INSTALLER"
+    CONNECTIVITY_MODE="profile"
+    ARG_PROFILE="no-such-profile"
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    resolve_pat 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "resolve_pat: profile mode fails for an unknown profile" "$rc"
+  assert_not_contains "resolve_pat: unknown-profile failure never leaks the fixture password" \
+    "$profile_err" "SECRETPAT123"
+  assert_not_contains "resolve_pat: unknown-profile failure never leaks the decoy password" \
+    "$profile_err" "DECOY_SHOULD_NEVER_BE_USED"
+}
+
 test_missing_required_ids_fail_fast() {
   echo "== test_missing_required_ids_fail_fast =="
   reset_env
-  run_file --database-id DB1 --pat SECRETPAT123 --profile staging
+  run_file --database-id DB1 --profile staging
   assert_rc_nonzero "missing account-id: nonzero exit" "$LAST_RC"
   assert_contains "missing account-id: names it" "$LAST_OUT" "--account-id"
   assert_contains "missing account-id: points to SaaS console" "$LAST_OUT" "SaaS web console"
   assert_eq "missing account-id: no network call" "" "$(log_content)"
 
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --profile staging
-  assert_rc_nonzero "missing pat: nonzero exit" "$LAST_RC"
-  assert_contains "missing pat: names PAT/EXASOL_PAT" "$LAST_OUT" "EXASOL_PAT"
-
-  reset_env
-  run_file --account-id ACC1 --pat SECRETPAT123 --profile staging
+  run_file --account-id ACC1 --profile staging
   assert_rc_nonzero "missing database-id: nonzero exit" "$LAST_RC"
   assert_contains "missing database-id: names it" "$LAST_OUT" "--database-id"
 }
@@ -544,7 +685,7 @@ test_saas_verify_listed_quoted_match() {
   no_match="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG CURL_LIST_SUFFIX_ONLY=1
     source "$INSTALLER"
-    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 ARG_PAT=SECRETPAT123 ARG_STAGING=0
+    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 RESOLVED_PAT=SECRETPAT123 ARG_STAGING=0
     if saas_verify_listed "rustslc.tar.gz"; then echo yes; else echo no; fi
   )"
   assert_eq "suffix collision: does not false-positive on a longer stored name" "no" "$no_match"
@@ -553,7 +694,7 @@ test_saas_verify_listed_quoted_match() {
   exact_match="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG
     source "$INSTALLER"
-    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 ARG_PAT=SECRETPAT123 ARG_STAGING=0
+    ARG_ACCOUNT_ID=ACC1 ARG_DATABASE_ID=DB1 RESOLVED_PAT=SECRETPAT123 ARG_STAGING=0
     if saas_verify_listed "rustslc.tar.gz"; then echo yes; else echo no; fi
   )"
   assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
@@ -643,7 +784,7 @@ test_target_base_default_and_override() {
 
   # Integration: staging target
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --profile staging --staging
+  run_file --account-id ACC1 --database-id DB1 --profile staging --staging
   log="$(log_content)"
   assert_contains "base: --staging REST calls hit cloud-staging.exasol.com" "$log" "https://cloud-staging.exasol.com/api/v1"
 }
@@ -699,15 +840,22 @@ test_external_failure_actionable() {
   # Credential safety: PAT and password never printed (host mode, failing run + success run).
   reset_env
   export CURL_DB_UNREACHABLE=1
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost:8563 --user myuser --password SECRETPW456
+  run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user myuser --password SECRETPW456
   assert_not_contains "creds: PAT absent from failing output" "$LAST_OUT" "SECRETPAT123"
   assert_not_contains "creds: password absent from failing output" "$LAST_OUT" "SECRETPW456"
 
   reset_env
-  run_file --account-id ACC1 --database-id DB1 --pat SECRETPAT123 --host myhost:8563 --user myuser --password SECRETPW456
+  run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user myuser --password SECRETPW456
   assert_rc_zero "creds: host-mode install succeeds" "$LAST_RC"
   assert_not_contains "creds: PAT absent from success output" "$LAST_OUT" "SECRETPAT123"
   assert_not_contains "creds: password absent from success output" "$LAST_OUT" "SECRETPW456"
+
+  # Credential safety: the profile-fixture password never printed (profile mode, success run).
+  # HAPPY_ARGS uses --profile staging, whose fixture password is SECRETPAT123.
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "creds: profile-mode install succeeds" "$LAST_RC"
+  assert_not_contains "creds: profile fixture password absent from success output" "$LAST_OUT" "SECRETPAT123"
 }
 
 test_stdin_piped_invocation_no_body_consumption() {
@@ -745,6 +893,11 @@ main() {
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials
+  test_dsn_mode_happy_path
+  test_url_decode_roundtrip
+  test_extract_dsn_password
+  test_read_profile_password
+  test_resolve_pat_per_mode
   test_missing_required_ids_fail_fast
   test_version_resolution_default_and_override
   test_script_languages_append_preserves_existing

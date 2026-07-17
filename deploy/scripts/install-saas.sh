@@ -8,7 +8,7 @@
 #   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
 #     -H "Accept: application/vnd.github.raw" \
 #     https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install-saas.sh \
-#   | EXASOL_PAT=$PAT bash -s -- --account-id $ACC --database-id $DB --profile staging
+#   | bash -s -- --account-id $ACC --database-id $DB --profile staging
 #
 # The file is sourceable: its functions can be sourced and unit-tested without running the
 # installer, because `main` runs only when the file is executed or piped, never when sourced.
@@ -29,7 +29,6 @@ RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#b
 # --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
 ARG_DATABASE_ID=""
-ARG_PAT=""
 ARG_GITHUB_TOKEN=""
 ARG_PROFILE=""
 ARG_DSN=""
@@ -44,6 +43,7 @@ ARG_HELP=0
 
 CONNECTIVITY_MODE=""
 HOST_DSN=""
+RESOLVED_PAT=""
 WORKDIR=""
 RESOLVED_ENGINE_TAG=""
 RESOLVED_ENGINE_VERSION=""
@@ -73,6 +73,37 @@ url_encode() {
     esac
   done
   printf '%s\n' "$out"
+}
+
+# Percent-decodes a string; the exact inverse of url_encode() above.
+url_decode() {
+  local s="$1" i c out=""
+  local len=${#s}
+  for ((i = 0; i < len; i++)); do
+    c="${s:i:1}"
+    if [[ "$c" == "%" && $((i + 2)) -lt len ]]; then
+      out+="$(printf "\\$(printf '%03o' "0x${s:i+1:2}")")"
+      i=$((i + 2))
+    else
+      out+="$c"
+    fi
+  done
+  printf '%s\n' "$out"
+}
+
+# Extracts the still-percent-encoded password segment from an exasol://user:password@host...
+# DSN. Splits on the LAST '@' before the host (the greedy match preserves a RAW, un-encoded '@'
+# inside the password, e.g. 'user:pass@word@host' extracts 'pass@word') and the FIRST ':' after
+# the scheme (separating user from password). Returns 1 with no output if the DSN has no
+# ':password@' segment (no '@' at all, or no ':' before it).
+extract_dsn_password() {
+  local dsn="$1"
+  local re='^[a-zA-Z][a-zA-Z0-9+.-]*://[^:]*:(.*)@.*$'
+  if [[ "$dsn" =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
 }
 
 # --- JSON helpers ------------------------------------------------------------
@@ -191,6 +222,76 @@ EOF_ASSETS
   return 1
 }
 
+# --- Credential resolution ---------------------------------------------------
+# Prints the exapump config.toml path this installer must read to mirror what
+# `exapump sql --profile <name>` itself would resolve (confirmed via `strings $(command -v
+# exapump)`: exapump honors EXAPUMP_CONFIG as a full-file-path override).
+exapump_config_path() {
+  printf '%s\n' "${EXAPUMP_CONFIG:-$HOME/.exapump/config.toml}"
+}
+
+# Reads the `password` key out of the named `[profile]` TOML section in $config_path. Bounded
+# scan (same discipline as extract_asset_id_by_name's bounded JSON block): only lines between the
+# named section's own header and the next `[`-headed header (or EOF) are considered, so a
+# same-named key in a different section is never matched. Returns 1 with no output if the file,
+# section, or key is absent.
+read_profile_password() {
+  local profile="$1" config_path="$2" line trimmed_line
+  local other_section_re='^\[.*\][[:space:]]*$'
+  local password_re="^password[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'][[:space:]]*\$"
+  local in_section=0
+
+  [[ -f "$config_path" ]] || return 1
+
+  while IFS= read -r line; do
+    if [[ "$in_section" -eq 0 ]]; then
+      trimmed_line="${line%"${line##*[![:space:]]}"}"
+      [[ "$trimmed_line" == "[$profile]" ]] && in_section=1
+      continue
+    fi
+    if [[ "$line" =~ $other_section_re ]]; then
+      return 1
+    fi
+    if [[ "$line" =~ $password_re ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <"$config_path"
+  return 1
+}
+
+# Sets the global RESOLVED_PAT from whichever connectivity credential is already in use: on
+# Exasol SaaS the PAT IS the SQL password, so this derives the one REST bearer credential instead
+# of asking the user to supply it a second time. Never prints the resolved value.
+resolve_pat() {
+  case "$CONNECTIVITY_MODE" in
+    host)
+      RESOLVED_PAT="$ARG_PASSWORD"
+      ;;
+    dsn)
+      local encoded
+      if ! encoded="$(extract_dsn_password "$ARG_DSN")" || [[ -z "$encoded" ]]; then
+        err "could not derive the SaaS REST credential: dsn connectivity mode requires a DSN with a ':password@' segment, but none was found in --dsn/EXAPUMP_DSN."
+        return 1
+      fi
+      RESOLVED_PAT="$(url_decode "$encoded")"
+      ;;
+    profile)
+      local config_path
+      config_path="$(exapump_config_path)"
+      if ! RESOLVED_PAT="$(read_profile_password "$ARG_PROFILE" "$config_path")" || [[ -z "$RESOLVED_PAT" ]]; then
+        err "could not derive the SaaS REST credential: no 'password' key found for profile '$ARG_PROFILE' in $config_path."
+        return 1
+      fi
+      ;;
+    *)
+      err "internal error: connectivity mode not resolved"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 usage() {
   cat <<'USAGE'
 install-saas.sh - install lakehouse-engine onto an Exasol SaaS database.
@@ -198,7 +299,6 @@ install-saas.sh - install lakehouse-engine onto an Exasol SaaS database.
 Required:
   --account-id <id>        SaaS account id (from the SaaS web console)
   --database-id <id>       SaaS database id (from the SaaS web console)
-  --pat <token>            SaaS personal access token (or set EXASOL_PAT)
   --github-token <token>   GitHub token with read access to the private lakehouse-engine-rs
                            repo (or set GITHUB_TOKEN)
 
@@ -208,6 +308,10 @@ Connectivity (exactly one mode):
   --host <host:port> --user <u> --password <p>
                            direct connection assembled into a DSN;
                            --host MUST include the port (e.g. myhost:8563) — there is no --port flag
+
+  The SaaS REST API credential (Bearer token) is derived automatically from whichever
+  connectivity mode is used above -- on Exasol SaaS the PAT IS the SQL password, so there is no
+  separate flag for it.
 
 Optional:
   --staging                target cloud-staging.exasol.com (default: cloud.exasol.com)
@@ -225,7 +329,6 @@ USAGE
 parse_args() {
   ARG_ACCOUNT_ID=""
   ARG_DATABASE_ID=""
-  ARG_PAT="${EXASOL_PAT:-}"
   ARG_GITHUB_TOKEN="${GITHUB_TOKEN:-}"
   ARG_PROFILE=""
   ARG_DSN="${EXAPUMP_DSN:-}"
@@ -243,7 +346,7 @@ parse_args() {
     case "$flag" in
       --staging) ARG_STAGING=1; shift; continue ;;
       --help|-h) ARG_HELP=1; shift; continue ;;
-      --account-id|--database-id|--pat|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
+      --account-id|--database-id|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
       *) err "unknown argument: $flag"; return 1 ;;
     esac
     if [[ $# -lt 2 ]]; then
@@ -254,7 +357,6 @@ parse_args() {
     case "$flag" in
       --account-id)        ARG_ACCOUNT_ID="$value" ;;
       --database-id)       ARG_DATABASE_ID="$value" ;;
-      --pat)               ARG_PAT="$value" ;;
       --github-token)      ARG_GITHUB_TOKEN="$value" ;;
       --profile)           ARG_PROFILE="$value" ;;
       --dsn)               ARG_DSN="$value" ;;
@@ -278,10 +380,6 @@ validate_required() {
   fi
   if [[ -z "$ARG_DATABASE_ID" ]]; then
     err "missing --database-id (find it in the Exasol SaaS web console under your database)"
-    missing=1
-  fi
-  if [[ -z "$ARG_PAT" ]]; then
-    err "missing SaaS PAT: pass --pat or set EXASOL_PAT (create a personal access token in the Exasol SaaS web console)"
     missing=1
   fi
   if [[ -z "$ARG_GITHUB_TOKEN" ]]; then
@@ -389,7 +487,7 @@ saas_db_reachable() {
   local base url
   base="$(resolve_saas_base)"
   url="$base/api/v1/accounts/$ARG_ACCOUNT_ID/databases/$ARG_DATABASE_ID"
-  if ! curl -fsS -H "Authorization: Bearer $ARG_PAT" "$url" </dev/null >/dev/null 2>&1; then
+  if ! curl -fsS -H "Authorization: Bearer $RESOLVED_PAT" "$url" </dev/null >/dev/null 2>&1; then
     local target="production"
     [[ "$ARG_STAGING" -eq 1 ]] && target="staging"
     err "SaaS database not reachable: GET /api/v1/accounts/<account>/databases/<database> failed on the $target target. Verify --account-id, --database-id, and the PAT (and --staging if applicable)."
@@ -401,7 +499,7 @@ saas_verify_listed() {
   local filename="$1" base url resp
   base="$(resolve_saas_base)"
   url="$base/api/v1/accounts/$ARG_ACCOUNT_ID/databases/$ARG_DATABASE_ID/files"
-  if ! resp="$(curl -fsS -H "Authorization: Bearer $ARG_PAT" "$url" </dev/null 2>&1)"; then
+  if ! resp="$(curl -fsS -H "Authorization: Bearer $RESOLVED_PAT" "$url" </dev/null 2>&1)"; then
     return 1
   fi
   # Match the quoted JSON string, not a bare substring: without the quote boundary,
@@ -414,7 +512,7 @@ saas_upload_file() {
   local local_path="$1" filename="$2" base url resp presigned
   base="$(resolve_saas_base)"
   url="$base/api/v1/accounts/$ARG_ACCOUNT_ID/databases/$ARG_DATABASE_ID/files/$filename"
-  if ! resp="$(curl -fsS -X POST -H "Authorization: Bearer $ARG_PAT" "$url" </dev/null 2>&1)"; then
+  if ! resp="$(curl -fsS -X POST -H "Authorization: Bearer $RESOLVED_PAT" "$url" </dev/null 2>&1)"; then
     err "SaaS upload of $filename failed: could not obtain a presigned URL (POST files endpoint). Check the account/database id and PAT scopes. curl said: $resp"
     return 1
   fi
@@ -717,8 +815,9 @@ main() {
     enc_password="$(url_encode "$ARG_PASSWORD")"
     HOST_DSN="exasol://$enc_user:$enc_password@$ARG_HOST?validateservercertificate=0"
   fi
-
   check_prereqs || exit 1
+  resolve_pat || exit 1
+
   saas_db_reachable || exit 1
 
   if ! WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lhvs-install.XXXXXX" 2>/dev/null)"; then

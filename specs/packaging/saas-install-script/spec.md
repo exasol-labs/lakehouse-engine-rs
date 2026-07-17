@@ -21,9 +21,13 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
   header. The language-container-rs repository is public; the installer sends the same token
   header to it (harmless for a public repo), so there is exactly one authenticated code path
   and no dependency on the `gh` CLI.
-* SaaS control-plane REST calls authenticate with a SaaS personal access token (PAT)
-  passed as `EXASOL_PAT` (or `--pat`); `--account-id` and `--database-id` are required
-  inputs because the SaaS API exposes no route to discover them.
+* SaaS control-plane REST calls (the files API, the database-reachability check) authenticate
+  with a bearer PAT, but the installer no longer asks for that PAT as a separate input. On
+  Exasol SaaS the PAT *is* the SQL password, so the same connectivity mode the user already
+  configured for `exapump sql` supplies it: `--password` directly in host mode, the DSN's
+  password segment in dsn mode, or the named profile's stored password (read straight out of
+  `exapump`'s own config file) in profile mode. `--account-id` and `--database-id` remain
+  required inputs because the SaaS API exposes no route to discover them.
 * SQL runs through `exapump sql` in exactly one connectivity mode: a named profile
   (`--profile`) or a direct connection (`--dsn`/`EXAPUMP_DSN`, or `--host`/`--user`/`--password`
   assembled into a DSN). The two modes are a validated either/or.
@@ -59,10 +63,24 @@ DDL, the fingerprint smoke test, and the stdin-piped invocation contract.
 
 ### Scenario: Missing required identifiers fail fast
 
-* *GIVEN* the script is invoked without `--account-id`, without `--database-id`, or without a PAT (`EXASOL_PAT`/`--pat`)
+* *GIVEN* the script is invoked without `--account-id` or without `--database-id`
 * *WHEN* the script runs
 * *THEN* the script MUST exit non-zero before making any network call
 * *AND* the error message MUST name the missing input and where to obtain it (the SaaS web console)
+
+### Scenario: The REST-API credential derives from the resolved connectivity mode
+
+* *GIVEN* connectivity-mode validation has resolved exactly one mode (host, dsn, or profile)
+* *WHEN* the script derives the SaaS REST-API bearer credential
+* *THEN* in host mode the script SHALL use `--password` directly as the credential
+* *AND* in dsn mode the script SHALL extract and percent-decode the password segment from the DSN
+* *AND* in profile mode the script SHALL read the named profile's `password` key directly out of
+  `exapump`'s own config file at `${EXAPUMP_CONFIG:-$HOME/.exapump/config.toml}`, matched only
+  within that profile's own `[name]` section
+* *AND* WHEN the mode-specific derivation yields no non-empty value (an empty `--password`, a DSN with no password segment, or a config file/section/key that can't be found) THEN the script MUST exit non-zero before any network call, naming the connectivity mode and what's missing
+* *AND* the script MUST NOT print the derived credential value in any success or failure output
+* *AND* the script MUST NOT accept a `--pat` flag or an `EXASOL_PAT` environment variable — the
+  credential is always derived, never supplied as a separate input
 
 ### Scenario: Artifact versions default to the latest release and honour overrides
 
