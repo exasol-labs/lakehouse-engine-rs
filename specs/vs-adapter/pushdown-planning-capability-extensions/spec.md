@@ -22,10 +22,10 @@ translator or aggregate planner with a shard-associative partial/merge path.
 
 ### Scenario: Scalar select-list expression is pushed into the scan-driving query
 
-* *GIVEN* a query whose select list contains a scalar expression over table columns (e.g. `UPPER(name)`, `price * qty`, `EXTRACT(YEAR FROM order_date)`)
+* *GIVEN* a query whose select list contains a scalar expression over table columns (e.g. `UPPER(name)`, `price * qty`, `EXTRACT(YEAR FROM order_date)`, `CAST(id AS VARCHAR(2000000))`, or `CASE WHEN qty > 0 THEN 1 ELSE 0 END`)
 * *AND* the adapter advertises `SELECTLIST_EXPRESSIONS`
 * *WHEN* Exasol sends the `pushdown` request carrying that select-list expression
-* *THEN* the adapter SHALL render each select-list expression node to a DataFusion SQL fragment using the VS expression translator (raising mode) and carry the rendered fragments in the scan spec so the scan UDF projects exactly those expressions
+* *THEN* the adapter SHALL render each select-list expression node — recognizing the distinct `function_scalar_cast`, `function_scalar_extract`, and `function_scalar_case` node types Exasol emits for CAST, EXTRACT, and CASE (including CASE-expanded NULLIF/ZEROIFNULL), not only the generic `function_scalar` node — to a DataFusion SQL fragment using the VS expression translator (raising mode), and SHALL carry the rendered fragments in the scan spec so the scan UDF projects exactly those expressions rather than triggering the full-base-row fallback that yields a column count Exasol rejects
 * *AND* the UDF's declared EMITS column list SHALL match the rendered select-list expressions in order and result type, where result types are read from the parallel top-level `selectListDataTypes` array in the pushdown request
 * *AND* a select-list item the adapter cannot translate SHALL cause the adapter to fall back to projecting the underlying columns and let Exasol evaluate the expression, rather than producing an incorrect result
 
