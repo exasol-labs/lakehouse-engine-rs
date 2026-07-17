@@ -307,8 +307,12 @@ fn handle_create_virtual_schema(
 /// The response `type` mirrors the request `type` per the Exasol VS adapter
 /// protocol (`createVirtualSchema` | `refresh` | `setProperties`). When the
 /// request carries `requestedTables` (a partial-refresh subset) it is echoed
-/// back verbatim so Exasol applies the requested subset; it is omitted when the
-/// request did not include it.
+/// back verbatim only because the protocol requires a well-formed response to
+/// mirror the fields of the request it answers — it is NOT relied upon to
+/// scope the resulting refresh: verified against the live engine, Exasol
+/// applies the adapter's full `schemaMetadata.tables` response to the whole
+/// namespace regardless of `requestedTables`. It is omitted when the request
+/// did not include it.
 fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
     let response_type = request
         .get("type")
