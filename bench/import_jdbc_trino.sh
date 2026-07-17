@@ -28,6 +28,11 @@ DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?
 REPORT="${1:-bench/reports/import-jdbc-trino-$(date +%Y%m%d-%H%M%S).txt}"
 mkdir -p "$(dirname "$REPORT")"
 : > "$REPORT"
+# Same FAILED convention as bench/run.sh: this script otherwise always exits 0 (its last command
+# is a plain echo) regardless of how many queries inside failed, so a caller chaining this in
+# (bench-remote.sh's BENCH_RUN_CEILING) would have no way to detect "every query failed" and would
+# silently proceed as if the run succeeded.
+FAILED=0
 
 # ---- register the Trino JDBC driver in BucketFS (idempotent: just re-upload every run) --------
 CACHE_DIR="bench/.cache"
@@ -163,7 +168,17 @@ INTO_NQ3="CNT DECIMAL(20,0), TOTAL_COST DECIMAL(15,2)"
 INTO_NQ4="L_ORDERKEY DECIMAL(20,0), L_EXTENDEDPRICE DECIMAL(15,2)"
 INTO_NQ5="O_ORDERPRIORITY VARCHAR(2000000), O_ORDERSTATUS VARCHAR(2000000), CNT DECIMAL(20,0), AVG_PRICE DECIMAL(15,2)"
 
-JDBC_URL="jdbc:trino://${TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
+# Raw column-type list for the full-table streaming scan below (§ raw scan), copied verbatim from
+# bench/import_ceiling.sh's INTO — same lineitem columns, already live-verified on test1 (including
+# the BIGINT-sum DECIMAL gotcha noted on INTO_Q9B above), just untransformed rather than aggregated.
+INTO_RAW="L_ORDERKEY DECIMAL(20,0), L_PARTKEY DECIMAL(20,0), L_SUPPKEY DECIMAL(20,0), L_LINENUMBER DECIMAL(20,0), L_QUANTITY DECIMAL(15,2), L_EXTENDEDPRICE DECIMAL(15,2), L_DISCOUNT DECIMAL(15,2), L_TAX DECIMAL(15,2), L_RETURNFLAG VARCHAR(2000000), L_LINESTATUS VARCHAR(2000000), L_SHIPDATE DATE, L_COMMITDATE DATE, L_RECEIPTDATE DATE, L_SHIPINSTRUCT VARCHAR(2000000), L_SHIPMODE VARCHAR(2000000), L_COMMENT VARCHAR(2000000)"
+
+# TRINO_JDBC_HOST (private IP, same VPC as Exasol) if set, else TRINO_HOST (public IP). The JDBC
+# connection here originates FROM the Exasol node, not the operator's machine — connecting to
+# another same-VPC instance's PUBLIC IP round-trips through the IGW, which is unreliable for a
+# long-lived paginated result fetch (live-verified: every query failed at "fetching next" after
+# ~2 minutes/4 attempts, even with the SG opened to the whole VPC on port 8080).
+JDBC_URL="jdbc:trino://${TRINO_JDBC_HOST:-$TRINO_HOST}:${TRINO_PORT}/iceberg/${TRINO_SCHEMA}"
 
 import_stmt() {  # into  statement-sql
   local into="$1" stmt="$2"
@@ -182,12 +197,45 @@ run_timed() {  # name  into  statement-sql
   t1=$(date +%s.%N)
   el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
   if [ $rc -ne 0 ]; then
+    # NOT added to FAILED: the standard q1-nq5 set is comparison/bonus data (same status as
+    # import_ceiling.sh's numbers), not what this script's exit code should gate on — only the
+    # raw-scan block below (the actual subject of the node-count-scaling experiment) does that.
+    # Live-verified: q1 alone hits a transient BucketFS driver-registration race on a freshly
+    # provisioned cluster ("Driver=TRINO is unknown") that self-resolves by q2 every time seen so
+    # far — treating that as fatal would abort a multi-trial sweep over one cosmetic hiccup.
     echo "  $name: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"
     return
   fi
   local rows; rows=$(printf '%s' "$out" | tail -n +2 | wc -l | tr -d '[:space:]')
   echo "  $name: ${el}s  rows=${rows}" | tee -a "$REPORT"
   echo "TIMING ${ENGINE_LABEL} ${name} ${el}" >> "$REPORT"
+}
+
+# Materializing load (real IMPORT INTO <table>, not a client-side derived-table SELECT) — same
+# apples-to-apples methodology as import_ceiling.sh's run_timed_load, so 180M rows never round-trip
+# through the exapump CSV client. Row count is read back from the target table, not parsed from
+# import output (IMPORT INTO returns no result set).
+run_timed_load() {  # label  target_table  sql
+  local label="$1" tbl="$2" sql="$3" t0 t1 out rc el cnt rps
+  t0=$(date +%s.%N)
+  # 1800s of client-side headroom (the JDBC_RAW_SCAN_LIMIT-bounded scan actually completes in
+  # ~15-20s at 1M rows) — generous margin in case a future caller raises the limit closer to
+  # Exasol's own ~300s per-statement ETL/JDBC-bridge ceiling (see the comment on JDBC_RAW_SCAN_LIMIT
+  # above for why that ceiling isn't itself configurable via ALTER SESSION QUERY_TIMEOUT).
+  out=$(printf '%s' "$sql" | timeout 1800 exapump sql -d "$DSN" -f csv 2>&1); rc=$?
+  t1=$(date +%s.%N)
+  el=$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")
+  if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
+  cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
+  rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
+  # RAW_OBJECT_SIZE (bytes) from Exasol's own system view — same metric/methodology as
+  # import_ceiling.sh's run_timed_load, for a like-for-like MB/s comparison.
+  local schema="${tbl%%.*}" tblname="${tbl##*.}" raw_bytes mb mbps
+  raw_bytes=$(printf '%s' "SELECT RAW_OBJECT_SIZE FROM EXA_ALL_OBJECT_SIZES WHERE ROOT_NAME='${schema}' AND OBJECT_NAME='${tblname}'" \
+    | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
+  mb=$(awk "BEGIN{printf \"%.1f\", ${raw_bytes:-0}/1048576}")
+  mbps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.1f\", ${raw_bytes:-0}/1048576/${el}; else print \"n/a\"}")
+  echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s  size=${mb}MB  throughput_mb=${mbps} MB/s" | tee -a "$REPORT"
 }
 
 echo "import-jdbc-trino benchmark — ${TRINO_HOST}:${TRINO_PORT} schema=${TRINO_SCHEMA} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
@@ -206,4 +254,36 @@ run_timed "nq2" "$INTO_NQ2" "$NQ2"
 run_timed "nq3" "$INTO_NQ3" "$NQ3"
 run_timed "nq4" "$INTO_NQ4" "$NQ4"
 run_timed "nq5" "$INTO_NQ5" "$NQ5"
+
+# ---- raw streaming scan: no aggregation, no filter — measures pure data-movement throughput
+# over the single JDBC connection, to compare against import_ceiling.sh's VS-path CTAS
+# (bench/import_ceiling.sh's vs_ctas_run*) at the same node count.
+#
+# Bounded to JDBC_RAW_SCAN_LIMIT rows (default 1,000,000 — large enough to reach steady-state
+# throughput past connection/setup overhead), NOT the full 180M-row table: Exasol's JDBC ETL
+# bridge has a per-statement execution ceiling around 300s that live-verified testing showed is
+# NOT the SQL-level QUERY_TIMEOUT session parameter (ALTER SESSION SET QUERY_TIMEOUT=1800 had no
+# effect — the full-table version of this query failed identically at exactly 300000ms both
+# with and without it) and isn't exposed as a configurable settings.cfg property either. rows/sec
+# from a fixed, timeout-safe sample is what the node-count-scaling hypothesis actually needs — if
+# JDBC's single connection doesn't scale with Exasol's node count, that shows up in this bounded
+# throughput number just as clearly as it would in an unbounded one.
+JDBC_RAW_SCAN_LIMIT="${JDBC_RAW_SCAN_LIMIT:-1000000}"
+echo "=== raw scan: IMPORT INTO (JDBC), SELECT * FROM lineitem LIMIT ${JDBC_RAW_SCAN_LIMIT}, 3x ===" | tee -a "$REPORT"
+printf '%s' "CREATE SCHEMA IF NOT EXISTS BENCH" | exapump sql -d "$DSN" >/dev/null 2>&1 || true
+printf '%s' "CREATE OR REPLACE TABLE BENCH.LINEITEM_JDBC (${INTO_RAW})" | exapump sql -d "$DSN" >/dev/null 2>&1
+for i in 1 2 3; do
+  if ! printf '%s' "TRUNCATE TABLE BENCH.LINEITEM_JDBC" | exapump sql -d "$DSN" >/dev/null 2>&1; then
+    echo "  jdbc_raw_scan_run$i: SKIPPED (TRUNCATE failed — would inflate rows/throughput on a re-run)" | tee -a "$REPORT"
+    FAILED=1
+    continue
+  fi
+  run_timed_load "jdbc_raw_scan_run$i" "BENCH.LINEITEM_JDBC" \
+    "IMPORT INTO BENCH.LINEITEM_JDBC FROM JDBC DRIVER='TRINO' AT '${JDBC_URL}' USER 'admin' IDENTIFIED BY '' STATEMENT 'SELECT * FROM lineitem LIMIT ${JDBC_RAW_SCAN_LIMIT}'"
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "IMPORT-JDBC-TRINO BENCHMARK FAILED (see FAILED entries above). Report: ${REPORT}"
+  exit 1
+fi
 echo "Done. Report: $REPORT"
