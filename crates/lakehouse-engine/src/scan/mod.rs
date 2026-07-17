@@ -1684,10 +1684,25 @@ async fn build_scan_sql(
     // and the aggregate `arg_expr`; quoting it as an identifier would build a
     // phantom column name that has no matching field. Emission is positional, so
     // projection order — not name — carries through to EMITS.
+    //
+    // Every `Expr` item gets an explicit positional alias. Without one,
+    // DataFusion derives its schema name from the expression text, and a bare
+    // column projected alongside an unaliased CAST/EXTRACT/CASE of that SAME
+    // column can derive an equal name (e.g. `ID` and `CAST(ID AS Utf8View)`),
+    // which DataFusion's planner rejects as a duplicate projection name (issue
+    // #136 follow-up). The alias text is never read — only position carries
+    // through to EMITS — so any unique-per-position identifier is safe. `Column`
+    // items keep their un-aliased form: a bare column's derived name is always
+    // its own quoted identifier, which `project_columns` already deduplicates
+    // by name upstream, so two `Column` items can never collide with each
+    // other — only an `Expr` wrapping a projected column can collide with it.
     let select_items: Vec<String> = proj_items
         .iter()
-        .map(|item| match item {
-            ProjectionItem::Expr { expr } => expr.clone(),
+        .enumerate()
+        .map(|(i, item)| match item {
+            ProjectionItem::Expr { expr } => {
+                format!("{expr} AS {}", quote_ident(&format!("_LH_PROJ_{i}")))
+            }
             ProjectionItem::Column(col_name) => {
                 let col_lower = col_name.to_lowercase();
                 let needs_cast = schema
@@ -4244,6 +4259,54 @@ mod tests {
             assert!(
                 sql.contains(r#""ID""#) && sql.contains(r#""RATING""#),
                 "outer projection must use uppercase aliases: {sql}"
+            );
+        }
+
+        /// A bare column projected alongside an unaliased `CAST` of that SAME
+        /// column (e.g. `SELECT id, CAST(id AS VARCHAR(2000000)) ...`, issue
+        /// #136's select-list shape) must not trip DataFusion's "duplicate
+        /// projection name" check — each `build_scan_sql` select item carries
+        /// its own explicit positional alias precisely to prevent this.
+        #[tokio::test]
+        async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
+            use super::super::build_scan_sql;
+            use crate::scan::spec::ProjectionItem;
+            use datafusion::arrow::array::Int64Array;
+            use datafusion::datasource::MemTable;
+            use datafusion::execution::context::SessionContext;
+
+            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+                datafusion::arrow::datatypes::Field::new(
+                    "id",
+                    datafusion::arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+            ]));
+            let ctx = SessionContext::new();
+            let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+            ctx.register_table("scan_target", Arc::new(table)).unwrap();
+
+            let mut spec = super::minimal_spec();
+            spec.projection = vec![
+                ProjectionItem::Column("ID".into()),
+                ProjectionItem::Expr {
+                    expr: r#"CAST("ID" AS VARCHAR)"#.into(),
+                },
+            ];
+
+            let sql = build_scan_sql(&ctx, "scan_target", &spec)
+                .await
+                .expect("build_scan_sql");
+            let df = ctx
+                .sql(&sql)
+                .await
+                .expect("plan scan SQL must not hit a duplicate projection name");
+            let batches = df.collect().await.expect("collect");
+            assert!(
+                batches
+                    .iter()
+                    .all(|b| b.column(0).as_any().downcast_ref::<Int64Array>().is_some()),
+                "column 0 must remain the bare ID column, unaffected by the alias"
             );
         }
 
