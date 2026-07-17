@@ -26,6 +26,14 @@ set -euo pipefail
 ICEBERG_VERSION="1.10.1"
 SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION}"
 
+# hadoop-aws (Hadoop's S3AFileSystem + its AWS SDK) is needed ONLY by the INT96
+# fixture below, whose native (non-Iceberg) Parquet write to MinIO and whose
+# add_files read of that `s3://` source both go through Hadoop's filesystem — not
+# Iceberg's S3FileIO (iceberg-aws-bundle), which serves the other fixtures. The
+# base apache/spark image ships no hadoop-aws, so it is added on that one
+# invocation. Pin to the image's bundled Hadoop (hadoop-client-*-3.3.4.jar).
+HADOOP_AWS_VERSION="3.3.4"
+
 # rest_catalog: the SAME REST catalog (iceberg-rest:8181) + MinIO (minio:9000,
 # bucket s3://warehouse/) every other E2E fixture/table uses — see
 # tests/common/seed.rs's build_seed_catalog and docker-compose.yml's
@@ -71,5 +79,24 @@ echo "=== spark-iceberg-fixtures: write.delete.granularity=partition MOR fixture
 
 echo "=== spark-iceberg-fixtures: format-version=3 Puffin deletion-vector fixture ==="
 /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_deletion_vector_fixture.sql
+
+# INT96 far-future-timestamp fixture (issue #143). Unlike the merge-on-read
+# fixtures above (authored by Spark's *Iceberg* writer, which emits INT64
+# regardless of outputTimestampType), this one needs a genuinely INT96-encoded
+# data file, so it writes a *native* Spark Parquet file and registers it via the
+# Iceberg add_files procedure — see create_int96_timestamp_fixture.sql for the
+# full rationale. Two extra args make this the one fixture that can't reuse
+# SPARK_CONF verbatim:
+#   * The trailing --packages adds hadoop-aws for the native S3 write / add_files
+#     read (see HADOOP_AWS_VERSION above); it still lists the Iceberg runtime, and
+#     spark-submit's last --packages wins, so nothing from SPARK_CONF is lost.
+#   * fs.s3.impl aliases the `s3` scheme to S3AFileSystem so the native write
+#     lands under `s3://` (Hadoop 3.3.4 binds only `s3a` by default), matching the
+#     scheme the scan UDF registers its object store under.
+echo "=== spark-iceberg-fixtures: INT96 far-future-timestamp fixture ==="
+/opt/spark/bin/spark-sql "${SPARK_CONF[@]}" \
+  --packages "${SPARK_PACKAGES},org.apache.hadoop:hadoop-aws:${HADOOP_AWS_VERSION}" \
+  --conf spark.hadoop.fs.s3.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  -f /fixtures/create_int96_timestamp_fixture.sql
 
 echo "=== spark-iceberg-fixtures: done ==="
