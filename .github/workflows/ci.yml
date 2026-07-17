@@ -23,12 +23,6 @@ env:
   CARGO_BUILD_JOBS: "4"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
-  # Keep in lockstep with the Makefile's SLC_VERSION / EXASOL_IMAGE / the three
-  # docker-compose.yml image pins — bump here whenever those change.
-  EXASOL_IMAGE_TAG: "2025.2.1"
-  MINIO_IMAGE_TAG: "RELEASE.2025-01-20T14-49-07Z"
-  ICEBERG_REST_IMAGE_TAG: "1.10.1"
-  SPARK_IMAGE_TAG: "3.5.7"
 
 jobs:
   # ── build early ──────────────────────────────────────────────────────────
@@ -61,6 +55,17 @@ jobs:
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
         with:
           components: clippy, rustfmt
+
+      # rust-cache keys on every installed toolchain's `rustc -vV`, including
+      # the runner image's preinstalled stable Rust — which drifts across the
+      # heterogeneous hosted-runner image pool and has nothing to do with this
+      # repo's pinned 1.94 (rust-toolchain.toml). A writer/reader landing on
+      # different preinstalled versions silently diverges the cache key and
+      # forces a full cold recompile in every reader job (#133). Drop
+      # everything but 1.94 so the key only reflects the toolchain actually
+      # used to compile.
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
       # Swatinem/rust-cache (not raw actions/cache) because it PRUNES target/
       # before saving: it strips this workspace's own crate artifacts +
@@ -190,6 +195,12 @@ jobs:
       - name: Ensure rustfmt/clippy available on 1.94
         run: rustup component add rustfmt clippy --toolchain 1.94
 
+      # Stabilizes the rust-cache key against the runner image's preinstalled
+      # Rust drifting between writer/reader jobs — see the `build` job's
+      # matching step for the full rationale (#133).
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
       # Restore the pruned cache the build job saved (same shared-key); read
       # only — save-if:false so this job never writes its own copy.
       - name: Restore cargo & build artifacts
@@ -219,6 +230,12 @@ jobs:
 
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+      # Stabilizes the rust-cache key against the runner image's preinstalled
+      # Rust drifting between writer/reader jobs — see the `build` job's
+      # matching step for the full rationale (#133).
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -287,6 +304,16 @@ jobs:
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
     steps:
+      # Freed before the cache restore below (not just before the docker
+      # pulls) — restoring the shared rust-cache tarball onto an
+      # already-tight runner disk can itself ENOSPC. android + dotnet alone
+      # recover ~80% of the space the extra directories (ghc/ghcup/CodeQL/
+      # powershell/swift/jvm) and `docker image prune -af` used to reclaim
+      # here, for a fraction of the time — matching the minimal form the
+      # other jobs already use (#121), and matching their step order too.
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
       - uses: actions/checkout@v7
 
       # Downloaded after checkout, so its mtime is newer than the checked-out
@@ -301,6 +328,12 @@ jobs:
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
+      # Stabilizes the rust-cache key against the runner image's preinstalled
+      # Rust drifting between writer/reader jobs — see the `build` job's
+      # matching step for the full rationale (#133).
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
       # Read-only restore of the shared workspace cache to warm the host debug
       # build of the e2e test binary. save-if:false so this job doesn't prune
       # target/ (which would delete the .so downloaded into target/release/
@@ -311,90 +344,17 @@ jobs:
           shared-key: workspace-rlib
           save-if: "false"
 
-      # The standard runner's / has too little free space for the Exasol image
-      # + its cached tarball + MinIO/Iceberg-REST images + the DB's /exa data.
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
-            /usr/local/share/powershell /usr/share/swift /usr/lib/jvm || true
-          sudo docker image prune -af || true
-          echo "--- after cleanup ---"; df -h /
-
-      - name: Cache Exasol DB image
-        uses: actions/cache@v6
-        with:
-          path: /tmp/exasol-db.tar
-          key: exasol-db-${{ env.EXASOL_IMAGE_TAG }}
-
-      - name: Load or pull Exasol image
-        run: |
-          TAG="${{ env.EXASOL_IMAGE_TAG }}"
-          TAR=/tmp/exasol-db.tar
-          if [ -f "$TAR" ]; then
-            docker load -i "$TAR"
-          else
-            docker pull "exasol/docker-db:$TAG"
-            docker save "exasol/docker-db:$TAG" -o "$TAR"
-          fi
-
-      - name: Cache MinIO image
-        uses: actions/cache@v6
-        with:
-          path: /tmp/minio.tar
-          key: minio-${{ env.MINIO_IMAGE_TAG }}
-
-      - name: Load or pull MinIO image
-        run: |
-          TAG="${{ env.MINIO_IMAGE_TAG }}"
-          TAR=/tmp/minio.tar
-          if [ -f "$TAR" ]; then
-            docker load -i "$TAR"
-          else
-            docker pull "minio/minio:$TAG"
-            docker save "minio/minio:$TAG" -o "$TAR"
-          fi
-
-      - name: Cache Iceberg REST fixture image
-        uses: actions/cache@v6
-        with:
-          path: /tmp/iceberg-rest.tar
-          key: iceberg-rest-fixture-${{ env.ICEBERG_REST_IMAGE_TAG }}
-
-      - name: Load or pull Iceberg REST fixture image
-        run: |
-          TAG="${{ env.ICEBERG_REST_IMAGE_TAG }}"
-          TAR=/tmp/iceberg-rest.tar
-          if [ -f "$TAR" ]; then
-            docker load -i "$TAR"
-          else
-            docker pull "apache/iceberg-rest-fixture:$TAG"
-            docker save "apache/iceberg-rest-fixture:$TAG" -o "$TAR"
-          fi
-
-      # Only the base Spark image is cached here; the Iceberg Spark runtime +
-      # AWS bundle jars come from `--packages` (Ivy resolution) inside the
-      # spark-iceberg-fixtures container itself. That ~150 MB download is NOT
-      # cached — it is repeated on every stack bring-up (a container-local Ivy
-      # cache under /tmp, deliberately not volume-backed; see the rationale in
-      # scripts/spark-fixtures/run_fixtures.sh).
-      - name: Cache Spark image
-        uses: actions/cache@v6
-        with:
-          path: /tmp/spark.tar
-          key: spark-${{ env.SPARK_IMAGE_TAG }}
-
-      - name: Load or pull Spark image
-        run: |
-          TAG="${{ env.SPARK_IMAGE_TAG }}"
-          TAR=/tmp/spark.tar
-          if [ -f "$TAR" ]; then
-            docker load -i "$TAR"
-          else
-            docker pull "apache/spark:$TAG"
-            docker save "apache/spark:$TAG" -o "$TAR"
-          fi
+      # No tarball cache here (tried it, dropped it): restoring a GHA cache
+      # tarball and `docker load`-ing it is a wash against a direct registry
+      # pull — same order of magnitude either way — but caching forced these
+      # into per-image sequential steps. `docker compose pull` fetches every
+      # service's image (Exasol, MinIO, Iceberg REST, Spark, minio-init's mc)
+      # concurrently, so the pulls overlap instead of queueing one after another.
+      # --quiet: without it, compose interleaves a live-updating progress bar
+      # per image per layer, which flattens into a huge wall of duplicate
+      # lines in the non-interactive CI log. Errors and image names still print.
+      - name: Pull stack images
+        run: docker compose pull --quiet
 
       # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
       # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
