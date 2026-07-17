@@ -2216,6 +2216,41 @@ mod tests {
         );
     }
 
+    /// A `function_scalar_cast` over a side column in a join's select list
+    /// resolves through `extract_join_projection` to a `ProjectionItem::Expr`,
+    /// NOT the two-table full-row fallback (issue #136). `extract_join_projection`
+    /// reuses `project_columns` verbatim against the disjoint union of both
+    /// tables' columns, so the same dispatch fix that covers the single-table
+    /// row-scan path (`support.rs`) must also cover this join path.
+    #[test]
+    fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "varchar", "size": 2000000},
+                "arguments": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]
+            }
+        ]);
+
+        let detected = detected_join(&request);
+        let (projection, _types) =
+            extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
+
+        assert_eq!(
+            projection.len(),
+            1,
+            "a function_scalar_cast select-list item must not fall back to the two-table \
+             full base row: {projection:?}"
+        );
+        assert!(
+            matches!(projection[0], ProjectionItem::Expr { .. }),
+            "a rendered CAST expression must be an Expr projection item, not a bare Column: \
+             {projection:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Join SQL-shape and decline routing (tasks 3.4 / 3.5)
     // -----------------------------------------------------------------------

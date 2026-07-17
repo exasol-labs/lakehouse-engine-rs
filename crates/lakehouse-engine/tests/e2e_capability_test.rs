@@ -852,3 +852,84 @@ fn e2e_week_in_filter() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 8.13  CAST / EXTRACT / CASE together in the SELECT list (#136)
+// ---------------------------------------------------------------------------
+
+/// `CAST`, `EXTRACT`, and `CASE` in the SELECT list all push down together
+/// and return correct evaluated values, with no "Expected number of columns"
+/// error.
+///
+/// Regression test for #136: a CAST in a virtual-schema SELECT list broke
+/// pushdown with a column-count mismatch. The root cause was that
+/// `project_columns` (`crates/lakehouse-engine/src/adapter/pushdown/support.rs`)
+/// did not dispatch `function_scalar_cast` — nor, by the same gap,
+/// `function_scalar_extract` and `function_scalar_case` — into
+/// `render_expression_safe`, so a SELECT-list item using CAST/EXTRACT/CASE
+/// fell back to projecting the full base row instead of the single evaluated
+/// expression column, producing a column-count mismatch against the
+/// advertised select list (`query_columns` panics on any adapter error, so
+/// this test failing to run at all would itself reproduce #136). All three
+/// functions are selected together to prove the fix covers all three
+/// dispatch gaps, not only CAST.
+///
+/// Seed: id 1..20, event_date = 2024-01-01 + (id-1) days (all January 2024).
+/// For id <= 3:
+///   CAST(id AS VARCHAR(2000000)) = "1", "2", "3"
+///   EXTRACT(YEAR FROM event_date) = 2024 for every row
+///   CASE WHEN id > 10 THEN 'high' ELSE 'low' END = 'low' for every row (id <= 3)
+#[test]
+fn e2e_selectlist_cast_extract_case_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, CAST(id AS VARCHAR(2000000)), EXTRACT(YEAR FROM event_date), \
+         CASE WHEN id > 10 THEN 'high' ELSE 'low' END FROM {} WHERE id <= 3 ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        4,
+        "expected 4 columns (id, CAST(id), EXTRACT(YEAR), CASE): {cols:?}"
+    );
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
+
+    // Verify CAST(id AS VARCHAR(2000000)) for each id.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        let cast_str = cols[1][i].as_str().unwrap_or_else(|| {
+            panic!(
+                "CAST(id AS VARCHAR) at row {i} is not a string: {:?}",
+                cols[1][i]
+            )
+        });
+        assert_eq!(
+            cast_str,
+            id.to_string(),
+            "row {i}: CAST(id AS VARCHAR(2000000)) must be \"{id}\", got {cast_str}"
+        );
+    }
+
+    // Verify EXTRACT(YEAR FROM event_date) is 2024 for every row.
+    for (i, v) in cols[2].iter().enumerate() {
+        let year = parse_int(v);
+        assert_eq!(
+            year, 2024,
+            "row {i}: EXTRACT(YEAR FROM event_date) must be 2024, got {year}"
+        );
+    }
+
+    // Verify CASE WHEN id > 10 THEN 'high' ELSE 'low' END is 'low' for id <= 3.
+    for (i, v) in cols[3].iter().enumerate() {
+        let case_val = v
+            .as_str()
+            .unwrap_or_else(|| panic!("CASE result at row {i} is not a string: {v:?}"));
+        assert_eq!(
+            case_val, "low",
+            "row {i}: CASE WHEN id > 10 THEN 'high' ELSE 'low' END must be 'low' for id<=3, got {case_val}"
+        );
+    }
+}
