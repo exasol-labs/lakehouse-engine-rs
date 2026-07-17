@@ -228,7 +228,14 @@ run_timed_load() {  # label  target_table  sql
   if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
   cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
   rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
-  echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s" | tee -a "$REPORT"
+  # RAW_OBJECT_SIZE (bytes) from Exasol's own system view — same metric/methodology as
+  # import_ceiling.sh's run_timed_load, for a like-for-like MB/s comparison.
+  local schema="${tbl%%.*}" tblname="${tbl##*.}" raw_bytes mb mbps
+  raw_bytes=$(printf '%s' "SELECT RAW_OBJECT_SIZE FROM EXA_ALL_OBJECT_SIZES WHERE ROOT_NAME='${schema}' AND OBJECT_NAME='${tblname}'" \
+    | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
+  mb=$(awk "BEGIN{printf \"%.1f\", ${raw_bytes:-0}/1048576}")
+  mbps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.1f\", ${raw_bytes:-0}/1048576/${el}; else print \"n/a\"}")
+  echo "  $label: ${el}s  rows=${cnt}  throughput=${rps} rows/s  size=${mb}MB  throughput_mb=${mbps} MB/s" | tee -a "$REPORT"
 }
 
 echo "import-jdbc-trino benchmark — ${TRINO_HOST}:${TRINO_PORT} schema=${TRINO_SCHEMA} with_deletes=${WITH_DELETES} — $(date)" | tee -a "$REPORT"
