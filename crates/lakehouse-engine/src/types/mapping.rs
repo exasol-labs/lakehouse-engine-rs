@@ -213,6 +213,10 @@ pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String 
 /// Matches the Exasol mapping in [`iceberg_primitive_to_exasol`]: in-range
 /// Decimal128 maps to `Decimal128(p, s)`, out-of-range Decimal and types with no
 /// Arrow equivalent (Time, Fixed, Binary) map to `Utf8` (surfaced as JSON VARCHAR).
+///
+/// This is the logical Iceberg→Arrow mapping and is unaffected by physical
+/// Parquet INT96 decode coercion, which is a scan-layer concern (see
+/// `crates/lakehouse-engine/src/scan/`) — not this file.
 pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType {
     use arrow::datatypes::TimeUnit;
     use iceberg::spec::PrimitiveType::*;

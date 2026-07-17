@@ -38,6 +38,12 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
   object-storage import phase do not already overlap and that decoupling them yields a
   measured throughput gain. Until that evidence exists, the streaming discipline stays
   strictly fetch-one / emit / drop with no buffer.
+* The scan registers files through a custom `ParquetSource`-backed table provider (`PositionalDeleteScanTable`); it does not use iceberg-rust's own Arrow reader, so it does not inherit that reader's INT96 coercion.
+* INT96 is a legacy pre-Iceberg Parquet/Hive/Spark physical timestamp encoding absent from the Iceberg spec, whose Parquet mapping is INT64-only. Tolerating INT96 on read is a real-world-compatibility affordance for non-compliant writers, not a spec deviation.
+* Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping is owned by `datafusion-scan/type-mapping`; this feature owns only the physical Parquet decode configuration.
+* INT96 physically carries nanosecond precision (Julian day + nanoseconds-within-day). Coercing to `"us"` deliberately truncates any sub-microsecond digits — a named trade-off, consistent with Iceberg's microsecond `timestamp` model, which promises no sub-microsecond precision. The engine never claimed to preserve INT96's extra precision.
+* `coerce_int96_tz = "UTC"` makes the decoded batch's physical Arrow type `Timestamp(Microsecond, "UTC")` regardless of the Iceberg column type. For an Iceberg `timestamp` (WITHOUT time zone) column the field-id (production) path's logical schema is `Timestamp(Microsecond, None)`; the None-vs-UTC difference is reconciled at the EMITS-coercion step (see the scenario below), not only on the legacy inference path.
+* Consequence of the root-cause-only, no-clamp decision: a coerced value above Exasol's own `TIMESTAMP` maximum (year > 9999) still fails at the Exasol emit boundary with a `TIMESTAMP` range error. This fix removes the arrow-decode overflow for values through `9999-12-31`; it does not make year > 9999 values scannable.
 * See `datafusion-scan/scan-execution-memory-and-credentials` for pool sizing and
   decode-bound scenarios.
 * See `datafusion-scan/scan-execution-telemetry` for the phase-timing surface that
@@ -142,4 +148,13 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
 * *THEN* the UDF SHALL surface a clean error that identifies memory/resource exhaustion as the cause, and MUST NOT crash the UDF VM
 * *AND* the error-redaction path MUST NOT reclassify a `ResourcesExhausted` condition as an "assigned data could not be read" storage error
 * *AND* the surfaced error message MUST NOT contain any storage access key, secret key, or session token
+
+### Scenario: Out-of-range INT96 timestamp columns decode at microsecond resolution without overflow
+
+* *GIVEN* a scanned Iceberg Parquet data file whose Iceberg `timestamp` (WITHOUT time zone) column is physically encoded as Parquet INT96 (a legacy pre-Iceberg encoding outside the Iceberg-to-Parquet mapping), carrying a value outside the Arrow nanosecond range 1677-09-21 to 2262-04-11, such as `9999-12-31 23:59:59`
+* *WHEN* the scan UDF constructs its `ParquetFormat`s, registers the file, and scans it
+* *THEN* the UDF SHALL configure every `ParquetFormat` it constructs — both the decode-path provider and any legacy first-file schema inference — to coerce INT96 columns to microsecond resolution (`coerce_int96 = "us"`) with a UTC time zone (`coerce_int96_tz = "UTC"`)
+* *AND* the scan SHALL decode the out-of-range timestamp WITHOUT an i64 nanosecond-overflow error, and on the legacy inference path the inferred schema and the decoded batch SHALL agree on the timestamp column's Arrow type
+* *AND* on the field-id (production) path, where the logical schema maps the Iceberg `timestamp` column to `Timestamp(Microsecond, None)`, the decoded `Timestamp(Microsecond, "UTC")` batch SHALL be coerced to the Arrow type the declared EMITS ExaType requires before `emit_batch` — per `datafusion-scan/scan-execution / Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch` — so the None-vs-UTC difference between logical schema and decoded batch is reconciled at emit
+* *AND* the emitted timestamp SHALL equal the source instant at microsecond resolution — INT96's sub-microsecond digits are deliberately truncated, consistent with Iceberg's microsecond `timestamp` model — per the existing Arrow-`Timestamp`-to-Exasol-`TIMESTAMP` mapping
 
