@@ -304,6 +304,16 @@ jobs:
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
     steps:
+      # Freed before the cache restore below (not just before the docker
+      # pulls) — restoring the shared rust-cache tarball onto an
+      # already-tight runner disk can itself ENOSPC. android + dotnet alone
+      # recover ~80% of the space the extra directories (ghc/ghcup/CodeQL/
+      # powershell/swift/jvm) and `docker image prune -af` used to reclaim
+      # here, for a fraction of the time — matching the minimal form the
+      # other jobs already use (#121), and matching their step order too.
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
       - uses: actions/checkout@v7
 
       # Downloaded after checkout, so its mtime is newer than the checked-out
@@ -334,21 +344,17 @@ jobs:
           shared-key: workspace-rlib
           save-if: "false"
 
-      # android + dotnet alone recover ~80% of the space the extra directories
-      # (ghc/ghcup/CodeQL/powershell/swift/jvm) and `docker image prune -af`
-      # used to reclaim here, for a fraction of the time — matching the
-      # minimal form the other jobs already use (#121).
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       # No tarball cache here (tried it, dropped it): restoring a GHA cache
       # tarball and `docker load`-ing it is a wash against a direct registry
       # pull — same order of magnitude either way — but caching forced these
       # into per-image sequential steps. `docker compose pull` fetches every
       # service's image (Exasol, MinIO, Iceberg REST, Spark, minio-init's mc)
       # concurrently, so the pulls overlap instead of queueing one after another.
+      # --quiet: without it, compose interleaves a live-updating progress bar
+      # per image per layer, which flattens into a huge wall of duplicate
+      # lines in the non-interactive CI log. Errors and image names still print.
       - name: Pull stack images
-        run: docker compose pull
+        run: docker compose pull --quiet
 
       # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
       # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
