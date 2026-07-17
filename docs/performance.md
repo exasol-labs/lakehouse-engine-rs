@@ -251,3 +251,39 @@ corroborating the result.
 - **Native `IMPORT FROM PARQUET` reads raw Parquet directly** and applies no Iceberg position-deletes
   (same reason it is excluded from §b); it is included here only as a cluster-parallel scaling
   baseline, not as a like-for-like correctness-equivalent path to the VS.
+
+### MB/s and the CTAS use case (2-node re-run)
+
+Follow-up 2-node-only re-run (`test1`, 2× `r8i.2xlarge`, same sf=30 `lineitem`, 180M rows, 139
+bytes/row raw) on 2026-07-17, adding **MB/s** alongside rows/s. Data volume is Exasol's own
+per-table `RAW_OBJECT_SIZE` (`EXA_ALL_OBJECT_SIZES`, read right after each load — the same metric the
+license-cap error references), not an estimate. The headline is the **CTAS use case** — streaming a
+full table into Exasol, i.e. the practical "how fast can I get a large table in?" question —
+comparing the lakehouse-engine-rs VS CTAS against native `IMPORT FROM JDBC`; native
+`IMPORT FROM PARQUET` is kept as context.
+
+Averages over completed runs (3× each; VS run 3 excluded — see below):
+
+| Scan path | Runtime (s, avg) | rows/s (avg) | MB/s (avg) |
+|---|---|---|---|
+| **lakehouse-engine-rs VS (`SELECT *` CTAS, full 180M)** | **245.3** | **733,748** | **102.0** |
+| **Native `IMPORT FROM JDBC` (Trino, 1M rows)** | **16.46** | **60,769** | **8.47** |
+| Native `IMPORT FROM PARQUET` (full 180M) | 80.64 | 2,232,163 | 310.4 |
+
+Per-run figures: VS CTAS 244.77 s / 245.86 s (735,378 / 732,117 rows/s; 102.2 / 101.8 MB/s)
+([`import-ceiling-20260717-071349.txt`](../bench/reports/import-ceiling-20260717-071349.txt)). JDBC
+16.62 / 16.44 / 16.31 s (60,168 / 60,827 / 61,312 rows/s; 8.4 / 8.5 / 8.5 MB/s)
+([`import-jdbc-trino-20260717-072128.txt`](../bench/reports/import-jdbc-trino-20260717-072128.txt)).
+Native Parquet 81.50 / 80.39 / 80.04 s (2,208,569 / 2,239,064 / 2,248,855 rows/s; 307.1 / 311.3 /
+312.7 MB/s) — same report file as the VS runs.
+
+**VS CTAS ÷ native JDBC: ~12.1× on rows/s and ~12.0× on MB/s** — essentially identical, as expected:
+MB/s and rows/s are the same measurement scaled by the constant 139 bytes/row (same schema, same row
+width in both paths), so MB/s doesn't change the conclusion versus rows/s — it corroborates it with
+an absolute data-volume framing that's more intuitive for a "how fast can I stream a table in"
+question. **Verdict: for the CTAS use case the lakehouse-engine-rs VS streams a full table into
+Exasol ~12× faster than native `IMPORT FROM JDBC`**, in both rows/s and MB/s terms.
+
+VS CTAS run 3 hit the same `test1` license cap ("cumulative database raw sizes ... exceeded license
+limit", SQL state R0010) before completing (2 of 3 runs), consistent with the caveat above; the two
+completed runs agree to within 0.4%.
