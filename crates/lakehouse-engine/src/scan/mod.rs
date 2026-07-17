@@ -4283,7 +4283,12 @@ mod tests {
                 ),
             ]));
             let ctx = SessionContext::new();
-            let table = MemTable::try_new(schema, vec![vec![]]).unwrap();
+            let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
             ctx.register_table("scan_target", Arc::new(table)).unwrap();
 
             let mut spec = super::minimal_spec();
@@ -4302,6 +4307,10 @@ mod tests {
                 .await
                 .expect("plan scan SQL must not hit a duplicate projection name");
             let batches = df.collect().await.expect("collect");
+            assert!(
+                batches.iter().any(|b| b.num_rows() > 0),
+                "test must exercise at least one actual row"
+            );
             assert!(
                 batches
                     .iter()
