@@ -174,15 +174,26 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
         }
         "literal_date" => return Ok(Some(format!("DATE {}", quote_literal(value("value"))))),
         "literal_timestamp" => {
-            return Ok(Some(format!("TIMESTAMP {}", quote_literal(value("value")))));
+            // Render via arrow_cast at explicit microsecond precision: a bare
+            // `TIMESTAMP '...'` is typed Timestamp(Nanosecond) by DataFusion's SQL
+            // frontend, which overflows in simplify_expressions when unified with
+            // the scan's microsecond-typed columns on far-future values (#155).
+            return Ok(Some(format!(
+                "arrow_cast({}, 'Timestamp(Microsecond, None)')",
+                quote_literal(value("value"))
+            )));
         }
         "literal_timestamp_utc" => {
-            // Append +00:00 so DataFusion parses it as a UTC timestamp-with-timezone.
+            // Append +00:00 so the value parses as UTC, then render via arrow_cast
+            // at explicit microsecond precision (see literal_timestamp above).
             let raw = match value("value") {
                 None | Some(Json::Null) => return Ok(Some("NULL".into())),
                 Some(v) => json_scalar_to_string(v),
             };
-            return Ok(Some(format!("TIMESTAMP '{raw}+00:00'")));
+            let quoted = quote_literal(Some(&Json::String(format!("{raw}+00:00"))));
+            return Ok(Some(format!(
+                "arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"+00:00\"))')"
+            )));
         }
         "column" => {
             let name = value("name")
@@ -957,7 +968,21 @@ mod tests {
         let expr = json!({"type": "literal_timestamp", "value": "2024-01-15 12:00:00"});
         assert_eq!(
             render_expression(&expr).unwrap(),
-            "TIMESTAMP '2024-01-15 12:00:00'"
+            "arrow_cast('2024-01-15 12:00:00', 'Timestamp(Microsecond, None)')"
+        );
+    }
+
+    #[test]
+    fn renders_far_future_timestamp_literal() {
+        // Literal reproduction of issue #155's overflow scenario: a bare
+        // `TIMESTAMP '...'` form types as Timestamp(Nanosecond) and overflows on
+        // far-future values during simplify_expressions; arrow_cast pins
+        // microsecond precision so this renders cleanly. Optimizer behavior is
+        // covered by `timestamp_literal_precision_test` in `lakehouse-engine`.
+        let expr = json!({"type": "literal_timestamp", "value": "9999-12-31 23:59:59"});
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            "arrow_cast('9999-12-31 23:59:59', 'Timestamp(Microsecond, None)')"
         );
     }
 
@@ -1468,7 +1493,10 @@ mod tests {
     fn renders_timestamp_utc_literal() {
         let expr = json!({"type": "literal_timestamp_utc", "value": "2024-03-01 10:00:00"});
         let sql = render_expression(&expr).unwrap();
-        assert_eq!(sql, "TIMESTAMP '2024-03-01 10:00:00+00:00'");
+        assert_eq!(
+            sql,
+            "arrow_cast('2024-03-01 10:00:00+00:00', 'Timestamp(Microsecond, Some(\"+00:00\"))')"
+        );
     }
 
     // --- REGEXP_LIKE predicate and function_scalar ---
