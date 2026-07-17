@@ -1,5 +1,5 @@
 /// VS adapter logic: createVirtualSchema, getCapabilities, pushdown,
-/// refreshVirtualSchema, dropVirtualSchema.
+/// refresh, setProperties, dropVirtualSchema.
 ///
 /// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
 pub mod capabilities;
@@ -34,7 +34,7 @@ const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
 // Key written into the createVirtualSchema response under
 // schemaMetadata.adapterNotes (a stringified JSON object) so that subsequent
-// requests (pushdown, refresh) can read the resolved node count back from
+// requests (pushdown, refresh, setProperties) can read the resolved node count back from
 // `schemaMetadataInfo.adapterNotes`.
 //
 // adapterNotes is used rather than schemaMetadata.properties because Exasol
@@ -136,8 +136,13 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     match request.get("type").and_then(|t| t.as_str()) {
         Some("getCapabilities") => Ok(get_capabilities_response()),
         Some("createVirtualSchema") => handle_create_virtual_schema(ctx, request),
-        Some("refreshVirtualSchema") => {
+        Some("refresh") => {
             // Stateless: refresh = re-resolve schema, same as create.
+            handle_create_virtual_schema(ctx, request)
+        }
+        Some("setProperties") => {
+            // Stateless: setProperties = re-resolve schema with the new
+            // properties applied, same enumeration as create.
             handle_create_virtual_schema(ctx, request)
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
@@ -190,7 +195,14 @@ fn handle_create_virtual_schema(
     ctx: &mut dyn UdfContext,
     request: &Json,
 ) -> Result<Json, UdfError> {
-    let props = get_properties(request);
+    // `setProperties` must let the incoming ALTER ... SET values win over the
+    // persisted properties (and delete on an explicit null); every other request
+    // type keeps the pushdown-oriented persisted-wins precedence.
+    let props = if request.get("type").and_then(|t| t.as_str()) == Some("setProperties") {
+        merge_set_properties(request)
+    } else {
+        get_properties(request)
+    };
     let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
 
     let iceberg_namespace = str_prop(&props, PROP_ICEBERG_NAMESPACE)
@@ -287,17 +299,29 @@ fn handle_create_virtual_schema(
         "adapterNotes": adapter_notes,
     });
 
-    let response_type =
-        if request.get("type").and_then(|t| t.as_str()) == Some("createVirtualSchema") {
-            "createVirtualSchema"
-        } else {
-            "refreshVirtualSchema"
-        };
+    Ok(build_schema_response(request, schema_metadata))
+}
 
-    Ok(json!({
+/// Assemble the createVirtualSchema / refresh / setProperties response.
+///
+/// The response `type` mirrors the request `type` per the Exasol VS adapter
+/// protocol (`createVirtualSchema` | `refresh` | `setProperties`). When the
+/// request carries `requestedTables` (a partial-refresh subset) it is echoed
+/// back verbatim so Exasol applies the requested subset; it is omitted when the
+/// request did not include it.
+fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
+    let response_type = request
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("createVirtualSchema");
+    let mut response = json!({
         "type": response_type,
         "schemaMetadata": schema_metadata,
-    }))
+    });
+    if let Some(requested_tables) = request.get("requestedTables") {
+        response["requestedTables"] = requested_tables.clone();
+    }
+    response
 }
 
 async fn handle_pushdown_request(
@@ -387,6 +411,36 @@ fn get_properties(request: &Json) -> Json {
     {
         for (k, v) in props {
             merged.insert(k.clone(), v.clone());
+        }
+    }
+    Json::Object(merged)
+}
+
+/// Merge persisted and request properties for a `setProperties` request.
+///
+/// The persisted `schemaMetadataInfo.properties` are the base; the request
+/// `properties` override on conflict (request wins), and a request value of
+/// `null` unsets — removes — that property. This is the inverse precedence of
+/// [`get_properties`]: `setProperties` carries the incoming
+/// `ALTER VIRTUAL SCHEMA ... SET` values, which must take effect, and an
+/// explicit NULL must delete the property (so a required property that is
+/// null-unset then correctly fails the required-property check rather than
+/// silently retaining its old persisted value).
+fn merge_set_properties(request: &Json) -> Json {
+    let mut merged = match request
+        .get("schemaMetadataInfo")
+        .and_then(|smi| smi.get("properties"))
+    {
+        Some(Json::Object(m)) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(Json::Object(props)) = request.get("properties") {
+        for (k, v) in props {
+            if v.is_null() {
+                merged.remove(k);
+            } else {
+                merged.insert(k.clone(), v.clone());
+            }
         }
     }
     Json::Object(merged)
@@ -927,6 +981,173 @@ mod tests {
         assert!(err.to_string().contains("unsupported"));
     }
 
+    /// `refresh` and `setProperties` are recognised protocol types: dispatch
+    /// routes them into `handle_create_virtual_schema`, so they fail (if at all)
+    /// on connection resolution — never with the `unsupported VS request type`
+    /// error the dead `refreshVirtualSchema` arm used to produce.
+    #[test]
+    fn refresh_and_set_properties_dispatched_not_unsupported() {
+        for req_type in ["refresh", "setProperties"] {
+            let req = serde_json::json!({
+                "type": req_type,
+                "properties": { PROP_CATALOG_CONNECTION: "no_such_conn" },
+            });
+            let err = dispatch(&mut NoopCtx, &req)
+                .expect_err("no live catalog is available in a unit test");
+            assert!(
+                !err.to_string().contains("unsupported"),
+                "{req_type} must not be rejected as an unsupported request type, got: {err}"
+            );
+        }
+    }
+
+    /// The response `type` mirrors the request `type` for every enumeration
+    /// request type (Exasol VS protocol requirement).
+    #[test]
+    fn build_schema_response_type_mirrors_request() {
+        let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
+        for req_type in ["createVirtualSchema", "refresh", "setProperties"] {
+            let req = serde_json::json!({"type": req_type});
+            let resp = build_schema_response(&req, schema_metadata.clone());
+            assert_eq!(
+                resp["type"].as_str(),
+                Some(req_type),
+                "response type must equal request type"
+            );
+        }
+    }
+
+    /// `requestedTables` is echoed verbatim when the request carries it and is
+    /// absent from the response otherwise (pure pass-through).
+    #[test]
+    fn build_schema_response_echoes_requested_tables_present_and_absent() {
+        let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
+
+        let with = serde_json::json!({
+            "type": "refresh",
+            "requestedTables": ["T1", "T2"],
+        });
+        let resp = build_schema_response(&with, schema_metadata.clone());
+        assert_eq!(
+            resp["requestedTables"],
+            serde_json::json!(["T1", "T2"]),
+            "requestedTables must be echoed verbatim"
+        );
+
+        let without = serde_json::json!({"type": "refresh"});
+        let resp = build_schema_response(&without, schema_metadata);
+        assert!(
+            resp.get("requestedTables").is_none(),
+            "requestedTables must be omitted when the request did not include it"
+        );
+    }
+
+    /// `merge_set_properties`: request props win over persisted props, and an
+    /// explicit `null` in the request unsets (removes) the property — the
+    /// inverse precedence of `get_properties`.
+    #[test]
+    fn merge_set_properties_new_wins_and_null_unsets() {
+        let req = serde_json::json!({
+            "type": "setProperties",
+            "properties": {
+                "ICEBERG_NAMESPACE": "new_ns",
+                "ALLOW_HTTP": null,
+            },
+            "schemaMetadataInfo": {
+                "properties": {
+                    "ICEBERG_NAMESPACE": "old_ns",
+                    "ALLOW_HTTP": "true",
+                    "CATALOG_CONNECTION": "keep_me",
+                }
+            },
+        });
+        let merged = merge_set_properties(&req);
+
+        // Request value wins over the persisted value.
+        assert_eq!(str_prop(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
+        // A null request value removes the persisted property entirely.
+        assert!(
+            merged.get("ALLOW_HTTP").is_none(),
+            "a null request value must unset the property"
+        );
+        // A persisted property the request does not mention is retained.
+        assert_eq!(str_prop(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
+    }
+
+    // Stub UdfContext whose `connection()` resolves successfully, so a
+    // `setProperties` dispatch can pass connection resolution and reach the
+    // downstream required-property check instead of failing earlier on a
+    // missing/unresolvable CONNECTION.
+    struct ConnResolvingCtx;
+    impl UdfContext for ConnResolvingCtx {
+        fn num_columns(&self) -> usize {
+            0
+        }
+        fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
+            Err(UdfError::Type("none".into()))
+        }
+        fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
+            Ok(())
+        }
+        fn next(&mut self) -> Result<bool, UdfError> {
+            Ok(false)
+        }
+        fn connection(
+            &self,
+            _name: &str,
+        ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
+            Ok(exasol_udf_sdk::connect_back::ConnectionObject {
+                kind: "PASSWORD".into(),
+                address: "http://catalog.example.com".into(),
+                user: String::new(),
+                password: serde_json::json!({
+                    "warehouse": "wh",
+                    "endpoint": "http://s3.example.com",
+                    "region": "us-east-1",
+                    "access_key": "AKID",
+                    "secret_key": "SECRET",
+                })
+                .to_string(),
+            })
+        }
+    }
+
+    /// [human-requested, PR #153 review, adversarial-review finding A2] A
+    /// `setProperties` request that null-unsets a required property
+    /// (`ICEBERG_NAMESPACE`) must fail with the normal required-property
+    /// error — never a panic, and never a silent fallback to the stale
+    /// persisted value. `merge_set_properties` on its own only proves the key
+    /// is removed from the merged map; this drives the null-unset through the
+    /// real `setProperties` dispatch path so the removal is proven to reach
+    /// `handle_create_virtual_schema`'s required-property check end-to-end.
+    #[test]
+    fn set_properties_null_unset_required_property_errors_not_panic() {
+        let req = serde_json::json!({
+            "type": "setProperties",
+            "properties": {
+                "ICEBERG_NAMESPACE": null,
+            },
+            "schemaMetadataInfo": {
+                "properties": {
+                    "ICEBERG_NAMESPACE": "old_ns",
+                    "CATALOG_CONNECTION": "MY_CONN",
+                }
+            },
+        });
+
+        let err = dispatch(&mut ConnResolvingCtx, &req)
+            .expect_err("null-unsetting a required property must error, not succeed");
+
+        assert!(
+            err.to_string().contains(PROP_ICEBERG_NAMESPACE),
+            "expected the required-property error to name '{PROP_ICEBERG_NAMESPACE}', got: {err}"
+        );
+        assert!(
+            err.to_string().contains("is required"),
+            "expected handle_create_virtual_schema's normal required-property error, got: {err}"
+        );
+    }
+
     #[test]
     fn exasol_type_to_json_roundtrip() {
         let cases = [
@@ -1145,7 +1366,7 @@ mod tests {
     #[test]
     fn build_adapter_notes_merges_existing() {
         let req = serde_json::json!({
-            "type": "refreshVirtualSchema",
+            "type": "refresh",
             "schemaMetadataInfo": {
                 "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
             },
@@ -1176,6 +1397,68 @@ mod tests {
             parsed[NOTE_CLUSTER_NODES].as_str(),
             Some("3"),
             "CLUSTER_NODES must be updated to the freshly resolved value"
+        );
+    }
+
+    /// Refresh re-enumerates the namespace and passes the freshly resolved
+    /// `table_map` into `build_adapter_notes` on every call; TABLE_MAP must be
+    /// rebuilt from that fresh map (not merged with whatever was persisted
+    /// from the prior enumeration), while unrelated adapterNotes keys survive
+    /// the rewrite untouched.
+    #[test]
+    fn refresh_rebuilds_table_map_preserves_notes() {
+        let req = serde_json::json!({
+            "type": "refresh",
+            "schemaMetadataInfo": {
+                "adapterNotes": serde_json::json!({
+                    "OTHER_KEY": "keep-me",
+                    "TABLE_MAP": {"OLD_TABLE": "ns.old_table"},
+                })
+                .to_string(),
+            },
+        });
+
+        let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
+        let notes = build_adapter_notes(
+            &req,
+            1,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            &fresh_table_map,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+
+        assert_eq!(
+            parsed["OTHER_KEY"].as_str(),
+            Some("keep-me"),
+            "an unrelated adapterNotes key must survive a refresh's TABLE_MAP rebuild"
+        );
+
+        let table_map = parsed[NOTE_TABLE_MAP]
+            .as_object()
+            .expect("TABLE_MAP must be an object");
+        assert_eq!(
+            table_map.len(),
+            1,
+            "TABLE_MAP must be rebuilt from the fresh enumeration, not merged with the stale one"
+        );
+        assert_eq!(
+            table_map.get("NEW_TABLE").and_then(|v| v.as_str()),
+            Some("ns.new_table"),
+            "the freshly resolved table must appear in the rebuilt TABLE_MAP"
+        );
+        assert!(
+            table_map.get("OLD_TABLE").is_none(),
+            "the stale TABLE_MAP entry must not survive a refresh rebuild"
         );
     }
 
@@ -2135,7 +2418,7 @@ mod tests {
     #[test]
     fn table_map_merges_with_existing_notes() {
         let req = serde_json::json!({
-            "type": "refreshVirtualSchema",
+            "type": "refresh",
             "schemaMetadataInfo": {
                 "adapterNotes": "{\"CLUSTER_NODES\":\"5\",\"OTHER\":\"preserved\"}"
             },

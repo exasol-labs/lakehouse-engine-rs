@@ -40,7 +40,8 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 
 * *GIVEN* a virtual schema created over an Iceberg namespace reachable through its CONNECTION
 * *WHEN* Exasol sends a `refresh` request that carries a `requestedTables` array (a partial `ALTER VIRTUAL SCHEMA ... REFRESH TABLES ...`)
-* *THEN* the adapter SHALL echo the same `requestedTables` array in the response so Exasol applies the refresh to exactly the requested tables
+* *THEN* the adapter SHALL echo the same `requestedTables` array in the response because the protocol requires a well-formed response of type `refresh` to mirror the fields of the request it answers
+* *AND* the adapter MUST NOT be relied upon to scope the resulting refresh to the echoed `requestedTables` — verified against the live engine, Exasol applies the adapter's full `schemaMetadata.tables` response to the whole namespace regardless of `requestedTables`, so a partial `REFRESH TABLES <t>` has the same real-world effect as a full `REFRESH`
 * *AND* when the request carries no `requestedTables`, the response SHALL omit `requestedTables` so Exasol applies a full refresh
 
 ### Scenario: Set properties overrides persisted properties and re-enumerates
