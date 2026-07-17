@@ -21,6 +21,7 @@ use crate::types::mapping::needs_json_fallback;
 use arrow::array::{Array, ListArray};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use datafusion::common::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
@@ -1486,6 +1487,31 @@ async fn build_dataframe(
 /// `scan_target` before asking [`build_raw_scan_physical_plan`] for the committed
 /// pipeline — the built-in `SessionContext::register_parquet` shortcut never
 /// attaches an access plan and so cannot exercise the delete-carrying path.
+/// Time unit INT96 timestamps are coerced to: microseconds. Matches Iceberg's own
+/// readers, which always read the legacy INT96 physical type as microseconds.
+const INT96_COERCE_TIME_UNIT: &str = "us";
+/// Timezone applied to coerced INT96 timestamps: an INT96 instant is UTC.
+const INT96_COERCE_TZ: &str = "UTC";
+
+/// The [`ParquetFormat`] every scan data-file read uses, coercing Parquet INT96
+/// timestamps to microsecond resolution as UTC instants (`coerce_int96 = "us"`,
+/// `coerce_int96_tz = "UTC"`).
+///
+/// arrow-rs otherwise decodes INT96 as `Timestamp(Nanosecond)`, whose i64 range
+/// (1677..=2262) overflows on the far-future values legacy writers such as
+/// Fivetran emit — the plain-`SELECT *` overflow of issue #143. This is the
+/// single source of truth for that coercion so the schema-inference site
+/// ([`register_file_list`]) and the decode site
+/// ([`crate::scan::positional_deletes::PositionalDeleteScanTable`]) cannot drift:
+/// a divergence between inferred `Timestamp(Nanosecond)` and decoded
+/// `Timestamp(Microsecond)` would be a schema mismatch.
+pub fn int96_coerced_parquet_format() -> ParquetFormat {
+    let mut options = TableParquetOptions::default();
+    options.global.coerce_int96 = Some(INT96_COERCE_TIME_UNIT.to_string());
+    options.global.coerce_int96_tz = Some(INT96_COERCE_TZ.to_string());
+    ParquetFormat::default().with_options(options)
+}
+
 pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,
@@ -1566,7 +1592,7 @@ async fn register_file_list(
     let table_schema = if use_field_id_adapter {
         build_logical_arrow_schema(logical_schema)
     } else {
-        let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        let listing_options = ListingOptions::new(Arc::new(int96_coerced_parquet_format()))
             .with_file_extension(".parquet")
             .with_collect_stat(false);
         let first_url = ListingTableUrl::parse(&first_abs)
@@ -2224,6 +2250,31 @@ mod tests {
     use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, StorageProps};
     use datafusion::execution::memory_pool::MemoryLimit;
     use object_store::ClientConfigKey;
+
+    // ---------------------------------------------------------------------------
+    // int96_coerced_parquet_format — no-drift regression guard for task 3.1
+    // ---------------------------------------------------------------------------
+
+    /// Both INT96 call sites (`positional_deletes.rs`'s decode path and this
+    /// module's legacy schema-inference branch) build their `ParquetFormat` via
+    /// the SAME shared [`int96_coerced_parquet_format`] helper, so asserting the
+    /// helper's own output once is sufficient to guard against the two sites
+    /// drifting apart (a divergence between inferred and decoded time units would
+    /// be a schema mismatch).
+    #[test]
+    fn both_parquet_format_sites_coerce_int96_us_utc() {
+        let format = int96_coerced_parquet_format();
+        assert_eq!(
+            format.coerce_int96(),
+            Some("us".to_string()),
+            "coerce_int96 must coerce INT96 timestamps to microsecond resolution"
+        );
+        assert_eq!(
+            format.options().global.coerce_int96_tz,
+            Some("UTC".to_string()),
+            "coerce_int96_tz must treat coerced INT96 instants as UTC"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // build_session_context memory pool sizing — seam tests for task 1.3

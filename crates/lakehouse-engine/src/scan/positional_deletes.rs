@@ -23,7 +23,9 @@
 //! `FieldIdExprAdapter`.
 
 use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageProps};
-use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
+use crate::scan::{
+    FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
+};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -499,7 +501,7 @@ impl PositionalDeleteScanTable {
             files,
             table_root,
             secrets,
-            format: Arc::new(ParquetFormat::default()),
+            format: Arc::new(int96_coerced_parquet_format()),
         }
     }
 
