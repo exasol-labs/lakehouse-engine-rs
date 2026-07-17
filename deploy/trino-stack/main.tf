@@ -28,6 +28,10 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+data "aws_vpc" "this" {
+  id = local.vpc_id
+}
+
 # --- Security group ---------------------------------------------------------
 resource "aws_security_group" "trino" {
   name        = "${local.prefix}-sg"
@@ -37,7 +41,7 @@ resource "aws_security_group" "trino" {
 }
 
 resource "aws_security_group_rule" "ingress" {
-  for_each          = toset(["22", "8080"]) # SSH, Trino UI/API
+  for_each          = toset(["22"]) # SSH: operator allowlist only
   type              = "ingress"
   from_port         = tonumber(each.value)
   to_port           = tonumber(each.value)
@@ -45,6 +49,21 @@ resource "aws_security_group_rule" "ingress" {
   cidr_blocks       = local.effective_cidrs
   security_group_id = aws_security_group.trino.id
   description       = "port ${each.value} from allowlist"
+}
+
+# 8080 (Trino UI/API) additionally needs the whole VPC CIDR, not just the operator's IP: Exasol's
+# IMPORT FROM JDBC executes the JDBC connection FROM the Exasol cluster nodes (test1, same VPC/
+# subnet as this stack), not from the operator's machine. Without this, every IMPORT FROM JDBC
+# query times out at the SG (ETL-5402 "Error fetching next") since the coordinator never receives
+# Exasol's TCP handshake — live-verified running bench/import_jdbc_trino.sh against test1.
+resource "aws_security_group_rule" "ingress_trino_port" {
+  type              = "ingress"
+  from_port         = 8080
+  to_port           = 8080
+  protocol          = "tcp"
+  cidr_blocks       = concat(local.effective_cidrs, [data.aws_vpc.this.cidr_block])
+  security_group_id = aws_security_group.trino.id
+  description       = "port 8080 from allowlist + VPC (Exasol IMPORT FROM JDBC)"
 }
 
 resource "aws_security_group_rule" "internode" {
