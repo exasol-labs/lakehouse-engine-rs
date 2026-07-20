@@ -22,9 +22,12 @@ defines and the engine's existing column-typing decisions already establish.
 
 Render both literals through DataFusion's `arrow_cast(<value>, <arrow-type-string>)`:
 `literal_timestamp` → `arrow_cast('<value>', 'Timestamp(Microsecond, None)')`;
-`literal_timestamp_utc` → `arrow_cast('<value>', 'Timestamp(Microsecond, Some("+00:00"))')`.
-Timestamp literals never use the bare `TIMESTAMP '…'` form again, and the literal value is
-single-quoted and escaped exactly as a string literal.
+`literal_timestamp_utc` → `arrow_cast('<value>+00:00', 'Timestamp(Microsecond, Some("UTC"))')` — the
+value string still carries a literal `+00:00` offset so it parses as UTC, but the cast's tz label
+is `"UTC"` (not `"+00:00"`) to match the scan's `Timestamptz` Arrow mapping (`types/mapping.rs`)
+and avoid a tz-label mismatch during type unification. Timestamp literals never use the bare
+`TIMESTAMP '…'` form again, and the literal value is single-quoted and escaped exactly as a
+string literal.
 
 ### Options Considered
 
