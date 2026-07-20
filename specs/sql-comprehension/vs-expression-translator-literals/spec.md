@@ -25,7 +25,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   `literal_null` → `NULL`;
   `literal_date` → `DATE 'YYYY-MM-DD'`;
   `literal_timestamp` → `arrow_cast('YYYY-MM-DD HH:MI:SS', 'Timestamp(Microsecond, None)')`;
-  `literal_timestamp_utc` → `arrow_cast('YYYY-MM-DD HH:MI:SS', 'Timestamp(Microsecond, Some("+00:00"))')`
+  `literal_timestamp_utc` → `arrow_cast('YYYY-MM-DD HH:MI:SS+00:00', 'Timestamp(Microsecond, Some("UTC"))')`
 * *AND* both timestamp forms SHALL carry an explicit `Timestamp(Microsecond, …)` target type — never the bare `TIMESTAMP '…'` form, which DataFusion's SQL frontend parses as `Timestamp(Nanosecond)` by default
 * *AND* the translator SHALL single-quote the timestamp value and escape internal single-quotes by doubling, exactly as for `literal_string`, so no literal value produces an SQL injection vector
 

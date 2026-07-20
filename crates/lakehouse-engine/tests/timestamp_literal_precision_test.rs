@@ -126,8 +126,8 @@ async fn far_future_timestamp_literal_does_not_overflow_simplify_expressions() {
     );
 
     // literal_timestamp_utc vs the Timestamp(Microsecond, Some(\"UTC\")) column.
-    // The literal carries the +00:00 tz label while the column carries UTC; both
-    // stay microsecond, so the comparison type-checks and cannot overflow.
+    // Both now carry the same UTC tz label and stay microsecond, so the
+    // comparison type-checks and cannot overflow.
     let tstz_predicate = format!("SELECT tstz FROM scan_target WHERE tstz < {tstz_literal}");
     let tstz_case = format!(
         "SELECT CASE WHEN tstz < {tstz_literal} THEN tstz ELSE {tstz_literal} END AS clamped \
