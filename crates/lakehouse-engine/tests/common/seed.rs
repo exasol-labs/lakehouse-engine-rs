@@ -2178,7 +2178,7 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
 /// is the generic schema-evolution primitive behind both the column-rename repro
 /// (`seed_renamed_column`) and the add-columns initial-default fixture
 /// (`seed_added_columns_initial_default`).
-async fn rest_replace_current_schema(
+pub async fn rest_replace_current_schema(
     catalog_url: &str,
     namespace: &str,
     table_name: &str,
