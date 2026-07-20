@@ -185,14 +185,17 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
         }
         "literal_timestamp_utc" => {
             // Append +00:00 so the value parses as UTC, then render via arrow_cast
-            // at explicit microsecond precision (see literal_timestamp above).
+            // at explicit microsecond precision (see literal_timestamp above). The
+            // cast target tz label is "UTC" (not "+00:00") to match the scan's
+            // Timestamptz Arrow mapping (types/mapping.rs) and avoid a tz-label
+            // mismatch during DataFusion type unification.
             let raw = match value("value") {
                 None | Some(Json::Null) => return Ok(Some("NULL".into())),
                 Some(v) => json_scalar_to_string(v),
             };
             let quoted = quote_literal(Some(&Json::String(format!("{raw}+00:00"))));
             return Ok(Some(format!(
-                "arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"+00:00\"))')"
+                "arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
             )));
         }
         "column" => {
@@ -1495,7 +1498,7 @@ mod tests {
         let sql = render_expression(&expr).unwrap();
         assert_eq!(
             sql,
-            "arrow_cast('2024-03-01 10:00:00+00:00', 'Timestamp(Microsecond, Some(\"+00:00\"))')"
+            "arrow_cast('2024-03-01 10:00:00+00:00', 'Timestamp(Microsecond, Some(\"UTC\"))')"
         );
     }
 
