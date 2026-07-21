@@ -240,12 +240,13 @@ leaves `CONVERT_TZ` supportable.
     type data exists today, but the shared `vs-expression` translator crate is not wired to receive
     it and cannot infer the type of an arbitrary, possibly non-column argument expression; an
     analogous `dataType` annotation threaded into the translator would let the arm branch).
-  - **`ADD_YEARS` → moved to Deferred.** Its leap-day clamp (`ADD_YEARS(DATE '2000-02-29', 1)` →
-    `2001-02-28`, verified on Exasol 2025.1.3) is calendar arithmetic that only interval-year
-    addition reproduces, and runtime-scaled interval addition hits the same arrow-rs#9030 rejection;
-    epoch-second arithmetic (a fixed `365.25`-day year) is not calendar-correct. Its return type is
-    also input-type-dependent like `ADD_DAYS`. No DataFusion 54.0.0 rendering is both execution-safe
-    and calendar-correct, so — per the same defer-honestly precedent as `ADD_MONTHS` — it is deferred.
+  - **`ADD_YEARS` → moved to Deferred.** The initial reason (leap clamp needs interval-year addition,
+    which hits arrow-rs#9030) was corrected — see the follow-up finding
+    `[plan-review] ADD_YEARS defers on month-end stickiness, not the interval-multiply gap`. The
+    accurate reason: Exasol applies month-end stickiness that no execution-safe DataFusion 54.0.0
+    rendering reproduces, the same divergence class as `ADD_MONTHS`. Its return type is also
+    input-type-dependent like `ADD_DAYS`. Deferred per the same defer-honestly precedent as
+    `ADD_MONTHS`.
   - Supported count updated from nine to **six** (`ADD_HOURS`, `ADD_MINUTES`, `DAYS_BETWEEN`,
     `HOURS_BETWEEN`, `MINUTES_BETWEEN`, `SECONDS_BETWEEN`); deferred count updated to **nine**
     (adds `ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`). Supersedes Design Decisions [1] (count) and [2]
@@ -282,4 +283,38 @@ leaves `CONVERT_TZ` supportable.
   now names the version caveat alongside the session-parameter dependency, so a future revisit checks
   the function exists on the target Exasol version before treating it as only a session-parameter
   problem. (No spec/plan wording change beyond this log entry; the function was already fall-through.)
+- **Promotes to ADR:** no
+
+### [plan-review] ADD_YEARS defers on month-end stickiness, not the interval-multiply gap
+
+- **Finding (BLOCKER):** An independent verification pass — every candidate rendering re-checked
+  against pinned-tag Arrow 58.3.0 / DataFusion 54.0.0 source and against live Exasol 2025.1.3 —
+  found the recorded `ADD_YEARS` deferral reason technically wrong and misleading. The prior reason
+  claimed leap-day clamping "only interval-year addition reproduces, and runtime-scaled interval
+  addition hits arrow-rs#9030." Two facts refute this: (a) a year-interval builds WITHOUT any runtime
+  multiply via `arrow_cast(<months_int>, 'Interval(YearMonth)')` — Arrow 58 permits
+  `Int32 → Interval(YearMonth)` (`arrow-cast/src/cast/mod.rs`, `can_cast_types`), so arrow-rs#9030
+  never applies to this path; (b) `Date`/`Timestamp` + `Interval(YearMonth)` addition IS implemented
+  and clamps the leap case correctly (`arrow-array/src/types.rs` `add_year_months` via chrono
+  `add_months_datetime`; `arrow-arith/src/numeric.rs`), so `ADD_YEARS(DATE '2000-02-29', 1)` →
+  `2001-02-28` is reproducible and execution-safe. The stated blocker (arrow-rs#9030) is therefore
+  false. Left uncorrected, a future planner could re-attempt `ADD_YEARS` once arrow-rs#9030 closes
+  and ship a rendering that is still wrong.
+- **Direction change:** Corrected the `ADD_YEARS` reason across `plan.md` (Consequences and
+  disposition table), `spec.md` (Background), and the prior interval-multiply finding to the verified
+  root cause: Exasol applies **month-end stickiness**, the same divergence class as `ADD_MONTHS`.
+  `ADD_YEARS(DATE '2001-02-28', 3)` returns `2004-02-29` on live Exasol 2025.1.3 (a last-day-of-month
+  argument maps to the last day of the target month), whereas Arrow's `Interval(YearMonth)` add keeps
+  the day-of-month and yields `2004-02-28`. No execution-safe DataFusion 54.0.0 rendering reproduces
+  this stickiness; the return type is also input-type-dependent like `ADD_DAYS`. `ADD_YEARS` stays
+  Deferred (disposition and count unchanged) on the same defer-honestly precedent as `ADD_MONTHS`.
+- **Verification note:** The pass also re-confirmed, at tag 54.0.0 and against live Exasol 2025.1.3,
+  every other disposition already recorded: the interval-multiply defect
+  (`type_coercion/binary.rs` coerces `Integer × Interval` to `Interval(MonthDayNano) ×
+  Interval(MonthDayNano)`); `DATE − DATE → Int64`; `date_part('epoch', …) → Float64`; the three
+  `arrow_cast` casts the `ADD_HOURS`/`ADD_MINUTES` microsecond-domain rendering depends on
+  (`Date32 → Timestamp(µs)`, `Timestamp → Int64` exact reinterpret, `Int64 → Timestamp`); ROUND as
+  round-half-away-from-zero; `ADD_DAYS`/`ADD_WEEKS` input-type-dependent return types
+  (`ADD_DAYS(DATE '2024-01-01', 5)` → DATE `2024-01-06`); the fractional/negative `*_BETWEEN` values;
+  and `DAYOFWEEK` absent on the target version (SQL code 42000). No other disposition changed.
 - **Promotes to ADR:** no
