@@ -338,6 +338,18 @@ pub async fn run_join_scan_with_session(
     Ok(())
 }
 
+/// One shared instance-level bound on concurrent delete-file reads, sized from
+/// THIS invocation's connection-concurrency budget (never at process scope — it
+/// depends on the per-call `s3_max_connections`).
+///
+/// Clamped to at least 1: `s3_max_connections` is normally clamped upstream, but
+/// a syntactically valid `ScanSpec` JSON (e.g. hand-crafted or malformed) can
+/// still carry an explicit `0`, and `Semaphore::new(0)` would deadlock every
+/// delete-file read rather than degrade gracefully.
+fn delete_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(spec.s3_max_connections.max(1)))
+}
+
 /// Register both sides of a broadcast join into one session: the sharded fact file
 /// list and the full dimension file list, each via [`register_file_list`].
 ///
@@ -365,7 +377,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
     // sides' registration: DataFusion plans a broadcast join's two scan leaves
     // concurrently, so a per-side semaphore would allow up to 2N concurrent
     // delete reads instead of the intended N.
-    let delete_read_limiter = Arc::new(Semaphore::new(spec.s3_max_connections));
+    let delete_read_limiter = delete_read_limiter(spec);
     register_file_list(
         ctx,
         JOIN_FACT_TABLE,
@@ -1526,10 +1538,7 @@ pub async fn register_files(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
-    // One shared instance-level bound on concurrent delete-file reads, sized
-    // from THIS invocation's connection-concurrency budget (never at process
-    // scope — it depends on the per-call `s3_max_connections`).
-    let delete_read_limiter = Arc::new(Semaphore::new(spec.s3_max_connections));
+    let delete_read_limiter = delete_read_limiter(spec);
     register_file_list(
         ctx,
         table_name,
@@ -2354,6 +2363,15 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         }
+    }
+
+    /// A malformed/hand-crafted `ScanSpec` with `s3_max_connections: 0` must not
+    /// deadlock every delete-file read via `Semaphore::new(0)`.
+    #[test]
+    fn delete_read_limiter_clamps_zero_connections_to_one() {
+        let mut spec = minimal_spec();
+        spec.s3_max_connections = 0;
+        assert_eq!(delete_read_limiter(&spec).available_permits(), 1);
     }
 
     /// A positive memory limit causes the DataFusion pool to be sized at fraction × (limit − overhead).
