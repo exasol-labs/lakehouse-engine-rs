@@ -1008,17 +1008,19 @@ fn exasol_type_to_json(exasol_type: &str) -> Json {
 /// HTTP status, or a transport/parse failure — returns `false` so enumeration
 /// aborts loudly, preserving the unreachable-catalog contract.
 ///
-/// Matching is `starts_with` (not `contains`) against the code-authored status
-/// prefix: a non-404 response whose redacted body merely contains the substring
-/// `404` must not false-match, and HTTP status codes are three digits so the
-/// prefix cannot collide with a longer code. Only `UdfError::User` can carry
-/// this message; the other `UdfError` variants are never produced by the
+/// Matching is `starts_with` (not `contains`) against the full pinned prefix
+/// `catalog returned HTTP 404: `, including the `": "` separator that always
+/// follows the status code in the emitted message: a non-404 response whose
+/// redacted body merely contains the substring `404` must not false-match, and
+/// the trailing separator ensures a differently-formatted reuse of `HTTP 404`
+/// elsewhere cannot accidentally satisfy this prefix. Only `UdfError::User` can
+/// carry this message; the other `UdfError` variants are never produced by the
 /// catalog error site, so they classify as `false`. `redact_error` preserves
 /// this prefix — it strips only secret/credential substrings from the message
 /// body, never the leading literal — so classification is unaffected by the
 /// redaction the caller applies before propagating the error.
 fn is_table_not_found(err: &UdfError) -> bool {
-    matches!(err, UdfError::User(msg) if msg.starts_with("catalog returned HTTP 404"))
+    matches!(err, UdfError::User(msg) if msg.starts_with("catalog returned HTTP 404: "))
 }
 
 /// Redact credential values from a UdfError message.
@@ -1079,6 +1081,17 @@ mod tests {
                 "catalog returned HTTP 500: upstream said error 404 in its body".into()
             )),
             "a 404 substring inside a non-404 error body must not false-match"
+        );
+
+        // The prefix must include the ": " separator that always follows the
+        // status code — a message that merely starts with the digits "404"
+        // but lacks the separator (e.g. a differently-formatted reuse of
+        // "HTTP 404" elsewhere) must not false-match.
+        assert!(
+            !is_table_not_found(&UdfError::User(
+                "catalog returned HTTP 404 Not Found".into()
+            )),
+            "the prefix match requires the ': ' separator, not just the status digits"
         );
 
         // Transport/parse failures (the other error sites in authed_get_json)
