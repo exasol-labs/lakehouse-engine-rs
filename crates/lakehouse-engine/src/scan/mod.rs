@@ -45,6 +45,7 @@ use object_store::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use url::Url;
 
 /// Bounded grace period for draining background async work at runtime teardown.
@@ -359,6 +360,12 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
     // dimension side carries its own table_root, file list, logical schema, and
     // per-file positional deletes, which register_file_list applies to the
     // dimension registration exactly as it does for the fact side.
+    //
+    // ONE shared delete-read semaphore for this invocation, cloned into BOTH
+    // sides' registration: DataFusion plans a broadcast join's two scan leaves
+    // concurrently, so a per-side semaphore would allow up to 2N concurrent
+    // delete reads instead of the intended N.
+    let delete_read_limiter = Arc::new(Semaphore::new(spec.s3_max_connections));
     register_file_list(
         ctx,
         JOIN_FACT_TABLE,
@@ -367,6 +374,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.logical_schema,
         &spec.name_mapping,
         &spec.storage,
+        Arc::clone(&delete_read_limiter),
     )
     .await?;
     register_file_list(
@@ -377,6 +385,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.logical_schema,
         &join.name_mapping,
         &spec.storage,
+        delete_read_limiter,
     )
     .await?;
     Ok(())
@@ -1517,6 +1526,10 @@ pub async fn register_files(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
+    // One shared instance-level bound on concurrent delete-file reads, sized
+    // from THIS invocation's connection-concurrency budget (never at process
+    // scope — it depends on the per-call `s3_max_connections`).
+    let delete_read_limiter = Arc::new(Semaphore::new(spec.s3_max_connections));
     register_file_list(
         ctx,
         table_name,
@@ -1525,6 +1538,7 @@ pub async fn register_files(
         &spec.logical_schema,
         &spec.name_mapping,
         &spec.storage,
+        delete_read_limiter,
     )
     .await
 }
@@ -1551,6 +1565,14 @@ pub async fn register_files(
 /// deletes — exactly as the single-table raw-scan path does — so a join over a
 /// table with merge-on-read deletes joins on post-delete rows on both sides,
 /// never silently reintroducing deleted rows through the join path.
+///
+/// `delete_read_limiter` is the shared instance-level semaphore bounding
+/// concurrent delete-file reads for this scan invocation; callers construct it
+/// ONCE per invocation and pass the SAME `Arc` to every `register_file_list`
+/// call for that invocation (including both sides of a join), so the whole
+/// instance stays within one N-permit budget rather than each side getting
+/// its own.
+#[allow(clippy::too_many_arguments)]
 async fn register_file_list(
     ctx: &SessionContext,
     table_name: &str,
@@ -1559,6 +1581,7 @@ async fn register_file_list(
     logical_schema: &[crate::scan::spec::LogicalField],
     name_mapping: &[NameMappingEntry],
     storage: &crate::scan::spec::StorageProps,
+    delete_read_limiter: Arc<Semaphore>,
 ) -> Result<(), UdfError> {
     let first = files.first().ok_or_else(|| {
         UdfError::User(format!(
@@ -1621,6 +1644,7 @@ async fn register_file_list(
         files.to_vec(),
         table_root.to_string(),
         storage,
+        delete_read_limiter,
     );
 
     ctx.register_table(table_name, Arc::new(table))
