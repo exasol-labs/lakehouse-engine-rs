@@ -13,6 +13,10 @@ can merge into the final query result.
   merge UDF for `COUNT(DISTINCT)`.
 * The same file-assignment, filter, and pushdown rules from `datafusion-scan/scan-execution`
   apply on the partial-aggregate path.
+* The partial-aggregate path registers the full logical table schema and builds its
+  DataFusion query from the `aggregates` field. It does not consult the scan spec's
+  `projection` field; DataFusion's own projection pushdown derives the physical column
+  set from the partial-aggregate query text.
 * Only SDK Value types cross the `.so` boundary; no Arrow types.
 * See `datafusion-scan/scan-execution` for the base raw-row scan scenarios and emit model.
 * See `datafusion-scan/scan-execution-grouped-agg` for grouped partial-aggregate
@@ -69,3 +73,11 @@ can merge into the final query result.
 * *THEN* the UDF SHALL stop and return a clean bounded-resource error identifying the offending column and the cap that was exceeded, consistent with the engine's `ResourcesExhausted` bounded-execution convention
 * *AND* the UDF MUST NOT emit a truncated distinct set (which would produce a wrong merged count)
 * *AND* the error message MUST NOT contain any credential value
+
+### Scenario: Partial aggregate physically reads only the aggregate-referenced columns
+
+* *GIVEN* a single-group partial-aggregate scan over a multi-column Parquet file whose aggregates reference a strict subset of the columns (e.g. `SUM(score)` over a table of `id`, `score`, `name`)
+* *AND* a scan spec whose `projection` field is empty
+* *WHEN* the scan UDF builds the DataFusion physical plan for the partial aggregate
+* *THEN* the physical Parquet scan SHALL project ONLY the columns referenced by the aggregates, never the full column set
+* *AND* the empty `projection` field SHALL NOT cause a full-column read, because DataFusion derives the physical projection from the partial-aggregate query text rather than from the scan spec's `projection` field
