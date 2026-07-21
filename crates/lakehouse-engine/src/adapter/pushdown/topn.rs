@@ -175,12 +175,11 @@ pub(super) fn detect_topn(
 #[cfg(test)]
 mod tests {
     use super::super::support::{
-        DISTINCT_MERGE_UDF_NAME, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types,
-        build_scan_driving_sql, extract_all_column_types, extract_projection, order_by_present,
-        shard_count,
+        DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, build_scan_driving_sql,
+        extract_all_column_types, extract_projection, order_by_present, shard_count,
     };
     use super::super::test_support::*;
-    use super::super::{detect_aggregates, validate_agg_col_types};
+    use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
     use super::*;
     use crate::scan::spec::{FileEntry, ScanSpec, render_order_by_clause};
     use vs_expression::render_df_filter_safe;
@@ -207,8 +206,9 @@ mod tests {
         let has_order_by = order_by_present(&pushdown_req);
         let col_types = extract_all_column_types(request);
 
-        let aggregates = detect_aggregates(&pushdown_req)
-            .filter(|plans| validate_agg_col_types(plans, &col_types));
+        let items = detect_aggregates(&pushdown_req)
+            .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
+        let aggregates = items.map(|it| ordinary_plans(&it));
         // Production always resolves a logical schema before detect_topn; reproduce
         // the LINEITEM schema every plan_scan_sql caller's request scans over.
         let logical_schema = lineitem_logical_schema();
@@ -233,6 +233,7 @@ mod tests {
             order_by,
             aggregates,
             group_keys: None,
+            distinct: false,
             emit_exa_types: proj_types.clone(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -258,7 +259,6 @@ mod tests {
             &col_types,
             &aggregate_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         // Mirror handle_pushdown's row-scan DECLINE wrapping (add-topn-pushdown B6).

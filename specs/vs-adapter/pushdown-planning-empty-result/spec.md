@@ -18,9 +18,8 @@ instead of rejecting it for a column-count/type mismatch.
   against the request's `selectListDataTypes` at pushdown-validation time; a
   response whose column count or declared types disagree is rejected (SQL code
   04000, e.g. `Expected number of columns is 1 but pushdown query has 4`).
-* The empty-result response MUST NOT invoke the scan SET UDF or the scalar
-  distinct-merge UDF, and MUST NOT reference any resolved data file: with zero
-  files there is nothing to scan or merge.
+* The empty-result response MUST NOT invoke the scan fan-out UDF, and MUST NOT
+  reference any resolved data file: with zero files there is nothing to scan.
 * The empty-result response's declared output column types come from the same
   type sources the non-empty path uses for that plan (the row projection's
   declared types; `selectListDataTypes` for aggregates), so the empty and
@@ -56,7 +55,16 @@ instead of rejecting it for a column-count/type mismatch.
 * *AND* the WHERE predicate prunes 100% of the table's data files at the Iceberg level
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL return a `pushdown` response that produces exactly one row whose single `COUNT(DISTINCT col)` output column is `0`, cast to the aggregate's declared result type
-* *AND* the response MUST NOT invoke the scalar distinct-merge UDF or emit any `LISTAGG` union over per-shard distinct sets
+* *AND* the response MUST NOT invoke the scan fan-out UDF and MUST NOT reference any resolved data file
+
+### Scenario: Multi-distinct or mixed single-group request with all files pruned matches the non-empty aggregate shape
+
+* *GIVEN* a single-group query whose select list carries more than one `COUNT(DISTINCT col)`, OR a `COUNT(DISTINCT col)` alongside one or more ordinary SUM/MIN/MAX/COUNT/AVG aggregates (Case 2/3), e.g. `SELECT COUNT(DISTINCT a), COUNT(DISTINCT b), SUM(x) FROM {vs_table} WHERE {prunes every file}`
+* *AND* the WHERE predicate prunes 100% of the table's data files at the Iceberg level
+* *WHEN* Exasol sends the corresponding `pushdown` request
+* *THEN* the adapter SHALL return a `pushdown` response producing exactly one row of N columns — one per select-list item, in order — each cast to its declared result type: every `COUNT`/`COUNT(DISTINCT)` column is `0` and every `SUM`/`MIN`/`MAX`/`AVG` column is `NULL`
+* *AND* that N-column shape SHALL be identical to the qualified single-table wrapper the non-empty Case 2/3 path returns (`vs-adapter/pushdown-planning-count-distinct`), so the empty and non-empty column counts and types never diverge and Exasol's positional pushdown validation accepts both (never a `04000` mismatch)
+* *AND* the response MUST NOT invoke the scan fan-out UDF and MUST NOT reference any resolved data file
 
 ### Scenario: Grouped aggregate with all files pruned returns zero rows in grouped shape
 

@@ -1993,16 +1993,21 @@ pub const DISTINCT_REGION_COUNT: i64 = 4;
 /// is 1 + 2 + ... + 20 = 210.
 pub const DISTINCT_COMMENT_LENGTH_SUM: i64 = 210;
 
-/// Table name for the single-shard high-cardinality `COUNT(DISTINCT)` safety-cap probe.
+/// Table name for the single-shard high-cardinality `COUNT(DISTINCT)` regression
+/// probe (issue #146).
 pub const E2E_HIGH_CARD_TABLE: &str = "high_card_probe";
 /// High-cardinality column on `high_card_probe`.
 pub const HIGH_CARD_COL: &str = "token";
-/// Row count, written as a SINGLE data file (one shard), chosen so the
-/// per-shard local distinct set deterministically exceeds
-/// `MAX_DISTINCT_BYTES_PER_SHARD` (1 MiB in `scan/mod.rs`) well before
-/// `MAX_DISTINCT_ELEMENTS_PER_SHARD` (100,000): 12,000 unique 100-byte
-/// tokens serialize to > 1.2 MB of JSON, comfortably past the 1 MiB cap.
-pub const HIGH_CARD_ROWS: usize = 12_000;
+/// Row count, written as a SINGLE data file (one shard) of unique 100-byte
+/// `token` values. Tens of thousands of distinct values — at ~100 bytes each the
+/// shard-local distinct set is ~3 MB, several times the 1,048,576-byte per-shard
+/// budget the old JSON-serialized distinct-set path enforced (issue #146). The
+/// native-merge path has no such cap: each shard-local distinct value streams as
+/// one row and Exasol's own `COUNT(DISTINCT "V")` counts the union, so the query
+/// completes and returns the exact count (equal to `HIGH_CARD_ROWS`, as every
+/// token is unique). Kept well below the 657k-row real-world repro scale — tens
+/// of thousands is enough to prove the fix on a single shard.
+pub const HIGH_CARD_ROWS: usize = 30_000;
 
 /// Seed the `distinct_probe` table (`id`, `category`, `region`, `comment`)
 /// into the `e2e_lakehouse` namespace across TWO data files. Idempotent.
@@ -2148,8 +2153,8 @@ pub async fn seed_high_card_probe(catalog_url: &str, warehouse: &str) -> Result<
 }
 
 /// One data file's worth of unique, fixed-length (100-byte) `token` values,
-/// zero-padded so every row's serialized JSON element contributes the same
-/// byte count and the safety-cap trip point stays deterministic.
+/// zero-padded so every distinct value is the same width and the shard-local
+/// distinct set's byte size stays deterministic.
 fn make_high_card_batch(rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (1..=rows as i64).collect();
     let tokens: Vec<String> = ids.iter().map(|&id| format!("{id:0>100}")).collect();

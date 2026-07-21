@@ -192,6 +192,7 @@ fn join_spec(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),

@@ -7,7 +7,10 @@
 //! (or by `handle_pushdown` plus a cluster), so they live here rather than in
 //! any single capability module.
 
-use super::grouped_agg::{cast_merge_items, is_literal_selectlist_item, partial_emits_items};
+use super::grouped_agg::{
+    cast_merge_items, col_type_for, is_literal_selectlist_item, partial_emits_items,
+};
+use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::scan::spec::{
     AggregatePlan, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
 };
@@ -17,12 +20,6 @@ use vs_expression::render_expression_safe;
 
 /// The registered SQL name of the scan SCALAR EMIT UDF entry point.
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
-
-/// The registered SQL name of the scalar distinct-merge UDF entry point.
-/// The outer wrapper of a single-group `COUNT(DISTINCT)` pushdown feeds the
-/// per-shard JSON-array partials into this scalar UDF (via `LISTAGG`); like the
-/// scan UDF it must be schema-qualified so it resolves outside the adapter schema.
-pub(super) const DISTINCT_MERGE_UDF_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
 
 /// The registered SQL name of the file-distributor LUA SET script.
 /// The nested fan-out subquery groups the per-shard file-list rows by `shard_key`
@@ -94,7 +91,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     col_types: &[(String, String)],
     aggregate_types: &[String],
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
     if let Some(aggregates) = spec_template.aggregates.as_deref() {
@@ -105,7 +101,6 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             col_types,
             aggregate_types,
             udf_name,
-            merge_udf_name,
             distribute_udf_name,
         )
     } else {
@@ -192,12 +187,11 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     col_types: &[(String, String)],
     aggregate_types: &[String],
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
     let emits_items = partial_emits_items(aggregates, col_types, aggregate_types);
     let emits = emits_items.join(", ");
-    let merge_select = cast_merge_items(aggregates, aggregate_types, merge_udf_name).join(", ");
+    let merge_select = cast_merge_items(aggregates, aggregate_types).join(", ");
 
     // The outer merge SELECT sits DIRECTLY over the scalar scan — no
     // `SELECT * FROM (...)` between them (decision [5]). The primitive short-circuits
@@ -208,6 +202,125 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
     format!("SELECT {merge_select} FROM ({fan_out})")
+}
+
+/// Build the outer wrapper SQL for a lone single-group `COUNT(DISTINCT ...)` — Case 1
+/// (see `vs-adapter/pushdown-planning-count-distinct`).
+///
+/// The one distinct item becomes a DISTINCT row-scan fan-out — a single-column
+/// projection with `distinct = true` and a NULL-excluding filter — whose per-shard
+/// local distinct rows are counted by a native Exasol `COUNT(DISTINCT "V")`:
+/// `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`.
+///
+/// This is the ONLY count-distinct shape that fans out. A Case 2/3 request (more than
+/// one distinct, or a distinct mixed with an ordinary aggregate) NEVER reaches this
+/// builder: the single-group dispatch (`is_lone_count_distinct`) declines it to the
+/// qualified single-table wrapper, because no composition of several scalar-subquery
+/// emitting-UDF calls in one select list compiles in Exasol (`sqlCode 04000`,
+/// "emitting function in expression").
+///
+/// LIMIT/OFFSET/ORDER BY are NEVER pushed into the distinct fan-out (leaking one would
+/// truncate the per-shard distinct set → a wrong count); the caller-guarded `limit` is
+/// applied only to the outer wrapper. The native `COUNT(DISTINCT "V")` yields exactly
+/// the type Exasol declares for a `COUNT(DISTINCT)`, so the count needs no output cast.
+///
+/// `base_spec` carries the shared shard-invariant fields (filter, storage, schema,
+/// tuning) with `aggregates`/`projection`/`emit_exa_types` empty, `distinct` false,
+/// and no LIMIT/ORDER BY.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
+    base_spec: &ScanSpec,
+    shards: &[Vec<E>],
+    items: &[SingleGroupItem],
+    col_types: &[(String, String)],
+    limit: Option<u64>,
+    udf_name: &str,
+    distribute_udf_name: &str,
+) -> String {
+    // Only Case 1 (exactly one COUNT(DISTINCT), nothing else) is dispatched here; the
+    // single-group `is_lone_count_distinct` guard declines every Case 2/3 shape to the
+    // qualified single-table wrapper before this builder is reached.
+    let [SingleGroupItem::Distinct(dc)] = items else {
+        unreachable!(
+            "build_count_distinct_scan_sql is dispatched only for a lone COUNT(DISTINCT) (Case 1)"
+        )
+    };
+    let fan_out = build_distinct_fan_out(
+        base_spec,
+        shards,
+        dc,
+        col_types,
+        udf_name,
+        distribute_udf_name,
+    );
+    let mut sql = format!(r#"SELECT COUNT(DISTINCT "V") FROM ({fan_out})"#);
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    sql
+}
+
+/// Build one DISTINCT row-scan fan-out for a single `COUNT(DISTINCT ...)` argument.
+///
+/// The fan-out is a row scan projecting ONLY the distinct argument, with
+/// `distinct = true` and the base WHERE narrowed by a NULL-excluding predicate on
+/// the argument. It carries NO LIMIT/OFFSET/ORDER BY (leaking one would truncate the
+/// per-shard distinct set → a wrong count). The single emitted column is named `"V"`,
+/// carrying the RAW VALUES of the counted argument — one row per shard-local distinct
+/// value — NOT a count. Its EMITS type follows the argument shape:
+///
+/// - **Bare column** → the source column's own Exasol type (from `col_types`), so a
+///   distinct over a native column keeps its native typing.
+/// - **Expression** → `VARCHAR(2000000)`. The VS has no per-argument value type
+///   (Exasol declares only the COUNT's own integer result type, which describes the
+///   OUTER count, never the inner expression's value type), so the scan serializes
+///   the expression's native DataFusion output to its string form before emit (the
+///   project-wide unknown/incompatible-value-type convention). An outer
+///   `COUNT(DISTINCT "V")` over that string form still dedups exactly — the string
+///   cast is deterministic and injective on distinct native values — and `"V"` is
+///   invisible to the caller, who sees only the final count. Using the COUNT's
+///   declared (integer) type here instead would coerce a string/date/etc. value to
+///   the wrong Arrow type at emit and silently corrupt the count.
+fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
+    base_spec: &ScanSpec,
+    shards: &[Vec<E>],
+    dc: &DistinctCount,
+    col_types: &[(String, String)],
+    udf_name: &str,
+    distribute_udf_name: &str,
+) -> String {
+    let value_type = match &dc.column {
+        // Bare column: "V" carries the column's raw values → its source Exasol type.
+        Some(col) => col_type_for(Some(col), None, col_types, None),
+        // Expression argument (detection guarantees `arg_expr` is set here): "V"
+        // carries the expression's raw values, whose type the VS cannot know — feed
+        // the string-serialized form as VARCHAR so the count stays exact.
+        None => "VARCHAR(2000000)".to_string(),
+    };
+    let (proj_item, arg_sql) = match (&dc.column, &dc.arg_expr) {
+        (Some(col), _) => (ProjectionItem::Column(col.clone()), quote_ident(col)),
+        (None, Some(expr)) => (ProjectionItem::Expr { expr: expr.clone() }, expr.clone()),
+        // Detection guarantees exactly one of column/arg_expr is populated.
+        (None, None) => (ProjectionItem::Column(String::new()), quote_ident("")),
+    };
+    let null_pred = format!("({arg_sql} IS NOT NULL)");
+    let filter = match base_spec.filter.as_deref() {
+        Some(f) if !f.is_empty() => Some(format!("({f}) AND {null_pred}")),
+        _ => Some(null_pred),
+    };
+    let spec = ScanSpec {
+        projection: vec![proj_item],
+        filter,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        distinct: true,
+        emit_exa_types: vec![value_type.clone()],
+        ..base_spec.clone()
+    };
+    let emits = format!(r#""V" {value_type}"#);
+    build_fan_out_inner(&spec, shards, &emits, udf_name, distribute_udf_name)
 }
 
 /// Builds the shard fan-out SELECT that Exasol distributes across nodes.
@@ -578,7 +691,7 @@ pub(super) fn redact_catalog_error(msg: &str) -> String {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::scan::spec::{AggKind, DeleteFileContentType};
+    use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
     use vs_expression::render_df_filter_safe;
 
     /// `exasol_type_from_json` must read the `withLocalTimeZone` flag back off a
@@ -634,6 +747,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -730,7 +844,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
@@ -1268,88 +1381,6 @@ mod tests {
     // Expression-argument aggregates (Task 2.1 / 2.3)
     // -----------------------------------------------------------------------
 
-    // -----------------------------------------------------------------------
-    // Single-group COUNT(DISTINCT) (Task 2.2 / 2.3)
-    // -----------------------------------------------------------------------
-
-    /// Scenario: the outer wrapper for a single-group COUNT(DISTINCT) feeds the
-    /// per-shard JSON-array partials into the schema-qualified scalar merge UDF via
-    /// `'[' || LISTAGG("PARTIAL_cd_i", ',') || ']'`, cast to the declared type.
-    #[test]
-    fn count_distinct_merge_sql_calls_scalar_udf_via_listagg() {
-        let spec_template = ScanSpec {
-            table_root: String::new(),
-            files: vec![],
-            projection: vec!["L_SHIPMODE".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::CountDistinct,
-                column: Some("L_SHIPMODE".into()),
-                arg_expr: None,
-            }]),
-            group_keys: None,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
-        };
-        // Two shards → a genuine fan-out whose partials LISTAGG merges.
-        let shards = vec![
-            vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
-            vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
-        ];
-        let col_types = vec![("L_SHIPMODE".to_string(), "VARCHAR(25)".to_string())];
-        let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
-        let sql = build_scan_driving_sql(
-            &spec_template,
-            &shards,
-            &["L_SHIPMODE".into()],
-            &["VARCHAR(25)".to_string()],
-            None,
-            &col_types,
-            &aggregate_types,
-            r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
-            r#""VS_SCHEMA".LAKEHOUSE_DISTINCT_MERGE_COUNT"#,
-            r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
-        );
-
-        // Partial column contract: one VARCHAR JSON-array column per distinct agg.
-        assert!(
-            sql.contains(r#""PARTIAL_cd_0" VARCHAR(2000000)"#),
-            "EMITS must declare the distinct partial column: {sql}"
-        );
-        // The merge call: schema-qualified scalar UDF fed the LISTAGG-wrapped
-        // array-of-arrays, cast to the COUNT(DISTINCT) declared type.
-        assert!(
-            sql.contains(
-                r#"CAST("VS_SCHEMA".LAKEHOUSE_DISTINCT_MERGE_COUNT('[' || LISTAGG("PARTIAL_cd_0", ',') || ']') AS DECIMAL(18,0))"#
-            ),
-            "outer wrapper must call the schema-qualified merge UDF via LISTAGG and cast to the declared type: {sql}"
-        );
-        // The count-distinct aggregate shares the nested-distributor + scalar-scan
-        // fan-out (decision [1]/[5]): the two-shard GROUP BY shard_key fan-out lives
-        // inside the distributor subquery, and the merge sits directly over the
-        // scalar scan with no `SELECT * FROM (...)` materializing wrapper.
-        assert!(
-            sql.contains(r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES(files) FROM (VALUES"#)
-                && sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
-            "count-distinct's fan-out must nest the distributor's GROUP BY shard_key: {sql}"
-        );
-        assert!(
-            !sql.contains("SELECT * FROM"),
-            "count-distinct merge must not sit behind a SELECT * materializing wrapper: {sql}"
-        );
-    }
-
     /// An aggregate select-list translates to a ScanSpec carrying
     /// the aggregate plan (kind+column) plus any pushed-down filter.
     #[test]
@@ -1375,6 +1406,7 @@ mod tests {
                 },
             ]),
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1400,7 +1432,6 @@ mod tests {
             &col_types,
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
 
@@ -1539,6 +1570,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1576,7 +1608,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
 
@@ -1610,6 +1641,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(agg_plans),
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1635,7 +1667,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         )
     }
@@ -1821,6 +1852,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(plans.clone()),
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1845,7 +1877,6 @@ mod tests {
             &col_types,
             &aggregate_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
@@ -1871,6 +1902,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(plans.clone()),
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1893,7 +1925,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
@@ -1992,6 +2023,339 @@ mod tests {
             sql.contains("PARTIAL_avg_cnt_1"),
             "single-shard must reference partial avg count: {sql}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Single-group COUNT(DISTINCT) — DISTINCT row-scan fan-out wrapper SQL
+    // (replaces the removed LISTAGG/merge-UDF SQL shape; Tasks 5.3 / 5.6)
+    // ---------------------------------------------------------------------------
+
+    /// A `base_spec` matching the real caller contract (`handle_pushdown`): no
+    /// projection/aggregates/limit/order-by, `distinct` false. Only `files` varies
+    /// per shard; `build_count_distinct_scan_sql` derives each per-distinct fan-out
+    /// (and any shared ordinary partial-aggregate scan) from this template.
+    fn count_distinct_base_spec() -> ScanSpec {
+        ScanSpec {
+            table_root: String::new(),
+            files: vec![],
+            projection: vec![],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: sample_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        }
+    }
+
+    /// Scenario: Case 1 (single-group `COUNT(DISTINCT col)`, nothing else) wraps
+    /// its DISTINCT row-scan fan-out in a plain, native `COUNT(DISTINCT "V")` —
+    /// replacing the removed `'[' || LISTAGG(...) || ']'` merge-UDF SQL shape.
+    /// Both UDF invocations (scan + distributor) are schema-qualified from the
+    /// names passed in; there is no third (merge) UDF name to qualify anymore.
+    #[test]
+    fn count_distinct_wrapper_uses_native_count_distinct() {
+        let base_spec = count_distinct_base_spec();
+        let items = vec![SingleGroupItem::Distinct(DistinctCount {
+            column: Some("L_SHIPMODE".into()),
+            arg_expr: None,
+        })];
+        let col_types = vec![("L_SHIPMODE".to_string(), "VARCHAR(25)".to_string())];
+        // Two shards → a genuine fan-out, not the single-shard short-circuit.
+        let shards = vec![
+            vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
+            vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
+        ];
+        let sql = build_count_distinct_scan_sql(
+            &base_spec,
+            &shards,
+            &items,
+            &col_types,
+            None,
+            r#""VS_SCHEMA".LAKEHOUSE_SCAN"#,
+            r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#,
+        );
+
+        assert!(
+            sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
+            "Case 1 must be a plain native COUNT(DISTINCT) over one fan-out: {sql}"
+        );
+        assert!(
+            sql.contains(r#""V" VARCHAR(25)"#),
+            "the fan-out's single emitted column must be named V, with its native \
+             (non-JSON) Exasol type: {sql}"
+        );
+        assert!(
+            sql.contains(r#"\"L_SHIPMODE\" IS NOT NULL"#),
+            "the fan-out must exclude NULLs from the distinct argument: {sql}"
+        );
+        assert!(
+            sql.contains(r#""VS_SCHEMA".LAKEHOUSE_SCAN"#)
+                && sql.contains(r#""VS_SCHEMA".LAKEHOUSE_DISTRIBUTE_FILES"#),
+            "both the scan and distributor UDFs must be schema-qualified from the \
+             names passed in: {sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("LISTAGG") && !sql.contains("DISTINCT_MERGE"),
+            "the removed per-shard JSON-array LISTAGG merge-UDF shape must never \
+             appear: {sql}"
+        );
+    }
+
+    /// Scenario (code-review fix, task 6.1): a `COUNT(DISTINCT <expr>)` whose
+    /// argument is an EXPRESSION (not a bare column) must declare the fan-out's
+    /// `"V"` column as `VARCHAR(2000000)` — the string-serialized raw values of
+    /// the counted expression — NOT the COUNT's own declared (integer) result
+    /// type. `"V"` carries the expression's VALUES (one row per shard-local
+    /// distinct value), which for a string/date/etc. expression is unrelated to
+    /// the count's type; declaring the count's type would coerce those values to
+    /// the wrong Arrow type at emit (e.g. a string cast to `DECIMAL` → all NULL →
+    /// a silently wrong count). VARCHAR keeps the count exact via Exasol string
+    /// dedup for any value type, and is invisible to the caller (who sees only the
+    /// outer count). A bare-column distinct is unaffected — it keeps the source
+    /// column's native type (asserted by
+    /// `count_distinct_wrapper_uses_native_count_distinct`).
+    #[test]
+    fn count_distinct_expression_arg_declares_varchar_value_type() {
+        let base_spec = count_distinct_base_spec();
+        // COUNT(DISTINCT UPPER(name)) — a string-valued expression argument.
+        let items = vec![SingleGroupItem::Distinct(DistinctCount {
+            column: None,
+            arg_expr: Some(r#"upper("NAME")"#.into()),
+        })];
+        // NAME is a VARCHAR source column, but the argument is an EXPRESSION, so
+        // no source-column type applies and the value type must not be looked up
+        // from col_types either. (The COUNT's own declared integer type — the wrong
+        // type the old `col_type_for` path stamped on "V" — is no longer passed at
+        // all: the builder never consults an aggregate type for the distinct value.)
+        let col_types = vec![("NAME".to_string(), "VARCHAR(100)".to_string())];
+        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+        let sql = build_count_distinct_scan_sql(
+            &base_spec,
+            &shards,
+            &items,
+            &col_types,
+            None,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        );
+
+        assert!(
+            sql.contains(r#""V" VARCHAR(2000000)"#),
+            "an expression-argument COUNT(DISTINCT) must declare V as \
+             VARCHAR(2000000) (the string-serialized expression values), not the \
+             count's own type: {sql}"
+        );
+        assert!(
+            !sql.contains(r#""V" DECIMAL"#),
+            "V must NOT be declared with the COUNT's declared (integer) result \
+             type — that is the value-type defect this fixes: {sql}"
+        );
+        assert!(
+            sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
+            "the outer merge is still a native COUNT(DISTINCT V): {sql}"
+        );
+        assert!(
+            sql.contains(r#"upper(\"NAME\") IS NOT NULL"#),
+            "the fan-out must exclude NULLs on the rendered expression argument, \
+             not a phantom column: {sql}"
+        );
+    }
+
+    // The former `multiple_count_distinct_columns_get_independent_fan_outs` (Case 2
+    // asserting the `FROM DUAL` scalar-subquery shape) was removed with the Case 2/3
+    // fan-out composition: only the lone-distinct Case 1 shape reaches
+    // `build_count_distinct_scan_sql`. Case 2/3 now DECLINES the fan-out and routes to
+    // the qualified single-table wrapper — asserted below.
+
+    /// Scenario (task 6.5): a Case 2/3 select list (more than one `COUNT(DISTINCT)`,
+    /// or a distinct mixed with an ordinary aggregate) is NOT dispatched to the
+    /// distinct fan-out (`is_lone_count_distinct` is false) and instead routes to the
+    /// shared qualified single-table wrapper. The wrapper renders every aggregate —
+    /// each `COUNT(DISTINCT)` spliced VERBATIM — over a materialized raw scan narrowed
+    /// to only the referenced columns (issue #160) and aliased `"LHS_T0"`. It is NOT a
+    /// distinct fan-out (`COUNT(DISTINCT "V")`), NOT a bare row scan (`SELECT * FROM`),
+    /// NOT a per-distinct SELECT-list scalar subquery (`(SELECT COUNT(DISTINCT "V")` —
+    /// the blocked design, `sqlCode 04000` "emitting function in expression"), and NOT
+    /// the removed `LISTAGG`/merge-UDF shape.
+    #[test]
+    fn multi_count_distinct_declines_to_qualified_wrapper() {
+        use super::super::joins::{
+            build_qualified_single_table_fallback_sql, referenced_column_projection,
+        };
+        use super::super::single_group_agg::{has_distinct, is_lone_count_distinct};
+
+        // A column node carrying `tableName` so the wrapper alias-qualifies it.
+        let cdist = |col: &str| {
+            serde_json::json!({
+                "type": "function_aggregate", "name": "COUNT", "distinct": true,
+                "arguments": [{"type": "column", "name": col, "tableName": "T"}],
+            })
+        };
+        // Case 2: two independent `COUNT(DISTINCT ...)` columns.
+        let pushdown_req = serde_json::json!({
+            "selectList": [cdist("CATEGORY"), cdist("REGION")],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 18, "scale": 0},
+                {"type": "decimal", "precision": 18, "scale": 0},
+            ],
+        });
+
+        // Dispatch: a Case 2 shape is a distinct request that is NOT a lone distinct,
+        // so the `mod.rs` branch declines the fan-out and takes the wrapper guard.
+        let items = super::super::detect_aggregates(&pushdown_req)
+            .expect("two COUNT(DISTINCT) items are detected as distinct fan-out descriptors");
+        assert!(
+            has_distinct(&items),
+            "a Case 2 select list still carries distinct items"
+        );
+        assert!(
+            !is_lone_count_distinct(&items),
+            "more than one COUNT(DISTINCT) is NOT a lone distinct — it must decline the \
+             fan-out and route to the qualified single-table wrapper"
+        );
+
+        // Build the wrapper exactly as the `mod.rs` Case 2/3 guard does: narrow the
+        // inner scan to only the referenced columns, then render the aggregates over it.
+        let all_cols = vec![
+            ("CATEGORY".to_string(), "VARCHAR(25)".to_string()),
+            ("REGION".to_string(), "VARCHAR(25)".to_string()),
+            ("IRRELEVANT_COL".to_string(), "DECIMAL(20,0)".to_string()),
+        ];
+        let (proj, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
+        let fan_out_spec = ScanSpec {
+            projection: proj,
+            emit_exa_types: proj_types,
+            ..count_distinct_base_spec()
+        };
+        let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
+        let sql = build_qualified_single_table_fallback_sql(
+            &request,
+            &pushdown_req,
+            &fan_out_spec,
+            &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        )
+        .expect("Case 2/3 qualified wrapper must build");
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0""#) && sql.contains("FROM ("),
+            "Case 2/3 must be the qualified single-table wrapper (one aliased raw \
+             fan-out subquery): {sql}"
+        );
+        assert_eq!(
+            sql.matches("COUNT(DISTINCT").count(),
+            2,
+            "both COUNT(DISTINCT) aggregates must be spliced verbatim into the outer \
+             wrapper — one per select item: {sql}"
+        );
+        assert!(
+            !sql.contains(r#"COUNT(DISTINCT "V")"#),
+            "Case 2/3 must NOT be a distinct row-scan fan-out (the Case 1 shape): {sql}"
+        );
+        assert!(
+            !sql.contains("(SELECT COUNT(DISTINCT"),
+            "Case 2/3 must NOT compose per-distinct SELECT-list scalar subqueries (the \
+             blocked design, sqlCode 04000 'emitting function in expression'): {sql}"
+        );
+        assert!(
+            !sql.starts_with("SELECT * FROM"),
+            "Case 2/3 must NOT be a bare row scan (the 04000 column-count mismatch): {sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("LISTAGG") && !sql.contains("DISTINCT_MERGE"),
+            "the removed per-shard JSON-array LISTAGG merge-UDF shape must never \
+             appear: {sql}"
+        );
+        assert!(
+            !sql.contains("IRRELEVANT_COL"),
+            "issue #160: the narrowed inner scan must project only referenced columns \
+             (CATEGORY, REGION), never the full base-table schema: {sql}"
+        );
+    }
+
+    /// Scenario (plan-review finding): LIMIT/OFFSET/ORDER BY must never leak into
+    /// a distinct fan-out — the fan-out builder unconditionally strips them from
+    /// `base_spec` regardless of what a (possibly non-conforming) caller passes,
+    /// so a leaked per-shard LIMIT can never truncate a shard's local distinct set
+    /// into a wrong count. Covers Case 1 (a lone single-group `COUNT(DISTINCT)`), the
+    /// only shape that fans out — Case 2/3 declines to the qualified single-table
+    /// wrapper. The request-level `limit` argument (the outer `LIMIT` on
+    /// `SELECT COUNT(DISTINCT c) FROM t LIMIT 1`) lands ONLY on the outer wrapper.
+    #[test]
+    fn count_distinct_fan_out_omits_limit_offset_order_by() {
+        // A deliberately non-conforming base_spec: real callers (`handle_pushdown`)
+        // always pass `limit: None, order_by: []`, but the fan-out builder must
+        // strip these unconditionally rather than relying on the caller's contract.
+        let mut poisoned_base_spec = count_distinct_base_spec();
+        poisoned_base_spec.limit = Some(999);
+        poisoned_base_spec.order_by = vec![SortKey {
+            column: "POISON_KEY".into(),
+            ascending: true,
+            nulls_last: false,
+        }];
+        let col_types = vec![
+            ("A".to_string(), "DECIMAL(20,0)".to_string()),
+            ("B".to_string(), "DECIMAL(20,0)".to_string()),
+        ];
+        let shards = vec![
+            vec![("s3://warehouse/a.parquet".to_string(), 1u64)],
+            vec![("s3://warehouse/b.parquet".to_string(), 1u64)],
+        ];
+
+        let assert_only_outer_limit_no_order_by = |sql: &str, case: &str| {
+            assert!(
+                !sql.contains("POISON_KEY") && !sql.contains("999"),
+                "{case}: a poisoned base_spec's LIMIT/ORDER BY must never leak into \
+                 any distinct fan-out: {sql}"
+            );
+            assert_eq!(
+                sql.matches("LIMIT").count(),
+                1,
+                "{case}: exactly one literal LIMIT (the outer wrapper's) may \
+                 appear — none may leak into a per-shard fan-out subquery: {sql}"
+            );
+            assert!(
+                sql.trim_end().ends_with("LIMIT 1"),
+                "{case}: the request-level LIMIT must land on the outermost \
+                 wrapper, after every fan-out subquery closes: {sql}"
+            );
+            assert!(
+                !sql.contains("ORDER BY"),
+                "{case}: no ORDER BY may appear — the fan-out never sorts: {sql}"
+            );
+        };
+
+        // Case 1: a single distinct count — the only shape that fans out. (The Case 2
+        // and Case 3 arms were removed with the Case 2/3 fan-out composition: those
+        // shapes now decline to the qualified single-table wrapper, whose own
+        // limit/order-by behavior is covered by task 6.5.)
+        let case1_items = vec![SingleGroupItem::Distinct(DistinctCount {
+            column: Some("A".into()),
+            arg_expr: None,
+        })];
+        let sql1 = build_count_distinct_scan_sql(
+            &poisoned_base_spec,
+            &shards,
+            &case1_items,
+            &col_types,
+            Some(1),
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        );
+        assert_only_outer_limit_no_order_by(&sql1, "Case 1");
     }
 
     // ---------------------------------------------------------------------------
@@ -2246,6 +2610,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2268,7 +2633,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(
@@ -2299,6 +2663,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2321,7 +2686,6 @@ mod tests {
             &[],
             &[],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
         assert!(

@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, AggregatePlan, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry,
-    LogicalField, NameMappingEntry, ProjectionItem, StorageProps,
+    AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
+    NameMappingEntry, ProjectionItem, StorageProps,
 };
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
@@ -14,6 +14,7 @@ use super::credentials::{
 };
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::namespace::parse_table_ident;
+use super::single_group_agg::{SingleGroupItem, ordinary_plans};
 use super::support::{
     aggregate_exasol_types, exasol_type_from_json, quote_ident, redact_catalog_error,
 };
@@ -648,13 +649,10 @@ pub(super) fn empty_result_sql(
     {
         return Ok(sql);
     }
-    if let Some(aggregates) =
-        detect_aggregates(pushdown_req).filter(|plans| validate_agg_col_types(plans, col_types))
+    if let Some(items) = detect_aggregates(pushdown_req)
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
     {
-        return Ok(empty_agg_sql(
-            &aggregates,
-            &aggregate_exasol_types(pushdown_req),
-        ));
+        return Ok(empty_agg_sql(&items, &aggregate_exasol_types(pushdown_req)));
     }
     Ok(empty_pushdown_sql(proj_cols, proj_types))
 }
@@ -683,7 +681,7 @@ fn empty_select_list_typed_sql(pushdown_req: &Json) -> Option<Json> {
 /// semantics over zero rows, mirroring the zero-count NULL guard (ADR-008).
 fn empty_agg_literal(kind: &AggKind) -> &'static str {
     match kind {
-        AggKind::Count | AggKind::CountCol | AggKind::CountDistinct => "0",
+        AggKind::Count | AggKind::CountCol => "0",
         AggKind::Sum
         | AggKind::Min
         | AggKind::Max
@@ -696,26 +694,32 @@ fn empty_agg_literal(kind: &AggKind) -> &'static str {
 }
 
 /// Build the single-group aggregate empty-result response: exactly one row whose
-/// columns are the per-`AggKind` empty literals cast to their declared result
-/// types (from `aggregate_exasol_types`/`selectListDataTypes`), in select-list
-/// order. `FROM DUAL` alone already yields one row, so no `WHERE` is emitted.
+/// columns are each select-list item's zero-row literal cast to its declared
+/// result type (from `aggregate_exasol_types`/`selectListDataTypes`), in
+/// select-list order. A `COUNT(DISTINCT ...)` item yields `0` (no merge UDF and
+/// no fan-out: with zero files there is nothing to scan or deduplicate); every
+/// ordinary aggregate yields its per-`AggKind` empty literal. `FROM DUAL` alone
+/// already yields one row, so no `WHERE` is emitted.
 ///
 /// The cast decision mirrors `cast_merge_items` (cast when a declared type is
 /// present and not the `VARCHAR(2000000)` default) so the empty column types can
 /// never drift from the non-empty single-group shape.
-fn empty_agg_sql(aggregates: &[AggregatePlan], aggregate_types: &[String]) -> Json {
-    let items: Vec<String> = aggregates
+fn empty_agg_sql(items: &[SingleGroupItem], aggregate_types: &[String]) -> Json {
+    let literals: Vec<String> = items
         .iter()
         .enumerate()
-        .map(|(i, plan)| {
-            let literal = empty_agg_literal(&plan.kind);
+        .map(|(i, item)| {
+            let literal = match item {
+                SingleGroupItem::Distinct(_) => "0",
+                SingleGroupItem::Aggregate(plan) => empty_agg_literal(&plan.kind),
+            };
             match aggregate_types.get(i) {
                 Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({literal} AS {ty})"),
                 _ => literal.to_string(),
             }
         })
         .collect();
-    let sql = format!("SELECT {} FROM DUAL", items.join(", "));
+    let sql = format!("SELECT {} FROM DUAL", literals.join(", "));
     serde_json::json!({"type": "pushdown", "sql": sql})
 }
 
@@ -775,9 +779,10 @@ fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Js
 
 #[cfg(test)]
 mod tests {
-    use super::super::support::DISTINCT_MERGE_UDF_NAME;
+    use super::super::single_group_agg::DistinctCount;
     use super::super::test_support::*;
     use super::*;
+    use crate::scan::spec::AggregatePlan;
     use iceberg::spec::{DataContentType, DataFileFormat};
 
     // ---------------------------------------------------------------------------
@@ -1017,20 +1022,20 @@ mod tests {
     /// `FROM DUAL` already yields exactly one row).
     #[test]
     fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
-        let aggregates = vec![
-            AggregatePlan {
+        let items = vec![
+            SingleGroupItem::Aggregate(AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
                 arg_expr: None,
-            },
-            AggregatePlan {
+            }),
+            SingleGroupItem::Aggregate(AggregatePlan {
                 kind: AggKind::Sum,
                 column: Some("AMOUNT".into()),
                 arg_expr: None,
-            },
+            }),
         ];
         let types = vec!["DECIMAL(18,0)".to_string(), "DECIMAL(36,2)".to_string()];
-        let resp = empty_agg_sql(&aggregates, &types);
+        let resp = empty_agg_sql(&items, &types);
         let sql = resp["sql"].as_str().unwrap();
         assert!(sql.contains("FROM DUAL"), "must select from DUAL: {sql}");
         assert!(
@@ -1047,30 +1052,126 @@ mod tests {
         );
     }
 
-    /// COUNT(DISTINCT) empty result is `0`, and references neither the scalar
-    /// distinct-merge UDF nor a `LISTAGG` union — with zero files there is nothing
-    /// to merge.
+    /// COUNT(DISTINCT) over zero files yields a plain `0` literal row — no distinct
+    /// fan-out, no scan, and no merge step (with zero files there is nothing to scan
+    /// or deduplicate).
     #[test]
     fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
-        let aggregates = vec![AggregatePlan {
-            kind: AggKind::CountDistinct,
+        let items = vec![SingleGroupItem::Distinct(DistinctCount {
             column: Some("ID".into()),
             arg_expr: None,
-        }];
+        })];
         let types = vec!["DECIMAL(18,0)".to_string()];
-        let resp = empty_agg_sql(&aggregates, &types);
+        let resp = empty_agg_sql(&items, &types);
         let sql = resp["sql"].as_str().unwrap();
-        assert!(
-            sql.contains("CAST(0 AS DECIMAL(18,0))"),
-            "COUNT(DISTINCT) empty literal must be 0: {sql}"
+        assert_eq!(
+            sql, "SELECT CAST(0 AS DECIMAL(18,0)) FROM DUAL",
+            "COUNT(DISTINCT) over zero files must be a plain 0 literal row with no fan-out \
+             or merge step: {sql}"
         );
+    }
+
+    /// Issue #57 shape-consistency (task 6.7): when EVERY file is pruned, a Case 2/3
+    /// single-group request (more than one `COUNT(DISTINCT)`, or a distinct mixed with
+    /// an ordinary aggregate) must return the SAME N-aggregate-column shape
+    /// (`empty_agg_sql`, one column per select item) that the non-empty qualified
+    /// single-table wrapper returns — NEVER the full-row empty shape
+    /// (`empty_pushdown_sql`), whose different column count trips Exasol's positional
+    /// pushdown validation (`sqlCode 04000`, "Expected number of columns is N but
+    /// pushdown query has M"), since Exasol never re-aggregates a declined pushdown.
+    #[test]
+    fn empty_case_2_3_matches_non_empty_aggregate_shape() {
+        fn count_top_level_cols(select_span: &str) -> usize {
+            let mut depth = 0i32;
+            let mut cols = 1usize;
+            for ch in select_span.chars() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => cols += 1,
+                    _ => {}
+                }
+            }
+            cols
+        }
+
+        // Case 3: two COUNT(DISTINCT) + one ordinary SUM → N = 3 output columns.
+        let pushdown_req = serde_json::json!({
+            "selectList": [
+                agg_item("COUNT", Some("A"), true),
+                agg_item("COUNT", Some("B"), true),
+                agg_item("SUM", Some("C"), false),
+            ],
+            "selectListDataTypes": [
+                {"type": "decimal", "precision": 18, "scale": 0},
+                {"type": "decimal", "precision": 18, "scale": 0},
+                {"type": "decimal", "precision": 36, "scale": 2},
+            ],
+        });
+        let col_types = vec![
+            ("A".to_string(), "DECIMAL(18,0)".to_string()),
+            ("B".to_string(), "DECIMAL(18,0)".to_string()),
+            ("C".to_string(), "DECIMAL(36,2)".to_string()),
+        ];
+
+        // The fixture must be a Case 2/3 shape: distinct present, but not a lone one
+        // (so the non-empty path declines the fan-out and routes to the wrapper).
+        let items = detect_aggregates(&pushdown_req).expect("a Case 3 select list detects");
         assert!(
-            !sql.contains(DISTINCT_MERGE_UDF_NAME),
-            "empty result must not reference the distinct-merge UDF: {sql}"
+            super::super::single_group_agg::has_distinct(&items)
+                && !super::super::single_group_agg::is_lone_count_distinct(&items),
+            "the fixture must be a Case 2/3 shape"
         );
+        let n = pushdown_req["selectList"].as_array().unwrap().len();
+
+        // A deliberately WIDER full-row projection (5 columns): if the empty dispatch
+        // wrongly returned the full-row shape, its column count would be 5, not N = 3.
+        let proj_cols: Vec<ProjectionItem> = ["A", "B", "C", "D", "E"]
+            .iter()
+            .map(|c| ProjectionItem::from(*c))
+            .collect();
+        let proj_types = vec![
+            "DECIMAL(18,0)".to_string(),
+            "DECIMAL(18,0)".to_string(),
+            "DECIMAL(36,2)".to_string(),
+            "VARCHAR(10)".to_string(),
+            "VARCHAR(10)".to_string(),
+        ];
+
+        let empty = empty_result_sql(&pushdown_req, &proj_cols, &proj_types, &col_types)
+            .expect("empty Case 2/3 result must build");
+        let empty_sql = empty["sql"].as_str().unwrap();
+
+        // Routes to the N-aggregate-column shape (empty_agg_sql), NOT the full-row shape.
+        let direct = empty_agg_sql(&items, &aggregate_exasol_types(&pushdown_req));
+        assert_eq!(
+            empty_sql,
+            direct["sql"].as_str().unwrap(),
+            "the empty Case 2/3 dispatch must route to empty_agg_sql: {empty_sql}"
+        );
+        assert_ne!(
+            empty_sql,
+            empty_pushdown_sql(&proj_cols, &proj_types)["sql"]
+                .as_str()
+                .unwrap(),
+            "the empty Case 2/3 dispatch must NOT return the full-row empty shape (#57): {empty_sql}"
+        );
+
+        // Exactly N columns — the same one-per-select-item shape the non-empty wrapper
+        // returns, so empty and non-empty column shapes never diverge.
+        let select_span = &empty_sql["SELECT ".len()..empty_sql.find(" FROM").expect("has FROM")];
+        assert_eq!(
+            count_top_level_cols(select_span),
+            n,
+            "the empty shape must have exactly N={n} aggregate columns (one per select \
+             item): {empty_sql}"
+        );
+        // COUNT(DISTINCT) over zero files → 0; the ordinary SUM → NULL, each cast to
+        // its declared type.
         assert!(
-            !sql.to_uppercase().contains("LISTAGG"),
-            "empty result must not emit a LISTAGG union: {sql}"
+            empty_sql.contains("CAST(0 AS DECIMAL(18,0))")
+                && empty_sql.contains("CAST(NULL AS DECIMAL(36,2))"),
+            "COUNT(DISTINCT) empties to 0 and the ordinary SUM to NULL: {empty_sql}"
         );
     }
 
@@ -1094,7 +1195,7 @@ mod tests {
                 "{kind:?} empty literal must be NULL"
             );
         }
-        for kind in [AggKind::Count, AggKind::CountCol, AggKind::CountDistinct] {
+        for kind in [AggKind::Count, AggKind::CountCol] {
             assert_eq!(
                 empty_agg_literal(&kind),
                 "0",
