@@ -19,7 +19,9 @@ use datafusion::physical_plan::displayable;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::adapter::pushdown::{build_scan_driving_sql, detect_aggregates};
+use lakehouse_engine::adapter::pushdown::{
+    build_scan_driving_sql, detect_aggregates, ordinary_plans,
+};
 use lakehouse_engine::scan::spec::{
     AggKind, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ProjectionItem,
     ScanSpec, SortKey, StorageProps,
@@ -69,6 +71,7 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -394,6 +397,7 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
         order_by: Vec::new(),
         aggregates: Some(aggregates),
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -444,8 +448,11 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 
     // Detection must decompose the aggregate — `None` here would mean the raw
     // two-column row-scan fallback (Exasol would aggregate itself).
-    let plans = detect_aggregates(&req)
+    let items = detect_aggregates(&req)
         .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
+    // This SUM is an ordinary (non-distinct) aggregate, so it must appear among
+    // the ordinary plans — not be dropped as a COUNT(DISTINCT) fan-out item.
+    let plans = ordinary_plans(&items);
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].kind, AggKind::Sum);
     assert!(
@@ -470,7 +477,6 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         &[],                            // col_types — a product has no source column
         &["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
         "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_MERGE",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
@@ -509,6 +515,7 @@ fn row_scan_spec() -> ScanSpec {
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -548,7 +555,6 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         &[],
         &[],
         "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_MERGE",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
@@ -609,7 +615,6 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
         &[],
         &[],
         "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_MERGE",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
@@ -681,6 +686,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -710,7 +716,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         &[],
         &[],
         "LAKEHOUSE_SCAN",
-        "LAKEHOUSE_MERGE",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 

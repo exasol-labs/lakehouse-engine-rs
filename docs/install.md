@@ -140,7 +140,7 @@ Continue with [step 2](#2-create-the-scripts).
 
 ## 2. Create the scripts
 
-All four entry points come from the one `.so` (three RUST scripts) plus one plain LUA passthrough
+All three entry points come from the one `.so` (two RUST scripts) plus one plain LUA passthrough
 script; the SLC dispatches the RUST ones by script name. `%udf_object` depends on where your
 `.so` landed in step 1 — use whichever block below matches:
 
@@ -155,11 +155,6 @@ CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
 
 CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
-%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
-/
-
-CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_DISTINCT_MERGE_COUNT(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
@@ -189,11 +184,6 @@ EMITS (...) AS
 %udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
 /
 
-CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_DISTINCT_MERGE_COUNT(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
-%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
-/
-
 CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
 EMITS (files VARCHAR(2000000)) AS
 function run(ctx)
@@ -207,13 +197,11 @@ end
 `LAKEHOUSE_SCAN` takes two `VARCHAR` arguments: `common` is the shard-invariant scan-spec blob
 (shared across all shards) and `files` is the per-shard file list; `EMITS (...)` is a placeholder —
 the adapter supplies concrete output columns per query.
-`LAKEHOUSE_DISTINCT_MERGE_COUNT` is the merge step for single-group `COUNT(DISTINCT)`: it takes the
-JSON array-of-arrays of per-shard local distinct sets and returns the global distinct cardinality.
 `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough LUA SET script (not a Rust entry point) that
 does the cross-node `GROUP BY shard_key` fan-out of the per-shard file lists ahead of the scalar
 scan.
 
-All three RUST scripts and `LAKEHOUSE_DISTRIBUTE_FILES` MUST be created in the same schema as
+Both RUST scripts and `LAKEHOUSE_DISTRIBUTE_FILES` MUST be created in the same schema as
 `LAKEHOUSE_ADAPTER` (here, `LHVS`) — the adapter qualifies its calls to them using its own
 running-script schema, not a configured property.
 

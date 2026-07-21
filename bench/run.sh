@@ -22,7 +22,6 @@ cd "$SCRIPT_DIR/.."
 SCHEMA=LHVS
 ADAPTER=LAKEHOUSE_ADAPTER
 SCAN=LAKEHOUSE_SCAN
-MERGE=LAKEHOUSE_DISTINCT_MERGE_COUNT
 DISTRIBUTOR=LAKEHOUSE_DISTRIBUTE_FILES
 CONN=LAKEHOUSE_CATALOG_CREDS
 VS=TPCH
@@ -332,14 +331,6 @@ EMITS (...) AS
 %udf_object ${SO_UDF_OBJECT}
 %udf_debug_level ${UDF_DEBUG_LEVEL}
 /"
-# Scalar distinct-merge script — third entry point in the same .so, created in
-# ${SCHEMA} so the pushdown wrapper SQL resolves it schema-qualified like the
-# scan script. Unions per-shard COUNT(DISTINCT) local sets and returns the cardinality.
-sql "CREATE OR REPLACE RUST SCALAR SCRIPT ${SCHEMA}.${MERGE}(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
-%udf_object ${SO_UDF_OBJECT}
-%udf_debug_level ${UDF_DEBUG_LEVEL}
-/"
 # File distributor — LUA SET SCRIPT, pure passthrough. Not a Rust entry point:
 # does the cross-node GROUP BY shard_key fan-out for the shard-invariant files
 # list only, carrying no row data.
@@ -355,7 +346,7 @@ sql "CREATE OR REPLACE CONNECTION ${CONN} TO '${CATALOG_URI//\'/\'\'}' USER '' I
 # Build a virtual schema against a given namespace (idempotent DROP+CREATE). Called
 # once normally; when BENCH_WITH_DELETES=1 it is called a SECOND time to build a
 # lightweight ${VS}_BASELINE against the untouched baseline ns so the delete-count
-# sanity check can compare LINEITEM row counts. Reuses the same adapter/scan/merge
+# sanity check can compare LINEITEM row counts. Reuses the same adapter/scan
 # scripts + CATALOG connection + VS_EXTRA_PROPS; only the name + namespace differ.
 build_vs() {  # vs_name namespace
   sql "DROP VIRTUAL SCHEMA IF EXISTS $1 CASCADE" || true
