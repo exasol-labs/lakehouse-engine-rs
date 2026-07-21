@@ -854,6 +854,94 @@ fn e2e_week_in_filter() {
 }
 
 // ---------------------------------------------------------------------------
+// 8.12b  Date-difference pushdown parity (#107, task 3.1)
+// ---------------------------------------------------------------------------
+//
+// Only the four *_BETWEEN functions are advertised. ADD_HOURS/ADD_MINUTES were
+// WITHDRAWN during this task: the microsecond round-trip renders a fixed
+// TIMESTAMP(3), but Exasol infers TIMESTAMP(0) for a DATE argument, so Exasol
+// rejects the pushdown of ADD_HOURS(<date>, n) ("Data type mismatch ... Expected
+// TIMESTAMP(0), but got TIMESTAMP(3)"). A type-blind string translator cannot
+// vary the result precision by argument type — see the plan's disposition table.
+
+/// Run `EXPLAIN VIRTUAL <query_sql>` and assert the pushed SQL contains
+/// `fragment`, proving the projection expression pushed down (rather than
+/// falling back to a raw column scan).
+fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str) {
+    let pushed = explain_virtual_sql(conn, query_sql);
+    assert!(
+        pushed.contains(fragment),
+        "expected pushed SQL to contain {fragment:?}, got: {pushed}"
+    );
+}
+
+/// `DAYS_BETWEEN` pushes down as an `Int64` whole-day date difference and
+/// preserves Exasol's sign convention: first argument earlier than the second
+/// yields a NEGATIVE result (task 3.1 case e).
+///
+/// Seed: `event_date` = 2024-01-01 + (id-1) days. id=1 → 2024-01-01, so
+/// `DAYS_BETWEEN(event_date, DATE '2024-01-10')` = 2024-01-01 − 2024-01-10 = −9.
+/// Verified against native Exasol: `DAYS_BETWEEN(DATE '2024-01-01', DATE
+/// '2024-01-10')` = −9.
+#[test]
+fn e2e_days_between_matches_exasol() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let t = vs_table();
+
+    let sql = format!("SELECT DAYS_BETWEEN(event_date, DATE '2024-01-10') FROM {t} WHERE id = 1");
+    assert_select_pushed_down(&mut conn, &sql, "AS DATE");
+
+    let cols = conn.query_columns(&sql);
+    let value = parse_int(&cols[0][0]);
+    assert_eq!(
+        value, -9,
+        "DAYS_BETWEEN(2024-01-01, 2024-01-10) must be -9 (Exasol sign convention), got {value}"
+    );
+}
+
+/// `HOURS_BETWEEN`, `MINUTES_BETWEEN`, and `SECONDS_BETWEEN` push down as
+/// fractional epoch-second differences and match Exasol's fractional values
+/// (task 3.1 case d — fractional 2.5-hour gap).
+///
+/// Seed: `event_ts` = 2024-01-01T00:00:00 + (id-1) hours. id=6 → 05:00:00.
+/// Against the fixed anchor 02:30:00 the gap is exactly 2.5 hours =
+/// 150 minutes = 9000 seconds. Native Exasol confirms `HOURS_BETWEEN` over a
+/// 2.5-hour gap = 2.5.
+#[test]
+fn e2e_time_between_matches_exasol() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let t = vs_table();
+
+    let anchor = "TIMESTAMP '2024-01-01 02:30:00'";
+
+    let hours_sql = format!("SELECT HOURS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
+    assert_select_pushed_down(&mut conn, &hours_sql, "date_part('epoch'");
+    let hours = parse_numeric(&conn.query_columns(&hours_sql)[0][0]);
+    assert!(
+        (hours - 2.5).abs() < 1e-9,
+        "HOURS_BETWEEN over a 2.5h gap must be 2.5, got {hours}"
+    );
+
+    let minutes_sql = format!("SELECT MINUTES_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
+    assert_select_pushed_down(&mut conn, &minutes_sql, "date_part('epoch'");
+    let minutes = parse_numeric(&conn.query_columns(&minutes_sql)[0][0]);
+    assert!(
+        (minutes - 150.0).abs() < 1e-9,
+        "MINUTES_BETWEEN over a 2.5h gap must be 150, got {minutes}"
+    );
+
+    let seconds_sql = format!("SELECT SECONDS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
+    assert_select_pushed_down(&mut conn, &seconds_sql, "date_part('epoch'");
+    let seconds = parse_numeric(&conn.query_columns(&seconds_sql)[0][0]);
+    assert!(
+        (seconds - 9000.0).abs() < 1e-9,
+        "SECONDS_BETWEEN over a 2.5h gap must be 9000, got {seconds}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 8.13  CAST / EXTRACT / CASE together in the SELECT list (#136)
 // ---------------------------------------------------------------------------
 
