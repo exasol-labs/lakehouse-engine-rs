@@ -565,9 +565,15 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub table_root: String,
 
-    /// Projected columns in order. Empty means "all columns" (no projection push).
-    /// Each entry is either a bare column reference or a rendered scalar expression
-    /// (see [`ProjectionItem`]).
+    /// Projected columns in order, for the row-scan and join paths, where an empty
+    /// value means "all columns" (no projection push). Each entry is either a bare
+    /// column reference or a rendered scalar expression (see [`ProjectionItem`]).
+    ///
+    /// NOT consulted on the aggregate-dispatch path (single-group or grouped
+    /// aggregate): that scan builds its query from `aggregates`/`group_keys` and
+    /// DataFusion's projection pushdown prunes the physical Parquet read, so the
+    /// field is inert there and the adapter leaves it empty. An empty value on an
+    /// aggregate spec therefore means "not applicable", NOT "all columns" (#145).
     pub projection: Vec<ProjectionItem>,
 
     /// DataFusion SQL WHERE predicate fragment, already translated.
@@ -690,9 +696,15 @@ pub struct ScanSpec {
     /// for the wire shape and its backward-compatible legacy fallback.
     pub files: Vec<FileEntry>,
 
-    /// Projected columns in order. Empty means "all columns" (no projection push).
-    /// Each entry is either a bare column reference or a rendered scalar expression
-    /// (see [`ProjectionItem`]).
+    /// Projected columns in order, for the row-scan and join paths, where an empty
+    /// value means "all columns" (no projection push). Each entry is either a bare
+    /// column reference or a rendered scalar expression (see [`ProjectionItem`]).
+    ///
+    /// NOT consulted on the aggregate-dispatch path (single-group or grouped
+    /// aggregate): that scan builds its query from `aggregates`/`group_keys` and
+    /// DataFusion's projection pushdown prunes the physical Parquet read, so the
+    /// field is inert there and the adapter leaves it empty. An empty value on an
+    /// aggregate spec therefore means "not applicable", NOT "all columns" (#145).
     pub projection: Vec<ProjectionItem>,
 
     /// DataFusion SQL WHERE predicate fragment, already translated.

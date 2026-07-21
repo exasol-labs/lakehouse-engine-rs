@@ -12,6 +12,7 @@ filter/LIMIT scenarios separate from aggregate-specific ones. See
 
 * Single-group aggregate pushdown is decomposed into a per-shard partial aggregate (computed by the `LAKEHOUSE_SCAN` scalar EMIT UDF) and an outer ungrouped merge aggregation in the wrapper SQL.
 * The `GROUP BY shard_key` used for cluster fan-out lives only inside the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery, never at the outer merge level.
+* The shard-invariant common spec's `projection` field is consulted only on the row-scan dispatch path. On the aggregate dispatch path the scan UDF reads the `aggregates` field and derives the DataFusion physical projection from the partial-aggregate query text, so `projection` is left empty.
 * See `vs-adapter/pushdown-planning` for the shard-invariant common spec, file-list resolution, and non-aggregate pushdown scenarios.
 
 ## Scenarios
@@ -51,3 +52,12 @@ filter/LIMIT scenarios separate from aggregate-specific ones. See
 * *THEN* the scan spec SHALL instruct the scan UDF to emit a partial `SUM(col)` and a partial `COUNT(col)` pair rather than a per-shard average
 * *AND* the wrapper SQL SHALL compute the final average as `SUM(partial_sum) / SUM(partial_count)`
 * *AND* the wrapper SQL SHALL yield NULL when the total partial count is zero, never dividing by zero
+
+### Scenario: Single-group aggregate scan spec leaves the projection field empty
+
+* *GIVEN* an ungrouped aggregate `pushdown` request over a table with more than one column (e.g. `SELECT COUNT(*)`, `SELECT SUM(col)`, or `SELECT MIN(col), MAX(col)`)
+* *WHEN* the adapter builds the partial-aggregate scan spec
+* *THEN* the shard-invariant common spec's `projection` field SHALL be empty, NOT the full base-table column list
+* *AND* the referenced-column information SHALL be carried in the `aggregates` field, which is the field the aggregate scan-dispatch path consults; the `projection` field MUST NOT be read on that path
+* *AND* an `EXPLAIN VIRTUAL` of the same query SHALL show `"projection":[]` in the emitted `LAKEHOUSE_SCAN` common spec, so the diagnostic output no longer misreports a full-column projection for an aggregate query
+* *AND* the physical Parquet read SHALL remain pruned to the aggregate-referenced columns via DataFusion's own projection pushdown (see `datafusion-scan/scan-execution-partial-agg`), so the empty `projection` field does not widen the scan

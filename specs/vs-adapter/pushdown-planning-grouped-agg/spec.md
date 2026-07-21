@@ -23,6 +23,10 @@ scalar-function-wrapping-aggregates select items on this same path.
   mode); any failure on ANY element causes the adapter to fall back to row scanning.
 * Each group-key element is rendered independently, so a multi-key GROUP BY MAY mix
   plain column references and scalar expressions in any combination.
+* The grouped common spec's `projection` field is consulted only on the row-scan
+  dispatch path. On the grouped aggregate dispatch path the scan UDF reads the
+  `group_keys` and `aggregates` fields and derives the DataFusion physical projection
+  from the grouped partial-aggregate query text, so `projection` is left empty.
 * DataFusion performs the user GROUP BY inside each scalar-scan invocation, emitting
   one partial-aggregate row per distinct user group per shard; the outer wrapper
   merges those partials on the user group keys with the same SUM/MIN/MAX/AVG-pair
@@ -111,3 +115,12 @@ scalar-function-wrapping-aggregates select items on this same path.
 * *AND* the scalar-over-aggregate select items in that wrapper SHALL be rendered by the `crates/vs-expression` translator (aggregate names spliced verbatim, arguments recursed), since Exasol computes the aggregation over materialized rows rather than over merged partials
 * *AND* the wrapper's result column count and per-column types SHALL match Exasol's positional `selectListDataTypes` validation
 * *AND* the returned result SHALL equal the result of the same grouped query evaluated on a single node
+
+### Scenario: Grouped aggregate scan spec leaves the projection field empty
+
+* *GIVEN* a grouped aggregate `pushdown` request (`aggregationType: "group_by"`) over a table with more than one column (e.g. `SELECT a, COUNT(*) FROM t GROUP BY a`) that is decomposed into a partial/merge grouped aggregate — NOT the undecomposable single-table fallback that dispatches as a raw scan and legitimately carries a non-empty `projection`
+* *WHEN* the adapter builds the grouped partial-aggregate scan spec
+* *THEN* the shard-invariant grouped common spec's `projection` field SHALL be empty, NOT the full base-table column list
+* *AND* the referenced-column information SHALL be carried in the `group_keys` and `aggregates` fields, which are the fields the grouped scan-dispatch path consults; the `projection` field MUST NOT be read on that path
+* *AND* an `EXPLAIN VIRTUAL` of the same query SHALL show `"projection":[]` in the emitted `LAKEHOUSE_SCAN` grouped common spec
+* *AND* the physical Parquet read SHALL remain pruned to the group-key and aggregate-referenced columns via DataFusion's own projection pushdown (see `datafusion-scan/scan-execution-grouped-agg`), so the empty `projection` field does not widen the scan
