@@ -86,9 +86,10 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
 /// the physical read is precisely the point of this test. `aggregates` and
 /// `group_keys` are set by each test.
 fn agg_spec(file_url: String) -> ScanSpec {
-    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let path = file_url.strip_prefix("file://").unwrap_or(&file_url);
+    let size = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat test parquet file {path}: {e}"))
+        .len();
     ScanSpec {
         table_root: String::new(),
         files: vec![FileEntry::new(file_url, size)],
