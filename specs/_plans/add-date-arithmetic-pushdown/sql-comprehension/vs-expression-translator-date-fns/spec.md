@@ -58,12 +58,18 @@ arithmetic, string, and conditional functions.
     would widen a DATE result. (`<x> + <n> * INTERVAL '1 day'` — which would preserve the argument
     type — is rejected at plan time by arrow-rs#9030.) Deferred rather than shipping a type-widening
     rendering; a future type-aware translator could revisit this.
-  * `ADD_YEARS` — leap-day clamping (`2000-02-29` + 1 year → `2001-02-28`, verified on Exasol
-    2025.1.3) is calendar arithmetic that only interval-year addition reproduces, and runtime-scaled
-    interval addition hits the same `Interval(MonthDayNano) * Interval(MonthDayNano)` rejection
-    (arrow-rs#9030); epoch-second arithmetic (a fixed `365.25`-day year) does not clamp
-    calendar-correctly. Its return type is also input-type-dependent like `ADD_DAYS`. No DataFusion
-    54.0.0 rendering is both execution-safe and calendar-correct, so it is deferred.
+  * `ADD_YEARS` — Exasol applies month-end stickiness that no execution-safe DataFusion 54.0.0
+    rendering reproduces, the same divergence class as `ADD_MONTHS`. The leap-day clamp alone
+    (`ADD_YEARS(DATE '2000-02-29', 1)` → `2001-02-28`) IS reproducible and execution-safe: a
+    year-interval builds without the broken runtime multiply via
+    `arrow_cast(<months_int>, 'Interval(YearMonth)')` (Arrow 58 allows `Int32 → Interval(YearMonth)`),
+    and `Date`/`Timestamp` + `Interval(YearMonth)` addition executes and clamps an overflow day to the
+    last valid day. That path does NOT reproduce Exasol's month-end stickiness: `ADD_YEARS(DATE
+    '2001-02-28', 3)` returns `2004-02-29` on live Exasol 2025.1.3 (a last-day-of-month argument maps
+    to the last day of the target month), whereas Arrow's month arithmetic keeps the day-of-month and
+    yields `2004-02-28`. Epoch-second arithmetic (a fixed `365.25`-day year) is not calendar-correct,
+    and the return type is input-type-dependent like `ADD_DAYS`. Deferred on the same defer-honestly
+    precedent as `ADD_MONTHS`.
   * `ADD_SECONDS` — the count is fractional (nanosecond resolution) and truncated to the first
     argument's fractional-seconds precision; DataFusion 54's `Float × INTERVAL` scaling is
     unverified and the epoch round-trip (`to_timestamp`) normalizes to nanoseconds and attaches
