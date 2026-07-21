@@ -24,14 +24,21 @@ leaves `CONVERT_TZ` supportable.
 
 ## Design Decisions
 
-### [1] Split the issue #107 functions into 9 supported and 6 deferred by verified parity
+### [1] Split the issue #107 functions into a supported and a deferred subset by verified parity
 
-- **Decision:** Support `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, `ADD_MINUTES`, `ADD_YEARS`,
-  `DAYS_BETWEEN`, `HOURS_BETWEEN`, `MINUTES_BETWEEN`, and `SECONDS_BETWEEN` with translator arms and
-  `FN_*` capabilities. Defer `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`,
-  `DAYOFWEEK`, and `CONVERT_TZ`, each with a named reason. `POSIX_TIME` stays unsupported (out of
-  scope). `LAST_DAY` is excluded entirely — it is not an Exasol function (see review finding
-  `[plan-review] LAST_DAY is not an Exasol function`).
+- **Count SUPERSEDED twice:** first by `[plan-review] LAST_DAY is not an Exasol function` (removed
+  `LAST_DAY`), then by `[plan-review] ADD_* interval-multiply renderings are execution-broken`, which
+  moved `ADD_DAYS`, `ADD_WEEKS`, and `ADD_YEARS` to Deferred. The final split is **six supported**
+  (`ADD_HOURS`, `ADD_MINUTES`, `DAYS_BETWEEN`, `HOURS_BETWEEN`, `MINUTES_BETWEEN`, `SECONDS_BETWEEN`)
+  and **nine deferred** (`ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`, `ADD_SECONDS`, `ADD_MONTHS`,
+  `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`). The split-by-verified-parity method
+  below is unchanged; only the membership shifted.
+- **Original decision (kept for history):** Support `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`,
+  `ADD_MINUTES`, `ADD_YEARS`, `DAYS_BETWEEN`, `HOURS_BETWEEN`, `MINUTES_BETWEEN`, and `SECONDS_BETWEEN`
+  with translator arms and `FN_*` capabilities. Defer `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`,
+  `YEARS_BETWEEN`, `DAYOFWEEK`, and `CONVERT_TZ`, each with a named reason. `POSIX_TIME` stays
+  unsupported (out of scope). `LAST_DAY` is excluded entirely — it is not an Exasol function (see
+  review finding `[plan-review] LAST_DAY is not an Exasol function`).
 - **Alternatives:** Advertise all as a block (rejected: violates the backing-path bar, risks
   silently wrong results). Defer everything until a full calendar-semantics layer exists (rejected:
   leaves verified, high-value pushdowns on the table).
@@ -43,14 +50,15 @@ leaves `CONVERT_TZ` supportable.
 
 ### [2] Use integer interval scaling for the ADD_* family; round the count first
 
-- **Decision:** Render `ADD_DAYS`/`ADD_WEEKS`/`ADD_HOURS`/`ADD_MINUTES`/`ADD_YEARS` as
+- **SUPERSEDED** by review finding `[plan-review] ADD_* interval-multiply renderings are
+  execution-broken`. The `<x> + CAST(ROUND(<n>) AS BIGINT) * <unit interval>` rendering hard-errors
+  at plan time in DataFusion 54.0.0 (`Interval(MonthDayNano) * Interval(MonthDayNano)`,
+  arrow-rs#9030); the "`Interval × integer` coercion is verified" rationale was wrong — coercion
+  succeeds at plan-typing but the multiply kernel is unimplemented. `ADD_HOURS`/`ADD_MINUTES` now
+  render in the microsecond domain; `ADD_DAYS`/`ADD_WEEKS`/`ADD_YEARS` are deferred.
+- **Original decision (kept for history):** Render
+  `ADD_DAYS`/`ADD_WEEKS`/`ADD_HOURS`/`ADD_MINUTES`/`ADD_YEARS` as
   `<x> + CAST(ROUND(<n>) AS BIGINT) * <unit interval>`.
-- **Alternatives:** `Float × INTERVAL` scaling without rounding (rejected: DataFusion 54's float
-  interval-scaling kernel is unverified; Exasol rounds the count for these functions anyway). Epoch
-  arithmetic (rejected: unnecessary for whole-unit adds and loses the input's date/timestamp type).
-- **Rationale:** DataFusion 54's `Interval × integer` coercion is verified against the v54 source;
-  Exasol rounds decimals before adding for `ADD_DAYS/WEEKS/HOURS/MINUTES`. `ROUND` then `CAST … AS
-  BIGINT` keeps the safe integer path and matches Exasol's rounding rule.
 - **Promotes to ADR:** no
 
 ### [3] Defer ADD_SECONDS despite being a fixed-length unit
@@ -107,8 +115,10 @@ leaves `CONVERT_TZ` supportable.
 - **Alternatives:** Advertise on the strength of unit tests alone (rejected: unit tests pin the
   emitted string, not Exasol runtime parity).
 - **Rationale:** Mirrors the `FN_WEEK` / PR #115 precedent, where ISO-8601 parity gates
-  advertisement. The `ADD_YEARS` leap-year clamp is the case most likely to diverge and is pinned
-  by a dedicated E2E assertion.
+  advertisement. The `ADD_HOURS`/`ADD_MINUTES` DATE-input promotion and the fractional `*_BETWEEN`
+  cases are the ones most likely to diverge and are pinned by dedicated E2E assertions. (`ADD_YEARS`
+  was superseded to Deferred by `[plan-review] ADD_* interval-multiply renderings are
+  execution-broken` and no longer has an E2E case.)
 - **Promotes to ADR:** no
 
 ## Review Findings
@@ -127,10 +137,12 @@ leaves `CONVERT_TZ` supportable.
   task 1.1, dropped `FN_LAST_DAY` from the capability task, dropped its E2E case from task 3.1,
   deleted its NEW spec scenario and both Scenario-Coverage rows. Reclassified `LAST_DAY` in the
   disposition table as a third category, **Not applicable** (distinct from Supported and Deferred —
-  the six deferred functions are real Exasol functions with a genuine parity gap; `LAST_DAY` does
+  the deferred functions are real Exasol functions with a genuine parity gap; `LAST_DAY` does
   not exist at all). `LAST_DAY` stays in the `unsupported_date_fn_falls_through` test (harmless
   generic fall-through) but appears in no capabilities.rs must-be-advertised assertion and gets no
-  translator arm. Updated the supported count to nine and superseded Design Decision [1].
+  translator arm. Updated the supported count (nine at the time of this finding; later six — see
+  `[plan-review] ADD_* interval-multiply renderings are execution-broken`) and superseded Design
+  Decision [1].
 - **Promotes to ADR:** no
 
 ### [plan-review] Soften the unverified DATE − DATE claim
@@ -173,8 +185,101 @@ leaves `CONVERT_TZ` supportable.
 
 - **Finding (ADVISORY, optional):** Task 1.1 bundles the `ADD_*` and `*_BETWEEN` rendering families
   into one `[expert]` task; the reviewer noted splitting would improve reviewability.
-- **Direction change:** Kept bundled. The nine arms are homogeneous (each emits one canonical string
-  pinned by a rendering unit test), share the same arity-check and fall-through pattern, and the
-  E2E parity gate (task 3.1) is the real correctness check. Splitting would add task-list overhead
-  without materially improving review of near-identical arms.
+- **Direction change:** Kept bundled. The arms are homogeneous (each emits one canonical string
+  pinned by a rendering unit test — six after `[plan-review] ADD_* interval-multiply renderings are
+  execution-broken`; nine when this finding was written), share the same arity-check and
+  fall-through pattern, and the E2E parity gate (task 3.1) is the real correctness check. Splitting
+  would add task-list overhead without materially improving review of near-identical arms.
+- **Promotes to ADR:** no
+
+### [plan-review] ADD_* interval-multiply renderings are execution-broken
+
+- **Finding (BLOCKER):** All five "Supported" `ADD_*` renderings used
+  `<x> + CAST(ROUND(<n>) AS BIGINT) * INTERVAL '<unit>'`. This does not diverge subtly — it HARD-ERRORS
+  before execution in the workspace-pinned DataFusion 54.0.0. Integer × Interval coercion succeeds at
+  plan-typing (both operands coerce to `Interval(MonthDayNano)`), but the `Interval(MonthDayNano) *
+  Interval(MonthDayNano)` multiply kernel is unimplemented (arrow-rs#9030, open, no milestone).
+  Verified three ways at tag 54.0.0: (a) the sqllogictest
+  `datafusion/sqllogictest/test_files/datetime/arith_interval_double.slt` documents `SELECT interval
+  '1 day' * 21` as `query error Invalid interval arithmetic operation: Interval(MonthDayNano) *
+  Interval(MonthDayNano)`; (b) executing `ts + CAST(ROUND(1) AS BIGINT) * INTERVAL '1 hour'` through
+  DataFusion 54.0.0 fails at planning with `Cannot get result type for temporal operation Int64 *
+  Interval(MonthDayNano): Invalid interval arithmetic operation`; (c) both operand orders hit the
+  same type-based path, so every unit (`day`/`hour`/`minute`/`year`) fails identically. Because
+  capabilities (task 2.1) advertise BEFORE the E2E gate (task 3.1) runs, shipping as-is would let a
+  real `ADD_DAYS`/etc. query push down and hard-error at the UDF. A secondary defect compounds it:
+  `Date32 + INTERVAL '1 hour'` stays `Date32` in DataFusion 54.0.0 (confirmed via
+  `arith_date_interval.slt` and by execution — `date + interval '1 hour'` → `2026-01-01`, `Date32`),
+  so even with the multiply fixed, `ADD_HOURS`/`ADD_MINUTES` on a DATE argument would silently drop
+  the sub-day offset.
+- **Direction change:**
+  - **`ADD_HOURS`, `ADD_MINUTES` → kept Supported, new rendering.** Render in the integer-microsecond
+    domain: `arrow_cast(arrow_cast(arrow_cast(<x>, 'Timestamp(Microsecond, None)'), 'Int64') +
+    CAST(ROUND(<n>) AS BIGINT) * <unit_microseconds>, 'Timestamp(Microsecond, None)')`
+    (`3600000000` for hours, `60000000` for minutes). Verified by execution through DataFusion
+    54.0.0: it runs (no interval multiply), preserves microsecond precision, and always yields a
+    `TIMESTAMP` — including promoting a Date32 argument to a midnight timestamp
+    (`ADD_HOURS(DATE '2020-01-01', 5)` → `2020-01-01 05:00:00`). This matches Exasol, which returns a
+    TIMESTAMP for `ADD_HOURS`/`ADD_MINUTES` on both DATE and TIMESTAMP inputs (verified on live
+    Exasol 2025.1.3), and it fixes the secondary Date32-stays-Date32 defect by construction. Named
+    trade-off: normalization to microseconds truncates a nanosecond-precision Iceberg v3
+    `timestamp_ns` argument's sub-microsecond part — consistent with the project's microsecond
+    timestamp mapping and the #155 literal-precision fix.
+  - **`ADD_DAYS`, `ADD_WEEKS` → moved to Deferred.** Exasol's return type is input-type-dependent:
+    `ADD_DAYS(DATE '2020-01-01', 5)` → `2020-01-06` (DATE), `ADD_DAYS(TIMESTAMP '2020-01-01
+    12:34:56', 5)` → `2020-01-06 12:34:56` (TIMESTAMP) — verified on live Exasol 2025.1.3. The
+    `vs-expression` translator renders SQL from the pushdown expression tree with no argument type
+    (column nodes carry only `name`/`tableAlias`), so a single rendering cannot return DATE for a
+    DATE argument and TIMESTAMP for a TIMESTAMP argument. The only type-preserving primitive
+    (`<x> + <interval>`) needs the broken runtime interval scale; every execution-safe rendering
+    routes through `TIMESTAMP` and would widen a DATE result. Deferred rather than shipping a
+    type-widening rendering (the user's bar: do not ship technically-executing-but-still-wrong). The
+    unblock condition is a type-aware translator (the adapter already annotates column nodes with
+    `tableAlias`, and `crates/lakehouse-engine/src/adapter/iceberg_predicate.rs`'s `resolve_column`
+    already resolves per-column Iceberg types from the scan schema elsewhere in the pipeline — so
+    type data exists today, but the shared `vs-expression` translator crate is not wired to receive
+    it and cannot infer the type of an arbitrary, possibly non-column argument expression; an
+    analogous `dataType` annotation threaded into the translator would let the arm branch).
+  - **`ADD_YEARS` → moved to Deferred.** Its leap-day clamp (`ADD_YEARS(DATE '2000-02-29', 1)` →
+    `2001-02-28`, verified on Exasol 2025.1.3) is calendar arithmetic that only interval-year
+    addition reproduces, and runtime-scaled interval addition hits the same arrow-rs#9030 rejection;
+    epoch-second arithmetic (a fixed `365.25`-day year) is not calendar-correct. Its return type is
+    also input-type-dependent like `ADD_DAYS`. No DataFusion 54.0.0 rendering is both execution-safe
+    and calendar-correct, so — per the same defer-honestly precedent as `ADD_MONTHS` — it is deferred.
+  - Supported count updated from nine to **six** (`ADD_HOURS`, `ADD_MINUTES`, `DAYS_BETWEEN`,
+    `HOURS_BETWEEN`, `MINUTES_BETWEEN`, `SECONDS_BETWEEN`); deferred count updated to **nine**
+    (adds `ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`). Supersedes Design Decisions [1] (count) and [2]
+    (ADD_* rendering). Updated the plan disposition table, task 1.1 rendering description, task 2.1
+    capability lists, task 3.1 E2E cases (dropped the `ADD_YEARS` leap case and the `ADD_DAYS`
+    half-rounding case; the rounding and DATE-input-promotion cases now use `ADD_HOURS`/`ADD_MINUTES`,
+    plus a new sub-second-preservation case), the Scenario Coverage table, and the spec deltas.
+- **Promotes to ADR:** yes
+
+### [plan-review] Confirm the DATE − DATE and epoch renderings against DataFusion 54.0.0 source
+
+- **Finding (ADVISORY → resolved):** The plan carried `DAYS_BETWEEN`'s `DATE − DATE → Int64` as
+  "assumed, not yet source-confirmed" (per an earlier advisory) and `date_part('epoch', …) → Float64`
+  as merely "verified surface" without a citation.
+- **Direction change:** Both are now source- and execution-confirmed at tag 54.0.0.
+  `DATE − DATE → Int64`: `is_date_minus_date` in
+  `datafusion/expr-common/src/type_coercion/binary.rs` returns `ret: Int64`, and an executed
+  `CAST(<ts> AS DATE) - CAST(<date> AS DATE)` returns an `Int64` (value `0` for equal dates).
+  `date_part('epoch', …) → Float64`: `datafusion/functions/src/datetime/date_part.rs`, and an
+  executed `date_part('epoch', ts)` returns a `Float64` fractional-second value. The Dependencies
+  section is upgraded from "assumed" to "confirmed"; the `DAYS_BETWEEN` E2E case now guards only the
+  sign convention, not the result type.
+- **Promotes to ADR:** no
+
+### [plan-review] DAYOFWEEK may not exist on the target Exasol version
+
+- **Finding (ADVISORY):** `DAYOFWEEK` was deferred solely on the `NLS_FIRST_DAY_OF_WEEK`
+  session-parameter dependency. Independent verification against the same Exasol version the E2E
+  harness targets found a second, more basic reason: `SELECT DAYOFWEEK(DATE '2020-01-01')` on live
+  Exasol 2025.1.3 returns `function or script DAYOFWEEK not found` (SQL code 42000). `DAYOFWEEK` is
+  documented on Exasol's current docs site but is not present on this project's target Exasol
+  version.
+- **Direction change:** `DAYOFWEEK` stays deferred (disposition unchanged), but the recorded reason
+  now names the version caveat alongside the session-parameter dependency, so a future revisit checks
+  the function exists on the target Exasol version before treating it as only a session-parameter
+  problem. (No spec/plan wording change beyond this log entry; the function was already fall-through.)
 - **Promotes to ADR:** no

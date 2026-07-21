@@ -24,23 +24,46 @@ arithmetic, string, and conditional functions.
   ISO-8601.
 
 <!-- DELTA:CHANGED -->
-* Date arithmetic and date-difference functions are translated for the subset whose DataFusion 54
-  rendering matches Exasol's documented semantics, verified per function against the Exasol
-  built-in function reference and the DataFusion 54 function surface (issue #107). The translated
-  set is:
-  * `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, `ADD_MINUTES` — fixed-length interval addition. Exasol
-    rounds the count to a whole number before adding; DataFusion 54 scales an integer count by a
-    unit `INTERVAL` (verified `Interval × integer` coercion) and returns the input date/timestamp
-    type unchanged.
-  * `ADD_YEARS` — year-interval addition. Arrow's month arithmetic clamps a nonexistent target day
-    to the last valid day (`2000-02-29` + 1 year → `2001-02-28`), matching Exasol's clamping rule.
+* Date arithmetic and date-difference functions are translated for the subset whose DataFusion
+  54.0.0 rendering both executes and matches Exasol's documented semantics, verified per function
+  against the Exasol built-in function reference (live Exasol 2025.1.3) and the DataFusion 54.0.0
+  function surface — confirmed against the pinned-tag source and by executing each rendering through
+  DataFusion 54.0.0 (issue #107). The translated set is:
+  * `ADD_HOURS`, `ADD_MINUTES` — fixed-length offset addition, rendered in the integer-microsecond
+    domain: the datetime argument is normalized to `Timestamp(Microsecond, None)`, cast to `Int64`
+    microseconds-since-epoch, the count (rounded to a whole number, matching Exasol's "decimals are
+    rounded before adding") scaled by the unit's microseconds as a plain integer literal is added,
+    and the sum is cast back to `Timestamp(Microsecond, None)`. The rendering does NOT use interval
+    multiplication (`<n> * INTERVAL '<unit>'`): DataFusion 54.0.0 rejects
+    `Interval(MonthDayNano) * Interval(MonthDayNano)` at plan time (arrow-rs#9030). The result is
+    always a `TIMESTAMP`, promoting a DATE argument to a timestamp at midnight — matching Exasol,
+    which returns a TIMESTAMP for `ADD_HOURS`/`ADD_MINUTES` on both DATE and TIMESTAMP inputs.
+    Because the rendering normalizes to microseconds (consistent with the project's microsecond
+    timestamp mapping and the #155 literal-precision fix), a nanosecond-precision Iceberg v3
+    `timestamp_ns` argument loses its sub-microsecond fractional part — a named trade-off, not a
+    silent gap, and consistent with Exasol's own microsecond-granularity handling of these values.
   * `DAYS_BETWEEN` — whole-day date difference. Exasol uses only the date part of a timestamp;
-    computed as `DATE − DATE`, assumed to yield an `Int64` day count in DataFusion 54 — gated by
-    the `DAYS_BETWEEN` E2E parity test, which withdraws the arm if this assumption doesn't hold.
+    computed as `DATE − DATE`, which yields an `Int64` day count in DataFusion 54.0.0 (confirmed:
+    `is_date_minus_date` in `datafusion/expr-common/src/type_coercion/binary.rs` returns
+    `ret: Int64`, and an executed `CAST(<a> AS DATE) - CAST(<b> AS DATE)` returns an `Int64`).
   * `HOURS_BETWEEN`, `MINUTES_BETWEEN`, `SECONDS_BETWEEN` — fractional differences over full
-    timestamps, computed from `date_part('epoch', …)` second differences.
+    timestamps, computed from `date_part('epoch', …)` (`Float64` seconds) differences.
 * The following remain unsupported and fall through so Exasol post-processes them, each for a
   named reason (issue #107 permits advertising only the subset with verified parity):
+  * `ADD_DAYS`, `ADD_WEEKS` — Exasol's return type depends on the argument type: a DATE argument
+    yields a DATE, a TIMESTAMP argument yields a TIMESTAMP preserving time-of-day (verified on live
+    Exasol 2025.1.3). The translator renders SQL from the pushdown expression tree with no argument
+    type information (column nodes carry only a name), so a single rendering cannot reproduce both
+    return types; every execution-safe DataFusion 54.0.0 rendering routes through a `TIMESTAMP` and
+    would widen a DATE result. (`<x> + <n> * INTERVAL '1 day'` — which would preserve the argument
+    type — is rejected at plan time by arrow-rs#9030.) Deferred rather than shipping a type-widening
+    rendering; a future type-aware translator could revisit this.
+  * `ADD_YEARS` — leap-day clamping (`2000-02-29` + 1 year → `2001-02-28`, verified on Exasol
+    2025.1.3) is calendar arithmetic that only interval-year addition reproduces, and runtime-scaled
+    interval addition hits the same `Interval(MonthDayNano) * Interval(MonthDayNano)` rejection
+    (arrow-rs#9030); epoch-second arithmetic (a fixed `365.25`-day year) does not clamp
+    calendar-correctly. Its return type is also input-type-dependent like `ADD_DAYS`. No DataFusion
+    54.0.0 rendering is both execution-safe and calendar-correct, so it is deferred.
   * `ADD_SECONDS` — the count is fractional (nanosecond resolution) and truncated to the first
     argument's fractional-seconds precision; DataFusion 54's `Float × INTERVAL` scaling is
     unverified and the epoch round-trip (`to_timestamp`) normalizes to nanoseconds and attaches
@@ -113,22 +136,13 @@ arithmetic, string, and conditional functions.
 * *AND* `FN_WEEK` (advertised per `vs-adapter/pushdown-planning-capability-extensions`) SHALL be advertised only while this ISO-8601 parity holds; if a year-boundary case diverges, the `WEEK` arm SHALL be withdrawn and `FN_WEEK` left unadvertised
 
 <!-- DELTA:NEW -->
-### Scenario: ADD_DAYS, ADD_WEEKS, ADD_HOURS, and ADD_MINUTES translate to rounded integer interval addition
+### Scenario: ADD_HOURS and ADD_MINUTES translate to microsecond-domain timestamp arithmetic
 
-* *GIVEN* a VS expression node of type `function_scalar` named `ADD_DAYS`, `ADD_WEEKS`, `ADD_HOURS`, or `ADD_MINUTES` with a datetime first argument and a numeric count second argument
+* *GIVEN* a VS expression node of type `function_scalar` named `ADD_HOURS` or `ADD_MINUTES` with a datetime first argument and a numeric count second argument
 * *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL render the datetime argument plus the count — rounded to a whole number — scaled by the matching unit interval, using `INTERVAL '1 day'` for `ADD_DAYS`, `INTERVAL '7 day'` for `ADD_WEEKS`, `INTERVAL '1 hour'` for `ADD_HOURS`, and `INTERVAL '1 minute'` for `ADD_MINUTES`, with both arguments rendered recursively (canonical form `(<datetime_sql> + CAST(ROUND(<count_sql>) AS BIGINT) * <unit_interval>)`)
-* *AND* the count SHALL be rounded to a whole number before scaling, matching Exasol's rule that the count's decimals are rounded before adding
-* *AND* a node with other than two arguments SHALL raise in raising mode and return `None` in the safe variants
-* *AND* `FN_ADD_DAYS`, `FN_ADD_WEEKS`, `FN_ADD_HOURS`, and `FN_ADD_MINUTES` SHALL each be advertised only while an end-to-end parity test confirms the rendered expression matches Exasol for that function; if one diverges, that arm SHALL be withdrawn and its capability left unadvertised
-
-### Scenario: ADD_YEARS translates to year-interval addition with leap-year clamping
-
-* *GIVEN* a VS expression node of type `function_scalar` named `ADD_YEARS` with a datetime first argument and a numeric count second argument
-* *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL render the datetime argument plus the count — rounded to a whole number — scaled by `INTERVAL '1 year'` (canonical form `(<datetime_sql> + CAST(ROUND(<count_sql>) AS BIGINT) * INTERVAL '1 year')`)
-* *AND* the rendered call SHALL clamp a nonexistent target day to the last valid day of the target month (`ADD_YEARS(DATE '2000-02-29', 1)` yields `2001-02-28`), matching Exasol
-* *AND* `FN_ADD_YEARS` SHALL be advertised only while an end-to-end parity test confirms this clamping matches Exasol; if it diverges, the `ADD_YEARS` arm SHALL be withdrawn and `FN_ADD_YEARS` left unadvertised
+* *THEN* the translator SHALL render the offset in the integer-microsecond domain — normalizing the datetime argument to `Timestamp(Microsecond, None)`, casting it to `Int64` microseconds-since-epoch, adding the count (rounded to a whole number, matching Exasol's rule that the count's decimals are rounded before adding) scaled by the unit's microseconds as a plain integer literal, then casting the sum back to `Timestamp(Microsecond, None)` — using `3600000000` microseconds for `ADD_HOURS` and `60000000` for `ADD_MINUTES`, with both arguments rendered recursively (canonical form `arrow_cast(arrow_cast(arrow_cast(<datetime_sql>, 'Timestamp(Microsecond, None)'), 'Int64') + CAST(ROUND(<count_sql>) AS BIGINT) * <unit_microseconds>, 'Timestamp(Microsecond, None)')`); the rendering MUST NOT use interval multiplication (`<count> * INTERVAL '<unit>'`), which DataFusion 54.0.0 rejects at plan time as `Invalid interval arithmetic operation: Interval(MonthDayNano) * Interval(MonthDayNano)` (arrow-rs#9030)
+* *AND* the result SHALL always be a `TIMESTAMP`, promoting a DATE argument to a timestamp at midnight before adding, matching Exasol (`ADD_HOURS`/`ADD_MINUTES` return a TIMESTAMP for both DATE and TIMESTAMP inputs — e.g. `ADD_HOURS(DATE '2020-01-01', 5)` yields `2020-01-01 05:00:00`)
+* *AND* a node with other than two arguments SHALL raise in raising mode and return `None` in the safe variants; and `FN_ADD_HOURS` and `FN_ADD_MINUTES` SHALL each be advertised only while an end-to-end parity test confirms the rendered expression matches Exasol for that function, otherwise that arm SHALL be withdrawn and its capability left unadvertised
 
 ### Scenario: DAYS_BETWEEN translates to a whole-day date difference
 
@@ -150,10 +164,10 @@ arithmetic, string, and conditional functions.
 <!-- DELTA:CHANGED -->
 ### Scenario: Unsupported date functions fall through as unsupported nodes
 
-* *GIVEN* a VS expression node of type `function_scalar` named with a date-function name this feature does not translate — `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`, `POSIX_TIME`, or `LAST_DAY`
+* *GIVEN* a VS expression node of type `function_scalar` named with a date-function name this feature does not translate — `ADD_DAYS`, `ADD_WEEKS`, `ADD_YEARS`, `ADD_SECONDS`, `ADD_MONTHS`, `MONTHS_BETWEEN`, `YEARS_BETWEEN`, `DAYOFWEEK`, `CONVERT_TZ`, `POSIX_TIME`, or `LAST_DAY`
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return an error naming the unsupported function
 * *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
-* *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because each named function either has a parity or session-state divergence from its DataFusion 54 equivalent or (`LAST_DAY`) is not an Exasol function at all (see Background)
-* *AND* the capabilities `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, and `FN_CONVERT_TZ` MUST NOT be advertised, and no `FN_LAST_DAY` capability SHALL exist to advertise (Exasol has no `LAST_DAY` function and its `ScalarFunctionCapability` enum has no `LAST_DAY` member)
+* *AND* the adapter SHALL omit the function from the scan spec and let Exasol post-process it, because each named function either has an execution, parity, session-state, or input-type-dependent-return divergence from its DataFusion 54.0.0 equivalent or (`LAST_DAY`) is not an Exasol function at all (see Background)
+* *AND* the capabilities `FN_ADD_DAYS`, `FN_ADD_WEEKS`, `FN_ADD_YEARS`, `FN_ADD_SECONDS`, `FN_ADD_MONTHS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, and `FN_CONVERT_TZ` MUST NOT be advertised, and no `FN_LAST_DAY` capability SHALL exist to advertise (Exasol has no `LAST_DAY` function and its `ScalarFunctionCapability` enum has no `LAST_DAY` member)
 <!-- /DELTA:CHANGED -->
