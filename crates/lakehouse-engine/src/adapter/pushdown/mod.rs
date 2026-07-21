@@ -287,7 +287,9 @@ pub async fn handle_pushdown(
             let spec_template = ScanSpec {
                 table_root: table_root.clone(),
                 files: vec![],
-                projection: proj_cols.clone(),
+                // This branch is ALWAYS an aggregate dispatch — see `ScanSpec::projection`
+                // doc for why an empty value here is inert, not "all columns" (#145).
+                projection: Vec::new(),
                 filter,
                 limit: grouped_limit,
                 order_by: Vec::new(),
@@ -410,20 +412,47 @@ pub async fn handle_pushdown(
         limit
     };
 
+    // Computed once before the struct literal moves `aggregates` into its field:
+    // both `projection` and `emit_exa_types` are emptied on the aggregate sub-path
+    // of this shared `spec_template` (see their field comments below).
+    let has_aggregates = aggregates.is_some();
+
     let spec_template = ScanSpec {
         table_root,
         files: vec![], // replaced per shard in build_scan_driving_sql
-        projection: proj_cols.clone(),
+        // This `spec_template` is SHARED between the single-group aggregate sub-path
+        // (`aggregates.is_some()`) and the row-scan sub-path. On the aggregate
+        // sub-path the scan never reads `projection` (the referenced columns live in
+        // `aggregates`; DataFusion prunes the physical Parquet read from the query
+        // text), so it is emptied — an inert value that keeps EXPLAIN VIRTUAL
+        // accurate (#145). The row-scan sub-path MUST keep its projection: it drives
+        // both the EMITS clause and the pushed-down scan, so `proj_cols` is preserved
+        // whenever there are no aggregates.
+        projection: if has_aggregates {
+            Vec::new()
+        } else {
+            proj_cols.clone()
+        },
         filter,
         limit: effective_limit,
         order_by,
         aggregates,
         group_keys: None,
-        // Row-scan EMITS types, positionally aligned with `proj_cols`. The scan
-        // coerces each emitted Arrow column to the type its declared ExaType
-        // accepts before emit_batch. Ignored when `aggregates` is Some (that path
-        // emits via the Value path). Same list the EMITS clause is built from.
-        emit_exa_types: proj_types.clone(),
+        // Like `projection` above, this field is SHARED via this `spec_template`
+        // between the single-group aggregate sub-path and the row-scan sub-path.
+        // The aggregate scan emits via the freely-coercing Value path and never
+        // reads `emit_exa_types` (matching the grouped branch, which empties it),
+        // so it is emptied when `aggregates.is_some()` — an inert value that keeps
+        // the EXPLAIN VIRTUAL common blob accurate instead of leaking a full
+        // base-table type list (#145, the sibling symptom to `projection`). The
+        // row-scan sub-path MUST keep `proj_types`: the scan coerces each emitted
+        // Arrow column to the type its declared ExaType accepts before emit_batch,
+        // and it is the same list the EMITS clause is built from.
+        emit_exa_types: if has_aggregates {
+            Vec::new()
+        } else {
+            proj_types.clone()
+        },
         logical_schema,
         name_mapping,
         join: None,

@@ -966,6 +966,63 @@ fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
+/// Regression guard for issue #145: the `LAKEHOUSE_SCAN` common scan spec for
+/// a single-group (no GROUP BY) aggregate query MUST report an empty
+/// `projection` field, both for a bare `COUNT(*)` and a `SUM(score)`.
+///
+/// The aggregate-dispatch path builds its query from `aggregates`/`group_keys`,
+/// never from `projection` (see the doc comment on
+/// [`CommonScanSpec::projection`](lakehouse_engine::scan::spec::CommonScanSpec)),
+/// so `handle_pushdown` leaves it empty rather than splicing in the full
+/// base-table column list `extract_projection` would otherwise fall back to —
+/// that full-row splice is exactly what the reporter observed in #145.
+///
+/// Matches the precise, field-shaped `"projection":[]` marker against the
+/// adapter's OWN emitted scan-spec JSON, mirroring the `"order_by":` marker in
+/// [`ordered_topn_pushes_down_matches_single_node`]: `CommonScanSpec::projection`
+/// has no `skip_serializing_if`, so an empty vector always serializes as
+/// `"projection":[]`, and the common blob is spliced into the pushed SQL via
+/// `sql_string_literal`, which only doubles single quotes — the JSON's double
+/// quotes reach the pushed SQL text unescaped, so the un-escaped substring is
+/// the correct, confirmed marker (not an assumption).
+#[test]
+fn single_group_aggregate_scan_spec_projection_is_empty() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for sql in [
+        format!("SELECT COUNT(*) FROM {}", vs_table()),
+        format!("SELECT SUM(score) FROM {}", vs_table()),
+    ] {
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed_sql.contains("aggregates"),
+            "{sql} must push down as a single-group aggregate (an \
+             'aggregates' field in the scan spec), got:\n{pushed_sql}"
+        );
+        assert!(
+            pushed_sql.contains("\"projection\":[]"),
+            "{sql}'s single-group aggregate scan spec must report an empty \
+             'projection' field (#145: the aggregate-dispatch path reads \
+             'aggregates'/'group_keys', not 'projection', so an empty value \
+             means \"not applicable\", not \"all columns\"), got:\n{pushed_sql}"
+        );
+        // Sibling of the `projection` leak (#145): the aggregate scan emits via
+        // the Value path and never reads `emit_exa_types`, so the aggregate spec
+        // must not leak a full base-table type list into the common blob. Unlike
+        // `projection`, `CommonScanSpec::emit_exa_types` carries
+        // `skip_serializing_if = "Vec::is_empty"`, so an empty value is OMITTED
+        // entirely — the field name must be absent, not `"emit_exa_types":[]`.
+        assert!(
+            !pushed_sql.contains("emit_exa_types"),
+            "{sql}'s single-group aggregate scan spec must omit \
+             'emit_exa_types' (#145 sibling: the aggregate path emits via the \
+             Value path and never reads it; empty + skip_serializing_if means \
+             the field is absent from the common blob), got:\n{pushed_sql}"
+        );
+    }
+}
+
 /// `SUM(LENGTH(col))` — an aggregate over a scalar expression argument, not a
 /// bare column — is pushed down as node-local partial aggregation instead of
 /// falling back to a raw row-scan.
@@ -1582,6 +1639,42 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
         !pushed_sql.contains("SELECT * FROM (SELECT"),
         "EXPLAIN VIRTUAL output must not be a raw row-scan fallback \
          ('SELECT * FROM (SELECT ...)'), got:\n{pushed_sql}"
+    );
+}
+
+/// Regression guard for issue #145: the `LAKEHOUSE_SCAN` common scan spec for
+/// a genuinely decomposed GROUP BY query (single key, real grouped
+/// partial-aggregate pushdown — NOT the undecomposable single-table raw-scan
+/// fallback `build_grouped_qualified_fallback_sql` falls back to, which
+/// legitimately carries a non-empty `projection`) MUST also report an empty
+/// `projection` field.
+///
+/// The grouped path builds its query from `group_keys`/`aggregates`, never
+/// from `projection` (see the doc comment on
+/// [`CommonScanSpec::projection`](lakehouse_engine::scan::spec::CommonScanSpec)),
+/// so leaving it empty is accurate — mirrors
+/// [`single_group_aggregate_scan_spec_projection_is_empty`] for the grouped
+/// dispatch path. [`assert_group_by_pushed_down`] confirms real grouped
+/// pushdown occurred (not the raw-scan fallback) before the `"projection":[]`
+/// marker is checked.
+#[test]
+fn grouped_aggregate_scan_spec_projection_is_empty() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, 4), COUNT(*), SUM(score) FROM {} GROUP BY MOD(id, 4)",
+        vs_table()
+    );
+    assert_group_by_pushed_down(&mut conn, &sql);
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("\"projection\":[]"),
+        "grouped aggregate scan spec must report an empty 'projection' \
+         field (#145: the grouped-dispatch path reads \
+         'group_keys'/'aggregates', not 'projection', so an empty value \
+         means \"not applicable\", not \"all columns\"), got:\n{pushed_sql}"
     );
 }
 
