@@ -17,20 +17,6 @@ The crate is a standalone workspace member with no knowledge of lakehouse-engine
 * *THEN* the translator SHALL return the column name uppercased and double-quoted as a DataFusion identifier
 * *AND* any embedded double-quote characters in the name MUST be escaped by doubling
 
-### Scenario: Literal nodes translate to SQL literal forms
-
-* *GIVEN* a VS expression node of type `literal_string`, `literal_exactnumeric`, `literal_double`, `literal_bool`, `literal_null`, `literal_date`, `literal_timestamp`, or `literal_timestamp_utc`
-* *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL return the corresponding SQL literal:
-  `literal_string` → single-quoted string with internal single-quotes escaped by doubling;
-  `literal_exactnumeric` / `literal_double` → bare numeric value;
-  `literal_bool` → `TRUE` or `FALSE`;
-  `literal_null` → `NULL`;
-  `literal_date` → `DATE 'YYYY-MM-DD'`;
-  `literal_timestamp` → `TIMESTAMP 'YYYY-MM-DD HH:MI:SS'`;
-  `literal_timestamp_utc` → a timestamp-with-timezone literal whose value DataFusion parses as UTC (`TIMESTAMP 'YYYY-MM-DD HH:MI:SS+00:00'` or the equivalent `arrow_cast` to `Timestamp(_, "UTC")`)
-* *AND* the translator MUST NOT produce any SQL injection vector from string literal values
-
 ### Scenario: Comparison predicates translate to binary operator expressions
 
 * *GIVEN* a VS expression node of type `predicate_equal`, `predicate_notequal`, `predicate_less`, `predicate_lessequal`, `predicate_greater`, or `predicate_greaterequal`
