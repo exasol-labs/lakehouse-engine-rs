@@ -2,11 +2,12 @@
 //! and its combination with expression-argument aggregates (Q9b's shape).
 //!
 //! Exercises the scenarios in
-//! `specs/_plans/add-count-distinct-and-expression-aggregate-pushdown/vs-adapter/pushdown-planning-count-distinct/spec.md`
-//! that unit tests cannot reach: the scalar merge UDF actually unioning
-//! per-shard local distinct sets computed by real DataFusion scans over real
-//! Iceberg/Parquet data, and the per-shard safety cap tripping against a real
-//! oversized local set.
+//! `specs/vs-adapter/pushdown-planning-count-distinct/spec.md` that unit tests
+//! cannot reach: real DataFusion DISTINCT row-scans over real Iceberg/Parquet
+//! data, whose per-shard distinct rows are counted by an outer Exasol-native
+//! `COUNT(DISTINCT "V")` (the native-merge path). This includes a
+//! high-cardinality single-shard set far larger than the former per-shard cap
+//! that issue #146 tripped — now it completes and returns the exact count.
 //!
 //! Shares the same Exasol + MinIO + Iceberg REST catalog stack as
 //! `e2e_scan_test.rs` / `e2e_capability_test.rs`. The setup (SLC install,
@@ -27,8 +28,8 @@ use common::exasol_ws::ExaConn;
 use common::seed::{
     DISTINCT_CATEGORY_COL, DISTINCT_CATEGORY_COUNT, DISTINCT_COMMENT_COL,
     DISTINCT_COMMENT_LENGTH_SUM, DISTINCT_REGION_COL, DISTINCT_REGION_COUNT, E2E_DISTINCT_TABLE,
-    E2E_HIGH_CARD_TABLE, E2E_NAMESPACE, HIGH_CARD_COL, seed_distinct_probe, seed_events,
-    seed_high_card_probe,
+    E2E_HIGH_CARD_TABLE, E2E_NAMESPACE, HIGH_CARD_COL, HIGH_CARD_ROWS, seed_distinct_probe,
+    seed_events, seed_high_card_probe,
 };
 use common::stack::{
     bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
@@ -49,9 +50,6 @@ const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
 const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// Scalar merge UDF for single-group COUNT(DISTINCT): third entry point in the
-/// same .so, created in the scan schema alongside the adapter and scan scripts.
-const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
 /// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
 /// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
 const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
@@ -183,14 +181,6 @@ EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
-    // Scalar distinct-merge script — third entry point in the SAME .so, created
-    // in the scan schema alongside the adapter and scan scripts.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
     // File distributor — LUA SET SCRIPT, pure passthrough.
     conn.execute(&format!(
         r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
@@ -238,11 +228,20 @@ fn parse_int(v: &serde_json::Value) -> i64 {
         .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
-/// Runs `EXPLAIN VIRTUAL` for a query and asserts the pushed SQL carries an
-/// `aggregates` field in the scan spec — i.e. single-group aggregate pushdown
-/// occurred — rather than falling back to a raw row-scan that ships every
-/// projected column to Exasol for it to aggregate itself.
-fn assert_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
+/// Runs `EXPLAIN VIRTUAL` for a Case 2/3 `COUNT(DISTINCT)` query (more than one
+/// distinct, or a distinct mixed with an ordinary aggregate) and asserts the pushed
+/// SQL is the DECLINED-fan-out qualified single-table wrapper: the exact select list
+/// (every aggregate, each `COUNT(DISTINCT)` spliced VERBATIM) rendered over a
+/// materialized raw scan aliased `LHS_T0`, so Exasol's own engine aggregates the
+/// returned rows.
+///
+/// This is deliberately NOT the distinct fan-out and NOT a bare row scan: a Case 2/3
+/// request cannot compose per-distinct SELECT-list scalar subqueries (Exasol rejects
+/// an emitting UDF nested in a scalar subquery — `sqlCode 04000`, "emitting function
+/// in expression"), and a bare row scan returns raw columns where Exasol expects one
+/// per aggregate select item (`04000` column-count mismatch, since Exasol never
+/// re-aggregates a declined pushdown).
+fn assert_qualified_wrapper_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
     let resp = conn.execute(&explain_sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -256,9 +255,56 @@ fn assert_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
         .join(" ");
 
     assert!(
-        pushed_sql.contains("aggregates"),
-        "EXPLAIN VIRTUAL output must contain an 'aggregates' field in the scan \
-         spec (single-group aggregate pushdown occurred), got:\n{pushed_sql}"
+        pushed_sql.contains("LHS_T0"),
+        "EXPLAIN VIRTUAL output must be the qualified single-table wrapper (one \
+         aliased raw fan-out subquery, 'AS LHS_T0'), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.to_uppercase().contains("COUNT(DISTINCT"),
+        "the wrapper must render each COUNT(DISTINCT) verbatim over the materialized \
+         scan (Exasol aggregates the returned rows), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains(r#"COUNT(DISTINCT "V")"#),
+        "a Case 2/3 request must NOT emit the Case 1 distinct row-scan fan-out \
+         (COUNT(DISTINCT \"V\")), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains(r#"(SELECT COUNT(DISTINCT "V")"#),
+        "a Case 2/3 request must NOT compose per-distinct SELECT-list scalar \
+         subqueries (the blocked 04000 design), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM (SELECT"),
+        "EXPLAIN VIRTUAL output must not be a raw row-scan fallback \
+         ('SELECT * FROM (SELECT ...)'), got:\n{pushed_sql}"
+    );
+}
+
+/// Runs `EXPLAIN VIRTUAL` for a `COUNT(DISTINCT ...)` query and asserts the
+/// pushed SQL uses the native-merge fan-out — an outer `COUNT(DISTINCT "V")`
+/// over a per-shard DISTINCT row-scan — rather than a raw row-scan fallback that
+/// ships the whole column to Exasol to aggregate itself. This applies ONLY to a
+/// lone single-group `COUNT(DISTINCT)` (Case 1); a Case 2/3 request declines the
+/// fan-out and is asserted with `assert_qualified_wrapper_pushed_down` instead.
+fn assert_count_distinct_fan_out_pushed_down(conn: &mut ExaConn, query_sql: &str) {
+    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
+    let resp = conn.execute(&explain_sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+
+    let pushed_sql: String = cols
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(
+        pushed_sql.to_uppercase().contains("COUNT(DISTINCT"),
+        "EXPLAIN VIRTUAL output must contain a native COUNT(DISTINCT ...) merge \
+         wrapper (the distinct count pushed down as a DISTINCT row-scan fan-out, \
+         not a raw-scan fallback), got:\n{pushed_sql}"
     );
     assert!(
         !pushed_sql.contains("SELECT * FROM (SELECT"),
@@ -272,19 +318,24 @@ fn assert_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
 // ---------------------------------------------------------------------------
 
 /// `COUNT(DISTINCT category)` over `distinct_probe` (seeded across TWO data
-/// files / shards) merges to the correct distinct count, proving:
+/// files / shards) proves the native-merge fan-out dedups AT RUNTIME, not
+/// just in generated SQL text — the `support.rs` SQL-shape unit test can only
+/// assert the wrapper text contains `COUNT(DISTINCT "V")`; only a real
+/// Exasol run over real per-shard data can prove that outer aggregate
+/// actually deduplicates across the shard boundary. Covers:
 ///   - dedup ACROSS shards: "A" appears as a non-NULL `category` value in both
-///     shards (file 1: ids 3,6,9; file 2: ids 12,15,18) — a merge that just
-///     summed per-shard distinct counts would overcount (e.g. 2 + 2 = 4
-///     instead of the correct 3).
+///     shards (file 1: ids 3,6,9; file 2: ids 12,15,18) — a fan-out that just
+///     summed per-shard distinct rows without deduplicating would overcount
+///     (e.g. 2 + 2 = 4 instead of the correct 3).
 ///   - NULL exclusion: 7 of the 20 rows have `category IS NULL`, and none of
 ///     them may contribute to the distinct set.
 ///   - empty result: a WHERE filter matching zero rows returns a distinct
 ///     count of 0, not an error.
-///   - an all-NULL local set edge case (`WHERE category IS NULL`) also merges
-///     to 0, exercising the "shard's local set is empty" path explicitly.
+///   - an all-NULL local set edge case (`WHERE category IS NULL`) also
+///     resolves to 0, exercising the "shard's local DISTINCT row-scan emits
+///     nothing" path explicitly.
 #[test]
-fn count_distinct_merges_across_shards_dedup_null_empty() {
+fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -293,11 +344,8 @@ fn count_distinct_merges_across_shards_dedup_null_empty() {
         "SELECT COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) FROM {}",
         distinct_table()
     );
-    assert_aggregate_pushed_down(&mut conn, &sql);
-    let cols = conn.query_columns(&sql);
-    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
-    assert_eq!(cols[0].len(), 1, "expected 1 row: {cols:?}");
-    let distinct_count = parse_int(&cols[0][0]);
+    assert_count_distinct_fan_out_pushed_down(&mut conn, &sql);
+    let distinct_count = conn.query_scalar_i64(&sql);
     assert_eq!(
         distinct_count, DISTINCT_CATEGORY_COUNT,
         "COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) must be {DISTINCT_CATEGORY_COUNT} \
@@ -312,15 +360,15 @@ fn count_distinct_merges_across_shards_dedup_null_empty() {
     // "B" and "C"), so Iceberg-level file pruning does NOT eliminate either
     // file. A predicate like `id > 1000` would instead prune BOTH files
     // entirely, which trips the unrelated, pre-existing empty-pushdown shape
-    // bug tracked in issue #57 — this sub-case must exercise "the merge UDF
-    // unions per-shard EMPTY `[]` partials", not that bug, so it deliberately
-    // avoids 100%-file-pruning predicates.
+    // bug tracked in issue #57 — this sub-case must exercise "the outer
+    // COUNT(DISTINCT) counts zero rows from per-shard DISTINCT row-scans that
+    // emitted nothing", not that bug, so it deliberately avoids
+    // 100%-file-pruning predicates.
     let empty_sql = format!(
         "SELECT COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) FROM {} WHERE {DISTINCT_CATEGORY_COL} = 'AA'",
         distinct_table()
     );
-    let empty_cols = conn.query_columns(&empty_sql);
-    let empty_count = parse_int(&empty_cols[0][0]);
+    let empty_count = conn.query_scalar_i64(&empty_sql);
     assert_eq!(
         empty_count, 0,
         "COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) over an empty result set must be 0, \
@@ -332,8 +380,7 @@ fn count_distinct_merges_across_shards_dedup_null_empty() {
         "SELECT COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) FROM {} WHERE {DISTINCT_CATEGORY_COL} IS NULL",
         distinct_table()
     );
-    let all_null_cols = conn.query_columns(&all_null_sql);
-    let all_null_count = parse_int(&all_null_cols[0][0]);
+    let all_null_count = conn.query_scalar_i64(&all_null_sql);
     assert_eq!(
         all_null_count, 0,
         "COUNT(DISTINCT {DISTINCT_CATEGORY_COL}) WHERE {DISTINCT_CATEGORY_COL} IS NULL \
@@ -341,19 +388,21 @@ fn count_distinct_merges_across_shards_dedup_null_empty() {
     );
 }
 
-/// `COUNT(DISTINCT token)` over `high_card_probe` — a single shard whose local
-/// distinct set exceeds the per-shard safety cap — fails with a clean,
-/// descriptive error instead of crashing, hanging, or silently returning a
-/// wrong (truncated) count.
+/// The #146 regression proof: `COUNT(DISTINCT token)` over `high_card_probe` —
+/// a single shard whose local distinct set is far larger than the deleted
+/// per-shard byte cap — now COMPLETES (no `ResourcesExhausted`) and returns the
+/// exact single-node distinct count.
 ///
-/// `high_card_probe` is seeded as ONE data file (`HIGH_CARD_ROWS` = 12,000
-/// unique 100-byte `token` values), so with a single file the adapter's
-/// sharding always yields exactly one shard — the WHOLE oversized set lands
-/// on one shard, deterministically tripping `MAX_DISTINCT_BYTES_PER_SHARD`
-/// (`crates/lakehouse-engine/src/scan/mod.rs`) well before
-/// `MAX_DISTINCT_ELEMENTS_PER_SHARD`.
+/// `high_card_probe` is seeded as ONE data file (`HIGH_CARD_ROWS` unique 100-byte
+/// `token` values), so the adapter's sharding yields exactly one shard and the
+/// WHOLE distinct set (~3 MB) lands on it. Under the old JSON-serialized
+/// distinct-set path this deterministically exceeded the 1,048,576-byte per-shard
+/// budget and failed with `ResourcesExhausted`. Under the native-merge path each
+/// shard-local distinct value streams as one row and Exasol's own
+/// `COUNT(DISTINCT "V")` counts the union — no cap, exact result. Every token is
+/// unique, so the distinct count equals `HIGH_CARD_ROWS`.
 #[test]
-fn high_cardinality_count_distinct_fails_cleanly() {
+fn high_cardinality_count_distinct_completes() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -361,40 +410,42 @@ fn high_cardinality_count_distinct_fails_cleanly() {
         "SELECT COUNT(DISTINCT {HIGH_CARD_COL}) FROM {}",
         high_card_table()
     );
-    let resp = conn.try_execute(&sql);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "COUNT(DISTINCT {HIGH_CARD_COL}) over a per-shard-cap-exceeding column \
-         must fail cleanly, not succeed with a (necessarily wrong) answer: {resp}"
-    );
 
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    assert!(
-        !msg.is_empty(),
-        "the safety-cap error must carry a descriptive message, got empty: {resp}"
-    );
-    assert!(
-        msg.to_uppercase().contains(&HIGH_CARD_COL.to_uppercase()),
-        "the safety-cap error should name the offending column '{HIGH_CARD_COL}' \
-         (column names surface uppercase in pushdown SQL/errors): {msg}"
-    );
-    assert!(
-        msg.to_lowercase().contains("cap") || msg.to_lowercase().contains("exceed"),
-        "the safety-cap error should describe a bounded-resource cap being exceeded: {msg}"
+    // The count must go through the native-merge fan-out (outer COUNT(DISTINCT
+    // "V") over a per-shard DISTINCT row-scan) — not a raw-scan fallback that
+    // would leave the aggregation to Exasol and so bypass the #146-fixed path.
+    assert_count_distinct_fan_out_pushed_down(&mut conn, &sql);
+
+    // `query_scalar_i64` runs the query and asserts success internally, so a
+    // ResourcesExhausted regression surfaces as a clear failure here rather than
+    // a silent wrong answer.
+    let distinct_count = conn.query_scalar_i64(&sql);
+    assert_eq!(
+        distinct_count, HIGH_CARD_ROWS as i64,
+        "COUNT(DISTINCT {HIGH_CARD_COL}) over {HIGH_CARD_ROWS} unique tokens must \
+         complete and equal {HIGH_CARD_ROWS} (the exact single-node distinct \
+         count), got {distinct_count}"
     );
 }
 
 /// A single query combining multiple `COUNT(DISTINCT ...)` columns AND a
 /// `SUM(LENGTH(...))`-shaped expression aggregate — the TPC-H Q9b shape
-/// (see `bench/run.sh`'s "Q9b wide projection" query) — pushes down as ONE
-/// aggregate plan and returns all values correctly together.
+/// (see `bench/run.sh`'s "Q9b wide projection" query) — is a Case 3 request
+/// (more than one distinct, mixed with an ordinary aggregate). It DECLINES the
+/// distinct fan-out (which cannot compose in one SELECT list — `sqlCode 04000`,
+/// "emitting function in expression") and routes to the qualified single-table
+/// wrapper: every aggregate, each `COUNT(DISTINCT)` spliced VERBATIM, rendered over
+/// a materialized sharded raw scan aliased `LHS_T0`, so Exasol's own engine
+/// aggregates the returned rows. The wrapper's output is exactly N = 3 aggregate
+/// columns (one per select item — not the raw row count, not the old
+/// independent-scalar-subquery shape), and every value matches the single-node
+/// (non-pushdown) result.
 ///
-/// `distinct_probe`: `COUNT(DISTINCT category)` = 3, `COUNT(DISTINCT region)`
-/// = 4 (independent columns, merged independently), `SUM(LENGTH(comment))`
-/// = 210 (comment length == id, summed 1..=20).
+/// `distinct_probe`: `COUNT(DISTINCT category)` = 3, `COUNT(DISTINCT region)` = 4,
+/// `SUM(LENGTH(comment))` = 210 (comment length == id, summed 1..=20) — the known
+/// single-node values the wrapper must reproduce exactly.
 #[test]
-fn q9b_multiple_count_distinct_and_expression_agg() {
+fn q9b_multi_count_distinct_matches_single_node() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -403,9 +454,12 @@ fn q9b_multiple_count_distinct_and_expression_agg() {
          SUM(LENGTH({DISTINCT_COMMENT_COL})) FROM {}",
         distinct_table()
     );
-    assert_aggregate_pushed_down(&mut conn, &sql);
+    // Case 3 declines the fan-out and returns the qualified single-table wrapper.
+    assert_qualified_wrapper_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
+    // N aggregate columns, one per select item — NOT the raw row count and NOT the
+    // blocked per-distinct scalar-subquery shape.
     assert_eq!(cols.len(), 3, "expected 3 aggregate columns: {cols:?}");
     assert_eq!(cols[0].len(), 1, "expected 1 row: {cols:?}");
 
@@ -437,6 +491,55 @@ fn q9b_multiple_count_distinct_and_expression_agg() {
         comment_length_sum, DISTINCT_COMMENT_LENGTH_SUM,
         "SUM(LENGTH({DISTINCT_COMMENT_COL})) must be {DISTINCT_COMMENT_LENGTH_SUM}, \
          got {comment_length_sum}"
+    );
+}
+
+/// A single-group `COUNT(DISTINCT <string-expression>)` — the expression-argument
+/// distinct case (issue #146 code-review follow-up, task 6.1). The fan-out's `"V"`
+/// column carries the RAW VALUES of the counted EXPRESSION, not a count. If `"V"`
+/// were declared with the COUNT's own (integer) result type — as it was before the
+/// fix — the scan would coerce the expression's non-numeric string values to
+/// DECIMAL at emit, turning every value into NULL and silently returning 0. With
+/// `"V"` declared VARCHAR the string values survive, so Exasol's native
+/// `COUNT(DISTINCT "V")` returns the exact single-node count.
+///
+/// `UPPER(category)` is idempotent on the already-uppercase {A,B,C} values (NULLs
+/// excluded) → 3; `LOWER(region)` is idempotent on the lowercase
+/// {north,central,south,east} values (no NULLs) → 4. Both exercise a string-valued
+/// expression argument across the two-shard `distinct_probe` fixture, so a wrong
+/// value type would surface as a wrong count.
+#[test]
+fn count_distinct_string_expression_argument_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // UPPER(category): string-valued expression, NULLs excluded → 3 distinct.
+    let upper_sql = format!(
+        "SELECT COUNT(DISTINCT UPPER({DISTINCT_CATEGORY_COL})) FROM {}",
+        distinct_table()
+    );
+    assert_count_distinct_fan_out_pushed_down(&mut conn, &upper_sql);
+    let upper_count = conn.query_scalar_i64(&upper_sql);
+    assert_eq!(
+        upper_count, DISTINCT_CATEGORY_COUNT,
+        "COUNT(DISTINCT UPPER({DISTINCT_CATEGORY_COL})) must be \
+         {DISTINCT_CATEGORY_COUNT} (string values {{A,B,C}}, NULLs excluded) — a 0 \
+         here is the pre-fix defect (string values coerced to DECIMAL → NULL), got \
+         {upper_count}"
+    );
+
+    // LOWER(region): string-valued expression, no NULLs → 4 distinct.
+    let lower_sql = format!(
+        "SELECT COUNT(DISTINCT LOWER({DISTINCT_REGION_COL})) FROM {}",
+        distinct_table()
+    );
+    assert_count_distinct_fan_out_pushed_down(&mut conn, &lower_sql);
+    let lower_count = conn.query_scalar_i64(&lower_sql);
+    assert_eq!(
+        lower_count, DISTINCT_REGION_COUNT,
+        "COUNT(DISTINCT LOWER({DISTINCT_REGION_COL})) must be \
+         {DISTINCT_REGION_COUNT} (string values {{north,central,south,east}}), got \
+         {lower_count}"
     );
 }
 

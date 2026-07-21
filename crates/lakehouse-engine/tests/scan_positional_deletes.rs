@@ -214,6 +214,7 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),

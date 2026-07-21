@@ -412,15 +412,11 @@ fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
 /// operator string, and parenthesization the translator supports with zero risk of
 /// drifting from it. Returns `None` if the structure cannot be rendered or a nested
 /// aggregate is not among `plans` (cannot be merged).
-fn render_scalar_over_merge(
-    node: &Json,
-    plans: &[AggregatePlan],
-    merge_udf_name: &str,
-) -> Option<String> {
+fn render_scalar_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
-    let merged = merge_select_items(plans, merge_udf_name);
+    let merged = merge_select_items(plans);
     let mut sql = render_expression(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg)?;
@@ -582,7 +578,6 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     limit: Option<u64>,
     col_types: &[(String, String)],
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
     having: Option<&str>,
     order_by: Option<&str>,
@@ -611,7 +606,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
             _ => format!(r#""GK_{i}""#),
         })
         .collect();
-    let merge_items = cast_merge_items(aggregates, aggregate_types, merge_udf_name);
+    let merge_items = cast_merge_items(aggregates, aggregate_types);
 
     // Assemble the outer SELECT in the user's selectList order: each classified
     // item is placed at its original ordinal, interleaving group-key casts and
@@ -641,7 +636,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 node,
                 declared_type,
                 ..
-            } => render_scalar_over_merge(node, aggregates, merge_udf_name)
+            } => render_scalar_over_merge(node, aggregates)
                 .map(|expr| cast_to_declared_type(&expr, declared_type)),
         })
         .collect();
@@ -721,29 +716,37 @@ pub(super) fn partial_emits_items(
                     vec![format!(r#""PARTIAL_count_{i}" DECIMAL(20,0)"#)]
                 }
                 AggKind::Sum => {
-                    let ty = col_type_for(plan, col_types, declared);
+                    let ty = col_type_for(
+                        plan.column.as_deref(),
+                        plan.arg_expr.as_deref(),
+                        col_types,
+                        declared,
+                    );
                     let emit_ty = sum_emit_type(&ty);
                     vec![format!(r#""PARTIAL_sum_{i}" {emit_ty}"#)]
                 }
                 AggKind::Min => {
-                    let ty = col_type_for(plan, col_types, declared);
+                    let ty = col_type_for(
+                        plan.column.as_deref(),
+                        plan.arg_expr.as_deref(),
+                        col_types,
+                        declared,
+                    );
                     vec![format!(r#""PARTIAL_min_{i}" {ty}"#)]
                 }
                 AggKind::Max => {
-                    let ty = col_type_for(plan, col_types, declared);
+                    let ty = col_type_for(
+                        plan.column.as_deref(),
+                        plan.arg_expr.as_deref(),
+                        col_types,
+                        declared,
+                    );
                     vec![format!(r#""PARTIAL_max_{i}" {ty}"#)]
                 }
                 AggKind::Avg => vec![
                     format!(r#""PARTIAL_avg_sum_{i}" DOUBLE PRECISION"#),
                     format!(r#""PARTIAL_avg_cnt_{i}" DECIMAL(20,0)"#),
                 ],
-                // COUNT(DISTINCT) emits its shard-local distinct set as one JSON
-                // array string — always VARCHAR(2000000), independent of the
-                // underlying column's own type. A scalar merge UDF unions the
-                // per-shard arrays and returns the final cardinality.
-                AggKind::CountDistinct => {
-                    vec![format!(r#""PARTIAL_cd_{i}" VARCHAR(2000000)"#)]
-                }
                 // Stat family: 3 columns — cnt (DECIMAL), sum (DOUBLE), sumsq (DOUBLE).
                 AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
                     vec![
@@ -766,19 +769,19 @@ pub(super) fn partial_emits_items(
 /// aggregate item's declared result type (`declared`, from
 /// `aggregate_exasol_types`/`selectListDataTypes`); when the declared type is
 /// unavailable it falls back to the column-map lookup (then `DOUBLE PRECISION`).
-fn col_type_for(
-    plan: &AggregatePlan,
+pub(super) fn col_type_for(
+    column: Option<&str>,
+    arg_expr: Option<&str>,
     col_types: &[(String, String)],
     declared: Option<&str>,
 ) -> String {
-    if plan.column.is_none()
-        && plan.arg_expr.is_some()
+    if column.is_none()
+        && arg_expr.is_some()
         && let Some(ty) = declared
     {
         return ty.to_string();
     }
-    plan.column
-        .as_deref()
+    column
         .and_then(|col| {
             col_types
                 .iter()
@@ -815,8 +818,6 @@ fn sum_emit_type(col_ty: &str) -> String {
 ///
 /// SUM and the STDDEV/VARIANCE family are only valid over DOUBLE PRECISION or DECIMAL columns.
 /// MIN/MAX are valid over any comparable type (DATE, TIMESTAMP, VARCHAR included).
-/// `CountDistinct` is valid over any type (its partial is a VARCHAR JSON array),
-/// so it is never numeric-checked here.
 /// Returns `false` (fall back to row scan) when any SUM or stat aggregate targets a
 /// non-numeric column.
 ///
@@ -839,7 +840,12 @@ pub fn validate_agg_col_types(
                 | AggKind::StddevSamp
         );
         if needs_numeric {
-            let ty = col_type_for(plan, col_types, None);
+            let ty = col_type_for(
+                plan.column.as_deref(),
+                plan.arg_expr.as_deref(),
+                col_types,
+                None,
+            );
             if !is_numeric_exasol_type(&ty) {
                 return false;
             }
@@ -872,7 +878,7 @@ fn is_numeric_exasol_type(ty: &str) -> bool {
 ///   empty tables (N=0, pop) and single-row groups (N=1, samp).
 ///   The GREATEST(0.0, …) inside the ELSE branch guards against tiny-negative
 ///   float rounding artifacts that would otherwise cause SQRT to error.
-fn merge_select_items(aggregates: &[AggregatePlan], merge_udf_name: &str) -> Vec<String> {
+fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
     aggregates
         .iter()
         .enumerate()
@@ -883,14 +889,6 @@ fn merge_select_items(aggregates: &[AggregatePlan], merge_udf_name: &str) -> Vec
             AggKind::Max => format!(r#"MAX("PARTIAL_max_{i}")"#),
             AggKind::Avg => {
                 format!(r#"SUM("PARTIAL_avg_sum_{i}") / NULLIF(SUM("PARTIAL_avg_cnt_{i}"), 0)"#)
-            }
-            // COUNT(DISTINCT): each shard emitted its local distinct set as one
-            // JSON array string in `PARTIAL_cd_{i}`. LISTAGG concatenates the
-            // per-shard arrays with `,`; wrapping in `[` … `]` yields a JSON
-            // array-of-arrays, which the scalar merge UDF unions and counts. The
-            // merge UDF name is schema-qualified the same way the scan UDF is.
-            AggKind::CountDistinct => {
-                format!(r#"{merge_udf_name}('[' || LISTAGG("PARTIAL_cd_{i}", ',') || ']')"#)
             }
             AggKind::VarPop => {
                 // numer / SUM(cnt); NULL when cnt = 0
@@ -955,11 +953,7 @@ fn merge_select_items(aggregates: &[AggregatePlan], merge_udf_name: &str) -> Vec
 /// Returns `None` if the predicate references an aggregate not among `plans`
 /// (cannot be merged) or contains an unsupported node — the caller then
 /// declines the grouped pushdown rather than emit a wrong or dropped HAVING.
-pub(super) fn render_having_over_merge(
-    node: &Json,
-    plans: &[AggregatePlan],
-    merge_udf_name: &str,
-) -> Option<String> {
+pub(super) fn render_having_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
     if !node.is_object() {
         return None;
     }
@@ -972,23 +966,17 @@ pub(super) fn render_having_over_merge(
     if kind == "function_aggregate" {
         let plan = parse_agg_item(node)?;
         let idx = plans.iter().position(|p| *p == plan)?;
-        return merge_select_items(plans, merge_udf_name)
-            .into_iter()
-            .nth(idx);
+        return merge_select_items(plans).into_iter().nth(idx);
     }
 
     // Boolean / comparison predicate nodes that can appear in a HAVING. Operator
     // strings and parenthesization mirror `vs-expression`'s renderer so output
     // matches conventions.
     match kind {
-        "predicate_and" => {
-            render_having_junction(child("expressions"), plans, " AND ", merge_udf_name)
-        }
-        "predicate_or" => {
-            render_having_junction(child("expressions"), plans, " OR ", merge_udf_name)
-        }
+        "predicate_and" => render_having_junction(child("expressions"), plans, " AND "),
+        "predicate_or" => render_having_junction(child("expressions"), plans, " OR "),
         "predicate_not" => {
-            let inner = render_having_operand(child("expression"), plans, merge_udf_name)?;
+            let inner = render_having_operand(child("expression"), plans)?;
             Some(format!("(NOT {inner})"))
         }
         "predicate_equal"
@@ -1006,22 +994,22 @@ pub(super) fn render_having_over_merge(
                 "predicate_greaterequal" => ">=",
                 _ => unreachable!(),
             };
-            let left = render_having_operand(child("left"), plans, merge_udf_name)?;
-            let right = render_having_operand(child("right"), plans, merge_udf_name)?;
+            let left = render_having_operand(child("left"), plans)?;
+            let right = render_having_operand(child("right"), plans)?;
             Some(format!("({left} {op} {right})"))
         }
         "predicate_between" => {
-            let target = render_having_operand(child("expression"), plans, merge_udf_name)?;
-            let low = render_having_operand(child("left"), plans, merge_udf_name)?;
-            let high = render_having_operand(child("right"), plans, merge_udf_name)?;
+            let target = render_having_operand(child("expression"), plans)?;
+            let low = render_having_operand(child("left"), plans)?;
+            let high = render_having_operand(child("right"), plans)?;
             Some(format!("({target} BETWEEN {low} AND {high})"))
         }
         "predicate_is_null" => {
-            let inner = render_having_operand(child("expression"), plans, merge_udf_name)?;
+            let inner = render_having_operand(child("expression"), plans)?;
             Some(format!("({inner} IS NULL)"))
         }
         "predicate_is_not_null" => {
-            let inner = render_having_operand(child("expression"), plans, merge_udf_name)?;
+            let inner = render_having_operand(child("expression"), plans)?;
             Some(format!("({inner} IS NOT NULL)"))
         }
         _ => None,
@@ -1032,11 +1020,7 @@ pub(super) fn render_having_over_merge(
 /// expression; any other node (column, literal, scalar function, arithmetic,
 /// or nested predicate) delegates to `render_having_over_merge` — which itself
 /// falls back to `render_expression` for non-predicate, non-aggregate nodes.
-fn render_having_operand(
-    node: Option<&Json>,
-    plans: &[AggregatePlan],
-    merge_udf_name: &str,
-) -> Option<String> {
+fn render_having_operand(node: Option<&Json>, plans: &[AggregatePlan]) -> Option<String> {
     let node = node.filter(|n| !n.is_null())?;
     let kind = node.get("type").and_then(|t| t.as_str())?;
     match kind {
@@ -1052,7 +1036,7 @@ fn render_having_operand(
         | "predicate_greaterequal"
         | "predicate_between"
         | "predicate_is_null"
-        | "predicate_is_not_null" => render_having_over_merge(node, plans, merge_udf_name),
+        | "predicate_is_not_null" => render_having_over_merge(node, plans),
         // Any other node (literal, column, scalar function, arithmetic): render over
         // the merge wrapper, rewriting EVERY nested `function_aggregate` to its merged
         // `PARTIAL_*` expression. A scalar function wrapping an aggregate (e.g.
@@ -1060,7 +1044,7 @@ fn render_having_operand(
         // rendered verbatim over absent source columns — the fix that closes issue
         // #82's gap, which also covers a scalar-over-aggregate inside a HAVING. A
         // node with no nested aggregate renders exactly as `vs-expression` would.
-        _ => render_scalar_over_merge(node, plans, merge_udf_name),
+        _ => render_scalar_over_merge(node, plans),
     }
 }
 
@@ -1071,12 +1055,11 @@ fn render_having_junction(
     expressions: Option<&Json>,
     plans: &[AggregatePlan],
     op: &str,
-    merge_udf_name: &str,
 ) -> Option<String> {
     let items = expressions?.as_array()?;
     let mut parts = Vec::with_capacity(items.len());
     for item in items {
-        parts.push(render_having_over_merge(item, plans, merge_udf_name)?);
+        parts.push(render_having_over_merge(item, plans)?);
     }
     match parts.len() {
         0 => None,
@@ -1095,9 +1078,8 @@ fn render_having_junction(
 pub(super) fn cast_merge_items(
     aggregates: &[AggregatePlan],
     aggregate_types: &[String],
-    merge_udf_name: &str,
 ) -> Vec<String> {
-    merge_select_items(aggregates, merge_udf_name)
+    merge_select_items(aggregates)
         .into_iter()
         .enumerate()
         .map(|(i, expr)| match aggregate_types.get(i) {
@@ -1123,10 +1105,12 @@ fn cast_to_declared_type(expr: &str, declared_type: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::detect_aggregates;
-    use super::super::joins::{build_grouped_qualified_fallback_sql, full_row_projection};
+    use super::super::joins::{
+        build_qualified_single_table_fallback_sql, referenced_column_projection,
+    };
     use super::super::support::{
-        DISTINCT_MERGE_UDF_NAME, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types,
-        extract_all_column_types, shard_count,
+        DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
+        shard_count,
     };
     use super::super::test_support::*;
     use super::*;
@@ -1406,6 +1390,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(result.plans.clone()),
             group_keys: Some(result.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1465,7 +1450,6 @@ mod tests {
             None,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             Some("1 ASC NULLS LAST"),
@@ -1600,6 +1584,7 @@ mod tests {
                 order_by: Vec::new(),
                 aggregates: Some(result.plans.clone()),
                 group_keys: Some(result.group_keys.clone()),
+                distinct: false,
                 emit_exa_types: Vec::new(),
                 logical_schema: Vec::new(),
                 name_mapping: Vec::new(),
@@ -1621,7 +1606,6 @@ mod tests {
             None,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -1880,6 +1864,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(result.plans.clone()),
             group_keys: Some(result.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1904,7 +1889,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -1975,6 +1959,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2002,7 +1987,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -2159,6 +2143,7 @@ mod tests {
                 arg_expr: None,
             }]),
             group_keys: Some(vec!["\"REGION\"".into()]),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2187,7 +2172,6 @@ mod tests {
             Some(100),
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -2325,6 +2309,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2349,7 +2334,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             having,
             None,
@@ -2598,6 +2582,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(d.plans.clone()),
             group_keys: Some(d.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2621,7 +2606,6 @@ mod tests {
             None,
             &soa_col_types(),
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -2842,7 +2826,11 @@ mod tests {
             ]}]
         });
         let all_cols = extract_all_column_types(&request);
-        let (proj_cols, proj_types) = full_row_projection(&all_cols);
+        // The shared referenced-column helper (issue #160) narrows the inner scan to
+        // only the columns the wrapper references — here L_RETURNFLAG (GROUP BY +
+        // select) and X, Y (nested inside the SUM/COUNT aggregate arguments), which is
+        // the whole table, so the wrapper shape is identical to the old full-row scan.
+        let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
         let fan_out_spec = ScanSpec {
             table_root: String::new(),
             files: vec![],
@@ -2852,6 +2840,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: proj_types,
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2864,13 +2853,12 @@ mod tests {
             instance_overhead_mb: 200,
             s3_max_connections: 8,
         };
-        let sql = build_grouped_qualified_fallback_sql(
+        let sql = build_qualified_single_table_fallback_sql(
             &request,
             &pushdown_req,
             &fan_out_spec,
             &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         )
         .expect("qualified fallback must build");
@@ -2919,7 +2907,7 @@ mod tests {
             column: Some("SCORE".into()),
             arg_expr: None,
         }];
-        let rendered = render_having_over_merge(&having, &plans, DISTINCT_MERGE_UDF_NAME)
+        let rendered = render_having_over_merge(&having, &plans)
             .expect("HAVING over a known aggregate must render");
         assert_eq!(
             rendered, r#"(SUM("PARTIAL_sum_0") > 250)"#,
@@ -2954,9 +2942,8 @@ mod tests {
             "left": agg_item("SUM", Some("SCORE"), false),
             "right": {"type": "literal_exactnumeric", "value": 250},
         });
-        let having =
-            render_having_over_merge(&having_node, &detection.plans, DISTINCT_MERGE_UDF_NAME)
-                .expect("HAVING must render over the merge decomposition");
+        let having = render_having_over_merge(&having_node, &detection.plans)
+            .expect("HAVING must render over the merge decomposition");
 
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
@@ -2969,6 +2956,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -2993,7 +2981,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             Some(&having),
             None,
@@ -3028,7 +3015,7 @@ mod tests {
             arg_expr: None,
         }];
         assert!(
-            render_having_over_merge(&having, &plans, DISTINCT_MERGE_UDF_NAME).is_none(),
+            render_having_over_merge(&having, &plans).is_none(),
             "HAVING over an aggregate absent from the plans must not render"
         );
     }
@@ -3063,6 +3050,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -3087,7 +3075,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             None,
             None,
@@ -3139,9 +3126,8 @@ mod tests {
             "left": agg_item("SUM", Some("SCORE"), false),
             "right": {"type": "literal_exactnumeric", "value": 100},
         });
-        let having =
-            render_having_over_merge(&having_node, &detection.plans, DISTINCT_MERGE_UDF_NAME)
-                .expect("HAVING must render over the merge decomposition");
+        let having = render_having_over_merge(&having_node, &detection.plans)
+            .expect("HAVING must render over the merge decomposition");
 
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
@@ -3154,6 +3140,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -3183,7 +3170,6 @@ mod tests {
             Some(2),
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             Some(&having),
             None,
@@ -3386,7 +3372,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         // Must contain NULLIF(..., 0) guard on the count
         assert!(
             sql.contains("NULLIF"),
@@ -3407,7 +3393,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         // Must use CASE WHEN … <= 1 THEN NULL to guard count<=1 → NULL.
         // Checking both `<= 1` and `CASE` ensures the N-1 sample divisor guard
         // is specifically present — not just any CASE or NULLIF in the expression.
@@ -3429,7 +3415,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         assert!(sql.contains("SQRT("), "stddev_pop must use SQRT: {sql}");
         assert!(
             !sql.contains("- 1"),
@@ -3445,7 +3431,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         assert!(sql.contains("SQRT("), "stddev_samp must use SQRT: {sql}");
         // N-1 guard: removing the N<=1 CASE would break this assertion.
         assert!(
@@ -3469,7 +3455,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         // Must contain a NULL guard (CASE … IS NULL) that wraps the whole expression.
         assert!(
             sql.contains("IS NULL"),
@@ -3493,7 +3479,7 @@ mod tests {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let sql = merge_select_items(&plans, DISTINCT_MERGE_UDF_NAME).join(", ");
+        let sql = merge_select_items(&plans).join(", ");
         // Must contain a NULL guard that wraps the whole expression.
         assert!(
             sql.contains("IS NULL"),
@@ -3604,6 +3590,7 @@ mod tests {
                 arg_expr: None,
             }]),
             group_keys: Some(vec![r#""REGION""#.to_string()]),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -3636,7 +3623,6 @@ mod tests {
             None,
             &col_types,
             SCAN_UDF_NAME,
-            DISTINCT_MERGE_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
             having_filter.as_deref(),
             None,

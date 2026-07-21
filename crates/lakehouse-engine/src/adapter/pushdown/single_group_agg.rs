@@ -8,19 +8,48 @@ use crate::scan::spec::{AggKind, AggregatePlan};
 use serde_json::Value as Json;
 use vs_expression::render_expression;
 
-/// Inspect the pushdown request's `selectList` and return the aggregate plan
-/// if every select-list item is a supported single-group aggregate.
+/// One resolved single-group select-list item, in select-list order.
+///
+/// An ordinary aggregate ([`SingleGroupItem::Aggregate`]) is computed node-locally
+/// as a partial result and merged by the outer wrapper's aggregate expression. A
+/// `COUNT(DISTINCT ...)` ([`SingleGroupItem::Distinct`]) is NOT an aggregate
+/// partial: it is decomposed into its own DISTINCT row-scan fan-out counted by an
+/// outer Exasol-native `COUNT(DISTINCT "V")` — see
+/// `vs-adapter/pushdown-planning-count-distinct`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleGroupItem {
+    /// An ordinary aggregate served by the shared per-shard partial-aggregate scan.
+    Aggregate(AggregatePlan),
+    /// A `COUNT(DISTINCT col|expr)` served by its own DISTINCT row-scan fan-out.
+    Distinct(DistinctCount),
+}
+
+/// A single-group `COUNT(DISTINCT col)` / `COUNT(DISTINCT expr)` descriptor.
+///
+/// Exactly one of `column` (bare-column fast path) or `arg_expr` (a rendered
+/// DataFusion SQL fragment) is populated, mirroring [`AggregatePlan`]. It carries
+/// no `AggKind`: the distinct count is realized as a DISTINCT row-scan fan-out over
+/// this argument (`CommonScanSpec::distinct`), not as an aggregate partial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistinctCount {
+    pub column: Option<String>,
+    pub arg_expr: Option<String>,
+}
+
+/// Inspect the pushdown request's `selectList` and return one resolved
+/// [`SingleGroupItem`] per item, in order, if every select-list item is a
+/// supported single-group aggregate.
 ///
 /// Returns `None` (fall back to row scan) when any of the following hold:
 /// - `groupBy` is present and non-empty (GROUP BY not supported)
 /// - any select item has `distinct: true` OTHER than a `COUNT(DISTINCT ...)`
-///   (single-group `COUNT(DISTINCT col)` / `COUNT(DISTINCT expr)` is accepted as
-///   [`AggKind::CountDistinct`]; DISTINCT SUM/AVG/etc. still decline)
+///   (single-group `COUNT(DISTINCT col)` / `COUNT(DISTINCT expr)` is accepted as a
+///   [`SingleGroupItem::Distinct`] fan-out; DISTINCT SUM/AVG/etc. still decline)
 /// - any select item is not one of COUNT(*), COUNT(col)/COUNT(expr),
 ///   SUM/MIN/MAX/AVG (bare column or renderable expression), or the
 ///   STDDEV/VARIANCE family
 /// - the select list is absent or empty
-pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<AggregatePlan>> {
+pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<SingleGroupItem>> {
     // Reject GROUP BY.
     if pushdown_req
         .get("groupBy")
@@ -36,22 +65,60 @@ pub fn detect_aggregates(pushdown_req: &Json) -> Option<Vec<AggregatePlan>> {
         return None;
     }
 
-    let mut plans = Vec::with_capacity(list.len());
+    let mut items = Vec::with_capacity(list.len());
     for item in list {
         // Every item must be a function_aggregate.
         if item.get("type").and_then(|t| t.as_str()) != Some("function_aggregate") {
             return None;
         }
-        // A single-group COUNT(DISTINCT ...) is decomposed into a per-shard local
-        // distinct set; every OTHER distinct aggregate declines via parse_agg_item.
-        let plan = match parse_count_distinct(item) {
-            Some(distinct_plan) => distinct_plan,
-            None => parse_agg_item(item)?,
+        // A single-group COUNT(DISTINCT ...) becomes a DISTINCT row-scan fan-out;
+        // every OTHER distinct aggregate declines via parse_agg_item.
+        let resolved = match parse_count_distinct(item) {
+            Some(distinct) => SingleGroupItem::Distinct(distinct),
+            None => SingleGroupItem::Aggregate(parse_agg_item(item)?),
         };
-        plans.push(plan);
+        items.push(resolved);
     }
 
-    Some(plans)
+    Some(items)
+}
+
+/// The ordinary (non-distinct) aggregate plans among `items`, in order.
+///
+/// These drive the shared per-shard partial-aggregate scan and
+/// [`validate_agg_col_types`](super::validate_agg_col_types); the distinct items
+/// are handled separately as DISTINCT row-scan fan-outs.
+///
+/// `pub` (not `pub(super)`): this is the boundary that lets callers outside the
+/// `pushdown` module (e.g. integration tests) obtain a nameable `Vec<AggregatePlan>`
+/// from the opaque [`SingleGroupItem`] returned by [`detect_aggregates`] without
+/// ever naming `SingleGroupItem` itself.
+pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            SingleGroupItem::Aggregate(plan) => Some(plan.clone()),
+            SingleGroupItem::Distinct(_) => None,
+        })
+        .collect()
+}
+
+/// Whether any item is a `COUNT(DISTINCT ...)` needing its own row-scan fan-out.
+pub(super) fn has_distinct(items: &[SingleGroupItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item, SingleGroupItem::Distinct(_)))
+}
+
+/// Whether the select list is EXACTLY one `COUNT(DISTINCT ...)` and nothing else —
+/// the ONLY shape that fans out to a dedicated DISTINCT row-scan counted by a native
+/// `COUNT(DISTINCT "V")` (Case 1). Any other distinct shape (more than one distinct,
+/// or a distinct alongside an ordinary SUM/MIN/MAX/COUNT/AVG aggregate — Case 2/3)
+/// declines the fan-out and routes to the qualified single-table wrapper: no
+/// composition of several scalar-subquery emitting-UDF calls in one select list
+/// compiles in Exasol (`sqlCode 04000`, "emitting function in expression").
+pub(super) fn is_lone_count_distinct(items: &[SingleGroupItem]) -> bool {
+    matches!(items, [SingleGroupItem::Distinct(_)])
 }
 
 /// Extract the column name (uppercase) from the first argument of an aggregate function.
@@ -92,7 +159,7 @@ fn arg_column_or_expr(args: Option<&Vec<Json>>) -> Option<(Option<String>, Optio
 }
 
 /// Parse a single-group `COUNT(DISTINCT ...)` select-list item into a
-/// [`AggKind::CountDistinct`] plan.
+/// [`DistinctCount`] fan-out descriptor.
 ///
 /// Handles both `COUNT(DISTINCT col)` (bare-column fast path) and
 /// `COUNT(DISTINCT expr)` (rendered argument), mirroring how `COUNT(col)` /
@@ -101,7 +168,7 @@ fn arg_column_or_expr(args: Option<&Vec<Json>>) -> Option<(Option<String>, Optio
 /// expression — the single-group caller then defers to [`parse_agg_item`]
 /// (which declines every other `distinct: true` item), so grouped
 /// `COUNT(DISTINCT)` and other distinct aggregates still fall back to row scan.
-fn parse_count_distinct(item: &Json) -> Option<AggregatePlan> {
+fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
     if item.get("distinct").and_then(|d| d.as_bool()) != Some(true) {
         return None;
     }
@@ -115,11 +182,7 @@ fn parse_count_distinct(item: &Json) -> Option<AggregatePlan> {
     }
     let args = item.get("arguments").and_then(|a| a.as_array());
     let (column, arg_expr) = arg_column_or_expr(args)?;
-    Some(AggregatePlan {
-        kind: AggKind::CountDistinct,
-        column,
-        arg_expr,
-    })
+    Some(DistinctCount { column, arg_expr })
 }
 
 /// Parse a single `function_aggregate` select-list item into an `AggregatePlan`.
@@ -236,6 +299,23 @@ mod tests {
     use super::super::validate_agg_col_types;
     use super::*;
 
+    /// Extract the [`AggregatePlan`] from an ordinary-aggregate item, panicking on a
+    /// `COUNT(DISTINCT)` item — the detection tests assert the ordinary shape.
+    fn agg_of(item: &SingleGroupItem) -> &AggregatePlan {
+        match item {
+            SingleGroupItem::Aggregate(plan) => plan,
+            SingleGroupItem::Distinct(_) => panic!("expected an ordinary aggregate item"),
+        }
+    }
+
+    /// Extract the [`DistinctCount`] from a `COUNT(DISTINCT)` item.
+    fn distinct_of(item: &SingleGroupItem) -> &DistinctCount {
+        match item {
+            SingleGroupItem::Distinct(dc) => dc,
+            SingleGroupItem::Aggregate(_) => panic!("expected a COUNT(DISTINCT) item"),
+        }
+    }
+
     /// `LENGTH(<col>)` scalar-expression node — renders to `character_length("<COL>")`.
     fn length_expr(col: &str) -> serde_json::Value {
         serde_json::json!({
@@ -267,8 +347,8 @@ mod tests {
         });
         let plans = detect_aggregates(&req).expect("should detect COUNT(*)");
         assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].kind, AggKind::Count);
-        assert!(plans[0].column.is_none());
+        assert_eq!(agg_of(&plans[0]).kind, AggKind::Count);
+        assert!(agg_of(&plans[0]).column.is_none());
     }
 
     /// COUNT(col) translates to CountCol with the column name.
@@ -278,8 +358,8 @@ mod tests {
             "selectList": [agg_item("COUNT", Some("amount"), false)]
         });
         let plans = detect_aggregates(&req).expect("should detect COUNT(col)");
-        assert_eq!(plans[0].kind, AggKind::CountCol);
-        assert_eq!(plans[0].column.as_deref(), Some("AMOUNT"));
+        assert_eq!(agg_of(&plans[0]).kind, AggKind::CountCol);
+        assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
     }
 
     /// SUM/MIN/MAX/AVG each translate to the right kind + column.
@@ -294,14 +374,14 @@ mod tests {
             ]
         });
         let plans = detect_aggregates(&req).expect("should detect all four");
-        assert_eq!(plans[0].kind, AggKind::Sum);
-        assert_eq!(plans[0].column.as_deref(), Some("AMOUNT"));
-        assert_eq!(plans[1].kind, AggKind::Min);
-        assert_eq!(plans[1].column.as_deref(), Some("TS"));
-        assert_eq!(plans[2].kind, AggKind::Max);
-        assert_eq!(plans[2].column.as_deref(), Some("TS"));
-        assert_eq!(plans[3].kind, AggKind::Avg);
-        assert_eq!(plans[3].column.as_deref(), Some("SCORE"));
+        assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
+        assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
+        assert_eq!(agg_of(&plans[1]).kind, AggKind::Min);
+        assert_eq!(agg_of(&plans[1]).column.as_deref(), Some("TS"));
+        assert_eq!(agg_of(&plans[2]).kind, AggKind::Max);
+        assert_eq!(agg_of(&plans[2]).column.as_deref(), Some("TS"));
+        assert_eq!(agg_of(&plans[3]).kind, AggKind::Avg);
+        assert_eq!(agg_of(&plans[3]).column.as_deref(), Some("SCORE"));
     }
 
     /// GROUP BY present and non-empty => fall back (None).
@@ -319,7 +399,7 @@ mod tests {
 
     /// A non-COUNT DISTINCT aggregate (e.g. SUM DISTINCT) => fall back.
     /// (Single-group COUNT(DISTINCT) is now decomposed — see
-    /// `count_distinct_builds_local_set_scan_spec`.)
+    /// `count_distinct_builds_distinct_row_scan_spec`.)
     #[test]
     fn detect_aggregates_falls_back_on_distinct() {
         let req = serde_json::json!({
@@ -387,17 +467,17 @@ mod tests {
         let plans = detect_aggregates(&req).expect("bare-column aggregates must decompose");
         // Every plan takes the fast path: no rendered expression argument.
         assert!(
-            plans.iter().all(|p| p.arg_expr.is_none()),
+            plans.iter().all(|p| agg_of(p).arg_expr.is_none()),
             "bare-column aggregates must never populate arg_expr: {plans:?}"
         );
-        assert_eq!(plans[0].kind, AggKind::Count);
-        assert!(plans[0].column.is_none());
-        assert_eq!(plans[1].kind, AggKind::CountCol);
-        assert_eq!(plans[1].column.as_deref(), Some("ID"));
-        assert_eq!(plans[2].kind, AggKind::Sum);
-        assert_eq!(plans[2].column.as_deref(), Some("AMOUNT"));
-        assert_eq!(plans[5].kind, AggKind::Avg);
-        assert_eq!(plans[6].kind, AggKind::StddevSamp);
+        assert_eq!(agg_of(&plans[0]).kind, AggKind::Count);
+        assert!(agg_of(&plans[0]).column.is_none());
+        assert_eq!(agg_of(&plans[1]).kind, AggKind::CountCol);
+        assert_eq!(agg_of(&plans[1]).column.as_deref(), Some("ID"));
+        assert_eq!(agg_of(&plans[2]).kind, AggKind::Sum);
+        assert_eq!(agg_of(&plans[2]).column.as_deref(), Some("AMOUNT"));
+        assert_eq!(agg_of(&plans[5]).kind, AggKind::Avg);
+        assert_eq!(agg_of(&plans[6]).kind, AggKind::StddevSamp);
 
         // The partial EMITS clause is identical to the pre-change output: bare-column
         // SUM over DECIMAL widens to DECIMAL(36,s) from the COLUMN type (aggregate_types
@@ -429,13 +509,13 @@ mod tests {
             "selectList": [agg_item_expr("SUM", length_expr("L_COMMENT"), false)]
         });
         let plans = detect_aggregates(&req).expect("expression-argument SUM must decompose");
-        assert_eq!(plans[0].kind, AggKind::Sum);
+        assert_eq!(agg_of(&plans[0]).kind, AggKind::Sum);
         assert!(
-            plans[0].column.is_none(),
+            agg_of(&plans[0]).column.is_none(),
             "expression argument must not populate column"
         );
         assert_eq!(
-            plans[0].arg_expr.as_deref(),
+            agg_of(&plans[0]).arg_expr.as_deref(),
             Some(r#"character_length("L_COMMENT")"#),
             "the rendered DataFusion fragment must be carried in arg_expr"
         );
@@ -506,9 +586,10 @@ mod tests {
                 agg_item_expr("SUM", mult_expr("L_EXTENDEDPRICE", "L_DISCOUNT"), false)
             ]
         });
-        let plans =
+        let items =
             detect_aggregates(&req).expect("SUM(col * col) must decompose, not fall back to scan");
-        assert_eq!(plans.len(), 1);
+        assert_eq!(items.len(), 1);
+        let plans = ordinary_plans(&items);
         assert_eq!(plans[0].kind, AggKind::Sum);
         assert!(
             plans[0].column.is_none(),
@@ -536,7 +617,7 @@ mod tests {
 
         // The merge wrapper casts the summed partial back to the declared type so
         // it matches Exasol's positional selectListDataTypes validation.
-        let merge = cast_merge_items(&plans, &declared, "LAKEHOUSE_MERGE");
+        let merge = cast_merge_items(&plans, &declared);
         assert_eq!(
             merge,
             vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
@@ -577,53 +658,84 @@ mod tests {
         );
     }
 
-    /// Scenario: single-group COUNT(DISTINCT col) is decomposed into a
-    /// `CountDistinct` plan (bare column populated), COUNT(DISTINCT expr) carries
-    /// the rendered argument, and each emits exactly one VARCHAR(2000000) partial
-    /// column regardless of the underlying column/declared type.
+    /// Scenario: single-group COUNT(DISTINCT col) is decomposed into a DISTINCT
+    /// row-scan fan-out descriptor ([`SingleGroupItem::Distinct`], bare column
+    /// populated); COUNT(DISTINCT expr) carries the rendered argument; and neither
+    /// contributes an ordinary aggregate plan (so no partial-aggregate column is
+    /// emitted for it — the count is a native `COUNT(DISTINCT "V")` over the fan-out).
     #[test]
-    fn count_distinct_builds_local_set_scan_spec() {
+    fn count_distinct_builds_distinct_row_scan_spec() {
         // COUNT(DISTINCT L_SHIPMODE) — bare column fast path.
         let req = serde_json::json!({
             "selectList": [agg_item("COUNT", Some("L_SHIPMODE"), true)]
         });
-        let plans = detect_aggregates(&req).expect("single-group COUNT(DISTINCT) must decompose");
-        assert_eq!(plans.len(), 1);
-        assert_eq!(plans[0].kind, AggKind::CountDistinct);
-        assert_eq!(plans[0].column.as_deref(), Some("L_SHIPMODE"));
-        assert!(plans[0].arg_expr.is_none());
+        let items = detect_aggregates(&req).expect("single-group COUNT(DISTINCT) must decompose");
+        assert_eq!(items.len(), 1);
+        assert!(has_distinct(&items), "the item must be a distinct fan-out");
+        let dc = distinct_of(&items[0]);
+        assert_eq!(dc.column.as_deref(), Some("L_SHIPMODE"));
+        assert!(dc.arg_expr.is_none());
+        // A distinct item is NOT an ordinary aggregate: it drives no partial column.
+        assert!(
+            ordinary_plans(&items).is_empty(),
+            "a COUNT(DISTINCT) item must not appear among the ordinary aggregate plans"
+        );
 
         // COUNT(DISTINCT LENGTH(col)) — rendered expression argument.
         let req_expr = serde_json::json!({
             "selectList": [agg_item_expr("COUNT", length_expr("L_COMMENT"), true)]
         });
-        let plans_expr = detect_aggregates(&req_expr).expect("COUNT(DISTINCT expr) must decompose");
-        assert_eq!(plans_expr[0].kind, AggKind::CountDistinct);
-        assert!(plans_expr[0].column.is_none());
+        let items_expr = detect_aggregates(&req_expr).expect("COUNT(DISTINCT expr) must decompose");
+        let dc_expr = distinct_of(&items_expr[0]);
+        assert!(dc_expr.column.is_none());
         assert_eq!(
-            plans_expr[0].arg_expr.as_deref(),
+            dc_expr.arg_expr.as_deref(),
             Some(r#"character_length("L_COMMENT")"#)
         );
+    }
 
-        // The partial column is ALWAYS VARCHAR(2000000): a JSON array of the shard's
-        // local distinct set — even over an integer column and with a DECIMAL
-        // declared COUNT type.
-        let col_types = vec![("L_ORDERKEY".to_string(), "DECIMAL(20,0)".to_string())];
-        let cd_int = vec![AggregatePlan {
-            kind: AggKind::CountDistinct,
-            column: Some("L_ORDERKEY".into()),
-            arg_expr: None,
-        }];
-        let emits = partial_emits_items(&cd_int, &col_types, &["DECIMAL(18,0)".to_string()]);
-        assert_eq!(
-            emits,
-            vec![r#""PARTIAL_cd_0" VARCHAR(2000000)"#.to_string()]
+    /// Scenario (task 6.5): single-group `COUNT(DISTINCT)` detection fans out ONLY a
+    /// lone distinct (Case 1 — `is_lone_count_distinct` true), and declines every
+    /// multi-distinct or distinct-plus-ordinary-aggregate shape (Case 2/3 —
+    /// `is_lone_count_distinct` false while `has_distinct` stays true), which is the
+    /// dispatch condition the `mod.rs` Case 2/3 guard uses to route the request to the
+    /// qualified single-table wrapper instead of the fan-out.
+    #[test]
+    fn multi_count_distinct_declines_to_qualified_wrapper() {
+        // Case 1: exactly one COUNT(DISTINCT), nothing else → fans out.
+        let lone = serde_json::json!({
+            "selectList": [agg_item("COUNT", Some("CATEGORY"), true)],
+        });
+        let items = detect_aggregates(&lone).expect("a lone COUNT(DISTINCT) decomposes");
+        assert!(
+            has_distinct(&items) && is_lone_count_distinct(&items),
+            "a lone COUNT(DISTINCT) is the only shape that fans out (Case 1)"
         );
 
-        // CountDistinct is never numeric-checked (valid over any column type).
+        // Case 2: more than one COUNT(DISTINCT) → declines the fan-out.
+        let multi = serde_json::json!({
+            "selectList": [
+                agg_item("COUNT", Some("CATEGORY"), true),
+                agg_item("COUNT", Some("REGION"), true),
+            ],
+        });
+        let items = detect_aggregates(&multi).expect("multiple distinct items still detect");
         assert!(
-            validate_agg_col_types(&cd_int, &col_types),
-            "CountDistinct must not force a row-scan fallback via type validation"
+            has_distinct(&items) && !is_lone_count_distinct(&items),
+            "more than one COUNT(DISTINCT) must decline the fan-out (Case 2)"
+        );
+
+        // Case 3: a COUNT(DISTINCT) mixed with an ordinary aggregate → declines.
+        let mixed = serde_json::json!({
+            "selectList": [
+                agg_item("COUNT", Some("CATEGORY"), true),
+                agg_item("SUM", Some("AMOUNT"), false),
+            ],
+        });
+        let items = detect_aggregates(&mixed).expect("distinct-plus-ordinary still detects");
+        assert!(
+            has_distinct(&items) && !is_lone_count_distinct(&items),
+            "a distinct mixed with an ordinary aggregate must decline the fan-out (Case 3)"
         );
     }
 
@@ -647,7 +759,7 @@ mod tests {
         }
         // A non-COUNT DISTINCT (SUM DISTINCT) is not decomposable — falls back.
         // (Single-group COUNT(DISTINCT) IS decomposed; see
-        // `count_distinct_builds_local_set_scan_spec`.)
+        // `count_distinct_builds_distinct_row_scan_spec`.)
         let req_distinct = serde_json::json!({
             "selectList": [agg_item("SUM", Some("AMOUNT"), true)],
         });

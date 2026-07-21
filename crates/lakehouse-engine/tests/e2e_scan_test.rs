@@ -9,9 +9,9 @@
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
 //! 2. Install SLC 0.21.0 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
-//! 3. Create the LAKEHOUSE_ADAPTER script, the LAKEHOUSE_SCAN SCALAR script, the
-//!    LAKEHOUSE_DISTINCT_MERGE_COUNT scalar merge script (all from the same .so),
-//!    and the LAKEHOUSE_DISTRIBUTE_FILES LUA SET passthrough distributor.
+//! 3. Create the LAKEHOUSE_ADAPTER script and the LAKEHOUSE_SCAN SCALAR script
+//!    (both from the same .so), and the LAKEHOUSE_DISTRIBUTE_FILES LUA SET
+//!    passthrough distributor.
 //! 4. Create the LHVS Virtual Schema over the seeded table.
 //!
 //! The VS properties carry UDF-internal URLs (docker-network names) for the
@@ -51,9 +51,6 @@ const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
 const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// Scalar merge UDF for single-group COUNT(DISTINCT): third entry point in the
-/// same .so, created in the scan schema alongside the adapter and scan scripts.
-const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
 /// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
 /// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
 const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
@@ -231,21 +228,6 @@ function run(ctx)
 end
 /"#
     ));
-
-    // Scalar distinct-merge script — RUST SCALAR SCRIPT, third entry point in
-    // the SAME .so. Created in {SCHEMA_NAME} (the scan schema) so the pushdown
-    // wrapper SQL can reference it schema-qualified, exactly like the SET script.
-    // Input: one VARCHAR — the JSON array-of-arrays of per-shard local distinct
-    // sets (built by the wrapper via `'[' || LISTAGG(partial, ',') || ']'`).
-    // Returns: the global distinct cardinality as DECIMAL(20,0) (covers full u64).
-    // No %main — the SLC selects __exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT
-    // by script name.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
 }
 
 /// Create the Virtual Schema pointing at the seeded Iceberg table.
@@ -296,26 +278,6 @@ fn vs_lineitem_table() -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-/// Packaging: the scalar distinct-merge script runs from the SAME uploaded .so
-/// as the adapter and scan scripts (no second artifact). Feeding it a JSON
-/// array-of-arrays of per-shard local distinct sets returns the unioned,
-/// deduplicated cardinality — here {F,N} ∪ {N,O} = {F,N,O} = 3.
-#[test]
-fn distinct_merge_scalar_script_runs_from_same_so() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let count = conn.query_scalar_i64(&format!(
-        r#"SELECT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}('[["F","N"],["N","O"]]')"#
-    ));
-
-    assert_eq!(
-        count, 3,
-        "scalar distinct-merge script from the shared .so must union per-shard \
-         sets and dedup (expected 3 distinct values, got {count})"
-    );
-}
 
 /// The E2E projection + filter + LIMIT query returns the correct projected,
 /// filtered, capped rows.
@@ -1645,7 +1607,7 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
 /// Regression guard for issue #145: the `LAKEHOUSE_SCAN` common scan spec for
 /// a genuinely decomposed GROUP BY query (single key, real grouped
 /// partial-aggregate pushdown — NOT the undecomposable single-table raw-scan
-/// fallback `build_grouped_qualified_fallback_sql` falls back to, which
+/// fallback `build_qualified_single_table_fallback_sql` falls back to, which
 /// legitimately carries a non-empty `projection`) MUST also report an empty
 /// `projection` field.
 ///
