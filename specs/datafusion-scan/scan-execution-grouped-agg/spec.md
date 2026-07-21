@@ -17,6 +17,10 @@ partial aggregate execution (one partial row per distinct user group per shard).
 * A grouped scan spec carries `group_keys` (rendered DataFusion SQL fragments) and
   partial-aggregate instructions. The scan emits one partial row per distinct user
   group per shard; the adapter's outer wrapper SQL re-groups and merges the partials.
+* The grouped partial-aggregate path registers the full logical table schema and builds
+  its DataFusion query from the `group_keys` and `aggregates` fields. It does not consult
+  the scan spec's `projection` field; DataFusion's own projection pushdown derives the
+  physical column set from the grouped partial-aggregate query text.
 * The `group_keys` list MAY contain two or more rendered fragments; the DataFusion
   GROUP BY is built over all of them, so the per-shard partial key space is the
   product of the distinct values of every group key.
@@ -92,3 +96,11 @@ partial aggregate execution (one partial row per distinct user group per shard).
 * *THEN* the scan SHALL emit one partial row per distinct multi-key group observed in the shard, with each group key's value in its own `GK_{i}` column
 * *AND* when `/tmp` is real disk with free space the grouped scan SHALL complete by spilling rather than failing, at any multi-key group cardinality
 * *AND* when no spill disk is available the scan SHALL return a clean `ResourcesExhausted` error rather than OOM-crashing the VM
+
+### Scenario: Grouped partial aggregate physically reads only the group-key and aggregate columns
+
+* *GIVEN* a grouped partial-aggregate scan over a multi-column Parquet file that groups on one column and aggregates another (e.g. `GROUP BY region` with `SUM(score)` over a table of `id`, `region`, `score`, `name`)
+* *AND* a scan spec whose `projection` field is empty
+* *WHEN* the scan UDF builds the DataFusion physical plan for the grouped partial aggregate
+* *THEN* the physical Parquet scan SHALL project ONLY the group-key and aggregate-referenced columns, never the full column set
+* *AND* the empty `projection` field SHALL NOT cause a full-column read, because DataFusion derives the physical projection from the grouped partial-aggregate query text rather than from the scan spec's `projection` field
