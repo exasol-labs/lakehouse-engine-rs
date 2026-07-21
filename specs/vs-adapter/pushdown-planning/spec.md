@@ -33,6 +33,7 @@ sum/count decomposition) is covered separately in
 * The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
 * The `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and distinct-merge UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan, distributor, and distinct-merge scripts are co-deployed in the adapter script's schema, so this single source qualifies all three.
+* The common spec's `projection` field carries the pushed-down projected columns ONLY for the row-scan and join dispatch paths. An aggregate or GROUP BY request leaves `projection` empty, because the aggregate scan-dispatch path derives its physical projection from the `aggregates`/`group_keys` fields rather than from `projection` (see `vs-adapter/pushdown-planning-single-group-agg` and `vs-adapter/pushdown-planning-grouped-agg`).
 * See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
 
 ## Scenarios
@@ -58,11 +59,12 @@ sum/count decomposition) is covered separately in
 
 ### Scenario: Projection is pushed into the scan-driving query
 
-* *GIVEN* a query that selects only some of the table's columns
+* *GIVEN* a row-scan or inner-join `pushdown` request that selects only some of the table's columns and carries NO aggregate and NO GROUP BY
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF, in the shard-invariant common spec spliced once as the scalar scan UDF's first-argument literal shared by all shards
 * *AND* the projected column names SHALL be the current Iceberg logical names carried in the common spec's logical schema, so the UDF's registered table exposes them and the field-id adapter maps each to the correct physical column per file
 * *AND* the scalar scan UDF's declared EMITS column list SHALL match the projected columns in order and type
+* *AND* the guarantee in this scenario SHALL govern ONLY the row-scan and join paths; an aggregate or GROUP BY request instead leaves the `projection` field empty (see `vs-adapter/pushdown-planning-single-group-agg` and `vs-adapter/pushdown-planning-grouped-agg`), so an empty `projection` on an aggregate scan spec is expected, not a lost projection
 
 ### Scenario: Filter predicate is pushed into the scan spec
 
