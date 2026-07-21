@@ -1797,6 +1797,60 @@ mod tests {
         );
     }
 
+    /// Contract pin: the catalog error site emits the exact
+    /// `catalog returned HTTP <status>: <body>` prefix that `adapter::mod`'s
+    /// `is_table_not_found` classifier keys on via `starts_with`.
+    ///
+    /// This drives the REAL `authed_get_json` non-success branch
+    /// (`format!("catalog returned HTTP {}: {}", status.as_u16(), redact(&body))`)
+    /// against a local server returning 404, so a future edit to the message
+    /// shape here breaks this test rather than silently making the skip-non-
+    /// Iceberg-table logic dead. The body is credential-free, so `redact`
+    /// leaves it verbatim, pinning both the `404` status rendering and the
+    /// `": "` separator.
+    #[tokio::test]
+    async fn catalog_error_message_uses_http_status_prefix() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        const NOT_ICEBERG_BODY: &str =
+            "NoSuchIcebergTableException: Input table is not an iceberg table";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        // Reply to a single request with an HTTP 404 and a Hive-table body.
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await.expect("read");
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                NOT_ICEBERG_BODY.len(),
+                NOT_ICEBERG_BODY
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/warehouse/namespaces/db/tables/hive_table");
+        let creds = creds_no_auth();
+        let err = authed_get_json::<serde_json::Value>(&url, &CatalogAuth::None, false, &creds)
+            .await
+            .expect_err("a 404 response must surface as an error");
+
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("catalog returned HTTP 404: "),
+            "the classifier's load-bearing prefix must be emitted verbatim, got: {msg}"
+        );
+        assert!(
+            msg.contains(NOT_ICEBERG_BODY),
+            "the (credential-free) response body must follow the status prefix, got: {msg}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Task 4.4 — catalog-auth secrets never in ScanSpec
     // ---------------------------------------------------------------------------
