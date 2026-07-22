@@ -1,15 +1,17 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" width="96" height="96" alt="lakehouse-engine-rs logo">
+
 # lakehouse-engine-rs
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml)
-[![spec|driven](https://img.shields.io/badge/spec%7Cdriven-6f42c1.svg)](specs/)
-[![Exasol|database](https://img.shields.io/badge/Exasol%7Cdatabase-004977.svg)](https://www.exasol.com)
+[![spec|driven](https://img.shields.io/badge/spec%7Cdriven-grey.svg)](specs/)
+[![Exasol|database](https://img.shields.io/badge/Exasol%7Cdatabase-grey.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 **In-place lakehouse query engine for Exasol — DataFusion in Rust UDFs, querying Iceberg and
-Databricks tables straight from SQL. No caching, no data movement.**
+Databricks tables straight from SQL.**
 
 </div>
 
@@ -36,8 +38,7 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 runs the [DataFusion](https://datafusion.apache.org/) engine on the node, in place. The VS stays
 thin — query translation, pushdown analysis, parallelization planning, result-schema mapping —
 while all execution happens in disposable, node-local DataFusion runtimes inside Rust UDFs. Files
-are sharded across nodes, scanned in parallel, then merged in Exasol. Every query is stateless: it
-starts from source metadata and leaves nothing behind.
+are sharded across nodes, scanned in parallel, then merged in Exasol.
 
 ## Documentation
 
@@ -46,16 +47,9 @@ starts from source metadata and leaves nothing behind.
 - [Capabilities](docs/capabilities.md) — projection / filter / LIMIT / aggregation pushdown matrix
 - [`specs/`](specs/) — design source of truth (spec-driven development via the `speq` skill)
 
-## Crates
-
-| Crate | Purpose |
-|-------|---------|
-| `crates/lakehouse-engine` | VS adapter + DataFusion scan SET UDF (`cdylib` + `rlib`) |
-| `crates/vs-expression` | SQL expression translator (`rlib`) |
-
 ## License
 
-Licensed under [MIT](LICENSE).
+Community-supported. Licensed under [MIT](LICENSE).
 
 ---
 

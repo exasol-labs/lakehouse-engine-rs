@@ -41,7 +41,9 @@ iceberg-catalog-rest = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 
 # rt-multi-thread: scan UDF builds a multi-thread runtime when DATAFUSION_THREADS_PER_UDF > 1.
-tokio      = { workspace = true, features = ["rt-multi-thread"] }
+# sync: tokio::sync::Semaphore (the shared delete-read limiter) declared directly rather
+# than relying on it being pulled in transitively (via aws-smithy-async / tokio-stream).
+tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
@@ -73,7 +75,9 @@ aws-smithy-runtime-api = { version = "1", features = ["client"] }
 reqwest = { version = "0.12" }
 
 [dev-dependencies]
-tokio               = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# time: tokio::time::sleep, used by the concurrency-bound integration tests to force
+# deterministic overlap in fake delete-file reads.
+tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Test fixtures (tests/common/seed.rs, tests/tpch_loader.rs) build Arrow
 # RecordBatch + parquet WriterProperties directly with the workspace arrow/parquet
 # 58 and feed them into iceberg 0.10.0-rc.2's writer stack, which also links
