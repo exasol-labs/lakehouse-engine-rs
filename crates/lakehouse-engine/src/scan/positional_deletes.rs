@@ -2,13 +2,17 @@
 //!
 //! The adapter resolves each data file's associated positional-delete files once
 //! per query and carries them in the per-shard files argument (see
-//! [`crate::scan::spec::FileEntry`]). At read time this module:
+//! [`crate::scan::spec::FileEntry`]). At read time this module runs a two-phase
+//! pipeline in [`PositionalDeleteScanTable::partitioned_files`]:
 //!
-//! 1. reads each associated positional-delete Parquet file (`file_path` / `pos`
-//!    columns, Iceberg reserved field-ids 2147483546 / 2147483545), filters its
-//!    rows to the data file being read (required for `partition` granularity,
-//!    where one delete file references many data files), and unions the `pos`
-//!    values into a per-data-file [`RoaringTreemap`];
+//! 1. **Phase A** reads each of the shard's UNIQUE positional-delete Parquet
+//!    files exactly once (`file_path` / `pos` columns, Iceberg reserved
+//!    field-ids 2147483546 / 2147483545), concurrently within a shared
+//!    connection budget, buckets each surviving `pos` value under its
+//!    `file_path` (restricted to the assigned data files — the shape required
+//!    for `partition` granularity, where one delete file references many data
+//!    files), and unions across delete files into a merged
+//!    `HashMap<data_file_path, `[`RoaringTreemap`]`>`;
 //! 2. converts that set plus the data file's per-row-group row counts into a
 //!    per-row-group [`RowSelection`] via [`build_deletes_row_selection`];
 //! 3. attaches it as a base [`ParquetAccessPlan`] on the data file's
@@ -44,12 +48,16 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
+use futures::future::try_join_all;
 use object_store::{ObjectMeta, ObjectStore};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 /// Iceberg reserved field-id for the `file_path` column of a positional-delete file.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
@@ -267,19 +275,59 @@ fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError>
     Ok((file_path_idx, pos_idx))
 }
 
-/// Read one positional-delete Parquet file (task 2.3), keep only the rows whose
-/// `file_path` equals `data_file_abs` (required for `partition` granularity,
-/// where one delete file references many data files), and union its `pos`
-/// values into `out`. Streams row groups; never issues an object-store HEAD
-/// (the file size is supplied). Unioning across multiple delete files is the
-/// caller's responsibility (it reuses the same `out`).
-async fn union_delete_positions(
+/// Whether a delete-file row group can hold deletes for any assigned data file,
+/// judged from its `file_path` column min/max statistics.
+///
+/// Pruning is RANGE-based: a row group is skipped ONLY when every assigned path
+/// sorts strictly outside the `[min, max]` byte range (before `min` or after
+/// `max`). Parquet truncates string statistics — min DOWN and max UP — so the
+/// stored `[min, max]` is a superset of the true range; a byte-wise range test
+/// therefore stays valid on truncated bounds and never prunes a row group that
+/// could contain a match. An equality shortcut (`min == max == target`) is NOT
+/// used: it would wrongly prune a row group whose truncated bounds bracket a
+/// longer real path. A row group whose `file_path` statistics are absent,
+/// partial (min or max unset), or not a byte-array is never pruned — overlap
+/// cannot be ruled out.
+fn delete_row_group_may_match(
+    row_group: &RowGroupMetaData,
+    file_path_idx: usize,
+    assigned: &HashSet<String>,
+) -> bool {
+    let Some(column) = row_group.columns().get(file_path_idx) else {
+        return true;
+    };
+    let Some(Statistics::ByteArray(stats)) = column.statistics() else {
+        return true;
+    };
+    let (Some(min), Some(max)) = (stats.min_bytes_opt(), stats.max_bytes_opt()) else {
+        return true;
+    };
+    assigned.iter().any(|path| {
+        let bytes = path.as_bytes();
+        min <= bytes && bytes <= max
+    })
+}
+
+/// Read one positional-delete Parquet file exactly once (Phase A), bucketing
+/// each surviving `pos` value under its `file_path` — restricted to `assigned`,
+/// the set of this shard's data-file absolute paths (required for `partition`
+/// granularity, where one delete file references many data files, only some of
+/// which this shard reads). Returns a per-delete-file
+/// `HashMap<data_file_path, `[`RoaringTreemap`]`>`; the caller unions these
+/// across delete files.
+///
+/// Delete-file row groups whose `file_path` min/max statistics cannot overlap
+/// any assigned data-file path are pruned via [`delete_row_group_may_match`], so
+/// only the surviving row groups' data pages are decoded (exploiting Iceberg's
+/// required (`file_path`, `pos`) sort). Each data file's set is bulk-built from
+/// its collected positions rather than one insert per row. Never issues an
+/// object-store HEAD (the file size is supplied).
+async fn read_delete_file_positions(
     store: Arc<dyn ObjectStore>,
     delete_meta: ObjectMeta,
-    data_file_abs: &str,
-    out: &mut RoaringTreemap,
+    assigned: &HashSet<String>,
     secrets: &[String],
-) -> Result<(), UdfError> {
+) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
     let reader = ParquetObjectReader::new(store, delete_meta.location.clone())
         .with_file_size(delete_meta.size);
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
@@ -288,51 +336,76 @@ async fn union_delete_positions(
     let schema = Arc::clone(builder.schema());
     let (file_path_idx, pos_idx) = locate_delete_columns(&schema)?;
 
-    let mut stream = builder
-        .build()
-        .map_err(|e| UdfError::User(redact(format!("failed to read delete file: {e}"), secrets)))?;
+    // Keep only the row groups whose `file_path` range can overlap an assigned
+    // data file; the rest are skipped so their data pages are never fetched.
+    let selected: Vec<usize> = builder
+        .metadata()
+        .row_groups()
+        .iter()
+        .enumerate()
+        .filter(|(_, row_group)| delete_row_group_may_match(row_group, file_path_idx, assigned))
+        .map(|(idx, _)| idx)
+        .collect();
 
-    while let Some(batch) = stream.next().await {
-        let batch = batch.map_err(|e| {
-            UdfError::User(redact(format!("error decoding delete file: {e}"), secrets))
+    // Collect matching positions per data file, then bulk-build each set below.
+    let mut positions_by_data_file: HashMap<String, Vec<u64>> = HashMap::new();
+
+    // When every row group is pruned there is nothing to decode; skip building
+    // the stream so no data pages are read at all.
+    if !selected.is_empty() {
+        let mut stream = builder.with_row_groups(selected).build().map_err(|e| {
+            UdfError::User(redact(format!("failed to read delete file: {e}"), secrets))
         })?;
-        let file_paths = batch.column(file_path_idx);
-        let positions = batch
-            .column(pos_idx)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| UdfError::User("positional-delete pos column is not Int64".into()))?;
 
-        // Downcast the `file_path` column once per batch (tolerating `Utf8`/`LargeUtf8`)
-        // and borrow each cell in place — no per-row downcast or allocation. Fail
-        // loud on any other type: a silent `None`-for-every-row fallback would drop
-        // ALL positional deletes without error — exactly the silent-correctness
-        // failure mode this feature exists to eliminate.
-        let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
-        let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
-        if utf8.is_none() && large_utf8.is_none() {
-            return Err(UdfError::User(format!(
-                "positional-delete file_path column has unexpected type {:?} \
-                 (expected Utf8 or LargeUtf8)",
-                file_paths.data_type()
-            )));
-        }
-        let path_at = |row: usize| -> Option<&str> {
-            if file_paths.is_null(row) {
-                return None;
-            }
-            match (utf8, large_utf8) {
-                (Some(a), _) => Some(a.value(row)),
-                (_, Some(a)) => Some(a.value(row)),
-                _ => None,
-            }
-        };
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| {
+                UdfError::User(redact(format!("error decoding delete file: {e}"), secrets))
+            })?;
+            let file_paths = batch.column(file_path_idx);
+            let positions = batch
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    UdfError::User("positional-delete pos column is not Int64".into())
+                })?;
 
-        for row in 0..batch.num_rows() {
-            if positions.is_null(row) {
-                continue;
+            // Downcast the `file_path` column once per batch (tolerating `Utf8`/`LargeUtf8`)
+            // and borrow each cell in place — no per-row downcast or allocation. Fail
+            // loud on any other type: a silent `None`-for-every-row fallback would drop
+            // ALL positional deletes without error — exactly the silent-correctness
+            // failure mode this feature exists to eliminate.
+            let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
+            let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
+            if utf8.is_none() && large_utf8.is_none() {
+                return Err(UdfError::User(format!(
+                    "positional-delete file_path column has unexpected type {:?} \
+                     (expected Utf8 or LargeUtf8)",
+                    file_paths.data_type()
+                )));
             }
-            if path_at(row) == Some(data_file_abs) {
+            let path_at = |row: usize| -> Option<&str> {
+                if file_paths.is_null(row) {
+                    return None;
+                }
+                match (utf8, large_utf8) {
+                    (Some(a), _) => Some(a.value(row)),
+                    (_, Some(a)) => Some(a.value(row)),
+                    _ => None,
+                }
+            };
+
+            for row in 0..batch.num_rows() {
+                if positions.is_null(row) {
+                    continue;
+                }
+                let Some(path) = path_at(row) else { continue };
+                // Only bucket deletes for data files this shard is reading; a
+                // partition-granularity delete file referencing sibling files
+                // contributes nothing here.
+                if !assigned.contains(path) {
+                    continue;
+                }
                 let pos = positions.value(row);
                 // A negative `pos` is malformed: casting it to u64 would wrap to a
                 // huge index and silently drop the delete. Reject it loudly rather
@@ -343,11 +416,37 @@ async fn union_delete_positions(
                          apply a malformed delete"
                     )));
                 }
-                out.insert(pos as u64);
+                // Probe with the borrowed `&str` and only allocate an owned key
+                // when the bucket is new. `entry` would force `path.to_string()`
+                // on every matching row — one heap allocation per deleted
+                // position in the dominant single-data-file case.
+                if let Some(bucket) = positions_by_data_file.get_mut(path) {
+                    bucket.push(pos as u64);
+                } else {
+                    positions_by_data_file.insert(path.to_string(), vec![pos as u64]);
+                }
             }
         }
     }
-    Ok(())
+
+    // Bulk-build each data file's set. The Iceberg spec sorts a delete file by
+    // (`file_path`, `pos`), so per data file the positions arrive ascending;
+    // sort + dedup makes the bulk build robust to any deviation without changing
+    // the resulting set (`RoaringTreemap` is a set, so order and duplicates do
+    // not affect the outcome — only the efficient sorted build path).
+    let mut result: HashMap<String, RoaringTreemap> =
+        HashMap::with_capacity(positions_by_data_file.len());
+    for (path, mut positions) in positions_by_data_file {
+        positions.sort_unstable();
+        positions.dedup();
+        let treemap = RoaringTreemap::from_sorted_iter(positions).map_err(|e| {
+            UdfError::User(format!(
+                "failed to build positional-delete set for a data file: {e}"
+            ))
+        })?;
+        result.insert(path, treemap);
+    }
+    Ok(result)
 }
 
 /// Build a base [`ParquetAccessPlan`] for a delete-carrying data file (task 2.4).
@@ -375,63 +474,6 @@ fn build_access_plan(
         }
     }
     plan
-}
-
-/// Resolve the deleted-row set for one data file and turn it into a base
-/// [`ParquetAccessPlan`], or `None` when the file's deletes remove no rows.
-///
-/// Fetches the data file's Parquet metadata through the shared session
-/// [`FileMetadataCache`] (task 2.5): the same cache the opener's
-/// `CachedParquetFileReaderFactory` reads, so the footer parses ONCE for both
-/// access-plan construction here and the scan. Never issues an object-store HEAD.
-///
-/// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
-async fn access_plan_for_data_file(
-    entry: &FileEntry,
-    data_file_abs: &str,
-    data_file_meta: &ObjectMeta,
-    store: Arc<dyn ObjectStore>,
-    metadata_cache: Arc<dyn datafusion::execution::cache::cache_manager::FileMetadataCache>,
-    table_root: &str,
-    secrets: &[String],
-) -> Result<Option<ParquetAccessPlan>, UdfError> {
-    let mut deletes = RoaringTreemap::new();
-    for delete in &entry.deletes {
-        ensure_positional_delete(delete, secrets)?;
-        let delete_abs = reconstruct_abs_uri(&delete.path, table_root);
-        let delete_meta = object_meta_for(&delete_abs, delete.size)?;
-        union_delete_positions(
-            Arc::clone(&store),
-            delete_meta,
-            data_file_abs,
-            &mut deletes,
-            secrets,
-        )
-        .await?;
-    }
-
-    if deletes.is_empty() {
-        // Deletes reference no row of THIS data file (e.g. a partition-granularity
-        // delete file that only touches sibling files): read it as-is.
-        return Ok(None);
-    }
-
-    let parquet_metadata = DFParquetMetadata::new(store.as_ref(), data_file_meta)
-        .with_file_metadata_cache(Some(metadata_cache))
-        .with_metadata_size_hint(None)
-        .fetch_metadata()
-        .await
-        .map_err(|e| {
-            UdfError::User(redact(
-                format!("failed to read data-file metadata for delete application: {e}"),
-                secrets,
-            ))
-        })?;
-
-    Ok(Some(build_access_plan(
-        parquet_metadata.row_groups(),
-        &deletes,
-    )))
 }
 
 /// Custom [`TableProvider`] over DataFusion's `ParquetSource` (task 2.1),
@@ -463,6 +505,13 @@ pub(crate) struct PositionalDeleteScanTable {
     table_root: String,
     secrets: Vec<String>,
     format: Arc<ParquetFormat>,
+    /// Shared instance-level bound on concurrent delete-file reads, sized
+    /// `s3_max_connections` and constructed once per scan invocation. Every
+    /// provider registered for the same invocation (including both sides of a
+    /// broadcast join) holds a clone of the SAME `Arc`, so the whole instance
+    /// stays within one N-permit budget rather than each provider getting its
+    /// own N.
+    delete_read_limiter: Arc<Semaphore>,
 }
 
 impl PositionalDeleteScanTable {
@@ -478,7 +527,11 @@ impl PositionalDeleteScanTable {
     /// logical schema, and empty when the table has neither. It is carried
     /// through unchanged to the [`FieldIdExprAdapterFactory`] installed in
     /// [`Self::scan`] for name-mapping resolution and the absent-with-default
-    /// fill respectively.
+    /// fill respectively. `delete_read_limiter` is the shared instance-level
+    /// semaphore bounding concurrent delete-file reads (sized
+    /// `s3_max_connections`, constructed once per scan invocation and shared
+    /// across every registered provider — see the struct-level doc comment).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
         table_schema: SchemaRef,
@@ -487,6 +540,7 @@ impl PositionalDeleteScanTable {
         files: Vec<FileEntry>,
         table_root: String,
         storage: &StorageProps,
+        delete_read_limiter: Arc<Semaphore>,
     ) -> Self {
         let secrets = storage
             .secret_values()
@@ -502,11 +556,91 @@ impl PositionalDeleteScanTable {
             table_root,
             secrets,
             format: Arc::new(int96_coerced_parquet_format()),
+            delete_read_limiter,
         }
+    }
+
+    /// Phase A: read each of the shard's UNIQUE positional-delete files exactly
+    /// once, concurrently within the shared [`Self::delete_read_limiter`] budget,
+    /// and merge the surviving positions into a
+    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file
+    /// absolute path each delete row targets.
+    ///
+    /// Every unique delete file is backstop-validated with
+    /// [`ensure_positional_delete`] BEFORE any I/O, so an unapplicable delete
+    /// anywhere in the shard fails loud before a single row is read. Each read
+    /// holds a permit from the shared limiter, so the whole instance — both
+    /// sides of a broadcast join included — stays within one connection budget.
+    /// The per-delete-file maps are unioned; [`RoaringTreemap`] union is
+    /// commutative and associative, so the non-deterministic completion order of
+    /// the concurrent reads cannot change the result.
+    ///
+    /// No object-store HEAD is issued: each delete file's [`ObjectMeta`] is built
+    /// from its spec-supplied [`DeleteFileRef::size`] via [`object_meta_for`].
+    ///
+    /// [`DeleteFileRef::size`]: crate::scan::spec::DeleteFileRef::size
+    async fn collect_delete_positions(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+    ) -> Result<HashMap<String, RoaringTreemap>, UdfError> {
+        let assigned: HashSet<String> = self
+            .files
+            .iter()
+            .map(|entry| reconstruct_abs_uri(&entry.path, &self.table_root))
+            .collect();
+
+        let mut unique_deletes: HashMap<&str, &DeleteFileRef> = HashMap::new();
+        for entry in &self.files {
+            for delete in &entry.deletes {
+                ensure_positional_delete(delete, &self.secrets)?;
+                unique_deletes.entry(delete.path.as_str()).or_insert(delete);
+            }
+        }
+
+        if unique_deletes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let assigned_ref = &assigned;
+        let reads = unique_deletes.into_values().map(|delete| {
+            let store = Arc::clone(store);
+            let limiter = Arc::clone(&self.delete_read_limiter);
+            let secrets = self.secrets.as_slice();
+            let table_root = self.table_root.as_str();
+            async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))?;
+                let delete_abs = reconstruct_abs_uri(&delete.path, table_root);
+                let delete_meta = object_meta_for(&delete_abs, delete.size)?;
+                read_delete_file_positions(store, delete_meta, assigned_ref, secrets).await
+            }
+        });
+        let per_file_maps = try_join_all(reads).await?;
+
+        let mut merged: HashMap<String, RoaringTreemap> = HashMap::new();
+        for map in per_file_maps {
+            for (path, positions) in map {
+                *merged.entry(path).or_default() |= positions;
+            }
+        }
+        Ok(merged)
     }
 
     /// Build one `PartitionedFile` per assigned data file, attaching a base
     /// `ParquetAccessPlan` (task 2.4) to each delete-carrying file.
+    ///
+    /// Phase A ([`Self::collect_delete_positions`]) performs all delete-file
+    /// I/O up front. Phase B (this loop) is delete-file-I/O-free: for each data
+    /// file it looks up the merged position set and, when non-empty, fetches the
+    /// data file's Parquet footer through the shared session [`FileMetadataCache`]
+    /// — the same cache the opener's `CachedParquetFileReaderFactory` reads, so
+    /// the footer parses ONCE for both access-plan construction and the scan, and
+    /// no object-store HEAD is issued — then builds the base [`ParquetAccessPlan`]
+    /// via [`build_access_plan`].
+    ///
+    /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
     async fn partitioned_files(
         &self,
         state: &dyn Session,
@@ -522,24 +656,31 @@ impl PositionalDeleteScanTable {
             })?;
         let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
 
+        let delete_positions = self.collect_delete_positions(&store).await?;
+
         let mut files = Vec::with_capacity(self.files.len());
         for entry in &self.files {
             let abs = reconstruct_abs_uri(&entry.path, &self.table_root);
             let meta = object_meta_for(&abs, entry.size)?;
             let mut partitioned = PartitionedFile::from(meta.clone());
 
-            if !entry.deletes.is_empty()
-                && let Some(access_plan) = access_plan_for_data_file(
-                    entry,
-                    &abs,
-                    &meta,
-                    Arc::clone(&store),
-                    Arc::clone(&metadata_cache),
-                    &self.table_root,
-                    &self.secrets,
-                )
-                .await?
+            if let Some(deletes) = delete_positions.get(abs.as_str())
+                && !deletes.is_empty()
             {
+                let parquet_metadata = DFParquetMetadata::new(store.as_ref(), &meta)
+                    .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
+                    .with_metadata_size_hint(None)
+                    .fetch_metadata()
+                    .await
+                    .map_err(|e| {
+                        UdfError::User(redact(
+                            format!(
+                                "failed to read data-file metadata for delete application: {e}"
+                            ),
+                            &self.secrets,
+                        ))
+                    })?;
+                let access_plan = build_access_plan(parquet_metadata.row_groups(), deletes);
                 partitioned = partitioned.with_extension(access_plan);
             }
 
@@ -796,10 +937,11 @@ mod tests {
     }
 
     /// Task 2.3: a positional-delete file whose `file_path` column references
-    /// TWO data files (the `partition` granularity shape) is filtered to only
-    /// the data file being read; only its `pos` values are unioned. Columns are
-    /// located by Iceberg reserved field-id, and the read never issues a HEAD
-    /// (the size is supplied on the `ObjectMeta`).
+    /// TWO data files (the `partition` granularity shape) is bucketed by
+    /// `file_path`, restricted to the assigned data files. Only the assigned
+    /// file's `pos` values survive; the sibling file (absent from the assigned
+    /// set) is filtered out. Columns are located by Iceberg reserved field-id,
+    /// and the read never issues a HEAD (the size is supplied on the `ObjectMeta`).
     #[test]
     fn reads_and_filters_delete_positions_by_file_path() {
         use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -808,7 +950,6 @@ mod tests {
         use object_store::path::Path as StorePath;
         use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
         use parquet::arrow::ArrowWriter;
-        use std::collections::HashMap;
 
         let field_id_meta = |id: i32| {
             HashMap::from([(
@@ -843,7 +984,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let deletes = rt.block_on(async move {
+        let by_data_file = rt.block_on(async move {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
             let location = StorePath::from("db/t/deletes/d.parquet");
             let size = buf.len() as u64;
@@ -855,15 +996,27 @@ mod tests {
                 e_tag: None,
                 version: None,
             };
-            let mut out = RoaringTreemap::new();
-            union_delete_positions(store, meta, target, &mut out, &[])
+            // Only `target` is assigned to this shard; `other` is a sibling file.
+            let assigned = HashSet::from([target.to_string()]);
+            read_delete_file_positions(store, meta, &assigned, &[])
                 .await
-                .unwrap();
-            out
+                .unwrap()
         });
 
-        // Only f1's positions (3, 7, 9) are unioned; f2's position (5) is filtered out.
-        assert_eq!(deletes.iter().collect::<Vec<u64>>(), vec![3, 7, 9]);
+        // Only f1's positions (3, 7, 9) are bucketed; f2's position (5) is
+        // filtered out because f2 is not in the assigned set.
+        assert_eq!(
+            by_data_file
+                .get(target)
+                .unwrap()
+                .iter()
+                .collect::<Vec<u64>>(),
+            vec![3, 7, 9]
+        );
+        assert!(
+            !by_data_file.contains_key(other),
+            "an unassigned sibling file must not appear in the position map"
+        );
     }
 
     /// Task 2.6: the read-time backstop rejects a non-positional delete file with
@@ -893,5 +1046,198 @@ mod tests {
             content_type: DeleteFileContentType::PositionDeletes,
         };
         assert!(ensure_positional_delete(&ok, &[]).is_ok());
+    }
+
+    /// Build a single-row-group meta whose `file_path` column (index 0) carries
+    /// the given byte-array min/max statistics (or no statistics when the tuple
+    /// is `(None, None)` AND `with_stats` is false).
+    fn row_group_with_file_path_stats(
+        min: Option<&str>,
+        max: Option<&str>,
+        with_stats: bool,
+    ) -> RowGroupMetaData {
+        use parquet::data_type::ByteArray;
+        let schema_descr = get_test_schema_descr();
+        let ptrs = schema_descr.columns();
+        let col0_builder = ColumnChunkMetaData::builder(ptrs[0].clone());
+        let col0_builder = if with_stats {
+            col0_builder.set_statistics(Statistics::byte_array(
+                min.map(ByteArray::from),
+                max.map(ByteArray::from),
+                None,
+                Some(0),
+                false,
+            ))
+        } else {
+            col0_builder
+        };
+        let col0 = col0_builder.build().unwrap();
+        let col1 = ColumnChunkMetaData::builder(ptrs[1].clone())
+            .build()
+            .unwrap();
+        build_test_row_group_meta(schema_descr.clone(), vec![col0, col1], 4, 0)
+    }
+
+    /// Task 3: pruning is range-based. A row group is decoded when an assigned
+    /// path falls within the `[min, max]` byte range, and pruned only when EVERY
+    /// assigned path sorts strictly outside it — on either side.
+    #[test]
+    fn pruning_is_range_based() {
+        let rg = row_group_with_file_path_stats(
+            Some("s3://b/data/f2.parquet"),
+            Some("s3://b/data/f5.parquet"),
+            true,
+        );
+
+        let inside = HashSet::from(["s3://b/data/f3.parquet".to_string()]);
+        assert!(
+            delete_row_group_may_match(&rg, 0, &inside),
+            "a path within [min, max] must be decoded"
+        );
+
+        let before = HashSet::from(["s3://b/data/f1.parquet".to_string()]);
+        assert!(
+            !delete_row_group_may_match(&rg, 0, &before),
+            "a path strictly before min must be pruned"
+        );
+
+        let after = HashSet::from(["s3://b/data/f9.parquet".to_string()]);
+        assert!(
+            !delete_row_group_may_match(&rg, 0, &after),
+            "a path strictly after max must be pruned"
+        );
+
+        // Two assigned paths straddling the range but neither inside it: the row
+        // group cannot hold either file's deletes, so it is pruned.
+        let straddle = HashSet::from([
+            "s3://b/data/f1.parquet".to_string(),
+            "s3://b/data/f9.parquet".to_string(),
+        ]);
+        assert!(
+            !delete_row_group_may_match(&rg, 0, &straddle),
+            "paths straddling but outside the range must be pruned"
+        );
+    }
+
+    /// Task 3: a row group with absent statistics — no `Statistics` at all, or a
+    /// `Statistics` whose min/max are unset — MUST be decoded (overlap cannot be
+    /// ruled out).
+    #[test]
+    fn absent_statistics_are_never_pruned() {
+        let assigned = HashSet::from(["s3://b/data/f1.parquet".to_string()]);
+
+        let no_stats = row_group_with_file_path_stats(None, None, false);
+        assert!(
+            delete_row_group_may_match(&no_stats, 0, &assigned),
+            "a row group with no file_path statistics must be decoded"
+        );
+
+        let empty_bounds = row_group_with_file_path_stats(None, None, true);
+        assert!(
+            delete_row_group_may_match(&empty_bounds, 0, &assigned),
+            "a row group whose min/max are unset must be decoded"
+        );
+    }
+
+    /// Task 3: Parquet truncates string statistics (min DOWN, max UP), so a
+    /// row group's real paths can be strictly inside its truncated `[min, max]`.
+    /// A byte-wise RANGE test still decodes it correctly, where an
+    /// `min == max == target` equality shortcut would wrongly prune it (min, max
+    /// and target are three distinct strings here).
+    #[test]
+    fn truncated_bounds_keep_range_valid() {
+        // Truncated min "…/f" sorts below every real "…/file_*"; truncated max
+        // "…/g" sorts above every real "…/file_*".
+        let rg = row_group_with_file_path_stats(
+            Some("s3://bucket/data/f"),
+            Some("s3://bucket/data/g"),
+            true,
+        );
+        let assigned = HashSet::from(["s3://bucket/data/file_00042.parquet".to_string()]);
+        assert!(
+            delete_row_group_may_match(&rg, 0, &assigned),
+            "a path inside truncated bounds must be decoded (range, not equality)"
+        );
+    }
+
+    /// Task 3: reading a multi-row-group delete file whose row groups carry
+    /// disjoint `file_path` ranges yields EXACTLY the assigned file's positions —
+    /// the pruned read equals an unpruned read (correctness-preserving).
+    #[test]
+    fn reads_multi_row_group_delete_file_correctly() {
+        use arrow::array::{Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use object_store::memory::InMemory;
+        use object_store::path::Path as StorePath;
+        use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let field_id_meta = |id: i32| {
+            HashMap::from([(
+                super::super::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false)
+                .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_FILE_PATH)),
+            Field::new("pos", DataType::Int64, false)
+                .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
+        ]));
+
+        // Rows sorted by (file_path, pos) as Iceberg requires; two rows per row
+        // group ⇒ each data file lands in its own row group with a tight range.
+        let f1 = "s3://bucket/db/t/data/f1.parquet";
+        let f2 = "s3://bucket/db/t/data/f2.parquet";
+        let f3 = "s3://bucket/db/t/data/f3.parquet";
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![f1, f1, f2, f2, f3, f3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 5, 15, 7, 30])),
+            ],
+        )
+        .unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let by_data_file = rt.block_on(async move {
+            let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let location = StorePath::from("db/t/deletes/multi.parquet");
+            let size = buf.len() as u64;
+            store.put(&location, PutPayload::from(buf)).await.unwrap();
+            let meta = ObjectMeta {
+                location,
+                last_modified: chrono::Utc.timestamp_nanos(0),
+                size,
+                e_tag: None,
+                version: None,
+            };
+            // Only f2 is assigned: its row group must be decoded, the f1 and f3
+            // row groups pruned. The result must still be exactly f2's positions.
+            let assigned = HashSet::from([f2.to_string()]);
+            read_delete_file_positions(store, meta, &assigned, &[])
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(
+            by_data_file.get(f2).unwrap().iter().collect::<Vec<u64>>(),
+            vec![5, 15],
+            "the assigned file's positions survive the pruned read"
+        );
+        assert!(!by_data_file.contains_key(f1));
+        assert!(!by_data_file.contains_key(f3));
     }
 }
