@@ -9,8 +9,9 @@ can merge into the final query result.
 * When a scan spec carries partial-aggregate instructions the UDF runs a DataFusion
   aggregation over its assigned files and emits partial results rather than raw rows.
 * The partial results are shaped so the Exasol wrapper can combine them across shards
-  with standard SQL aggregate functions (`SUM`, `MIN`, `MAX`) or a dedicated scalar
-  merge UDF for `COUNT(DISTINCT)`.
+  with standard SQL aggregate functions (`SUM`, `MIN`, `MAX`). `COUNT(DISTINCT)` is NOT a
+  partial aggregate on this path — the adapter dispatches it as a DISTINCT row-scan (see
+  `vs-adapter/pushdown-planning-count-distinct` and the DISTINCT row-scan scenario below).
 * The same file-assignment, filter, and pushdown rules from `datafusion-scan/scan-execution`
   apply on the partial-aggregate path.
 * The partial-aggregate path registers the full logical table schema and builds its
@@ -58,21 +59,14 @@ can merge into the final query result.
 * *AND* the merged result over all shards SHALL equal the same aggregate-over-expression evaluated over all rows on a single node
 * *AND* no Arrow type SHALL cross the `.so` boundary
 
-### Scenario: COUNT(DISTINCT) emits the shard's local distinct set as one VARCHAR partial value
+### Scenario: COUNT(DISTINCT) runs as a DISTINCT row-scan rather than a partial aggregate
 
-* *GIVEN* a scan spec requesting a single-group `COUNT(DISTINCT col)` partial and the files assigned to this shard
+* *GIVEN* a scan spec whose projection is a single column (or rendered expression) with the `distinct` flag set, and the files assigned to this shard
 * *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL compute the LOCAL distinct value set of that column over its assigned files inside DataFusion, excluding NULLs
-* *AND* the UDF SHALL serialize that local distinct set to a JSON array string inside the UDF and emit it as exactly one VARCHAR partial value for that aggregate, so no Arrow list/array type crosses the `.so` boundary
-* *AND* an empty shard SHALL emit an empty JSON array (`[]`) so the merge treats it as contributing no distinct values
-
-### Scenario: COUNT(DISTINCT) enforces a bounded per-shard safety cap
-
-* *GIVEN* a scan spec requesting a single-group `COUNT(DISTINCT col)` partial over a column whose per-shard local distinct set would exceed the configured cap — a maximum distinct-element count and a maximum serialized-byte size kept safely below the `VARCHAR(2000000)` wire limit
-* *WHEN* the scan UDF accumulates the local distinct set and the cap is reached
-* *THEN* the UDF SHALL stop and return a clean bounded-resource error identifying the offending column and the cap that was exceeded, consistent with the engine's `ResourcesExhausted` bounded-execution convention
-* *AND* the UDF MUST NOT emit a truncated distinct set (which would produce a wrong merged count)
-* *AND* the error message MUST NOT contain any credential value
+* *THEN* the UDF SHALL apply DataFusion `.distinct()` to that single-column projection over its assigned files, streaming one row per locally-distinct value rather than computing an aggregate partial
+* *AND* the UDF SHALL emit those rows through the raw row-scan `emit_batch` path, declaring the column with its actual Exasol EMITS type (the standard Arrow-to-Exasol mapping, including the JSON-string fallback for incompatible types), never serializing the whole distinct set into one JSON-array VARCHAR value
+* *AND* the UDF MUST NOT accumulate the full distinct set into a single value and MUST NOT enforce any per-shard element or byte cap
+* *AND* no Arrow type SHALL cross the `.so` boundary
 
 ### Scenario: Partial aggregate physically reads only the aggregate-referenced columns
 

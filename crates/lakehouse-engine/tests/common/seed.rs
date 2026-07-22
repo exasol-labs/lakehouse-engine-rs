@@ -1993,16 +1993,21 @@ pub const DISTINCT_REGION_COUNT: i64 = 4;
 /// is 1 + 2 + ... + 20 = 210.
 pub const DISTINCT_COMMENT_LENGTH_SUM: i64 = 210;
 
-/// Table name for the single-shard high-cardinality `COUNT(DISTINCT)` safety-cap probe.
+/// Table name for the single-shard high-cardinality `COUNT(DISTINCT)` regression
+/// probe (issue #146).
 pub const E2E_HIGH_CARD_TABLE: &str = "high_card_probe";
 /// High-cardinality column on `high_card_probe`.
 pub const HIGH_CARD_COL: &str = "token";
-/// Row count, written as a SINGLE data file (one shard), chosen so the
-/// per-shard local distinct set deterministically exceeds
-/// `MAX_DISTINCT_BYTES_PER_SHARD` (1 MiB in `scan/mod.rs`) well before
-/// `MAX_DISTINCT_ELEMENTS_PER_SHARD` (100,000): 12,000 unique 100-byte
-/// tokens serialize to > 1.2 MB of JSON, comfortably past the 1 MiB cap.
-pub const HIGH_CARD_ROWS: usize = 12_000;
+/// Row count, written as a SINGLE data file (one shard) of unique 100-byte
+/// `token` values. Tens of thousands of distinct values — at ~100 bytes each the
+/// shard-local distinct set is ~3 MB, several times the 1,048,576-byte per-shard
+/// budget the old JSON-serialized distinct-set path enforced (issue #146). The
+/// native-merge path has no such cap: each shard-local distinct value streams as
+/// one row and Exasol's own `COUNT(DISTINCT "V")` counts the union, so the query
+/// completes and returns the exact count (equal to `HIGH_CARD_ROWS`, as every
+/// token is unique). Kept well below the 657k-row real-world repro scale — tens
+/// of thousands is enough to prove the fix on a single shard.
+pub const HIGH_CARD_ROWS: usize = 30_000;
 
 /// Seed the `distinct_probe` table (`id`, `category`, `region`, `comment`)
 /// into the `e2e_lakehouse` namespace across TWO data files. Idempotent.
@@ -2148,8 +2153,8 @@ pub async fn seed_high_card_probe(catalog_url: &str, warehouse: &str) -> Result<
 }
 
 /// One data file's worth of unique, fixed-length (100-byte) `token` values,
-/// zero-padded so every row's serialized JSON element contributes the same
-/// byte count and the safety-cap trip point stays deterministic.
+/// zero-padded so every distinct value is the same width and the shard-local
+/// distinct set's byte size stays deterministic.
 fn make_high_card_batch(rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (1..=rows as i64).collect();
     let tokens: Vec<String> = ids.iter().map(|&id| format!("{id:0>100}")).collect();
@@ -2167,6 +2172,451 @@ fn make_high_card_batch(rows: usize) -> RecordBatch {
         ],
     )
     .expect("high_card_probe RecordBatch construction is infallible")
+}
+
+// ---------------------------------------------------------------------------
+// Typed COUNT(DISTINCT) probe table — bare-column type matrix + expression args
+// ---------------------------------------------------------------------------
+//
+// Used only by `tests/e2e_count_distinct_test.rs`. A single table carrying one
+// column per Iceberg/Arrow-reachable Exasol type, seeded across TWO data files
+// (rows 1..=6, 7..=12) so `COUNT(DISTINCT)` pushdown must dedup across the shard
+// boundary rather than sum per-shard counts. Every typed column mixes in NULLs
+// (which must be excluded from the count) and repeats at least one non-NULL value
+// in BOTH files (so a fan-out that merely summed per-shard distinct rows would
+// overcount). The expected distinct counts are NOT hand-written constants: they
+// are computed by the `typed_*_distinct` helpers below FROM THE SAME arrays that
+// build the Arrow batches (`typed_probe`), so the fixture is its own single source
+// of truth and a data edit can never silently disagree with an expected count.
+//
+// Type coverage (bare-column, Case 1 fan-out — reviewer's requested matrix):
+//   c_decimal_a  Iceberg decimal(9,2)  -> Exasol DECIMAL(9,2)
+//   c_decimal_b  Iceberg decimal(20,4) -> Exasol DECIMAL(20,4)  (varying prec/scale)
+//   c_double     Iceberg double        -> Exasol DOUBLE PRECISION
+//   c_varchar    Iceberg string        -> Exasol VARCHAR(2000000)
+//   c_date       Iceberg date          -> Exasol DATE
+//   c_ts         Iceberg timestamp     -> Exasol TIMESTAMP (millisecond fraction)
+//   c_bool       Iceberg boolean       -> Exasol BOOLEAN
+//
+// CHAR is deliberately absent: no Iceberg/Arrow source type maps to Exasol CHAR
+// (Iceberg `string` maps to VARCHAR per the type table in the crate root), so a
+// bare-column CHAR virtual column is unreachable through this scan path. VARCHAR
+// (c_varchar) is the closest bare-column string coverage; a CHAR-typed result is
+// covered only as a wrapper-routed `CAST(... AS CHAR(n))` expression argument.
+//
+// The `c_ts` values all share the same whole second (2024-01-01 00:00:00) and
+// differ ONLY in the millisecond component (.100 .. .600). Exasol's default
+// TIMESTAMP precision is fsp=3 (milliseconds), which the VS declares by mapping
+// Iceberg `timestamp` to a plain `TIMESTAMP` column, so these millisecond-distinct
+// instants are preserved and counted distinct. Sub-millisecond (microsecond-only)
+// distinctions are NOT preserved by an Exasol TIMESTAMP(3) column — a deliberate
+// Exasol-type limitation, not a fan-out defect — so the fixture stays at
+// millisecond resolution. `c_price`/`c_qty` back the numeric product expression,
+// and `c_bool`+`c_ts` back the temporal `CASE` expression, of task 2.4.
+
+/// Table name for the typed `COUNT(DISTINCT)` probe.
+pub const E2E_TYPED_TABLE: &str = "typed_distinct_probe";
+
+/// Bare `DECIMAL(9,2)` column.
+pub const TYPED_COL_DECIMAL_A: &str = "c_decimal_a";
+/// Bare `DECIMAL(20,4)` column (distinct precision/scale from `c_decimal_a`).
+pub const TYPED_COL_DECIMAL_B: &str = "c_decimal_b";
+/// Bare `DOUBLE PRECISION` column.
+pub const TYPED_COL_DOUBLE: &str = "c_double";
+/// Bare `VARCHAR` column (mixed case, so `UPPER(...)` folds some values together).
+pub const TYPED_COL_VARCHAR: &str = "c_varchar";
+/// Bare `DATE` column.
+pub const TYPED_COL_DATE: &str = "c_date";
+/// Bare `TIMESTAMP` column (values differ only in the millisecond fraction).
+pub const TYPED_COL_TS: &str = "c_ts";
+/// Bare `BOOLEAN` column.
+pub const TYPED_COL_BOOL: &str = "c_bool";
+/// `DOUBLE` operand of the numeric product expression (`c_price * c_qty`).
+pub const TYPED_COL_PRICE: &str = "c_price";
+/// `DECIMAL(20,0)` operand of the numeric product expression (`c_price * c_qty`).
+pub const TYPED_COL_QTY: &str = "c_qty";
+
+/// Rows seeded into `typed_distinct_probe`, across two data files.
+pub const TYPED_TABLE_TOTAL_ROWS: usize = 12;
+/// Row-index boundary between the two data files (file 1: rows 1..=6, file 2: 7..=12).
+const TYPED_FILE_SPLIT: usize = 6;
+
+/// Precision/scale of `c_decimal_a` (Exasol `DECIMAL(9,2)`).
+const TYPED_DECIMAL_A_PS: (u8, i8) = (9, 2);
+/// Precision/scale of `c_decimal_b` (Exasol `DECIMAL(20,4)`).
+const TYPED_DECIMAL_B_PS: (u8, i8) = (20, 4);
+
+/// The full 12-row column vectors for `typed_distinct_probe`, the SINGLE source of
+/// truth for both the Arrow batches and the expected distinct counts.
+///
+/// Decimal columns hold unscaled `i128` values (`c_decimal_a` scale 2, `c_decimal_b`
+/// scale 4); `date_days` is days-since-epoch; `ts_micros` is microseconds since the
+/// UNIX epoch. `None` is a NULL cell.
+struct TypedProbe {
+    ids: Vec<i64>,
+    decimal_a: Vec<Option<i128>>,
+    decimal_b: Vec<Option<i128>>,
+    double: Vec<Option<f64>>,
+    varchar: Vec<Option<&'static str>>,
+    date_days: Vec<Option<i32>>,
+    ts_micros: Vec<Option<i64>>,
+    boolean: Vec<Option<bool>>,
+    price: Vec<Option<f64>>,
+    qty: Vec<Option<i64>>,
+}
+
+/// Build the deterministic 12-row `typed_distinct_probe` data. See the module note
+/// above for the cross-shard-duplicate + NULL design of each column.
+fn typed_probe() -> TypedProbe {
+    // Millisecond offsets within 2024-01-01 00:00:00 for `c_ts`.
+    let ts = |ms: i64| BASE_TS_MICROS + ms * 1_000;
+    // Day offsets from 2024-01-01 for `c_date`.
+    let day = |off: i32| BASE_DATE + off;
+    TypedProbe {
+        ids: (1..=TYPED_TABLE_TOTAL_ROWS as i64).collect(),
+        // scale 2 unscaled: 10.50, 20.25, NULL, 30.00, 10.50, 40.99 | 10.50, 50.00, 20.25, NULL, 60.00, 30.00
+        decimal_a: vec![
+            Some(1050),
+            Some(2025),
+            None,
+            Some(3000),
+            Some(1050),
+            Some(4099),
+            Some(1050),
+            Some(5000),
+            Some(2025),
+            None,
+            Some(6000),
+            Some(3000),
+        ],
+        // scale 4 unscaled: 100000.0001, 200000.0002, NULL, 300000.0003, 100000.0001, 400000.0004 | ...
+        decimal_b: vec![
+            Some(1_000_000_001),
+            Some(2_000_000_002),
+            None,
+            Some(3_000_000_003),
+            Some(1_000_000_001),
+            Some(4_000_000_004),
+            Some(1_000_000_001),
+            Some(5_000_000_005),
+            Some(2_000_000_002),
+            None,
+            Some(6_000_000_006),
+            Some(3_000_000_003),
+        ],
+        double: vec![
+            Some(0.5),
+            Some(1.5),
+            None,
+            Some(2.5),
+            Some(0.5),
+            Some(3.5),
+            Some(0.5),
+            Some(4.5),
+            Some(1.5),
+            None,
+            Some(5.5),
+            Some(2.5),
+        ],
+        // Mixed case: raw distinct = 8, UPPER-folded distinct = 5. "aa"/"AA"/"Aa"
+        // and "bb"/"BB" fold across the shard boundary, so native UPPER dedup is
+        // exercised cross-shard.
+        varchar: vec![
+            Some("aa"),
+            Some("AA"),
+            None,
+            Some("bb"),
+            Some("aa"),
+            Some("cc"),
+            Some("Aa"),
+            Some("dd"),
+            Some("BB"),
+            None,
+            Some("ee"),
+            Some("cc"),
+        ],
+        date_days: vec![
+            Some(day(0)),
+            Some(day(1)),
+            None,
+            Some(day(2)),
+            Some(day(0)),
+            Some(day(3)),
+            Some(day(0)),
+            Some(day(4)),
+            Some(day(1)),
+            None,
+            Some(day(5)),
+            Some(day(2)),
+        ],
+        ts_micros: vec![
+            Some(ts(100)),
+            Some(ts(200)),
+            None,
+            Some(ts(300)),
+            Some(ts(100)),
+            Some(ts(400)),
+            Some(ts(100)),
+            Some(ts(500)),
+            Some(ts(200)),
+            None,
+            Some(ts(600)),
+            Some(ts(300)),
+        ],
+        boolean: vec![
+            Some(true),
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+            Some(true),
+        ],
+        // c_price * c_qty products: 6,6,NULL,4,6,10 | 12,12,6,8,NULL,20 → distinct = 6.
+        price: vec![
+            Some(2.0),
+            Some(3.0),
+            None,
+            Some(4.0),
+            Some(2.0),
+            Some(5.0),
+            Some(2.0),
+            Some(3.0),
+            Some(6.0),
+            Some(4.0),
+            None,
+            Some(5.0),
+        ],
+        qty: vec![
+            Some(3),
+            Some(2),
+            Some(5),
+            Some(1),
+            Some(3),
+            Some(2),
+            Some(6),
+            Some(4),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+        ],
+    }
+}
+
+/// Count distinct non-`None` `f64` cells by exact bit pattern (all seeded values are
+/// positive and finite, so bitwise equality matches SQL `DISTINCT` equality here).
+fn distinct_f64(values: impl Iterator<Item = Option<f64>>) -> i64 {
+    let set: std::collections::HashSet<u64> = values.flatten().map(f64::to_bits).collect();
+    set.len() as i64
+}
+
+/// Count distinct non-`None` cells of a `Hash + Eq` column.
+fn distinct_hashable<T: std::hash::Hash + Eq>(values: impl Iterator<Item = Option<T>>) -> i64 {
+    let set: std::collections::HashSet<T> = values.flatten().collect();
+    set.len() as i64
+}
+
+/// Distinct `c_decimal_a` count (bare `DECIMAL(9,2)`), NULLs excluded.
+pub fn typed_decimal_a_distinct() -> i64 {
+    distinct_hashable(typed_probe().decimal_a.into_iter())
+}
+/// Distinct `c_decimal_b` count (bare `DECIMAL(20,4)`), NULLs excluded.
+pub fn typed_decimal_b_distinct() -> i64 {
+    distinct_hashable(typed_probe().decimal_b.into_iter())
+}
+/// Distinct `c_double` count (bare `DOUBLE`), NULLs excluded.
+pub fn typed_double_distinct() -> i64 {
+    distinct_f64(typed_probe().double.into_iter())
+}
+/// Distinct `c_varchar` count (bare `VARCHAR`, raw values), NULLs excluded.
+pub fn typed_varchar_distinct() -> i64 {
+    distinct_hashable(typed_probe().varchar.into_iter())
+}
+/// Distinct `UPPER(c_varchar)` count (wrapper-routed string expression), NULLs
+/// excluded — lower than the raw count because mixed-case values fold together.
+pub fn typed_varchar_upper_distinct() -> i64 {
+    distinct_hashable(
+        typed_probe()
+            .varchar
+            .into_iter()
+            .map(|v| v.map(str::to_uppercase)),
+    )
+}
+/// Distinct `c_date` count (bare `DATE`), NULLs excluded.
+pub fn typed_date_distinct() -> i64 {
+    distinct_hashable(typed_probe().date_days.into_iter())
+}
+/// Distinct `c_ts` count (bare `TIMESTAMP`), NULLs excluded.
+pub fn typed_ts_distinct() -> i64 {
+    distinct_hashable(typed_probe().ts_micros.into_iter())
+}
+/// Distinct `c_bool` count (bare `BOOLEAN`), NULLs excluded — at most 2.
+pub fn typed_bool_distinct() -> i64 {
+    distinct_hashable(typed_probe().boolean.into_iter())
+}
+/// Distinct `CAST(c_varchar AS CHAR(n))` count (wrapper-routed CHAR expression):
+/// equals the raw `c_varchar` distinct count because the seeded values have no
+/// trailing spaces, so fixed-width padding is injective over them.
+pub fn typed_varchar_char_distinct() -> i64 {
+    typed_varchar_distinct()
+}
+/// Distinct `c_price * c_qty` count (wrapper-routed numeric expression), rows where
+/// either operand is NULL excluded.
+pub fn typed_product_distinct() -> i64 {
+    let probe = typed_probe();
+    distinct_f64(
+        probe
+            .price
+            .into_iter()
+            .zip(probe.qty)
+            .map(|(p, q)| match (p, q) {
+                (Some(p), Some(q)) => Some(p * q as f64),
+                _ => None,
+            }),
+    )
+}
+/// Distinct `CASE WHEN c_bool THEN c_ts ELSE NULL END` count (wrapper-routed
+/// temporal expression): the distinct millisecond-resolution timestamps among rows
+/// whose `c_bool` is true. Proves sub-second (millisecond) distinctions survive the
+/// wrapper's native dedup across the shard boundary, with no string intermediate.
+pub fn typed_ts_case_distinct() -> i64 {
+    let probe = typed_probe();
+    distinct_hashable(
+        probe
+            .ts_micros
+            .into_iter()
+            .zip(probe.boolean)
+            .map(|(ts, b)| if b == Some(true) { ts } else { None }),
+    )
+}
+
+/// Seed the `typed_distinct_probe` table into the `e2e_lakehouse` namespace across
+/// TWO data files (rows 1..=6, 7..=12). Idempotent.
+pub async fn seed_typed_distinct_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-typed").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for typed_distinct_probe")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let (da_p, da_s) = TYPED_DECIMAL_A_PS;
+    let (db_p, db_s) = TYPED_DECIMAL_B_PS;
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(
+                2,
+                TYPED_COL_DECIMAL_A,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: da_p as u32,
+                    scale: da_s as u32,
+                }),
+            )
+            .into(),
+            NestedField::optional(
+                3,
+                TYPED_COL_DECIMAL_B,
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: db_p as u32,
+                    scale: db_s as u32,
+                }),
+            )
+            .into(),
+            NestedField::optional(4, TYPED_COL_DOUBLE, Type::Primitive(PrimitiveType::Double))
+                .into(),
+            NestedField::optional(5, TYPED_COL_VARCHAR, Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::optional(6, TYPED_COL_DATE, Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::optional(7, TYPED_COL_TS, Type::Primitive(PrimitiveType::Timestamp))
+                .into(),
+            NestedField::optional(8, TYPED_COL_BOOL, Type::Primitive(PrimitiveType::Boolean))
+                .into(),
+            NestedField::optional(9, TYPED_COL_PRICE, Type::Primitive(PrimitiveType::Double))
+                .into(),
+            NestedField::optional(10, TYPED_COL_QTY, Type::Primitive(PrimitiveType::Long)).into(),
+        ])
+        .build()
+        .context("build typed_distinct_probe Iceberg schema")?;
+
+    let probe = typed_probe();
+    let file1 = vec![make_typed_probe_batch(&probe, 0, TYPED_FILE_SPLIT)];
+    let file2 = vec![make_typed_probe_batch(
+        &probe,
+        TYPED_FILE_SPLIT,
+        TYPED_TABLE_TOTAL_ROWS,
+    )];
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_TYPED_TABLE,
+        iceberg_schema,
+        vec![file1, file2],
+    )
+    .await
+    .context("seed typed_distinct_probe table")?;
+    Ok(())
+}
+
+/// Build the Arrow `RecordBatch` for `typed_distinct_probe` rows `[start, end)`,
+/// preserving each column's per-row NULLs. Arrow types mirror the Iceberg schema
+/// exactly so the parquet writer accepts the batch.
+fn make_typed_probe_batch(probe: &TypedProbe, start: usize, end: usize) -> RecordBatch {
+    let (da_p, da_s) = TYPED_DECIMAL_A_PS;
+    let (db_p, db_s) = TYPED_DECIMAL_B_PS;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(TYPED_COL_DECIMAL_A, DataType::Decimal128(da_p, da_s), true),
+        Field::new(TYPED_COL_DECIMAL_B, DataType::Decimal128(db_p, db_s), true),
+        Field::new(TYPED_COL_DOUBLE, DataType::Float64, true),
+        Field::new(TYPED_COL_VARCHAR, DataType::Utf8, true),
+        Field::new(TYPED_COL_DATE, DataType::Date32, true),
+        Field::new(
+            TYPED_COL_TS,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(TYPED_COL_BOOL, DataType::Boolean, true),
+        Field::new(TYPED_COL_PRICE, DataType::Float64, true),
+        Field::new(TYPED_COL_QTY, DataType::Int64, true),
+    ]));
+
+    let decimal_a = Decimal128Array::from(probe.decimal_a[start..end].to_vec())
+        .with_precision_and_scale(da_p, da_s)
+        .expect("c_decimal_a precision/scale is valid");
+    let decimal_b = Decimal128Array::from(probe.decimal_b[start..end].to_vec())
+        .with_precision_and_scale(db_p, db_s)
+        .expect("c_decimal_b precision/scale is valid");
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(probe.ids[start..end].to_vec())),
+            Arc::new(decimal_a),
+            Arc::new(decimal_b),
+            Arc::new(Float64Array::from(probe.double[start..end].to_vec())),
+            Arc::new(StringArray::from(probe.varchar[start..end].to_vec())),
+            Arc::new(Date32Array::from(probe.date_days[start..end].to_vec())),
+            Arc::new(TimestampMicrosecondArray::from(
+                probe.ts_micros[start..end].to_vec(),
+            )),
+            Arc::new(BooleanArray::from(probe.boolean[start..end].to_vec())),
+            Arc::new(Float64Array::from(probe.price[start..end].to_vec())),
+            Arc::new(Int64Array::from(probe.qty[start..end].to_vec())),
+        ],
+    )
+    .expect("typed_distinct_probe RecordBatch construction is infallible")
 }
 
 /// Replace a table's current schema via a raw Iceberg REST commit.
