@@ -1874,7 +1874,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Shared referenced-column narrowing (issue #160, task 6.6)
+    // Shared referenced-column narrowing (issue #160)
     // -----------------------------------------------------------------------
 
     /// Issue #160 regression: BOTH decline wrappers — the grouped decline wrapper AND
