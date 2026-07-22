@@ -4,7 +4,7 @@
 
 use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec};
 use serde_json::Value as Json;
-use vs_expression::render_expression;
+use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
 use super::support::{build_fan_out_inner, exasol_type_from_json, quote_ident};
@@ -417,7 +417,11 @@ fn render_scalar_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<Stri
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     let merged = merge_select_items(plans);
-    let mut sql = render_expression(&sentinel_tree).ok()?;
+    // Exasol dialect: this SQL is spliced verbatim into the OUTER merge wrapper,
+    // which Exasol's own core engine parses — so a CAST target needs Exasol
+    // syntax (length-qualified `VARCHAR(n)`), unlike the DataFusion-side
+    // renderability check in `classify_scalar_over_aggregate`.
+    let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg)?;
         let slot = plans.iter().position(|p| *p == plan)?;
@@ -1115,6 +1119,38 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use vs_expression::render_expression_safe;
+
+    /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
+    /// CHAR/VARCHAR target must render the CAST target LENGTH-QUALIFIED
+    /// (`VARCHAR(20)`): `render_scalar_over_merge`'s output is spliced into the
+    /// OUTER merge wrapper that Exasol's own engine parses, where a bare
+    /// length-less `VARCHAR` is the exact "unexpected ')', expecting '('" parse
+    /// error this fix addresses. Guards the grouped-merge half of the
+    /// Exasol-dialect CAST split; the DataFusion-side renderability check in
+    /// `classify_scalar_over_aggregate` deliberately keeps bare `VARCHAR`.
+    #[test]
+    fn scalar_over_merge_casts_to_length_qualified_exasol_varchar() {
+        let sum_node = serde_json::json!({
+            "type": "function_aggregate", "name": "SUM", "distinct": false,
+            "arguments": [{"type": "column", "name": "x"}]
+        });
+        let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
+        let node = serde_json::json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [sum_node],
+            "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
+        });
+        let sql = render_scalar_over_merge(&node, &plans)
+            .expect("CAST over a mergeable aggregate must render");
+        assert!(
+            sql.contains("VARCHAR(20)"),
+            "Exasol-parsed merge wrapper needs a length-qualified CAST target: {sql}"
+        );
+        assert!(
+            !sql.contains("AS VARCHAR)"),
+            "must NOT emit a bare length-less VARCHAR (Exasol rejects it): {sql}"
+        );
+    }
 
     /// Scenario (capability-extensions): a GROUP BY request carrying a
     /// COUNT(DISTINCT) still declines (falls back to row scanning); grouped
