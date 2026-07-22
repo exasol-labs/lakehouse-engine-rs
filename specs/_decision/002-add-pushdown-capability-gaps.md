@@ -4,7 +4,12 @@
 
 **ID:** exclude-fn-div-no-faithful-datafusion-floor-division
 **Plan:** `add-pushdown-capability-gaps`
-**Status:** Accepted
+**Status:** Superseded by exclude-fn-div-no-faithful-datafusion-truncated-division
+
+Live Exasol verification (2026-07-22) found this ADR's premise false: Exasol `DIV` truncates toward
+zero, not floor division, and matches DataFusion integer `/`. The decline outcome stands; only this
+ADR's stated reason was wrong. See `specs/_decision/016-add-fn-div-pushdown.md` (plan
+`add-fn-div-pushdown`) for the corrected ADR.
 
 ### Context
 
