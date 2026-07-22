@@ -138,3 +138,25 @@ Decision [2].
   negative test. The residual question of covering the other three paths is left as the reviewer's
   standing ADVISORY, carried to the PR body rather than fixed here.
 - **Promotes to ADR:** no
+
+### [main-sync] BucketFS PUT retry fix on main falls outside this plan's scope
+
+- **Finding:** `main` advanced from the plan's merge-base (`108dabf`) to `390e9e5` after this plan was
+  authored. Exactly one commit touches `crates/lakehouse-engine/tests/`: `405ae7b fix(e2e): retry
+  BucketFS PUT on transient connection errors`, and it changes only `common/stack.rs::upload_to_bucketfs`
+  — a bounded 5-attempt retry with a 2 s sleep on connection-level `send()` errors (a non-2xx HTTP
+  response still fails immediately). The signature `pub fn upload_to_bucketfs(local_path:
+  &std::path::Path, bucketfs_path: &str)` is unchanged.
+- **Direction change:** None. `upload_to_bucketfs` already lives in the shared `common/stack.rs` and is
+  already imported byte-identically by all 7 `exasol-e2e` binaries, so it is not one of the duplicated
+  helpers this plan consolidates into `common/e2e_harness`; no plan task touches `stack.rs`. The plan's
+  `upload_so` is a new wrapper that folds the duplicated `lakehouse_engine_so_path()` +
+  `upload_to_bucketfs(...)` call pair and calls the retry-hardened `upload_to_bucketfs` unchanged.
+  Re-verified every line number the plan and this log cite in files other than `stack.rs` against the
+  post-merge branch: `exasol_ws.rs` 72/120/128, `e2e_refresh_test.rs` 628-632,
+  `e2e_int96_timestamp_test.rs` 309/383, `e2e_positional_deletes_test.rs` 294/359/420/621 — all still
+  accurate. Both spec deltas reference `upload_to_bucketfs`, retry, and BucketFS PUT timing nowhere.
+  Task 4.3 (`make test-e2e`) and the "no product-code change" non-goal need no wording change; the retry
+  hardening only makes the plan's manual E2E validation less likely to hit a flaky transient-connection
+  failure unrelated to the refactor.
+- **Promotes to ADR:** no
