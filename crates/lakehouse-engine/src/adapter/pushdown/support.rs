@@ -260,27 +260,26 @@ pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     sql
 }
 
-/// Build one DISTINCT row-scan fan-out for a single `COUNT(DISTINCT ...)` argument.
+/// Build one DISTINCT row-scan fan-out for a lone `COUNT(DISTINCT <bare column>)`.
 ///
-/// The fan-out is a row scan projecting ONLY the distinct argument, with
+/// The fan-out is a row scan projecting ONLY the distinct column, with
 /// `distinct = true` and the base WHERE narrowed by a NULL-excluding predicate on
-/// the argument. It carries NO LIMIT/OFFSET/ORDER BY (leaking one would truncate the
+/// the column. It carries NO LIMIT/OFFSET/ORDER BY (leaking one would truncate the
 /// per-shard distinct set → a wrong count). The single emitted column is named `"V"`,
-/// carrying the RAW VALUES of the counted argument — one row per shard-local distinct
-/// value — NOT a count. Its EMITS type follows the argument shape:
+/// carrying the RAW VALUES of the counted column — one row per shard-local distinct
+/// value — NOT a count. `"V"` is declared with the source column's own exact Exasol
+/// type (from `col_types`), so the outer native `COUNT(DISTINCT "V")` dedups across
+/// shards on exact values with no cast step.
 ///
-/// - **Bare column** → the source column's own Exasol type (from `col_types`), so a
-///   distinct over a native column keeps its native typing.
-/// - **Expression** → `VARCHAR(2000000)`. The VS has no per-argument value type
-///   (Exasol declares only the COUNT's own integer result type, which describes the
-///   OUTER count, never the inner expression's value type), so the scan serializes
-///   the expression's native DataFusion output to its string form before emit (the
-///   project-wide unknown/incompatible-value-type convention). An outer
-///   `COUNT(DISTINCT "V")` over that string form still dedups exactly — the string
-///   cast is deterministic and injective on distinct native values — and `"V"` is
-///   invisible to the caller, who sees only the final count. Using the COUNT's
-///   declared (integer) type here instead would coerce a string/date/etc. value to
-///   the wrong Arrow type at emit and silently corrupt the count.
+/// Only a bare-column argument reaches this builder: [`is_lone_count_distinct`] requires
+/// `dc.column.is_some()`, so a `COUNT(DISTINCT <expression>)` — alone or combined with
+/// other aggregates — declines to the qualified single-table wrapper, where Exasol
+/// evaluates the expression and DISTINCT natively over exact-typed base columns (no
+/// `arrow::compute::cast(.., Utf8)` injectivity dependency, which could silently
+/// undercount). An expression-argument `DistinctCount` (`column` `None`) is therefore
+/// unreachable here.
+///
+/// [`is_lone_count_distinct`]: super::single_group_agg::is_lone_count_distinct
 fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
     shards: &[Vec<E>],
@@ -289,20 +288,23 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    let value_type = match &dc.column {
-        // Bare column: "V" carries the column's raw values → its source Exasol type.
-        Some(col) => col_type_for(Some(col), None, col_types, None),
-        // Expression argument (detection guarantees `arg_expr` is set here): "V"
-        // carries the expression's raw values, whose type the VS cannot know — feed
-        // the string-serialized form as VARCHAR so the count stays exact.
-        None => "VARCHAR(2000000)".to_string(),
+    // Only a lone bare-column COUNT(DISTINCT) is dispatched here (Case 1): the
+    // single-group `is_lone_count_distinct` guard requires `dc.column.is_some()`, so an
+    // expression argument declines to the qualified single-table wrapper before this
+    // builder is reached. Mirrors the sibling `unreachable!` in
+    // `build_count_distinct_scan_sql` rather than silently emitting an empty identifier.
+    let Some(col) = dc.column.as_deref() else {
+        unreachable!(
+            "build_distinct_fan_out is dispatched only for a lone bare-column \
+             COUNT(DISTINCT) (Case 1); an expression argument routes to the qualified \
+             single-table wrapper instead"
+        )
     };
-    let (proj_item, arg_sql) = match (&dc.column, &dc.arg_expr) {
-        (Some(col), _) => (ProjectionItem::Column(col.clone()), quote_ident(col)),
-        (None, Some(expr)) => (ProjectionItem::Expr { expr: expr.clone() }, expr.clone()),
-        // Detection guarantees exactly one of column/arg_expr is populated.
-        (None, None) => (ProjectionItem::Column(String::new()), quote_ident("")),
-    };
+    // "V" carries the column's raw values → its source Exasol type, so the outer
+    // native COUNT(DISTINCT "V") dedups across shards on exact values, no cast step.
+    let value_type = col_type_for(Some(col), None, col_types, None);
+    let proj_item = ProjectionItem::Column(col.to_string());
+    let arg_sql = quote_ident(col);
     let null_pred = format!("({arg_sql} IS NOT NULL)");
     let filter = match base_spec.filter.as_deref() {
         Some(f) if !f.is_empty() => Some(format!("({f}) AND {null_pred}")),
@@ -2113,65 +2115,13 @@ mod tests {
         );
     }
 
-    /// Scenario (code-review fix, task 6.1): a `COUNT(DISTINCT <expr>)` whose
-    /// argument is an EXPRESSION (not a bare column) must declare the fan-out's
-    /// `"V"` column as `VARCHAR(2000000)` — the string-serialized raw values of
-    /// the counted expression — NOT the COUNT's own declared (integer) result
-    /// type. `"V"` carries the expression's VALUES (one row per shard-local
-    /// distinct value), which for a string/date/etc. expression is unrelated to
-    /// the count's type; declaring the count's type would coerce those values to
-    /// the wrong Arrow type at emit (e.g. a string cast to `DECIMAL` → all NULL →
-    /// a silently wrong count). VARCHAR keeps the count exact via Exasol string
-    /// dedup for any value type, and is invisible to the caller (who sees only the
-    /// outer count). A bare-column distinct is unaffected — it keeps the source
-    /// column's native type (asserted by
-    /// `count_distinct_wrapper_uses_native_count_distinct`).
-    #[test]
-    fn count_distinct_expression_arg_declares_varchar_value_type() {
-        let base_spec = count_distinct_base_spec();
-        // COUNT(DISTINCT UPPER(name)) — a string-valued expression argument.
-        let items = vec![SingleGroupItem::Distinct(DistinctCount {
-            column: None,
-            arg_expr: Some(r#"upper("NAME")"#.into()),
-        })];
-        // NAME is a VARCHAR source column, but the argument is an EXPRESSION, so
-        // no source-column type applies and the value type must not be looked up
-        // from col_types either. (The COUNT's own declared integer type — the wrong
-        // type the old `col_type_for` path stamped on "V" — is no longer passed at
-        // all: the builder never consults an aggregate type for the distinct value.)
-        let col_types = vec![("NAME".to_string(), "VARCHAR(100)".to_string())];
-        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
-        let sql = build_count_distinct_scan_sql(
-            &base_spec,
-            &shards,
-            &items,
-            &col_types,
-            None,
-            SCAN_UDF_NAME,
-            DISTRIBUTE_FILES_UDF_NAME,
-        );
-
-        assert!(
-            sql.contains(r#""V" VARCHAR(2000000)"#),
-            "an expression-argument COUNT(DISTINCT) must declare V as \
-             VARCHAR(2000000) (the string-serialized expression values), not the \
-             count's own type: {sql}"
-        );
-        assert!(
-            !sql.contains(r#""V" DECIMAL"#),
-            "V must NOT be declared with the COUNT's declared (integer) result \
-             type — that is the value-type defect this fixes: {sql}"
-        );
-        assert!(
-            sql.starts_with(r#"SELECT COUNT(DISTINCT "V") FROM ("#),
-            "the outer merge is still a native COUNT(DISTINCT V): {sql}"
-        );
-        assert!(
-            sql.contains(r#"upper(\"NAME\") IS NOT NULL"#),
-            "the fan-out must exclude NULLs on the rendered expression argument, \
-             not a phantom column: {sql}"
-        );
-    }
+    // The former `count_distinct_expression_arg_declares_varchar_value_type` test was
+    // removed with the VARCHAR fan-out arm it exercised: a lone `COUNT(DISTINCT <expr>)`
+    // no longer fans out at all (`is_lone_count_distinct` now requires a bare-column
+    // argument). An expression-argument distinct declines to the qualified single-table
+    // wrapper, where Exasol evaluates the expression and DISTINCT natively over
+    // exact-typed base columns — covered by
+    // `single_group_agg::lone_expression_count_distinct_declines_fan_out_to_wrapper`.
 
     // The former `multiple_count_distinct_columns_get_independent_fan_outs` (Case 2
     // asserting the `FROM DUAL` scalar-subquery shape) was removed with the Case 2/3
