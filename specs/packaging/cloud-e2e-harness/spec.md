@@ -18,6 +18,9 @@ values. All DSN/connection strings include `validateservercertificate=0`. No cre
 value is printed to test output. The same cloud path is driven by the remote bench
 harness (`bench/run.sh` with `BENCH_TARGET=remote`), which builds the
 `CREATE VIRTUAL SCHEMA` statement against the live cluster from the bench environment.
+The cloud suite drives Exasol through the shared `common/exasol_ws::ExaConn` WebSocket
+client — the same client the local Docker suite uses — connected in a redacting mode so
+credential-bearing SQL never reaches test output.
 
 ## Scenarios
 
@@ -61,3 +64,12 @@ harness (`bench/run.sh` with `BENCH_TARGET=remote`), which builds the
 * *THEN* the harness SHALL pass `NR_OF_CORES` and `PARALLELISM_FACTOR` as virtual-schema properties on the remote target, just as the docker target already does
 * *AND* the property values SHALL come from `BENCH_NR_OF_CORES` and `BENCH_PARALLELISM_FACTOR`, applying the same defaults the docker path uses when those variables are unset
 * *AND* the remote path MUST NOT emit an empty extra-properties block that drops these parallelism knobs (the prior behaviour where the cluster ran at its built-in defaults)
+
+### Scenario: Cloud suite drives Exasol through the shared redacting WebSocket client
+
+* *GIVEN* the AWS credential and endpoint environment variables are present
+* *AND* the cloud E2E suite opens its Exasol WebSocket SQL session
+* *WHEN* it issues credential-bearing DDL (a CONNECTION carrying SigV4 or vended keys) that fails
+* *THEN* the suite SHALL use the shared `common/exasol_ws::ExaConn` client — the same client the local Docker suite uses — connected in a redacting mode that omits the SQL statement and the Exasol response body from the `execute()` DDL-failure panic; this redaction covers the `execute()` DDL-failure path only, leaving `query_scalar_i64`, `query_row_count`, and the `connect()` auth-failure assertion unredacted for this fold (the cloud suite passes no credential-bearing SQL through them and the login response carries no credential value)
+* *AND* that `execute()` failure message MUST NOT print the failing SQL or the Exasol response, so no static, SigV4, or vended credential value embedded in the credential-bearing DDL SHALL appear in the failure output
+* *AND* the redacting behaviour MUST be opt-in, so the local Docker suite still includes the failing SQL in its `execute()` failure messages for debuggability
