@@ -338,6 +338,7 @@ mod tests {
             "FN_DIV",
             "FN_TO_CHAR",
             "FN_TO_NUMBER",
+            // FN_REGEXP_* decline: see issue #106 (PCRE/regex-crate dialect gap).
             "FN_REGEXP_REPLACE",
             "FN_REGEXP_SUBSTR",
             "FN_REGEXP_INSTR",
