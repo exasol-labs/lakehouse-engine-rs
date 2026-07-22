@@ -296,7 +296,9 @@ twins keep the bare-`VARCHAR` DataFusion behavior for scan-spec fragments; new
 twins length-qualify character targets (`VARCHAR(n)`; `CHAR(n)` also → `VARCHAR(n)` per the
 mission data-type table, from the width Exasol itself sent) and are used ONLY where Exasol
 parses the rendered SQL: the qualified single-table / N-scan join wrapper (`joins.rs`) and the
-grouped-merge wrapper (`grouped_agg.rs`). The dialect flows through a private `CastDialect`
-parameter threaded across the shared recursive translator; the DataFusion-parsed
-broadcast-join condition/filter and the grouped `group_keys`/renderability check stay on the
-default DataFusion dialect.
+grouped-merge wrapper (`grouped_agg.rs`). The dialect flows through a private `Dialect`
+parameter threaded across the shared recursive translator (named generically, not
+`CastDialect`, since it is passed to every node and any future rendering rule that differs
+by target parser can branch on it — CAST is just the only one that does today); the
+DataFusion-parsed broadcast-join condition/filter and the grouped `group_keys`/renderability
+check stay on the default DataFusion dialect.

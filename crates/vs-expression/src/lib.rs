@@ -11,10 +11,13 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-/// Which SQL dialect a CAST target type is rendered for.
+/// Which SQL parser the rendered fragment must satisfy.
 ///
 /// The SAME recursive translator feeds two different parsers depending on the
-/// call site, and they have OPPOSITE requirements for character-type CAST
+/// call site. Threaded through every node (not just CAST) so any future
+/// rendering rule that differs by target parser has a place to branch;
+/// currently only the CAST target (`render_cast_target`) actually does,
+/// where the two dialects have OPPOSITE requirements for character-type CAST
 /// targets:
 /// - `DataFusion`: the rendered fragment is embedded in a `ScanSpec`
 ///   (`filter`/`projection`/`group_keys`) and parsed by DataFusion's SQL
@@ -28,7 +31,7 @@ use serde_json::Value as Json;
 ///   MUST be followed by `(n)` — so a character CAST target needs an explicit
 ///   length.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CastDialect {
+enum Dialect {
     DataFusion,
     Exasol,
 }
@@ -80,7 +83,7 @@ fn json_scalar_to_string(value: &Json) -> String {
 }
 
 /// Render a slice of argument nodes, returning an error if any fails.
-fn render_args(args: &[Json], dialect: CastDialect) -> Result<Vec<String>, UdfError> {
+fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError> {
     args.iter()
         .enumerate()
         .map(|(i, arg)| {
@@ -91,14 +94,14 @@ fn render_args(args: &[Json], dialect: CastDialect) -> Result<Vec<String>, UdfEr
 }
 
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
-fn render_cast_target(data_type: &Json, dialect: CastDialect) -> Result<String, UdfError> {
+fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfError> {
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match type_name.to_uppercase().as_str() {
         "VARCHAR" | "CHAR" => match dialect {
             // DataFusion's SQL frontend rejects VARCHAR(n) with a length (no
             // `support_varchar_with_length`); only bare VARCHAR parses there.
-            CastDialect::DataFusion => Ok("VARCHAR".to_string()),
+            Dialect::DataFusion => Ok("VARCHAR".to_string()),
             // Exasol's parser has the OPPOSITE requirement: VARCHAR/CHAR MUST
             // carry a length. Render `VARCHAR(<size>)` from the width Exasol
             // itself sent (`{"type":"VARCHAR","size":n}` /
@@ -106,7 +109,7 @@ fn render_cast_target(data_type: &Json, dialect: CastDialect) -> Result<String, 
             // back to the project's "unknown/incompatible width" convention.
             // Do NOT clamp to Exasol's 2,000,000 max — trust the value Exasol
             // sent.
-            CastDialect::Exasol => Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
+            Dialect::Exasol => Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
                 Some(size) => format!("VARCHAR({size})"),
                 None => "VARCHAR(2000000)".to_string(),
             }),
@@ -151,7 +154,7 @@ fn render_cast_target(data_type: &Json, dialect: CastDialect) -> Result<String, 
 fn render_cast(
     args: Option<&Vec<Json>>,
     data_type: Option<&Json>,
-    dialect: CastDialect,
+    dialect: Dialect,
 ) -> Result<Option<String>, UdfError> {
     let args = args.ok_or_else(|| UdfError::User("CAST missing 'arguments'".into()))?;
     if args.is_empty() {
@@ -169,7 +172,7 @@ fn render_cast(
 /// Returns `Ok(None)` when `expr` is `Json::Null` (absent optional child).
 /// Returns `Ok(Some(sql))` on success.
 /// Returns `Err(UdfError::User(...))` for unsupported or malformed nodes.
-fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<String>, UdfError> {
+fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<String>, UdfError> {
     if expr.is_null() {
         return Ok(None);
     }
@@ -276,30 +279,38 @@ fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<S
 
     // --- Logical connectives and other predicates ---
     match kind {
-        "predicate_and" => render_junction(value("expressions"), " AND ", "TRUE", dialect).map(Some),
+        "predicate_and" => {
+            render_junction(value("expressions"), " AND ", "TRUE", dialect).map(Some)
+        }
         "predicate_or" => render_junction(value("expressions"), " OR ", "FALSE", dialect).map(Some),
         "predicate_not" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| UdfError::User("predicate_not missing 'expression'".into()))?;
+            let inner =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| UdfError::User("predicate_not missing 'expression'".into()))?;
             Ok(Some(format!("(NOT {inner})")))
         }
         "predicate_is_null" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| UdfError::User("predicate_is_null missing 'expression'".into()))?;
+            let inner =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| {
+                        UdfError::User("predicate_is_null missing 'expression'".into())
+                    })?;
             Ok(Some(format!("({inner} IS NULL)")))
         }
         "predicate_is_not_null" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| {
-                    UdfError::User("predicate_is_not_null missing 'expression'".into())
-                })?;
+            let inner =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| {
+                        UdfError::User("predicate_is_not_null missing 'expression'".into())
+                    })?;
             Ok(Some(format!("({inner} IS NOT NULL)")))
         }
         "predicate_in_constlist" => {
-            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| {
-                    UdfError::User("predicate_in_constlist missing 'expression'".into())
-                })?;
+            let target =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| {
+                        UdfError::User("predicate_in_constlist missing 'expression'".into())
+                    })?;
             let mut rendered: Vec<String> = Vec::new();
             if let Some(Json::Array(args)) = value("arguments") {
                 for arg in args {
@@ -315,7 +326,8 @@ fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<S
             }
         }
         "predicate_between" => {
-            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
+            let target =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
             let low = render_expression_inner(value("left").unwrap_or(&Json::Null), dialect)?;
             let high = render_expression_inner(value("right").unwrap_or(&Json::Null), dialect)?;
             match (target, low, high) {
@@ -326,8 +338,10 @@ fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<S
             }
         }
         "predicate_like" => {
-            let left = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
-            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?;
+            let left =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
+            let pattern =
+                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?;
             match (left, pattern) {
                 (Some(l), Some(p)) => {
                     let escape = value("escape_char").and_then(|e| e.as_str());
@@ -347,12 +361,16 @@ fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<S
         }
         // Exasol sends REGEXP_LIKE as node type `predicate_like_regexp`.
         "predicate_like_regexp" => {
-            let subject = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| {
-                    UdfError::User("predicate_like_regexp missing 'expression'".into())
-                })?;
-            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?
-                .ok_or_else(|| UdfError::User("predicate_like_regexp missing 'pattern'".into()))?;
+            let subject =
+                render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| {
+                        UdfError::User("predicate_like_regexp missing 'expression'".into())
+                    })?;
+            let pattern =
+                render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?
+                    .ok_or_else(|| {
+                        UdfError::User("predicate_like_regexp missing 'pattern'".into())
+                    })?;
             Ok(Some(format!("regexp_like({subject}, {pattern})")))
         }
         // Exasol sends EXTRACT as its own node type with the field in `toExtract`:
@@ -669,12 +687,14 @@ fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<S
                     let branch_end = if has_else { args.len() - 1 } else { args.len() };
                     let mut i = 0;
                     while i < branch_end {
-                        let cond = render_expression_inner(&args[i], dialect)?.ok_or_else(|| {
-                            UdfError::User(format!("CASE WHEN cond[{i}] is null"))
-                        })?;
-                        let result = render_expression_inner(&args[i + 1], dialect)?.ok_or_else(|| {
-                            UdfError::User(format!("CASE THEN result[{}] is null", i + 1))
-                        })?;
+                        let cond =
+                            render_expression_inner(&args[i], dialect)?.ok_or_else(|| {
+                                UdfError::User(format!("CASE WHEN cond[{i}] is null"))
+                            })?;
+                        let result =
+                            render_expression_inner(&args[i + 1], dialect)?.ok_or_else(|| {
+                                UdfError::User(format!("CASE THEN result[{}] is null", i + 1))
+                            })?;
                         sql.push_str(&format!(" WHEN {cond} THEN {result}"));
                         i += 2;
                     }
@@ -869,7 +889,7 @@ fn render_junction(
     expressions: Option<&Json>,
     op: &str,
     empty_value: &str,
-    dialect: CastDialect,
+    dialect: Dialect,
 ) -> Result<String, UdfError> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(Json::Array(items)) = expressions {
@@ -905,7 +925,7 @@ fn render_junction(
 /// is parsed by Exasol's core engine, use the Exasol-dialect twin
 /// [`render_expression_exasol`].
 pub fn render_expression(expr: &Json) -> Result<String, UdfError> {
-    render_expression_inner(expr, CastDialect::DataFusion)?
+    render_expression_inner(expr, Dialect::DataFusion)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
@@ -915,7 +935,7 @@ pub fn render_expression(expr: &Json) -> Result<String, UdfError> {
 /// Never panics. DataFusion dialect — see [`render_expression`]; the
 /// Exasol-dialect twin is [`render_expression_exasol_safe`].
 pub fn render_expression_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, CastDialect::DataFusion).ok()?
+    render_expression_inner(expr, Dialect::DataFusion).ok()?
 }
 
 /// Render a VS filter expression to a DataFusion SQL WHERE fragment.
@@ -928,7 +948,7 @@ pub fn render_expression_safe(expr: &Json) -> Option<String> {
 /// DataFusion dialect — see [`render_expression`]; the Exasol-dialect twin is
 /// [`render_df_filter_exasol_safe`].
 pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr, CastDialect::DataFusion).ok()??;
+    let result = render_expression_inner(filter_expr, Dialect::DataFusion).ok()??;
     if result == "TRUE" || result == "NULL" {
         None
     } else {
@@ -947,7 +967,7 @@ pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
 /// grouped-aggregate outer-merge wrapper (`grouped_agg.rs`) — NOT for fragments
 /// embedded in a DataFusion `ScanSpec`, which must use [`render_expression`].
 pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
-    render_expression_inner(expr, CastDialect::Exasol)?
+    render_expression_inner(expr, Dialect::Exasol)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
@@ -957,7 +977,7 @@ pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
 /// [`render_expression_exasol`]; the DataFusion-dialect twin is
 /// [`render_expression_safe`].
 pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr, CastDialect::Exasol).ok()?
+    render_expression_inner(expr, Dialect::Exasol).ok()?
 }
 
 /// Render a VS filter expression to an **Exasol** SQL WHERE fragment.
@@ -967,7 +987,7 @@ pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
 /// dialect — see [`render_expression_exasol`]; the DataFusion-dialect twin is
 /// [`render_df_filter_safe`].
 pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr, CastDialect::Exasol).ok()??;
+    let result = render_expression_inner(filter_expr, Dialect::Exasol).ok()??;
     if result == "TRUE" || result == "NULL" {
         None
     } else {
