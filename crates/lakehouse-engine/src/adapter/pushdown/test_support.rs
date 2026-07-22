@@ -96,6 +96,7 @@ pub(super) fn build_sql_for_fixture_n(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -121,7 +122,6 @@ pub(super) fn build_sql_for_fixture_n(
         &col_types,
         &[],
         SCAN_UDF_NAME,
-        DISTINCT_MERGE_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
 }
@@ -205,6 +205,7 @@ pub(super) fn build_row_sql_with_root(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: proj_types.clone(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
@@ -230,7 +231,6 @@ pub(super) fn build_row_sql_with_root(
         &col_types,
         &[],
         SCAN_UDF_NAME,
-        DISTINCT_MERGE_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
 }

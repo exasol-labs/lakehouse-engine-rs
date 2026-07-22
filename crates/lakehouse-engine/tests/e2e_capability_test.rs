@@ -42,8 +42,6 @@ const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
 const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
 const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// Scalar merge UDF (third entry point in the same .so), created in the scan schema.
-const MERGE_SCRIPT_NAME: &str = "LAKEHOUSE_DISTINCT_MERGE_COUNT";
 /// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
 /// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
 const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
@@ -172,14 +170,6 @@ EMITS (...) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));
-    // Scalar distinct-merge script — third entry point in the SAME .so, created
-    // in the scan schema alongside the scan script (mirrors e2e_scan_test.rs).
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{MERGE_SCRIPT_NAME}(partials VARCHAR(2000000))
-RETURNS DECIMAL(20,0) AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
     // File distributor — LUA SET SCRIPT, pure passthrough (mirrors
     // e2e_scan_test.rs).
     conn.execute(&format!(
@@ -297,6 +287,49 @@ fn e2e_advertises_inner_equi_join_capability() {
     assert!(
         advertised.contains("\"JOIN_CONDITION_EQUI\""),
         "getCapabilities must advertise the JOIN_CONDITION_EQUI capability:\n{advertised}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5.2  COUNT(DISTINCT) aggregate-pushdown capability advertisement (live round-trip)
+// ---------------------------------------------------------------------------
+
+/// A live `getCapabilities` round-trip against the running VS advertises
+/// `FN_AGG_COUNT_DISTINCT` — single-group `COUNT(DISTINCT col)` pushdown
+/// (issue #56, revisited by fix-count-distinct-shard-cap).
+///
+/// Mirrors `e2e_advertises_inner_equi_join_capability`: `EXPLAIN VIRTUAL` of a
+/// query over the virtual schema drives Exasol's planner through
+/// `getCapabilities`, and its output echoes the adapter's capability response
+/// verbatim. Asserting `FN_AGG_COUNT_DISTINCT` is present in that live
+/// response — rather than only against the in-process `CAPABILITIES` constant
+/// (`capabilities_advertise_count_distinct` in
+/// `src/adapter/capabilities.rs`) — proves the deployed `.so` advertises it
+/// end to end. `AGGREGATE_SINGLE_GROUP` must also be present since
+/// single-group `COUNT(DISTINCT)` pushdown depends on it.
+#[test]
+fn advertises_count_distinct_capability() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // A COUNT(DISTINCT) query guarantees the capability is exercised in
+    // planning; the capability list itself is echoed regardless of the query
+    // shape.
+    let query = format!("SELECT COUNT(DISTINCT name) FROM {}", vs_table());
+    let advertised = explain_virtual_sql(&mut conn, &query);
+
+    assert!(
+        advertised.contains("\"capabilities\":"),
+        "EXPLAIN VIRTUAL must echo the getCapabilities response:\n{advertised}"
+    );
+    assert!(
+        advertised.contains("\"FN_AGG_COUNT_DISTINCT\""),
+        "getCapabilities must advertise the FN_AGG_COUNT_DISTINCT capability:\n{advertised}"
+    );
+    assert!(
+        advertised.contains("\"AGGREGATE_SINGLE_GROUP\""),
+        "getCapabilities must advertise AGGREGATE_SINGLE_GROUP alongside \
+         FN_AGG_COUNT_DISTINCT:\n{advertised}"
     );
 }
 

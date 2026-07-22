@@ -6,13 +6,15 @@ use crate::scan::spec::{
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{
+    render_df_filter_exasol_safe, render_df_filter_safe, render_expression_exasol_safe,
+    render_expression_safe,
+};
 
 use super::file_resolution::{empty_result_sql, relativize_shards_to_root, resolve_file_list};
 use super::support::{
-    DISTINCT_MERGE_UDF_NAME, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
-    exasol_type_from_json, extract_limit, order_by_present, project_columns, quote_ident,
-    shard_count,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql, exasol_type_from_json,
+    extract_limit, order_by_present, project_columns, quote_ident, shard_count,
 };
 use super::topn::parse_sort_key_element;
 
@@ -575,19 +577,28 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
     }
 }
 
-/// Render an expression node to table-qualified DataFusion/Exasol SQL for the
-/// two-scan wrapper: annotate each `column` with its side alias, then reuse the
-/// `vs-expression` translator. `None` when the node cannot be rendered.
+/// Render an expression node to table-qualified **Exasol** SQL for the two-scan
+/// wrapper: annotate each `column` with its side alias, then reuse the
+/// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
+/// node cannot be rendered.
+///
+/// This whole module builds outer-wrapper SQL that Exasol's own core engine
+/// parses directly, so CAST targets must use Exasol syntax (length-qualified
+/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in this
+/// file (`render_join_condition`, `render_broadcast_join`) which stay on the
+/// bare-`VARCHAR` DataFusion dialect.
 fn render_expression_qualified(expr: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
-    render_expression_safe(&annotate_columns_with_alias(expr, alias_of))
+    render_expression_exasol_safe(&annotate_columns_with_alias(expr, alias_of))
 }
 
-/// Render a WHERE filter to a table-qualified Exasol boolean expression for the
-/// two-scan wrapper. `None` when the filter is absent-shaped, trivially true, or
-/// unrenderable — mirroring the single-table `render_df_filter_safe` contract, so a
-/// dropped predicate is Exasol's own backstop responsibility exactly as elsewhere.
+/// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
+/// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
+/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract,
+/// so a dropped predicate is Exasol's own backstop responsibility exactly as
+/// elsewhere. Uses the Exasol-dialect entry point because the wrapper WHERE is
+/// parsed by Exasol's core engine (length-qualified CAST targets).
 fn render_df_filter_qualified(filter: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
-    render_df_filter_safe(&annotate_columns_with_alias(filter, alias_of))
+    render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
 /// Walk an expression tree, recording every `column` node's owning side: its
@@ -950,7 +961,6 @@ pub(super) async fn plan_join(
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
     let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
     let tuning = JoinScanTuning {
         cluster_nodes,
@@ -981,7 +991,6 @@ pub(super) async fn plan_join(
                 &rendered,
                 &tuning,
                 &udf_name,
-                &merge_udf_name,
                 &distribute_udf_name,
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
@@ -995,7 +1004,6 @@ pub(super) async fn plan_join(
         &sides,
         &tuning,
         &udf_name,
-        &merge_udf_name,
         &distribute_udf_name,
     )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
@@ -1171,7 +1179,6 @@ fn build_n_scan_join_sql(
     sides: &[ResolvedJoinSide],
     tuning: &JoinScanTuning,
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     let cols_per_side: Vec<Vec<(String, String)>> = sides
@@ -1245,7 +1252,6 @@ fn build_n_scan_join_sql(
             side_filter.as_ref(),
             tuning,
             udf_name,
-            merge_udf_name,
             distribute_udf_name,
         ));
     }
@@ -1334,7 +1340,6 @@ fn build_side_fan_out_sql(
     side_filter: Option<&Json>,
     tuning: &JoinScanTuning,
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
     let proj_cols: Vec<ProjectionItem> = columns
@@ -1366,6 +1371,7 @@ fn build_side_fan_out_sql(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: proj_types.clone(),
         logical_schema: side.logical_schema.clone(),
         name_mapping: side.name_mapping.clone(),
@@ -1387,7 +1393,6 @@ fn build_side_fan_out_sql(
         &[],
         &[],
         udf_name,
-        merge_udf_name,
         distribute_udf_name,
     )
 }
@@ -1412,7 +1417,6 @@ fn build_broadcast_join_sql(
     rendered: &RenderedJoinPushdown,
     tuning: &JoinScanTuning,
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
     let fact = &sides.fact;
@@ -1444,6 +1448,7 @@ fn build_broadcast_join_sql(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: rendered.projection_types.clone(),
         logical_schema: fact.logical_schema.clone(),
         name_mapping: fact.name_mapping.clone(),
@@ -1466,7 +1471,6 @@ fn build_broadcast_join_sql(
         &[],
         &[],
         udf_name,
-        merge_udf_name,
         distribute_udf_name,
     )
 }
@@ -1554,29 +1558,93 @@ fn qualified_join_order_by(
     Ok(Some(parts.join(", ")))
 }
 
-/// The full base row as `(ProjectionItem::Column, Exasol type)` lists, positionally
-/// aligned. Used by the grouped qualified-wrapper fallback so its inner sharded raw
-/// scan exposes every column the outer grouped select list / GROUP BY / HAVING /
-/// ORDER BY can reference.
-pub(super) fn full_row_projection(
-    all_cols: &[(String, String)],
-) -> (Vec<ProjectionItem>, Vec<String>) {
-    (
-        all_cols
+/// Record the UPPERCASE name of every `column` node in `expr`, recursively — the
+/// exhaustive walk that descends through scalar wrappers, CASE branches, and
+/// aggregate ARGUMENT sub-expressions, so a column nested inside `SUM(CASE WHEN
+/// region='R' THEN 1 END)` or `ROUND(100.0*SUM(x)/COUNT(*),2)` is surfaced, not just
+/// a top-level reference. A missed nested reference would leave the inner scan
+/// without a column the wrapper's rendered SQL names.
+fn collect_all_column_names(expr: &Json, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column")
+                && let Some(name) = map.get("name").and_then(|n| n.as_str())
+            {
+                out.insert(name.to_uppercase());
+            }
+            for value in map.values() {
+                collect_all_column_names(value, out);
+            }
+        }
+        Json::Array(items) => items
             .iter()
-            .map(|(name, _)| ProjectionItem::Column(name.clone()))
-            .collect(),
-        all_cols.iter().map(|(_, ty)| ty.clone()).collect(),
-    )
+            .for_each(|item| collect_all_column_names(item, out)),
+        _ => {}
+    }
 }
 
-/// Build the qualified single-table wrapper for a GROUP BY request that could not be
-/// decomposed into the partial/merge plan (an undecomposable scalar-over-aggregate
-/// item, a non-numeric aggregate with no HAVING, or any other non-pushable grouped
-/// shape). This is the join N-scan fallback at N = 1: one aliased raw fan-out
-/// subquery, no cross-join and no join condition, with the exact grouped select list,
-/// GROUP BY, HAVING, ORDER BY, and LIMIT rendered as ordinary Exasol SQL over it so
-/// Exasol's core engine computes the aggregate over the returned rows.
+/// The subset of `all_cols` the qualified single-table wrapper actually references,
+/// as positionally-aligned `(ProjectionItem::Column, Exasol type)` lists — the shared
+/// inner-scan projection for BOTH decline wrappers (grouped and single-group Case
+/// 2/3), replacing the old whole-table `full_row_projection` (issue #160).
+///
+/// Walks the FULL expression tree of every clause the wrapper renders — the SELECT
+/// list, WHERE filter, GROUP BY keys, HAVING, and ORDER BY — via
+/// [`collect_all_column_names`], so every column the rendered SQL names is projected
+/// and none is missing at runtime. Column order and Exasol types are preserved from
+/// `all_cols`. Always returns at least one column (an empty EMITS clause is invalid
+/// in Exasol): when the request references no source column it falls back to the
+/// first column of `all_cols`.
+pub(super) fn referenced_column_projection(
+    pushdown_req: &Json,
+    all_cols: &[(String, String)],
+) -> (Vec<ProjectionItem>, Vec<String>) {
+    let mut names = std::collections::HashSet::new();
+    if let Some(list) = pushdown_req.get("selectList") {
+        collect_all_column_names(list, &mut names);
+    }
+    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+        collect_all_column_names(f, &mut names);
+    }
+    for key in ["groupBy", "orderBy"] {
+        if let Some(v) = pushdown_req.get(key) {
+            collect_all_column_names(v, &mut names);
+        }
+    }
+    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
+        collect_all_column_names(h, &mut names);
+    }
+
+    let mut cols = Vec::new();
+    let mut types = Vec::new();
+    for (name, ty) in all_cols {
+        if names.contains(name) {
+            cols.push(ProjectionItem::Column(name.clone()));
+            types.push(ty.clone());
+        }
+    }
+    // Guarantee at least one projected column: an empty EMITS clause is invalid in
+    // Exasol. A request referencing no source column falls back to the first column.
+    if cols.is_empty()
+        && let Some((name, ty)) = all_cols.first()
+    {
+        cols.push(ProjectionItem::Column(name.clone()));
+        types.push(ty.clone());
+    }
+    (cols, types)
+}
+
+/// Build the qualified single-table wrapper for an aggregate request that could not
+/// be decomposed into the partial/merge plan. Serves BOTH decline paths: a GROUP BY
+/// request (an undecomposable scalar-over-aggregate item, a non-numeric aggregate
+/// with no HAVING, or any other non-pushable grouped shape) AND a single-group Case
+/// 2/3 `COUNT(DISTINCT)` request (more than one distinct, or a distinct mixed with an
+/// ordinary aggregate) that cannot fan out. This is the join N-scan fallback at
+/// N = 1: one aliased raw fan-out subquery, no cross-join and no join condition, with
+/// the exact select list, GROUP BY (rendered only when the request carries one — so
+/// the single-group shape emits no GROUP BY), HAVING, ORDER BY, and LIMIT rendered as
+/// ordinary Exasol SQL over it, so Exasol's core engine computes the aggregate over
+/// the returned rows.
 ///
 /// Reuses the join path's qualified renderers verbatim: the single table is aliased
 /// `LHS_T0`, every column reference is table-qualified against that alias, and
@@ -1588,13 +1656,12 @@ pub(super) fn full_row_projection(
 /// is needed — mirroring the grouped push-down path. The result column count and
 /// per-column types match Exasol's positional `selectListDataTypes` validation, so
 /// this never emits the `04000`-triggering bare row scan.
-pub(super) fn build_grouped_qualified_fallback_sql<E: Clone + Into<FileEntry>>(
+pub(super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown_req: &Json,
     fan_out_spec: &ScanSpec,
     shards: &[Vec<E>],
     udf_name: &str,
-    merge_udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
     const ALIAS: &str = "LHS_T0";
@@ -1647,7 +1714,6 @@ pub(super) fn build_grouped_qualified_fallback_sql<E: Clone + Into<FileEntry>>(
         &[],
         &[],
         udf_name,
-        merge_udf_name,
         distribute_udf_name,
     );
 
@@ -2356,7 +2422,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the two-table unified fallback must build");
@@ -2467,7 +2532,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the qualified unified fallback must build despite the column-name collision");
@@ -2508,7 +2572,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("an all-inner N-scan wrapper must build, never Err");
@@ -2560,7 +2623,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the Q1-shape (supplier⋈nation⋈region) must build, never Err");
@@ -2605,7 +2667,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the NQ3-shape (part⋈partsupp⋈supplier⋈nation) must build, never Err");
@@ -2687,7 +2748,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("three tables sharing an ID column must still build, never Err");
@@ -2728,7 +2788,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the above-threshold two-table fallback must build");
@@ -2771,7 +2830,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the three-table inner-join chain must build");
@@ -2863,7 +2921,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("the star-shape greedy-attach fallback must build");
@@ -2931,7 +2988,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("aggregate-over-join must build the unified wrapper");
@@ -3007,6 +3063,41 @@ mod tests {
         );
     }
 
+    /// The exact failing-E2E shape: `COUNT(DISTINCT CAST(col AS CHAR(20)))`
+    /// routed to the qualified wrapper must render the CAST target
+    /// LENGTH-QUALIFIED (`VARCHAR(20)`), never bare `VARCHAR`. The qualified
+    /// wrapper SQL is parsed by Exasol's own engine, whose VARCHAR type REQUIRES
+    /// a length — a bare `VARCHAR` is the "unexpected ')', expecting '('" parse
+    /// error (`count_distinct_expression_arg_via_wrapper_matches_single_node`).
+    /// This guards the join/qualified-wrapper half of the Exasol-dialect CAST
+    /// split under plain `cargo test`, without Docker/Exasol.
+    #[test]
+    fn qualified_count_distinct_cast_char_renders_length_qualified_exasol_varchar() {
+        let alias_of = seam_alias_of();
+        let item = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "distinct": true,
+            "arguments": [{
+                "type": "function_scalar_cast", "name": "CAST",
+                "arguments": [{"type": "column", "name": "C_VARCHAR", "tableName": "CUSTOMER"}],
+                "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
+            }]
+        });
+        let sql = render_selectlist_item_qualified(&item, &alias_of)
+            .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
+        assert!(
+            sql.contains("VARCHAR(20)"),
+            "Exasol-parsed qualified wrapper needs a length-qualified CAST target: {sql}"
+        );
+        assert!(
+            !sql.contains("AS VARCHAR)"),
+            "must NOT emit a bare length-less VARCHAR (Exasol rejects it): {sql}"
+        );
+        assert!(
+            sql.contains(r#"COUNT(DISTINCT CAST("LHS_T0"."C_VARCHAR" AS VARCHAR(20)))"#),
+            "full qualified COUNT(DISTINCT CAST(...)) shape must match: {sql}"
+        );
+    }
+
     /// The finding-#1 byte-compatibility guard: a TOP-LEVEL bare aggregate renders
     /// through the unified `render_selectlist_item_qualified` byte-identically to the
     /// former dedicated `render_aggregate_qualified` — a single-arg aggregate as
@@ -3068,7 +3159,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("ordered unified wrapper must build");
@@ -3342,7 +3432,6 @@ mod tests {
             Some(&filter),
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         );
         let common = common_arg_literal(&sql_with);
@@ -3356,15 +3445,8 @@ mod tests {
             "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
         );
 
-        let sql_without = build_side_fan_out_sql(
-            &side,
-            &cols,
-            None,
-            &two_scan_tuning(),
-            "SCAN",
-            "MERGE",
-            "DISTRIBUTE",
-        );
+        let sql_without =
+            build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
         let common_none = common_arg_literal(&sql_without);
         assert!(
             !common_none.contains("\"filter\""),
@@ -3389,8 +3471,7 @@ mod tests {
             parallelism_factor: 1,
             ..two_scan_tuning()
         };
-        let sql =
-            build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+        let sql = build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "DISTRIBUTE");
 
         assert!(
             !sql.contains("SELECT * FROM ("),
@@ -3434,8 +3515,7 @@ mod tests {
             parallelism_factor: 1,
             ..two_scan_tuning()
         };
-        let sql =
-            build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+        let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE");
 
         assert!(
             !sql.contains("SELECT * FROM ("),
@@ -3531,7 +3611,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("unified wrapper must build");
@@ -3745,5 +3824,218 @@ mod tests {
         assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
         assert_eq!(qualify_udf(Some(""), "UDF"), "UDF");
         assert_eq!(qualify_udf(None, "UDF"), "UDF");
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared referenced-column narrowing (issue #160, task 6.6)
+    // -----------------------------------------------------------------------
+
+    /// Issue #160 regression: BOTH decline wrappers — the grouped decline wrapper AND
+    /// the single-group Case 2/3 `COUNT(DISTINCT)` wrapper — obtain their inner-scan
+    /// projection from the ONE shared `referenced_column_projection` helper, which
+    /// narrows to only the columns the wrapper references and NEVER falls back to the
+    /// full base-table schema.
+    ///
+    /// The narrowing walks the FULL expression tree of every clause the wrapper
+    /// renders: a column referenced ONLY inside an aggregate argument
+    /// (`SUM(CASE WHEN region='R' ...)` surfaces `REGION`), a column referenced ONLY in
+    /// HAVING, and a column referenced ONLY in ORDER BY (and the WHERE filter) are all
+    /// surfaced, while an unreferenced base-table column is dropped. Then each wrapper
+    /// is built from that narrowed projection and asserted to omit the unreferenced
+    /// column entirely (its EMITS clause names only referenced columns).
+    #[test]
+    fn fallback_projection_narrows_to_referenced_columns() {
+        fn col(name: &str, ty: &str) -> (String, String) {
+            (name.to_string(), ty.to_string())
+        }
+        fn spec_with(projection: Vec<ProjectionItem>, emit_exa_types: Vec<String>) -> ScanSpec {
+            ScanSpec {
+                table_root: String::new(),
+                files: vec![],
+                projection,
+                filter: None,
+                limit: None,
+                order_by: Vec::new(),
+                aggregates: None,
+                group_keys: None,
+                distinct: false,
+                emit_exa_types,
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join: None,
+                storage: sample_storage(),
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            }
+        }
+        fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
+            proj.iter()
+                .map(|p| match p {
+                    ProjectionItem::Column(n) => n.clone(),
+                    ProjectionItem::Expr { .. } => panic!("narrowing must yield columns only"),
+                })
+                .collect()
+        }
+
+        let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
+        let shards = [vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
+
+        // --- The shared helper narrows across EVERY reference site (pure #160 core). ---
+        // GK: group key + bare select; REGION: only inside SUM(CASE ...); HCOL: only in
+        // HAVING; OCOL: only in ORDER BY; FCOL: only in the WHERE filter;
+        // IRRELEVANT_COL: never referenced.
+        let all_cols = vec![
+            col("GK", "VARCHAR(10)"),
+            col("REGION", "VARCHAR(10)"),
+            col("HCOL", "DECIMAL(18,0)"),
+            col("OCOL", "DECIMAL(18,0)"),
+            col("FCOL", "DECIMAL(18,0)"),
+            col("IRRELEVANT_COL", "VARCHAR(10)"),
+        ];
+        let rich_req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "GK", "tableName": "T"}],
+            "selectList": [
+                {"type": "column", "name": "GK", "tableName": "T"},
+                {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
+                    {"type": "function_scalar", "name": "CASE", "arguments": [
+                        {"type": "predicate_equal",
+                         "left": {"type": "column", "name": "REGION", "tableName": "T"},
+                         "right": {"type": "literal_string", "value": "R"}},
+                        {"type": "literal_exactnumeric", "value": 1},
+                        {"type": "literal_exactnumeric", "value": 0}]}]}
+            ],
+            "having": {"type": "predicate_greater",
+                "left": {"type": "function_aggregate", "name": "SUM", "distinct": false,
+                         "arguments": [{"type": "column", "name": "HCOL", "tableName": "T"}]},
+                "right": {"type": "literal_exactnumeric", "value": 10}},
+            "orderBy": [{"expression": {"type": "column", "name": "OCOL", "tableName": "T"},
+                         "isAscending": true, "nullsLast": false}],
+            "filter": {"type": "predicate_equal",
+                "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+                "right": {"type": "literal_exactnumeric", "value": 5}},
+        });
+        let (proj, types) = referenced_column_projection(&rich_req, &all_cols);
+        let names = proj_names(&proj);
+        for expected in ["GK", "REGION", "HCOL", "OCOL", "FCOL"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "#160: {expected} is referenced (select/aggregate-arg/CASE/HAVING/ORDER BY/\
+                 filter) and MUST be surfaced: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"IRRELEVANT_COL".to_string()),
+            "#160: an unreferenced base-table column must be narrowed out, never the \
+             full schema: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            5,
+            "narrowed to EXACTLY the 5 referenced columns, not the full 6-column \
+             base-table schema: {names:?}"
+        );
+        assert_eq!(
+            types.len(),
+            5,
+            "types stay positionally aligned with columns"
+        );
+
+        // --- Grouped decline wrapper is BUILT from the narrowed projection. ---
+        // REGION is referenced ONLY inside the SUM(CASE ...) aggregate argument.
+        let grouped_all = vec![
+            col("GK", "VARCHAR(10)"),
+            col("REGION", "VARCHAR(10)"),
+            col("IRRELEVANT_COL", "VARCHAR(10)"),
+        ];
+        let grouped_req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "GK", "tableName": "T"}],
+            "selectList": [
+                {"type": "column", "name": "GK", "tableName": "T"},
+                {"type": "function_aggregate", "name": "SUM", "distinct": false, "arguments": [
+                    {"type": "function_scalar", "name": "CASE", "arguments": [
+                        {"type": "predicate_equal",
+                         "left": {"type": "column", "name": "REGION", "tableName": "T"},
+                         "right": {"type": "literal_string", "value": "R"}},
+                        {"type": "literal_exactnumeric", "value": 1},
+                        {"type": "literal_exactnumeric", "value": 0}]}]}
+            ],
+        });
+        let (gproj, gtypes) = referenced_column_projection(&grouped_req, &grouped_all);
+        assert_eq!(
+            proj_names(&gproj),
+            vec!["GK".to_string(), "REGION".to_string()],
+            "the grouped inner scan narrows to GK + REGION (nested in SUM(CASE ...)), \
+             never IRRELEVANT_COL"
+        );
+        let gsql = build_qualified_single_table_fallback_sql(
+            &request,
+            &grouped_req,
+            &spec_with(gproj, gtypes),
+            &shards,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        )
+        .expect("grouped decline wrapper must build");
+        assert!(
+            !gsql.contains("IRRELEVANT_COL"),
+            "#160: the grouped wrapper's inner scan must NOT emit the unreferenced \
+             column: {gsql}"
+        );
+        assert!(
+            gsql.contains("REGION")
+                && gsql.contains(" GROUP BY ")
+                && gsql.contains(r#"AS "LHS_T0""#),
+            "the grouped wrapper renders the aggregate over the narrowed aliased scan: {gsql}"
+        );
+
+        // --- Single-group Case 2/3 wrapper is BUILT from the same shared helper. ---
+        let sg_all = vec![
+            col("A", "VARCHAR(10)"),
+            col("B", "VARCHAR(10)"),
+            col("IRRELEVANT_COL", "VARCHAR(10)"),
+        ];
+        let sg_req = serde_json::json!({
+            "selectList": [
+                {"type": "function_aggregate", "name": "COUNT", "distinct": true,
+                 "arguments": [{"type": "column", "name": "A", "tableName": "T"}]},
+                {"type": "function_aggregate", "name": "COUNT", "distinct": true,
+                 "arguments": [{"type": "column", "name": "B", "tableName": "T"}]},
+            ],
+        });
+        let (sproj, stypes) = referenced_column_projection(&sg_req, &sg_all);
+        assert_eq!(
+            proj_names(&sproj),
+            vec!["A".to_string(), "B".to_string()],
+            "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
+        );
+        let ssql = build_qualified_single_table_fallback_sql(
+            &request,
+            &sg_req,
+            &spec_with(sproj, stypes),
+            &shards,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        )
+        .expect("single-group Case 2/3 wrapper must build");
+        assert!(
+            !ssql.contains("IRRELEVANT_COL"),
+            "#160: the single-group Case 2/3 wrapper's inner scan must NOT emit the \
+             unreferenced column: {ssql}"
+        );
+        assert_eq!(
+            ssql.matches("COUNT(DISTINCT").count(),
+            2,
+            "both COUNT(DISTINCT) aggregates spliced verbatim into the wrapper: {ssql}"
+        );
+        assert!(
+            !ssql.contains(" GROUP BY ") && ssql.contains(r#"AS "LHS_T0""#),
+            "the single-group wrapper renders NO GROUP BY over the aliased scan: {ssql}"
+        );
     }
 }

@@ -1,11 +1,13 @@
-//! Packaging integration test: the single built `.so` exports all THREE UDF
-//! entry point symbols (the VS adapter, the DataFusion scan SET UDF, and the
-//! scalar distinct-merge UDF).
+//! Packaging integration test: the single built `.so` exports EXACTLY the two
+//! UDF entry point symbols (the VS adapter and the DataFusion scan SCALAR EMIT
+//! UDF) and nothing more.
 //!
 //! Covers packaging/single-so-two-entry-points scenario:
-//! "One crate exports both the adapter and the scan entry points" (extended to
-//! three) — the `.so` SHALL export the adapter entry-point symbol, the scan
-//! entry-point symbol, and the scalar distinct-merge entry-point symbol.
+//! "One crate exports the adapter and the scan entry points" — the `.so` SHALL
+//! export the adapter entry-point symbol and the scan entry-point symbol, and
+//! MUST export no third entry point (single-group `COUNT(DISTINCT)` now merges
+//! via a native Exasol `COUNT(DISTINCT)`, so the former scalar distinct-merge
+//! entry point is gone).
 //!
 //! Gated under `exasol-e2e` because it inspects the containerized release
 //! artifact, which `make test-e2e` guarantees is freshly built (it depends on
@@ -56,10 +58,19 @@ fn so_exports_scan_symbol_and_no_distributor_symbol() {
         symbols.contains("__exa_udf_entry_LAKEHOUSE_SCAN"),
         "the .so must export the scan entry symbol __exa_udf_entry_LAKEHOUSE_SCAN"
     );
-    assert!(
-        symbols.contains("__exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"),
-        "the .so must export the scalar distinct-merge entry symbol \
-         __exa_udf_entry_LAKEHOUSE_DISTINCT_MERGE_COUNT"
+    // EXACTLY two Rust UDF entry points — the adapter and the scan. The former
+    // scalar distinct-merge entry point was removed (single-group COUNT(DISTINCT)
+    // now merges via a native Exasol COUNT(DISTINCT)), so any third
+    // `__exa_udf_entry_*` symbol is a regression.
+    let entry_symbols: Vec<&str> = symbols
+        .lines()
+        .filter(|line| line.contains("__exa_udf_entry_"))
+        .collect();
+    assert_eq!(
+        entry_symbols.len(),
+        2,
+        "the .so must export EXACTLY two UDF entry-point symbols (the adapter and \
+         the scan), found: {entry_symbols:?}"
     );
     // The file distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a plain LUA SET script
     // created by its own DDL — it carries no Rust logic and is NOT a `.so` entry
