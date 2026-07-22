@@ -847,6 +847,71 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("to_timestamp({})", rendered.join(", "))))
                 }
+                // ADD_HOURS / ADD_MINUTES are deliberately NOT translated. The
+                // microsecond round-trip rendering executed correctly for a TIMESTAMP
+                // argument, but E2E parity against live Exasol (task 3.1) showed it
+                // diverges on a DATE argument: Exasol infers ADD_HOURS(DATE, n) →
+                // TIMESTAMP(0), while the rendering always yields TIMESTAMP(3), so
+                // Exasol rejects the pushdown ("Data type mismatch ... Expected
+                // TIMESTAMP(0), but got TIMESTAMP(3)"). A type-blind string translator
+                // has no argument type and cannot vary the result precision, so these
+                // fall through — same input-type-dependent class as ADD_DAYS/ADD_WEEKS.
+                // DAYS_BETWEEN — whole-day date difference. Exasol uses only the date
+                // part of a timestamp; DATE - DATE yields an Int64 day count in
+                // DataFusion 54.0.0 (is_date_minus_date in type_coercion/binary.rs →
+                // ret: Int64). Wrapped in outer parens so the difference composes
+                // safely as an operand (same convention as the FN_ADD/SUB/MULT arms).
+                "DAYS_BETWEEN" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar DAYS_BETWEEN missing 'arguments'".into())
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar DAYS_BETWEEN requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let first = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
+                        UdfError::User("DAYS_BETWEEN first argument is null".into())
+                    })?;
+                    let second = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
+                        UdfError::User("DAYS_BETWEEN second argument is null".into())
+                    })?;
+                    Ok(Some(format!(
+                        "(CAST({first} AS DATE) - CAST({second} AS DATE))"
+                    )))
+                }
+                // HOURS_BETWEEN / MINUTES_BETWEEN / SECONDS_BETWEEN — fractional
+                // differences over full timestamps, from date_part('epoch', …)
+                // (Float64 seconds) differences. The epoch difference is divided by
+                // the unit's seconds (undivided for SECONDS_BETWEEN); the whole
+                // expression is fully parenthesized so it composes safely as an
+                // operand (first minus second → negative when arg1 precedes arg2).
+                "HOURS_BETWEEN" | "MINUTES_BETWEEN" | "SECONDS_BETWEEN" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    if args.len() != 2 {
+                        return Err(UdfError::User(format!(
+                            "function_scalar {fn_name} requires 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let first = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
+                        UdfError::User(format!("{fn_name} first argument is null"))
+                    })?;
+                    let second = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
+                        UdfError::User(format!("{fn_name} second argument is null"))
+                    })?;
+                    let diff =
+                        format!("(date_part('epoch', {first}) - date_part('epoch', {second}))");
+                    Ok(Some(match fn_name.as_str() {
+                        "HOURS_BETWEEN" => format!("({diff} / 3600)"),
+                        "MINUTES_BETWEEN" => format!("({diff} / 60)"),
+                        "SECONDS_BETWEEN" => diff,
+                        _ => unreachable!(),
+                    }))
+                }
                 other => Err(UdfError::User(format!(
                     "unsupported scalar function: {other}"
                 ))),
@@ -2231,6 +2296,119 @@ mod tests {
         assert!(render_expression_safe(&expr).is_none());
     }
 
+    // ADD_HOURS / ADD_MINUTES have no rendering test: they were withdrawn after
+    // E2E parity (task 3.1) showed the microsecond round-trip diverges on a DATE
+    // argument (Exasol expects TIMESTAMP(0), the rendering yields TIMESTAMP(3)).
+    // They now fall through — see `unsupported_date_fn_falls_through`.
+
+    // --- DAYS_BETWEEN (whole-day date difference) ---
+
+    #[test]
+    fn renders_days_between_as_date_difference() {
+        // DATE - DATE yields an Int64 day count in DataFusion 54.0.0
+        // (is_date_minus_date in type_coercion/binary.rs → ret: Int64). Outer parens
+        // keep the difference composition-safe as an operand (same convention as the
+        // FN_ADD/SUB/MULT arms).
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "DAYS_BETWEEN",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CAST("A" AS DATE) - CAST("B" AS DATE))"#
+        );
+    }
+
+    // --- HOURS/MINUTES/SECONDS_BETWEEN (epoch-second differences) ---
+
+    #[test]
+    fn renders_time_between_as_epoch_difference() {
+        let hours = json!({
+            "type": "function_scalar",
+            "name": "HOURS_BETWEEN",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&hours).unwrap(),
+            r#"((date_part('epoch', "A") - date_part('epoch', "B")) / 3600)"#
+        );
+
+        let minutes = json!({
+            "type": "function_scalar",
+            "name": "MINUTES_BETWEEN",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&minutes).unwrap(),
+            r#"((date_part('epoch', "A") - date_part('epoch', "B")) / 60)"#
+        );
+
+        let seconds = json!({
+            "type": "function_scalar",
+            "name": "SECONDS_BETWEEN",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert_eq!(
+            render_expression(&seconds).unwrap(),
+            r#"(date_part('epoch', "A") - date_part('epoch', "B"))"#
+        );
+    }
+
+    #[test]
+    fn between_fns_reject_wrong_arity() {
+        for name in [
+            "DAYS_BETWEEN",
+            "HOURS_BETWEEN",
+            "MINUTES_BETWEEN",
+            "SECONDS_BETWEEN",
+        ] {
+            let one_arg = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [{"type": "column", "name": "a"}]
+            });
+            assert!(
+                render_expression(&one_arg).is_err(),
+                "{name} 1-arg must raise"
+            );
+            assert!(
+                render_expression_safe(&one_arg).is_none(),
+                "{name} 1-arg must be None in safe mode"
+            );
+
+            let three_args = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"},
+                    {"type": "column", "name": "c"}
+                ]
+            });
+            assert!(
+                render_expression(&three_args).is_err(),
+                "{name} 3-arg must raise"
+            );
+            assert!(
+                render_expression_safe(&three_args).is_none(),
+                "{name} 3-arg must be None in safe mode"
+            );
+        }
+    }
+
     // --- Integer division DIV is deliberately not translated ---
 
     #[test]
@@ -2353,23 +2531,25 @@ mod tests {
 
     #[test]
     fn unsupported_date_fn_falls_through() {
-        // Full excluded set per the date-fns spec Background: date-arithmetic,
-        // date-difference, and the other date scalars whose DataFusion 54
-        // equivalents diverge from Exasol (or don't exist at all).
+        // Remaining excluded set per the date-fns spec Background: the date-arithmetic,
+        // date-difference, and other date scalars whose DataFusion 54 equivalents still
+        // diverge from Exasol (or don't exist at all). DAYS_BETWEEN, HOURS_BETWEEN,
+        // MINUTES_BETWEEN, and SECONDS_BETWEEN are no longer here — they now have real
+        // translator arms (see the disposition table in `add-date-arithmetic-pushdown`)
+        // and are covered by their own rendering tests instead. ADD_HOURS/ADD_MINUTES
+        // ARE still here: their arm was withdrawn after E2E parity (task 3.1) showed
+        // the microsecond round-trip diverges on a DATE argument (Exasol expects
+        // TIMESTAMP(0), the rendering yields TIMESTAMP(3)).
         let unsupported = [
             // Date-arithmetic
-            "ADD_DAYS",
             "ADD_HOURS",
             "ADD_MINUTES",
+            "ADD_DAYS",
             "ADD_SECONDS",
             "ADD_WEEKS",
             "ADD_MONTHS",
             "ADD_YEARS",
             // Date-difference
-            "DAYS_BETWEEN",
-            "HOURS_BETWEEN",
-            "MINUTES_BETWEEN",
-            "SECONDS_BETWEEN",
             "MONTHS_BETWEEN",
             "YEARS_BETWEEN",
             // Other date scalars
