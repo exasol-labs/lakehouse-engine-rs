@@ -341,10 +341,19 @@ pub fn build_partial_agg_sql_filtered(
 /// it is substituted VERBATIM as raw SQL text; it is already a fully-rendered
 /// DataFusion fragment, so it is NOT re-quoted or re-escaped as an identifier.
 /// Otherwise the bare column name is emitted as a quoted identifier.
+///
+/// A plan reaching this helper with neither `arg_expr` nor `column` set is a
+/// malformed non-COUNT aggregate (COUNT(*) never calls here). Rather than emit
+/// an empty `""` identifier — which DataFusion rejects with an opaque
+/// `column "" not found` — fall back to a self-describing sentinel so the error
+/// names the actual defect.
 fn agg_arg_sql(plan: &AggregatePlan) -> String {
+    /// Sentinel identifier for a malformed aggregate plan missing both its
+    /// rendered expression and its bare column name.
+    const MISSING_AGG_ARG: &str = "__MISSING_AGG_ARGUMENT__";
     match plan.arg_expr.as_deref() {
         Some(expr) => expr.to_string(),
-        None => quote_ident(plan.column.as_deref().unwrap_or("")),
+        None => quote_ident(plan.column.as_deref().unwrap_or(MISSING_AGG_ARG)),
     }
 }
 
