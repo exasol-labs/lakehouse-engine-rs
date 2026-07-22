@@ -124,6 +124,19 @@ pub const CAPABILITIES: &[&str] = &[
     // ISO-8601 week number (issue #107): renders date_part('week', <arg>), verified
     // to match Exasol WEEK including year-boundary dates.
     "FN_WEEK",
+    // Date-difference pushdown (issue #107): *_BETWEEN via date_part('epoch', ..)
+    // deltas (DAYS_BETWEEN via DATE-DATE). ADD_HOURS/ADD_MINUTES are NOT advertised:
+    // E2E parity (task 3.1) proved the microsecond round-trip diverges on a DATE
+    // argument — Exasol infers TIMESTAMP(0) for ADD_HOURS(DATE, n) while the rendering
+    // yields TIMESTAMP(3), and Exasol rejects the pushdown ("Data type mismatch ...
+    // Expected TIMESTAMP(0), but got TIMESTAMP(3)"). The type-blind string translator
+    // cannot vary the result precision by argument type, so they were withdrawn (same
+    // input-type class as the deferred ADD_DAYS/ADD_WEEKS). The other eleven issue #107
+    // functions stay deferred — see plan `add-date-arithmetic-pushdown`.
+    "FN_DAYS_BETWEEN",
+    "FN_HOURS_BETWEEN",
+    "FN_MINUTES_BETWEEN",
+    "FN_SECONDS_BETWEEN",
     // Conditional scalar functions
     "FN_CASE",
     "FN_GREATEST",
@@ -304,7 +317,23 @@ mod tests {
             );
         }
 
+        // --- date-difference pushdown: supported subset (issue #107) ---
+        for name in &[
+            "FN_DAYS_BETWEEN",
+            "FN_HOURS_BETWEEN",
+            "FN_MINUTES_BETWEEN",
+            "FN_SECONDS_BETWEEN",
+        ] {
+            assert!(
+                cap_strs.contains(name),
+                "{name} must be advertised: {cap_strs:?}"
+            );
+        }
+
         // --- declined translations must stay unadvertised ---
+        // FN_ADD_HOURS/FN_ADD_MINUTES were withdrawn after E2E parity (task 3.1):
+        // the microsecond round-trip diverges on a DATE argument (Exasol infers
+        // TIMESTAMP(0), the rendering yields TIMESTAMP(3), pushdown rejected).
         for name in &[
             "FN_DIV",
             "FN_TO_CHAR",
@@ -313,17 +342,13 @@ mod tests {
             "FN_REGEXP_SUBSTR",
             "FN_REGEXP_INSTR",
             "FN_REGEXP_COUNT",
-            "FN_ADD_DAYS",
             "FN_ADD_HOURS",
             "FN_ADD_MINUTES",
+            "FN_ADD_DAYS",
             "FN_ADD_SECONDS",
             "FN_ADD_WEEKS",
             "FN_ADD_MONTHS",
             "FN_ADD_YEARS",
-            "FN_DAYS_BETWEEN",
-            "FN_HOURS_BETWEEN",
-            "FN_MINUTES_BETWEEN",
-            "FN_SECONDS_BETWEEN",
             "FN_MONTHS_BETWEEN",
             "FN_YEARS_BETWEEN",
             "FN_DAYOFWEEK",
