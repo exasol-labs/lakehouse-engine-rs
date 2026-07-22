@@ -100,3 +100,43 @@ positional-delete case (tracked as issue #68).
 * *WHEN* the scan UDF registers those files
 * *THEN* the UDF SHALL scan them through the same DataFusion `ParquetSource`-backed provider with NO base `ParquetAccessPlan` attached (an absent or all-selected access plan)
 * *AND* the emitted rows SHALL be identical to the pre-feature delete-free scan for the same query
+
+### Scenario: A shared delete file is read once per shard regardless of referencing data-file count
+
+* *GIVEN* a shard whose assigned data files include two or more files that reference the same partition-granularity Parquet positional-delete file
+* *WHEN* the scan UDF applies positional deletes to the shard's data files
+* *THEN* the UDF SHALL read that delete file's contents from object storage AT MOST ONCE for the whole shard, not once per referencing data file
+* *AND* the delete positions the UDF applies to each referencing data file SHALL be identical to reading and filtering that delete file separately per data file
+* *AND* the UDF MUST NOT issue an object-store HEAD for the delete file, because its size comes from the delete-file reference in the scan spec
+
+### Scenario: Concurrent delete-file reads stay within the connection budget
+
+* *GIVEN* a shard whose assigned data files reference more unique positional-delete files than the resolved `s3_max_connections` budget N
+* *WHEN* the scan UDF reads those delete files to build its per-data-file delete sets
+* *THEN* the number of concurrently in-flight delete-file object-store reads MUST NOT exceed N at any instant, counted across every delete-read fan-out active in the scan invocation — a single table, or both sides of a broadcast join sharing one size-N limiter
+* *AND* the UDF SHALL read delete files concurrently up to N in flight rather than strictly one at a time
+* *AND* the resulting per-data-file delete sets SHALL be identical to a strictly serial read, because unioning delete positions is order-independent
+
+### Scenario: Row groups that cannot contain an assigned data file's deletes are skipped
+
+* *GIVEN* a partition-granularity positional-delete file, sorted by (`file_path`, `pos`) as the Iceberg spec requires, whose per-row-group `file_path` min/max statistics show some row groups reference only data files absent from this shard
+* *WHEN* the scan UDF reads that delete file
+* *THEN* the UDF SHALL skip a row group whose `file_path` min/max bounds cannot overlap any assigned data file's path, decoding only the row groups that can contain an assigned data file's delete positions
+* *AND* the skip test MUST be range-based: skip a row group only when the target data-file path sorts strictly before its `file_path` min statistic OR strictly after its `file_path` max statistic; the UDF MUST NOT treat a `min == max == target` row group as an exact single-value match or otherwise shortcut the range comparison
+* *AND* a row group whose `file_path` statistics are ABSENT (not written, or disabled) MUST NOT be pruned; the UDF SHALL decode it
+* *AND* the accumulated delete set for each assigned data file SHALL be identical to the set produced by decoding every row group without pruning, including when the `file_path` min/max statistics are truncated
+
+> Iceberg table spec (https://iceberg.apache.org/spec/, Position Delete Files) is the normative basis for this pruning:
+> - "Position delete files are required to be sorted by file and position, not a table order, and should set sort order id to null." A given data file's entries are therefore contiguous within one delete file, so row-group `file_path` min/max bounds are a safe skip.
+> - "Column metrics can be used to determine whether a delete file's rows overlap the contents of a data file or a scan range." This is normative permission to skip row groups by `file_path` min/max bounds.
+>
+> Parquet statistics truncation keeps this skip safe only when it is range-based. A truncated min is rounded DOWN and a truncated max is rounded UP, so `[min, max]` stays a loose superset of the row group's true `file_path` values, and `target < min OR target > max` never wrongly skips a row group that could hold the target. An equality shortcut (`min == max == target`) is NOT safe: truncation can collapse two distinct long paths to an equal truncated min/max pair, so a match there does not prove the row group holds the target. A row group with ABSENT `file_path` statistics carries no bound and MUST be decoded.
+>
+> Page-level (page-index) pruning is a deliberate NON-goal of this plan: row-group-level pruning already exploits the spec-guaranteed sort, and positional-delete files are small. This is an optimization scope trim, not an Iceberg-spec deviation — the spec permits but does not require reader-side pruning at any granularity.
+
+### Scenario: The refactor preserves the delete-application safety invariants
+
+* *GIVEN* a shard whose assigned data files carry associated Parquet positional-delete files at file or partition granularity
+* *WHEN* the two-phase pipeline applies those deletes (Phase A reads each unique delete file once into a data-file-path → deleted-position map; Phase B looks up that map per data file with no delete-file I/O)
+* *THEN* the post-delete row set for every data file MUST be identical to applying every associated delete file's positions per data file, unchanged by the read-once, concurrent, pruned restructure
+* *AND* the read-time backstop rejecting non-positional deletes, credential redaction on every error path, and the no-object-store-HEAD invariant MUST all hold unchanged
