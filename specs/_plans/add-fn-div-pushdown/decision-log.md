@@ -29,18 +29,20 @@ remains unless DataFusion adds a faithful `div`.
 
 ### [1] Correct the FN_DIV decline rationale to verified truncation semantics
 
+- **ID:** exclude-fn-div-no-faithful-datafusion-truncated-division
 - **Decision:** Supersede ADR "Exclude FN_DIV — No Faithful DataFusion Floor Division" with a
   corrected ADR. Exasol `DIV` truncates the quotient toward zero (live-verified, not floor
   division) and matches DataFusion integer `/`; the decline stands because DataFusion 54 has no
   `div` builtin, a `TRUNC(m/n)` emulation diverges from Exasol on DOUBLE-operand division by zero
-  (Exasol raises SQL state 22012; DataFusion float division yields infinity), and per-function
-  capability advertisement cannot restrict `DIV` pushdown to the integer-operand case where `/`
-  would match.
+  (Exasol raises SQL state 22012; DataFusion float division yields infinity), and DIV's operand
+  types are not carried in the expression node — unlike CAST's explicit `dataType` field, which
+  lets `render_cast_target` decline only a subset of target types while `FN_CAST` stays advertised
+  — so the arithmetic operator arm cannot identify a safe integer-only case to render selectively.
 - **Alternatives:** (a) Advertise `FN_DIV` via `TRUNC(m/n)` — rejected: the DOUBLE division-by-zero
-  divergence is a silent wrong result, and advertisement is per function, not per operand type.
-  (b) Close #105 with no spec change — rejected: the permanent spec and ADR assert a live-refuted
-  premise, which could lead a future planner to ship `FN_DIV` via `FLOOR` and introduce a real
-  divergence.
+  divergence is a silent wrong result, and DIV's operand types aren't available to the translator to
+  restrict rendering to the safe integer case. (b) Close #105 with no spec change — rejected: the
+  permanent spec and ADR assert a live-refuted premise, which could lead a future planner to ship
+  `FN_DIV` via `FLOOR` and introduce a real divergence.
 - **Rationale:** The decline outcome is correct, but its recorded reason is factually wrong.
   Correcting it upholds the project's verified-semantics bar and removes a future-error trap.
 - **Supersedes:** Exclude FN_DIV — No Faithful DataFusion Floor Division

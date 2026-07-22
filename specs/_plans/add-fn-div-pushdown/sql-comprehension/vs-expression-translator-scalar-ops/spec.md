@@ -22,5 +22,5 @@ Exasol emits CAST as its own top-level node type, `function_scalar_cast` — not
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return an error naming `DIV` as unsupported
 * *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate `DIV`, because DataFusion 54 has no `div` builtin and a `TRUNC(m/n)` emulation diverges from Exasol for DOUBLE operands on division by zero — Exasol raises SQL state 22012, DataFusion float division yields infinity — a divergence per-function capability advertisement cannot exclude
+* *AND* the adapter SHALL omit the expression and let Exasol evaluate `DIV`, because DataFusion 54 has no `div` builtin and a `TRUNC(m/n)` emulation diverges from Exasol for DOUBLE operands on division by zero — Exasol raises SQL state 22012, DataFusion float division yields infinity — and unlike CAST's explicit `dataType` field, DIV's operand types are not carried in the expression node, so the translator cannot identify and selectively render only the safe integer-operand case
 <!-- /DELTA:CHANGED -->

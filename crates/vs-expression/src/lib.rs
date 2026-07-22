@@ -2126,9 +2126,14 @@ mod tests {
 
     #[test]
     fn div_falls_through_as_unsupported() {
-        // Exasol DIV is floor division; DataFusion 54 `/` truncates integer
-        // division toward zero (diverges on negative operands) and has no `div`
-        // function. DIV must therefore decline so Exasol evaluates it.
+        // Exasol DIV truncates toward zero (verified live: DIV(-7,2) = -3, not
+        // floor's -4) and matches DataFusion's integer `/`. But DataFusion 54 has
+        // no `div` builtin, and a `TRUNC(m/n)` emulation would diverge from
+        // Exasol on DOUBLE-operand division by zero (Exasol raises SQL state
+        // 22012; DataFusion float division yields infinity). DIV operand types
+        // aren't carried in the expression node, so the translator can't
+        // selectively render only the safe integer case. DIV must therefore
+        // decline so Exasol evaluates it.
         let expr = json!({
             "type": "function_scalar",
             "name": "DIV",
