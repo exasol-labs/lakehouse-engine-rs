@@ -140,9 +140,9 @@ Continue with [step 2](#2-create-the-scripts).
 
 ## 2. Create the scripts
 
-All three entry points come from the one `.so` (two RUST scripts) plus one plain LUA passthrough
-script; the SLC dispatches the RUST ones by script name. `%udf_object` depends on where your
-`.so` landed in step 1 — use whichever block below matches:
+Two RUST entry points come from the one `.so`, plus one plain LUA passthrough script; the SLC
+dispatches the RUST ones by script name. `%udf_object` depends on where your `.so` landed in
+step 1 — use whichever block below matches:
 
 ### If you used 1a, or 1b via BucketFS UI / raw HTTP PUT
 
