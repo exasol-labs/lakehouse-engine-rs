@@ -2,7 +2,9 @@ use crate::scan::spec::ProjectionItem;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{
+    render_df_filter_exasol_safe, render_expression_exasol_safe, render_expression_safe,
+};
 
 use super::super::support::{project_columns, quote_ident};
 use super::planning::{DetectedJoin, involved_table_columns};
@@ -80,25 +82,34 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
     }
 }
 
-/// Render an expression node to table-qualified DataFusion/Exasol SQL for the
-/// two-scan wrapper: annotate each `column` with its side alias, then reuse the
-/// `vs-expression` translator. `None` when the node cannot be rendered.
+/// Render an expression node to table-qualified **Exasol** SQL for the two-scan
+/// wrapper: annotate each `column` with its side alias, then reuse the
+/// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
+/// node cannot be rendered.
+///
+/// This whole module builds outer-wrapper SQL that Exasol's own core engine
+/// parses directly, so CAST targets must use Exasol syntax (length-qualified
+/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in this
+/// file (`render_join_condition`, `render_broadcast_join`) which stay on the
+/// bare-`VARCHAR` DataFusion dialect.
 pub(super) fn render_expression_qualified(
     expr: &Json,
     alias_of: &HashMap<String, String>,
 ) -> Option<String> {
-    render_expression_safe(&annotate_columns_with_alias(expr, alias_of))
+    render_expression_exasol_safe(&annotate_columns_with_alias(expr, alias_of))
 }
 
-/// Render a WHERE filter to a table-qualified Exasol boolean expression for the
-/// two-scan wrapper. `None` when the filter is absent-shaped, trivially true, or
-/// unrenderable — mirroring the single-table `render_df_filter_safe` contract, so a
-/// dropped predicate is Exasol's own backstop responsibility exactly as elsewhere.
+/// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
+/// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
+/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract,
+/// so a dropped predicate is Exasol's own backstop responsibility exactly as
+/// elsewhere. Uses the Exasol-dialect entry point because the wrapper WHERE is
+/// parsed by Exasol's core engine (length-qualified CAST targets).
 pub(super) fn render_df_filter_qualified(
     filter: &Json,
     alias_of: &HashMap<String, String>,
 ) -> Option<String> {
-    render_df_filter_safe(&annotate_columns_with_alias(filter, alias_of))
+    render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
 /// Walk an expression tree, recording every `column` node's owning side: its
@@ -364,6 +375,7 @@ mod tests {
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
+    use vs_expression::render_df_filter_safe;
 
     // ---------------------------------------------------------------------------
     // Join rendering: disjoint-column guard + condition/filter/projection
@@ -776,7 +788,6 @@ mod tests {
             Some(&filter),
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         );
         let common = common_arg_literal(&sql_with);
@@ -790,15 +801,8 @@ mod tests {
             "the fan-out filter MUST be bare (alias stripped), never alias-qualified: {common}"
         );
 
-        let sql_without = build_side_fan_out_sql(
-            &side,
-            &cols,
-            None,
-            &two_scan_tuning(),
-            "SCAN",
-            "MERGE",
-            "DISTRIBUTE",
-        );
+        let sql_without =
+            build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
         let common_none = common_arg_literal(&sql_without);
         assert!(
             !common_none.contains("\"filter\""),
@@ -823,8 +827,7 @@ mod tests {
             parallelism_factor: 1,
             ..two_scan_tuning()
         };
-        let sql =
-            build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+        let sql = build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "DISTRIBUTE");
 
         assert!(
             !sql.contains("SELECT * FROM ("),
@@ -868,8 +871,7 @@ mod tests {
             parallelism_factor: 1,
             ..two_scan_tuning()
         };
-        let sql =
-            build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "MERGE", "DISTRIBUTE");
+        let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE");
 
         assert!(
             !sql.contains("SELECT * FROM ("),
@@ -965,7 +967,6 @@ mod tests {
             &sides,
             &two_scan_tuning(),
             "SCAN",
-            "MERGE",
             "DISTRIBUTE",
         )
         .expect("unified wrapper must build");

@@ -19,11 +19,10 @@ use serde::{Deserialize, Serialize};
 /// STDDEV/VARIANCE family are decomposed into a (cnt, sum, sum_sq) sufficient-
 /// statistics triple; the wrapper reconstructs the population or sample statistic.
 ///
-/// `CountDistinct` is the single-group `COUNT(DISTINCT col)` shape: each shard computes
-/// its LOCAL distinct value set (NULLs excluded) and emits it as one VARCHAR partial
-/// value carrying a JSON array; a scalar merge UDF unions the per-shard sets and returns
-/// the final cardinality. No Arrow type crosses the `.so` boundary — see
-/// `specs/_plans/add-count-distinct-and-expression-aggregate-pushdown/vs-adapter/pushdown-planning-count-distinct/spec.md`.
+/// Single-group `COUNT(DISTINCT col)` is NOT an aggregate partial: it is decomposed
+/// into a DISTINCT row-scan fan-out (`CommonScanSpec::distinct`) whose per-shard local
+/// distinct rows are counted by an outer Exasol-native `COUNT(DISTINCT "V")`, so no
+/// `AggKind` variant represents it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AggKind {
@@ -41,10 +40,6 @@ pub enum AggKind {
     StddevPop,
     /// STDDEV / STDDEV_SAMP — sqrt(VAR_SAMP).
     StddevSamp,
-    /// Single-group `COUNT(DISTINCT col)` — see the doc above for the shard-local-set /
-    /// scalar-merge-UDF decomposition. Never produced by the grouped (GROUP BY) detection
-    /// path, which still declines `distinct: true` and falls back to row scanning.
-    CountDistinct,
 }
 
 /// One aggregate function in a pushed-down aggregate plan.
@@ -598,6 +593,16 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
 
+    /// Apply DataFusion `.distinct()` to the row-scan projection. Set only on the
+    /// single-group `COUNT(DISTINCT col)` fan-out (see
+    /// `vs-adapter/pushdown-planning-count-distinct`): each shard streams one row per
+    /// shard-local distinct projected value through the `emit_batch` path, and the
+    /// outer wrapper runs a native `COUNT(DISTINCT "V")` over the union. Inert (and
+    /// absent from JSON) on every other path — `false` (the default) means a plain
+    /// row scan; a legacy spec lacking the field deserializes to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub distinct: bool,
+
     /// Declared Exasol EMITS type string for each output column.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emit_exa_types: Vec<String>,
@@ -733,6 +738,14 @@ pub struct ScanSpec {
     /// Present only for grouped aggregate scans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_keys: Option<Vec<String>>,
+
+    /// Apply DataFusion `.distinct()` to the row-scan projection. Set only on the
+    /// single-group `COUNT(DISTINCT col)` fan-out (see [`CommonScanSpec::distinct`]):
+    /// each shard streams one row per shard-local distinct projected value, counted by
+    /// an outer native `COUNT(DISTINCT "V")`. `false` (the default) is a plain row
+    /// scan; a legacy spec lacking the field deserializes to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub distinct: bool,
 
     /// Declared Exasol EMITS type string for each output column, positionally
     /// aligned with the row-scan projection. The scan coerces each emitted Arrow
@@ -887,6 +900,7 @@ impl ScanSpec {
             order_by: self.order_by.clone(),
             aggregates: self.aggregates.clone(),
             group_keys: self.group_keys.clone(),
+            distinct: self.distinct,
             emit_exa_types: self.emit_exa_types.clone(),
             logical_schema: self.logical_schema.clone(),
             name_mapping: self.name_mapping.clone(),
@@ -921,6 +935,7 @@ impl ScanSpec {
             order_by: common.order_by,
             aggregates: common.aggregates,
             group_keys: common.group_keys,
+            distinct: common.distinct,
             emit_exa_types: common.emit_exa_types,
             logical_schema: common.logical_schema,
             name_mapping: common.name_mapping,
@@ -990,6 +1005,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -1174,11 +1190,6 @@ mod tests {
                 column: Some("AMOUNT".into()),
                 arg_expr: None,
             },
-            AggregatePlan {
-                kind: AggKind::CountDistinct,
-                column: Some("L_SHIPMODE".into()),
-                arg_expr: None,
-            },
         ]);
         let agg_json = agg_spec.to_json();
         assert!(
@@ -1188,7 +1199,7 @@ mod tests {
 
         let back = ScanSpec::from_json(&agg_json).unwrap();
         let plans = back.aggregates.expect("aggregates must survive round-trip");
-        assert_eq!(plans.len(), 7);
+        assert_eq!(plans.len(), 6);
         assert_eq!(plans[0].kind, AggKind::Count);
         assert_eq!(plans[0].column, None);
         assert_eq!(plans[1].kind, AggKind::CountCol);
@@ -1198,13 +1209,11 @@ mod tests {
         assert_eq!(plans[4].kind, AggKind::Max);
         assert_eq!(plans[5].kind, AggKind::Avg);
         assert_eq!(plans[5].column.as_deref(), Some("AMOUNT"));
-        assert_eq!(plans[6].kind, AggKind::CountDistinct);
-        assert_eq!(plans[6].column.as_deref(), Some("L_SHIPMODE"));
     }
 
     /// Task 1.1: `AggregatePlan.arg_expr` round-trips through JSON, is omitted from the
     /// wire form when `None` (backward-compatible with bare-column plans), and a plan
-    /// carrying an expression argument survives the round-trip alongside `CountDistinct`.
+    /// carrying an expression argument survives the round-trip alongside a bare-column plan.
     #[test]
     fn arg_expr_round_trips_and_omitted_when_none() {
         // A bare-column plan (arg_expr: None) must not carry the key at all.
@@ -1231,7 +1240,7 @@ mod tests {
                 arg_expr: Some("LENGTH(\"L_COMMENT\")".into()),
             },
             AggregatePlan {
-                kind: AggKind::CountDistinct,
+                kind: AggKind::CountCol,
                 column: Some("L_SHIPMODE".into()),
                 arg_expr: None,
             },
@@ -1248,7 +1257,7 @@ mod tests {
         assert_eq!(plans[0].kind, AggKind::Sum);
         assert_eq!(plans[0].column, None);
         assert_eq!(plans[0].arg_expr.as_deref(), Some("LENGTH(\"L_COMMENT\")"));
-        assert_eq!(plans[1].kind, AggKind::CountDistinct);
+        assert_eq!(plans[1].kind, AggKind::CountCol);
         assert_eq!(plans[1].arg_expr, None);
 
         // A legacy aggregate payload (predating arg_expr) deserializes with it defaulting

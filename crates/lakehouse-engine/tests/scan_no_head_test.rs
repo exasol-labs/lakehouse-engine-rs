@@ -268,6 +268,7 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),

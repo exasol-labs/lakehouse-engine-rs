@@ -4,9 +4,7 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::file_resolution::empty_result_sql;
-use super::support::{
-    DISTINCT_MERGE_UDF_NAME, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident,
-};
+use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
 mod planning;
 mod rendering;
@@ -18,7 +16,9 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
-pub(super) use sql_builders::{build_grouped_qualified_fallback_sql, full_row_projection};
+pub(super) use sql_builders::{
+    build_qualified_single_table_fallback_sql, referenced_column_projection,
+};
 
 use planning::{
     involved_table_columns, join_requires_exasol_postprocessing, resolve_one_join_side,
@@ -135,7 +135,6 @@ pub(super) async fn plan_join(
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
     let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
     let tuning = JoinScanTuning {
         cluster_nodes,
@@ -166,7 +165,6 @@ pub(super) async fn plan_join(
                 &rendered,
                 &tuning,
                 &udf_name,
-                &merge_udf_name,
                 &distribute_udf_name,
             );
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
@@ -180,7 +178,6 @@ pub(super) async fn plan_join(
         &sides,
         &tuning,
         &udf_name,
-        &merge_udf_name,
         &distribute_udf_name,
     )?;
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))

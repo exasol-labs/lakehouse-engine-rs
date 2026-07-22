@@ -20,8 +20,8 @@ use vs_expression::render_df_filter_safe;
 
 mod support;
 use support::{
-    DISTINCT_MERGE_UDF_NAME, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types,
-    extract_all_column_types, extract_limit, extract_projection, order_by_present,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
+    extract_limit, extract_projection, order_by_present,
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
@@ -39,7 +39,8 @@ mod topn;
 use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
-pub use single_group_agg::detect_aggregates;
+pub use single_group_agg::{detect_aggregates, ordinary_plans};
+use single_group_agg::{has_distinct, is_lone_count_distinct};
 
 mod grouped_agg;
 pub use grouped_agg::{
@@ -61,8 +62,8 @@ pub(crate) use joins::{
     ResolvedJoinSide, detect_join, render_broadcast_join,
 };
 use joins::{
-    build_grouped_qualified_fallback_sql, full_row_projection, ineligible_join_decline, plan_join,
-    qualify_udf,
+    build_qualified_single_table_fallback_sql, ineligible_join_decline, plan_join, qualify_udf,
+    referenced_column_projection,
 };
 
 #[cfg(test)]
@@ -194,11 +195,10 @@ pub async fn handle_pushdown(
     // stay absolute. The scan UDF rejoins relative paths onto `table_root`.
     let shards = relativize_shards_to_root(shards, &table_root);
 
-    // The scan and distinct-merge UDFs must be schema-qualified: the pushdown query
+    // The scan and distributor UDFs must be schema-qualified: the pushdown query
     // executes outside the adapter script's schema, so an unqualified name would not
     // resolve ("function or script LAKEHOUSE_SCAN not found").
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
-    let merge_udf_name = qualify_udf(scan_schema, DISTINCT_MERGE_UDF_NAME);
     let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
 
     // The raw HAVING node (for grouped aggregate queries). Rendered against the
@@ -242,19 +242,17 @@ pub async fn handle_pushdown(
             // dropping it would yield wrong results because Exasol will not
             // re-apply a HAVING we advertised AGGREGATE_HAVING for.
             let having = match having_node {
-                Some(node) => {
-                    match render_having_over_merge(node, &grouped_agg_plans, &merge_udf_name) {
-                        Some(sql) => Some(sql),
-                        None => {
-                            return Err(UdfError::User(
-                                "grouped aggregate pushdown declined: HAVING references an \
+                Some(node) => match render_having_over_merge(node, &grouped_agg_plans) {
+                    Some(sql) => Some(sql),
+                    None => {
+                        return Err(UdfError::User(
+                            "grouped aggregate pushdown declined: HAVING references an \
                              aggregate that cannot be merged or an unsupported node; \
                              this is a hard error, not a native re-plan"
-                                    .into(),
-                            ));
-                        }
+                                .into(),
+                        ));
                     }
-                }
+                },
                 None => None,
             };
             // Grouped aggregate pushdown path. Once ORDER_BY_COLUMN is advertised,
@@ -295,6 +293,7 @@ pub async fn handle_pushdown(
                 order_by: Vec::new(),
                 aggregates: Some(grouped_agg_plans.clone()),
                 group_keys: Some(group_keys.clone()),
+                distinct: false,
                 // Aggregate scans emit via the freely-coercing Value path, not the
                 // strict emit_batch IPC path, so no per-column declared types needed.
                 emit_exa_types: Vec::new(),
@@ -326,7 +325,6 @@ pub async fn handle_pushdown(
                 grouped_limit,
                 &col_types,
                 &udf_name,
-                &merge_udf_name,
                 &distribute_udf_name,
                 having.as_deref(),
                 grouped_order_by.as_deref(),
@@ -346,7 +344,7 @@ pub async fn handle_pushdown(
     // select list (aggregates verbatim) over a materialized sharded raw scan so
     // Exasol's core engine aggregates the returned rows (issue #82 / task 2.5-2.7).
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by") {
-        let (fb_proj_cols, fb_proj_types) = full_row_projection(&col_types);
+        let (fb_proj_cols, fb_proj_types) = referenced_column_projection(&pushdown_req, &col_types);
         // Per-shard scan stays LIMIT-free and sort-free (no aggregates, no group
         // keys); the group keys, HAVING, ORDER BY, and LIMIT go in the outer wrapper
         // only. The WHERE filter is pushed into the scan (advertised filter
@@ -361,6 +359,7 @@ pub async fn handle_pushdown(
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: fb_proj_types,
             logical_schema: logical_schema.clone(),
             name_mapping: name_mapping.clone(),
@@ -373,23 +372,127 @@ pub async fn handle_pushdown(
             instance_overhead_mb,
             s3_max_connections,
         };
-        let sql = build_grouped_qualified_fallback_sql(
+        let sql = build_qualified_single_table_fallback_sql(
             request,
             &pushdown_req,
             &fan_out_spec,
             &shards,
             &udf_name,
-            &merge_udf_name,
             &distribute_udf_name,
         )?;
         return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
     }
 
-    // Single-group aggregate or row scan.
-    // After detection, validate that each SUM/MIN/MAX targets a supported column type;
-    // if any SUM targets a non-numeric type (DATE, VARCHAR, etc.), fall back to row scan.
-    let aggregates =
-        detect_aggregates(&pushdown_req).filter(|plans| validate_agg_col_types(plans, &col_types));
+    // Single-group aggregate or row scan. A COUNT(DISTINCT) item is decomposed into
+    // its own DISTINCT row-scan fan-out counted by a native COUNT(DISTINCT "V") (see
+    // vs-adapter/pushdown-planning-count-distinct); every other single-group aggregate
+    // keeps its shared partial/merge scan. Validation runs against the ORDINARY plans
+    // only — a distinct item is a row-scan fan-out, not an aggregate partial — but a
+    // non-numeric SUM/MIN/MAX still demotes the whole detection to a row scan.
+    let items = detect_aggregates(&pushdown_req)
+        .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
+
+    // Case 1 COUNT(DISTINCT) path: EXACTLY one COUNT(DISTINCT ...) and nothing else.
+    // This is the ONLY count-distinct shape that fans out — a dedicated DISTINCT
+    // row-scan counted by a native COUNT(DISTINCT "V"). The request-level LIMIT lands
+    // ONLY on that outer wrapper — never inside the fan-out sub-scan (a leaked LIMIT
+    // would truncate a shard's local distinct set → a wrong count) — and is withheld
+    // entirely when an ORDER BY the adapter did not render is present
+    // (anti-wrong-truncation guard, decision [4]). The base spec carries no
+    // projection/aggregates/limit/order-by/distinct: the wrapper builder derives the
+    // fan-out from it.
+    if let Some(items) = &items
+        && is_lone_count_distinct(items)
+    {
+        let cd_limit = if has_order_by { None } else { limit };
+        let base_spec = ScanSpec {
+            table_root: table_root.clone(),
+            files: vec![],
+            projection: Vec::new(),
+            filter: filter.clone(),
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
+            logical_schema: logical_schema.clone(),
+            name_mapping: name_mapping.clone(),
+            join: None,
+            storage: storage.clone(),
+            df_target_partitions,
+            df_batch_size,
+            df_threads_per_udf,
+            memory_pool_fraction,
+            instance_overhead_mb,
+            s3_max_connections,
+        };
+        let sql = support::build_count_distinct_scan_sql(
+            &base_spec,
+            &shards,
+            items,
+            &col_types,
+            cd_limit,
+            &udf_name,
+            &distribute_udf_name,
+        );
+        return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+    }
+
+    // Case 2/3 single-group COUNT(DISTINCT) decline: MORE THAN ONE COUNT(DISTINCT), or
+    // a distinct mixed with an ordinary SUM/MIN/MAX/COUNT/AVG aggregate. Such a request
+    // reaches here still carrying a distinct item (Case 1 returned above), and — like
+    // the grouped guard above — it MUST NOT fall through to the bare row scan below: a
+    // raw full-row scan returns the projected source columns where Exasol's pushdown
+    // validation expects one column per aggregate select item → SQL state `04000`,
+    // because Exasol never re-aggregates a declined pushdown (it runs the returned SQL
+    // as the final answer as-is). A per-distinct fan-out likewise cannot be composed as
+    // sibling SELECT-list scalar subqueries (Exasol rejects an emitting UDF nested in a
+    // scalar subquery, `04000` "emitting function in expression"). Route it to the
+    // shared qualified single-table wrapper (the join N-scan fallback at N = 1), which
+    // renders the exact single-group select list — every COUNT(DISTINCT) and ordinary
+    // aggregate spliced verbatim — over a materialized sharded raw scan narrowed to
+    // only the referenced columns (issue #160), so Exasol's core engine aggregates the
+    // returned rows and the result column count matches its positional validation.
+    if let Some(items) = &items
+        && has_distinct(items)
+    {
+        let (fb_proj_cols, fb_proj_types) = referenced_column_projection(&pushdown_req, &col_types);
+        let fan_out_spec = ScanSpec {
+            table_root: table_root.clone(),
+            files: vec![],
+            projection: fb_proj_cols,
+            filter: filter.clone(),
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: fb_proj_types,
+            logical_schema: logical_schema.clone(),
+            name_mapping: name_mapping.clone(),
+            join: None,
+            storage: storage.clone(),
+            df_target_partitions,
+            df_batch_size,
+            df_threads_per_udf,
+            memory_pool_fraction,
+            instance_overhead_mb,
+            s3_max_connections,
+        };
+        let sql = build_qualified_single_table_fallback_sql(
+            request,
+            &pushdown_req,
+            &fan_out_spec,
+            &shards,
+            &udf_name,
+            &distribute_udf_name,
+        )?;
+        return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
+    }
+
+    // No distinct item: the ordinary single-group aggregate plans (or None → row scan).
+    let aggregates = items.map(|it| ordinary_plans(&it));
 
     // Ordered top-N applies ONLY to the pure row-scan path (no aggregates). On a
     // match the sort keys are carried into the common blob (per-shard bounded sort)
@@ -438,6 +541,7 @@ pub async fn handle_pushdown(
         order_by,
         aggregates,
         group_keys: None,
+        distinct: false,
         // Like `projection` above, this field is SHARED via this `spec_template`
         // between the single-group aggregate sub-path and the row-scan sub-path.
         // The aggregate scan emits via the freely-coercing Value path and never
@@ -475,7 +579,6 @@ pub async fn handle_pushdown(
         &col_types,
         &aggregate_types,
         &udf_name,
-        &merge_udf_name,
         &distribute_udf_name,
     );
 
@@ -562,6 +665,7 @@ mod tests {
                 arg_expr: None,
             }]),
             group_keys: Some(group_keys.clone()),
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -651,6 +755,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
@@ -807,6 +912,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: logical.clone(),
             name_mapping: Vec::new(),
@@ -1054,6 +1160,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: Vec::new(),
             logical_schema: logical.clone(),
             name_mapping: Vec::new(),

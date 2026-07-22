@@ -38,7 +38,7 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 4. **Pushdown** — required: column projection, filter predicates, LIMIT, ORDER BY + LIMIT (TopN).
    Shipped: single-group aggregation and GROUP BY aggregation with partial/merge decomposition
    (node-local aggregate → Exasol final aggregate) to minimize network transfer; COUNT(DISTINCT)
-   via per-shard distinct sets with a safety cap; partition-equality and min/max range file pruning
+   via per-shard DISTINCT row-scans counted by an outer Exasol-native COUNT(DISTINCT); partition-equality and min/max range file pruning
    at plan time; broadcast-eligible inner equi-join pushdown (small-side broadcast fan-out, planned
    and executed node-locally) with a safe fallback to an unaccelerated wrapper for joins outside the
    broadcast contract — general/multi-way joins and query rewriting remain out of scope (see below).

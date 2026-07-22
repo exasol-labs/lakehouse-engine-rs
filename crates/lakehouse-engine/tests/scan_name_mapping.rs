@@ -165,6 +165,7 @@ fn name_mapping_spec(
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: Vec::new(),
         logical_schema,
         name_mapping,

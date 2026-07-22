@@ -1891,6 +1891,7 @@ mod tests {
             order_by: Vec::new(),
             aggregates: None,
             group_keys: None,
+            distinct: false,
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
