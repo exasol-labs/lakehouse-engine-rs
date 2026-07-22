@@ -13,11 +13,13 @@ a documented set needs explicit aliasing: `SIGN`→`signum`, `LENGTH`→`charact
 `UNICODECHR`→`chr`, `NULLIFZERO`→`nullif(x,0)`, `ZEROIFNULL`→`coalesce(x,0)`.
 
 The scalar regexp functions (`REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT`)
-are deliberately not translated. DataFusion 54 runs the Rust `regex` crate, whose dialect rejects
-the pattern backreferences and lookaround Exasol's PCRE dialect accepts; DataFusion 54 has no
-`regexp_substr`; and Exasol's position, occurrence, and return-option arguments have no matching
-DataFusion argument shape. This is separate from the `FN_PRED_REGEXP_LIKE` predicate, which stays
-advertised and is out of scope here.
+are deliberately not translated. Re-verified for issue #106 against the pinned DataFusion 54.0.0
+and `regex` 1.12.4: DataFusion runs the Rust `regex` crate, whose dialect rejects the pattern
+backreferences and lookaround Exasol's PCRE dialect accepts; DataFusion has no `regexp_substr`; and
+Exasol's position, occurrence, and return-option arguments have no matching DataFusion argument
+shape. A compile-time literal-pattern check would certify pattern syntax, not match parity with
+Exasol's PCRE, so it cannot lift the decline (see issue #106). This is separate from the
+`FN_PRED_REGEXP_LIKE` predicate, which stays advertised and is out of scope here.
 
 ## Scenarios
 
@@ -70,5 +72,5 @@ advertised and is out of scope here.
 * *WHEN* `render_expression` processes the node in raising mode
 * *THEN* the translator SHALL return an error naming the function as unsupported
 * *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, so `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, and `FN_REGEXP_COUNT` remain unadvertised
+* *AND* the adapter SHALL omit the expression and let Exasol evaluate it, so `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, and `FN_REGEXP_COUNT` remain unadvertised — the investigation recorded under issue #106 re-verified this decline against the pinned DataFusion 54.0.0 and `regex` 1.12.4 and found no change (see issue #106)
 * *AND* the exclusion MUST NOT alter the pre-existing `FN_PRED_REGEXP_LIKE` predicate advertisement
