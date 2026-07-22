@@ -12,6 +12,14 @@ scalar scan's emitted partial rows on the user group keys. See
 `vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate` for
 scalar-function-wrapping-aggregates select items on this same path.
 
+When a grouped select item cannot be decomposed into supported partials, the adapter
+falls back to a qualified single-table wrapper whose inner sharded raw scan MUST project
+only the columns the request references (group keys, select-list aggregate arguments,
+filter, and any HAVING/ORDER BY columns), not the full base-table schema (issue #160).
+The narrowing is computed by a single shared referenced-column helper reused by the
+single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline
+(`vs-adapter/pushdown-planning-count-distinct`), so both decline paths narrow identically.
+
 ## Background
 
 * A grouped aggregate pushdown arrives as `aggregationType: "group_by"` with a
@@ -44,6 +52,16 @@ scalar-function-wrapping-aggregates select items on this same path.
   query has M"). It falls back to a qualified single-table wrapper that renders the
   exact grouped select list over a materialized sharded raw scan, analogous to the
   unified join fallback.
+* Before this delta the fallback's inner scan projected the ENTIRE base-table schema
+  (`full_row_projection`), streaming every column of every matching row regardless of
+  what the query references (issue #160). It now projects only the referenced columns.
+* The referenced-column set is group keys + SELECT-list aggregate arguments + filter
+  columns + HAVING and ORDER BY references; it MUST expose every column the outer
+  wrapper renders. When the request references no source column the projection falls
+  back to at least one column, since an empty EMITS clause is invalid in Exasol.
+* The narrowing is a single shared helper reused by the single-group `COUNT(DISTINCT)`
+  Case 2/3 qualified-wrapper decline, so both decline paths narrow through one
+  mechanism, not two.
 
 ## Scenarios
 
@@ -112,6 +130,8 @@ scalar-function-wrapping-aggregates select items on this same path.
 * *WHEN* the adapter processes the request
 * *THEN* the adapter MUST NOT emit a bare raw full-row `ScanSpec` for a grouped request (that would return a column count differing from the request's `selectList`, causing a client-facing `04000` "Expected number of columns is N but pushdown query has M")
 * *AND* the adapter SHALL instead render the exact grouped select list, GROUP BY, HAVING, ORDER BY, and LIMIT as ordinary Exasol SQL over a materialized single-table sharded raw scan — a qualified single-table wrapper analogous to the unified join fallback (`SELECT <grouped select list> FROM (<sharded raw fan-out>) GROUP BY ... HAVING ... ORDER BY ... LIMIT ...`) — so Exasol's core engine computes the aggregate over the returned rows
+* *AND* the inner sharded raw scan's projection SHALL be narrowed to only the columns the request references — group keys, select-list aggregate arguments, filter columns, and HAVING and ORDER BY columns — NEVER the full base-table schema (issue #160), so the fallback scan prunes I/O and network transfer to the referenced-column set while still exposing every column the outer wrapper renders
+* *AND* the referenced-column set SHALL be computed by a single shared helper reused by the single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline (`vs-adapter/pushdown-planning-count-distinct`), so both decline paths narrow identically; when the request references no source column the projection SHALL fall back to at least one column, since an empty EMITS clause is invalid in Exasol
 * *AND* the scalar-over-aggregate select items in that wrapper SHALL be rendered by the `crates/vs-expression` translator (aggregate names spliced verbatim, arguments recursed), since Exasol computes the aggregation over materialized rows rather than over merged partials
 * *AND* the wrapper's result column count and per-column types SHALL match Exasol's positional `selectListDataTypes` validation
 * *AND* the returned result SHALL equal the result of the same grouped query evaluated on a single node
