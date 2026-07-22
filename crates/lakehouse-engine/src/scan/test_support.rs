@@ -6,7 +6,6 @@
 
 use crate::scan::spec::{FileEntry, ScanSpec, StorageProps};
 
-/// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
 /// The byte size of the local file behind a `file://` URL.
 ///
 /// The custom `ParquetSource`-backed provider builds each file's `ObjectMeta`
@@ -20,6 +19,7 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
     std::fs::metadata(path).expect("stat local parquet").len()
 }
 
+/// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
 pub(super) fn minimal_spec() -> ScanSpec {
     ScanSpec {
         table_root: String::new(),
