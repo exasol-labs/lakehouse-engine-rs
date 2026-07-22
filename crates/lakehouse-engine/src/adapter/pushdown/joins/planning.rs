@@ -368,7 +368,7 @@ pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(S
         .map(|cols| {
             cols.iter()
                 .filter_map(|c| {
-                    let name = c.get("name")?.as_str()?.to_uppercase();
+                    let name = c.get("name")?.as_str()?.to_ascii_uppercase();
                     let dt_json = c.get("dataType")?;
                     Some((name, exasol_type_from_json(dt_json)))
                 })
