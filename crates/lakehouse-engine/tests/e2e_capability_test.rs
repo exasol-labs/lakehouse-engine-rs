@@ -890,7 +890,11 @@ fn e2e_days_between_matches_exasol() {
     let t = vs_table();
 
     let sql = format!("SELECT DAYS_BETWEEN(event_date, DATE '2024-01-10') FROM {t} WHERE id = 1");
-    assert_select_pushed_down(&mut conn, &sql, "AS DATE");
+    // "AS DATE" alone can also match Exasol's echoed pushdownRequest (e.g. a DATE
+    // literal/cast in the original query), so anchor on "- CAST(" instead — that
+    // sequence only appears in the adapter's own `(CAST(.. AS DATE) - CAST(.. AS
+    // DATE))` rendering, never in the echoed request.
+    assert_select_pushed_down(&mut conn, &sql, "- CAST(");
 
     let cols = conn.query_columns(&sql);
     let value = parse_int(&cols[0][0]);
