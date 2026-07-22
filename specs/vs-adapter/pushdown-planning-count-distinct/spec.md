@@ -29,14 +29,18 @@ engine rather than a fixed per-shard serialization cap.
   scalar subquery at compile time (`sqlCode 04000`, "emitting function in expression"), so
   multiple distinct fan-outs cannot be composed as sibling scalar subqueries in one outer SELECT.
 * `COUNT(DISTINCT col)` is NOT a partial aggregate. For the lone-distinct case the adapter
-  plans it as a row-scan whose projection is the single distinct column (or rendered
-  expression) with a `distinct` flag set, reusing the same fan-out, streaming, and per-column
-  EMITS-type machinery the raw row-scan path uses. The scan spec MUST NOT carry a
+  plans it as a row-scan whose projection is the single distinct column with a `distinct`
+  flag set, reusing the same fan-out, streaming, and per-column EMITS-type machinery the raw
+  row-scan path uses. The scan spec MUST NOT carry a
   `CountDistinct` aggregate partial, and no per-shard JSON distinct-set is produced.
-* Each distinct-column fan-out emits one row per shard-local distinct value using the
-  column's actual Exasol EMITS type — the standard Arrow-to-Exasol mapping, including the
-  JSON-string fallback for Exasol-incompatible types, the same type resolution MIN/MAX
-  partials use — never a hardcoded `VARCHAR(2000000)` JSON array.
+* The Case 1 fan-out engages ONLY for a bare-column distinct argument. It emits one row per
+  shard-local distinct value declaring that column's actual Exasol EMITS type — the standard
+  Arrow-to-Exasol mapping, including the JSON-string fallback for Exasol-incompatible types, the
+  same type resolution MIN/MAX partials use — never a hardcoded `VARCHAR(2000000)` JSON array
+  and never any other VARCHAR-typed intermediate value. A `COUNT(DISTINCT <expression>)` — lone
+  or combined with any other aggregate — NEVER reaches this fan-out: it always declines to the
+  Case 2/3 qualified single-table wrapper, where Exasol evaluates the expression and the
+  DISTINCT natively over the expression's exact-typed base columns.
 * `COUNT(DISTINCT col)` excludes NULLs, matching single-node SQL semantics: the pushed-down
   fan-out filter excludes NULL values.
 * The cross-shard merge is a plain Exasol `COUNT(DISTINCT "V")` over the union of every
@@ -59,11 +63,11 @@ engine rather than a fixed per-shard serialization cap.
 ### Scenario: Single-group COUNT(DISTINCT) is decomposed into a dedicated DISTINCT row-scan fan-out
 
 * *GIVEN* a virtual schema over an Iceberg table backed by MinIO
-* *AND* a query whose select list is a LONE `COUNT(DISTINCT col)` over the whole table with no GROUP BY and no other select-list item, e.g. `SELECT COUNT(DISTINCT L_SHIPMODE) FROM {vs_table}`
+* *AND* a query whose select list is a LONE `COUNT(DISTINCT col)` over the whole table with no GROUP BY, no other select-list item, and a BARE COLUMN argument (Case 1), e.g. `SELECT COUNT(DISTINCT L_SHIPMODE) FROM {vs_table}`
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL recognise the distinct aggregate, resolve the file list once, and build a row-scan-shaped scan spec whose projection is that single column (or rendered expression) with the `distinct` flag set and NULLs excluded
-* *AND* the fan-out SHALL emit one row per shard-local distinct value through the existing row-scan streaming path, declaring that column with its actual Exasol EMITS type (never a `VARCHAR(2000000)` JSON array) and crossing the `.so` boundary as no Arrow type
-* *AND* the scan spec MUST NOT carry a `CountDistinct` aggregate partial and the wrapper SQL MUST NOT invoke any custom distinct-merge UDF
+* *THEN* the adapter SHALL recognise the distinct aggregate, resolve the file list once, and build a row-scan-shaped scan spec whose projection is that single bare column with the `distinct` flag set and NULLs excluded
+* *AND* the fan-out SHALL emit one row per shard-local distinct value through the existing row-scan streaming path, declaring that column with its actual Exasol EMITS type — NEVER a `VARCHAR(2000000)` value or any other VARCHAR-typed intermediate — and crossing the `.so` boundary as no Arrow type
+* *AND* the scan spec MUST NOT carry a `CountDistinct` aggregate partial, the wrapper SQL MUST NOT invoke any custom distinct-merge UDF, and a `COUNT(DISTINCT <expression>)` argument (e.g. `COUNT(DISTINCT UPPER(L_SHIPMODE))`) MUST NOT engage this fan-out even as the lone select-list item — it always declines to the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns or a distinct mixed with ordinary aggregates decline the fan-out and route to a qualified single-table wrapper")
 
 ### Scenario: Outer wrapper counts the unioned per-shard distinct rows with a native COUNT(DISTINCT)
 

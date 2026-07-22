@@ -225,3 +225,51 @@ Case 2/3 now compiles and returns the correct N-column aggregate shape in both t
 empty and non-empty case. The single-group and grouped decline paths share one
 referenced-column narrowing helper, closing issue #160 (the grouped fallback's
 whole-table projection) in the same change.
+
+## ADR: Narrow Case 1 to bare-column arguments — expression-argument distinct always routes to the qualified wrapper
+
+**ID:** count-distinct-case-1-bare-column-only
+**Plan:** `fix-count-distinct-review-findings`
+**Status:** Accepted
+
+### Context
+
+`build_distinct_fan_out` (`support.rs`) declares the per-shard fan-out's value column
+`"V"` with the argument's real Exasol type for a bare column, but `VARCHAR(2000000)` for
+an expression argument — relying on `arrow::compute::cast(.., Utf8)` being injective on
+the expression's native output type. That injectivity assumption was never proven and is
+not generally true (e.g. two distinct timestamps can print identically after
+string-cast truncation), so cross-shard dedup on the string form can silently undercount.
+This convention was never captured as its own entry in this file; it existed only in
+`build_distinct_fan_out`'s doc comment and code. The Case 2/3 qualified single-table
+wrapper (`count-distinct-case-2-3-qualified-wrapper`, above) already evaluates every
+aggregate, including `COUNT(DISTINCT <expr>)`, natively over exact-typed base columns
+with no cast step — it was simply never the route a LONE expression-argument distinct
+took.
+
+### Decision
+
+Narrow `is_lone_count_distinct` to require a bare-column argument
+(`dc.column.is_some()`). A `COUNT(DISTINCT <expression>)` — lone or combined with any
+other aggregate — no longer reaches `build_distinct_fan_out` at all: it always falls
+into the existing `has_distinct && !is_lone_count_distinct` guard and routes to the
+qualified single-table wrapper, exactly like a genuine multi-distinct or
+mixed-aggregate request. The fan-out's `value_type` match collapses to the bare-column
+case; the `None => "VARCHAR(2000000)"` arm and its cast-injectivity dependency are
+deleted.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Route lone expression-argument distinct to the qualified wrapper | ✓ Chosen — the wrapper is already built, tested (Case 2/3), and exact; it needs no cast and no injectivity assumption |
+| Keep the VARCHAR fan-out; document and test the injectivity assumption | ✗ Rejected — still approximate in principle; a documented assumption is not a proof, and a passing test cannot cover every Arrow type's string-cast behavior |
+| Keep the VARCHAR fan-out; allowlist "safe to string-cast" expression output types | ✗ Rejected — adds an ongoing maintenance surface (a type allowlist) to preserve a shortcut the wrapper makes unnecessary |
+
+### Consequences
+
+Every `COUNT(DISTINCT <expression>)`, lone or combined, is now exact with no cast step
+and no injectivity dependency — the same guarantee the wrapper already gives Case 2/3.
+The `VARCHAR(2000000)` value-type arm and its dedicated test become dead code and are
+removed. Case 1 now only ever fans out a bare column; its `"V"` column always carries
+that column's real Exasol type, never a string-serialized intermediate value.

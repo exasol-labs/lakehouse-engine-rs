@@ -110,15 +110,25 @@ pub(super) fn has_distinct(items: &[SingleGroupItem]) -> bool {
         .any(|item| matches!(item, SingleGroupItem::Distinct(_)))
 }
 
-/// Whether the select list is EXACTLY one `COUNT(DISTINCT ...)` and nothing else —
-/// the ONLY shape that fans out to a dedicated DISTINCT row-scan counted by a native
-/// `COUNT(DISTINCT "V")` (Case 1). Any other distinct shape (more than one distinct,
-/// or a distinct alongside an ordinary SUM/MIN/MAX/COUNT/AVG aggregate — Case 2/3)
-/// declines the fan-out and routes to the qualified single-table wrapper: no
-/// composition of several scalar-subquery emitting-UDF calls in one select list
-/// compiles in Exasol (`sqlCode 04000`, "emitting function in expression").
+/// Whether the select list is EXACTLY one `COUNT(DISTINCT <bare column>)` and nothing
+/// else — the ONLY shape that fans out to a dedicated DISTINCT row-scan counted by a
+/// native `COUNT(DISTINCT "V")` (Case 1). The lone distinct must have a bare-column
+/// argument (`dc.column.is_some()`): only a source column has a known exact Exasol
+/// type to declare for the per-shard `"V"` value column, so cross-shard dedup stays
+/// exact. A lone `COUNT(DISTINCT <expression>)` (`dc.column` is `None`, `dc.arg_expr`
+/// set) is deliberately EXCLUDED — it would otherwise have to declare `"V"` as
+/// `VARCHAR(2000000)` and rely on the expression's native→`Utf8` cast being injective,
+/// which can silently undercount (e.g. two distinct timestamps that print identically
+/// after string truncation). Any non-lone distinct shape (more than one distinct, or a
+/// distinct alongside an ordinary SUM/MIN/MAX/COUNT/AVG aggregate — Case 2/3) is
+/// likewise excluded. Every excluded shape declines the fan-out and routes to the
+/// qualified single-table wrapper (`has_distinct && !is_lone_count_distinct` in
+/// `mod.rs`), where Exasol evaluates any expression and the DISTINCT natively over
+/// exact-typed base columns — and where no composition of several scalar-subquery
+/// emitting-UDF calls in one select list would compile anyway (`sqlCode 04000`,
+/// "emitting function in expression").
 pub(super) fn is_lone_count_distinct(items: &[SingleGroupItem]) -> bool {
-    matches!(items, [SingleGroupItem::Distinct(_)])
+    matches!(items, [SingleGroupItem::Distinct(dc)] if dc.column.is_some())
 }
 
 /// Extract the column name (uppercase) from the first argument of an aggregate function.
@@ -736,6 +746,60 @@ mod tests {
         assert!(
             has_distinct(&items) && !is_lone_count_distinct(&items),
             "a distinct mixed with an ordinary aggregate must decline the fan-out (Case 3)"
+        );
+    }
+
+    /// Scenario (PR #163 review finding, task 1.4): a LONE
+    /// `COUNT(DISTINCT <expression>)` (e.g. `COUNT(DISTINCT LENGTH(name))`, nothing
+    /// else in the select list) must NOT take the per-shard fan-out. After narrowing
+    /// `is_lone_count_distinct` to bare-column arguments, an expression argument makes
+    /// `is_lone_count_distinct` false while `has_distinct` stays true — which is the
+    /// EXACT dispatch condition (`has_distinct && !is_lone_count_distinct`) the `mod.rs`
+    /// Case 2/3 guard uses to decline the fan-out and route to the qualified
+    /// single-table wrapper, where Exasol evaluates the expression and DISTINCT natively
+    /// over exact-typed base columns (no `arrow::compute::cast(.., Utf8)` injectivity
+    /// dependency, which could silently undercount). A lone BARE-COLUMN distinct is
+    /// unaffected — it still fans out (Case 1).
+    ///
+    /// This is the direct regression test for the dispatch narrowing: before it, a lone
+    /// expression distinct wrongly matched "lone" and fanned out with a VARCHAR-typed
+    /// `"V"`; it must now route exactly like a genuine multi-distinct/mixed Case 2/3.
+    #[test]
+    fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
+        // Lone COUNT(DISTINCT LENGTH(NAME)) — a single expression-argument distinct.
+        let expr = serde_json::json!({
+            "selectList": [agg_item_expr("COUNT", length_expr("NAME"), true)],
+        });
+        let items = detect_aggregates(&expr)
+            .expect("a lone COUNT(DISTINCT expr) still decomposes to a distinct item");
+        assert_eq!(items.len(), 1);
+        let dc = distinct_of(&items[0]);
+        assert!(
+            dc.column.is_none() && dc.arg_expr.is_some(),
+            "the argument is an expression, so the distinct carries a rendered arg_expr, \
+             not a bare column"
+        );
+        assert!(
+            has_distinct(&items),
+            "a lone expression COUNT(DISTINCT) is still a distinct request"
+        );
+        assert!(
+            !is_lone_count_distinct(&items),
+            "an EXPRESSION-argument lone COUNT(DISTINCT) must NOT fan out — it declines to \
+             the qualified single-table wrapper exactly like a Case 2/3 request (this is \
+             the regression: before the dispatch narrowing it wrongly fanned out with a \
+             VARCHAR-typed \"V\")"
+        );
+
+        // Contrast: a lone BARE-COLUMN COUNT(DISTINCT) IS a lone distinct — still fans out.
+        let bare = serde_json::json!({
+            "selectList": [agg_item("COUNT", Some("NAME"), true)],
+        });
+        let bare_items =
+            detect_aggregates(&bare).expect("a lone bare-column COUNT(DISTINCT) decomposes");
+        assert!(
+            is_lone_count_distinct(&bare_items),
+            "a lone BARE-COLUMN COUNT(DISTINCT) is unaffected — it still fans out (Case 1)"
         );
     }
 
