@@ -43,9 +43,11 @@ shipping `FN_DIV` via `FLOOR`, which would itself diverge from Exasol.
 Keep `FN_DIV` unadvertised, restated on the verified reason. DataFusion 54 has no `div` builtin. A
 `TRUNC(m/n)` emulation would render every operand type, but for DOUBLE operands it diverges from
 Exasol on division by zero — Exasol raises SQL state 22012 while DataFusion float division yields
-infinity. Capability advertisement is per function, not per operand type (the same principle as the
-`FN_TO_CHAR`/`FN_TO_NUMBER` decline), so the translator cannot restrict `DIV` pushdown to the
-integer-operand case where `/` would match. The decline therefore stands; only its rationale is
+infinity. Unlike CAST, whose explicit `dataType` field lets `render_cast_target` decline only the
+unsupported target subset while still advertising `FN_CAST`, DIV's operand types are not carried in
+the expression node — the arithmetic operator arm renders operands via recursive calls into opaque
+SQL strings without ever inspecting their types, so the translator cannot identify a safe
+integer-only case to render selectively. The decline therefore stands; only its rationale is
 corrected.
 
 #### Patterns
@@ -59,7 +61,7 @@ corrected.
 
 | Decision | Alternatives Considered | Rationale |
 |----------|------------------------|-----------|
-| Keep `FN_DIV` declined; correct the rationale to truncation + DOUBLE div-by-zero divergence | Advertise `FN_DIV` via `TRUNC(m/n)` | Rejected — DOUBLE-operand division by zero yields infinity in DataFusion vs. an Exasol error, and per-function advertisement cannot exclude DOUBLE operands; no verified-safe rendering exists |
+| Keep `FN_DIV` declined; correct the rationale to truncation + DOUBLE div-by-zero divergence | Advertise `FN_DIV` via `TRUNC(m/n)` | Rejected — DOUBLE-operand division by zero yields infinity in DataFusion vs. an Exasol error, and DIV's operand types aren't carried in the expression node so the translator cannot selectively render only the safe integer case; no verified-safe rendering exists |
 | Correct spec/ADR/comment now | Close #105 with no spec change | Rejected — the permanent spec and ADR assert a live-refuted premise ("floor division"); leaving it risks a future wrong "fix" |
 
 ## Features
