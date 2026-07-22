@@ -746,14 +746,14 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
     );
     let failing_sql = format!("{base_sql} THIS_TRAILING_TOKEN_MAKES_THE_STATEMENT_INVALID");
 
-    // Silence the default panic hook while we deliberately trigger the panic, so
-    // the (already-redacted) message is not dumped to stderr as test noise.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // Deliberately trigger the execute() failure panic and capture it. We do NOT
+    // touch the global panic hook: it is process-wide and Rust runs this binary's
+    // tests in parallel, so silencing it could swallow panic output from other
+    // concurrently running tests. The redacting `ExaConn` already omits the SQL
+    // and response body from this message, so letting the hook print it is safe.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         conn.execute(&failing_sql);
     }));
-    std::panic::set_hook(prev_hook);
 
     let payload = match result {
         Ok(_) => panic!(
