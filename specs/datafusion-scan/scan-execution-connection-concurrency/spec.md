@@ -93,3 +93,11 @@ CPU thread/partition budget of `datafusion-scan/scan-execution-threading`.
 * *WHEN* the adapter serializes the scan-driving SQL arguments
 * *THEN* the resolved connection-concurrency budget SHALL travel in the shard-invariant common spec argument, serialized EXACTLY ONCE for the whole fan-out, and MUST NOT be repeated in any per-shard argument
 * *AND* the `ScanSpec` reconstituted for every shard SHALL carry the same connection-concurrency budget
+
+### Scenario: The connection budget also bounds positional-delete file reads
+
+* *GIVEN* a scan spec whose `s3_max_connections` field is a positive integer N and whose assigned data files carry associated Parquet positional-delete files
+* *WHEN* the scan UDF applies positional deletes across every scan table it registers for the query — a single table, or both the fact and dimension sides of a broadcast join, which DataFusion may plan concurrently
+* *THEN* a single fan-out limiter of size N — one semaphore constructed once per scan invocation and shared by every registered scan table — SHALL bound the delete-file reads, so across all delete-read fan-outs active in one scan invocation AT MOST N delete-file object-store reads are in flight at any instant
+* *AND* two independent size-N limiters (one per provider) SHALL NOT be used, because concurrently planned join-side scan leaves would then allow up to 2N in-flight delete reads, breaking the instance-level bound
+* *AND* this delete-read bound SHALL be an application-level concurrency limit, distinct from the HTTP client idle-pool size that the same N configures on the object store

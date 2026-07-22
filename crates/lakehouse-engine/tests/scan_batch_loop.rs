@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array, Decimal128Array, Int64Array, StringArray};
+use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, StringViewArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
@@ -154,7 +154,67 @@ fn spec_for_file(file_url: String) -> ScanSpec {
         order_by: Vec::new(),
         aggregates: None,
         group_keys: None,
+        distinct: false,
         emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join: None,
+        storage: StorageProps {
+            endpoint: "http://localhost:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret_key: "s".into(),
+            session_token: None,
+            allow_http: true,
+            path_style: true,
+        },
+        df_target_partitions: 1,
+        df_batch_size: 64,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 200,
+        s3_max_connections: 8,
+    }
+}
+
+/// Write a local Parquet at `dir/name` with a single Utf8 `category` column
+/// holding `values` verbatim (duplicates included), and return its `file://` URL.
+fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) -> String {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "category",
+        DataType::Utf8,
+        false,
+    )]));
+    let path = dir.join(name);
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values.to_vec()))])
+        .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// A DISTINCT row-scan `ScanSpec` over one file: single-column `CATEGORY`
+/// projection with `distinct: true` and no LIMIT/ORDER BY — the same fan-out
+/// shape the single-group `COUNT(DISTINCT col)` adapter path builds
+/// (`single_group_agg.rs`), minus the NULL-excluding filter (not needed here
+/// since the fixture carries no NULLs).
+fn distinct_spec_for_file(file_url: String) -> ScanSpec {
+    let size = file_size(&file_url);
+    ScanSpec {
+        table_root: String::new(),
+        files: vec![FileEntry::new(file_url, size)],
+        projection: vec!["CATEGORY".into()],
+        filter: None,
+        limit: None,
+        order_by: Vec::new(),
+        aggregates: None,
+        group_keys: None,
+        distinct: true,
+        emit_exa_types: vec!["VARCHAR(2000000)".into()],
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         join: None,
@@ -225,6 +285,32 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
             }
         } else {
             panic!("unexpected id column type: {:?}", col.data_type());
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Collect the CATEGORY column across all emitted batches as `String`, sorted.
+/// DataFusion's Parquet reader may return the raw scan plan's string column as
+/// either `Utf8` or `Utf8View`; the emit path coerces it before it crosses the
+/// UDF boundary, so `StringArray` is expected here, but both are accepted per
+/// the repo's established downcast pattern (`scan_parquet_pruning.rs`,
+/// `scan_plan_shape.rs`).
+fn categories_of(batches: &[RecordBatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        let col = b.column(0);
+        if let Some(v) = col.as_any().downcast_ref::<StringViewArray>() {
+            for i in 0..b.num_rows() {
+                out.push(v.value(i).to_string());
+            }
+        } else if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
+            for i in 0..b.num_rows() {
+                out.push(s.value(i).to_string());
+            }
+        } else {
+            panic!("unexpected category column type: {:?}", col.data_type());
         }
     }
     out.sort_unstable();
@@ -370,6 +456,43 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
         per_row, reference,
         "a single per-row call must emit rows byte-for-byte identical to the direct \
          raw-scan path"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `distinct: true` scan spec streams exactly one row per shard-local distinct
+/// projected value through the same `emit_batch`/batch-loop mechanism ordinary
+/// row-scans use — the single-group `COUNT(DISTINCT col)` fan-out shape
+/// (`vs-adapter/pushdown-planning-count-distinct`; see `scan/mod.rs`
+/// `build_dataframe`'s `if spec.distinct { df.distinct() }`). Ten rows over a
+/// three-value column collapse to exactly those three distinct values, each
+/// appearing once, proving `.distinct()` is actually applied at the DataFusion/
+/// batch level rather than merely accepted at the SQL-generation level (that
+/// contract is covered separately by the `support.rs` SQL-shape unit tests).
+#[test]
+fn distinct_row_scan_streams_one_row_per_distinct_value() {
+    let dir = std::env::temp_dir().join(format!("lh_distinct_row_scan_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Ten rows, three distinct values, each duplicated at least once.
+    let values = ["a", "b", "a", "c", "b", "a", "c", "b", "a", "c"];
+    let file_url = write_parquet_categories(&dir, "categories.parquet", &values);
+    let spec = distinct_spec_for_file(file_url);
+
+    let built = AtomicUsize::new(0);
+    let emitted = run_one_row(&spec, &built);
+
+    assert_eq!(
+        total_rows(&emitted),
+        3,
+        "distinct: true must collapse 10 duplicate-laden rows down to the 3 \
+         distinct values, not stream all 10"
+    );
+    assert_eq!(
+        categories_of(&emitted),
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        "emitted rows must be exactly the distinct value set, no duplicates"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
