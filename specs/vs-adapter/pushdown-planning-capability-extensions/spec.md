@@ -110,5 +110,5 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *GIVEN* the adapter's advertised capability set
 * *WHEN* Exasol requests `getCapabilities`
 * *THEN* the response SHALL NOT advertise `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEXP_INSTR`, or `FN_REGEXP_COUNT`
-* *AND* Exasol SHALL post-process regexp scalar functions rather than pushing them to the node-local scan, because DataFusion 54's Rust `regex` dialect, its missing `regexp_substr`, and its differing argument shapes make a faithful translation impossible (see `sql-comprehension/vs-expression-translator-scalar-fns`)
+* *AND* Exasol SHALL post-process regexp scalar functions rather than pushing them to the node-local scan, because at the pinned DataFusion 54.0.0 and `regex` 1.12.4 the Rust `regex` dialect rejects the backreferences and lookaround Exasol's PCRE dialect accepts, DataFusion has no `regexp_substr`, and its `regexp_replace`/`regexp_instr`/`regexp_count` argument shapes omit Exasol's position, occurrence, and return-option arguments — a compile-time literal-pattern check cannot certify semantic match parity, so no faithful translation exists (see issue #106 and `sql-comprehension/vs-expression-translator-scalar-fns`)
 * *AND* the pre-existing `FN_PRED_REGEXP_LIKE` predicate advertisement SHALL remain unchanged
