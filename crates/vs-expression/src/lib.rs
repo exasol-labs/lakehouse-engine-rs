@@ -11,6 +11,28 @@
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+/// Which SQL dialect a CAST target type is rendered for.
+///
+/// The SAME recursive translator feeds two different parsers depending on the
+/// call site, and they have OPPOSITE requirements for character-type CAST
+/// targets:
+/// - `DataFusion`: the rendered fragment is embedded in a `ScanSpec`
+///   (`filter`/`projection`/`group_keys`) and parsed by DataFusion's SQL
+///   frontend INSIDE the scan UDF. datafusion-sql rejects `VARCHAR(n)` with a
+///   length unless `support_varchar_with_length` is enabled (this project does
+///   not enable it), so a character CAST target must be bare `VARCHAR`.
+/// - `Exasol`: the rendered fragment becomes part of the outer wrapper SQL text
+///   parsed by Exasol's own core engine (the qualified single-table / N-scan
+///   join wrapper in `joins.rs`, the grouped-aggregate outer-merge wrapper in
+///   `grouped_agg.rs`). Exasol has no length-less VARCHAR/CHAR type — `VARCHAR`
+///   MUST be followed by `(n)` — so a character CAST target needs an explicit
+///   length.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastDialect {
+    DataFusion,
+    Exasol,
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -58,22 +80,37 @@ fn json_scalar_to_string(value: &Json) -> String {
 }
 
 /// Render a slice of argument nodes, returning an error if any fails.
-fn render_args(args: &[Json]) -> Result<Vec<String>, UdfError> {
+fn render_args(args: &[Json], dialect: CastDialect) -> Result<Vec<String>, UdfError> {
     args.iter()
         .enumerate()
         .map(|(i, arg)| {
-            render_expression_inner(arg)?
+            render_expression_inner(arg, dialect)?
                 .ok_or_else(|| UdfError::User(format!("argument[{i}] rendered to null")))
         })
         .collect()
 }
 
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
-fn render_cast_target(data_type: &Json) -> Result<String, UdfError> {
+fn render_cast_target(data_type: &Json, dialect: CastDialect) -> Result<String, UdfError> {
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match type_name.to_uppercase().as_str() {
-        "VARCHAR" | "CHAR" => Ok("VARCHAR".to_string()),
+        "VARCHAR" | "CHAR" => match dialect {
+            // DataFusion's SQL frontend rejects VARCHAR(n) with a length (no
+            // `support_varchar_with_length`); only bare VARCHAR parses there.
+            CastDialect::DataFusion => Ok("VARCHAR".to_string()),
+            // Exasol's parser has the OPPOSITE requirement: VARCHAR/CHAR MUST
+            // carry a length. Render `VARCHAR(<size>)` from the width Exasol
+            // itself sent (`{"type":"VARCHAR","size":n}` /
+            // `{"type":"CHAR","size":n,...}`). If `size` is somehow absent, fall
+            // back to the project's "unknown/incompatible width" convention.
+            // Do NOT clamp to Exasol's 2,000,000 max — trust the value Exasol
+            // sent.
+            CastDialect::Exasol => Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
+                Some(size) => format!("VARCHAR({size})"),
+                None => "VARCHAR(2000000)".to_string(),
+            }),
+        },
         "DECIMAL" => {
             let p = data_type
                 .get("precision")
@@ -114,15 +151,16 @@ fn render_cast_target(data_type: &Json) -> Result<String, UdfError> {
 fn render_cast(
     args: Option<&Vec<Json>>,
     data_type: Option<&Json>,
+    dialect: CastDialect,
 ) -> Result<Option<String>, UdfError> {
     let args = args.ok_or_else(|| UdfError::User("CAST missing 'arguments'".into()))?;
     if args.is_empty() {
         return Err(UdfError::User("CAST requires 1 argument".into()));
     }
-    let inner = render_expression_inner(&args[0])?
+    let inner = render_expression_inner(&args[0], dialect)?
         .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
-    let target_type = render_cast_target(data_type)?;
+    let target_type = render_cast_target(data_type, dialect)?;
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
@@ -131,7 +169,7 @@ fn render_cast(
 /// Returns `Ok(None)` when `expr` is `Json::Null` (absent optional child).
 /// Returns `Ok(Some(sql))` on success.
 /// Returns `Err(UdfError::User(...))` for unsupported or malformed nodes.
-fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
+fn render_expression_inner(expr: &Json, dialect: CastDialect) -> Result<Option<String>, UdfError> {
     if expr.is_null() {
         return Ok(None);
     }
@@ -224,8 +262,8 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
 
     // --- Binary comparison predicates ---
     if let Some(op) = binary_op(kind) {
-        let left = render_expression_inner(value("left").unwrap_or(&Json::Null))?;
-        let right = render_expression_inner(value("right").unwrap_or(&Json::Null))?;
+        let left = render_expression_inner(value("left").unwrap_or(&Json::Null), dialect)?;
+        let right = render_expression_inner(value("right").unwrap_or(&Json::Null), dialect)?;
         match (left, right) {
             (Some(l), Some(r)) => return Ok(Some(format!("({l} {op} {r})"))),
             _ => {
@@ -238,34 +276,34 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
 
     // --- Logical connectives and other predicates ---
     match kind {
-        "predicate_and" => render_junction(value("expressions"), " AND ", "TRUE").map(Some),
-        "predicate_or" => render_junction(value("expressions"), " OR ", "FALSE").map(Some),
+        "predicate_and" => render_junction(value("expressions"), " AND ", "TRUE", dialect).map(Some),
+        "predicate_or" => render_junction(value("expressions"), " OR ", "FALSE", dialect).map(Some),
         "predicate_not" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| UdfError::User("predicate_not missing 'expression'".into()))?;
             Ok(Some(format!("(NOT {inner})")))
         }
         "predicate_is_null" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| UdfError::User("predicate_is_null missing 'expression'".into()))?;
             Ok(Some(format!("({inner} IS NULL)")))
         }
         "predicate_is_not_null" => {
-            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+            let inner = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| {
                     UdfError::User("predicate_is_not_null missing 'expression'".into())
                 })?;
             Ok(Some(format!("({inner} IS NOT NULL)")))
         }
         "predicate_in_constlist" => {
-            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| {
                     UdfError::User("predicate_in_constlist missing 'expression'".into())
                 })?;
             let mut rendered: Vec<String> = Vec::new();
             if let Some(Json::Array(args)) = value("arguments") {
                 for arg in args {
-                    if let Some(r) = render_expression_inner(arg)? {
+                    if let Some(r) = render_expression_inner(arg, dialect)? {
                         rendered.push(r);
                     }
                 }
@@ -277,9 +315,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             }
         }
         "predicate_between" => {
-            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null))?;
-            let low = render_expression_inner(value("left").unwrap_or(&Json::Null))?;
-            let high = render_expression_inner(value("right").unwrap_or(&Json::Null))?;
+            let target = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
+            let low = render_expression_inner(value("left").unwrap_or(&Json::Null), dialect)?;
+            let high = render_expression_inner(value("right").unwrap_or(&Json::Null), dialect)?;
             match (target, low, high) {
                 (Some(t), Some(l), Some(h)) => Ok(Some(format!("({t} BETWEEN {l} AND {h})"))),
                 _ => Err(UdfError::User(
@@ -288,8 +326,8 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             }
         }
         "predicate_like" => {
-            let left = render_expression_inner(value("expression").unwrap_or(&Json::Null))?;
-            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null))?;
+            let left = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?;
+            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?;
             match (left, pattern) {
                 (Some(l), Some(p)) => {
                     let escape = value("escape_char").and_then(|e| e.as_str());
@@ -309,11 +347,11 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
         }
         // Exasol sends REGEXP_LIKE as node type `predicate_like_regexp`.
         "predicate_like_regexp" => {
-            let subject = render_expression_inner(value("expression").unwrap_or(&Json::Null))?
+            let subject = render_expression_inner(value("expression").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| {
                     UdfError::User("predicate_like_regexp missing 'expression'".into())
                 })?;
-            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null))?
+            let pattern = render_expression_inner(value("pattern").unwrap_or(&Json::Null), dialect)?
                 .ok_or_else(|| UdfError::User("predicate_like_regexp missing 'pattern'".into()))?;
             Ok(Some(format!("regexp_like({subject}, {pattern})")))
         }
@@ -336,7 +374,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                     "function_scalar_extract requires 1 argument".into(),
                 ));
             }
-            let src = render_expression_inner(&args[0])?
+            let src = render_expression_inner(&args[0], dialect)?
                 .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
             // DataFusion 54 (default features) has no EXTRACT(field FROM expr) ExprPlanner;
             // render the portable function form date_part('FIELD', expr) instead.
@@ -366,7 +404,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
             }
             let basis = match value("basis") {
                 Some(b) if !b.is_null() => Some(
-                    render_expression_inner(b)?
+                    render_expression_inner(b, dialect)?
                         .ok_or_else(|| UdfError::User("CASE basis is null".into()))?,
                 ),
                 _ => None,
@@ -377,14 +415,14 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 sql.push_str(b);
             }
             for (i, when) in whens.iter().enumerate() {
-                let when_sql = render_expression_inner(when)?
+                let when_sql = render_expression_inner(when, dialect)?
                     .ok_or_else(|| UdfError::User("CASE WHEN value is null".into()))?;
-                let then_sql = render_expression_inner(&results[i])?
+                let then_sql = render_expression_inner(&results[i], dialect)?
                     .ok_or_else(|| UdfError::User("CASE THEN result is null".into()))?;
                 sql.push_str(&format!(" WHEN {when_sql} THEN {then_sql}"));
             }
             if results.len() == whens.len() + 1 {
-                let else_sql = render_expression_inner(&results[whens.len()])?
+                let else_sql = render_expression_inner(&results[whens.len()], dialect)?
                     .ok_or_else(|| UdfError::User("CASE ELSE result is null".into()))?;
                 sql.push_str(&format!(" ELSE {else_sql}"));
             }
@@ -400,7 +438,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
         // `function_scalar`+name=CAST arm below is a defensive alternate encoding.
         "function_scalar_cast" => {
             let args = value("arguments").and_then(|a| a.as_array());
-            render_cast(args, value("dataType"))
+            render_cast(args, value("dataType"), dialect)
         }
         "function_scalar" => {
             let fn_name = value("name")
@@ -434,9 +472,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let left = render_expression_inner(&args[0])?
+                    let left = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User(format!("{fn_name} left operand is null")))?;
-                    let right = render_expression_inner(&args[1])?.ok_or_else(|| {
+                    let right = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
                         UdfError::User(format!("{fn_name} right operand is null"))
                     })?;
                     Ok(Some(format!("({left} {op} {right})")))
@@ -451,7 +489,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             "function_scalar NEG requires 1 argument".into(),
                         ));
                     }
-                    let operand = render_expression_inner(&args[0])?
+                    let operand = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("NEG operand is null".into()))?;
                     Ok(Some(format!("(-{operand})")))
                 }
@@ -461,7 +499,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 // `qecast.cpp` emits CAST exclusively that way); this arm is kept
                 // defensively — like the REGEXP_LIKE alternate encoding below — and
                 // shares the same body via `render_cast`.
-                "CAST" => render_cast(args, value("dataType")),
+                "CAST" => render_cast(args, value("dataType"), dialect),
                 // REGEXP_LIKE as a function_scalar (alternate encoding)
                 "REGEXP_LIKE" => {
                     let args = args.ok_or_else(|| {
@@ -473,9 +511,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let subject = render_expression_inner(&args[0])?
+                    let subject = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("REGEXP_LIKE subject is null".into()))?;
-                    let pattern = render_expression_inner(&args[1])?
+                    let pattern = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("REGEXP_LIKE pattern is null".into()))?;
                     Ok(Some(format!("regexp_like({subject}, {pattern})")))
                 }
@@ -505,7 +543,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             &lower
                         }
                     };
-                    let arg = render_expression_inner(&args[0])?
+                    let arg = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
                     Ok(Some(format!("{df_name}({arg})")))
                 }
@@ -520,7 +558,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                         )));
                     }
                     let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 "POWER" | "ATAN2" => {
@@ -534,7 +572,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                         )));
                     }
                     let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 // MOD → (<l> % <r>) — DataFusion 54 exposes modulo only as the % operator
@@ -548,9 +586,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let left = render_expression_inner(&args[0])?
+                    let left = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("MOD left operand is null".into()))?;
-                    let right = render_expression_inner(&args[1])?
+                    let right = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
                     Ok(Some(format!("({left} % {right})")))
                 }
@@ -574,7 +612,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             &lower
                         }
                     };
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring)
@@ -590,9 +628,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let string = render_expression_inner(&args[0])?
+                    let string = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("INSTR string arg is null".into()))?;
-                    let substr = render_expression_inner(&args[1])?
+                    let substr = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("INSTR substring arg is null".into()))?;
                     Ok(Some(format!("strpos({string}, {substr})")))
                 }
@@ -607,9 +645,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                         )));
                     }
                     // Exasol LOCATE(substring, string) — reorder to strpos(string, substring)
-                    let substr = render_expression_inner(&args[0])?
+                    let substr = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("LOCATE substring arg is null".into()))?;
-                    let string = render_expression_inner(&args[1])?
+                    let string = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("LOCATE string arg is null".into()))?;
                     Ok(Some(format!("strpos({string}, {substr})")))
                 }
@@ -631,17 +669,17 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                     let branch_end = if has_else { args.len() - 1 } else { args.len() };
                     let mut i = 0;
                     while i < branch_end {
-                        let cond = render_expression_inner(&args[i])?.ok_or_else(|| {
+                        let cond = render_expression_inner(&args[i], dialect)?.ok_or_else(|| {
                             UdfError::User(format!("CASE WHEN cond[{i}] is null"))
                         })?;
-                        let result = render_expression_inner(&args[i + 1])?.ok_or_else(|| {
+                        let result = render_expression_inner(&args[i + 1], dialect)?.ok_or_else(|| {
                             UdfError::User(format!("CASE THEN result[{}] is null", i + 1))
                         })?;
                         sql.push_str(&format!(" WHEN {cond} THEN {result}"));
                         i += 2;
                     }
                     if has_else {
-                        let else_val = render_expression_inner(&args[args.len() - 1])?
+                        let else_val = render_expression_inner(&args[args.len() - 1], dialect)?
                             .ok_or_else(|| UdfError::User("CASE ELSE value is null".into()))?;
                         sql.push_str(&format!(" ELSE {else_val}"));
                     }
@@ -659,7 +697,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                         )));
                     }
                     let df_name = fn_name.to_lowercase();
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 // NULLIFZERO / ZEROIFNULL
@@ -673,7 +711,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let arg = render_expression_inner(&args[0])?
+                    let arg = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("NULLIFZERO argument is null".into()))?;
                     Ok(Some(format!("nullif({arg}, 0)")))
                 }
@@ -687,7 +725,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let arg = render_expression_inner(&args[0])?
+                    let arg = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("ZEROIFNULL argument is null".into()))?;
                     Ok(Some(format!("coalesce({arg}, 0)")))
                 }
@@ -702,9 +740,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let left = render_expression_inner(&args[0])?
+                    let left = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("NULLIF first argument is null".into()))?;
-                    let right = render_expression_inner(&args[1])?
+                    let right = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("NULLIF second argument is null".into()))?;
                     Ok(Some(format!("nullif({left}, {right})")))
                 }
@@ -719,7 +757,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let src = render_expression_inner(&args[0])?
+                    let src = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User(format!("{fn_name} argument is null")))?;
                     Ok(Some(format!("date_part('{fn_name}', {src})")))
                 }
@@ -740,7 +778,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let src = render_expression_inner(&args[0])?
+                    let src = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("WEEK argument is null".into()))?;
                     Ok(Some(format!("date_part('week', {src})")))
                 }
@@ -755,9 +793,9 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             args.len()
                         )));
                     }
-                    let unit = render_expression_inner(&args[0])?
+                    let unit = render_expression_inner(&args[0], dialect)?
                         .ok_or_else(|| UdfError::User("DATE_TRUNC unit is null".into()))?;
-                    let src = render_expression_inner(&args[1])?
+                    let src = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
                     Ok(Some(format!("date_trunc({unit}, {src})")))
                 }
@@ -774,7 +812,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             "function_scalar TO_DATE requires at least 1 argument".into(),
                         ));
                     }
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("to_date({})", rendered.join(", "))))
                 }
                 "TO_TIMESTAMP" => {
@@ -786,7 +824,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                             "function_scalar TO_TIMESTAMP requires at least 1 argument".into(),
                         ));
                     }
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("to_timestamp({})", rendered.join(", "))))
                 }
                 other => Err(UdfError::User(format!(
@@ -813,7 +851,7 @@ fn render_expression_inner(expr: &Json) -> Result<Option<String>, UdfError> {
                 Some(args) => {
                     let distinct = value("distinct").and_then(|d| d.as_bool()) == Some(true);
                     let distinct_kw = if distinct { "DISTINCT " } else { "" };
-                    let rendered = render_args(args)?;
+                    let rendered = render_args(args, dialect)?;
                     Ok(Some(format!(
                         "{name}({distinct_kw}{})",
                         rendered.join(", ")
@@ -831,11 +869,12 @@ fn render_junction(
     expressions: Option<&Json>,
     op: &str,
     empty_value: &str,
+    dialect: CastDialect,
 ) -> Result<String, UdfError> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(Json::Array(items)) = expressions {
         for expr in items {
-            let rendered = render_expression_inner(expr)?;
+            let rendered = render_expression_inner(expr, dialect)?;
             if let Some(r) = rendered
                 && !r.is_empty()
             {
@@ -859,16 +898,24 @@ fn render_junction(
 /// Render a VS expression node to a DataFusion SQL fragment.
 ///
 /// Raises on unsupported or malformed nodes.
+///
+/// Renders CAST targets in the DataFusion dialect: a character CAST target is
+/// bare `VARCHAR` with NO length, because datafusion-sql rejects a length on
+/// VARCHAR (no `support_varchar_with_length`). For the code paths whose output
+/// is parsed by Exasol's core engine, use the Exasol-dialect twin
+/// [`render_expression_exasol`].
 pub fn render_expression(expr: &Json) -> Result<String, UdfError> {
-    render_expression_inner(expr)?.ok_or_else(|| UdfError::User("expression node is null".into()))
+    render_expression_inner(expr, CastDialect::DataFusion)?
+        .ok_or_else(|| UdfError::User("expression node is null".into()))
 }
 
 /// Render a VS expression node to a DataFusion SQL fragment.
 ///
 /// Returns `None` on any failure (unsupported node types, malformed input).
-/// Never panics.
+/// Never panics. DataFusion dialect — see [`render_expression`]; the
+/// Exasol-dialect twin is [`render_expression_exasol_safe`].
 pub fn render_expression_safe(expr: &Json) -> Option<String> {
-    render_expression_inner(expr).ok()?
+    render_expression_inner(expr, CastDialect::DataFusion).ok()?
 }
 
 /// Render a VS filter expression to a DataFusion SQL WHERE fragment.
@@ -877,8 +924,50 @@ pub fn render_expression_safe(expr: &Json) -> Option<String> {
 /// - rendering fails (unsupported node types, malformed input), or
 /// - the filter is trivially true (`TRUE` or `NULL`) — the adapter omits
 ///   it from the scan spec and lets Exasol keep it as a correctness backstop.
+///
+/// DataFusion dialect — see [`render_expression`]; the Exasol-dialect twin is
+/// [`render_df_filter_exasol_safe`].
 pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
-    let result = render_expression_inner(filter_expr).ok()??;
+    let result = render_expression_inner(filter_expr, CastDialect::DataFusion).ok()??;
+    if result == "TRUE" || result == "NULL" {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Render a VS expression node to an **Exasol** SQL fragment.
+///
+/// Identical to [`render_expression`] except CAST targets are rendered in the
+/// Exasol dialect: a character CAST target is length-qualified (`VARCHAR(n)`;
+/// `CHAR(n)` also maps to `VARCHAR(n)` per the mission data-type table), because
+/// Exasol's own parser has no length-less VARCHAR type. Use this on the code
+/// paths whose rendered SQL is parsed by Exasol's core engine directly — the
+/// qualified single-table / N-scan join wrapper (`joins.rs`) and the
+/// grouped-aggregate outer-merge wrapper (`grouped_agg.rs`) — NOT for fragments
+/// embedded in a DataFusion `ScanSpec`, which must use [`render_expression`].
+pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
+    render_expression_inner(expr, CastDialect::Exasol)?
+        .ok_or_else(|| UdfError::User("expression node is null".into()))
+}
+
+/// Render a VS expression node to an **Exasol** SQL fragment.
+///
+/// Returns `None` on any failure. Exasol dialect — see
+/// [`render_expression_exasol`]; the DataFusion-dialect twin is
+/// [`render_expression_safe`].
+pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
+    render_expression_inner(expr, CastDialect::Exasol).ok()?
+}
+
+/// Render a VS filter expression to an **Exasol** SQL WHERE fragment.
+///
+/// Returns `None` when rendering fails or the filter is trivially true
+/// (`TRUE`/`NULL`), mirroring [`render_df_filter_safe`] exactly. Exasol
+/// dialect — see [`render_expression_exasol`]; the DataFusion-dialect twin is
+/// [`render_df_filter_safe`].
+pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
+    let result = render_expression_inner(filter_expr, CastDialect::Exasol).ok()??;
     if result == "TRUE" || result == "NULL" {
         None
     } else {
@@ -2411,6 +2500,83 @@ mod tests {
         assert!(
             render_expression_safe(&bad).is_none(),
             "an unrenderable argument must be None in safe mode"
+        );
+    }
+
+    // --- CAST dialect split (DataFusion vs Exasol) ---
+    //
+    // The SAME expression node renders differently depending on which parser
+    // will consume the fragment: DataFusion's SQL frontend rejects a length on
+    // VARCHAR (bare `VARCHAR`), while Exasol's own parser REQUIRES a length
+    // (`VARCHAR(n)`). These guard the Exasol-dialect entry points and the
+    // divergence between the two so a future refactor cannot silently collapse
+    // them back together.
+
+    #[test]
+    fn renders_cast_varchar_exasol_dialect_includes_length() {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "VARCHAR", "size": 100}
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("X" AS VARCHAR(100))"#
+        );
+    }
+
+    #[test]
+    fn renders_cast_char_exasol_dialect_includes_length() {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("X" AS VARCHAR(3))"#
+        );
+    }
+
+    /// Divergence guard: the SAME node must render bare `VARCHAR` in the
+    /// DataFusion dialect and length-qualified `VARCHAR(n)` in the Exasol
+    /// dialect. If a future change collapses the two dialects together, exactly
+    /// one of these assertions fails, catching the regression that reintroduces
+    /// the "unexpected ')', expecting '(' " Exasol parse error (or the
+    /// datafusion-sql "length not supported" error, depending on direction).
+    #[test]
+    fn cast_char_target_diverges_between_dialects() {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [{"type": "column", "name": "c_varchar"}],
+            "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
+        });
+        // DataFusion dialect: bare VARCHAR, no length.
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"CAST("C_VARCHAR" AS VARCHAR)"#
+        );
+        // Exasol dialect: length-qualified.
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("C_VARCHAR" AS VARCHAR(20))"#
+        );
+    }
+
+    /// Defensive fallback: a character CAST target with no `size` (which a real
+    /// Exasol-sent dataType always carries, but be defensive) renders the
+    /// project's "unknown/incompatible width" default `VARCHAR(2000000)` in the
+    /// Exasol dialect — never bare `VARCHAR`, which Exasol would reject.
+    #[test]
+    fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "VARCHAR"}
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("X" AS VARCHAR(2000000))"#
         );
     }
 }

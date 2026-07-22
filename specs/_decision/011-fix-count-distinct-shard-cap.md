@@ -273,3 +273,30 @@ and no injectivity dependency — the same guarantee the wrapper already gives C
 The `VARCHAR(2000000)` value-type arm and its dedicated test become dead code and are
 removed. Case 1 now only ever fans out a bare column; its `"V"` column always carries
 that column's real Exasol type, never a string-serialized intermediate value.
+
+## Follow-up: Exasol-dialect CAST for the qualified wrapper
+
+**Plan:** `fix-count-distinct-shard-cap`
+**Status:** Accepted
+
+The qualified single-table wrapper (`count-distinct-case-2-3-qualified-wrapper`) and the
+grouped-aggregate outer-merge wrapper render their SELECT/WHERE fragments through
+`crates/vs-expression`, whose CAST-target renderer mapped every `VARCHAR`/`CHAR` target to a
+bare, length-less `VARCHAR`. That is correct only for the DataFusion-side scan-spec fragments
+(`filter`/`projection`/`group_keys`): datafusion-sql rejects `VARCHAR(n)` with a length
+unless `support_varchar_with_length` is enabled, which this project does not. But the wrapper
+SQL is parsed by Exasol's OWN core engine, whose `VARCHAR` type has no length-less form — a
+bare `VARCHAR` is a hard parse error (`sqlCode 04000`, "unexpected ')', expecting '('"), which
+broke `COUNT(DISTINCT CAST(<col> AS CHAR(20)))` once it was routed to the wrapper (E2E
+`count_distinct_expression_arg_via_wrapper_matches_single_node`).
+
+The CAST-target renderer therefore split by dialect. `render_expression` and its `_safe`
+twins keep the bare-`VARCHAR` DataFusion behavior for scan-spec fragments; new
+`render_expression_exasol` / `render_expression_exasol_safe` / `render_df_filter_exasol_safe`
+twins length-qualify character targets (`VARCHAR(n)`; `CHAR(n)` also → `VARCHAR(n)` per the
+mission data-type table, from the width Exasol itself sent) and are used ONLY where Exasol
+parses the rendered SQL: the qualified single-table / N-scan join wrapper (`joins.rs`) and the
+grouped-merge wrapper (`grouped_agg.rs`). The dialect flows through a private `CastDialect`
+parameter threaded across the shared recursive translator; the DataFusion-parsed
+broadcast-join condition/filter and the grouped `group_keys`/renderability check stay on the
+default DataFusion dialect.

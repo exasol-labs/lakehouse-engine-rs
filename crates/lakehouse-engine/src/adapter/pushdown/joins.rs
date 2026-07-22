@@ -6,7 +6,10 @@ use crate::scan::spec::{
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{render_df_filter_safe, render_expression_safe};
+use vs_expression::{
+    render_df_filter_exasol_safe, render_df_filter_safe, render_expression_exasol_safe,
+    render_expression_safe,
+};
 
 use super::file_resolution::{empty_result_sql, relativize_shards_to_root, resolve_file_list};
 use super::support::{
@@ -574,19 +577,28 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
     }
 }
 
-/// Render an expression node to table-qualified DataFusion/Exasol SQL for the
-/// two-scan wrapper: annotate each `column` with its side alias, then reuse the
-/// `vs-expression` translator. `None` when the node cannot be rendered.
+/// Render an expression node to table-qualified **Exasol** SQL for the two-scan
+/// wrapper: annotate each `column` with its side alias, then reuse the
+/// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
+/// node cannot be rendered.
+///
+/// This whole module builds outer-wrapper SQL that Exasol's own core engine
+/// parses directly, so CAST targets must use Exasol syntax (length-qualified
+/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in this
+/// file (`render_join_condition`, `render_broadcast_join`) which stay on the
+/// bare-`VARCHAR` DataFusion dialect.
 fn render_expression_qualified(expr: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
-    render_expression_safe(&annotate_columns_with_alias(expr, alias_of))
+    render_expression_exasol_safe(&annotate_columns_with_alias(expr, alias_of))
 }
 
-/// Render a WHERE filter to a table-qualified Exasol boolean expression for the
-/// two-scan wrapper. `None` when the filter is absent-shaped, trivially true, or
-/// unrenderable — mirroring the single-table `render_df_filter_safe` contract, so a
-/// dropped predicate is Exasol's own backstop responsibility exactly as elsewhere.
+/// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
+/// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
+/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract,
+/// so a dropped predicate is Exasol's own backstop responsibility exactly as
+/// elsewhere. Uses the Exasol-dialect entry point because the wrapper WHERE is
+/// parsed by Exasol's core engine (length-qualified CAST targets).
 fn render_df_filter_qualified(filter: &Json, alias_of: &HashMap<String, String>) -> Option<String> {
-    render_df_filter_safe(&annotate_columns_with_alias(filter, alias_of))
+    render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
 /// Walk an expression tree, recording every `column` node's owning side: its
@@ -3048,6 +3060,41 @@ mod tests {
         assert!(
             sql.contains("COUNT(*)"),
             "the nested COUNT(*) must render as the star case: {sql}"
+        );
+    }
+
+    /// The exact failing-E2E shape: `COUNT(DISTINCT CAST(col AS CHAR(20)))`
+    /// routed to the qualified wrapper must render the CAST target
+    /// LENGTH-QUALIFIED (`VARCHAR(20)`), never bare `VARCHAR`. The qualified
+    /// wrapper SQL is parsed by Exasol's own engine, whose VARCHAR type REQUIRES
+    /// a length — a bare `VARCHAR` is the "unexpected ')', expecting '('" parse
+    /// error (`count_distinct_expression_arg_via_wrapper_matches_single_node`).
+    /// This guards the join/qualified-wrapper half of the Exasol-dialect CAST
+    /// split under plain `cargo test`, without Docker/Exasol.
+    #[test]
+    fn qualified_count_distinct_cast_char_renders_length_qualified_exasol_varchar() {
+        let alias_of = seam_alias_of();
+        let item = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "distinct": true,
+            "arguments": [{
+                "type": "function_scalar_cast", "name": "CAST",
+                "arguments": [{"type": "column", "name": "C_VARCHAR", "tableName": "CUSTOMER"}],
+                "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
+            }]
+        });
+        let sql = render_selectlist_item_qualified(&item, &alias_of)
+            .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
+        assert!(
+            sql.contains("VARCHAR(20)"),
+            "Exasol-parsed qualified wrapper needs a length-qualified CAST target: {sql}"
+        );
+        assert!(
+            !sql.contains("AS VARCHAR)"),
+            "must NOT emit a bare length-less VARCHAR (Exasol rejects it): {sql}"
+        );
+        assert!(
+            sql.contains(r#"COUNT(DISTINCT CAST("LHS_T0"."C_VARCHAR" AS VARCHAR(20)))"#),
+            "full qualified COUNT(DISTINCT CAST(...)) shape must match: {sql}"
         );
     }
 
