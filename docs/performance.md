@@ -148,6 +148,51 @@ files correctly paired per data file). The 15 query results and timings above ar
 the harness's own trailing pushdown-check block flaked both times. `bench/run.sh`'s `pushdown_check`
 has no retry, so one transient EXPLAIN failure fails the whole run; worth hardening separately.
 
+## PR #162 positional-delete read-path refactor: re-run vs. baseline
+
+[PR #162](https://github.com/exasol-labs/lakehouse-engine-rs/pull/162) (merged 2026-07-22,
+`e40d26c`, bumped to v0.27.4) replaced the serial per-(data-file, delete-file) positional-delete
+read path with a two-phase, read-once, bounded-concurrent pipeline (dedup + shared connection-budget
+semaphore + row-group pruning by `file_path` statistics — see the PR description for the full
+design). To check whether this sped up the merge-on-read read path measured in §b, the same
+`BENCH_WITH_DELETES=1` suite was re-run from the PR branch against a fresh `test1` cluster (2×
+`r8i.2xlarge`, same `tpch_deletes` data — the delete-count sanity check matched the §b baseline
+exactly: `LINEITEM 170997641 (~95.0% of baseline 179998372)`), then the cluster was torn down.
+
+| Query | Baseline (2026-07-09, §b) | PR #162 re-run | Δ |
+|---|---|---|---|
+| Q1 (3-way join, wiring) | 2.20 s | 2.19 s | ~flat |
+| Q2 (3-way join, big scan) | 92.43 s | **64.92 s** | **-30%** |
+| Q3 (join + filter + GROUP BY) | 50.79 s | 67.54 s | +33% |
+| Q4 (pricing summary, filter) | 32.81 s | 35.81 s | +9% |
+| Q5 (Q3, no filter) | 61.17 s | 70.27 s | +15% |
+| Q6 (Q4, no filter) | 32.43 s | 30.05 s | -7% |
+| Q7 (high-cardinality GROUP BY) | 33.78 s | 30.73 s | -9% |
+| Q8 (selective filter) | 30.73 s | **23.13 s** | **-25%** |
+| Q9a (narrow projection) | 29.66 s | **20.72 s** | **-30%** |
+| Q9b (wide projection) | 37.86 s | 71.68 s | **+89%** |
+| NQ1 (arithmetic aggregate) | 32.52 s | 33.05 s | +2% |
+| NQ2 (LIKE + IN filter) | 31.17 s | 32.69 s | +5% |
+| NQ3 (4-way join) | 9.46 s | 13.76 s | +45% |
+| NQ4 (ORDER BY + LIMIT) | 29.94 s | **23.40 s** | **-22%** |
+| NQ5 (GROUP BY + HAVING) | 11.06 s | 13.14 s | +19% |
+| **Sum** | **518.0 s** | **533.1 s** | **+3%** |
+
+**Verdict: mixed, no clear net speedup.** Some queries improved substantially (Q2, Q8, Q9a, NQ4:
+-22% to -30%), plausibly the queries where the dedup/shared-semaphore change reduces redundant
+delete-file reads the most (Q2/NQ4 touch multi-file `LINEITEM` broadcast-join legs; Q8/Q9a are
+selective/narrow single-table scans). But others regressed by a similar or larger margin — **Q9b's
++89% stands out**: it is a wide-projection, non-join, full-table scan, so the refactor's
+join-side dedup benefit shouldn't apply there, making its regression the most suspicious data point
+here and a candidate for follow-up profiling. Net aggregate time across all 15 queries is flat to
+slightly worse (+3%), not the improvement the refactor targets.
+
+**Caveat: single run vs. single run.** Like §b itself, this is one trial compared against one
+prior trial, on a shared cloud test cluster — not an average of multiple runs. A swing this large in
+both directions (particularly Q9b) warrants a repeat trial (2-3x each side) before treating any
+individual query's delta as conclusive; this pass only establishes that the aggregate picture is not
+a clean win.
+
 ## Raw streaming scan & IMPORT FROM JDBC parallelism
 
 ### Hypothesis
