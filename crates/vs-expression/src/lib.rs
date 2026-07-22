@@ -2470,14 +2470,16 @@ mod tests {
         }
     }
 
-    // --- Regexp scalar functions are deliberately not translated ---
+    // --- Regexp scalar functions are deliberately not translated (issue #106) ---
 
     #[test]
     fn regexp_scalar_functions_fall_through() {
         // The Rust `regex` crate (DataFusion 54) rejects backreferences and
-        // lookaround that Exasol's PCRE dialect accepts, lacks regexp_substr, and
-        // its argument shapes differ from Exasol's position/occurrence/return
-        // options — so all four scalar regexp functions decline.
+        // lookaround that Exasol's PCRE dialect accepts (blocks all four),
+        // lacks regexp_substr (blocks REGEXP_SUBSTR), and REGEXP_REPLACE /
+        // REGEXP_INSTR's argument shapes differ from Exasol's position/
+        // occurrence/return options (REGEXP_COUNT's shape actually aligns) —
+        // so all four scalar regexp functions decline (issue #106).
         let unsupported = [
             "REGEXP_REPLACE",
             "REGEXP_SUBSTR",
@@ -2507,8 +2509,9 @@ mod tests {
 
     #[test]
     fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
-        // The scalar-regexp exclusion must not affect the REGEXP_LIKE predicate
-        // path (FN_PRED_REGEXP_LIKE stays advertised): both encodings still render.
+        // The scalar-regexp exclusion (issue #106) must not affect the REGEXP_LIKE
+        // predicate path (FN_PRED_REGEXP_LIKE stays advertised): both encodings
+        // still render.
         let predicate = json!({
             "type": "predicate_like_regexp",
             "expression": {"type": "column", "name": "name"},

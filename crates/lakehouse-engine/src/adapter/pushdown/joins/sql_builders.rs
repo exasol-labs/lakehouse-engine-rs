@@ -682,7 +682,7 @@ fn collect_all_column_names(expr: &Json, out: &mut std::collections::HashSet<Str
             if map.get("type").and_then(|t| t.as_str()) == Some("column")
                 && let Some(name) = map.get("name").and_then(|n| n.as_str())
             {
-                out.insert(name.to_uppercase());
+                out.insert(name.to_ascii_uppercase());
             }
             for value in map.values() {
                 collect_all_column_names(value, out);
