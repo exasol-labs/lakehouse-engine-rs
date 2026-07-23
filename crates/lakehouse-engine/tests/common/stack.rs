@@ -215,12 +215,39 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
         .timeout(Duration::from_secs(120))
         .build()
         .expect("build BucketFS HTTPS client");
-    let resp = client
-        .put(&url)
-        .basic_auth("w", Some(&password))
-        .body(bytes)
-        .send()
-        .unwrap_or_else(|e| panic!("BucketFS PUT to {url} failed: {e}"));
+    // BucketFS's HTTPS listener can transiently refuse/reset a connection right
+    // after the SQL port already accepts connections (`wait_for_exasol` only
+    // checks the SQL port). Retry a few times on a connection-level send()
+    // error before giving up; a non-2xx HTTP response is a real failure and
+    // is NOT retried.
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    let mut resp = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client
+            .put(&url)
+            .basic_auth("w", Some(&password))
+            .body(bytes.clone())
+            .send()
+        {
+            Ok(r) => {
+                resp = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+        }
+    }
+    let resp = resp.unwrap_or_else(|| {
+        panic!(
+            "BucketFS PUT to {url} failed after {MAX_ATTEMPTS} attempts: {}",
+            last_err.expect("at least one attempt recorded an error")
+        )
+    });
     assert!(
         resp.status().is_success(),
         "BucketFS PUT to {url} returned {} (expected 2xx)",

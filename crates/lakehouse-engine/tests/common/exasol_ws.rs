@@ -17,11 +17,25 @@ use tungstenite::{Message, WebSocket, client_tls_with_config};
 
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
+    redact_sql: bool,
 }
 
 impl ExaConn {
     /// Connect and authenticate to Exasol via WebSocket (TLS, self-signed cert accepted).
+    ///
+    /// `execute()` failures include the SQL statement and the Exasol response body for
+    /// debuggability. Use `connect_redacting` when the SQL may carry credentials.
     pub fn connect(host: &str, port: u16, user: &str, password: &str) -> Self {
+        Self::connect_inner(host, port, user, password, false)
+    }
+
+    /// Connect in redacting mode: `execute()` failures omit the SQL statement and the
+    /// Exasol response body so credential-bearing DDL cannot leak into test output.
+    pub fn connect_redacting(host: &str, port: u16, user: &str, password: &str) -> Self {
+        Self::connect_inner(host, port, user, password, true)
+    }
+
+    fn connect_inner(host: &str, port: u16, user: &str, password: &str, redact_sql: bool) -> Self {
         let url = format!("wss://{host}:{port}");
         let tls = TlsConnector::builder()
             .danger_accept_invalid_certs(true)
@@ -71,7 +85,7 @@ impl ExaConn {
             Some("ok"),
             "Exasol authentication failed: {resp}"
         );
-        ExaConn { ws }
+        ExaConn { ws, redact_sql }
     }
 
     /// Execute SQL; panics on error. Returns the raw JSON response.
@@ -85,11 +99,21 @@ impl ExaConn {
             .send(Message::Text(cmd.to_string().into()))
             .expect("send execute");
         let resp = Self::read_json(&mut self.ws);
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("ok"),
-            "Exasol execute failed for SQL:\n{sql}\n\nError: {resp}"
-        );
+        if self.redact_sql {
+            // Redacting mode: the SQL may carry credentials (SigV4, vended keys) and the
+            // Exasol error response may echo them back, so surface neither.
+            assert_eq!(
+                resp["status"].as_str(),
+                Some("ok"),
+                "Exasol execute failed for SQL — check Exasol error"
+            );
+        } else {
+            assert_eq!(
+                resp["status"].as_str(),
+                Some("ok"),
+                "Exasol execute failed for SQL:\n{sql}\n\nError: {resp}"
+            );
+        }
         resp
     }
 
