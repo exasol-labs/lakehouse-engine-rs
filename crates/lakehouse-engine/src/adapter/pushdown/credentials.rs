@@ -2323,7 +2323,10 @@ mod tests {
             "use_sigv4 must take precedence and resolve to CatalogAuth::Sigv4"
         );
 
-        // 2. Non-empty token, no SigV4, no OAuth client credentials → Bearer.
+        // Precedence #2 (OAuth2 client-credentials grant) is the network branch and
+        // is exercised elsewhere; the remaining non-network branches follow.
+
+        // 3. Non-empty token, no SigV4, no OAuth client credentials → Bearer.
         let mut bearer_creds = creds_no_auth();
         bearer_creds.token = Some(BEARER_TOK.into());
         let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &bearer_creds)
@@ -2337,7 +2340,7 @@ mod tests {
             _ => panic!("a non-empty static token must resolve to CatalogAuth::Bearer"),
         }
 
-        // 3. No auth supplied at all → None.
+        // 4. No auth supplied at all → None.
         let no_auth_creds = creds_no_auth();
         let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &no_auth_creds)
             .await
