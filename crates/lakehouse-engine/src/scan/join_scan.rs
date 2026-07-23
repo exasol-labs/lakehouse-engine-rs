@@ -25,7 +25,7 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// Stream a two-table inner equi-join over an already-built session.
 ///
 /// Registers the sharded fact file list (`spec.files`) and the full, shard-invariant
-/// dimension file list (`spec.join.files`) as two tables in the SAME session, each
+/// dimension file list (`spec.common.join.files`) as two tables in the SAME session, each
 /// wrapped in an aliased sub-SELECT exposing Exasol-facing uppercase column names,
 /// then executes `SELECT <projection> FROM (dim) INNER JOIN (fact) ON <condition>
 /// [WHERE <filter>] [LIMIT n]` and streams the joined batches through [`emit_stream`]
@@ -43,7 +43,7 @@ pub async fn run_join_scan_with_session(
     spec: &ScanSpec,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.storage.secret_values();
+    let secrets = spec.common.storage.secret_values();
     register_join_tables(session_ctx, spec).await?;
     let sql = build_join_sql(session_ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
     let df = session_ctx
@@ -54,7 +54,7 @@ pub async fn run_join_scan_with_session(
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
-    emit_stream(ctx, stream, &secrets, &spec.emit_exa_types, timers).await?;
+    emit_stream(ctx, stream, &secrets, &spec.common.emit_exa_types, timers).await?;
     emit_phase_telemetry(ctx, timers);
     Ok(())
 }
@@ -67,11 +67,12 @@ pub async fn run_join_scan_with_session(
 /// than silently producing a wrong-shaped result.
 async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(), UdfError> {
     let join = spec
+        .common
         .join
         .as_ref()
         .expect("register_join_tables called without a join block");
 
-    if spec.aggregates.is_some() || spec.group_keys.is_some() {
+    if spec.common.aggregates.is_some() || spec.common.group_keys.is_some() {
         return Err(UdfError::User(
             "join pushdown does not support aggregate or GROUP BY in the same scan spec".into(),
         ));
@@ -91,10 +92,10 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         ctx,
         JOIN_FACT_TABLE,
         &spec.files,
-        &spec.table_root,
-        &spec.logical_schema,
-        &spec.name_mapping,
-        &spec.storage,
+        &spec.common.table_root,
+        &spec.common.logical_schema,
+        &spec.common.name_mapping,
+        &spec.common.storage,
         Arc::clone(&delete_read_limiter),
     )
     .await?;
@@ -105,7 +106,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.table_root,
         &join.logical_schema,
         &join.name_mapping,
-        &spec.storage,
+        &spec.common.storage,
         delete_read_limiter,
     )
     .await?;
@@ -121,7 +122,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
 /// unambiguously against the join's combined schema.
 ///
 /// The dimension side is placed on the LEFT so it is the hash-join build side (see
-/// [`run_join_scan_with_session`]). Output column order follows `spec.projection`
+/// [`run_join_scan_with_session`]). Output column order follows `spec.common.projection`
 /// (positionally aligned with `emit_exa_types`); an empty projection expands to
 /// every column, dimension columns first. `LIMIT`, when present, is applied here
 /// exactly as the single-table scan applies it — the VS does not currently push a
@@ -133,6 +134,7 @@ async fn build_join_sql(
     spec: &ScanSpec,
 ) -> Result<String, UdfError> {
     let join = spec
+        .common
         .join
         .as_ref()
         .expect("build_join_sql called without a join block");
@@ -162,13 +164,13 @@ async fn build_join_sql(
     // tables (VS guarantee), so a bare uppercase name resolves in exactly one side.
     let combined = combined_upper_fields(dim_schema, fact_schema);
 
-    let proj_items: Vec<ProjectionItem> = if spec.projection.is_empty() {
+    let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
         combined
             .iter()
             .map(|(name, _)| ProjectionItem::Column(name.clone()))
             .collect()
     } else {
-        spec.projection.clone()
+        spec.common.projection.clone()
     };
 
     let select_items: Vec<String> = proj_items
@@ -183,14 +185,14 @@ async fn build_join_sql(
         join.condition
     );
 
-    if let Some(filter) = &spec.filter
+    if let Some(filter) = &spec.common.filter
         && !filter.is_empty()
     {
         sql.push_str(" WHERE ");
         sql.push_str(filter);
     }
 
-    if let Some(limit) = spec.limit {
+    if let Some(limit) = spec.common.limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 

@@ -35,3 +35,26 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *THEN* each capability submodule MUST contain a `#[cfg(test)] mod tests` covering only that submodule's own items
 * *AND* no single central pushdown test module SHALL remain
 * *AND* a test helper shared across submodules MUST live in one shared `#[cfg(test)]` support module rather than being duplicated
+
+### Scenario: The dispatcher builds each fan-out spec from one shared shard-invariant base
+
+* *GIVEN* the pushdown dispatcher's fan-out construction sites, each previously repeating the same shard-invariant tail verbatim — logical schema, name mapping, absent join, storage, the four DataFusion tuning fields, the memory-pool fields, and the S3 connection budget — plus an empty files list
+* *WHEN* the dispatcher constructs the scan spec for the grouped-aggregate, group-by fallback, lone-`COUNT(DISTINCT)`, multi/mixed-`COUNT(DISTINCT)` decline, and single-group/row-scan dispatch shapes
+* *THEN* every site SHALL derive its shard-invariant fields from one shared base value and set only the fields that differ at that site
+* *AND* the scan-driving SQL generated for each dispatch shape MUST be byte-identical to the pre-refactor output
+
+### Scenario: Both qualified single-table fallback guards call one shared helper
+
+* *GIVEN* the two near-identical dispatch guards that route to the qualified single-table wrapper — a `GROUP BY` request that declined grouped decomposition, and a multi or mixed `COUNT(DISTINCT)` single-group request
+* *WHEN* each guard builds its referenced-column projection, its fan-out spec, and its wrapper SQL
+* *THEN* both guards SHALL call one shared helper that performs the referenced-column-projection, fan-out-spec, and wrapper-SQL sequence
+* *AND* the wrapper SQL each guard produces MUST be byte-identical to the pre-refactor output
+
+### Scenario: One classifier decides the request shape for both the dispatch and empty-result paths
+
+* *GIVEN* the request-routing decision — grouped aggregate first, then single-group aggregate, then row scan, applying the same aggregate-column-type validation gates and the same HAVING-present hard-error decline — previously encoded twice, once in the non-empty dispatcher and once in the empty-result path
+* *WHEN* the adapter plans a pushdown request, whether data files remain or every file is pruned
+* *THEN* the request shape SHALL be computed once by one shared classifier that both paths consume
+* *AND* each path SHALL render only its own SQL from the shared decision — the non-empty path its scan-driving SQL, the empty path its shape-correct empty response
+* *AND* a non-numeric grouped aggregate carrying a HAVING SHALL surface the same hard-error decline on both paths
+* *AND* the scan-driving SQL and the empty-result response MUST each be byte-identical to their pre-refactor output

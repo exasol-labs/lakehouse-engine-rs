@@ -642,7 +642,7 @@ pub fn merge_vended_into_storage(
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::scan::spec::{FileEntry, ScanSpec};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
 
     // ---------------------------------------------------------------------------
     // Task 3.3 / 3.4 — SigV4 wiring: URL construction + signed/unsigned routing
@@ -1880,29 +1880,31 @@ mod tests {
         };
 
         let spec = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                table_root: String::new(),
+                projection: vec!["ID".into()],
+                filter: None,
+                limit: None,
+                order_by: Vec::new(),
+                aggregates: None,
+                group_keys: None,
+                distinct: false,
+                emit_exa_types: vec!["DECIMAL(20,0)".into()],
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join: None,
+                storage: vended_storage,
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            },
             files: vec![FileEntry::new(
                 "s3://warehouse/db/events/part-00000.parquet",
                 1,
             )],
-            projection: vec!["ID".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: vended_storage,
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
 
         let json = spec.to_json();

@@ -40,7 +40,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
+    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -260,26 +260,28 @@ fn dummy_storage() -> StorageProps {
 /// so the output ordering is deterministic.
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     ScanSpec {
-        table_root,
+        common: CommonScanSpec {
+            table_root,
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: dummy_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 64,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        },
         files: files.into_iter().map(FileEntry::from).collect(),
-        projection: vec!["ID".into(), "NAME".into()],
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: dummy_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 64,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
     }
 }
 

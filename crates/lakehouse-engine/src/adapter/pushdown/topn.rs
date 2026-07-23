@@ -181,7 +181,7 @@ mod tests {
     use super::super::test_support::*;
     use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
     use super::*;
-    use crate::scan::spec::{FileEntry, ScanSpec, render_order_by_clause};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, render_order_by_clause};
     use vs_expression::render_df_filter_safe;
 
     // -----------------------------------------------------------------------
@@ -225,26 +225,28 @@ mod tests {
         };
 
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                table_root: String::new(),
+                projection: proj_cols.clone(),
+                filter,
+                limit: effective_limit,
+                order_by,
+                aggregates,
+                group_keys: None,
+                distinct: false,
+                emit_exa_types: proj_types.clone(),
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join: None,
+                storage: sample_storage(),
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            },
             files: vec![],
-            projection: proj_cols.clone(),
-            filter,
-            limit: effective_limit,
-            order_by,
-            aggregates,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: proj_types.clone(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
         let g = shard_count(cluster_nodes, 1, files.len());
@@ -262,8 +264,9 @@ mod tests {
             DISTRIBUTE_FILES_UDF_NAME,
         );
         // Mirror handle_pushdown's row-scan DECLINE wrapping (add-topn-pushdown B6).
-        let declined_order_by =
-            has_order_by && spec_template.order_by.is_empty() && spec_template.aggregates.is_none();
+        let declined_order_by = has_order_by
+            && spec_template.common.order_by.is_empty()
+            && spec_template.common.aggregates.is_none();
         if declined_order_by {
             let keys = parse_order_by_keys(&pushdown_req);
             if keys.is_empty() {
