@@ -1886,28 +1886,13 @@ mod tests {
         });
         let fan_out_spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec![
                     ProjectionItem::Column("C_CUSTKEY".to_string()),
                     ProjectionItem::Column("C_NAME".to_string()),
                 ],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
                 emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()],
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1951,25 +1936,10 @@ mod tests {
         fn spec_with(projection: Vec<ProjectionItem>, emit_exa_types: Vec<String>) -> ScanSpec {
             ScanSpec {
                 common: CommonScanSpec {
-                    table_root: String::new(),
                     projection,
-                    filter: None,
-                    limit: None,
-                    order_by: Vec::new(),
-                    aggregates: None,
-                    group_keys: None,
-                    distinct: false,
                     emit_exa_types,
-                    logical_schema: Vec::new(),
-                    name_mapping: Vec::new(),
-                    join: None,
                     storage: sample_storage(),
-                    df_target_partitions: 1,
-                    df_batch_size: 8192,
-                    df_threads_per_udf: 1,
-                    memory_pool_fraction: 0.6,
-                    instance_overhead_mb: 200,
-                    s3_max_connections: 8,
+                    ..Default::default()
                 },
                 files: vec![],
             }

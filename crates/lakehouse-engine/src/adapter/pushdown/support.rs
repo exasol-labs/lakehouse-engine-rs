@@ -747,23 +747,9 @@ mod tests {
             common: CommonScanSpec {
                 table_root: "s3://warehouse/db/table".into(),
                 projection: vec![ProjectionItem::Column("ID".into())],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
                 emit_exa_types: vec!["DECIMAL(20,0)".into()],
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         }
@@ -1395,11 +1381,8 @@ mod tests {
         // Build a spec_template as handle_pushdown would.
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["AMOUNT".into()],
                 filter: Some("(\"REGION\" = 'EU')".into()),
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(vec![
                     AggregatePlan {
                         kind: AggKind::Sum,
@@ -1412,19 +1395,8 @@ mod tests {
                         arg_expr: None,
                     },
                 ]),
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1575,25 +1547,10 @@ mod tests {
         let distinctive_s3_max_connections = 37;
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["ID".into()],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
                 s3_max_connections: distinctive_s3_max_connections,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1648,25 +1605,9 @@ mod tests {
     ) -> String {
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(agg_plans),
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1861,25 +1802,9 @@ mod tests {
         }];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(plans.clone()),
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1913,25 +1838,9 @@ mod tests {
         }];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(plans.clone()),
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2057,25 +1966,8 @@ mod tests {
     fn count_distinct_base_spec() -> ScanSpec {
         ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         }
@@ -2577,25 +2469,9 @@ mod tests {
         let g = shard_count(3, 1, files.len());
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["ID".into()],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2632,25 +2508,9 @@ mod tests {
         let g = shard_count(1, 1, files.len());
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["ID".into()],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };

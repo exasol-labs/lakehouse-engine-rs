@@ -641,29 +641,14 @@ mod tests {
         let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
         let spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(vec![AggregatePlan {
                     kind: AggKind::Count,
                     column: None,
                     arg_expr: None,
                 }]),
                 group_keys: Some(group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
         };
@@ -734,25 +719,12 @@ mod tests {
         // NEVER threaded into ScanSpec (it has no auth fields by construction).
         let spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["ID".into(), "NAME".into()],
                 filter: Some("(\"ID\" > 10)".into()),
                 limit: Some(100),
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
                 emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![FileEntry::new(
                 "s3://warehouse/db/events/part-00000.parquet",
@@ -896,25 +868,9 @@ mod tests {
         // Verify round-trip through ScanSpec: logical_schema survives JSON serde.
         let spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
                 logical_schema: logical.clone(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1146,25 +1102,9 @@ mod tests {
 
         let spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
                 logical_schema: logical.clone(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };

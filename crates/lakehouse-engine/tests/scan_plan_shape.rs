@@ -64,33 +64,17 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         .unwrap_or(0);
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some(r#""ID" >= 10"#.into()),
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
-                session_token: None,
                 allow_http: true,
-                path_style: true,
+                ..Default::default()
             },
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
     }
@@ -390,35 +374,19 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
-            projection: Vec::new(),
             filter: Some(
                 r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
             ),
-            limit: None,
-            order_by: Vec::new(),
             aggregates: Some(aggregates),
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
-                session_token: None,
                 allow_http: true,
-                path_style: true,
+                ..Default::default()
             },
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: Vec::new(),
     }
@@ -512,25 +480,8 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 fn row_scan_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
-            projection: Vec::new(),
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
             storage: test_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: Vec::new(),
     }
@@ -655,9 +606,8 @@ fn test_storage() -> StorageProps {
         region: "us-east-1".to_string(),
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 
@@ -687,23 +637,10 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
                 ProjectionItem::Column("C_NAME".into()),
                 ProjectionItem::Column("O_ORDERDATE".into()),
             ],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
             emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
             join: Some(join),
             storage: test_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: vec![],
     };

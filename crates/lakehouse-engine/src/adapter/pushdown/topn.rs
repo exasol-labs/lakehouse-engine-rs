@@ -226,25 +226,14 @@ mod tests {
 
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: proj_cols.clone(),
                 filter,
                 limit: effective_limit,
                 order_by,
                 aggregates,
-                group_keys: None,
-                distinct: false,
                 emit_exa_types: proj_types.clone(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };

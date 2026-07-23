@@ -169,9 +169,8 @@ fn storage() -> StorageProps {
         region: "us-east-1".into(),
         access_key: "test-access-key".into(),
         secret_key: "TOPSECRETVALUE".into(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 
@@ -187,17 +186,9 @@ fn join_spec(
 ) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
             projection: projection.into_iter().map(Into::into).collect(),
             filter: filter.map(Into::into),
             limit,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
             join: Some(JoinSpec {
                 table_root: String::new(),
                 files: dim_files.into_iter().map(FileEntry::from).collect(),
@@ -207,12 +198,7 @@ fn join_spec(
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
             }),
             storage: storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: fact_files.into_iter().map(FileEntry::from).collect(),
     }
