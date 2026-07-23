@@ -16,6 +16,10 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
+pub(super) use sql_builders::qualified_single_table_fallback_pushdown;
+// Only test modules (`grouped_agg.rs`, `support.rs`) reach these two directly now;
+// production callers go through `qualified_single_table_fallback_pushdown` above.
+#[cfg(test)]
 pub(super) use sql_builders::{
     build_qualified_single_table_fallback_sql, referenced_column_projection,
 };

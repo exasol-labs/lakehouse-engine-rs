@@ -642,7 +642,7 @@ pub fn merge_vended_into_storage(
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::scan::spec::{FileEntry, ScanSpec};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
 
     // ---------------------------------------------------------------------------
     // Task 3.3 / 3.4 — SigV4 wiring: URL construction + signed/unsigned routing
@@ -1017,8 +1017,8 @@ mod tests {
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
             session_token: Some("OLD_TOKEN".into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let merged = merge_vended_into_storage(&base, "VENDED_AK", "VENDED_SK", Some("VENDED_TOK"));
@@ -1067,9 +1067,8 @@ mod tests {
             region: "us-east-1".into(),
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
-            session_token: None,
             allow_http: true,
-            path_style: true,
+            ..Default::default()
         };
 
         // Empty vended keys — falls back to static.
@@ -1102,8 +1101,8 @@ mod tests {
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
             session_token: Some("OLD_STS_TOKEN".into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let merged =
@@ -1875,34 +1874,21 @@ mod tests {
             access_key: VENDED_AK.into(),
             secret_key: VENDED_SK.into(),
             session_token: Some(VENDED_TOK.into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let spec = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                projection: vec!["ID".into()],
+                emit_exa_types: vec!["DECIMAL(20,0)".into()],
+                storage: vended_storage,
+                ..Default::default()
+            },
             files: vec![FileEntry::new(
                 "s3://warehouse/db/events/part-00000.parquet",
                 1,
             )],
-            projection: vec!["ID".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: vended_storage,
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
 
         let json = spec.to_json();
