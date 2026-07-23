@@ -18,7 +18,6 @@ matches your catalog, then copy its recipe.
 | [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) | SigV4 | **Validated, not in CI**: opt-in cloud test against real Glue |
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | bearer token or OAuth2 | **Exercised, not in CI**: same opt-in cloud test |
 | [Databricks Unity Catalog Iceberg REST](#databricks-unity-catalog-iceberg-rest) | token/OAuth2 (in theory) | **Untested**: template only, no Databricks-specific code |
-| [Hive metastore, Nessie, filesystem/Hadoop](#not-implemented-hive-nessie-hadoop) | n/a | **Not implemented**: no code path exists |
 
 The steps here cover only the catalog CONNECTION and the Virtual Schema — the
 [Point the VS at your data](install.md#point-the-vs-at-your-data) step of [Install](install.md). Get
@@ -194,11 +193,6 @@ Point `TO` at the Databricks Unity Catalog Iceberg REST endpoint and use the tok
 described above. Treat the [AWS Glue recipe](#aws-glue-iceberg-rest-sigv4) as the template and
 adjust the catalog URI and credential flags to the Databricks endpoint. There is no worked example
 here because the shape has not been validated.
-
-## Not implemented: Hive, Nessie, Hadoop
-
-Hive metastore, Nessie, and filesystem/Hadoop catalogs are **not implemented**: no code path exists
-for any of them, and no configuration enables them.
 
 ## Addressing
 
