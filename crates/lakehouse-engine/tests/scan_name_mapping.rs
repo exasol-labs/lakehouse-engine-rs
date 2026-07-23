@@ -100,9 +100,8 @@ fn dummy_storage() -> StorageProps {
         region: "us-east-1".into(),
         access_key: "k".into(),
         secret_key: "s".into(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 
@@ -158,25 +157,12 @@ fn name_mapping_spec(
 ) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
             projection: vec!["ID".into(), "NEW_COL".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
             logical_schema,
             name_mapping,
-            join: None,
             storage: dummy_storage(),
-            df_target_partitions: 1,
             df_batch_size: 64,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: vec![FileEntry::new(file_url, file_size)],
     }

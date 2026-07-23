@@ -1420,25 +1420,10 @@ mod tests {
     fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
         ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(result.plans.clone()),
                 group_keys: Some(result.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         }
@@ -1616,25 +1601,10 @@ mod tests {
         let sql = build_grouped_aggregate_scan_sql(
             &ScanSpec {
                 common: CommonScanSpec {
-                    table_root: String::new(),
-                    projection: vec![],
-                    filter: None,
-                    limit: None,
-                    order_by: Vec::new(),
                     aggregates: Some(result.plans.clone()),
                     group_keys: Some(result.group_keys.clone()),
-                    distinct: false,
-                    emit_exa_types: Vec::new(),
-                    logical_schema: Vec::new(),
-                    name_mapping: Vec::new(),
-                    join: None,
                     storage: sample_storage(),
-                    df_target_partitions: 1,
-                    df_batch_size: 8192,
-                    df_threads_per_udf: 1,
-                    memory_pool_fraction: 0.6,
-                    instance_overhead_mb: 200,
-                    s3_max_connections: 8,
+                    ..Default::default()
                 },
                 files: vec![],
             },
@@ -1898,25 +1868,10 @@ mod tests {
         let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(result.plans.clone()),
                 group_keys: Some(result.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -1995,25 +1950,10 @@ mod tests {
         ];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(agg_plans.clone()),
                 group_keys: Some(group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2177,29 +2117,15 @@ mod tests {
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
                 limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
-                order_by: Vec::new(),
                 aggregates: Some(vec![AggregatePlan {
                     kind: AggKind::Count,
                     column: None,
                     arg_expr: None,
                 }]),
                 group_keys: Some(vec!["\"REGION\"".into()]),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2349,25 +2275,10 @@ mod tests {
         ];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(agg_plans.clone()),
                 group_keys: Some(group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2624,25 +2535,10 @@ mod tests {
         let group_key_types = group_key_exasol_types(req, &d.group_keys, &d.select_items);
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(d.plans.clone()),
                 group_keys: Some(d.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -2884,25 +2780,10 @@ mod tests {
         let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
         let fan_out_spec = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: proj_cols,
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
                 emit_exa_types: proj_types,
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -3002,25 +2883,10 @@ mod tests {
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(detection.plans.clone()),
                 group_keys: Some(detection.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -3098,25 +2964,10 @@ mod tests {
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(detection.plans.clone()),
                 group_keys: Some(detection.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -3190,25 +3041,10 @@ mod tests {
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(detection.plans.clone()),
                 group_keys: Some(detection.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };
@@ -3638,29 +3474,15 @@ mod tests {
         let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
         let spec_template = ScanSpec {
             common: CommonScanSpec {
-                table_root: String::new(),
                 projection: vec!["REGION".into(), "AMOUNT".into()],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
                 aggregates: Some(vec![AggregatePlan {
                     kind: AggKind::Sum,
                     column: Some("AMOUNT".into()),
                     arg_expr: None,
                 }]),
                 group_keys: Some(vec![r#""REGION""#.to_string()]),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![],
         };

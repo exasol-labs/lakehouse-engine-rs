@@ -220,6 +220,26 @@ fn default_true() -> bool {
     true
 }
 
+impl Default for StorageProps {
+    /// Mirrors serde's field-absent defaults: empty connection fields, no session
+    /// token, HTTPS (`allow_http` false), and path-style access ON (`default_true`).
+    /// So `StorageProps::default()` equals deserializing a `StorageProps` whose
+    /// optional fields are all absent — the single source of truth is the same
+    /// `default_true` seam serde uses. A placeholder for tests, which override the
+    /// connection fields that matter to a given scenario.
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            region: String::new(),
+            access_key: String::new(),
+            secret_key: String::new(),
+            session_token: None,
+            allow_http: false,
+            path_style: default_true(),
+        }
+    }
+}
+
 impl StorageProps {
     /// The non-empty secret values (access key, secret key, session token).
     ///
@@ -680,6 +700,44 @@ impl CommonScanSpec {
     }
 }
 
+impl Default for CommonScanSpec {
+    /// The shard-invariant baseline: no pushdown (empty projection/filter/order-by,
+    /// no aggregate/group/join), a placeholder [`StorageProps`], and every tuning
+    /// knob at its shared test-fixture value. Its purpose is construction ergonomics
+    /// for tests, which spread `..Default::default()` and override ONLY the fields a
+    /// given scenario exercises, rather than respelling all shard-invariant fields.
+    ///
+    /// The five `df_*`/`memory_pool_fraction`/`instance_overhead_mb` knobs reuse the
+    /// same `default_*` seams serde applies to an absent JSON field, so they cannot
+    /// drift from the wire defaults. `s3_max_connections` is the one deliberate
+    /// exception: it is the fixture convention (`8`) shared with the golden dispatch
+    /// baselines, NOT serde's field-absent fallback [`DEFAULT_S3_MAX_CONNECTIONS`]
+    /// (`16`) — `Default` is a test-construction aid, not a wire-compat contract.
+    fn default() -> Self {
+        Self {
+            table_root: String::new(),
+            projection: Vec::new(),
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: StorageProps::default(),
+            df_target_partitions: default_one_usize(),
+            df_batch_size: default_batch_size(),
+            df_threads_per_udf: default_one_usize(),
+            memory_pool_fraction: default_memory_pool_fraction(),
+            instance_overhead_mb: default_instance_overhead_mb(),
+            s3_max_connections: 8,
+        }
+    }
+}
+
 /// The scan specification passed from the adapter to the scan SET UDF.
 ///
 /// Holds the shard-invariant [`CommonScanSpec`] (every field identical across all
@@ -833,35 +891,52 @@ mod tests {
                 projection: vec!["id".into(), "name".into()],
                 filter: Some("(\"ID\" > 10)".into()),
                 limit: Some(100),
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
                 storage: StorageProps {
                     endpoint: "http://minio:9000".into(),
                     region: "us-east-1".into(),
                     access_key: "minioadmin".into(),
                     secret_key: "minioadmin".into(),
-                    session_token: None,
                     allow_http: true,
-                    path_style: true,
+                    ..Default::default()
                 },
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
+                ..Default::default()
             },
             files: vec![
                 FileEntry::new("data/part-00000.parquet", 1024),
                 FileEntry::new("data/part-00001.parquet", 2048),
             ],
         }
+    }
+
+    /// `CommonScanSpec::default()` — the shared test-construction baseline that
+    /// `..Default::default()` spreads across the test suite fill in — must track
+    /// serde's field-absent defaults for every tuning knob that reuses a `default_*`
+    /// seam, so the two default sources cannot silently drift. `s3_max_connections`
+    /// is the one deliberate exception (the fixture convention `8`, not the serde
+    /// field-absent fallback `DEFAULT_S3_MAX_CONNECTIONS` = `16`); this pins that
+    /// intent so a change to either side is a conscious edit, not an accident.
+    #[test]
+    fn default_matches_serde_absent_except_s3_max_connections() {
+        // A common blob whose every optional/tuning field is absent from JSON
+        // (only the two non-defaulted fields, `projection` and `storage`, present).
+        let minimal = r#"{"projection":[],"storage":{"endpoint":"","region":"","access_key":"","secret_key":""}}"#;
+        let from_absent = CommonScanSpec::from_json(minimal).unwrap();
+        let d = CommonScanSpec::default();
+
+        // The knobs Default shares with serde agree field-for-field.
+        assert_eq!(d.table_root, from_absent.table_root);
+        assert_eq!(d.df_target_partitions, from_absent.df_target_partitions);
+        assert_eq!(d.df_batch_size, from_absent.df_batch_size);
+        assert_eq!(d.df_threads_per_udf, from_absent.df_threads_per_udf);
+        assert_eq!(d.memory_pool_fraction, from_absent.memory_pool_fraction);
+        assert_eq!(d.instance_overhead_mb, from_absent.instance_overhead_mb);
+        assert_eq!(d.storage.path_style, from_absent.storage.path_style);
+        assert!(!d.storage.allow_http && !from_absent.storage.allow_http);
+
+        // The one deliberate divergence: Default is the fixture value, serde's
+        // field-absent fallback is the conservative wire default.
+        assert_eq!(d.s3_max_connections, 8);
+        assert_eq!(from_absent.s3_max_connections, DEFAULT_S3_MAX_CONNECTIONS);
     }
 
     /// Scenario (D.2): Scan-spec round-trips through Value boundary.
