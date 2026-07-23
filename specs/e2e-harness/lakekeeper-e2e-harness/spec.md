@@ -15,8 +15,8 @@ own `lakekeeper-e2e` cargo feature.
 
 * Every scenario runs against a local Docker stack of Exasol, MinIO, Lakekeeper, a
   PostgreSQL metadata database, and a Keycloak IdP, and MUST fail (never skip) when
-  the stack is unavailable — the same fail-loud discipline as `packaging/e2e-harness`,
-  and the opposite of `packaging/cloud-e2e-harness`.
+  the stack is unavailable — the same fail-loud discipline as `e2e-harness/e2e-harness`,
+  and the opposite of `e2e-harness/cloud-e2e-harness`.
 * The suite is gated behind a dedicated `lakekeeper-e2e` cargo feature, distinct from
   `exasol-e2e` and `cloud-e2e`, so the fast unauthenticated baseline suite is never
   altered.
@@ -44,7 +44,7 @@ own `lakekeeper-e2e` cargo feature.
 * All DSN/connection strings include `validateservercertificate=0`. No credential
   value (client secret, bearer token, static or vended S3 key) appears in test output.
 * The scan-path provisioning (SLC install, `.so` upload, script DDL, VS creation)
-  reuses the shared `common/e2e_harness` definition per `packaging/e2e-harness`;
+  reuses the shared `common/e2e_harness` definition per `e2e-harness/e2e-harness`;
   only the CONNECTION password, warehouse-name, and namespace vary per binary.
 * VS properties use docker-network-internal URLs (catalog `http://lakekeeper:8181/catalog`,
   MinIO `http://minio:9000`, token endpoint on the Keycloak service) because the

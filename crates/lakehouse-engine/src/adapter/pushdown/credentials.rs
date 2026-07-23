@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// Build a RestCatalog configured to read/write data files through the S3
 /// (MinIO) storage factory.
 ///
-/// iceberg 0.9.1 requires an explicit `StorageFactory`; the S3 config keys are
+/// iceberg 0.10.0 requires an explicit `StorageFactory`; the S3 config keys are
 /// supplied in the same props map passed to `load`. Credentials live only in
 /// this map and never appear in returned SQL or error strings.
 pub(super) async fn build_rest_catalog(
@@ -79,7 +79,7 @@ pub(super) async fn build_rest_catalog(
 }
 
 /// REST-catalog auth property keys (literal strings, fixed by `iceberg-catalog-rest`
-/// 0.9.1; the crate exports no constants for them). They flow through
+/// 0.10.0; the crate exports no constants for them). They flow through
 /// `RestCatalogBuilder::load`, which copies every prop except `uri`/`warehouse`.
 const REST_CATALOG_PROP_TOKEN: &str = "token";
 const REST_CATALOG_PROP_CREDENTIAL: &str = "credential";
@@ -451,17 +451,45 @@ pub(super) fn glue_catalog_prefix(warehouse: &str) -> String {
     format!("catalogs/{warehouse}")
 }
 
+/// Read the per-warehouse routing `prefix` from a `GET /v1/config` response.
+///
+/// Per the Iceberg REST spec a client merges the server's `defaults` (base) and
+/// `overrides` (higher precedence) config maps; the `prefix` property may be
+/// served in EITHER. Databricks-style catalogs place it in `overrides`, while
+/// Lakekeeper serves the per-warehouse UUID prefix in `defaults`. Prefer
+/// `overrides.prefix` (spec merge precedence), then fall back to `defaults.prefix`;
+/// EMPTY when neither carries a non-empty value (the plain-REST case, including
+/// `apache/iceberg-rest-fixture`).
+///
+/// Reading only `overrides.prefix` (the former behaviour) yielded an empty prefix
+/// against Lakekeeper, producing a malformed `loadTable` URL missing the required
+/// warehouse segment → HTTP 404.
+fn prefix_from_config(config: &serde_json::Value) -> String {
+    let read = |map: &str| {
+        config
+            .get(map)
+            .and_then(|m| m.get("prefix"))
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    read("overrides")
+        .or_else(|| read("defaults"))
+        .unwrap_or_default()
+}
+
 /// Resolve the `loadTable` URL prefix from the catalog config endpoint.
 ///
-/// `GET {catalog_uri}/v1/config?warehouse=<warehouse>` → `overrides.prefix`.
+/// `GET {catalog_uri}/v1/config?warehouse=<warehouse>` → merged `prefix` (see
+/// [`prefix_from_config`] for the `overrides`-then-`defaults` precedence).
 /// Databricks-style endpoints return a `prefix` that must address the table
-/// instead of the raw warehouse; plain REST catalogs (including
-/// `apache/iceberg-rest-fixture`) typically omit the prefix. When the config
-/// endpoint returns no `overrides.prefix` (or cannot be contacted), the prefix
-/// is EMPTY — not the warehouse — so `build_load_table_url` produces the
-/// standard-REST URL `/v1/namespaces/{ns}/tables/{table}` with no extra segment.
-/// Inserting the warehouse as a path segment would yield a malformed URL
-/// (e.g. `/v1/s3://warehouse//namespaces/…` → HTTP 400).
+/// instead of the raw warehouse; Lakekeeper returns a per-warehouse UUID prefix;
+/// plain REST catalogs (including `apache/iceberg-rest-fixture`) typically omit
+/// the prefix. When the config endpoint returns no `prefix` (or cannot be
+/// contacted), the prefix is EMPTY — not the warehouse — so `build_load_table_url`
+/// produces the standard-REST URL `/v1/namespaces/{ns}/tables/{table}` with no
+/// extra segment. Inserting the warehouse as a path segment would yield a
+/// malformed URL (e.g. `/v1/s3://warehouse//namespaces/…` → HTTP 400).
 ///
 /// The SigV4/Glue path short-circuits immediately: the prefix is derived from
 /// the warehouse via `glue_catalog_prefix` (`catalogs/{warehouse}`, AWS Glue's
@@ -483,13 +511,7 @@ async fn resolve_load_table_prefix(
         catalog_uri.trim_end_matches('/')
     );
     match authed_get_json::<serde_json::Value>(&config_url, auth, false, creds).await {
-        Ok(config) => config
-            .get("overrides")
-            .and_then(|o| o.get("prefix"))
-            .and_then(|p| p.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(String::new),
+        Ok(config) => prefix_from_config(&config),
         Err(_) => String::new(),
     }
 }
@@ -500,7 +522,7 @@ async fn resolve_load_table_prefix(
 /// Auth-mode-agnostic: chooses SigV4 signing, a static/OAuth2-derived bearer
 /// token, or no auth via `resolve_catalog_auth`. The returned `LoadTableResult`
 /// feeds BOTH file planning AND vended-credential extraction, so vending works on
-/// every mode. `iceberg-catalog-rest` 0.9.1's `RestCatalog::load_table` returns
+/// every mode. `iceberg-catalog-rest` 0.10.0's `RestCatalog::load_table` returns
 /// only a `Table` and drops the response `config`/`storage_credentials`, which is
 /// why this self-issued GET is required.
 ///
@@ -560,6 +582,31 @@ pub fn extract_vended_keys(
     extract_s3_keys_from_config(&result.config)
 }
 
+/// Look up a single non-empty config value from a `LoadTableResult`, applying
+/// `extract_vended_keys`' precedence: the longest-matching `storage_credentials`
+/// entry's config (when one matches `location`), else the flat `config` map.
+///
+/// Returns `None` when the key is absent or empty at the selected source. When a
+/// `storage_credentials` entry matches but lacks the key, this returns `None`
+/// rather than falling back to the flat map — the matched entry is authoritative
+/// for the anchored location, mirroring `extract_vended_keys`.
+fn vended_config_value(
+    result: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+    key: &str,
+) -> Option<String> {
+    if let Some(creds) = &result.storage_credentials {
+        let best = creds
+            .iter()
+            .filter(|sc| !sc.prefix.is_empty() && location.starts_with(&sc.prefix))
+            .max_by_key(|sc| sc.prefix.len());
+        if let Some(sc) = best {
+            return sc.config.get(key).filter(|s| !s.is_empty()).cloned();
+        }
+    }
+    result.config.get(key).filter(|s| !s.is_empty()).cloned()
+}
+
 /// Extract the vended `client.region` from a `LoadTableResult`, if present.
 ///
 /// Mirrors `extract_vended_keys`' precedence: prefer the longest-matching
@@ -570,24 +617,36 @@ pub(super) fn extract_vended_region(
     result: &iceberg_catalog_rest::LoadTableResult,
     location: &str,
 ) -> Option<String> {
-    if let Some(creds) = &result.storage_credentials {
-        let best = creds
-            .iter()
-            .filter(|sc| !sc.prefix.is_empty() && location.starts_with(&sc.prefix))
-            .max_by_key(|sc| sc.prefix.len());
-        if let Some(sc) = best {
-            return sc
-                .config
-                .get("client.region")
-                .filter(|s| !s.is_empty())
-                .cloned();
-        }
-    }
-    result
-        .config
-        .get("client.region")
-        .filter(|s| !s.is_empty())
-        .cloned()
+    vended_config_value(result, location, "client.region")
+}
+
+/// Extract the vended `s3.endpoint` from a `LoadTableResult`, if present.
+///
+/// Required for S3-compatible object stores (e.g. MinIO behind Lakekeeper) whose
+/// endpoint is not the AWS default: the vended `loadTable` config carries the
+/// concrete `s3.endpoint`, and a vended CONNECTION carries no static endpoint of
+/// its own. Returns `None` when absent (the AWS-S3 case), so the caller preserves
+/// the static endpoint. Same precedence as `extract_vended_region`.
+pub(super) fn extract_vended_endpoint(
+    result: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Option<String> {
+    vended_config_value(result, location, "s3.endpoint")
+}
+
+/// Extract the vended `s3.path-style-access` flag from a `LoadTableResult`, if
+/// present and parseable as a boolean.
+///
+/// S3-compatible stores (MinIO) require path-style addressing; the vended config
+/// advertises it as `s3.path-style-access`. Returns `None` when absent or
+/// unparseable, so the caller preserves the static `path_style`. Same precedence
+/// as `extract_vended_region`.
+pub(super) fn extract_vended_path_style(
+    result: &iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> Option<bool> {
+    vended_config_value(result, location, "s3.path-style-access")
+        .and_then(|s| s.parse::<bool>().ok())
 }
 
 fn extract_s3_keys_from_config(
@@ -1113,6 +1172,122 @@ mod tests {
             merged.session_token.as_deref(),
             Some("NEW_STS_TOKEN"),
             "new vended session_token must replace old static one"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 6 (add-lakekeeper-e2e) — `/v1/config` prefix location + vended S3
+    // endpoint/path-style extraction. Both surfaced as genuine interop gaps
+    // against a real Lakekeeper 0.13.1 (defaults.prefix; MinIO vended endpoint).
+    // ---------------------------------------------------------------------------
+
+    /// Databricks-style catalogs serve the routing prefix in `overrides` — it wins.
+    #[test]
+    fn prefix_from_config_prefers_overrides() {
+        let config = serde_json::json!({
+            "overrides": {"prefix": "over-prefix"},
+            "defaults": {"prefix": "def-prefix"}
+        });
+        assert_eq!(prefix_from_config(&config), "over-prefix");
+    }
+
+    /// Lakekeeper serves the per-warehouse prefix in `defaults`; with no
+    /// `overrides.prefix` the adapter must fall back to it (the fixed gap).
+    #[test]
+    fn prefix_from_config_falls_back_to_defaults() {
+        let config = serde_json::json!({
+            "overrides": {"uri": "http://localhost:28181/catalog"},
+            "defaults": {"prefix": "530164b8-8697-11f1-939b-239086e9948e", "rest-page-size": "100"}
+        });
+        assert_eq!(
+            prefix_from_config(&config),
+            "530164b8-8697-11f1-939b-239086e9948e",
+            "Lakekeeper's defaults.prefix must be honoured when overrides.prefix is absent"
+        );
+    }
+
+    /// Plain REST catalogs (fixture) omit the prefix entirely → empty.
+    #[test]
+    fn prefix_from_config_empty_when_absent() {
+        assert_eq!(prefix_from_config(&serde_json::json!({})), "");
+        assert_eq!(
+            prefix_from_config(&serde_json::json!({"overrides": {}, "defaults": {}})),
+            ""
+        );
+        // An empty-string prefix in either map is treated as absent.
+        assert_eq!(
+            prefix_from_config(&serde_json::json!({"defaults": {"prefix": ""}})),
+            ""
+        );
+    }
+
+    /// The vended flat config's `s3.endpoint` and `s3.path-style-access` are
+    /// extracted so an S3-compatible store (MinIO behind Lakekeeper) is reachable
+    /// even though the vended CONNECTION carries no static endpoint.
+    #[test]
+    fn extract_vended_endpoint_and_path_style_from_config() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", "VENDED_AK"),
+                ("s3.secret-access-key", "VENDED_SK"),
+                ("s3.endpoint", "http://minio:9000/"),
+                ("s3.path-style-access", "true"),
+            ],
+        );
+        assert_eq!(
+            extract_vended_endpoint(&result, "s3://bucket/db/t/metadata/v1.json").as_deref(),
+            Some("http://minio:9000/")
+        );
+        assert_eq!(
+            extract_vended_path_style(&result, "s3://bucket/db/t/metadata/v1.json"),
+            Some(true)
+        );
+    }
+
+    /// The endpoint is read from the longest-matching `storage_credentials` entry
+    /// (the Lakekeeper shape) with the same precedence as the vended keys/region.
+    #[test]
+    fn extract_vended_endpoint_from_storage_credentials() {
+        let result = make_load_table_result(
+            Some(vec![(
+                "s3://bucket/db",
+                vec![
+                    ("s3.endpoint", "http://minio:9000/"),
+                    ("s3.path-style-access", "true"),
+                ],
+            )]),
+            vec![("s3.endpoint", "http://wrong:1/")],
+        );
+        assert_eq!(
+            extract_vended_endpoint(&result, "s3://bucket/db/t/metadata/v1.json").as_deref(),
+            Some("http://minio:9000/"),
+            "the matching storage_credentials entry's endpoint must win over flat config"
+        );
+        assert_eq!(
+            extract_vended_path_style(&result, "s3://bucket/db/t/metadata/v1.json"),
+            Some(true)
+        );
+    }
+
+    /// AWS S3 omits `s3.endpoint`/`s3.path-style-access`; absence returns `None`
+    /// so the caller preserves the static values (Glue vended path unchanged).
+    #[test]
+    fn extract_vended_endpoint_none_when_absent() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", "VENDED_AK"),
+                ("s3.secret-access-key", "VENDED_SK"),
+            ],
+        );
+        assert_eq!(
+            extract_vended_endpoint(&result, "s3://bucket/db/t/metadata/v1.json"),
+            None
+        );
+        assert_eq!(
+            extract_vended_path_style(&result, "s3://bucket/db/t/metadata/v1.json"),
+            None
         );
     }
 

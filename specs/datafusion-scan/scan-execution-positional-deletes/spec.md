@@ -45,7 +45,7 @@ positional-delete case (tracked as issue #68).
 * See `datafusion-scan/scan-execution` for the base scan flow and the unified-provider plan
   shape, `datafusion-scan/scan-execution-spec-reconstitution` for the delete-carrying wire
   format, `datafusion-scan/scan-execution-file-metadata` for the no-HEAD footer read, and
-  `packaging/e2e-harness-positional-deletes` for the full-stack matrix.
+  `e2e-harness/e2e-harness-positional-deletes` for the full-stack matrix.
 
 ## Scenarios
 

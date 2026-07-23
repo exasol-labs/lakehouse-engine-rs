@@ -436,6 +436,140 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  # ── second viability gate: Lakekeeper (OIDC/Keycloak + MinIO STS) overlay ─
+  # Mirrors the `e2e` job's setup steps; the compose overlay adds Keycloak +
+  # Lakekeeper + its Postgres backend on top of the base stack (reuses base
+  # `minio` and `exasol`). Independent of `e2e` (same upstream `needs`, no
+  # dependency between the two) so they run in parallel; not a `release` gate
+  # — only `e2e` is (see the `release` job's `needs`).
+  e2e-lakekeeper:
+    name: E2E (Lakekeeper)
+    runs-on: ubuntu-latest
+    needs: [build-so, lint, unit-tests, licenses]
+    # This stack's own healthchecks (docker-compose.lakekeeper.yml) already
+    # bound each service's time-to-healthy (interval × retries + start_period);
+    # this is the wall-clock backstop for the whole job, same rationale as
+    # `e2e`'s timeout-minutes — a hang here should surface as a clear CI
+    # failure, not a long silent one. The Lakekeeper stack has one fewer
+    # one-shot fixture job than `e2e` (no Spark fixtures), so 45 min matches
+    # `e2e`'s budget rather than needing more.
+    timeout-minutes: 45
+    env:
+      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      LH_EXASOL_CPUS: "2"
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Download liblakehouse_engine.so
+        uses: actions/download-artifact@v8
+        with:
+          name: lakehouse-engine-so
+          path: target/release/
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
+      - name: Restore cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: workspace-rlib
+          save-if: "false"
+
+      - name: Pull stack images
+        run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
+
+      # Same root cause and fix as the `e2e` job: this suite also spawns
+      # Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
+      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
+      # Four-phase bring-up, same rationale as the `e2e` job's two-phase one:
+      # `docker compose up --wait` doesn't reliably support a one-shot
+      # container in the same wait set as long-running services, so every
+      # one-shot job here (minio-init, minio-lakekeeper-init,
+      # lakekeeper-migrate) is `docker wait`-ed to completion individually
+      # before the long-running services are brought up with `--wait`. By the
+      # time the last phase runs, lakekeeper-migrate has already completed, so
+      # `lakekeeper`'s `service_completed_successfully` dependency on it is
+      # already satisfied — only the still-running services need `--wait`.
+      - name: Start stack (Exasol + MinIO + Keycloak + Lakekeeper)
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+
+          $COMPOSE up -d minio-init
+          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
+          if [ "$INIT_EXIT" != "0" ]; then
+            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
+            $COMPOSE logs minio-init
+            exit 1
+          fi
+
+          $COMPOSE up -d minio-lakekeeper-init
+          STS_INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-lakekeeper-init-1)
+          if [ "$STS_INIT_EXIT" != "0" ]; then
+            echo "::error::minio-lakekeeper-init exited $STS_INIT_EXIT (STS user/policy setup failed)"
+            $COMPOSE logs minio-lakekeeper-init
+            exit 1
+          fi
+
+          $COMPOSE up -d lakekeeper-migrate
+          MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
+          if [ "$MIGRATE_EXIT" != "0" ]; then
+            echo "::error::lakekeeper-migrate exited $MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs lakekeeper-migrate
+            exit 1
+          fi
+
+          $COMPOSE up -d --wait exasol minio keycloak lakekeeper-db lakekeeper
+
+      - name: Run Lakekeeper E2E suite
+        run: make test-e2e-lakekeeper
+
+      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
+      # only shows up in the host kernel ring buffer, not DB-side logs.
+      - name: Dump Lakekeeper stack logs on failure
+        if: failure()
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+          echo "=== container stats / host free ==="
+          $COMPOSE ps || true
+          free -m || true
+          echo "=== HOST kernel ring buffer (sudo) ==="
+          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
+          echo "--- last 40 kernel lines (fallback) ---"
+          sudo dmesg --ctime | tail -40 || true
+          echo "=== keycloak logs ==="
+          $COMPOSE logs keycloak | tail -100 || true
+          echo "=== lakekeeper-migrate logs ==="
+          $COMPOSE logs lakekeeper-migrate | tail -100 || true
+          echo "=== lakekeeper logs ==="
+          $COMPOSE logs lakekeeper | tail -100 || true
+          echo "=== exasql crash logs ==="
+          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
+          echo "=== collecting /exa/logs tree for artifact ==="
+          rm -rf exa-logs-lakekeeper && mkdir -p exa-logs-lakekeeper
+          $COMPOSE cp exasol:/exa/logs exa-logs-lakekeeper/ 2>/dev/null || true
+
+      - name: Upload Lakekeeper Exasol logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: exa-logs-lakekeeper
+          path: exa-logs-lakekeeper/
+          if-no-files-found: ignore
+
+      - name: Stop stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
+
   # ── release: main-push-with-version-bump, or a direct tag push ──────────
   release:
     name: Release
