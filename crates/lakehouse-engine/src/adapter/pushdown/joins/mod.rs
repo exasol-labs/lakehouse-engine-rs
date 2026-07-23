@@ -3,6 +3,7 @@ use crate::scan::spec::{CatalogProps, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use super::credentials::CatalogSession;
 use super::file_resolution::empty_result_sql;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
@@ -91,7 +92,7 @@ pub(super) async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    catalog_uri: &str,
+    session: &CatalogSession,
     storage: &StorageProps,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
@@ -116,7 +117,7 @@ pub(super) async fn plan_join(
         let side = resolve_one_join_side(
             &leaf.table_name,
             &leaf.iceberg_ident,
-            catalog_uri,
+            session,
             storage,
             catalog,
             creds,

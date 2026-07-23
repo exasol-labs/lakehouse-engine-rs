@@ -27,10 +27,12 @@ use support::{
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
 mod credentials;
+use credentials::CatalogSession;
 pub use credentials::{extract_vended_keys, merge_vended_into_storage};
 
 mod namespace;
 pub use namespace::list_namespace_tables;
+use namespace::parse_table_ident;
 
 mod file_resolution;
 use file_resolution::{empty_result_sql, encode_initial_default, relativize_shards_to_root};
@@ -139,11 +141,21 @@ pub async fn handle_pushdown(
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
         JoinShape::Join(join) => {
+            // Parse-before-config (intent-fidelity): validate every involved-table
+            // identifier at the pushdown seam BEFORE `CatalogSession::resolve` issues
+            // the `/v1/config` lookup, so a malformed identifier issues zero catalog
+            // HTTP and returns the same parse error. Building the session here (once)
+            // and threading `&session` into every leg is what makes a per-leg rebuild
+            // structurally inexpressible.
+            for leaf in &join.tables {
+                parse_table_ident(&leaf.iceberg_ident)?;
+            }
+            let session = CatalogSession::resolve(catalog_uri, &catalog.warehouse, creds).await?;
             return plan_join(
                 request,
                 &pushdown_req,
                 &join,
-                catalog_uri,
+                &session,
                 storage,
                 catalog,
                 creds,
