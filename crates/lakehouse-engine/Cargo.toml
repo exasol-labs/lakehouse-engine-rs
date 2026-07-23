@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.28.3"
+version = "0.29.1"
 edition = "2024"
 license.workspace = true
 
@@ -80,7 +80,7 @@ reqwest = { version = "0.12" }
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # Test fixtures (tests/common/seed.rs, tests/tpch_loader.rs) build Arrow
 # RecordBatch + parquet WriterProperties directly with the workspace arrow/parquet
-# 58 and feed them into iceberg 0.10.0-rc.2's writer stack, which also links
+# 58 and feed them into iceberg 0.10.0's writer stack, which also links
 # arrow 58 — a single arrow-58 tree end to end, no per-tree aliases or IPC bridge.
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }

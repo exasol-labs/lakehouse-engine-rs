@@ -18,6 +18,9 @@ scenarios.
 * See `packaging/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately
   place an aggregate before, between, or after the group keys in the `selectList` — the
   arrangement every case in this spec avoids.
+* The provisioning helpers (SLC install, `.so` upload, script and Virtual Schema creation)
+  are defined once in a shared `common/e2e_harness` module and reused by every E2E binary;
+  per-binary variation is passed as explicit parameters.
 
 ## Scenarios
 
@@ -61,3 +64,12 @@ scenarios.
 * *THEN* the returned rows SHALL exactly match the seeded source rows satisfying the predicate, and SHALL be identical to the same query run with Iceberg pruning unable to apply (predicate forced untranslatable)
 * *AND* where the harness can observe it (Iceberg `plan_files` output during file resolution), the resolved file list SHALL contain fewer files than the unpruned snapshot file count
 * *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+
+### Scenario: Every E2E binary provisions the scan path from one shared harness definition
+
+* *GIVEN* the `exasol-e2e` test binaries under `crates/lakehouse-engine/tests`, each with its own `OnceLock`-guarded setup
+* *AND* a single shared `common/e2e_harness` module defining the SLC install, the `.so` upload, the script creation, and the Virtual Schema creation
+* *WHEN* any binary's setup provisions the lakehouse VS scan path
+* *THEN* the binary SHALL install `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and the adapter script from that shared definition, so the script DDL is byte-identical across every binary
+* *AND* the per-binary Virtual Schema properties that vary (VS name, Iceberg namespace, catalog CONNECTION name, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`) SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic
+* *AND* an end-to-end query through any binary's Virtual Schema SHALL return results identical to the single-node DataFusion equivalent, and the affected tests MUST fail (not skip) when the Exasol Docker container or MinIO is unavailable
