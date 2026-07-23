@@ -23,18 +23,8 @@
 #![cfg(feature = "cloud-e2e")]
 
 mod common;
+use common::exasol_ws::ExaConn;
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
-
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use native_tls::TlsConnector;
-use rand::rngs::OsRng;
-use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::pkcs8::DecodePublicKey;
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
-use serde_json::{Value, json};
-use std::net::TcpStream;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{Message, WebSocket, client_tls_with_config};
 
 // ---------------------------------------------------------------------------
 // Environment variable names
@@ -308,179 +298,6 @@ impl CatalogAuthEnv {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal WebSocket client for cloud tests (self-contained, no exasol-e2e dep)
-// ---------------------------------------------------------------------------
-
-struct CloudExaConn {
-    ws: WebSocket<MaybeTlsStream<TcpStream>>,
-}
-
-impl CloudExaConn {
-    fn connect(host: &str, port: u16, user: &str, password: &str) -> Self {
-        let url = format!("wss://{host}:{port}");
-        let tls = TlsConnector::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
-            .build()
-            .expect("build TLS connector");
-        let tcp = TcpStream::connect(format!("{host}:{port}"))
-            .unwrap_or_else(|e| panic!("TCP connect to Exasol at {host}:{port}: {e}"));
-        let connector = tungstenite::Connector::NativeTls(tls);
-        let (mut ws, _) = client_tls_with_config(url.as_str(), tcp, None, Some(connector))
-            .expect("WebSocket TLS handshake with Exasol");
-
-        ws.send(Message::Text(
-            r#"{"command":"login","protocolVersion":3}"#.to_string().into(),
-        ))
-        .expect("send login initiation");
-        let resp = Self::read_json(&mut ws);
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("ok"),
-            "Exasol login initiation failed: {resp}"
-        );
-        let pem = resp["responseData"]["publicKeyPem"]
-            .as_str()
-            .expect("publicKeyPem in login response");
-
-        let enc_password = encrypt_password(password, pem);
-        let creds = json!({
-            "command": "login",
-            "protocolVersion": 3,
-            "username": user,
-            "password": enc_password,
-            "useCompression": false,
-            "clientName": "lakehouse-engine-cloud-test",
-            "driverName": "lakehouse-engine-cloud-test",
-            "clientOs": "Linux",
-            "clientOsUsername": "ci",
-            "clientRuntime": "Rust"
-        });
-        ws.send(Message::Text(creds.to_string().into()))
-            .expect("send credentials");
-        let resp = Self::read_json(&mut ws);
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("ok"),
-            "Exasol authentication failed"
-        );
-        CloudExaConn { ws }
-    }
-
-    fn execute(&mut self, sql: &str) -> Value {
-        let cmd = json!({
-            "command": "execute",
-            "sqlText": sql,
-            "attributes": {"resultSetMaxRows": 10000}
-        });
-        self.ws
-            .send(Message::Text(cmd.to_string().into()))
-            .expect("send execute");
-        let resp = Self::read_json(&mut self.ws);
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("ok"),
-            "Exasol execute failed for SQL — check Exasol error"
-        );
-        resp
-    }
-
-    fn try_execute(&mut self, sql: &str) -> Value {
-        let cmd = json!({
-            "command": "execute",
-            "sqlText": sql,
-            "attributes": {"resultSetMaxRows": 10000}
-        });
-        self.ws
-            .send(Message::Text(cmd.to_string().into()))
-            .expect("send execute");
-        Self::read_json(&mut self.ws)
-    }
-
-    fn query_columns(&mut self, sql: &str) -> Vec<Vec<Value>> {
-        let resp = self.execute(sql);
-        let result_set = &resp["responseData"]["results"][0]["resultSet"];
-        self.fetch_result_columns(result_set)
-    }
-
-    fn fetch_result_columns(&mut self, result_set: &Value) -> Vec<Vec<Value>> {
-        if let Some(data) = result_set["data"].as_array() {
-            return data
-                .iter()
-                .map(|col| col.as_array().cloned().unwrap_or_default())
-                .collect();
-        }
-        let handle = match result_set["resultSetHandle"].as_u64() {
-            Some(h) => h,
-            None => return vec![],
-        };
-        let num_rows = result_set["numRows"].as_u64().unwrap_or(0);
-        if num_rows == 0 {
-            let close = json!({"command":"closeResultSet","resultSetHandles":[handle]});
-            self.ws.send(Message::Text(close.to_string().into())).ok();
-            let _ = Self::read_json(&mut self.ws);
-            return vec![];
-        }
-        let fetch = json!({
-            "command": "fetch",
-            "resultSetHandle": handle,
-            "startPosition": 0,
-            "numBytes": 67108864
-        });
-        self.ws
-            .send(Message::Text(fetch.to_string().into()))
-            .expect("send fetch");
-        let fetch_resp = Self::read_json(&mut self.ws);
-        let close = json!({"command":"closeResultSet","resultSetHandles":[handle]});
-        self.ws.send(Message::Text(close.to_string().into())).ok();
-        let _ = Self::read_json(&mut self.ws);
-        fetch_resp["data"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|col| col.as_array().cloned().unwrap_or_default())
-            .collect()
-    }
-
-    fn read_json(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Value {
-        loop {
-            let msg = ws.read().expect("read WebSocket message from Exasol");
-            match msg {
-                Message::Text(text) => {
-                    return serde_json::from_str(text.as_str())
-                        .expect("parse Exasol response as JSON");
-                }
-                Message::Ping(data) => {
-                    ws.send(Message::Pong(data)).expect("pong Exasol");
-                }
-                Message::Pong(_) | Message::Frame(_) => {}
-                Message::Binary(_) => panic!("unexpected binary WebSocket message from Exasol"),
-                Message::Close(_) => panic!("Exasol WebSocket closed unexpectedly"),
-            }
-        }
-    }
-}
-
-impl Drop for CloudExaConn {
-    fn drop(&mut self) {
-        let _ = self.ws.close(None);
-    }
-}
-
-fn encrypt_password(password: &str, pem_key: &str) -> String {
-    let key = if pem_key.contains("BEGIN RSA PUBLIC KEY") {
-        RsaPublicKey::from_pkcs1_pem(pem_key).expect("parse PKCS#1 RSA key from Exasol")
-    } else {
-        RsaPublicKey::from_public_key_pem(pem_key).expect("parse PKCS#8 RSA key from Exasol")
-    };
-    let ciphertext = key
-        .encrypt(&mut OsRng, Pkcs1v15Encrypt, password.as_bytes())
-        .expect("RSA encrypt Exasol password");
-    B64.encode(ciphertext)
-}
-
-// ---------------------------------------------------------------------------
 // Schema + VS setup helpers
 // ---------------------------------------------------------------------------
 
@@ -500,7 +317,7 @@ fn glue_namespace(glue_table: &str) -> &str {
     glue_table.rsplit_once('.').map_or(glue_table, |(ns, _)| ns)
 }
 
-fn setup_cloud_vs(conn: &mut CloudExaConn, env: &CloudEnv, conn_name: &str, vs_name: &str) {
+fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, conn_name: &str, vs_name: &str) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
 
     let password = env.catalog_connection_password();
@@ -517,7 +334,7 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
     ));
 }
 
-fn setup_cloud_vs_vended(conn: &mut CloudExaConn, env: &CloudEnv) {
+fn setup_cloud_vs_vended(conn: &mut ExaConn, env: &CloudEnv) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
 
     let password = env.catalog_connection_password_vended();
@@ -600,7 +417,7 @@ fn cloud_smoke_projection_filter_query() {
         }
     };
 
-    let mut conn = CloudExaConn::connect(
+    let mut conn = ExaConn::connect_redacting(
         &env.exasol_host,
         env.exasol_port,
         &env.exasol_user,
@@ -660,7 +477,7 @@ fn cloud_perf_grouped_aggregate_smoke() {
         }
     };
 
-    let mut conn = CloudExaConn::connect(
+    let mut conn = ExaConn::connect_redacting(
         &env.exasol_host,
         env.exasol_port,
         &env.exasol_user,
@@ -742,7 +559,7 @@ fn cloud_scan_reads_with_vended_credentials() {
         }
     };
 
-    let mut conn = CloudExaConn::connect(
+    let mut conn = ExaConn::connect_redacting(
         &env.exasol_host,
         env.exasol_port,
         &env.exasol_user,
@@ -811,7 +628,7 @@ fn catalog_token_oauth_auth_resolves_files_e2e() {
         }
     };
 
-    let mut conn = CloudExaConn::connect(
+    let mut conn = ExaConn::connect_redacting(
         &env.exasol_host,
         env.exasol_port,
         &env.exasol_user,
@@ -873,4 +690,101 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
 
     // Token and client_secret values must not appear in any printed output above.
     // (Auth credentials are never embedded in any variable printed above.)
+}
+
+// ---------------------------------------------------------------------------
+// Redaction negative test
+// ---------------------------------------------------------------------------
+
+/// A failing, credential-bearing DDL executed through a redacting `ExaConn` must
+/// not surface the SQL text or any credential value in the `execute()` failure.
+///
+/// Skips (like the other cloud tests) when the required env vars are absent.
+/// Mirrors the no-leak assertion style in `e2e_refresh_test.rs`.
+#[test]
+fn cloud_redacting_conn_omits_credentials_on_failure() {
+    // Obviously-fake sentinels — never real credentials, so they are safe to
+    // surface in a failing-assertion diagnostic below.
+    const SENTINEL_ACCESS_KEY: &str = "AKIA_DUMMY_REDACTION_SENTINEL_KEY";
+    const SENTINEL_SECRET_KEY: &str = "DUMMY_REDACTION_SENTINEL_SECRET_VALUE";
+
+    let env = match CloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "SKIPPED: cloud_redacting_conn_omits_credentials_on_failure — env vars absent"
+            );
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    // A realistic credential-bearing CONNECTION DDL carrying the sentinels in its
+    // JSON password, plus an invalid trailing token so Exasol rejects it at parse
+    // time — driving the execute() DDL-failure path that redaction governs.
+    let sentinel_password = CatalogConnectionPassword {
+        warehouse: "s3://redaction-probe/".to_string(),
+        endpoint: String::new(),
+        region: "us-east-1".to_string(),
+        access_key: SENTINEL_ACCESS_KEY.to_string(),
+        secret_key: SENTINEL_SECRET_KEY.to_string(),
+        session_token: None,
+        path_style: false,
+        use_sigv4: true,
+        use_vended_credentials: false,
+    };
+    let base_sql = build_create_connection_sql(
+        "LH_REDACTION_PROBE",
+        "https://redaction-probe.invalid",
+        &sentinel_password,
+    );
+    let failing_sql = format!("{base_sql} THIS_TRAILING_TOKEN_MAKES_THE_STATEMENT_INVALID");
+
+    // Deliberately trigger the execute() failure panic and capture it. We do NOT
+    // touch the global panic hook: it is process-wide and Rust runs this binary's
+    // tests in parallel, so silencing it could swallow panic output from other
+    // concurrently running tests. The redacting `ExaConn` already omits the SQL
+    // and response body from this message, so letting the hook print it is safe.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        conn.execute(&failing_sql);
+    }));
+
+    let payload = match result {
+        Ok(_) => panic!(
+            "expected execute() to fail on the malformed credential-bearing DDL, but it succeeded"
+        ),
+        Err(p) => p,
+    };
+    let panic_msg: String = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::new()
+    };
+
+    // A non-empty string payload proves the failure message was actually
+    // captured, so the no-leak assertions below are not vacuously satisfied.
+    assert!(
+        !panic_msg.is_empty(),
+        "expected a string panic payload from the failed redacting execute()"
+    );
+    assert!(
+        !panic_msg.contains(failing_sql.as_str()),
+        "redacting execute() failure must not echo the SQL text: {panic_msg}"
+    );
+    assert!(
+        !panic_msg.contains(SENTINEL_ACCESS_KEY) && !panic_msg.contains(SENTINEL_SECRET_KEY),
+        "redacting execute() failure must not leak sentinel credential values: {panic_msg}"
+    );
+
+    println!(
+        "cloud_redacting_conn_omits_credentials_on_failure: redaction verified (no SQL, no credentials in failure output)"
+    );
 }
