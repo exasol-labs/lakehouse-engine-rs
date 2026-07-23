@@ -661,7 +661,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // short-circuits to a from-less scalar call for a single shard); the outer wrapper
     // below re-groups the emitted per-shard partials on the user's group keys.
     let mut common_template = spec_template.clone();
-    common_template.limit = None;
+    common_template.common.limit = None;
     let fan_out = build_fan_out_inner(
         &common_template,
         shards,
@@ -1118,6 +1118,7 @@ mod tests {
     };
     use super::super::test_support::*;
     use super::*;
+    use crate::scan::spec::CommonScanSpec;
     use vs_expression::render_expression_safe;
 
     /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
@@ -1418,26 +1419,13 @@ mod tests {
     /// Build a minimal grouped `ScanSpec` for the merge-SQL builder tests.
     fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
         ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(result.plans.clone()),
+                group_keys: Some(result.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         }
     }
 
@@ -1612,26 +1600,13 @@ mod tests {
             group_key_exasol_types(&req, &result.group_keys, &result.select_items);
         let sql = build_grouped_aggregate_scan_sql(
             &ScanSpec {
-                table_root: String::new(),
+                common: CommonScanSpec {
+                    aggregates: Some(result.plans.clone()),
+                    group_keys: Some(result.group_keys.clone()),
+                    storage: sample_storage(),
+                    ..Default::default()
+                },
                 files: vec![],
-                projection: vec![],
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: Some(result.plans.clone()),
-                group_keys: Some(result.group_keys.clone()),
-                distinct: false,
-                emit_exa_types: Vec::new(),
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
-                storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
             },
             &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
             &result.group_keys,
@@ -1892,26 +1867,13 @@ mod tests {
         let group_key_types = vec!["VARCHAR(2000000)".to_string(); 2];
         let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(result.plans.clone()),
+                group_keys: Some(result.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(result.plans.clone()),
-            group_keys: Some(result.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
@@ -1987,26 +1949,13 @@ mod tests {
             ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
         ];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(agg_plans.clone()),
+                group_keys: Some(group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(agg_plans.clone()),
-            group_keys: Some(group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let files_with_sizes: Vec<FileEntry> =
             files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
@@ -2167,30 +2116,18 @@ mod tests {
         let g = shard_count(1, 1, files.len());
         let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec!["\"REGION\"".into()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
-            order_by: Vec::new(),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Count,
-                column: None,
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec!["\"REGION\"".into()]),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
         let sql = build_grouped_aggregate_scan_sql(
@@ -2337,26 +2274,13 @@ mod tests {
             ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
         ];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(agg_plans.clone()),
+                group_keys: Some(group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(agg_plans.clone()),
-            group_keys: Some(group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         build_grouped_aggregate_scan_sql(
@@ -2610,26 +2534,13 @@ mod tests {
             .expect("must detect the grouped scalar-over-aggregate pushdown");
         let group_key_types = group_key_exasol_types(req, &d.group_keys, &d.select_items);
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(d.plans.clone()),
+                group_keys: Some(d.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(d.plans.clone()),
-            group_keys: Some(d.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         build_grouped_aggregate_scan_sql(
             &spec_template,
@@ -2868,26 +2779,13 @@ mod tests {
         // the whole table, so the wrapper shape is identical to the old full-row scan.
         let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
         let fan_out_spec = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                projection: proj_cols,
+                emit_exa_types: proj_types,
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: proj_cols,
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: proj_types,
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let sql = build_qualified_single_table_fallback_sql(
             &request,
@@ -2984,26 +2882,13 @@ mod tests {
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(detection.plans.clone()),
+                group_keys: Some(detection.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
@@ -3078,26 +2963,13 @@ mod tests {
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(detection.plans.clone()),
+                group_keys: Some(detection.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
         let sql = build_grouped_aggregate_scan_sql(
@@ -3168,26 +3040,13 @@ mod tests {
         let col_types: Vec<(String, String)> =
             vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                aggregates: Some(detection.plans.clone()),
+                group_keys: Some(detection.group_keys.clone()),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(detection.plans.clone()),
-            group_keys: Some(detection.group_keys.clone()),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         // Multiple shards so the inner scan is a real `GROUP BY shard_key` fan-out,
         // not the single-shard direct-call shortcut.
@@ -3614,30 +3473,18 @@ mod tests {
         // Build a grouped aggregate SQL with a HAVING predicate.
         let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
         let spec_template = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                projection: vec!["REGION".into(), "AMOUNT".into()],
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Sum,
+                    column: Some("AMOUNT".into()),
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec![r#""REGION""#.to_string()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
             files: vec![],
-            projection: vec!["REGION".into(), "AMOUNT".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: Some(vec![AggregatePlan {
-                kind: AggKind::Sum,
-                column: Some("AMOUNT".into()),
-                arg_expr: None,
-            }]),
-            group_keys: Some(vec![r#""REGION""#.to_string()]),
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let shards = vec![vec![("s3://wh/f.parquet".to_string(), 1u64)]];
         let col_types = vec![
