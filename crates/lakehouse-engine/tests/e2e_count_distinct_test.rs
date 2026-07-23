@@ -24,6 +24,7 @@
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
+use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     DISTINCT_CATEGORY_COL, DISTINCT_CATEGORY_COUNT, DISTINCT_COMMENT_COL,
@@ -37,34 +38,16 @@ use common::seed::{
     typed_varchar_distinct, typed_varchar_upper_distinct,
 };
 use common::stack::{
-    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
-    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, upload_to_bucketfs, wait_for_exasol, wait_for_iceberg_catalog,
-    wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
 };
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Constants (mirror e2e_scan_test.rs / e2e_capability_test.rs — same stack, same VS)
 // ---------------------------------------------------------------------------
 
-const SYS_PASSWORD: &str = "exasol";
-const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
-const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
-const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
-/// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
-const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
-const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
-const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
-const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-const SLC_VERSION: &str = "0.21.0";
-const LANG_ALIAS: &str = "RUST";
-/// Name of the Exasol CONNECTION carrying catalog + storage credentials.
-const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
 // ---------------------------------------------------------------------------
 // One-time setup (idempotent; mirrors e2e_scan_test.rs / e2e_capability_test.rs)
@@ -100,122 +83,12 @@ fn setup_e2e() {
         });
 
         install_slc();
-
-        let so_path = lakehouse_engine_so_path();
-        upload_to_bucketfs(&so_path, SO_BUCKETFS_PUT_PATH);
+        upload_so();
 
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn);
+        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
     });
-}
-
-fn install_slc() {
-    let slc_url = format!(
-        "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
-    );
-    let tarball_bytes = reqwest::blocking::get(&slc_url)
-        .unwrap_or_else(|e| panic!("download SLC {SLC_VERSION} from {slc_url}: {e}"))
-        .bytes()
-        .unwrap_or_else(|e| panic!("read SLC tarball bytes: {e}"));
-    assert!(
-        !tarball_bytes.is_empty(),
-        "SLC tarball is empty — download failed"
-    );
-
-    let password = bucketfs_write_password();
-    let bfs_url = format!(
-        "https://{}:{}{}",
-        exasol_host(),
-        bucketfs_port(),
-        SLC_BUCKETFS_PUT_PATH
-    );
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("BucketFS client");
-    let resp = client
-        .put(&bfs_url)
-        .basic_auth("w", Some(&password))
-        .body(tarball_bytes.to_vec())
-        .send()
-        .unwrap_or_else(|e| panic!("BucketFS PUT SLC to {bfs_url}: {e}"));
-    assert!(
-        resp.status().is_success(),
-        "BucketFS PUT SLC returned {} — expected 2xx",
-        resp.status()
-    );
-
-    let mut conn = exa_conn();
-    let rust_def = format!(
-        "{LANG_ALIAS}=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"
-    );
-    let current = conn.query_columns(
-        "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES'",
-    );
-    let current_val = current
-        .first()
-        .and_then(|col| col.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let preserved = current_val
-        .split_whitespace()
-        .filter(|s| !s.starts_with(&format!("{LANG_ALIAS}=")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let new_val = format!("{preserved} {rust_def}");
-    conn.execute(&format!(
-        "ALTER SYSTEM SET SCRIPT_LANGUAGES = '{}'",
-        new_val.trim()
-    ));
-}
-
-fn exa_conn() -> ExaConn {
-    ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
-}
-
-fn create_schema_and_scripts(conn: &mut ExaConn) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
-EMITS (...) AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
-    // File distributor — LUA SET SCRIPT, pure passthrough.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
-EMITS (files VARCHAR(2000000)) AS
-function run(ctx)
-    repeat
-        ctx.emit(ctx.files)
-    until not ctx.next()
-end
-/"#
-    ));
-}
-
-fn create_virtual_schema(conn: &mut ExaConn) {
-    let password = local_stack_connection_password();
-    let catalog_uri = iceberg_catalog_url_internal();
-    let create_conn_sql = build_create_connection_sql(CATALOG_CONN_NAME, &catalog_uri, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
-  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
-  ALLOW_HTTP          = 'true'"#
-    ));
 }
 
 fn distinct_table() -> String {
@@ -233,12 +106,6 @@ fn typed_table() -> String {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-fn parse_int(v: &serde_json::Value) -> i64 {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
-}
 
 /// Runs `EXPLAIN VIRTUAL` for a Case 2/3 `COUNT(DISTINCT)` query (more than one
 /// distinct, or a distinct mixed with an ordinary aggregate) and asserts the pushed
