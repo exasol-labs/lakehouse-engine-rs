@@ -27,6 +27,7 @@ use exasol_udf_sdk::error::UdfError;
 
 pub mod adapter;
 pub mod scan;
+mod scan_surface_probe;
 pub mod types;
 
 // ---------------------------------------------------------------------------
