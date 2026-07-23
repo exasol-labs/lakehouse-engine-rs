@@ -4,7 +4,8 @@
 
 # Parameters & Telemetry
 
-Every knob, and how to see what a scan is doing. For *which* values to set, see
+Every knob, and how to see what a scan is doing. Set these properties on the
+`CREATE VIRTUAL SCHEMA` statement from [Install](install.md). For *which* values to set, see
 [Performance](performance.md); for what the values mean architecturally, see
 [Architecture](architecture.md).
 

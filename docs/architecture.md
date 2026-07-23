@@ -32,23 +32,25 @@ User Query
   → Result
 ```
 
-Metadata resolves **once per query in the VS layer**, never per node. Each UDF invocation
-gets an explicit file list (a projection- + predicate-carrying scan spec); a node never
-discovers files itself and never scans another node's files.
+Metadata resolves **once per query in the VS layer**, never per node: the VS reads the Iceberg
+snapshot and file list from the catalog named by the Virtual Schema's CONNECTION (see
+[Catalogs](catalogs.md)). Each UDF invocation gets an explicit file list (a projection- and
+predicate-carrying scan spec); a node never discovers files itself and never scans another
+node's files.
 
 ## Sharding rules
 
 ```
 G = CLUSTER_NODES × PARALLELISM_FACTOR
-G = min(G, 300)              # ≤300 ⇒ Exasol distributes round-robin (balanced)
-G = clamp(G, 1, file_count)  # >300 ⇒ hash-partition (unbalanced) — so cap at 300
+G = min(G, 300)              # cap at 300: ≤300 ⇒ round-robin (balanced), >300 ⇒ hash-partition (unbalanced)
+G = clamp(G, 1, file_count)  # at least 1, never more shards than files
 ```
 
 - **Oversubscribe on purpose** — `G` > a node's cores is intended. Extra shards queue on the
   node's instance pool and run as cores free up, smoothing stragglers. Files are assigned by
   greedy descending-size byte-balance (not file count), so shards carry ~equal bytes.
-- **Peak memory is bounded by cores, not `G`.** Parallel instances per node = a fixed VM pool
-  sized to `NR_OF_CORES`; oversubscription improves balancing, not peak memory. The engine
+- **Peak memory is bounded by cores, not `G`.** Parallel instances per node come from a fixed VM
+  pool sized to `NR_OF_CORES`; oversubscription improves balancing, not peak memory. The engine
   also stalls new VMs at **80 %** of the per-instance limit, so the scan UDF sizes its
   DataFusion pool to a fraction (default 0.6) of that limit.
 
@@ -94,5 +96,6 @@ Aggregates decompose into partial/merge so each node ships one partial row per g
 rows — minimizing transfer. Single-group `COUNT(DISTINCT)` decomposes too: each shard emits its
 local distinct set (JSON-encoded), merged by a dedicated scalar UDF. Grouped `COUNT(DISTINCT)`,
 `MEDIAN`, and `LISTAGG` remain non-decomposable and run in Exasol on returned rows. Joins aren't
-pushed: Exasol scans each table independently, then
-joins the result sets. Full list: [Capabilities](capabilities.md).
+pushed: Exasol scans each table independently, then joins the result sets. Full list:
+[Capabilities](capabilities.md); the [benchmark query set](benchmark.md) exercises each of these
+pushdown paths end to end.
