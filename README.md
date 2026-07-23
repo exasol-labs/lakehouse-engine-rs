@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/logo.svg" width="96" height="96" alt="lakehouse-engine-rs logo">
+<img src="docs/assets/logo.svg" width="128" height="128" alt="lakehouse-engine-rs logo">
 
 # lakehouse-engine-rs
 
