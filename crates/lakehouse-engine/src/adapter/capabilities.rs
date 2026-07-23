@@ -362,6 +362,44 @@ mod tests {
             );
         }
 
+        // --- bitwise operator functions declined: see issue #108 ---
+        // Exasol's bit functions operate on the unsigned 64-bit domain
+        // (0..=18446744073709551615, result DECIMAL(20,0)); Iceberg has no unsigned
+        // integer primitive. None of the eleven has a faithful DataFusion 54.0.0
+        // translation, so all stay unadvertised and fall back to row scanning.
+        //
+        // Class 1 — operator-backed but signed/unsigned-divergent (same limitation as
+        // FN_DIV): DataFusion's &/|/#/<</>> act on signed operands, so a bit-63-set
+        // result is negative under Int64 and carries that negative value into
+        // DECIMAL(20,0); >> is arithmetic (sign-extend) vs Exasol's logical (zero-fill).
+        for name in &[
+            "FN_BIT_AND",
+            "FN_BIT_OR",
+            "FN_BIT_XOR",
+            "FN_BIT_LSHIFT",
+            "FN_BIT_RSHIFT",
+        ] {
+            assert!(
+                !cap_strs.contains(name),
+                "{name} must NOT be advertised (issue #108, unsigned-domain divergence): {cap_strs:?}"
+            );
+        }
+        // Class 2 — no DataFusion 54.0.0 builtin exists (unary ~ is not_impl_err; no
+        // rotate / bit-test / bit-set / bits-to-number scalar function is registered).
+        for name in &[
+            "FN_BIT_NOT",
+            "FN_BIT_LROTATE",
+            "FN_BIT_RROTATE",
+            "FN_BIT_CHECK",
+            "FN_BIT_SET",
+            "FN_BIT_TO_NUM",
+        ] {
+            assert!(
+                !cap_strs.contains(name),
+                "{name} must NOT be advertised (issue #108, no DataFusion builtin): {cap_strs:?}"
+            );
+        }
+
         // --- task 1.2: arithmetic binary-operator functions ---
         for name in &["FN_ADD", "FN_SUB", "FN_MULT", "FN_FLOAT_DIV"] {
             assert!(
