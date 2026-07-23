@@ -10,6 +10,8 @@
 #![allow(dead_code)]
 
 #[cfg(feature = "exasol-e2e")]
+pub mod e2e_harness;
+#[cfg(any(feature = "exasol-e2e", feature = "cloud-e2e"))]
 pub mod exasol_ws;
 #[cfg(feature = "exasol-e2e")]
 pub mod int96_fixtures;

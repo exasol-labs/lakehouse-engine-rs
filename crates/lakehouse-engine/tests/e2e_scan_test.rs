@@ -19,6 +19,7 @@
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
+use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
@@ -29,45 +30,19 @@ use common::seed::{
     seed_events, seed_renamed_column,
 };
 use common::stack::{
-    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
-    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, upload_to_bucketfs, wait_for_exasol, wait_for_iceberg_catalog,
+    build_create_connection_sql, iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog,
     wait_for_minio,
 };
 
-use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
-use lakehouse_engine::scan::spec::{CatalogProps, StorageProps};
 
 use std::sync::OnceLock;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const SYS_PASSWORD: &str = "exasol";
-const SCHEMA_NAME: &str = "LHVS";
 const VS_NAME: &str = "MY_LAKEHOUSE";
-const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
-const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
-/// fan-out. Not a Rust entry point — created by plain DDL, no .so involved.
-const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
-/// BucketFS path for the .so (as PUT target).
-const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
-/// BucketFS path for the .so as referenced in %udf_object (without leading /).
-const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
-/// BucketFS path for the SLC tarball.
-const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-/// SLC version we link against.
-const SLC_VERSION: &str = "0.21.0";
-/// Name of the Exasol CONNECTION carrying catalog + storage credentials.
-const CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
-/// Language alias for our SLC. This Exasol is dedicated to lakehouse-engine
-/// (the sibling stack is stopped), so we register the canonical RUST
-/// alias cleanly rather than coexisting with a foreign RUST= entry.
-const LANG_ALIAS: &str = "RUST";
 
 // ---------------------------------------------------------------------------
 // One-time setup
@@ -98,161 +73,13 @@ fn setup_e2e() {
         install_slc();
 
         // 4. Upload the .so to BucketFS.
-        let so_path = lakehouse_engine_so_path();
-        upload_to_bucketfs(&so_path, SO_BUCKETFS_PUT_PATH);
+        upload_so();
 
         // 5. Create Exasol schema + scripts + VS.
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
-        create_virtual_schema(&mut conn);
+        create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
     });
-}
-
-/// Install SLC 0.21.0 for the LHRUST language alias.
-fn install_slc() {
-    // Download the SLC tarball.
-    let slc_url = format!(
-        "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
-    );
-    let tarball_bytes = reqwest::blocking::get(&slc_url)
-        .unwrap_or_else(|e| panic!("download SLC {SLC_VERSION} from {slc_url}: {e}"))
-        .bytes()
-        .unwrap_or_else(|e| panic!("read SLC tarball bytes: {e}"));
-    assert!(
-        !tarball_bytes.is_empty(),
-        "SLC tarball is empty — download failed"
-    );
-
-    // Upload to BucketFS.
-    let password = bucketfs_write_password();
-    let bfs_url = format!(
-        "https://{}:{}{}",
-        exasol_host(),
-        bucketfs_port(),
-        SLC_BUCKETFS_PUT_PATH
-    );
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(120))
-        .build()
-        .expect("BucketFS client");
-    let resp = client
-        .put(&bfs_url)
-        .basic_auth("w", Some(&password))
-        .body(tarball_bytes.to_vec())
-        .send()
-        .unwrap_or_else(|e| panic!("BucketFS PUT SLC to {bfs_url}: {e}"));
-    assert!(
-        resp.status().is_success(),
-        "BucketFS PUT SLC returned {} — expected 2xx",
-        resp.status()
-    );
-
-    // Register the RUST language alias, replacing any existing RUST= entry so
-    // the alias points at our freshly-uploaded 0.21.0 SLC. This Exasol is
-    // dedicated to lakehouse-engine, so a clean replacement is correct.
-    let mut conn = exa_conn();
-    let rust_def = format!(
-        "{LANG_ALIAS}=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"
-    );
-
-    let current = conn.query_columns(
-        "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES'",
-    );
-    let current_val = current
-        .first()
-        .and_then(|col| col.first())
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    // Drop any pre-existing alias of the same name, then append our definition.
-    let preserved = current_val
-        .split_whitespace()
-        .filter(|s| !s.starts_with(&format!("{LANG_ALIAS}=")))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let new_val = format!("{preserved} {rust_def}");
-
-    conn.execute(&format!(
-        "ALTER SYSTEM SET SCRIPT_LANGUAGES = '{}'",
-        new_val.trim()
-    ));
-}
-
-/// Open an Exasol connection using sys credentials.
-fn exa_conn() -> ExaConn {
-    ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
-}
-
-/// Create the dedicated schema, adapter script, and scan script.
-fn create_schema_and_scripts(conn: &mut ExaConn) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
-
-    // Adapter script — RUST ADAPTER SCRIPT.
-    // The SLC dispatches to the entry point whose name matches the SQL script
-    // name (__exa_udf_entry_LAKEHOUSE_ADAPTER); there is no %main directive
-    // for RUST scripts. %udf_object references the uploaded .so.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} ADAPTER SCRIPT {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
-
-    // Scan script — RUST SCALAR SCRIPT (streams rows node-locally, no
-    // materializing SET/GROUP BY on the scan itself).
-    // Input: two VARCHAR columns — arg0 is the common ScanSpec blob (shared
-    // across all shards, serialized once via `ScanSpec::to_common_json()`),
-    // arg1 is the per-shard files JSON list (via `ScanSpec::files_json()`).
-    // The output columns are dynamic: declared with the placeholder EMITS (...)
-    // here and supplied concretely by the adapter's pushdown SQL
-    // (`... EMITS (col TYPE, ...)`).
-    // No %main — the SLC selects __exa_udf_entry_LAKEHOUSE_SCAN by script name.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
-EMITS (...) AS
-%udf_object {SO_UDF_OBJECT_PATH}
-/"#
-    ));
-
-    // File distributor — LUA SET SCRIPT, pure passthrough. Not a Rust entry
-    // point: does the cross-node `GROUP BY shard_key` fan-out for the
-    // shard-invariant `files` list only, carrying no row data.
-    conn.execute(&format!(
-        r#"CREATE OR REPLACE LUA SET SCRIPT {SCHEMA_NAME}.{DISTRIBUTOR_SCRIPT_NAME}(files VARCHAR(2000000))
-EMITS (files VARCHAR(2000000)) AS
-function run(ctx)
-    repeat
-        ctx.emit(ctx.files)
-    until not ctx.next()
-end
-/"#
-    ));
-}
-
-/// Create the Virtual Schema pointing at the seeded Iceberg table.
-///
-/// Credentials are stored in an Exasol CONNECTION (CATALOG_CONN_NAME) whose
-/// address is the catalog URI and whose password is a JSON credential object.
-/// VS properties use docker-network-internal URLs because the adapter UDF
-/// runs inside the Exasol container and must reach services by hostname.
-fn create_virtual_schema(conn: &mut ExaConn) {
-    // Create the catalog CONNECTION first (idempotent: CREATE OR REPLACE).
-    let password = local_stack_connection_password();
-    let catalog_uri = iceberg_catalog_url_internal();
-    let create_conn_sql = build_create_connection_sql(CATALOG_CONN_NAME, &catalog_uri, &password);
-    conn.execute(&create_conn_sql);
-
-    // Drop the VS first (idempotent).
-    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS_NAME} CASCADE"));
-
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_NAME}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
-  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
-  ALLOW_HTTP          = 'true'"#
-    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +431,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA EVO_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
+  CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
   ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
   PARALLELISM_FACTOR  = '1'
   ALLOW_HTTP          = 'true'"#
@@ -683,7 +510,7 @@ fn e2e_added_columns_initial_default_fill_all_types() {
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA INITDEF_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
+  CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
   ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
   SCAN_SCHEMA         = '{SCHEMA_NAME}'
   PARALLELISM_FACTOR  = '1'
@@ -1010,23 +837,6 @@ fn sum_length_expression_argument_pushed_down() {
         "SUM(LENGTH(name)) must be {expected} (name is always 8 chars, \
          {SEED_TOTAL_ROWS} rows), got {total}"
     );
-}
-
-/// Runs `EXPLAIN VIRTUAL` for a query and returns the pushed SQL text (the
-/// `LAKEHOUSE_SCAN` scan-spec JSON embedded in the plan), for callers that need
-/// to inspect it for more than the single `aggregates`-field check that
-/// [`assert_single_group_aggregate_pushed_down`] performs (e.g. also asserting
-/// `arg_expr` is present, or that `aggregates` is absent for a fallback check).
-fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
-    let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
-    let resp = conn.execute(&explain_sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
-    cols.iter()
-        .flat_map(|col| col.iter())
-        .filter_map(|v| v.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// `SUM(id * score)` — a SUM over a two-column binary-arithmetic argument
@@ -1535,18 +1345,6 @@ fn scan_registers_assigned_files_with_path_size_payload() {
 //   id → 20 groups, 1 row each (high cardinality / spill path)
 //   NULLIF(MOD(id, 5), 0) → groups {1,2,3,4,NULL}, sizes 4,4,4,4,4
 // ---------------------------------------------------------------------------
-
-fn parse_numeric(v: &serde_json::Value) -> f64 {
-    v.as_f64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("expected numeric value, got: {v:?}"))
-}
-
-fn parse_int(v: &serde_json::Value) -> i64 {
-    v.as_i64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
-}
 
 /// Runs `EXPLAIN VIRTUAL` for a GROUP BY query and asserts the pushed SQL
 /// evidences a grouped partial-aggregate pushdown — not the raw row-scan
@@ -2802,53 +2600,6 @@ fn e2e_pushdown_scans_table_from_involved_tables() {
 /// Helper: virtual schema name for the partitioned regions table.
 fn vs_regions_table() -> String {
     format!("{VS_NAME}.{}", E2E_PART_TABLE.to_uppercase())
-}
-
-/// Build a `ConnectionCreds` pointing at the host-visible local Docker stack.
-///
-/// Used by the adapter-level file-resolution tests (task 5.3) that call
-/// `resolve_file_list` directly rather than going through Exasol pushdown.
-/// The host-visible catalog and MinIO URLs (not the internal Docker aliases)
-/// are used because the test process runs on the host, not inside a container.
-fn local_stack_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "s3://warehouse/".to_string(),
-        endpoint: common::stack::minio_url(),
-        region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-    }
-}
-
-/// Build `StorageProps` for the host-visible local Docker stack.
-fn local_stack_storage() -> StorageProps {
-    StorageProps {
-        endpoint: common::stack::minio_url(),
-        region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
-        session_token: None,
-        allow_http: true,
-        path_style: true,
-    }
-}
-
-/// Build `CatalogProps` for the host-visible local Docker stack, for `table`.
-fn local_stack_catalog(table: &str) -> CatalogProps {
-    CatalogProps {
-        uri: common::stack::iceberg_catalog_url(),
-        warehouse: "s3://warehouse/".to_string(),
-        table: table.to_string(),
-    }
 }
 
 /// Task 5.2 — Partition filter prunes and returns correct rows.
