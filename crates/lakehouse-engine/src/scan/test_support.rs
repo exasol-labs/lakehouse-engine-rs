@@ -23,33 +23,15 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
 pub(super) fn minimal_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            table_root: String::new(),
-            projection: vec![],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
             storage: StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "testkey".into(),
                 secret_key: "testsecret".into(),
-                session_token: None,
                 allow_http: true,
-                path_style: true,
+                ..Default::default()
             },
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
+            ..Default::default()
         },
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024)],
     }
