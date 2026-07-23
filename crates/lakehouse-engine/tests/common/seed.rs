@@ -1,7 +1,7 @@
 //! Iceberg table seeder for lakehouse-engine E2E tests.
 //!
 //! Seeds a deterministic mixed-column table into the Iceberg REST catalog over MinIO.
-//! Uses iceberg-rust 0.10.0-rc.2 + iceberg-catalog-rest 0.10.0-rc.2 (same as the
+//! Uses iceberg-rust 0.10.0 + iceberg-catalog-rest 0.10.0 (same as the
 //! main crate). Arrow batches and parquet writer properties are built with the
 //! workspace arrow/parquet 58 — the same single tree iceberg 0.10 links.
 //!
@@ -1713,7 +1713,7 @@ pub async fn seed_added_columns_initial_default(catalog_url: &str, warehouse: &s
     // commit in step 3); `Schema.checkCompatibility` rejects them on a v2 table.
     //
     // NOTE: against the Iceberg REST catalog, `TableCreation::format_version(V3)` is a
-    // no-op (iceberg-rust 0.10.0-rc.2 does not send it in a form the server honors); the
+    // no-op (iceberg-rust 0.10.0 does not send it in a form the server honors); the
     // REST create-table protocol derives the format-version from the `format-version`
     // TABLE PROPERTY (iceberg-java `TableProperties.FORMAT_VERSION`). We set the property
     // so the server actually creates a v3 table, and assert the result below so this can

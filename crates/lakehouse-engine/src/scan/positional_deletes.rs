@@ -77,7 +77,7 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 ///
 /// Vendored from apache/iceberg-rust
 /// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`,
-/// tag `v0.10.0-rc.2`), where it is `pub(super)` on `ArrowReader` and therefore
+/// tag `v0.10.0`), where it is `pub(super)` on `ArrowReader` and therefore
 /// not importable. Kept algorithmically identical to reuse its verified
 /// row-group-boundary handling (including the multi-row-group and skipped-row-group
 /// bug fixes upstream added), differing only in taking the delete set as a
@@ -792,7 +792,7 @@ mod tests {
     }
 
     /// Vendored verbatim from apache/iceberg-rust's own unit test for
-    /// `build_deletes_row_selection` (tag `v0.10.0-rc.2`), adapted only to feed a
+    /// `build_deletes_row_selection` (tag `v0.10.0`), adapted only to feed a
     /// `RoaringTreemap` directly. It is the correctness oracle for the vendored
     /// row-group-boundary algorithm: it exercises skip/select runs at the first,
     /// intermediate, and last positions of skipped and selected row groups, both
