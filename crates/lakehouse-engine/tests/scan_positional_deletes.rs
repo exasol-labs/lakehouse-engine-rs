@@ -27,7 +27,8 @@ use exasol_udf_sdk::value::Value;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ScanSpec, StorageProps,
+    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ScanSpec,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     run_join_scan_with_session, run_raw_scan_with_session, session_config_for_spec,
@@ -209,26 +210,28 @@ fn delete_ref(abs_url: &str) -> DeleteFileRef {
 /// optionally pushing a filter and/or a limit.
 fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) -> ScanSpec {
     ScanSpec {
-        table_root: String::new(),
+        common: CommonScanSpec {
+            table_root: String::new(),
+            projection: vec!["ID".into(), "NAME".into()],
+            filter,
+            limit,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: dummy_storage(),
+            df_target_partitions: 1,
+            df_batch_size: 64,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        },
         files,
-        projection: vec!["ID".into(), "NAME".into()],
-        filter,
-        limit,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: dummy_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 64,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
     }
 }
 
@@ -1033,7 +1036,7 @@ fn scan_delete_reads_bounded_by_connection_budget() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.s3_max_connections = BUDGET;
+    spec.common.s3_max_connections = BUDGET;
 
     let (store, peak) = tracking_store_with_probe(needles);
     let rows = block_on(async {
@@ -1081,7 +1084,7 @@ fn scan_delete_reads_serial_when_budget_is_one() {
 
     let entry = FileEntry::with_deletes(data_url.clone(), local_file_size(&data_url), delete_refs);
     let mut spec = scan_spec(vec![entry], None, None);
-    spec.s3_max_connections = 1;
+    spec.common.s3_max_connections = 1;
 
     let (store, peak) = tracking_store_with_probe(needles);
     let rows = block_on(async {
@@ -1215,9 +1218,9 @@ fn scan_delete_reads_bounded_across_join_sides() {
     );
 
     let mut spec = scan_spec(vec![fact_entry], None, None);
-    spec.projection = vec!["O_KEY".into(), "C_DATA".into()];
-    spec.s3_max_connections = BUDGET;
-    spec.join = Some(JoinSpec {
+    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.s3_max_connections = BUDGET;
+    spec.common.join = Some(JoinSpec {
         table_root: String::new(),
         files: vec![dim_entry],
         logical_schema: Vec::new(),

@@ -14,14 +14,12 @@ use super::credentials::{
 };
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::namespace::parse_table_ident;
-use super::single_group_agg::{SingleGroupItem, ordinary_plans};
+use super::request_shape::{RequestShape, classify_request_shape};
+use super::single_group_agg::SingleGroupItem;
 use super::support::{
     aggregate_exasol_types, exasol_type_from_json, quote_ident, redact_catalog_error,
 };
-use super::{
-    GroupedSelectItem, build_logical_schema, detect_aggregates, detect_group_by_aggregates,
-    validate_agg_col_types,
-};
+use super::{GroupedSelectItem, build_logical_schema};
 
 /// Emit a file path relative to `table_root` when the file lives under it,
 /// otherwise pass the absolute path through unchanged.
@@ -589,25 +587,31 @@ pub async fn resolve_table_schema(
 
 /// Build the shape-correct empty-result response for a fully-pruned file list.
 ///
-/// The request-shape decision is hoisted ahead of the zero-files short-circuit
-/// and mirrors the non-empty dispatch priority — grouped aggregate, then
-/// single-group aggregate, then row scan. Both aggregate branches are gated on
-/// the same `validate_agg_col_types` check the non-empty path applies: a
-/// non-numeric aggregate demotes to the next shape, so the empty response's
-/// positional column shape always equals what the non-empty path would have
-/// committed to. A non-numeric grouped aggregate carrying a HAVING is declined
-/// with the same `Err` the non-empty path returns (a hard error, no native re-plan),
-/// because the adapter advertises AGGREGATE_HAVING and dropping the HAVING would
-/// yield wrong results. No scan or distinct-merge UDF is referenced: with zero
-/// files there is nothing to scan or merge.
+/// Routing goes through the SAME shared [`classify_request_shape`] the non-empty
+/// dispatcher uses, so the empty and non-empty positional column shapes are
+/// identical by construction — the 3-tier priority (grouped → single-group → row
+/// scan), the `validate_agg_col_types` numeric gates, and the
+/// non-numeric-grouped-with-HAVING hard-error decline all live in the classifier,
+/// never re-derived here. Each arm renders only its own empty shape:
+/// - `Grouped` → zero rows in the full grouped output shape (`empty_grouped_sql`);
+/// - `GroupByWrapper` → a zero-row result typed from `selectListDataTypes`
+///   (`empty_select_list_typed_sql`), falling back to the full-row empty shape when
+///   `selectListDataTypes` is absent or empty;
+/// - `SingleGroupAgg` → one shape-correct empty aggregate row (`empty_agg_sql`);
+/// - `RowScan` → a typed empty projection (`empty_pushdown_sql`).
+///
+/// No scan or distinct-merge UDF is referenced: with zero files there is nothing to
+/// scan or merge, and a zero-row result already satisfies any HAVING/ORDER BY/LIMIT.
 pub(super) fn empty_result_sql(
     pushdown_req: &Json,
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     col_types: &[(String, String)],
 ) -> Result<Json, UdfError> {
-    if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
-        if validate_agg_col_types(&detection.plans, col_types) {
+    match classify_request_shape(pushdown_req, col_types)? {
+        // A zero-row result satisfies any HAVING, so the classifier's `having` is
+        // deliberately ignored on the empty path.
+        RequestShape::Grouped { detection, .. } => {
             let group_key_types = group_key_exasol_types(
                 pushdown_req,
                 &detection.group_keys,
@@ -615,46 +619,26 @@ pub(super) fn empty_result_sql(
             );
             // Per-plan declared types, aligned 1:1 with `detection.plans` (includes
             // aggregates nested inside a scalar-over-aggregate item) — the same
-            // aligned source the non-empty grouped path now uses.
-            return Ok(empty_grouped_sql(
+            // aligned source the non-empty grouped path uses.
+            Ok(empty_grouped_sql(
                 &group_key_types,
                 &detection.plan_types,
                 &detection.select_items,
-            ));
+            ))
         }
-        // Gate failed. The non-empty grouped path declines with an Err when a
-        // HAVING is present (advertised AGGREGATE_HAVING → Exasol will not
-        // re-apply it); mirror that so the empty path declines identically.
-        if pushdown_req
-            .get("having")
-            .filter(|h| !h.is_null())
-            .is_some()
-        {
-            return Err(UdfError::User(
-                "grouped aggregate pushdown declined: HAVING present but aggregate \
-                 column type is non-numeric; this is a hard error, not a native re-plan"
-                    .into(),
-            ));
+        // The non-empty path routes such a request to the qualified single-table
+        // wrapper whose output columns ARE the `selectList` items. Mirror that shape
+        // with a zero-row result typed from `selectListDataTypes`, so the empty and
+        // non-empty column shapes never diverge (never a full-row `04000` mismatch).
+        // When `selectListDataTypes` is absent or empty this falls back to the
+        // full-row empty shape, byte-for-byte with the pre-refactor behaviour.
+        RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown_req)
+            .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types))),
+        RequestShape::SingleGroupAgg { items } => {
+            Ok(empty_agg_sql(&items, &aggregate_exasol_types(pushdown_req)))
         }
-        // No HAVING: fall through to the group_by qualified-wrapper shape below,
-        // exactly as the non-empty path routes such a request.
+        RequestShape::RowScan => Ok(empty_pushdown_sql(proj_cols, proj_types)),
     }
-    // A GROUP BY request that declined grouped detection (or the non-numeric-no-HAVING
-    // fall-through above) routes, on the non-empty path, to the qualified single-table
-    // wrapper whose output columns ARE the `selectList` items. Mirror that shape here
-    // with a zero-row result typed from `selectListDataTypes`, so the empty and
-    // non-empty column shapes never diverge (never a full-row `04000` mismatch).
-    if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) == Some("group_by")
-        && let Some(sql) = empty_select_list_typed_sql(pushdown_req)
-    {
-        return Ok(sql);
-    }
-    if let Some(items) = detect_aggregates(pushdown_req)
-        .filter(|it| validate_agg_col_types(&ordinary_plans(it), col_types))
-    {
-        return Ok(empty_agg_sql(&items, &aggregate_exasol_types(pushdown_req)));
-    }
-    Ok(empty_pushdown_sql(proj_cols, proj_types))
 }
 
 /// A zero-row result whose columns are `CAST(NULL AS <ty>)` for each
@@ -779,6 +763,7 @@ fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Js
 
 #[cfg(test)]
 mod tests {
+    use super::super::detect_aggregates;
     use super::super::single_group_agg::DistinctCount;
     use super::super::test_support::*;
     use super::*;

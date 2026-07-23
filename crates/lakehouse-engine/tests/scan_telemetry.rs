@@ -22,7 +22,7 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
-use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -130,34 +130,36 @@ fn scan_spec(file_url: String) -> ScanSpec {
         .map(|m| m.len())
         .unwrap_or(0);
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: vec!["ID".into(), "NAME".into()],
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            table_root: String::new(),
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                session_token: None,
+                allow_http: true,
+                path_style: true,
+            },
+            df_target_partitions: 1,
+            df_batch_size: 64,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
         },
-        df_target_partitions: 1,
-        df_batch_size: 64,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 

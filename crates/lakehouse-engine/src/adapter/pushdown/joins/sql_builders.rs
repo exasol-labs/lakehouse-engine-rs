@@ -1,4 +1,4 @@
-use crate::scan::spec::{FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec};
+use crate::scan::spec::{CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -438,26 +438,28 @@ fn join_fan_out_scan_spec(
     tuning: &JoinScanTuning,
 ) -> ScanSpec {
     ScanSpec {
-        table_root: primary.table_root.clone(),
+        common: CommonScanSpec {
+            table_root: primary.table_root.clone(),
+            projection,
+            filter,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types,
+            logical_schema: primary.logical_schema.clone(),
+            name_mapping: primary.name_mapping.clone(),
+            join,
+            storage: primary.effective_storage.clone(),
+            df_target_partitions: tuning.df_target_partitions,
+            df_batch_size: tuning.df_batch_size,
+            df_threads_per_udf: tuning.df_threads_per_udf,
+            memory_pool_fraction: tuning.memory_pool_fraction,
+            instance_overhead_mb: tuning.instance_overhead_mb,
+            s3_max_connections: tuning.s3_max_connections,
+        },
         files: vec![],
-        projection,
-        filter,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types,
-        logical_schema: primary.logical_schema.clone(),
-        name_mapping: primary.name_mapping.clone(),
-        join,
-        storage: primary.effective_storage.clone(),
-        df_target_partitions: tuning.df_target_partitions,
-        df_batch_size: tuning.df_batch_size,
-        df_threads_per_udf: tuning.df_threads_per_udf,
-        memory_pool_fraction: tuning.memory_pool_fraction,
-        instance_overhead_mb: tuning.instance_overhead_mb,
-        s3_max_connections: tuning.s3_max_connections,
     }
 }
 
@@ -797,9 +799,10 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     // from the fan-out spec so the no-select-list fallback (unusual for a grouped
     // request) still resolves types from the one side.
     let all_cols: Vec<(String, String)> = fan_out_spec
+        .common
         .projection
         .iter()
-        .zip(fan_out_spec.emit_exa_types.iter())
+        .zip(fan_out_spec.common.emit_exa_types.iter())
         .filter_map(|(item, ty)| match item {
             ProjectionItem::Column(name) => Some((name.clone(), ty.clone())),
             ProjectionItem::Expr { .. } => None,
@@ -812,8 +815,8 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 
     // One aliased raw sharded fan-out. LIMIT-free / sort-free / no aggregates — the
     // fan-out spec already guarantees this.
-    let proj_cols = fan_out_spec.projection.clone();
-    let proj_types = fan_out_spec.emit_exa_types.clone();
+    let proj_cols = fan_out_spec.common.projection.clone();
+    let proj_types = fan_out_spec.common.emit_exa_types.clone();
     let fan_out = build_scan_driving_sql(
         fan_out_spec,
         shards,
@@ -829,6 +832,54 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     let mut sql = format!("SELECT {select} FROM ({fan_out}) AS {}", quote_ident(ALIAS));
     sql.push_str(&trailing);
     Ok(sql)
+}
+
+/// Dispatch a request to the qualified single-table fallback wrapper, from the
+/// shared shard-invariant `base` `build_dispatch_sql` builds once.
+///
+/// Both `build_dispatch_sql` decline guards — the group-by-not-decomposed guard
+/// and the multi/mixed `COUNT(DISTINCT)` guard — reach this same shape: derive the
+/// referenced-column projection, build the fan-out spec from `base` with only the
+/// projection/filter/emit-types set (every other field, including LIMIT/ORDER
+/// BY/aggregates/group keys/distinct, stays at `base`'s neutral placeholder — the
+/// fan-out is always LIMIT-free and sort-free here, see
+/// [`build_qualified_single_table_fallback_sql`]'s doc), render the wrapper SQL, and
+/// wrap it in the pushdown response envelope.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) fn qualified_single_table_fallback_pushdown(
+    request: &Json,
+    pushdown_req: &Json,
+    base: &CommonScanSpec,
+    filter: Option<String>,
+    shards: &[Vec<FileEntry>],
+    col_types: &[(String, String)],
+    udf_name: &str,
+    distribute_udf_name: &str,
+) -> Result<Json, UdfError> {
+    let (fb_proj_cols, fb_proj_types) = referenced_column_projection(pushdown_req, col_types);
+    let fan_out_spec = ScanSpec {
+        common: CommonScanSpec {
+            projection: fb_proj_cols,
+            filter,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: fb_proj_types,
+            ..base.clone()
+        },
+        files: vec![],
+    };
+    let sql = build_qualified_single_table_fallback_sql(
+        request,
+        pushdown_req,
+        &fan_out_spec,
+        shards,
+        udf_name,
+        distribute_udf_name,
+    )?;
+    Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
 
 #[cfg(test)]
@@ -1834,29 +1885,31 @@ mod tests {
             ],
         });
         let fan_out_spec = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                table_root: String::new(),
+                projection: vec![
+                    ProjectionItem::Column("C_CUSTKEY".to_string()),
+                    ProjectionItem::Column("C_NAME".to_string()),
+                ],
+                filter: None,
+                limit: None,
+                order_by: Vec::new(),
+                aggregates: None,
+                group_keys: None,
+                distinct: false,
+                emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()],
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join: None,
+                storage: sample_storage(),
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            },
             files: vec![],
-            projection: vec![
-                ProjectionItem::Column("C_CUSTKEY".to_string()),
-                ProjectionItem::Column("C_NAME".to_string()),
-            ],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()],
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: sample_storage(),
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
         let actual = build_qualified_single_table_fallback_sql(
             &request,
@@ -1897,26 +1950,28 @@ mod tests {
         }
         fn spec_with(projection: Vec<ProjectionItem>, emit_exa_types: Vec<String>) -> ScanSpec {
             ScanSpec {
-                table_root: String::new(),
+                common: CommonScanSpec {
+                    table_root: String::new(),
+                    projection,
+                    filter: None,
+                    limit: None,
+                    order_by: Vec::new(),
+                    aggregates: None,
+                    group_keys: None,
+                    distinct: false,
+                    emit_exa_types,
+                    logical_schema: Vec::new(),
+                    name_mapping: Vec::new(),
+                    join: None,
+                    storage: sample_storage(),
+                    df_target_partitions: 1,
+                    df_batch_size: 8192,
+                    df_threads_per_udf: 1,
+                    memory_pool_fraction: 0.6,
+                    instance_overhead_mb: 200,
+                    s3_max_connections: 8,
+                },
                 files: vec![],
-                projection,
-                filter: None,
-                limit: None,
-                order_by: Vec::new(),
-                aggregates: None,
-                group_keys: None,
-                distinct: false,
-                emit_exa_types,
-                logical_schema: Vec::new(),
-                name_mapping: Vec::new(),
-                join: None,
-                storage: sample_storage(),
-                df_target_partitions: 1,
-                df_batch_size: 8192,
-                df_threads_per_udf: 1,
-                memory_pool_fraction: 0.6,
-                instance_overhead_mb: 200,
-                s3_max_connections: 8,
             }
         }
         fn proj_names(proj: &[ProjectionItem]) -> Vec<String> {
