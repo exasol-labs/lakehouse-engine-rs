@@ -9,8 +9,8 @@ use iceberg::TableIdent;
 use serde_json::Value as Json;
 
 use super::credentials::{
-    build_s3_file_io, extract_vended_keys, extract_vended_region, load_table_any_auth,
-    merge_vended_into_storage,
+    CatalogSession, build_s3_file_io, extract_vended_keys, extract_vended_region,
+    load_table_any_auth, merge_vended_into_storage,
 };
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::namespace::parse_table_ident;
@@ -175,10 +175,48 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// Resolve the data-file list from the Iceberg REST catalog.
+/// Resolve the data-file list from the Iceberg REST catalog for a single table.
 ///
-/// This is the resolve-once seam: called exactly once per pushdown in the
-/// adapter; the file list is passed explicitly to the scan UDF.
+/// This is the resolve-once seam: called exactly once per single-table pushdown in
+/// the adapter; the file list is passed explicitly to the scan UDF. The table
+/// identifier is validated BEFORE any catalog HTTP (parse-before-config: a malformed
+/// identifier issues zero `/v1/config` traffic and returns the same parse error),
+/// then a single-use [`CatalogSession`] is built and the work delegated to
+/// [`resolve_file_list_with_session`] — the shared-session core join legs reuse.
+///
+/// `filter_json` is the raw pushdown filter JSON forwarded for Iceberg-level file
+/// pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
+pub async fn resolve_file_list(
+    catalog_uri: &str,
+    catalog_props: &CatalogProps,
+    storage: &StorageProps,
+    creds: &ConnectionCreds,
+    filter_json: Option<&Json>,
+) -> Result<
+    (
+        Vec<FileEntry>,
+        StorageProps,
+        Vec<LogicalField>,
+        String,
+        Vec<NameMappingEntry>,
+    ),
+    UdfError,
+> {
+    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
+    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
+    // identifier issues zero catalog HTTP and returns the same parse error.
+    parse_table_ident(&catalog_props.table)?;
+    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
+    resolve_file_list_with_session(&session, catalog_props, storage, creds, filter_json).await
+}
+
+/// Resolve the data-file list from the Iceberg REST catalog, reusing an existing
+/// per-query [`CatalogSession`].
+///
+/// This is the shared-session core of [`resolve_file_list`]: the catalog-auth
+/// strategy, `/v1/config` prefix, and pooled HTTP client are resolved once per query
+/// into the passed [`CatalogSession`] and reused across every table's `loadTable`
+/// GET (e.g. each leg of a join), never rebuilt per table.
 ///
 /// The catalog load_table request is self-issued via `load_table_any_auth`, which
 /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
@@ -192,8 +230,8 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 ///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
-pub async fn resolve_file_list(
-    catalog_uri: &str,
+pub(crate) async fn resolve_file_list_with_session(
+    session: &CatalogSession,
     catalog_props: &CatalogProps,
     storage: &StorageProps,
     creds: &ConnectionCreds,
@@ -212,7 +250,7 @@ pub async fn resolve_file_list(
     // catalog-auth mode applies, then derive the effective storage gated SOLELY on
     // `use_vended_credentials` (orthogonal to the auth mode), and build the Table
     // from the response metadata so plan_files() can read manifests from S3.
-    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
+    let result = load_table_any_auth(session, catalog_props, creds).await?;
 
     // Resolve the effective storage (vended or static).
     // The longest-prefix anchor for storage_credentials matching must be an S3
@@ -563,9 +601,19 @@ pub async fn resolve_table_schema(
     catalog_props: &CatalogProps,
     creds: &ConnectionCreds,
 ) -> Result<Vec<(String, String)>, UdfError> {
-    // Load the table metadata via the unified auth-mode-agnostic loader. Schema
-    // resolution reads only `current_schema()`; vended credentials never affect it.
-    let result = load_table_any_auth(catalog_uri, catalog_props, creds).await?;
+    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
+    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
+    // identifier issues zero catalog HTTP and returns the same parse error —
+    // mirroring the guard at the single-table pushdown seam in `mod.rs`.
+    parse_table_ident(&catalog_props.table)?;
+
+    // Build a single-use session inline (one OAuth grant, one `/v1/config` lookup)
+    // and load the table metadata on it via the unified auth-mode-agnostic loader.
+    // Schema resolution reads only `current_schema()`; vended credentials never
+    // affect it. Cost is unchanged from the pre-refactor path: one grant, one
+    // config lookup, one `loadTable` GET.
+    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
+    let result = load_table_any_auth(&session, catalog_props, creds).await?;
     let table_metadata = result.metadata;
 
     let schema = table_metadata.current_schema();
