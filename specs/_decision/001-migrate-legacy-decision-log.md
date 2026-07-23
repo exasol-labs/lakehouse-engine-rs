@@ -2165,7 +2165,7 @@ Empty and non-empty column shapes can never drift apart, since both derive from 
 
 **ID:** pin-iceberg-0-10-0-rc-2-via-git-tag-not-a-crates-io-exact-version-pin
 **Plan:** `change-iceberg-rust-0-10-bump`
-**Status:** Accepted
+**Status:** Superseded by pin-iceberg-0-10-0-via-crates-io-registry-version-not-git-tag
 
 ### Context
 
