@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
 license.workspace = true
 
@@ -16,6 +16,10 @@ exasol-e2e = []
 # feature. Test code enabled by this feature SKIPS (never fails) when the
 # required environment variables are absent — the opposite of exasol-e2e.
 cloud-e2e = []
+# Gate Lakekeeper E2E tests (require a live Exasol + MinIO + Lakekeeper +
+# Keycloak stack) behind this feature. Test code enabled by this feature must
+# FAIL (not skip) when the stack is unreachable — same contract as exasol-e2e.
+lakekeeper-e2e = []
 
 [dependencies]
 exasol-udf-sdk    = { version = "0.21.0", features = ["emit-arrow"] }
@@ -92,6 +96,12 @@ tpchgen             = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 reqwest             = { version = "0.12", features = ["blocking"] }
+# Seed harness only: name reqsign-core's `Context`/`Result` to implement a
+# `ProvideCredential` that forces static MinIO admin S3 credentials for the seed
+# write path, overriding Lakekeeper's vended STS session token (see seed.rs
+# `build_seed_catalog_with_auth`). Pinned to the version already in the tree via
+# iceberg-storage-opendal/opendal so the `AwsCredential`/`Context` types match.
+reqsign-core        = "3.0.1"
 tungstenite         = { version = "0.29.0", features = ["native-tls"] }
 native-tls          = "0.2"
 rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }

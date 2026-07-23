@@ -11,9 +11,9 @@
 
 use super::exasol_ws::ExaConn;
 use super::stack::{
-    bucketfs_port, bucketfs_write_password, build_create_connection_sql, exasol_host,
-    exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal, lakehouse_engine_so_path,
-    local_stack_connection_password, minio_url, upload_to_bucketfs,
+    CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
+    exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
+    lakehouse_engine_so_path, local_stack_connection_password, minio_url, upload_to_bucketfs,
 };
 
 use lakehouse_engine::adapter::connection::ConnectionCreds;
@@ -224,8 +224,27 @@ impl<'a> VsProps<'a> {
 pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
+    create_virtual_schema_with_password(conn, props, &catalog_uri, &password);
+}
+
+/// Create (or replace) a Virtual Schema from `props` against an explicit
+/// `catalog_uri` and CONNECTION `password`, instead of the local Docker
+/// stack's default (MinIO + unauthenticated Iceberg REST fixture).
+///
+/// Lets a caller targeting a different catalog (e.g. an OIDC-secured
+/// Lakekeeper warehouse) supply its own CONNECTION password, warehouse name
+/// (carried on `password.warehouse`), and namespace (`props.namespace`)
+/// without re-declaring the shared schema/script/SLC provisioning in
+/// `create_schema_and_scripts` — only the CONNECTION password and VS
+/// properties vary per catalog.
+pub fn create_virtual_schema_with_password(
+    conn: &mut ExaConn,
+    props: &VsProps,
+    catalog_uri: &str,
+    password: &CatalogConnectionPassword,
+) {
     let create_conn_sql =
-        build_create_connection_sql(props.catalog_conn_name, &catalog_uri, &password);
+        build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
 
     let _ = conn.try_execute(&format!(
