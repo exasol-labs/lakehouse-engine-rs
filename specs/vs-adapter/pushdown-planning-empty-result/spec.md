@@ -23,7 +23,12 @@ instead of rejecting it for a column-count/type mismatch.
 * The empty-result response's declared output column types come from the same
   type sources the non-empty path uses for that plan (the row projection's
   declared types; `selectListDataTypes` for aggregates), so the empty and
-  non-empty shapes are identical for any given request.
+  non-empty shapes are identical for any given request — except the
+  `GroupByWrapper` fall-through documented in the empty-result scenario: when an
+  aggregate request carries no `selectListDataTypes` (absent or empty), the
+  empty path renders the full-row-projection shape while the non-empty path
+  renders its `selectList`-derived shape, so the two can differ in column count
+  in that edge.
 * Credentials MUST NOT appear in any empty-result SQL string or error message.
 * "Empty-aggregate semantics" follow single-node SQL over zero input rows: the
   COUNT family (`COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`) yields `0`;
@@ -80,4 +85,5 @@ instead of rejecting it for a column-count/type mismatch.
 * *WHEN* the adapter reaches the zero-files short-circuit
 * *THEN* the adapter SHALL choose the empty-result shape using the SAME plan-detection priority the non-empty path uses — grouped aggregate first, then single-group aggregate, then row scan
 * *AND* the single-group aggregate shape SHALL be chosen only when the aggregate column types pass the same numeric-type validation the non-empty path applies (so an aggregate the non-empty path demotes to a row scan produces the row-scan empty shape, not an aggregate shape)
-* *AND* the resulting response's positional column shape SHALL be one Exasol accepts against `selectListDataTypes`, never a raw row-projection shape returned for an aggregate request
+* *AND* the empty and non-empty paths SHALL derive that priority, those validation gates, and the HAVING-present hard-error decline from one shared request classifier, so the ROUTING decision is shared by construction rather than kept in lockstep by convention; each path then renders its own shape from that shared decision
+* *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present — a positional shape Exasol accepts against it, not a raw row projection — and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)

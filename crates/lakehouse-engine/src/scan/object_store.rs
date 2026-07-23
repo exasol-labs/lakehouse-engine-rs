@@ -39,8 +39,8 @@ pub(super) fn build_session_context(
     let spill = probe_tmp_spill();
     let runtime_env = build_runtime_env(
         memory_limit_bytes,
-        spec.memory_pool_fraction,
-        spec.instance_overhead_mb * 1024 * 1024,
+        spec.common.memory_pool_fraction,
+        spec.common.instance_overhead_mb * 1024 * 1024,
         spill,
     )
     .map_err(|e| UdfError::User(format!("failed to build DataFusion runtime env: {e}")))?;
@@ -54,9 +54,9 @@ pub(super) fn build_session_context(
     let bucket = extract_bucket(spec)?;
     register_bucket_store(
         &ctx,
-        &spec.storage,
+        &spec.common.storage,
         &bucket,
-        spec.s3_max_connections,
+        spec.common.s3_max_connections,
         &sizes,
     )?;
 
@@ -65,16 +65,16 @@ pub(super) fn build_session_context(
     // index) so DataFusion can resolve its object store; skip when it coincides
     // with the fact bucket — the common same-warehouse case, where the fact store
     // already serves both sides.
-    if let Some(join) = &spec.join
+    if let Some(join) = &spec.common.join
         && !join.files.is_empty()
     {
         let dim_bucket = extract_bucket_from_files(&join.files, &join.table_root)?;
         if dim_bucket != bucket {
             register_bucket_store(
                 &ctx,
-                &spec.storage,
+                &spec.common.storage,
                 &dim_bucket,
-                spec.s3_max_connections,
+                spec.common.s3_max_connections,
                 &sizes,
             )?;
         }
@@ -140,11 +140,11 @@ pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String 
 /// [`Path`]: object_store::path::Path
 fn build_spec_size_index(spec: &ScanSpec) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
     let mut sizes = HashMap::with_capacity(spec.files.len());
-    index_file_sizes(&mut sizes, &spec.files, &spec.table_root)?;
+    index_file_sizes(&mut sizes, &spec.files, &spec.common.table_root)?;
     // A broadcast join carries the dimension side's full file list; its per-file
     // sizes are indexed too so DataFusion answers the dimension HEADs from the spec
     // (no network round-trip), exactly as it does for the sharded fact side.
-    if let Some(join) = &spec.join {
+    if let Some(join) = &spec.common.join {
         index_file_sizes(&mut sizes, &join.files, &join.table_root)?;
     }
     Ok(sizes)
@@ -325,7 +325,7 @@ fn build_s3_store(
 /// the bucket is then the host of that absolute URI. For the all-absolute case
 /// (empty `table_root`) reconstruction is a no-op, so behavior is unchanged.
 fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
-    extract_bucket_from_files(&spec.files, &spec.table_root)
+    extract_bucket_from_files(&spec.files, &spec.common.table_root)
 }
 
 /// Extract the S3 bucket (host) from the first entry of an explicit file list,
@@ -405,9 +405,9 @@ mod tests {
     fn session_context_sizes_pool_from_ctx_limit() {
         let limit: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
         let spec = minimal_spec();
-        let overhead_bytes = spec.instance_overhead_mb * 1024 * 1024;
+        let overhead_bytes = spec.common.instance_overhead_mb * 1024 * 1024;
         let net = limit - overhead_bytes;
-        let expected_budget = (net as f64 * spec.memory_pool_fraction) as usize;
+        let expected_budget = (net as f64 * spec.common.memory_pool_fraction) as usize;
         let ctx = build_session_context(&spec, limit).expect("build must succeed");
         match ctx.runtime_env().memory_pool.memory_limit() {
             MemoryLimit::Finite(actual) => assert_eq!(
@@ -439,8 +439,8 @@ mod tests {
     #[test]
     fn memory_budget_round_trips_into_scan_spec() {
         let mut spec = minimal_spec();
-        spec.memory_pool_fraction = 0.5;
-        spec.instance_overhead_mb = 256;
+        spec.common.memory_pool_fraction = 0.5;
+        spec.common.instance_overhead_mb = 256;
         let limit: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
         let overhead_bytes = 256_u64 * 1024 * 1024;
         let net = limit - overhead_bytes;
@@ -491,10 +491,14 @@ mod tests {
     #[test]
     fn build_s3_store_applies_spec_connection_budget() {
         let mut spec = minimal_spec();
-        spec.s3_max_connections = 16;
+        spec.common.s3_max_connections = 16;
         let bucket = extract_bucket(&spec).expect("bucket must parse");
-        build_s3_store(&spec.storage, &bucket, spec.s3_max_connections)
-            .expect("store must build with a connection budget");
+        build_s3_store(
+            &spec.common.storage,
+            &bucket,
+            spec.common.s3_max_connections,
+        )
+        .expect("store must build with a connection budget");
     }
 
     /// 4.1: a `://`-bearing entry is absolute and passes through unchanged.
@@ -548,7 +552,7 @@ mod tests {
     #[test]
     fn size_index_keys_by_listing_url_prefix() {
         let mut spec = minimal_spec();
-        spec.table_root = "s3://bucket/db/table".into();
+        spec.common.table_root = "s3://bucket/db/table".into();
         spec.files = vec![
             FileEntry::new("data/rel.parquet", 111),
             FileEntry::new("s3://bucket/db/table/data/abs.parquet", 222),
@@ -573,13 +577,13 @@ mod tests {
     fn extract_bucket_handles_relative_and_absolute_first_entry() {
         // Relative first entry: bucket comes from the table root.
         let mut rel = minimal_spec();
-        rel.table_root = "s3://warehouse/db/table".into();
+        rel.common.table_root = "s3://warehouse/db/table".into();
         rel.files = vec![FileEntry::new("data/part-0.parquet", 1)];
         assert_eq!(extract_bucket(&rel).unwrap(), "warehouse");
 
         // Absolute first entry, empty root (legacy): unchanged behavior.
         let mut abs = minimal_spec();
-        abs.table_root = String::new();
+        abs.common.table_root = String::new();
         abs.files = vec![FileEntry::new("s3://legacy-bucket/data/part-0.parquet", 1)];
         assert_eq!(extract_bucket(&abs).unwrap(), "legacy-bucket");
     }

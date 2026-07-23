@@ -19,7 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
-use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -69,34 +69,20 @@ fn pruning_spec(file_url: String) -> ScanSpec {
         .map(|m| m.len())
         .unwrap_or(0);
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: vec!["ID".into(), "NAME".into()],
-        filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            },
+            ..Default::default()
         },
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 
