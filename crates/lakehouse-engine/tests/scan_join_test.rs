@@ -29,7 +29,9 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{FileEntry, JoinSpec, JoinType, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, StorageProps,
+};
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
 };
@@ -184,33 +186,35 @@ fn join_spec(
     limit: Option<u64>,
 ) -> ScanSpec {
     ScanSpec {
-        table_root: String::new(),
-        files: fact_files.into_iter().map(FileEntry::from).collect(),
-        projection: projection.into_iter().map(Into::into).collect(),
-        filter: filter.map(Into::into),
-        limit,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: Some(JoinSpec {
+        common: CommonScanSpec {
             table_root: String::new(),
-            files: dim_files.into_iter().map(FileEntry::from).collect(),
+            projection: projection.into_iter().map(Into::into).collect(),
+            filter: filter.map(Into::into),
+            limit,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
-            join_type: JoinType::Inner,
-            condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
-        }),
-        storage: storage(),
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+            join: Some(JoinSpec {
+                table_root: String::new(),
+                files: dim_files.into_iter().map(FileEntry::from).collect(),
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join_type: JoinType::Inner,
+                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+            }),
+            storage: storage(),
+            df_target_partitions: 1,
+            df_batch_size: 8192,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
+        },
+        files: fact_files.into_iter().map(FileEntry::from).collect(),
     }
 }
 
@@ -265,6 +269,7 @@ fn join_spec_reconstitutes_two_file_lists() {
 
     // Dimension side: the shard-invariant join block's full file list.
     let join = reconstituted
+        .common
         .join
         .expect("join block must survive the split/merge");
     assert_eq!(

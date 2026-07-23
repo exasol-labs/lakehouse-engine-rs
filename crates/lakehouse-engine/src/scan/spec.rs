@@ -681,161 +681,36 @@ impl CommonScanSpec {
 }
 
 /// The scan specification passed from the adapter to the scan SET UDF.
+///
+/// Holds the shard-invariant [`CommonScanSpec`] (every field identical across all
+/// shards of a fan-out) plus the per-shard `files` list. `common` is embedded via
+/// `#[serde(flatten)]` so the serialized JSON stays FLAT — a whole-`ScanSpec` JSON
+/// and the two-argument wire (common blob + files array) carry the same keys at the
+/// same level, and the common-blob and files-list serializations are byte-identical
+/// whether produced from a `ScanSpec` or a standalone `CommonScanSpec`. This is the
+/// single declaration of the shard-invariant fields (see [`CommonScanSpec`]); reads
+/// reach them through `spec.common.<field>`.
+///
+/// Note: flatten serializes `common`'s fields first and `files` last, so a
+/// whole-`ScanSpec` `to_json()` places `files` at the END rather than second. The
+/// two-argument wire (`to_common_json` + `files_json`) — the ONLY form production
+/// reconstitutes from, via `from_parts_json` — is unaffected, because each part is
+/// serialized independently.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanSpec {
-    /// The Iceberg table's root location (`table.metadata().location()`), used
-    /// to reconstruct absolute file paths from per-shard relative paths.
-    ///
-    /// An empty string (the default) means every entry in `files` is already
-    /// absolute — either a legacy payload that predates this field, or a file
-    /// that does not live under the table root.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub table_root: String,
+    /// The shard-invariant portion of the spec — everything except `files`. Embedded
+    /// flat on the wire (see the struct doc); the sole declaration of these fields.
+    #[serde(flatten)]
+    pub common: CommonScanSpec,
 
     /// Explicit list of assigned Parquet files, each carrying its byte size
     /// and its associated positional-delete file refs (if any). `path` is
-    /// relative to `table_root` when non-empty and the file lives under it,
+    /// relative to `common.table_root` when non-empty and the file lives under it,
     /// otherwise an absolute URI (S3 or s3a). The scan UDF registers ONLY
     /// these files — no catalog discovery — and uses `size` to build each
     /// file's `ObjectMeta` without an object-store HEAD. See [`FileEntry`]
     /// for the wire shape and its backward-compatible legacy fallback.
     pub files: Vec<FileEntry>,
-
-    /// Projected columns in order, for the row-scan and join paths, where an empty
-    /// value means "all columns" (no projection push). Each entry is either a bare
-    /// column reference or a rendered scalar expression (see [`ProjectionItem`]).
-    ///
-    /// NOT consulted on the aggregate-dispatch path (single-group or grouped
-    /// aggregate): that scan builds its query from `aggregates`/`group_keys` and
-    /// DataFusion's projection pushdown prunes the physical Parquet read, so the
-    /// field is inert there and the adapter leaves it empty. An empty value on an
-    /// aggregate spec therefore means "not applicable", NOT "all columns" (#145).
-    pub projection: Vec<ProjectionItem>,
-
-    /// DataFusion SQL WHERE predicate fragment, already translated.
-    /// None means no filter pushdown (Exasol keeps the predicate for correctness).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filter: Option<String>,
-
-    /// Row limit. None means no LIMIT pushdown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit: Option<u64>,
-
-    /// ORDER BY sort keys for a pushed-down ordered top-N scan, in order. Empty
-    /// (the default) means no ordering pushdown (row scan or aggregate); absent
-    /// from JSON when empty so pre-existing scan specs are backward-compatible.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub order_by: Vec<SortKey>,
-
-    /// Ordered list of aggregate functions to compute as node-local partial
-    /// results. `None` (the default) means row scanning; absent from JSON when
-    /// serialized so pre-existing scan specs are backward-compatible.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggregates: Option<Vec<AggregatePlan>>,
-
-    /// Rendered DataFusion SQL fragments for each GROUP BY key, in order.
-    /// `None` means no GROUP BY pushdown (single-group or row scan).
-    /// Present only for grouped aggregate scans.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_keys: Option<Vec<String>>,
-
-    /// Apply DataFusion `.distinct()` to the row-scan projection. Set only on the
-    /// single-group `COUNT(DISTINCT col)` fan-out (see [`CommonScanSpec::distinct`]):
-    /// each shard streams one row per shard-local distinct projected value, counted by
-    /// an outer native `COUNT(DISTINCT "V")`. `false` (the default) is a plain row
-    /// scan; a legacy spec lacking the field deserializes to `false`.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub distinct: bool,
-
-    /// Declared Exasol EMITS type string for each output column, positionally
-    /// aligned with the row-scan projection. The scan coerces each emitted Arrow
-    /// column to the type this ExaType accepts (via `emit_batch`'s strict feed)
-    /// before emitting. Populated by the adapter from the SAME types it writes
-    /// into the EMITS clause. Empty (the default) for aggregate scans — which use
-    /// the freely-coercing Value emit path — and for specs that predate this
-    /// field (backward-compatible).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emit_exa_types: Vec<String>,
-
-    /// Full logical schema of the Iceberg table at query time: every column
-    /// (not just the projected subset), each carrying its Iceberg field-id,
-    /// current logical name, Arrow type tag, and nullability.
-    ///
-    /// The VS adapter populates this once at `resolve_file_list` from
-    /// `table.metadata().current_schema()`. The scan UDF uses it to build the
-    /// logical Arrow schema and install a `FieldIdExprAdapter` so column binding
-    /// is field-id-first (name fallback) — correct across Iceberg schema evolution
-    /// (renames, drops, nullable additions).
-    ///
-    /// Absent (empty, the default) for specs that predate this field; the scan
-    /// UDF falls back to first-file schema inference (backward-compatible).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub logical_schema: Vec<LogicalField>,
-
-    /// Flattened `schema.name-mapping.default` entries, resolved once in the VS
-    /// (`resolve_file_list`) alongside `logical_schema` from the Iceberg table
-    /// property of the same name. Consulted by the scan UDF's field-id resolver
-    /// ONLY for a physical field carrying no embedded `PARQUET:field_id` — an
-    /// embedded field-id is authoritative and always wins. Absent (empty, the
-    /// default) for specs that predate this field, or when the table carries no
-    /// such property: the existing physical-name fallback is unaffected
-    /// (backward-compatible). See
-    /// `specs/_plans/change-name-mapping-fallback/plan.md`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub name_mapping: Vec<NameMappingEntry>,
-
-    /// Broadcast (dimension) side of a pushed-down inner equi-join, or `None` (the
-    /// default) for a plain single-table scan. Shard-invariant, so it round-trips
-    /// through the [`CommonScanSpec`] on the split/merge path. Absent from JSON when
-    /// `None`, so every pre-existing non-join spec deserializes unchanged. The fact
-    /// side stays in `files`; the dimension side's files live in [`JoinSpec::files`],
-    /// so the two file lists never collide. See [`JoinSpec`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub join: Option<JoinSpec>,
-
-    pub storage: StorageProps,
-
-    /// DataFusion `target_partitions` for this scan instance.
-    /// Controls the number of logical partitions DataFusion creates internally.
-    /// Defaults to 1 (no intra-instance partitioning) so the cluster-level shard
-    /// fan-out is the sole source of parallelism and nodes are not oversubscribed.
-    /// Old specs that lack this field deserialize to 1 (backward-compatible).
-    #[serde(default = "default_one_usize")]
-    pub df_target_partitions: usize,
-
-    /// DataFusion `batch_size` (rows per Arrow RecordBatch) for this scan instance.
-    /// Controls the granularity of DataFusion's internal execution batches.
-    /// Defaults to 8192 (DataFusion's own default).
-    /// Old specs that lack this field deserialize to 8192 (backward-compatible).
-    #[serde(default = "default_batch_size")]
-    pub df_batch_size: usize,
-
-    /// Number of Tokio worker threads for the scan runtime.
-    /// When 1 (the default), `new_current_thread()` is used (one OS thread).
-    /// When > 1, `new_multi_thread().worker_threads(n)` is used.
-    /// Old specs that lack this field deserialize to 1 (backward-compatible).
-    #[serde(default = "default_one_usize")]
-    pub df_threads_per_udf: usize,
-
-    /// Fraction of the net per-instance budget given to the DataFusion memory pool.
-    /// Net budget = per-instance RSS limit − container overhead. Old specs that lack
-    /// this field deserialize to 0.6 (backward-compatible).
-    #[serde(default = "default_memory_pool_fraction")]
-    pub memory_pool_fraction: f64,
-
-    /// Fixed container/binary RSS overhead (MB) subtracted from the per-instance
-    /// limit before applying `memory_pool_fraction`. Old specs that lack this field
-    /// deserialize to 200 (backward-compatible).
-    #[serde(default = "default_instance_overhead_mb")]
-    pub instance_overhead_mb: u64,
-
-    /// Connection-concurrency budget for the scan's S3-compatible object store:
-    /// the number of concurrent connections held warm per host, independent of
-    /// the CPU thread/partition budget (`df_target_partitions`/`df_threads_per_udf`).
-    /// Old specs that lack this field deserialize to a conservative built-in
-    /// default (backward-compatible), clamped to at least 1.
-    #[serde(default = "default_s3_max_connections")]
-    pub s3_max_connections: usize,
 }
 
 fn default_one_usize() -> usize {
@@ -892,27 +767,7 @@ impl ScanSpec {
 
     /// Extract the shard-invariant portion of this spec (everything except `files`).
     pub fn to_common(&self) -> CommonScanSpec {
-        CommonScanSpec {
-            table_root: self.table_root.clone(),
-            projection: self.projection.clone(),
-            filter: self.filter.clone(),
-            limit: self.limit,
-            order_by: self.order_by.clone(),
-            aggregates: self.aggregates.clone(),
-            group_keys: self.group_keys.clone(),
-            distinct: self.distinct,
-            emit_exa_types: self.emit_exa_types.clone(),
-            logical_schema: self.logical_schema.clone(),
-            name_mapping: self.name_mapping.clone(),
-            join: self.join.clone(),
-            storage: self.storage.clone(),
-            df_target_partitions: self.df_target_partitions,
-            df_batch_size: self.df_batch_size,
-            df_threads_per_udf: self.df_threads_per_udf,
-            memory_pool_fraction: self.memory_pool_fraction,
-            instance_overhead_mb: self.instance_overhead_mb,
-            s3_max_connections: self.s3_max_connections,
-        }
+        self.common.clone()
     }
 
     /// Serialize the shard-invariant common blob once (the UDF's first argument).
@@ -926,28 +781,7 @@ impl ScanSpec {
     /// per-shard files list. This is the SOLE way to reattach `files`, which makes
     /// `files` the only per-shard field by construction.
     pub fn from_parts(common: CommonScanSpec, files: Vec<FileEntry>) -> Self {
-        Self {
-            table_root: common.table_root,
-            files,
-            projection: common.projection,
-            filter: common.filter,
-            limit: common.limit,
-            order_by: common.order_by,
-            aggregates: common.aggregates,
-            group_keys: common.group_keys,
-            distinct: common.distinct,
-            emit_exa_types: common.emit_exa_types,
-            logical_schema: common.logical_schema,
-            name_mapping: common.name_mapping,
-            join: common.join,
-            storage: common.storage,
-            df_target_partitions: common.df_target_partitions,
-            df_batch_size: common.df_batch_size,
-            df_threads_per_udf: common.df_threads_per_udf,
-            memory_pool_fraction: common.memory_pool_fraction,
-            instance_overhead_mb: common.instance_overhead_mb,
-            s3_max_connections: common.s3_max_connections,
-        }
+        Self { common, files }
     }
 
     /// Reconstitute a full `ScanSpec` from the two UDF arguments: the common blob
@@ -994,37 +828,39 @@ mod tests {
 
     fn sample_spec() -> ScanSpec {
         ScanSpec {
-            table_root: "s3://warehouse/db/table".into(),
+            common: CommonScanSpec {
+                table_root: "s3://warehouse/db/table".into(),
+                projection: vec!["id".into(), "name".into()],
+                filter: Some("(\"ID\" > 10)".into()),
+                limit: Some(100),
+                order_by: Vec::new(),
+                aggregates: None,
+                group_keys: None,
+                distinct: false,
+                emit_exa_types: Vec::new(),
+                logical_schema: Vec::new(),
+                name_mapping: Vec::new(),
+                join: None,
+                storage: StorageProps {
+                    endpoint: "http://minio:9000".into(),
+                    region: "us-east-1".into(),
+                    access_key: "minioadmin".into(),
+                    secret_key: "minioadmin".into(),
+                    session_token: None,
+                    allow_http: true,
+                    path_style: true,
+                },
+                df_target_partitions: 1,
+                df_batch_size: 8192,
+                df_threads_per_udf: 1,
+                memory_pool_fraction: 0.6,
+                instance_overhead_mb: 200,
+                s3_max_connections: 8,
+            },
             files: vec![
                 FileEntry::new("data/part-00000.parquet", 1024),
                 FileEntry::new("data/part-00001.parquet", 2048),
             ],
-            projection: vec!["id".into(), "name".into()],
-            filter: Some("(\"ID\" > 10)".into()),
-            limit: Some(100),
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: Vec::new(),
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: StorageProps {
-                endpoint: "http://minio:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "minioadmin".into(),
-                secret_key: "minioadmin".into(),
-                session_token: None,
-                allow_http: true,
-                path_style: true,
-            },
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         }
     }
 
@@ -1058,27 +894,27 @@ mod tests {
                 FileEntry::new("data/part-00001.parquet", 2048),
             ]
         );
-        assert_eq!(back.table_root, "s3://warehouse/db/table");
-        assert_eq!(back.projection, vec!["id", "name"]);
-        assert_eq!(back.filter.as_deref(), Some("(\"ID\" > 10)"));
-        assert_eq!(back.limit, Some(100));
+        assert_eq!(back.common.table_root, "s3://warehouse/db/table");
+        assert_eq!(back.common.projection, vec!["id", "name"]);
+        assert_eq!(back.common.filter.as_deref(), Some("(\"ID\" > 10)"));
+        assert_eq!(back.common.limit, Some(100));
 
         // Credentials survive the round-trip (they must reach the scan UDF).
-        assert_eq!(back.storage.endpoint, "http://minio:9000");
-        assert_eq!(back.storage.access_key, "minioadmin");
-        assert_eq!(back.storage.secret_key, "minioadmin");
-        assert!(back.storage.path_style);
-        assert!(back.storage.allow_http);
+        assert_eq!(back.common.storage.endpoint, "http://minio:9000");
+        assert_eq!(back.common.storage.access_key, "minioadmin");
+        assert_eq!(back.common.storage.secret_key, "minioadmin");
+        assert!(back.common.storage.path_style);
+        assert!(back.common.storage.allow_http);
     }
 
     #[test]
     fn optional_fields_omitted_when_none() {
         let mut spec = sample_spec();
-        spec.filter = None;
-        spec.limit = None;
-        spec.storage.session_token = None;
-        spec.aggregates = None;
-        spec.group_keys = None;
+        spec.common.filter = None;
+        spec.common.limit = None;
+        spec.common.storage.session_token = None;
+        spec.common.aggregates = None;
+        spec.common.group_keys = None;
         let json = spec.to_json();
         assert!(!json.contains("filter"));
         assert!(!json.contains("limit"));
@@ -1099,7 +935,7 @@ mod tests {
     fn emit_exa_types_round_trips_and_defaults_to_empty() {
         // Empty (default): the field is omitted from serialized JSON.
         let row_spec = sample_spec();
-        assert!(row_spec.emit_exa_types.is_empty());
+        assert!(row_spec.common.emit_exa_types.is_empty());
         let row_json = row_spec.to_json();
         assert!(
             !row_json.contains("emit_exa_types"),
@@ -1108,7 +944,7 @@ mod tests {
 
         // Non-empty: the declared EMITS types survive the round-trip in order.
         let mut spec = sample_spec();
-        spec.emit_exa_types = vec![
+        spec.common.emit_exa_types = vec![
             "DECIMAL(20,0)".to_string(),
             "VARCHAR(2000000)".to_string(),
             "DOUBLE PRECISION".to_string(),
@@ -1120,7 +956,7 @@ mod tests {
         );
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(
-            back.emit_exa_types,
+            back.common.emit_exa_types,
             vec![
                 "DECIMAL(20,0)".to_string(),
                 "VARCHAR(2000000)".to_string(),
@@ -1141,7 +977,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
-            legacy.emit_exa_types.is_empty(),
+            legacy.common.emit_exa_types.is_empty(),
             "missing emit_exa_types must default to empty (backward-compat)"
         );
     }
@@ -1159,7 +995,7 @@ mod tests {
 
         // Aggregate scan: round-trip with all supported kinds.
         let mut agg_spec = sample_spec();
-        agg_spec.aggregates = Some(vec![
+        agg_spec.common.aggregates = Some(vec![
             AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
@@ -1198,7 +1034,10 @@ mod tests {
         );
 
         let back = ScanSpec::from_json(&agg_json).unwrap();
-        let plans = back.aggregates.expect("aggregates must survive round-trip");
+        let plans = back
+            .common
+            .aggregates
+            .expect("aggregates must survive round-trip");
         assert_eq!(plans.len(), 6);
         assert_eq!(plans[0].kind, AggKind::Count);
         assert_eq!(plans[0].column, None);
@@ -1218,7 +1057,7 @@ mod tests {
     fn arg_expr_round_trips_and_omitted_when_none() {
         // A bare-column plan (arg_expr: None) must not carry the key at all.
         let mut agg_spec = sample_spec();
-        agg_spec.aggregates = Some(vec![AggregatePlan {
+        agg_spec.common.aggregates = Some(vec![AggregatePlan {
             kind: AggKind::Sum,
             column: Some("AMOUNT".into()),
             arg_expr: None,
@@ -1229,11 +1068,11 @@ mod tests {
             "arg_expr must be absent when None: {bare_json}"
         );
         let back = ScanSpec::from_json(&bare_json).unwrap();
-        assert_eq!(back.aggregates.unwrap()[0].arg_expr, None);
+        assert_eq!(back.common.aggregates.unwrap()[0].arg_expr, None);
 
         // An expression-argument plan carries the rendered SQL fragment and round-trips.
         let mut expr_spec = sample_spec();
-        expr_spec.aggregates = Some(vec![
+        expr_spec.common.aggregates = Some(vec![
             AggregatePlan {
                 kind: AggKind::Sum,
                 column: None,
@@ -1252,7 +1091,10 @@ mod tests {
         );
 
         let back = ScanSpec::from_json(&expr_json).unwrap();
-        let plans = back.aggregates.expect("aggregates must survive round-trip");
+        let plans = back
+            .common
+            .aggregates
+            .expect("aggregates must survive round-trip");
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].kind, AggKind::Sum);
         assert_eq!(plans[0].column, None);
@@ -1274,7 +1116,10 @@ mod tests {
             }
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
-        let legacy_plans = legacy.aggregates.expect("legacy aggregates must parse");
+        let legacy_plans = legacy
+            .common
+            .aggregates
+            .expect("legacy aggregates must parse");
         assert_eq!(
             legacy_plans[0].arg_expr, None,
             "missing arg_expr must default to None (backward-compat)"
@@ -1288,7 +1133,7 @@ mod tests {
     fn order_by_round_trips_and_defaults_to_empty() {
         // Empty (default): the field is omitted from serialized JSON.
         let row_spec = sample_spec();
-        assert!(row_spec.order_by.is_empty());
+        assert!(row_spec.common.order_by.is_empty());
         let row_json = row_spec.to_json();
         assert!(
             !row_json.contains("order_by"),
@@ -1298,7 +1143,7 @@ mod tests {
         // Non-empty: sort keys survive the round-trip, in order, with direction
         // and NULL placement intact.
         let mut spec = sample_spec();
-        spec.order_by = vec![
+        spec.common.order_by = vec![
             SortKey {
                 column: "L_EXTENDEDPRICE".to_string(),
                 ascending: false,
@@ -1317,23 +1162,23 @@ mod tests {
         );
 
         let back = ScanSpec::from_json(&json).unwrap();
-        assert_eq!(back.order_by, spec.order_by);
-        assert_eq!(back.order_by.len(), 2);
-        assert_eq!(back.order_by[0].column, "L_EXTENDEDPRICE");
-        assert!(!back.order_by[0].ascending);
-        assert!(back.order_by[0].nulls_last);
-        assert_eq!(back.order_by[1].column, "L_ORDERKEY");
-        assert!(back.order_by[1].ascending);
-        assert!(!back.order_by[1].nulls_last);
+        assert_eq!(back.common.order_by, spec.common.order_by);
+        assert_eq!(back.common.order_by.len(), 2);
+        assert_eq!(back.common.order_by[0].column, "L_EXTENDEDPRICE");
+        assert!(!back.common.order_by[0].ascending);
+        assert!(back.common.order_by[0].nulls_last);
+        assert_eq!(back.common.order_by[1].column, "L_ORDERKEY");
+        assert!(back.common.order_by[1].ascending);
+        assert!(!back.common.order_by[1].nulls_last);
 
         // Full-spec equality also holds (order_by participates in ScanSpec's PartialEq).
         assert_eq!(back, spec);
 
         // The split (to_common) / merge (from_parts) path threads order_by through.
         let common = spec.to_common();
-        assert_eq!(common.order_by, spec.order_by);
+        assert_eq!(common.order_by, spec.common.order_by);
         let merged = ScanSpec::from_parts(common, spec.files.clone());
-        assert_eq!(merged.order_by, spec.order_by);
+        assert_eq!(merged.common.order_by, spec.common.order_by);
 
         // A legacy payload without the field deserializes to an empty Vec.
         let legacy_json = r#"{
@@ -1348,7 +1193,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
-            legacy.order_by.is_empty(),
+            legacy.common.order_by.is_empty(),
             "missing order_by must default to empty (backward-compat)"
         );
 
@@ -1382,7 +1227,7 @@ mod tests {
 
         // Grouped scan: round-trip with Some group keys.
         let mut grouped_spec = sample_spec();
-        grouped_spec.group_keys = Some(vec![
+        grouped_spec.common.group_keys = Some(vec![
             "\"REGION\"".to_string(),
             "YEAR(\"EVENT_DATE\")".to_string(),
         ]);
@@ -1393,7 +1238,10 @@ mod tests {
         );
 
         let back = ScanSpec::from_json(&grouped_json).unwrap();
-        let keys = back.group_keys.expect("group_keys must survive round-trip");
+        let keys = back
+            .common
+            .group_keys
+            .expect("group_keys must survive round-trip");
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "\"REGION\"");
         assert_eq!(keys[1], "YEAR(\"EVENT_DATE\")");
@@ -1417,7 +1265,7 @@ mod tests {
     fn logical_schema_round_trips_and_defaults_to_empty() {
         // A spec with a populated logical_schema.
         let mut spec = sample_spec();
-        spec.logical_schema = vec![
+        spec.common.logical_schema = vec![
             LogicalField {
                 field_id: 1,
                 name: "id".to_string(),
@@ -1464,7 +1312,7 @@ mod tests {
 
         // Round-trip: all fields survive.
         let back = ScanSpec::from_json(&json).unwrap();
-        let fields = &back.logical_schema;
+        let fields = &back.common.logical_schema;
         assert_eq!(fields.len(), 5);
         assert_eq!(fields[0].field_id, 1);
         assert_eq!(fields[0].name, "id");
@@ -1481,7 +1329,7 @@ mod tests {
 
         // A spec without logical_schema must omit the field from JSON.
         let row_spec = sample_spec();
-        assert!(row_spec.logical_schema.is_empty());
+        assert!(row_spec.common.logical_schema.is_empty());
         let row_json = row_spec.to_json();
         assert!(
             !row_json.contains("logical_schema"),
@@ -1501,7 +1349,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
-            legacy.logical_schema.is_empty(),
+            legacy.common.logical_schema.is_empty(),
             "missing logical_schema must default to empty (backward-compat)"
         );
     }
@@ -1512,7 +1360,7 @@ mod tests {
     fn name_mapping_round_trips_and_defaults_to_empty() {
         // A spec with a populated name_mapping.
         let mut spec = sample_spec();
-        spec.name_mapping = vec![
+        spec.common.name_mapping = vec![
             NameMappingEntry {
                 name: "id".to_string(),
                 field_id: 1,
@@ -1532,7 +1380,7 @@ mod tests {
 
         // Round-trip: all entries survive.
         let back = ScanSpec::from_json(&json).unwrap();
-        let entries = &back.name_mapping;
+        let entries = &back.common.name_mapping;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "id");
         assert_eq!(entries[0].field_id, 1);
@@ -1541,7 +1389,7 @@ mod tests {
 
         // A spec without name_mapping must omit the field from JSON.
         let row_spec = sample_spec();
-        assert!(row_spec.name_mapping.is_empty());
+        assert!(row_spec.common.name_mapping.is_empty());
         let row_json = row_spec.to_json();
         assert!(
             !row_json.contains("name_mapping"),
@@ -1561,7 +1409,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
-            legacy.name_mapping.is_empty(),
+            legacy.common.name_mapping.is_empty(),
             "missing name_mapping must default to empty (backward-compat)"
         );
     }
@@ -1577,16 +1425,16 @@ mod tests {
     fn scan_spec_threading_fields_round_trip_and_default_to_one() {
         // 1. Explicit values round-trip.
         let mut spec = sample_spec();
-        spec.df_target_partitions = 4;
-        spec.df_threads_per_udf = 2;
+        spec.common.df_target_partitions = 4;
+        spec.common.df_threads_per_udf = 2;
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(
-            back.df_target_partitions, 4,
+            back.common.df_target_partitions, 4,
             "df_target_partitions must survive round-trip"
         );
         assert_eq!(
-            back.df_threads_per_udf, 2,
+            back.common.df_threads_per_udf, 2,
             "df_threads_per_udf must survive round-trip"
         );
 
@@ -1613,11 +1461,11 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
-            legacy.df_target_partitions, 1,
+            legacy.common.df_target_partitions, 1,
             "missing df_target_partitions must default to 1 (backward-compat)"
         );
         assert_eq!(
-            legacy.df_threads_per_udf, 1,
+            legacy.common.df_threads_per_udf, 1,
             "missing df_threads_per_udf must default to 1 (backward-compat)"
         );
     }
@@ -1631,11 +1479,11 @@ mod tests {
     fn df_batch_size_round_trips_and_defaults() {
         // 1. Explicit non-default value round-trips.
         let mut spec = sample_spec();
-        spec.df_batch_size = 4096;
+        spec.common.df_batch_size = 4096;
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(
-            back.df_batch_size, 4096,
+            back.common.df_batch_size, 4096,
             "df_batch_size must survive round-trip"
         );
 
@@ -1658,7 +1506,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
-            legacy.df_batch_size, 8192,
+            legacy.common.df_batch_size, 8192,
             "missing df_batch_size must default to 8192 (backward-compat)"
         );
     }
@@ -1672,16 +1520,16 @@ mod tests {
     fn scan_spec_memory_fields_round_trip_and_default() {
         // 1. Explicit non-default values round-trip.
         let mut spec = sample_spec();
-        spec.memory_pool_fraction = 0.5;
-        spec.instance_overhead_mb = 256;
+        spec.common.memory_pool_fraction = 0.5;
+        spec.common.instance_overhead_mb = 256;
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(
-            back.memory_pool_fraction, 0.5,
+            back.common.memory_pool_fraction, 0.5,
             "memory_pool_fraction must survive round-trip"
         );
         assert_eq!(
-            back.instance_overhead_mb, 256,
+            back.common.instance_overhead_mb, 256,
             "instance_overhead_mb must survive round-trip"
         );
 
@@ -1698,11 +1546,11 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
-            legacy.memory_pool_fraction, 0.6,
+            legacy.common.memory_pool_fraction, 0.6,
             "missing memory_pool_fraction must default to 0.6 (backward-compat)"
         );
         assert_eq!(
-            legacy.instance_overhead_mb, 200,
+            legacy.common.instance_overhead_mb, 200,
             "missing instance_overhead_mb must default to 200 (backward-compat)"
         );
     }
@@ -1718,11 +1566,11 @@ mod tests {
     fn s3_max_connections_round_trips_and_defaults() {
         // 1. Explicit non-default value round-trips.
         let mut spec = sample_spec();
-        spec.s3_max_connections = 32;
+        spec.common.s3_max_connections = 32;
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).unwrap();
         assert_eq!(
-            back.s3_max_connections, 32,
+            back.common.s3_max_connections, 32,
             "s3_max_connections must survive round-trip"
         );
 
@@ -1746,12 +1594,12 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
-            legacy.s3_max_connections,
+            legacy.common.s3_max_connections,
             default_s3_max_connections(),
             "missing s3_max_connections must default to the built-in budget (backward-compat)"
         );
         assert!(
-            legacy.s3_max_connections >= 1,
+            legacy.common.s3_max_connections >= 1,
             "default s3_max_connections must be clamped to at least 1"
         );
 
@@ -1780,7 +1628,7 @@ mod tests {
         );
         let merged = ScanSpec::from_parts(split, spec.files.clone());
         assert_eq!(
-            merged.s3_max_connections, 32,
+            merged.common.s3_max_connections, 32,
             "from_parts must carry s3_max_connections through the merge"
         );
     }
@@ -1828,7 +1676,7 @@ mod tests {
         // with table_root reattached from the common blob and files as tuples.
         let reconstituted = ScanSpec::from_parts_json(&common_json, &files_json).unwrap();
         assert_eq!(reconstituted, original);
-        assert_eq!(reconstituted.table_root, "s3://warehouse/db/table");
+        assert_eq!(reconstituted.common.table_root, "s3://warehouse/db/table");
         assert_eq!(
             reconstituted.files,
             vec![
@@ -1883,14 +1731,14 @@ mod tests {
     fn legacy_empty_root_treats_paths_as_absolute() {
         // Explicit table_root survives serialize -> deserialize on both spec kinds.
         let spec = sample_spec();
-        assert_eq!(spec.table_root, "s3://warehouse/db/table");
+        assert_eq!(spec.common.table_root, "s3://warehouse/db/table");
         let json = spec.to_json();
         assert!(
             json.contains(r#""table_root":"s3://warehouse/db/table""#),
             "non-empty table_root must appear in JSON: {json}"
         );
         let back = ScanSpec::from_json(&json).unwrap();
-        assert_eq!(back.table_root, "s3://warehouse/db/table");
+        assert_eq!(back.common.table_root, "s3://warehouse/db/table");
 
         let common = spec.to_common();
         let common_json = common.to_json();
@@ -1901,7 +1749,7 @@ mod tests {
 
         // An empty table_root is omitted from serialized JSON (skip_serializing_if).
         let mut rootless = sample_spec();
-        rootless.table_root = String::new();
+        rootless.common.table_root = String::new();
         let rootless_json = rootless.to_json();
         assert!(
             !rootless_json.contains("table_root"),
@@ -1922,7 +1770,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
-            legacy.table_root, "",
+            legacy.common.table_root, "",
             "missing table_root must default to empty (backward-compat; paths are absolute)"
         );
         assert_eq!(legacy.files, vec![FileEntry::new("s3://w/f0.parquet", 100)]);
@@ -1948,7 +1796,7 @@ mod tests {
             legacy_common,
             vec![FileEntry::new("s3://w/f0.parquet", 100)],
         );
-        assert_eq!(reconstituted.table_root, "");
+        assert_eq!(reconstituted.common.table_root, "");
     }
 
     /// Task 1.3(c): `catalog` no longer appears in any serialized JSON.
@@ -1975,7 +1823,7 @@ mod tests {
         // A non-join spec (join: None) must omit the field from serialized JSON on
         // both the full spec and the shard-invariant common blob.
         let spec = sample_spec();
-        assert!(spec.join.is_none());
+        assert!(spec.common.join.is_none());
         let json = spec.to_json();
         assert!(
             !json.contains("\"join\""),
@@ -2000,7 +1848,7 @@ mod tests {
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
-            legacy.join.is_none(),
+            legacy.common.join.is_none(),
             "missing join must default to None (backward-compat)"
         );
 
@@ -2119,7 +1967,7 @@ mod tests {
     #[test]
     fn join_block_round_trips_through_split_and_merge() {
         let mut spec = sample_spec();
-        spec.join = Some(JoinSpec {
+        spec.common.join = Some(JoinSpec {
             table_root: "s3://warehouse/db/dim".into(),
             files: vec![
                 FileEntry::new("data/dim-00000.parquet", 512),
@@ -2155,7 +2003,7 @@ mod tests {
         // The join block lives in the shard-invariant common part, so the dimension
         // files ride in the common blob (once), not per shard.
         let common = spec.to_common();
-        assert_eq!(common.join, spec.join);
+        assert_eq!(common.join, spec.common.join);
         let common_json = spec.to_common_json();
         assert!(
             common_json.contains("dim-00000.parquet"),
@@ -2173,6 +2021,7 @@ mod tests {
         let reconstituted = ScanSpec::from_parts_json(&common_json, &files_json).unwrap();
         assert_eq!(reconstituted, spec);
         let jb = reconstituted
+            .common
             .join
             .expect("join block must survive reconstitution");
         assert_eq!(jb.table_root, "s3://warehouse/db/dim");
@@ -2191,5 +2040,30 @@ mod tests {
         // The struct-level split/merge is equivalent to the JSON round-trip.
         let via_struct = ScanSpec::from_parts(spec.to_common(), spec.files.clone());
         assert_eq!(via_struct, spec);
+    }
+
+    /// The two-argument UDF wire (shard-invariant common blob + per-shard files
+    /// array) MUST stay byte-for-byte identical after `CommonScanSpec` was embedded
+    /// into `ScanSpec` via `#[serde(flatten)]`. Flatten reorders `ScanSpec`'s own
+    /// whole-struct serialization (`files` moves to the end), but production never
+    /// reconstitutes from a whole-`ScanSpec` JSON — it splits via `to_common_json()`
+    /// (which serializes `CommonScanSpec`, untouched) and `files_json()` (untouched).
+    /// This pins both against strings captured from the pre-flatten code, so any
+    /// future field reorder, dropped `skip_serializing_if`, or default drift in the
+    /// common blob or files list is caught as a byte diff.
+    #[test]
+    fn common_blob_wire_is_byte_stable() {
+        let spec = sample_spec();
+
+        let common_wire = r#"{"table_root":"s3://warehouse/db/table","projection":["id","name"],"filter":"(\"ID\" > 10)","limit":100,"storage":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}"#;
+        assert_eq!(spec.to_common_json(), common_wire);
+
+        let files_wire = r#"[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#;
+        assert_eq!(ScanSpec::files_json(&spec.files), files_wire);
+
+        // The common blob is structurally free of the per-shard `files` key and the
+        // adapter-only `catalog` key (the flatten preserves this guarantee).
+        assert!(!common_wire.contains("\"files\""));
+        assert!(!common_wire.contains("catalog"));
     }
 }

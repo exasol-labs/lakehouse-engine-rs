@@ -40,7 +40,7 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
 use lakehouse_engine::scan::{
     build_scan_runtime, read_scan_spec, run_raw_scan_with_session, run_scan_one,
     session_config_for_spec,
@@ -146,34 +146,36 @@ fn file_size(file_url: &str) -> u64 {
 fn spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: vec!["ID".into(), "NAME".into()],
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            table_root: String::new(),
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: false,
+            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                session_token: None,
+                allow_http: true,
+                path_style: true,
+            },
+            df_target_partitions: 1,
+            df_batch_size: 64,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
         },
-        df_target_partitions: 1,
-        df_batch_size: 64,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 
@@ -205,34 +207,36 @@ fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) 
 fn distinct_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: vec!["CATEGORY".into()],
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: true,
-        emit_exa_types: vec!["VARCHAR(2000000)".into()],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            table_root: String::new(),
+            projection: vec!["CATEGORY".into()],
+            filter: None,
+            limit: None,
+            order_by: Vec::new(),
+            aggregates: None,
+            group_keys: None,
+            distinct: true,
+            emit_exa_types: vec!["VARCHAR(2000000)".into()],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join: None,
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                session_token: None,
+                allow_http: true,
+                path_style: true,
+            },
+            df_target_partitions: 1,
+            df_batch_size: 64,
+            df_threads_per_udf: 1,
+            memory_pool_fraction: 0.6,
+            instance_overhead_mb: 200,
+            s3_max_connections: 8,
         },
-        df_target_partitions: 1,
-        df_batch_size: 64,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 
@@ -340,7 +344,7 @@ fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
     // Reconstitute this row's spec from the two scalar arguments, exactly as
     // production does — reading only columns 0 and 1, never calling ctx.next().
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
-    let rt = counting_build_runtime(reconstituted.df_threads_per_udf, built);
+    let rt = counting_build_runtime(reconstituted.common.df_threads_per_udf, built);
     let result = rt.block_on(run_scan_one(&mut ctx, reconstituted, local_session));
     result.expect("per-row scan");
     // Explicit, deterministic teardown of THIS call's runtime — the runtime is a
