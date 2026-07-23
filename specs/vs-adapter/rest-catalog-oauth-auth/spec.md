@@ -43,6 +43,18 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 * See `vs-adapter/connection-credentials` for credential parsing and the orthogonal,
   always-optional static-S3 fields, and `vs-adapter/pushdown-planning-cloud-credentials`
   for the SigV4, vended-credential, and orthogonality flows.
+* The OAuth2 client-credentials mode extends to a multi-warehouse catalog served
+  under a base-path prefix (the Lakekeeper shape), where the `warehouse` field is a
+  catalog-assigned name and the adapter resolves a per-warehouse `overrides.prefix`
+  from the catalog config endpoint; no new CONNECTION field is introduced.
+* The `prefix` config property is read from the MERGED config per the Iceberg REST
+  spec (a client merges the server's `defaults` base and `overrides`; `overrides`
+  wins). It may be served in either map: Databricks-style catalogs place it in
+  `overrides`, while Lakekeeper 0.13.1 serves the per-warehouse UUID prefix in
+  `defaults`. Reading only `overrides.prefix` yielded an empty prefix against
+  Lakekeeper and a malformed `loadTable` URL (missing the required warehouse
+  segment → HTTP 404); the adapter therefore prefers `overrides.prefix` and falls
+  back to `defaults.prefix`.
 
 ## Scenarios
 
@@ -78,3 +90,11 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
 * *AND* the `ScanSpec` SHALL carry no catalog identifier block at all — the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
 * *AND* each `ScanSpec` storage block SHALL carry only the S3 storage credentials — the vended STS credentials when `use_vended_credentials` is enabled and they were resolved, otherwise the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials`
+
+### Scenario: OAuth2 client-credentials path resolves tables from a multi-warehouse catalog served under a base path
+
+* *GIVEN* a virtual schema whose CONNECTION address is a REST catalog URI that includes a base path segment (for example `http://host:8181/catalog`), whose `warehouse` is a catalog-assigned warehouse NAME rather than an S3 URI, and whose credentials supply `client_id` and `client_secret` without enabling `use_sigv4`
+* *WHEN* the adapter resolves the file list through the unsigned catalog path
+* *THEN* the adapter SHALL fetch `GET {uri}/v1/config?warehouse={name}` authenticated by the OAuth2-derived bearer token and read the per-warehouse `prefix` from the merged config, preferring `overrides.prefix` and falling back to `defaults.prefix` (Lakekeeper serves the per-warehouse prefix in `defaults`)
+* *AND* the adapter SHALL address the subsequent `loadTable` request under `{uri}/v1/{prefix}/namespaces/{ns}/tables/{table}`, preserving the base path segment from the configured URI and accepting the warehouse-name as the warehouse identifier
+* *AND* the `client_secret` and the obtained bearer token MUST NOT appear in any returned SQL string or error message

@@ -345,6 +345,7 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
         path_style: true,
         use_sigv4: false,
         use_vended_credentials: false,
+        ..Default::default()
     };
     let bogus_uri = "http://does-not-exist.invalid:8181";
     let create_conn_sql =
