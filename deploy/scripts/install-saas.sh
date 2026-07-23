@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-command installer that provisions lakehouse-engine onto an Exasol SaaS database:
-# registers the Rust SLC, uploads and registers the engine .so plus its four scripts, and
+# registers the Rust SLC, uploads and registers the engine .so plus its three scripts, and
 # verifies the load with a fingerprint smoke test. Stops at a query-ready product install and
 # prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does NOT create catalog objects.
 #
@@ -636,10 +636,6 @@ ddl_scan() {
   printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))\nEMITS (...) AS\n%%udf_object %s' "$1" "$2"
 }
 
-ddl_distinct_merge_count() {
-  printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_DISTINCT_MERGE_COUNT(partials VARCHAR(2000000))\nRETURNS DECIMAL(20,0) AS\n%%udf_object %s' "$1" "$2"
-}
-
 ddl_distribute_files() {
   printf 'CREATE OR REPLACE LUA SET SCRIPT %s.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))\nEMITS (files VARCHAR(2000000)) AS\nfunction run(ctx)\n    repeat\n        ctx.emit(ctx.files)\n    until not ctx.next()\nend' "$1"
 }
@@ -719,7 +715,6 @@ create_engine_scripts() {
     "$(ddl_create_schema "$schema")"
     "$(ddl_adapter "$schema" "$so")"
     "$(ddl_scan "$schema" "$so")"
-    "$(ddl_distinct_merge_count "$schema" "$so")"
     "$(ddl_distribute_files "$schema")"
   )
   for stmt in "${statements[@]}"; do

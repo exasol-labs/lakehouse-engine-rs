@@ -146,7 +146,7 @@ Continue with [step 2](#2-create-the-scripts).
 ### 1c. Automated (SaaS): one command
 
 On Exasol SaaS, [`deploy/scripts/install-saas.sh`](../deploy/scripts/install-saas.sh) collapses the
-entire 1b flow — SLC registration, the presigned-URL upload of both tarballs, the four-script DDL at
+entire 1b flow — SLC registration, the presigned-URL upload of both tarballs, the three-script DDL at
 the SaaS `%udf_object` path, and the [fingerprint smoke test](#fingerprint-smoke-test-optional) —
 into one idempotent command. It stops at a query-ready product install and prints the
 [step 3](#3-create-the-catalog-connection) / [step 4](#4-create-the-virtual-schema) SQL as a
@@ -167,7 +167,7 @@ a shell variable to read into the `Authorization` header. Leaving it implicit, o
 the same line as `curl`, silently sends an empty token and fails confusingly downstream.
 
 To pin a specific script version instead of the default branch, append `?ref=<version>` (a tag,
-branch, or commit SHA) to the Contents API URL, e.g. `.../install-saas.sh?ref=v0.26.3` — the
+branch, or commit SHA) to the Contents API URL, e.g. `.../install-saas.sh?ref=v0.26.4` — the
 reason this uses the GitHub Contents API rather than a plain release-asset URL is exactly to keep
 this pinning capability available.
 

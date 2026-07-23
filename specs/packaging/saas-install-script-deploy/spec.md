@@ -1,7 +1,7 @@
 # Feature: SaaS Install Script — Artifact Deploy, Verification, and Stdin Safety
 
 The SaaS installer uploads the engine and SLC tarballs through the SaaS presigned-URL
-dance, creates the four product scripts at the SaaS `%udf_object` path, verifies the load
+dance, creates the three product scripts at the SaaS `%udf_object` path, verifies the load
 with a fingerprint smoke test, and stops at a query-ready product install — printing the
 next-step `CREATE CONNECTION` / `CREATE VIRTUAL SCHEMA` SQL as a template rather than
 creating dataset-specific catalog objects. It also defines the subprocess-stdin discipline
@@ -34,10 +34,11 @@ read-modify-write that runs before this stage.
   raises it for every hard Rust-UDF error (`vs-adapter/pushdown-planning-join-fallback`), and the
   scan-spec deserialization error is deliberately not a fixed string
   (`datafusion-scan/scan-execution-spec-reconstitution`), so neither is a matchable literal.
-* All four scripts are created in one schema (default `LHVS`): `LAKEHOUSE_ADAPTER`
-  (RUST ADAPTER), `LAKEHOUSE_SCAN` (RUST SCALAR, dynamic `EMITS (...)`),
-  `LAKEHOUSE_DISTINCT_MERGE_COUNT` (RUST SCALAR, `RETURNS DECIMAL(20,0)`), and
-  `LAKEHOUSE_DISTRIBUTE_FILES` (LUA SET passthrough).
+* All three scripts are created in one schema (default `LHVS`): `LAKEHOUSE_ADAPTER`
+  (RUST ADAPTER), `LAKEHOUSE_SCAN` (RUST SCALAR, dynamic `EMITS (...)`), and
+  `LAKEHOUSE_DISTRIBUTE_FILES` (LUA SET passthrough). There is no scalar merge UDF: single-group
+  `COUNT(DISTINCT)` is merged by an outer Exasol-native `COUNT(DISTINCT)` over the per-shard
+  DISTINCT row-scan fan-out, not by a dedicated RUST script.
 * CONFIRMED LIVE (against Exasol SaaS staging): the SaaS files-endpoint POST response
   HTML-escapes the presigned URL's `&` query-parameter separators as their JSON numeric escape
   sequence, the same default behavior as Go's `encoding/json` `Marshal`. The no-jq, bash-regex
@@ -68,18 +69,18 @@ read-modify-write that runs before this stage.
 * *AND* the script SHALL follow the GitHub redirect to the signed storage host with curl `-L`, and MUST NOT forward the `Authorization` header to that host (curl's default `-L` behavior, never `--location-trusted`), because the signed URL carries its own credentials and rejects a second authentication mechanism
 * *AND* WHEN the asset `name` is absent from the release JSON, or the asset download fails, THEN the script MUST exit non-zero with a message naming the repository, the tag, and the asset
 
-### Scenario: Four scripts are created at the SaaS path with correct script types
+### Scenario: Three scripts are created at the SaaS path with correct script types
 
 * *GIVEN* the engine `.so` has been uploaded to the SaaS bucket
 * *WHEN* the script creates the deployment DDL
-* *THEN* the script SHALL create all four scripts in the target schema (default `LHVS`) referencing the SaaS `%udf_object` path `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so`
+* *THEN* the script SHALL create all three scripts in the target schema (default `LHVS`) referencing the SaaS `%udf_object` path `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so`
 * *AND* `LAKEHOUSE_SCAN` MUST be a RUST SCALAR SCRIPT with a dynamic `EMITS (...)` declaration, never a SET SCRIPT and never a static EMITS
-* *AND* `LAKEHOUSE_DISTINCT_MERGE_COUNT` MUST be a RUST SCALAR SCRIPT declared `RETURNS DECIMAL(20,0)`, and `LAKEHOUSE_DISTRIBUTE_FILES` MUST be a LUA SET passthrough script
+* *AND* `LAKEHOUSE_DISTRIBUTE_FILES` MUST be a LUA SET passthrough script
 * *AND* the DDL SHALL use `CREATE SCHEMA IF NOT EXISTS` and `CREATE OR REPLACE ... SCRIPT` so a re-run neither errors nor duplicates any script
 
 ### Scenario: Fingerprint smoke test decides install success
 
-* *GIVEN* the four scripts have been created
+* *GIVEN* the three scripts have been created
 * *WHEN* the script runs the two-argument fingerprint smoke query `SELECT LHVS.LAKEHOUSE_SCAN('x','y') EMITS (r VARCHAR(2000000)) FROM (SELECT 1)`
 * *THEN* WHEN the response contains the substring `Fingerprint mismatch` THEN the script MUST fail the install non-zero and instruct the user to align the registered SLC version with the release's `exasol-udf-sdk`/`exasol-udf-macros` pin
 * *AND* WHEN the query returns any other error THEN the script SHALL treat the smoke test as passed, because the placeholder arguments `'x'`/`'y'` are intentionally not a valid scan spec, so any non-fingerprint error is the expected and correct outcome

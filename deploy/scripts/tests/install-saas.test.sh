@@ -700,22 +700,20 @@ test_saas_verify_listed_quoted_match() {
   assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
 }
 
-test_four_scripts_ddl_saas_path_types() {
-  echo "== test_four_scripts_ddl_saas_path_types =="
+test_three_scripts_ddl_saas_path_types() {
+  echo "== test_three_scripts_ddl_saas_path_types =="
   # Unit: DDL string shapes.
-  local scan dmc dist adapter schema
+  local scan dist adapter schema
   scan="$( source "$INSTALLER"; ddl_scan LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "scan is RUST SCALAR" "$scan" "RUST SCALAR SCRIPT"
   assert_contains "scan uses dynamic EMITS" "$scan" "EMITS (...)"
   assert_not_contains "scan is never a SET script" "$scan" "SET SCRIPT"
-  dmc="$( source "$INSTALLER"; ddl_distinct_merge_count LHVS /x.so )"
-  assert_contains "distinct-merge RETURNS DECIMAL(20,0)" "$dmc" "RETURNS DECIMAL(20,0)"
   dist="$( source "$INSTALLER"; ddl_distribute_files LHVS )"
   assert_contains "distribute is LUA SET" "$dist" "LUA SET SCRIPT"
   adapter="$( source "$INSTALLER"; ddl_adapter LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "adapter references SaaS %udf_object path" "$adapter" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
 
-  # Integration: the four scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
+  # Integration: the three scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "ddl: install succeeds" "$LAST_RC"
@@ -724,8 +722,6 @@ test_four_scripts_ddl_saas_path_types() {
   assert_contains "ddl: LAKEHOUSE_ADAPTER RUST ADAPTER" "$log" "RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER"
   assert_contains "ddl: LAKEHOUSE_SCAN RUST SCALAR" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN"
   assert_contains "ddl: dynamic EMITS on scan" "$log" "EMITS (...)"
-  assert_contains "ddl: DISTINCT_MERGE_COUNT DECIMAL(20,0)" "$log" "LHVS.LAKEHOUSE_DISTINCT_MERGE_COUNT"
-  assert_contains "ddl: DISTINCT_MERGE_COUNT RETURNS DECIMAL(20,0)" "$log" "RETURNS DECIMAL(20,0)"
   assert_contains "ddl: DISTRIBUTE_FILES LUA SET" "$log" "LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "ddl: uses CREATE OR REPLACE" "$log" "CREATE OR REPLACE"
 }
@@ -871,7 +867,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_contains "stdin-piped: release-by-tag asset id lookup reached (releases/tags)" "$log" "releases/tags/"
   assert_contains "stdin-piped: release asset downloaded (releases/assets)" "$log" "releases/assets/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
-  assert_contains "stdin-piped: four scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
+  assert_contains "stdin-piped: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_SCAN('x', 'y')"
 
   # Per-subprocess proof that stdin is redirected from /dev/null: run in file mode with a sentinel
@@ -908,7 +904,7 @@ main() {
   test_release_asset_download_via_rest
   test_extract_asset_id_by_name_realistic
   test_saas_verify_listed_quoted_match
-  test_four_scripts_ddl_saas_path_types
+  test_three_scripts_ddl_saas_path_types
   test_fingerprint_smoke_pass_and_fail
   test_stops_at_product_prints_template
   test_target_base_default_and_override
