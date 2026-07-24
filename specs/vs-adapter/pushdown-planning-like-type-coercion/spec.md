@@ -1,26 +1,28 @@
-# Feature: Pushdown Planning
+# Feature: Pushdown Planning — LIKE Type Coercion
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and any supported aggregate, and emits the SQL that drives the DataFusion scan.
+Makes pushed-down `LIKE` and `REGEXP_LIKE` predicates type-aware in the single-table pushdown
+path (see `vs-adapter/pushdown-planning`'s "Filter predicate is pushed into the scan spec"
+scenario, which this feature specializes). A LIKE predicate's `column` subject never carries a
+`dataType` on the wire, and DataFusion performs no implicit non-string-to-VARCHAR coercion the
+way Exasol does — so a pushed-down LIKE over a non-string column previously hard-failed the
+DataFusion scan at execution time. This feature dispatches on the column's Exasol type, read from
+`involvedTables[0].columns`, before rendering the filter: string subjects pass through unchanged,
+DATE subjects are rewrapped in an explicit CAST-to-VARCHAR, and every other non-string subject
+declines pushdown of the whole top-level filter so Exasol evaluates it natively. This is a
+single-table scan-spec-filter-path fix only; the broadcast-join per-leg filter path
+(`crates/lakehouse-engine/src/adapter/pushdown/joins/sql_builders.rs`) and the SELECT-list/
+projection path have the same latent gap and are tracked separately (issues #215 and #219).
 
 ## Background
 
-* A predicate node the adapter cannot faithfully translate is OMITTED from the scan spec; Exasol keeps and evaluates the predicate itself as a correctness backstop.
 * A LIKE predicate's `column` subject carries no `dataType` on the wire; column Exasol types are read from `involvedTables[0].columns`.
+* The type dispatch and rewrite happen in the adapter (`pushdown/support.rs`), not in `vs-expression`, because `vs-expression` is a pure syntactic JSON-to-SQL translator with no external column-type context and is shared with a sibling VS-adapter project.
+* The rewrite (or decline) applies ONLY to the JSON tree fed to the DataFusion filter renderer; the raw filter tree forwarded to Iceberg file pruning is left untouched.
+* A non-string LIKE subject anywhere in the filter tree declines the WHOLE top-level filter (not just the offending conjunct), mirroring the existing all-or-nothing untranslatable-predicate correctness backstop — Exasol then evaluates the entire predicate natively.
+* The DATE CAST-to-VARCHAR is Exasol-faithful only under the default `NLS_DATE_FORMAT` (`YYYY-MM-DD`); a session with an altered NLS date format is an accepted, tracked exception (#216), not a silent gap.
 
 ## Scenarios
 
-<!-- DELTA:CHANGED -->
-### Scenario: Filter predicate is pushed into the scan spec
-
-* *GIVEN* a query with a WHERE predicate over a supported column and operator
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, omitting (never mistranslating) any node it cannot render
-* *AND* before translating a `predicate_like` or `predicate_like_regexp` whose subject is a bare `column` node, the adapter SHALL apply the type-aware LIKE rule (see the LIKE scenarios below), because DataFusion performs no implicit non-string-to-VARCHAR coercion and would hard-fail the scan on a LIKE over a non-string column
-* *AND* the adapter SHALL ALSO translate the soundly-translatable conjuncts into an `iceberg::expr::Predicate` applied to the Iceberg table scan as a file-pruning filter, dropping any node it cannot translate soundly rather than skipping a file that could match
-* *AND* the DataFusion scan SHALL always apply the full common-spec filter, so the Iceberg pruning filter only narrows which files are opened and never changes the result set
-<!-- /DELTA:CHANGED -->
-
-<!-- DELTA:NEW -->
 ### Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged
 
 * *GIVEN* a `pushdown` request whose filter carries a `predicate_like` or `predicate_like_regexp` whose `expression` is a bare `column` node
@@ -77,4 +79,3 @@ Translates an Exasol query against the virtual schema into a pushdown plan: it r
 * *WHEN* the adapter builds the DataFusion scan-spec filter
 * *THEN* the adapter SHALL decline pushdown of the whole top-level filter, not only the offending conjunct, mirroring the all-or-nothing untranslatable-predicate backstop
 * *AND* a DATE-column LIKE nested in the same connectives SHALL instead be rewritten in place to its CAST-to-VARCHAR form while the surrounding tree is preserved
-<!-- /DELTA:NEW -->
