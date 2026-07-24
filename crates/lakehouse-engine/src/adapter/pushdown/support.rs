@@ -948,7 +948,13 @@ pub(super) fn exasol_type_from_json(dt: &Json) -> String {
             if with_local_time_zone {
                 "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
             } else {
-                "TIMESTAMP".to_string()
+                match dt
+                    .get("fractionalSecondsPrecision")
+                    .and_then(|v| v.as_u64())
+                {
+                    Some(p) => format!("TIMESTAMP({p})"),
+                    None => "TIMESTAMP".to_string(),
+                }
             }
         }
         _ => {
@@ -1032,6 +1038,38 @@ mod tests {
 
         let ts = serde_json::json!({"type": "timestamp"});
         assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
+    }
+
+    /// `exasol_type_from_json` must read `fractionalSecondsPrecision` back off a
+    /// `{"type":"timestamp", ...}` dataType JSON and render it as `TIMESTAMP(p)` — the
+    /// field is `fractionalSecondsPrecision`, not `precision` (that key is
+    /// DECIMAL/INTERVAL-only in Exasol's data-type API). Absent precision still falls
+    /// back to bare `TIMESTAMP`, and `withLocalTimeZone: true` still takes precedence
+    /// over precision (no `(p)` suffix on WLTZ), matching issue #212's collapse-point-1
+    /// fix.
+    #[test]
+    fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
+        let ts0 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
+        assert_eq!(exasol_type_from_json(&ts0), "TIMESTAMP(0)");
+
+        let ts6 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 6});
+        assert_eq!(exasol_type_from_json(&ts6), "TIMESTAMP(6)");
+
+        let ts9 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 9});
+        assert_eq!(exasol_type_from_json(&ts9), "TIMESTAMP(9)");
+
+        let ts_absent = serde_json::json!({"type": "timestamp"});
+        assert_eq!(exasol_type_from_json(&ts_absent), "TIMESTAMP");
+
+        let tstz_with_precision = serde_json::json!({
+            "type": "timestamp",
+            "withLocalTimeZone": true,
+            "fractionalSecondsPrecision": 7
+        });
+        assert_eq!(
+            exasol_type_from_json(&tstz_with_precision),
+            "TIMESTAMP WITH LOCAL TIME ZONE"
+        );
     }
 
     /// `exasol_type_from_json` must read the `characterSet` field back off a
