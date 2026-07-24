@@ -39,6 +39,16 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
   tokens) MUST NEVER appear in any returned SQL string or error message.
 * See `vs-adapter/pushdown-planning` for the base pushdown planning scenarios and
   `vs-adapter/rest-catalog-oauth-auth` for the catalog-auth modes.
+* Vended-credential resolution extends to an S3-compatible object store (MinIO
+  behind Lakekeeper) whose endpoint is not the AWS default: the adapter adopts the
+  vended `s3.endpoint` and `s3.path-style-access` in addition to the vended
+  `client.region`, so a vended CONNECTION that carries no static S3 endpoint of its
+  own can still reach the correct store. Surfaced as a genuine interop gap against a
+  real Lakekeeper 0.13.1 + MinIO stack: the vended `loadTable` config carries
+  `s3.endpoint` (e.g. `http://minio:9000/`) and `s3.path-style-access` (`true`), but
+  the adapter previously preserved only the static endpoint/path-style, so the S3
+  client defaulted to AWS and MinIO was unreachable. AWS S3 omits these config keys,
+  so absence preserves the static values and the Glue vended path is unchanged.
 
 ## Scenarios
 
@@ -93,6 +103,9 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *THEN* the adapter SHALL send the `X-Iceberg-Access-Delegation: vended-credentials` request header so spec-compliant catalogs return vended credentials
 * *AND* when the `loadTable` response config carries a `client.region` value, the adapter SHALL set the per-shard scan-spec storage `region` to that vended region
 * *AND* when no `client.region` is present, the adapter SHALL preserve the static `region` from the CONNECTION
+* *AND* when the `loadTable` response config carries an `s3.endpoint` value, the adapter SHALL set the per-shard scan-spec storage `endpoint` to that vended endpoint; when absent, the adapter SHALL preserve the static `endpoint` from the CONNECTION
+* *AND* when the `loadTable` response config carries an `s3.path-style-access` value parseable as a boolean, the adapter SHALL set the per-shard scan-spec storage `path_style` to it; when absent or unparseable, the adapter SHALL preserve the static `path_style`
+* *AND* the vended endpoint and path-style SHALL be read with the same precedence as the vended keys — the longest-matching `storage_credentials` entry's config, falling back to the flat `config` map
 
 ### Scenario: Static credentials are used for data files when vending is disabled
 

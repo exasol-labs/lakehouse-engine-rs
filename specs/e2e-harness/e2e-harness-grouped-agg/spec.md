@@ -3,15 +3,15 @@
 End-to-end scenarios covering grouped-aggregate and nested-aggregate correctness against
 a local Exasol Docker container: single-key and multi-key GROUP BY, expression group
 keys, grouped AVG, high-cardinality spill, and a nested aggregate over a grouped
-sub-select. Split out of `packaging/e2e-harness` to keep that feature's core
+sub-select. Split out of `e2e-harness/e2e-harness` to keep that feature's core
 projection/filter/LIMIT/file-pruning scenarios separate from aggregate-specific ones. See
-`packaging/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately place
+`e2e-harness/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately place
 an aggregate before, between, or after the group keys in the `selectList`.
 
 ## Background
 
 * Every E2E scenario runs against a local Exasol Docker container over MinIO and MUST fail (never skip) when the stack is unavailable.
-* See `packaging/e2e-harness` for the core projection/filter/LIMIT and file-pruning E2E scenarios and the harness's script-provisioning scenario.
+* See `e2e-harness/e2e-harness` for the core projection/filter/LIMIT and file-pruning E2E scenarios and the harness's script-provisioning scenario.
 
 ## Scenarios
 

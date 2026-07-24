@@ -503,6 +503,7 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         path_style: true,
         use_sigv4: false,
         use_vended_credentials: false,
+        ..Default::default()
     };
     let bogus_uri = "http://does-not-exist.invalid:8181";
     let replace_conn_sql =
