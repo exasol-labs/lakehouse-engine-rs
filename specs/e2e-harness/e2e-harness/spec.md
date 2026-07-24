@@ -5,7 +5,7 @@ through the adapter and scan UDF to Iceberg Parquet files in MinIO — verifying
 correctness of projection, filter, and Iceberg file-pruning pushdown against a local
 Exasol Docker container. The harness installs `LAKEHOUSE_SCAN` as a SCALAR EMIT script
 and `LAKEHOUSE_DISTRIBUTE_FILES` as a LUA SET distributor script. See
-`packaging/e2e-harness-grouped-agg` for grouped-aggregate and nested-aggregate E2E
+`e2e-harness/e2e-harness-grouped-agg` for grouped-aggregate and nested-aggregate E2E
 scenarios.
 
 ## Background
@@ -15,7 +15,7 @@ scenarios.
 * All DSN/connection strings MUST include `validateservercertificate=0`.
 * The file-pruning E2E seeds a partitioned Iceberg table whose data files are distributed
   across partition values, so a partition-column predicate can prune whole files.
-* See `packaging/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately
+* See `e2e-harness/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately
   place an aggregate before, between, or after the group keys in the `selectList` — the
   arrangement every case in this spec avoids.
 * The provisioning helpers (SLC install, `.so` upload, script and Virtual Schema creation)
@@ -53,7 +53,7 @@ scenarios.
 * *WHEN* the harness creates the scan-path scripts
 * *THEN* the harness SHALL create `LAKEHOUSE_SCAN` as a SCALAR SCRIPT (EMITS its dynamic output columns) referencing the uploaded `.so`
 * *AND* the harness SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a LUA SET SCRIPT that passes each shard's `files` VARCHAR through unchanged, referencing no `.so`
-* *AND* an end-to-end projection/filter query over the installed scripts SHALL return results identical to the single-node DataFusion equivalent (grouped/nested-aggregate coverage lives in `packaging/e2e-harness-grouped-agg`)
+* *AND* an end-to-end projection/filter query over the installed scripts SHALL return results identical to the single-node DataFusion equivalent (grouped/nested-aggregate coverage lives in `e2e-harness/e2e-harness-grouped-agg`)
 * *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
 
 ### Scenario: End-to-end filtered query over a partitioned table returns correct rows with file pruning

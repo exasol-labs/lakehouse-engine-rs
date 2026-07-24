@@ -55,9 +55,12 @@ use iceberg::{
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::{
+    AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
+};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
+use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
 
 /// Namespace and table names for the E2E seed tables.
 pub const E2E_NAMESPACE: &str = "e2e_lakehouse";
@@ -129,13 +132,85 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     Ok(events_handle)
 }
 
-/// Build a REST catalog client for seed operations.
-pub async fn build_seed_catalog(
+/// Optional authentication for a seed catalog. `Default` (`None`) reproduces
+/// the unauthenticated, static-MinIO-credential baseline that
+/// [`build_seed_catalog`] shipped before Lakekeeper support.
+///
+/// A non-empty `token` is sent to the REST catalog as a static bearer
+/// credential. This is the only catalog-auth mode the Lakekeeper E2E suite uses:
+/// its setup obtains a bearer token from Keycloak's client-credentials grant and
+/// passes it here. (The suite does NOT drive the REST client's own OAuth2
+/// client-credentials flow for seeding, nor does it override S3 storage
+/// credentials — the storage credentials are forced static unconditionally by
+/// [`build_seed_catalog_with_auth`]; see there for why.)
+#[derive(Clone, Default)]
+pub struct SeedCatalogAuth {
+    pub token: Option<String>,
+}
+
+// REST-catalog auth property key (literal string, fixed by `iceberg-catalog-rest`;
+// the crate exports no constant for it). It flows through
+// `RestCatalogBuilder::load`, which copies every prop except `uri`/`warehouse`.
+const REST_CATALOG_PROP_TOKEN: &str = "token";
+
+/// Resolve the static S3 storage config `(endpoint, region, access_key,
+/// secret_key, path_style)` for a seed catalog: always the static MinIO baseline
+/// (`minioadmin`/`minioadmin`, host MinIO URL, `us-east-1`, path-style). Shared by
+/// [`seed_catalog_props`] (props map) and [`build_seed_catalog_with_auth`] (the
+/// forced static-credential loader) so both derive the same credentials from one
+/// place.
+fn seed_storage_config() -> (String, String, String, String, bool) {
+    (
+        super::stack::minio_url(),
+        "us-east-1".to_string(),
+        "minioadmin".to_string(),
+        "minioadmin".to_string(),
+        true,
+    )
+}
+
+/// A [`ProvideCredential`] that always returns fixed static S3 credentials with no
+/// session token.
+///
+/// Installed on the seed catalog's S3 storage factory so seeding signs every
+/// object-store request with the static admin credentials, regardless of any
+/// per-table credentials the catalog vends. See [`build_seed_catalog_with_auth`]
+/// for why this is required against Lakekeeper's `sts-enabled` warehouse.
+#[derive(Debug)]
+struct StaticS3CredentialProvider {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl ProvideCredential for StaticS3CredentialProvider {
+    type Credential = AwsCredential;
+
+    async fn provide_credential(
+        &self,
+        _ctx: &ReqsignContext,
+    ) -> ReqsignResult<Option<Self::Credential>> {
+        Ok(Some(AwsCredential {
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            // No session token: this is a long-lived root credential, not STS.
+            // A `None` `expires_in` marks the credential permanently valid
+            // (reqsign `SigningCredential::is_valid`).
+            ..Default::default()
+        }))
+    }
+}
+
+/// Build the REST-catalog property map for a seed catalog from `auth`.
+///
+/// Pure (no I/O) so the credential/storage wiring is unit-testable without a
+/// live catalog. Storage is the static MinIO baseline; catalog auth is a static
+/// bearer `token` when supplied (non-empty), otherwise none.
+fn seed_catalog_props(
     catalog_url: &str,
     warehouse: &str,
-    label: &str,
-) -> Result<impl Catalog> {
-    let s3_endpoint = super::stack::minio_url();
+    auth: &SeedCatalogAuth,
+) -> HashMap<String, String> {
+    let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
 
     let mut props = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_url.to_string());
@@ -143,15 +218,70 @@ pub async fn build_seed_catalog(
         REST_CATALOG_PROP_WAREHOUSE.to_string(),
         warehouse.to_string(),
     );
-    props.insert(S3_ENDPOINT.to_string(), s3_endpoint);
-    props.insert(S3_REGION.to_string(), "us-east-1".to_string());
-    props.insert(S3_ACCESS_KEY_ID.to_string(), "minioadmin".to_string());
-    props.insert(S3_SECRET_ACCESS_KEY.to_string(), "minioadmin".to_string());
-    props.insert(S3_PATH_STYLE_ACCESS.to_string(), "true".to_string());
+    props.insert(S3_ENDPOINT.to_string(), endpoint);
+    props.insert(S3_REGION.to_string(), region);
+    props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
+    props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
+    props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
+
+    if let Some(token) = auth.token.as_deref().filter(|v| !v.is_empty()) {
+        props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
+    }
+
+    props
+}
+
+/// Build an unauthenticated REST catalog client for seed operations, using the
+/// static MinIO credentials that back the baseline `iceberg-rest-fixture`.
+///
+/// Thin wrapper over [`build_seed_catalog_with_auth`] with no catalog auth —
+/// every existing seed call site uses this unchanged.
+pub async fn build_seed_catalog(
+    catalog_url: &str,
+    warehouse: &str,
+    label: &str,
+) -> Result<impl Catalog> {
+    build_seed_catalog_with_auth(catalog_url, warehouse, label, SeedCatalogAuth::default()).await
+}
+
+/// Build a REST catalog client for seed operations with explicit `auth`.
+///
+/// Extends [`build_seed_catalog`] so seeding can target an OAuth2-secured
+/// Lakekeeper warehouse via a static bearer catalog-auth token.
+/// `SeedCatalogAuth::default()` reproduces the unauthenticated static-MinIO
+/// baseline exactly.
+pub async fn build_seed_catalog_with_auth(
+    catalog_url: &str,
+    warehouse: &str,
+    label: &str,
+    auth: SeedCatalogAuth,
+) -> Result<impl Catalog> {
+    let props = seed_catalog_props(catalog_url, warehouse, &auth);
+
+    // Force the STATIC S3 credentials for ALL storage I/O, overriding whatever the
+    // catalog vends per-table. Lakekeeper's `sts-enabled` (vended) warehouse
+    // returns short-lived STS session-token credentials in each table's
+    // `loadTable`/`config` response, and iceberg-catalog-rest merges that config
+    // OVER the static builder props (`RestCatalog::load_file_io`: `props.extend(
+    // config)`), so the seed WRITE path would otherwise sign with the vended
+    // session token — which MinIO rejects with `InvalidTokenId`. Installing a
+    // `CustomAwsCredentialLoader` makes opendal's S3 backend use this
+    // credential-provider chain in place of the config-derived credentials (a
+    // user-supplied chain REPLACES the default/static provider), so seeding always
+    // writes with the static admin credentials regardless of the warehouse's
+    // vended-creds flag. The static warehouse never vends creds, so its seeding
+    // behavior is unchanged (the loader returns the same `minioadmin` credentials
+    // the props already carried). This is a seed-harness-only override; the
+    // adapter's own read path handles vended credentials correctly.
+    let (_, _, access_key, secret_key, _) = seed_storage_config();
+    let credential_loader = CustomAwsCredentialLoader::new(StaticS3CredentialProvider {
+        access_key_id: access_key,
+        secret_access_key: secret_key,
+    });
 
     RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
+            customized_credential_load: Some(credential_loader),
         }))
         .load(label, props)
         .await
@@ -321,7 +451,28 @@ async fn write_one_file_append(
 
 /// Seed only the events table into the REST catalog. Idempotent.
 async fn seed_events_table(catalog_url: &str, warehouse: &str) -> Result<SeedHandle> {
-    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed").await?;
+    seed_events_table_with_auth(catalog_url, warehouse, SeedCatalogAuth::default()).await
+}
+
+/// Seed the baseline `events` table into `warehouse` through a REST catalog built
+/// with `auth`, then return the committed data-file paths.
+///
+/// This is the authenticated seeding entry point for the Lakekeeper E2E suite: it
+/// creates the `e2e_lakehouse` namespace (if absent) and appends the SAME 20-row,
+/// two-file events data (`SEED_TOTAL_ROWS`, `SEED_ROWS_SCORE_GT_15`) the
+/// unauthenticated baseline produces, so the Lakekeeper scan tests can assert
+/// against identical known values. Group C's setup calls this once per warehouse
+/// (static + vended), passing a static bearer token in `auth`; Lakekeeper
+/// negotiates the per-warehouse routing prefix from `GET /v1/config?warehouse=`, so
+/// only the warehouse NAME is needed here. Idempotent per warehouse. With
+/// `SeedCatalogAuth::default()` this is exactly the original baseline seed.
+pub async fn seed_events_table_with_auth(
+    catalog_url: &str,
+    warehouse: &str,
+    auth: SeedCatalogAuth,
+) -> Result<SeedHandle> {
+    let catalog =
+        build_seed_catalog_with_auth(catalog_url, warehouse, "lakehouse-e2e-seed", auth).await?;
 
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
     let table_ident = TableIdent::new(ns.clone(), E2E_TABLE.to_string());
@@ -1314,7 +1465,7 @@ async fn write_one_partitioned_file<C: Catalog>(
 // Schema-evolution table (evo) — reproduces issue #26 (rename by field-id)
 // ---------------------------------------------------------------------------
 //
-// iceberg-rust 0.9.1 exposes NO schema-evolution API (the `transaction` module
+// iceberg-rust 0.10.0 exposes NO schema-evolution API (the `transaction` module
 // has only append/snapshot/sort_order/location/properties/statistics/format
 // actions, and `TableCommit`'s builder is `pub(crate)`). So the rename step is
 // applied out-of-band via a raw Iceberg REST commit (`add-schema` +
@@ -2688,4 +2839,87 @@ pub async fn rest_replace_current_schema(
         anyhow::bail!("REST schema-replace commit failed ({status}): {text}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod seed_catalog_props_tests {
+    use super::*;
+    use iceberg::io::{
+        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    };
+    use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE};
+
+    fn get<'a>(props: &'a std::collections::HashMap<String, String>, key: &str) -> Option<&'a str> {
+        props.get(key).map(String::as_str)
+    }
+
+    #[test]
+    fn default_auth_uses_static_minio_and_injects_no_catalog_auth() {
+        let props = seed_catalog_props("http://lk:8181/catalog", "wh", &SeedCatalogAuth::default());
+
+        assert_eq!(
+            get(&props, REST_CATALOG_PROP_URI),
+            Some("http://lk:8181/catalog")
+        );
+        assert_eq!(get(&props, REST_CATALOG_PROP_WAREHOUSE), Some("wh"));
+        assert_eq!(get(&props, S3_ACCESS_KEY_ID), Some("minioadmin"));
+        assert_eq!(get(&props, S3_SECRET_ACCESS_KEY), Some("minioadmin"));
+        assert_eq!(get(&props, S3_REGION), Some("us-east-1"));
+        assert_eq!(get(&props, S3_PATH_STYLE_ACCESS), Some("true"));
+        assert!(
+            !props[S3_ENDPOINT].is_empty(),
+            "S3 endpoint must default to the host MinIO URL"
+        );
+        // No catalog auth in the baseline (matches today's build_seed_catalog).
+        assert!(get(&props, "credential").is_none());
+        assert!(get(&props, "oauth2-server-uri").is_none());
+        assert!(get(&props, "scope").is_none());
+        assert!(get(&props, "token").is_none());
+    }
+
+    #[test]
+    fn static_bearer_token_is_injected_when_no_client_credentials() {
+        let auth = SeedCatalogAuth {
+            token: Some("bearer-xyz".to_string()),
+        };
+        let props = seed_catalog_props("http://lk:8181/catalog", "wh", &auth);
+
+        assert_eq!(get(&props, "token"), Some("bearer-xyz"));
+        assert!(get(&props, "credential").is_none());
+    }
+
+    #[test]
+    fn events_seed_shape_is_identical_for_lakekeeper_and_baseline() {
+        // seed_events_table_with_auth writes the SAME two-file events data
+        // regardless of `auth`, so the Lakekeeper scan tests can assert against
+        // the documented constants. Guard the shape those assertions rely on: the
+        // two files together hold SEED_TOTAL_ROWS rows, of which
+        // SEED_ROWS_SCORE_GT_15 score > 15.0. A drift in make_events_batch (row
+        // count or score formula) fails here rather than silently breaking the
+        // Lakekeeper E2E assertions.
+        let mid = SEED_TOTAL_ROWS / 2;
+        let file1 = make_events_batch(1, mid);
+        let file2 = make_events_batch(mid + 1, SEED_TOTAL_ROWS);
+        assert_eq!(file1.num_rows() + file2.num_rows(), SEED_TOTAL_ROWS);
+
+        let score_col = file1
+            .schema()
+            .index_of("score")
+            .expect("events has a score column");
+        let count_gt_15: usize = [&file1, &file2]
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(score_col)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("score column is Float64")
+                    .iter()
+                    .flatten()
+                    .filter(|&score| score > 15.0)
+                    .count()
+            })
+            .sum();
+        assert_eq!(count_gt_15, SEED_ROWS_SCORE_GT_15);
+    }
 }
