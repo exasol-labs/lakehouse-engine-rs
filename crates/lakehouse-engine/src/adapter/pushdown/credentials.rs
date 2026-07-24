@@ -245,6 +245,7 @@ const OAUTH2_DEFAULT_TOKEN_PATH: &str = "/v1/oauth/tokens";
 /// returned error: every error site strips the client secret AND the obtained
 /// token via value-based redaction.
 async fn oauth2_client_credentials_grant(
+    client: &reqwest::Client,
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<String, UdfError> {
@@ -279,7 +280,6 @@ async fn oauth2_client_credentials_grant(
         form.push(("scope", scope));
     }
 
-    let client = reqwest::Client::new();
     let response = client
         .post(&token_url)
         .header("accept", "application/json")
@@ -336,6 +336,7 @@ async fn oauth2_client_credentials_grant(
 /// 3. non-empty `token` → static bearer.
 /// 4. otherwise → no auth.
 async fn resolve_catalog_auth(
+    client: &reqwest::Client,
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<CatalogAuth, UdfError> {
@@ -343,7 +344,7 @@ async fn resolve_catalog_auth(
         return Ok(CatalogAuth::Sigv4);
     }
     if non_empty(&creds.client_id).is_some() && non_empty(&creds.client_secret).is_some() {
-        let token = oauth2_client_credentials_grant(catalog_uri, creds).await?;
+        let token = oauth2_client_credentials_grant(client, catalog_uri, creds).await?;
         return Ok(CatalogAuth::Bearer(token));
     }
     if let Some(token) = non_empty(&creds.token) {
@@ -358,6 +359,7 @@ async fn resolve_catalog_auth(
 ///
 /// Credential values NEVER appear in the returned error.
 async fn authed_get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
     url: &str,
     auth: &CatalogAuth,
     send_access_delegation: bool,
@@ -376,7 +378,6 @@ async fn authed_get_json<T: serde::de::DeserializeOwned>(
         }
     };
 
-    let client = reqwest::Client::new();
     let mut builder = client.get(url).header("accept", "application/json");
     if send_access_delegation {
         builder = builder.header("X-Iceberg-Access-Delegation", "vended-credentials");
@@ -495,6 +496,7 @@ fn prefix_from_config(config: &serde_json::Value) -> String {
 /// the warehouse via `glue_catalog_prefix` (`catalogs/{warehouse}`, AWS Glue's
 /// required REST prefix format) — no config round-trip.
 async fn resolve_load_table_prefix(
+    client: &reqwest::Client,
     catalog_uri: &str,
     warehouse: &str,
     auth: &CatalogAuth,
@@ -510,21 +512,74 @@ async fn resolve_load_table_prefix(
         "{}/v1/config?warehouse={encoded_warehouse}",
         catalog_uri.trim_end_matches('/')
     );
-    match authed_get_json::<serde_json::Value>(&config_url, auth, false, creds).await {
+    match authed_get_json::<serde_json::Value>(client, &config_url, auth, false, creds).await {
         Ok(config) => prefix_from_config(&config),
         Err(_) => String::new(),
     }
 }
 
-/// Self-issue a `loadTable` GET under any catalog-auth mode and deserialize the
-/// raw `LoadTableResult`.
+/// The catalog HTTP state resolved once per query: one pooled `reqwest` client,
+/// the catalog URI, the resolved catalog-auth strategy, and the `/v1/config` URL
+/// prefix.
 ///
-/// Auth-mode-agnostic: chooses SigV4 signing, a static/OAuth2-derived bearer
-/// token, or no auth via `resolve_catalog_auth`. The returned `LoadTableResult`
-/// feeds BOTH file planning AND vended-credential extraction, so vending works on
-/// every mode. `iceberg-catalog-rest` 0.10.0's `RestCatalog::load_table` returns
-/// only a `Table` and drops the response `config`/`storage_credentials`, which is
-/// why this self-issued GET is required.
+/// The auth strategy and prefix are catalog-scoped, not table-scoped, so a single
+/// resolution is built once (by [`CatalogSession::resolve`]) before file
+/// resolution and reused across every table's `loadTable` GET — collapsing the
+/// per-table OAuth grant, config lookup, and cold client into one of each per
+/// query. `reqwest::Client` is `Arc`-backed, so the one client shares its
+/// per-host connection pool across every catalog request.
+///
+/// Internal to the crate (`pub(crate)`) and never re-exported on the pushdown
+/// façade. Its fields are private, so the private `CatalogAuth` type never leaks
+/// through the public interface.
+pub(crate) struct CatalogSession {
+    client: reqwest::Client,
+    catalog_uri: String,
+    auth: CatalogAuth,
+    prefix: String,
+}
+
+impl CatalogSession {
+    /// Resolve the per-query catalog HTTP state once: construct a single pooled
+    /// `reqwest` client, resolve the catalog-auth strategy on it (running the
+    /// OAuth2 client-credentials grant exactly once on the OAuth path), then
+    /// resolve the `/v1/config` prefix on the same client (exactly once).
+    ///
+    /// A failed config lookup yields an EMPTY prefix, never a hard build error —
+    /// the swallow lives in `resolve_load_table_prefix`, which returns `String`,
+    /// so a config failure cannot fail session construction. A failed OAuth2
+    /// grant DOES propagate, matching the pre-refactor per-table behaviour.
+    ///
+    /// Credential values never appear in any returned error: the grant and every
+    /// config request route through their own redaction closures unchanged.
+    pub(super) async fn resolve(
+        catalog_uri: &str,
+        warehouse: &str,
+        creds: &ConnectionCreds,
+    ) -> Result<CatalogSession, UdfError> {
+        let client = reqwest::Client::new();
+        let auth = resolve_catalog_auth(&client, catalog_uri, creds).await?;
+        let prefix = resolve_load_table_prefix(&client, catalog_uri, warehouse, &auth, creds).await;
+        Ok(CatalogSession {
+            client,
+            catalog_uri: catalog_uri.to_string(),
+            auth,
+            prefix,
+        })
+    }
+}
+
+/// Self-issue a `loadTable` GET on the query's `CatalogSession` and deserialize
+/// the raw `LoadTableResult`.
+///
+/// Auth-mode-agnostic: the session already carries the resolved catalog-auth
+/// strategy (SigV4 signing, a static/OAuth2-derived bearer token, or no auth) and
+/// the `/v1/config` prefix, so this issues ONLY the per-table GET — it never
+/// re-derives auth or the prefix. The returned `LoadTableResult` feeds BOTH file
+/// planning AND vended-credential extraction, so vending works on every mode.
+/// `iceberg-catalog-rest` 0.10.0's `RestCatalog::load_table` returns only a
+/// `Table` and drops the response `config`/`storage_credentials`, which is why
+/// this self-issued GET is required.
 ///
 /// Sends `X-Iceberg-Access-Delegation: vended-credentials` ONLY when
 /// `creds.use_vended_credentials`, keeping the no-vending request byte-identical
@@ -533,20 +588,18 @@ async fn resolve_load_table_prefix(
 /// Credential values (signing keys, bearer/OAuth2 tokens, vended STS, client
 /// secret) NEVER appear in the returned error.
 pub(super) async fn load_table_any_auth(
-    catalog_uri: &str,
+    session: &CatalogSession,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
 ) -> Result<iceberg_catalog_rest::LoadTableResult, UdfError> {
-    let auth = resolve_catalog_auth(catalog_uri, creds).await?;
-
     let (ns_ident, table_name) = parse_table_ident(&catalog.table)?;
     let ns_url = ns_ident.to_url_string();
-    let prefix = resolve_load_table_prefix(catalog_uri, &catalog.warehouse, &auth, creds).await;
-    let url = build_load_table_url(catalog_uri, &prefix, &ns_url, &table_name);
+    let url = build_load_table_url(&session.catalog_uri, &session.prefix, &ns_url, &table_name);
 
     authed_get_json::<iceberg_catalog_rest::LoadTableResult>(
+        &session.client,
         &url,
-        &auth,
+        &session.auth,
         creds.use_vended_credentials,
         creds,
     )
@@ -701,7 +754,7 @@ pub fn merge_vended_into_storage(
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use crate::scan::spec::{FileEntry, ScanSpec};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
 
     // ---------------------------------------------------------------------------
     // Task 3.3 / 3.4 — SigV4 wiring: URL construction + signed/unsigned routing
@@ -1076,8 +1129,8 @@ mod tests {
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
             session_token: Some("OLD_TOKEN".into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let merged = merge_vended_into_storage(&base, "VENDED_AK", "VENDED_SK", Some("VENDED_TOK"));
@@ -1126,9 +1179,8 @@ mod tests {
             region: "us-east-1".into(),
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
-            session_token: None,
             allow_http: true,
-            path_style: true,
+            ..Default::default()
         };
 
         // Empty vended keys — falls back to static.
@@ -1161,8 +1213,8 @@ mod tests {
             access_key: "STATIC_AK".into(),
             secret_key: "STATIC_SK".into(),
             session_token: Some("OLD_STS_TOKEN".into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let merged =
@@ -1962,7 +2014,8 @@ mod tests {
             assert!(has_scope, "scope must be in POST body when supplied");
         });
 
-        let token = oauth2_client_credentials_grant(&catalog_uri, &creds)
+        let client = reqwest::Client::new();
+        let token = oauth2_client_credentials_grant(&client, &catalog_uri, &creds)
             .await
             .expect("grant must succeed");
 
@@ -2011,9 +2064,11 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{port}/v1/warehouse/namespaces/db/tables/hive_table");
         let creds = creds_no_auth();
-        let err = authed_get_json::<serde_json::Value>(&url, &CatalogAuth::None, false, &creds)
-            .await
-            .expect_err("a 404 response must surface as an error");
+        let client = reqwest::Client::new();
+        let err =
+            authed_get_json::<serde_json::Value>(&client, &url, &CatalogAuth::None, false, &creds)
+                .await
+                .expect_err("a 404 response must surface as an error");
 
         let msg = err.to_string();
         assert!(
@@ -2050,34 +2105,21 @@ mod tests {
             access_key: VENDED_AK.into(),
             secret_key: VENDED_SK.into(),
             session_token: Some(VENDED_TOK.into()),
-            allow_http: false,
             path_style: false,
+            ..Default::default()
         };
 
         let spec = ScanSpec {
-            table_root: String::new(),
+            common: CommonScanSpec {
+                projection: vec!["ID".into()],
+                emit_exa_types: vec!["DECIMAL(20,0)".into()],
+                storage: vended_storage,
+                ..Default::default()
+            },
             files: vec![FileEntry::new(
                 "s3://warehouse/db/events/part-00000.parquet",
                 1,
             )],
-            projection: vec!["ID".into()],
-            filter: None,
-            limit: None,
-            order_by: Vec::new(),
-            aggregates: None,
-            group_keys: None,
-            distinct: false,
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            logical_schema: Vec::new(),
-            name_mapping: Vec::new(),
-            join: None,
-            storage: vended_storage,
-            df_target_partitions: 1,
-            df_batch_size: 8192,
-            df_threads_per_udf: 1,
-            memory_pool_fraction: 0.6,
-            instance_overhead_mb: 200,
-            s3_max_connections: 8,
         };
 
         let json = spec.to_json();
@@ -2129,43 +2171,63 @@ mod tests {
     // Task 4.5 / 3.1 — Redaction: secrets never in errors from the new paths
     // ---------------------------------------------------------------------------
 
-    /// Scenario: bearer token, OAuth2 client secret, and access token never
-    /// appear in errors surfaced by the new auth paths.
+    /// Scenario: a `loadTable` error surfaced through the REAL `authed_get_json`
+    /// redact closure, with the session's resolved auth set to
+    /// `CatalogAuth::Bearer(<live token>)`, strips BOTH the static catalog-auth
+    /// secrets (via `redact_catalog_auth_error`, keyed on `creds.client_secret`)
+    /// AND the live bearer token (added to the redaction set only because
+    /// `auth` is `CatalogAuth::Bearer` — the live token is never present in
+    /// `creds`, so `redact_catalog_auth_error` alone could not strip it).
     ///
-    /// Tests `redact_catalog_auth_error` directly (it is the gate used by
-    /// `authed_get_json`'s redact closure for every error site on those paths).
-    #[test]
-    fn bearer_and_oauth_secrets_not_in_error_messages() {
-        // Bearer token must be stripped.
+    /// The local server echoes both secrets in the error body — the failure
+    /// mode the closure guards against — so this drives the real function
+    /// rather than re-implementing its redaction logic inline.
+    #[tokio::test]
+    async fn load_table_error_redacts_session_bearer_and_static_secrets() {
+        use std::net::SocketAddr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let addr: SocketAddr = listener.local_addr().expect("local_addr");
+        let port = addr.port();
+
+        let body = format!("error: secret={CLIENT_SECRET} bearer={OAUTH_ACCESS_TOKEN}");
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await.expect("read");
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/namespaces/db/tables/t");
         let mut creds = creds_no_auth();
-        creds.token = Some(BEARER_TOK.into());
+        creds.client_secret = Some(CLIENT_SECRET.into());
+        let auth = CatalogAuth::Bearer(OAUTH_ACCESS_TOKEN.to_string());
 
-        let raw_error = format!("catalog returned HTTP 401: token={BEARER_TOK} invalid");
-        let redacted = redact_catalog_auth_error(&raw_error, &creds);
+        let err = authed_get_json::<serde_json::Value>(&client, &url, &auth, false, &creds)
+            .await
+            .expect_err("a 401 response must surface as an error");
+
+        let msg = err.to_string();
         assert!(
-            !redacted.contains(BEARER_TOK),
-            "bearer token must not appear in error: {redacted}"
+            msg.starts_with("catalog returned HTTP 401: "),
+            "the redaction closure must have run against the real 401 body, got: {msg}"
         );
-
-        // OAuth2 client_secret must be stripped.
-        let mut creds2 = creds_no_auth();
-        creds2.client_secret = Some(CLIENT_SECRET.into());
-
-        let raw_error2 = format!("OAuth2 failed: secret={CLIENT_SECRET} rejected");
-        let redacted2 = redact_catalog_auth_error(&raw_error2, &creds2);
         assert!(
-            !redacted2.contains(CLIENT_SECRET),
-            "client_secret must not appear in error: {redacted2}"
+            !msg.contains(CLIENT_SECRET),
+            "static client_secret must not appear in error: {msg}"
         );
-
-        // The obtained OAuth2 access_token is redacted by the authed_get_json closure
-        // which additionally strips the CatalogAuth::Bearer token. Simulate that here:
-        let raw_error3 =
-            format!("catalog request failed: Authorization: Bearer {OAUTH_ACCESS_TOKEN}");
-        let redacted3 = crate::scan::emit::redact_secret_values(&raw_error3, &[OAUTH_ACCESS_TOKEN]);
         assert!(
-            !redacted3.contains(OAUTH_ACCESS_TOKEN),
-            "obtained OAuth2 access_token must not appear in error: {redacted3}"
+            !msg.contains(OAUTH_ACCESS_TOKEN),
+            "live session bearer token must not appear in error: {msg}"
         );
     }
 
@@ -2241,7 +2303,9 @@ mod tests {
         creds.use_sigv4 = true;
         let auth = CatalogAuth::Sigv4;
 
-        let result = resolve_load_table_prefix(&catalog_uri, warehouse, &auth, &creds).await;
+        let client = reqwest::Client::new();
+        let result =
+            resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
 
         assert_eq!(
             result,
@@ -2292,8 +2356,10 @@ mod tests {
         let creds = creds_no_auth();
         let auth = CatalogAuth::None;
 
+        let client = reqwest::Client::new();
         let result =
-            resolve_load_table_prefix(&catalog_uri, "original-warehouse", &auth, &creds).await;
+            resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds)
+                .await;
 
         assert_eq!(
             result, resolved_prefix,
@@ -2346,7 +2412,9 @@ mod tests {
         let creds = creds_no_auth();
         let auth = CatalogAuth::None;
 
-        let result = resolve_load_table_prefix(&catalog_uri, warehouse, &auth, &creds).await;
+        let client = reqwest::Client::new();
+        let result =
+            resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
 
         assert_eq!(
             result, "",
@@ -2404,6 +2472,87 @@ mod tests {
         assert!(
             !redacted.contains(SCOPE_SENTINEL),
             "scope must be redacted: {redacted}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Group C — resolve_catalog_auth precedence + CatalogSession::resolve
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `resolve_catalog_auth` selects the auth strategy by the
+    /// documented precedence, on the non-network branches only (`use_sigv4` and
+    /// the no-client-credentials paths never contact the network).
+    #[tokio::test]
+    async fn resolve_catalog_auth_precedence_non_network_branches() {
+        let client = reqwest::Client::new();
+
+        // 1. use_sigv4 → Sigv4, regardless of any token also being set.
+        let mut sigv4_creds = creds_no_auth();
+        sigv4_creds.use_sigv4 = true;
+        sigv4_creds.token = Some(BEARER_TOK.into());
+        let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &sigv4_creds)
+            .await
+            .expect("sigv4 resolution must not fail");
+        assert!(
+            matches!(auth, CatalogAuth::Sigv4),
+            "use_sigv4 must take precedence and resolve to CatalogAuth::Sigv4"
+        );
+
+        // Precedence #2 (OAuth2 client-credentials grant) is the network branch and
+        // is exercised elsewhere; the remaining non-network branches follow.
+
+        // 3. Non-empty token, no SigV4, no OAuth client credentials → Bearer.
+        let mut bearer_creds = creds_no_auth();
+        bearer_creds.token = Some(BEARER_TOK.into());
+        let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &bearer_creds)
+            .await
+            .expect("bearer resolution must not fail");
+        match auth {
+            CatalogAuth::Bearer(token) => assert_eq!(
+                token, BEARER_TOK,
+                "static token must be carried into CatalogAuth::Bearer verbatim"
+            ),
+            _ => panic!("a non-empty static token must resolve to CatalogAuth::Bearer"),
+        }
+
+        // 4. No auth supplied at all → None.
+        let no_auth_creds = creds_no_auth();
+        let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &no_auth_creds)
+            .await
+            .expect("no-auth resolution must not fail");
+        assert!(
+            matches!(auth, CatalogAuth::None),
+            "no auth fields supplied must resolve to CatalogAuth::None"
+        );
+    }
+
+    /// Scenario: `CatalogSession::resolve` on the SigV4 path never contacts the
+    /// `/v1/config` endpoint (mirroring `resolve_load_table_prefix`'s short-circuit)
+    /// and carries `catalog_uri` verbatim, so it needs no live server at all.
+    #[tokio::test]
+    async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
+        let catalog_uri = "https://glue.us-east-1.amazonaws.com/iceberg";
+        let warehouse = "123456789012";
+
+        let mut creds = base_creds();
+        creds.use_sigv4 = true;
+
+        let session = CatalogSession::resolve(catalog_uri, warehouse, &creds)
+            .await
+            .expect("sigv4 session resolution must not fail without any network access");
+
+        assert!(
+            matches!(session.auth, CatalogAuth::Sigv4),
+            "sigv4 creds must resolve to CatalogAuth::Sigv4"
+        );
+        assert_eq!(
+            session.prefix,
+            glue_catalog_prefix(warehouse),
+            "sigv4 prefix must be derived from the warehouse, with no /v1/config round-trip"
+        );
+        assert_eq!(
+            session.catalog_uri, catalog_uri,
+            "catalog_uri must be carried verbatim"
         );
     }
 }

@@ -1171,9 +1171,9 @@ mod tests {
         let mut spec = minimal_spec();
         let file_size = local_file_size(&file_url);
         spec.files = vec![FileEntry::new(file_url, file_size)];
-        spec.logical_schema = logical;
+        spec.common.logical_schema = logical;
         // The adapter pushes uppercase current-name projection.
-        spec.projection = vec!["ID".into(), "RATING".into()];
+        spec.common.projection = vec!["ID".into(), "RATING".into()];
 
         // Drive the EXACT production path: register_files + build_scan_sql, then
         // collect the resulting rows.
@@ -1300,8 +1300,8 @@ mod tests {
             FileEntry::new(file_old, old_size),
             FileEntry::new(file_new, new_size),
         ];
-        spec.logical_schema = logical;
-        spec.projection = vec!["ID".into(), "RATING".into()];
+        spec.common.logical_schema = logical;
+        spec.common.projection = vec!["ID".into(), "RATING".into()];
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
         register_files(&ctx, "scan_target", &spec)
@@ -1407,7 +1407,7 @@ mod tests {
         // Carry every primitive case on ONE ScanSpec so the assertion exercises the
         // real serialize → deserialize path once for the whole vocabulary.
         let mut spec = minimal_spec();
-        spec.logical_schema = cases
+        spec.common.logical_schema = cases
             .iter()
             .enumerate()
             .map(|(i, (tag, encoded, _))| LogicalField {
@@ -1422,7 +1422,8 @@ mod tests {
         let json = spec.to_json();
         let back = ScanSpec::from_json(&json).expect("scan spec must round-trip");
 
-        for ((tag, encoded, expected), field) in cases.iter().zip(back.logical_schema.iter()) {
+        for ((tag, encoded, expected), field) in cases.iter().zip(back.common.logical_schema.iter())
+        {
             assert_eq!(field.arrow_type, *tag, "arrow_type tag survives round-trip");
             let encoded_back = field
                 .initial_default
@@ -1442,7 +1443,7 @@ mod tests {
         // scalars, so the serialized logical schema contains no storage secret
         // (minimal_spec's credentials are "testkey"/"testsecret", carried only in
         // the separate `storage` block).
-        let logical_json = serde_json::to_string(&back.logical_schema).unwrap();
+        let logical_json = serde_json::to_string(&back.common.logical_schema).unwrap();
         for secret in ["testkey", "testsecret", "access_key", "secret_key"] {
             assert!(
                 !logical_json.contains(secret),
