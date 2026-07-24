@@ -22,7 +22,7 @@ use vs_expression::render_df_filter_safe;
 mod support;
 use support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
-    extract_limit, extract_projection, order_by_present,
+    extract_limit, extract_projection, like_subject_type_guard, order_by_present,
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
@@ -178,7 +178,15 @@ pub async fn handle_pushdown(
 
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
-    let filter = filter_json_raw.and_then(render_df_filter_safe);
+    let col_types = extract_all_column_types(request);
+
+    // The type guard runs on the RAW filter JSON before rendering: it may decline
+    // (non-string LIKE subject with no safe rewrite, issue #207) or rewrap a DATE
+    // subject as CAST(.. AS VARCHAR). `filter_json_raw` itself is left completely
+    // unmodified for the later `resolve_file_list` Iceberg-level pruning call below.
+    let filter = filter_json_raw
+        .and_then(|f| like_subject_type_guard(f, &col_types))
+        .and_then(|f| render_df_filter_safe(&f));
 
     let limit = extract_limit(&pushdown_req);
 
@@ -187,8 +195,6 @@ pub async fn handle_pushdown(
     // adapter does not match as a bounded top-N, so a bare per-shard/outer LIMIT is
     // never emitted ahead of an ordering the adapter did not itself render.
     let has_order_by = order_by_present(&pushdown_req);
-
-    let col_types = extract_all_column_types(request);
 
     // Resolve file list exactly once. The returned `effective_storage` carries
     // vended STS creds when use_vended_credentials is true; otherwise it equals
