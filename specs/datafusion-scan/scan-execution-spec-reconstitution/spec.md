@@ -40,6 +40,15 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *AND* the merge SHALL store each data-file and delete-file path verbatim (relative or absolute) without resolving it, so path reconstruction is deferred to file registration
 * *AND* the reconstituted scan spec MUST NOT carry any catalog identifier field, because the scan UDF never contacts the catalog
 
+### Scenario: Consolidating the shard-invariant fields preserves the two-argument wire
+
+* *GIVEN* a `ScanSpec` whose shard-invariant fields are held in one embedded `CommonScanSpec` value and whose only own field beside it is the per-shard `files` list
+* *WHEN* the adapter serializes the shard-invariant common blob (UDF argument 0) and the per-shard files list (UDF argument 1)
+* *THEN* the common-blob JSON SHALL carry every shard-invariant field at the top level, byte-identical to the pre-consolidation encoding, and MUST NOT contain a `files` key or a `catalog` key
+* *AND* the per-shard files-list JSON SHALL be byte-identical to the pre-consolidation encoding
+* *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard
+* *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
+
 ### Scenario: A file-list argument that predates the delete encoding still reconstitutes
 
 * *GIVEN* a scan invocation whose second argument holds legacy file entries that carry a path and byte size but NO delete-file references (a spec that predates positional-delete support)

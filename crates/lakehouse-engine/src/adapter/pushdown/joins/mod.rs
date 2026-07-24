@@ -3,6 +3,7 @@ use crate::scan::spec::{CatalogProps, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
+use super::credentials::CatalogSession;
 use super::file_resolution::empty_result_sql;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
@@ -16,6 +17,10 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
+pub(super) use sql_builders::qualified_single_table_fallback_pushdown;
+// Only test modules (`grouped_agg.rs`, `support.rs`) reach these two directly now;
+// production callers go through `qualified_single_table_fallback_pushdown` above.
+#[cfg(test)]
 pub(super) use sql_builders::{
     build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
@@ -87,7 +92,7 @@ pub(super) async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    catalog_uri: &str,
+    session: &CatalogSession,
     storage: &StorageProps,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
@@ -112,7 +117,7 @@ pub(super) async fn plan_join(
         let side = resolve_one_join_side(
             &leaf.table_name,
             &leaf.iceberg_ident,
-            catalog_uri,
+            session,
             storage,
             catalog,
             creds,

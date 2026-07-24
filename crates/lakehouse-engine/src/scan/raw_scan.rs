@@ -43,13 +43,13 @@ pub async fn run_raw_scan_with_session(
     spec: &ScanSpec,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.storage.secret_values();
+    let secrets = spec.common.storage.secret_values();
     let df = build_dataframe(session_ctx, spec).await?;
     let stream = df
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
-    emit_stream(ctx, stream, &secrets, &spec.emit_exa_types, timers).await?;
+    emit_stream(ctx, stream, &secrets, &spec.common.emit_exa_types, timers).await?;
     // One per-VM telemetry record at completion. Gated + best-effort: a
     // logging/sink failure NEVER fails the scan (the scan already succeeded).
     emit_phase_telemetry(ctx, timers);
@@ -65,7 +65,7 @@ pub async fn run_raw_scan_with_session(
 /// still carry an explicit `0`, and `Semaphore::new(0)` would deadlock every
 /// delete-file read rather than degrade gracefully.
 pub(super) fn delete_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(spec.s3_max_connections.max(1)))
+    Arc::new(Semaphore::new(spec.common.s3_max_connections.max(1)))
 }
 
 /// Build the DataFrame: register files as a ListingTable, then apply
@@ -88,7 +88,7 @@ async fn build_dataframe(
     // wrapper counts the union with a native `COUNT(DISTINCT "V")`. The fan-out spec
     // carries no LIMIT/ORDER BY, so `.distinct()` over the WHERE-filtered projection
     // is exactly the shard-local distinct set. Inert on every other scan.
-    if spec.distinct {
+    if spec.common.distinct {
         df.distinct()
             .map_err(|e| UdfError::User(format!("DataFusion distinct error: {e}")))
     } else {
@@ -122,10 +122,10 @@ pub async fn register_files(
         ctx,
         table_name,
         &spec.files,
-        &spec.table_root,
-        &spec.logical_schema,
-        &spec.name_mapping,
-        &spec.storage,
+        &spec.common.table_root,
+        &spec.common.logical_schema,
+        &spec.common.name_mapping,
+        &spec.common.storage,
         delete_read_limiter,
     )
     .await
@@ -320,14 +320,14 @@ pub(super) async fn build_scan_sql(
 
     // Determine the items to project (already uppercase from the adapter). An
     // empty projection means "all columns"; each is a bare column reference.
-    let proj_items: Vec<ProjectionItem> = if spec.projection.is_empty() {
+    let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
         schema
             .fields()
             .iter()
             .map(|f| ProjectionItem::Column(f.name().to_uppercase()))
             .collect()
     } else {
-        spec.projection.clone()
+        spec.common.projection.clone()
     };
 
     // Build outer SELECT items. A bare column is quoted as an identifier, with a
@@ -379,7 +379,7 @@ pub(super) async fn build_scan_sql(
     let mut sql = format!("SELECT {select_clause} FROM ({inner})");
 
     // Append WHERE clause if a translated filter is present.
-    if let Some(filter) = &spec.filter
+    if let Some(filter) = &spec.common.filter
         && !filter.is_empty()
     {
         sql.push_str(" WHERE ");
@@ -396,13 +396,13 @@ pub(super) async fn build_scan_sql(
     // DataFusion folds `ORDER BY <keys> LIMIT n` into a bounded, fetch-limited
     // TopK (not a full global sort). When `order_by` is empty this block emits
     // nothing, leaving pre-ordering-feature SQL byte-identical.
-    if !spec.order_by.is_empty() {
+    if !spec.common.order_by.is_empty() {
         sql.push_str(" ORDER BY ");
-        sql.push_str(&render_order_by_clause(&spec.order_by));
+        sql.push_str(&render_order_by_clause(&spec.common.order_by));
     }
 
     // Append LIMIT clause.
-    if let Some(limit) = spec.limit {
+    if let Some(limit) = spec.common.limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 
@@ -441,13 +441,13 @@ mod tests {
     #[test]
     fn delete_read_limiter_clamps_zero_connections_to_one() {
         let mut spec = minimal_spec();
-        spec.s3_max_connections = 0;
+        spec.common.s3_max_connections = 0;
         assert_eq!(delete_read_limiter(&spec).available_permits(), 1);
     }
 
     /// Scenario: scan without a logical schema falls back to first-file inference.
     ///
-    /// When `spec.logical_schema` is empty (legacy or unset), `register_files`
+    /// When `spec.common.logical_schema` is empty (legacy or unset), `register_files`
     /// must infer the Arrow schema from the first file and register the table
     /// without installing the field-id adapter. The registered table must be
     /// queryable and return all rows written to the file.
@@ -496,7 +496,7 @@ mod tests {
         let mut spec = minimal_spec();
         let file_size = local_file_size(&file_url);
         spec.files = vec![FileEntry::new(file_url, file_size)];
-        spec.logical_schema = Vec::new();
+        spec.common.logical_schema = Vec::new();
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
         register_files(&ctx, "scan_target", &spec)
@@ -582,13 +582,13 @@ mod tests {
             let mut spec = minimal_spec();
             let file_size = local_file_size(file_url);
             spec.files = vec![FileEntry::new(file_url, file_size)];
-            spec.projection = vec!["ID".into(), "PRICE".into()];
-            spec.order_by = vec![SortKey {
+            spec.common.projection = vec!["ID".into(), "PRICE".into()];
+            spec.common.order_by = vec![SortKey {
                 column: "PRICE".into(),
                 ascending,
                 nulls_last,
             }];
-            spec.limit = Some(limit);
+            spec.common.limit = Some(limit);
 
             let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
             register_files(&ctx, "scan_target", &spec)
@@ -688,8 +688,8 @@ mod tests {
         ctx.register_table("scan_target", Arc::new(table)).unwrap();
 
         let mut spec = minimal_spec();
-        spec.projection = vec!["ID".into(), "RATING".into()];
-        spec.logical_schema = logical;
+        spec.common.projection = vec!["ID".into(), "RATING".into()];
+        spec.common.logical_schema = logical;
 
         let sql = build_scan_sql(&ctx, "scan_target", &spec).await.unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
         ctx.register_table("scan_target", Arc::new(table)).unwrap();
 
         let mut spec = minimal_spec();
-        spec.projection = vec![
+        spec.common.projection = vec![
             ProjectionItem::Column("ID".into()),
             ProjectionItem::Expr {
                 expr: r#"CAST("ID" AS VARCHAR)"#.into(),

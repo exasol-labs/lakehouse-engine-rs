@@ -23,8 +23,8 @@ use lakehouse_engine::adapter::pushdown::{
     build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
-    AggKind, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ProjectionItem,
-    ScanSpec, SortKey, StorageProps,
+    AggKind, CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType,
+    ProjectionItem, ScanSpec, SortKey, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -63,34 +63,20 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         .map(|m| m.len())
         .unwrap_or(0);
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: vec!["ID".into(), "NAME".into()],
-        filter: Some(r#""ID" >= 10"#.into()),
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            projection: vec!["ID".into(), "NAME".into()],
+            filter: Some(r#""ID" >= 10"#.into()),
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            },
+            ..Default::default()
         },
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 
@@ -225,11 +211,11 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
     let file_url = write_local_parquet_with_score(&dir);
 
     let mut spec = single_partition_spec(file_url);
-    spec.filter = None;
+    spec.common.filter = None;
     // id (bare column), score * 2 (expression), UPPER(name) (expression) — the
     // expressions reference the uppercase-aliased inner columns, exactly as the
     // adapter's `render_expression` emits them.
-    spec.projection = vec![
+    spec.common.projection = vec![
         ProjectionItem::Column("ID".into()),
         ProjectionItem::Expr {
             expr: r#"("SCORE" * 2)"#.into(),
@@ -349,14 +335,14 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     let file_url = write_local_parquet(&dir);
 
     let mut spec = single_partition_spec(file_url);
-    spec.filter = None;
+    spec.common.filter = None;
     // ORDER BY ID DESC NULLS LAST LIMIT 5 over the 100-row fixture.
-    spec.order_by = vec![SortKey {
+    spec.common.order_by = vec![SortKey {
         column: "ID".into(),
         ascending: false,
         nulls_last: true,
     }];
-    spec.limit = Some(5);
+    spec.common.limit = Some(5);
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
     ctx.register_parquet("scan_target", &spec.files[0].path, Default::default())
@@ -387,36 +373,22 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
 /// for the SQL-shape assertion; `aggregates` drives the aggregate branch).
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
     ScanSpec {
-        table_root: String::new(),
-        files: Vec::new(),
-        projection: Vec::new(),
-        filter: Some(
-            r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
-        ),
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: Some(aggregates),
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            filter: Some(
+                r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
+            ),
+            aggregates: Some(aggregates),
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            },
+            ..Default::default()
         },
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: Vec::new(),
     }
 }
 
@@ -507,26 +479,11 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 /// row-scan branch of `build_scan_driving_sql`. Callers set `order_by`/`limit`.
 fn row_scan_spec() -> ScanSpec {
     ScanSpec {
-        table_root: String::new(),
+        common: CommonScanSpec {
+            storage: test_storage(),
+            ..Default::default()
+        },
         files: Vec::new(),
-        projection: Vec::new(),
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: test_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
     }
 }
 
@@ -595,12 +552,12 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     let proj = vec![ProjectionItem::Column("L_EXTENDEDPRICE".into())];
     let types = vec!["DECIMAL(18,2)".to_string()];
     let mut spec = row_scan_spec();
-    spec.order_by = vec![SortKey {
+    spec.common.order_by = vec![SortKey {
         column: "L_EXTENDEDPRICE".into(),
         ascending: false,
         nulls_last: true,
     }];
-    spec.limit = Some(20);
+    spec.common.limit = Some(20);
 
     let shards = vec![
         vec![("data/part-0.parquet".to_string(), 1000u64)],
@@ -649,9 +606,8 @@ fn test_storage() -> StorageProps {
         region: "us-east-1".to_string(),
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 
@@ -675,29 +631,18 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     };
 
     let spec = ScanSpec {
-        table_root: "s3://warehouse/lh/orders".to_string(),
-        files: vec![], // replaced per shard
-        projection: vec![
-            ProjectionItem::Column("C_NAME".into()),
-            ProjectionItem::Column("O_ORDERDATE".into()),
-        ],
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: Some(join),
-        storage: test_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        common: CommonScanSpec {
+            table_root: "s3://warehouse/lh/orders".to_string(),
+            projection: vec![
+                ProjectionItem::Column("C_NAME".into()),
+                ProjectionItem::Column("O_ORDERDATE".into()),
+            ],
+            emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
+            join: Some(join),
+            storage: test_storage(),
+            ..Default::default()
+        },
+        files: vec![],
     };
 
     // Fact side sharded into two byte-balanced work units → a real GROUP BY fan-out.
@@ -705,8 +650,8 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("data/ord-0.parquet".to_string(), 8192u64)],
         vec![("data/ord-1.parquet".to_string(), 8192u64)],
     ];
-    let proj = spec.projection.clone();
-    let types = spec.emit_exa_types.clone();
+    let proj = spec.common.projection.clone();
+    let types = spec.common.emit_exa_types.clone();
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
@@ -912,7 +857,7 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
     )];
     // Predicate keeps only ids 200..=399 → row groups 2 and 3; prunes the other
     // eight tight, disjoint row groups.
-    spec.filter = Some(r#""ID" >= 200 AND "ID" < 400"#.into());
+    spec.common.filter = Some(r#""ID" >= 200 AND "ID" < 400"#.into());
 
     // Register the REAL production provider (attaches the access plan), then ask
     // for the exact committed raw-scan pipeline.

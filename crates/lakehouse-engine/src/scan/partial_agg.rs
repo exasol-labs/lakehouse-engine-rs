@@ -61,21 +61,23 @@ pub(super) async fn run_partial_aggregate(
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
     // Dispatch: grouped path when group_keys is Some and non-empty.
-    if let Some(group_keys) = &spec.group_keys
+    if let Some(group_keys) = &spec.common.group_keys
         && !group_keys.is_empty()
     {
         return run_grouped_partial_aggregate(ctx, session_ctx, spec).await;
     }
 
-    let secrets = spec.storage.secret_values();
+    let secrets = spec.common.storage.secret_values();
     let aggregates = spec
+        .common
         .aggregates
         .as_deref()
         .expect("run_partial_aggregate called without aggregates");
 
     let aliased_table = register_aliased_scan_target(session_ctx, spec).await?;
 
-    let sql = build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.filter.as_deref());
+    let sql =
+        build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.common.filter.as_deref());
 
     let df = session_ctx
         .sql(&sql)
@@ -120,12 +122,14 @@ async fn run_grouped_partial_aggregate(
     session_ctx: &SessionContext,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
-    let secrets = spec.storage.secret_values();
+    let secrets = spec.common.storage.secret_values();
     let group_keys = spec
+        .common
         .group_keys
         .as_deref()
         .expect("run_grouped_partial_aggregate called without group_keys");
     let aggregates = spec
+        .common
         .aggregates
         .as_deref()
         .expect("run_grouped_partial_aggregate called without aggregates");
@@ -136,7 +140,7 @@ async fn run_grouped_partial_aggregate(
         group_keys,
         aggregates,
         &aliased_table,
-        spec.filter.as_deref(),
+        spec.common.filter.as_deref(),
     );
 
     let df = session_ctx

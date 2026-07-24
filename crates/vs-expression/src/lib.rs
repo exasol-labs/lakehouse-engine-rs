@@ -2507,6 +2507,74 @@ mod tests {
         }
     }
 
+    // --- Bitwise operator functions are deliberately not translated (issue #108) ---
+
+    #[test]
+    fn bitwise_operator_functions_fall_through() {
+        // Exasol's eleven bit functions operate on an UNSIGNED 64-bit domain
+        // (0..=18446744073709551615, result DECIMAL(20,0)); none has a faithful
+        // DataFusion 54.0.0 translation, so all eleven decline (issue #108). Two
+        // distinct blocker classes:
+        //
+        //   1. Operator-backed but signed-domain (BIT_AND/OR/XOR/LSHIFT/RSHIFT):
+        //      DataFusion's `&`/`|`/`#`/`<<`/`>>` (Operator::BitwiseAnd/Or/Xor/
+        //      ShiftLeft/ShiftRight) act on the SIGNED operand type. Any bit-63-set
+        //      result is unsigned-large in Exasol but negative under Int64, and
+        //      Int64 -> DECIMAL(20,0) carries the negative value; `>>` is arithmetic
+        //      (sign-extend) vs Exasol's logical (zero-fill). Operand types aren't
+        //      carried in the expression node, so the type/value-blind translator
+        //      cannot restrict to the safe subset (the recorded DIV limitation).
+        //   2. No DataFusion 54.0.0 operator or builtin at all (BIT_NOT/LROTATE/
+        //      RROTATE/CHECK/SET/TO_NUM): unary `~` is `not_impl_err`, and
+        //      datafusion-functions registers no rotate/bit-test/bit-set/bits-to-
+        //      number scalar (only the unrelated string `bit_length`).
+        //
+        // Both classes fall through the generic unsupported-`function_scalar` path;
+        // this test pins that decline (no dedicated production arm exists).
+        let unsupported = [
+            "BIT_AND",
+            "BIT_OR",
+            "BIT_XOR",
+            "BIT_NOT",
+            "BIT_LSHIFT",
+            "BIT_RSHIFT",
+            "BIT_LROTATE",
+            "BIT_RROTATE",
+            "BIT_CHECK",
+            "BIT_SET",
+            "BIT_TO_NUM",
+        ];
+        for name in unsupported {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"}
+                ]
+            });
+            let err = render_expression(&expr).unwrap_err();
+            let err_string = err.to_string();
+            // Pinned to the generic fallthrough text, not just the function name: a
+            // future dedicated arm that merely validates arity (e.g. modeled on NEG's
+            // arity-check error) would also produce a message containing `name`, which
+            // would silently defeat this decline-lock for the six functions with no
+            // DataFusion builtin at all (BIT_NOT/LROTATE/RROTATE/CHECK/SET/TO_NUM).
+            assert!(
+                err_string.contains("unsupported scalar function"),
+                "{name} must fall through the generic unsupported-scalar-function path: {err}"
+            );
+            assert!(
+                err_string.contains(name),
+                "error must name the unsupported function '{name}': {err}"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "{name} must be None in safe mode without panicking"
+            );
+        }
+    }
+
     #[test]
     fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
         // The scalar-regexp exclusion (issue #106) must not affect the REGEXP_LIKE

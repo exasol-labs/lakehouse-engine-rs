@@ -113,8 +113,8 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 
 /// Build the DataFusion `SessionConfig` for the given scan spec.
 ///
-/// Sets `target_partitions` from `spec.df_target_partitions` (clamped to ≥1)
-/// and `batch_size` from `spec.df_batch_size` (clamped to ≥1).
+/// Sets `target_partitions` from `spec.common.df_target_partitions` (clamped to ≥1)
+/// and `batch_size` from `spec.common.df_batch_size` (clamped to ≥1).
 /// With the default of 1 partition and a current-thread Tokio runtime, each UDF
 /// instance uses exactly one core; cluster-level shard fan-out provides all parallelism.
 ///
@@ -129,13 +129,13 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     let config = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(spec.df_target_partitions.max(1))
-        .with_batch_size(spec.df_batch_size.max(1))
+        .with_target_partitions(spec.common.df_target_partitions.max(1))
+        .with_batch_size(spec.common.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
         .set_bool("datafusion.execution.parquet.pushdown_filters", true);
 
-    if spec.join.is_some() {
+    if spec.common.join.is_some() {
         // Broadcast-join build-side determinism. The scan places the bounded
         // dimension on the LEFT of the join (`build_join_sql`), and `HashJoinExec`
         // always builds its hash table from the left child. DataFusion's
@@ -196,10 +196,10 @@ pub fn read_scan_spec(ctx: &dyn UdfContext) -> Result<ScanSpec, UdfError> {
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // One run() call = one row (SDK 0.21.0 scalar dispatch — no ctx.next()).
     // Reconstitute this row's spec BEFORE building the runtime: the runtime kind
-    // depends on spec.df_threads_per_udf. NULL in either argument is a user error.
+    // depends on spec.common.df_threads_per_udf. NULL in either argument is a user error.
     let spec = read_scan_spec(ctx)?;
 
-    let rt = build_scan_runtime(spec.df_threads_per_udf).map_err(UdfError::User)?;
+    let rt = build_scan_runtime(spec.common.df_threads_per_udf).map_err(UdfError::User)?;
 
     // Run this row's scan on the runtime and tear it down deterministically. The
     // implicit `drop(rt)` path raced object_store's detached hyper tasks at
@@ -251,13 +251,13 @@ async fn run_scan_dispatch(
     // the default `info` level stays silent.
     let mut timers = diagnostics::PhaseTimers::start();
 
-    if spec.join.is_some() {
+    if spec.common.join.is_some() {
         // A join spec drives the two-table broadcast inner equi-join path: register
         // the sharded fact side and the full dimension side in one session, join
         // node-locally, and stream joined batches. Takes precedence over the
         // aggregate/raw dispatch (the VS never combines a join with aggregates).
         run_join_scan_with_session(ctx, session_ctx, spec, &mut timers).await
-    } else if spec.aggregates.is_some() {
+    } else if spec.common.aggregates.is_some() {
         // Partial-aggregate paths emit a single summary row; phase telemetry
         // targets the raw-row streaming path where startup / import / send-back
         // are the throughput question. Leave the aggregate path unchanged.
@@ -296,7 +296,7 @@ mod tests {
     fn session_config_applies_batch_size_and_clamps_floor() {
         // 1. Explicit batch size is applied.
         let mut spec = minimal_spec();
-        spec.df_batch_size = 4096;
+        spec.common.df_batch_size = 4096;
         let config = session_config_for_spec(&spec);
         assert_eq!(
             config.batch_size(),
@@ -305,7 +305,7 @@ mod tests {
         );
 
         // 2. Zero (sub-1) batch size is clamped to 1.
-        spec.df_batch_size = 0;
+        spec.common.df_batch_size = 0;
         let config_clamped = session_config_for_spec(&spec);
         assert_eq!(
             config_clamped.batch_size(),
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn session_config_uses_spec_target_partitions() {
         let mut spec = minimal_spec();
-        spec.df_target_partitions = 4;
+        spec.common.df_target_partitions = 4;
         let config = session_config_for_spec(&spec);
         assert_eq!(
             config.target_partitions(),
