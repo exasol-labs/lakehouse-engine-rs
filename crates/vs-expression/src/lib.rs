@@ -82,6 +82,21 @@ fn json_scalar_to_string(value: &Json) -> String {
     }
 }
 
+/// Whether an argument node is a NULL-valued literal: a `literal_null` node,
+/// or any `literal_*` node whose `value` is JSON `null` or absent. Used to
+/// strip NULL entries from a const list before rendering, since Exasol's
+/// `IN`/`NOT IN` ignores NULL list entries while DataFusion's three-valued
+/// logic would otherwise silently empty the result (#206).
+fn is_null_literal(arg: &Json) -> bool {
+    match arg.get("type").and_then(|t| t.as_str()) {
+        Some("literal_null") => true,
+        Some(t) if t.starts_with("literal_") => {
+            matches!(arg.get("value"), None | Some(Json::Null))
+        }
+        _ => false,
+    }
+}
+
 /// Render a slice of argument nodes, returning an error if any fails.
 fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError> {
     args.iter()
@@ -314,6 +329,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let mut rendered: Vec<String> = Vec::new();
             if let Some(Json::Array(args)) = value("arguments") {
                 for arg in args {
+                    if is_null_literal(arg) {
+                        continue;
+                    }
                     if let Some(r) = render_expression_inner(arg, dialect)? {
                         rendered.push(r);
                     }
@@ -1267,6 +1285,53 @@ mod tests {
             "arguments": []
         });
         assert_eq!(render_expression(&expr).unwrap(), "FALSE");
+    }
+
+    #[test]
+    fn renders_in_constlist_strips_null() {
+        let expr = json!({
+            "type": "predicate_in_constlist",
+            "expression": {"type": "column", "name": "status"},
+            "arguments": [
+                {"type": "literal_string", "value": "A"},
+                {"type": "literal_null"},
+                {"type": "literal_date", "value": null}
+            ]
+        });
+        let sql = render_expression(&expr).unwrap();
+        assert!(sql.contains("'A'"), "'A' not found: {sql}");
+        assert!(!sql.contains("NULL"), "NULL should not survive: {sql}");
+    }
+
+    #[test]
+    fn renders_all_null_in_as_false() {
+        let expr = json!({
+            "type": "predicate_in_constlist",
+            "expression": {"type": "column", "name": "x"},
+            "arguments": [
+                {"type": "literal_null"},
+                {"type": "literal_date", "value": null}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), "FALSE");
+    }
+
+    #[test]
+    fn renders_not_in_constlist_strips_null() {
+        let expr = json!({
+            "type": "predicate_not",
+            "expression": {
+                "type": "predicate_in_constlist",
+                "expression": {"type": "column", "name": "status"},
+                "arguments": [
+                    {"type": "literal_string", "value": "A"},
+                    {"type": "literal_null"},
+                    {"type": "literal_date", "value": null}
+                ]
+            }
+        });
+        let sql = render_expression(&expr).unwrap();
+        assert_eq!(sql, r#"(NOT ("STATUS" IN ('A')))"#);
     }
 
     // --- BETWEEN ---
