@@ -347,8 +347,9 @@ pub(super) async fn build_scan_sql(
     // #136 follow-up). The alias text is never read — only position carries
     // through to EMITS — so any unique-per-position identifier is safe. `Column`
     // items keep their un-aliased form: a bare column's derived name is always
-    // its own quoted identifier, which `project_columns` already deduplicates
-    // by name upstream, so two `Column` items can never collide with each
+    // its own quoted identifier, and Exasol itself de-duplicates repeated bare
+    // column references in the select list before the pushdown request ever
+    // reaches the adapter, so two `Column` items can never collide with each
     // other — only an `Expr` wrapping a projected column can collide with it.
     let select_items: Vec<String> = proj_items
         .iter()
