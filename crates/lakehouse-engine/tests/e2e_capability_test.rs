@@ -420,6 +420,127 @@ fn e2e_selectlist_expression_pushdown() {
     }
 }
 
+/// Regression for issue #190: a projected constant/literal select-list item
+/// must push down without collapsing to the full base-table row. Runs three
+/// literal-projection shapes over the full 20-row EVENTS table (no WHERE)
+/// and asserts both the emitted column arity and the constant value in every
+/// literal position — including BOTH positions of a duplicated literal,
+/// which pre-fix collapsed to arity 2 (value-based dedup) or failed with a
+/// column-count error (full-row fallback).
+#[test]
+fn e2e_selectlist_literal_projection_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+
+    // `SELECT 1 FROM <t>`: single literal column, all 20 rows, every value 1.
+    {
+        let sql = format!("SELECT 1 FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(cols.len(), 1, "expected 1 column (bare literal): {cols:?}");
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, v) in cols[0].iter().enumerate() {
+            let n = parse_numeric(v);
+            assert!(
+                (n - 1.0).abs() < f64::EPSILON,
+                "row {i}: literal column must be 1, got {n}"
+            );
+        }
+    }
+
+    // `SELECT 1, name FROM <t>`: literal + real column, arity 2.
+    {
+        let sql = format!("SELECT 1, name FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (literal, name): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        assert_eq!(cols[1].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, v) in cols[0].iter().enumerate() {
+            let n = parse_numeric(v);
+            assert!(
+                (n - 1.0).abs() < f64::EPSILON,
+                "row {i}: literal column must be 1, got {n}"
+            );
+        }
+        for (i, v) in cols[1].iter().enumerate() {
+            let name = v
+                .as_str()
+                .unwrap_or_else(|| panic!("row {i}: name is not a string: {v:?}"));
+            assert!(
+                name.to_lowercase().starts_with("event"),
+                "row {i}: name must start with \"event\", got {name}"
+            );
+        }
+    }
+
+    // `SELECT 1, name, 1 FROM <t>`: duplicated literal — the arity-3 regression
+    // case for issue #190. Both literal positions (0 and 2) must independently
+    // carry the constant 1; a pre-fix value-based dedup would have collapsed
+    // this to arity 2, and the full-row fallback would have errored on arity.
+    {
+        let sql = format!("SELECT 1, name, 1 FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            3,
+            "expected 3 columns (literal, name, literal): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        assert_eq!(cols[2].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, (a, b)) in cols[0].iter().zip(cols[2].iter()).enumerate() {
+            let a = parse_numeric(a);
+            let b = parse_numeric(b);
+            assert!(
+                (a - 1.0).abs() < f64::EPSILON,
+                "row {i}: column 0 (first duplicated literal) must be 1, got {a}"
+            );
+            assert!(
+                (b - 1.0).abs() < f64::EPSILON,
+                "row {i}: column 2 (second duplicated literal) must be 1, got {b}"
+            );
+        }
+    }
+}
+
+/// Regression for issue #190: a query whose predicate prunes every Iceberg
+/// data file (`id > 1000` against a max seeded id of 20) must still accept a
+/// select list of repeated literals plus a real column. This exercises the
+/// `empty_pushdown_sql` path with positional-unique synthetic EMITS aliases
+/// for the two `1` literals — proving Exasol accepts the zero-row shape
+/// rather than rejecting it on a duplicate-alias or arity error.
+#[test]
+fn e2e_all_files_pruned_literal_projection_empty_shape() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT 1, name, 1 FROM {} WHERE id > 1000", vs_table());
+    // `execute` panics if Exasol rejects the pushdown (a duplicate EMITS alias
+    // or a column-count mismatch), so reaching the assertions already proves
+    // Exasol accepted the empty-pushdown shape. Assert on the resultSet
+    // METADATA, not `query_columns`: that helper returns an empty vec for any
+    // zero-row result, so it cannot observe the column count of zero rows.
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let num_columns = result_set["numColumns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numColumns in resultSet: {resp}"));
+    assert_eq!(
+        num_columns, 3,
+        "expected 3 columns (literal, name, literal) even with all files pruned: {resp}"
+    );
+    let num_rows = result_set["numRows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numRows in resultSet: {resp}"));
+    assert_eq!(
+        num_rows, 0,
+        "all-files-pruned predicate must return zero rows: {resp}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8.7  HAVING clause pushdown
 // ---------------------------------------------------------------------------
@@ -791,7 +912,13 @@ fn e2e_time_between_matches_exasol() {
     let anchor = "TIMESTAMP '2024-01-01 02:30:00'";
 
     let hours_sql = format!("SELECT HOURS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &hours_sql, "date_part('epoch'");
+    // The projected expression now lands in the scan spec's JSON `projection`
+    // field, which is embedded as the single-quoted `LAKEHOUSE_SCAN('…')`
+    // argument, so its single quotes are doubled by SQL-string escaping
+    // (`date_part('epoch'` → `date_part(''epoch''`). Before the positional
+    // EMITS-naming change (#190) the expression also appeared verbatim as the
+    // EMITS identifier; it no longer does — the EMITS name is now `_LH_PROJ_0`.
+    assert_select_pushed_down(&mut conn, &hours_sql, "date_part(''epoch''");
     let hours = parse_numeric(&conn.query_columns(&hours_sql)[0][0]);
     assert!(
         (hours - 2.5).abs() < 1e-9,
@@ -799,7 +926,7 @@ fn e2e_time_between_matches_exasol() {
     );
 
     let minutes_sql = format!("SELECT MINUTES_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &minutes_sql, "date_part('epoch'");
+    assert_select_pushed_down(&mut conn, &minutes_sql, "date_part(''epoch''");
     let minutes = parse_numeric(&conn.query_columns(&minutes_sql)[0][0]);
     assert!(
         (minutes - 150.0).abs() < 1e-9,
@@ -807,7 +934,7 @@ fn e2e_time_between_matches_exasol() {
     );
 
     let seconds_sql = format!("SELECT SECONDS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &seconds_sql, "date_part('epoch'");
+    assert_select_pushed_down(&mut conn, &seconds_sql, "date_part(''epoch''");
     let seconds = parse_numeric(&conn.query_columns(&seconds_sql)[0][0]);
     assert!(
         (seconds - 9000.0).abs() < 1e-9,

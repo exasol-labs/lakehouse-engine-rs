@@ -18,7 +18,7 @@ use super::namespace::parse_table_ident;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::single_group_agg::SingleGroupItem;
 use super::support::{
-    aggregate_exasol_types, exasol_type_from_json, quote_ident, redact_catalog_error,
+    aggregate_exasol_types, emits_ident, exasol_type_from_json, redact_catalog_error,
 };
 use super::{GroupedSelectItem, build_logical_schema};
 
@@ -815,7 +815,8 @@ fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Js
     let items: Vec<String> = proj_cols
         .iter()
         .zip(proj_types.iter())
-        .map(|(item, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(item.emit_name())))
+        .enumerate()
+        .map(|(i, (item, ty))| format!("CAST(NULL AS {ty}) AS {}", emits_ident(item, i)))
         .collect();
     let sql = format!("SELECT {} FROM DUAL WHERE 1=0", items.join(", "));
     serde_json::json!({"type": "pushdown", "sql": sql})
@@ -825,6 +826,7 @@ fn empty_pushdown_sql(proj_cols: &[ProjectionItem], proj_types: &[String]) -> Js
 mod tests {
     use super::super::detect_aggregates;
     use super::super::single_group_agg::DistinctCount;
+    use super::super::support::quote_ident;
     use super::super::test_support::*;
     use super::*;
     use crate::scan::spec::AggregatePlan;
@@ -1060,6 +1062,49 @@ mod tests {
         let sql = resp["sql"].as_str().unwrap();
         assert!(sql.contains("WHERE 1=0"));
         assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
+    }
+
+    /// A pruned query with repeated literals in the projection (e.g.
+    /// `SELECT 1, name, 1 ... WHERE <all files pruned>`) keeps unique EMITS
+    /// aliases via `emits_ident`: the two `Expr` positions get distinct
+    /// positional synthetic names, never a duplicated `AS "1"` collision
+    /// (issue #190).
+    #[test]
+    fn empty_pushdown_sql_repeated_literals_unique_aliases() {
+        let proj_cols: Vec<ProjectionItem> = vec![
+            ProjectionItem::Expr { expr: "1".into() },
+            ProjectionItem::Column("NAME".into()),
+            ProjectionItem::Expr { expr: "1".into() },
+        ];
+        let proj_types = vec![
+            "DECIMAL(18,0)".to_string(),
+            "VARCHAR(2000000)".to_string(),
+            "DECIMAL(18,0)".to_string(),
+        ];
+        let resp = empty_pushdown_sql(&proj_cols, &proj_types);
+        let sql = resp["sql"].as_str().unwrap();
+
+        assert_eq!(
+            sql.matches("CAST(NULL AS").count(),
+            3,
+            "must emit three CAST(NULL AS ...) items, one per select-list item: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("AS {}", quote_ident("_LH_PROJ_0"))),
+            "position 0's literal must get a positional-unique alias: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("AS {}", quote_ident("NAME"))),
+            "the column item must keep its real quoted name: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("AS {}", quote_ident("_LH_PROJ_2"))),
+            "position 2's literal must get a distinct positional-unique alias: {sql}"
+        );
+        assert!(
+            !sql.contains(&format!("AS {}", quote_ident("1"))),
+            "must never alias a literal by its rendered value text (would collide): {sql}"
+        );
     }
 
     /// Single-group empty result: one row, per-`AggKind` literal cast to its
