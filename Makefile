@@ -76,6 +76,16 @@ export LH_REST_PORT
 test-e2e: cross-musl-udf-build
 	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test -- --test-threads=1
 
+# Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
+# stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
+#     minio exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+# They FAIL (not skip) when the stack is unavailable — same contract as
+# test-e2e. All tests share one VS, so the binary runs serially
+# (--test-threads=1).
+test-e2e-lakekeeper: cross-musl-udf-build
+	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
+
 # Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
 #
 # This Exasol is the dedicated lakehouse-engine stack (the sibling stack
@@ -164,4 +174,4 @@ lint:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e install-slc bucketfs-upload-so fmt lint bench
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench

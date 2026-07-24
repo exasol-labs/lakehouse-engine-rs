@@ -147,6 +147,7 @@ impl CloudEnv {
             path_style: false,
             use_sigv4: true,
             use_vended_credentials: false,
+            ..Default::default()
         }
     }
 
@@ -738,6 +739,7 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
         path_style: false,
         use_sigv4: true,
         use_vended_credentials: false,
+        ..Default::default()
     };
     let base_sql = build_create_connection_sql(
         "LH_REDACTION_PROBE",

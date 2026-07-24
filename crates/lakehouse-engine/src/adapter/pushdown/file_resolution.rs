@@ -9,8 +9,9 @@ use iceberg::TableIdent;
 use serde_json::Value as Json;
 
 use super::credentials::{
-    CatalogSession, build_s3_file_io, extract_vended_keys, extract_vended_region,
-    load_table_any_auth, merge_vended_into_storage,
+    CatalogSession, build_s3_file_io, extract_vended_endpoint, extract_vended_keys,
+    extract_vended_path_style, extract_vended_region, load_table_any_auth,
+    merge_vended_into_storage,
 };
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::namespace::parse_table_ident;
@@ -275,6 +276,17 @@ pub(crate) async fn resolve_file_list_with_session(
         // preserve the static region.
         if let Some(region) = extract_vended_region(&result, anchor) {
             merged.region = region;
+        }
+        // Adopt the vended S3 endpoint and path-style flag when advertised. An
+        // S3-compatible store (e.g. MinIO behind Lakekeeper) vends the concrete
+        // `s3.endpoint`/`s3.path-style-access`, and a vended CONNECTION carries no
+        // static endpoint; AWS S3 omits them, so absence preserves the static
+        // values and the Glue vended path is unchanged.
+        if let Some(endpoint) = extract_vended_endpoint(&result, anchor) {
+            merged.endpoint = endpoint;
+        }
+        if let Some(path_style) = extract_vended_path_style(&result, anchor) {
+            merged.path_style = path_style;
         }
         merged
     } else {

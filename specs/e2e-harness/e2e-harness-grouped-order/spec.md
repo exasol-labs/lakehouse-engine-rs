@@ -1,6 +1,6 @@
 # Feature: End-to-End Harness — Grouped-Aggregate Select-List Ordering
 
-Extends `packaging/e2e-harness` with grouped-aggregate E2E cases that deliberately place
+Extends `e2e-harness/e2e-harness` with grouped-aggregate E2E cases that deliberately place
 an aggregate before, between, or after the group keys in the `selectList`, and — with the
 advertisement of `AGGREGATE_GROUP_BY_TUPLE` (issue #53) — cases that prove a multi-column
 GROUP BY is actually pushed down to the scan UDF (via `EXPLAIN VIRTUAL`) rather than

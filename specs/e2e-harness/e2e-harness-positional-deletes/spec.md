@@ -1,6 +1,6 @@
 # Feature: End-to-End Harness — Positional Deletes
 
-Extends the end-to-end harness (`packaging/e2e-harness`) with a matrix that drives Iceberg
+Extends the end-to-end harness (`e2e-harness/e2e-harness`) with a matrix that drives Iceberg
 merge-on-read positional-delete tables through the full lakehouse VS query path — from Exasol SQL
 through the adapter and scan UDF to Iceberg Parquet data + positional-delete files in MinIO —
 verifying that the post-delete row set is returned, that deletes compose with projection/filter/

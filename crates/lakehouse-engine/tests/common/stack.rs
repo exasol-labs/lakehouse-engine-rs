@@ -1,5 +1,9 @@
 //! Stack readiness helpers and environment accessors for lakehouse-engine E2E tests.
-#![cfg(any(feature = "exasol-e2e", feature = "cloud-e2e"))]
+#![cfg(any(
+    feature = "exasol-e2e",
+    feature = "cloud-e2e",
+    feature = "lakekeeper-e2e"
+))]
 
 use std::time::{Duration, Instant};
 
@@ -256,7 +260,7 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
 }
 
 /// Path (host-side) of the compiled lakehouse-engine .so.
-#[cfg(feature = "exasol-e2e")]
+#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -277,7 +281,15 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
 /// The resulting string is suitable for use in:
 ///   `CREATE OR REPLACE CONNECTION <name> TO '<uri>' USER '' IDENTIFIED BY '<json>'`
 ///
-/// All boolean flags default to `false`; `path_style` defaults to `true`.
+/// All boolean flags, including `path_style`, default to `false` under this
+/// struct's `Default` — callers that want `path_style: true` (e.g. MinIO) must
+/// set it explicitly, as `local_stack_connection_password` and the Lakekeeper
+/// static-warehouse password already do.
+/// The catalog-auth fields (`token`, `client_id`, `client_secret`,
+/// `oauth2_server_uri`, `scope`) are `Option<String>` and default to `None`
+/// (absent from the serialized JSON) so existing callers built via struct-update
+/// syntax (`..Default::default()`) need not set them.
+#[derive(Default)]
 pub struct CatalogConnectionPassword {
     pub warehouse: String,
     pub endpoint: String,
@@ -288,6 +300,16 @@ pub struct CatalogConnectionPassword {
     pub path_style: bool,
     pub use_sigv4: bool,
     pub use_vended_credentials: bool,
+    /// Static bearer token for catalog authentication. Absent when not supplied.
+    pub token: Option<String>,
+    /// OAuth2 client ID for catalog client-credentials flow. Absent when not supplied.
+    pub client_id: Option<String>,
+    /// OAuth2 client secret for catalog client-credentials flow. Absent when not supplied.
+    pub client_secret: Option<String>,
+    /// Optional OAuth2 token endpoint URI. Absent when not supplied.
+    pub oauth2_server_uri: Option<String>,
+    /// Optional OAuth2 scope. Absent when not supplied.
+    pub scope: Option<String>,
 }
 
 impl CatalogConnectionPassword {
@@ -307,6 +329,21 @@ impl CatalogConnectionPassword {
         });
         if let Some(token) = &self.session_token {
             obj["session_token"] = serde_json::Value::String(token.clone());
+        }
+        if let Some(token) = &self.token {
+            obj["token"] = serde_json::Value::String(token.clone());
+        }
+        if let Some(client_id) = &self.client_id {
+            obj["client_id"] = serde_json::Value::String(client_id.clone());
+        }
+        if let Some(client_secret) = &self.client_secret {
+            obj["client_secret"] = serde_json::Value::String(client_secret.clone());
+        }
+        if let Some(oauth2_server_uri) = &self.oauth2_server_uri {
+            obj["oauth2_server_uri"] = serde_json::Value::String(oauth2_server_uri.clone());
+        }
+        if let Some(scope) = &self.scope {
+            obj["scope"] = serde_json::Value::String(scope.clone());
         }
         // Escape single quotes for safe SQL embedding (SQL string literal).
         obj.to_string().replace('\'', "''")
@@ -337,7 +374,7 @@ pub fn build_create_connection_sql(
 /// Uses the same internal URLs that `create_virtual_schema` uses for
 /// CATALOG_URI / S3_ENDPOINT — these are the addresses reachable from
 /// inside the Exasol UDF container.
-#[cfg(feature = "exasol-e2e")]
+#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
@@ -349,5 +386,60 @@ pub fn local_stack_connection_password() -> CatalogConnectionPassword {
         path_style: true,
         use_sigv4: false,
         use_vended_credentials: false,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod catalog_connection_password_tests {
+    use super::CatalogConnectionPassword;
+
+    fn base_password() -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            warehouse: "s3://warehouse/".to_string(),
+            endpoint: "http://minio:9000".to_string(),
+            region: "us-east-1".to_string(),
+            access_key: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
+            path_style: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn omits_catalog_auth_fields_when_absent() {
+        let json_str = base_password().to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        for key in [
+            "token",
+            "client_id",
+            "client_secret",
+            "oauth2_server_uri",
+            "scope",
+        ] {
+            assert!(
+                parsed.get(key).is_none(),
+                "expected key '{key}' to be absent, found: {parsed}"
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_catalog_auth_fields_when_present() {
+        let password = CatalogConnectionPassword {
+            token: Some("bearer-token".to_string()),
+            client_id: Some("my-client".to_string()),
+            client_secret: Some("my-secret".to_string()),
+            oauth2_server_uri: Some("https://idp.example.com/token".to_string()),
+            scope: Some("catalog".to_string()),
+            ..base_password()
+        };
+        let json_str = password.to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["token"], "bearer-token");
+        assert_eq!(parsed["client_id"], "my-client");
+        assert_eq!(parsed["client_secret"], "my-secret");
+        assert_eq!(parsed["oauth2_server_uri"], "https://idp.example.com/token");
+        assert_eq!(parsed["scope"], "catalog");
     }
 }

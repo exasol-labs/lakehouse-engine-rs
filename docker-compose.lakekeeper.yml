@@ -1,0 +1,193 @@
+# Lakekeeper E2E overlay — layered ON TOP of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
+#     minio exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#
+# Adds an OpenID-secured (Keycloak) multi-warehouse Lakekeeper Iceberg REST
+# catalog backed by the base stack's MinIO. It REUSES the base `minio` and
+# `exasol` services rather than redefining them — the only base service this
+# overlay overrides is `exasol`, and only to extend its /etc/hosts loop so the
+# UDF can resolve the two new service names (see the exasol block below).
+#
+# Authorization: Lakekeeper's reference compose bolts on OpenFGA, but that is
+# *authorization*. This suite only exercises *authentication* (the engine's
+# OAuth2 client-credentials CONNECTION path), so OpenFGA is omitted and
+# Lakekeeper runs with its default `allowall` authz backend.
+#
+# --- Credentials & identifiers this stack exposes (consumed by the Rust harness,
+#     tasks 3.2 / 3.3 / 4.x — keep these in sync with tests/common) -------------
+#   Keycloak realm ............ iceberg
+#   OAuth2 client_id .......... lakehouse
+#   OAuth2 client_secret ...... lakehouse-engine-secret     (confidential client)
+#   OIDC audience (aud) ....... lakekeeper                  (= LAKEKEEPER__OPENID_AUDIENCE)
+#   Token endpoint (UDF-side).. http://keycloak:8080/realms/iceberg/protocol/openid-connect/token
+#   Token endpoint (host-side). http://localhost:${LH_KEYCLOAK_PORT}/realms/iceberg/protocol/openid-connect/token
+#   Provider URI (issuer) ..... http://keycloak:8080/realms/iceberg (internal, primary)
+#                               http://localhost:${LH_KEYCLOAK_PORT}/realms/iceberg (host, additional issuer)
+#   Catalog base URL (UDF) .... http://lakekeeper:8181/catalog
+#   Management API (host) ..... http://localhost:${LH_LAKEKEEPER_PORT}/management/v1
+#   MinIO warehouse bucket .... warehouse            (created by base `minio-init`)
+#   Static warehouse creds .... minioadmin / minioadmin          (sts-enabled=false)
+#   Vended warehouse creds .... lakekeeper / lakekeeper-secret-key (sts-enabled=true)
+#     scoped by MinIO policy `lakekeeper-warehouse` (bucket `warehouse` only),
+#     created by the `minio-lakekeeper-init` one-shot below.
+#
+# Host ports are env-overridable (matching the base file's convention) so the
+# E2E suite can always pick free ports:
+#   Keycloak 8080 -> ${LH_KEYCLOAK_PORT:-28080}   Lakekeeper 8181 -> ${LH_LAKEKEEPER_PORT:-28181}
+
+services:
+  keycloak:
+    image: "${LH_KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak:26.0.7}"
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+    volumes:
+      - ./scripts/keycloak-realm-iceberg.json:/opt/keycloak/data/import/realm.json:ro
+    command:
+      - start-dev
+      - --health-enabled=true
+      - --metrics-enabled=true
+      - --import-realm
+      - --log-level=INFO
+    # /dev/tcp probe against the IMPORTED `iceberg` realm (not `master`): this
+    # gates dependents on realm-import completion, not just on Keycloak booting.
+    # No curl in the Keycloak image; the bundled shell supports /dev/tcp.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'exec 3<>/dev/tcp/127.0.0.1/8080;echo -e "GET /realms/iceberg/.well-known/openid-configuration HTTP/1.1\r\nhost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n" >&3;grep "jwks_uri" <&3',
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "${LH_KEYCLOAK_PORT:-28080}:8080"
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.30
+
+  lakekeeper-db:
+    image: "${LH_LAKEKEEPER_DB_IMAGE:-postgres:17}"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.31
+
+  # Run-once schema migration against the Postgres backend. Not a long-running
+  # service: dependents gate on `service_completed_successfully`. Because it
+  # exits, it is NOT included in a `--wait` set that also waits for healthy —
+  # `--wait` treats a clean exit of a completed dependency as satisfied.
+  lakekeeper-migrate:
+    image: "${LH_LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.1}"
+    entrypoint: ["/home/nonroot/lakekeeper", "migrate"]
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - RUST_LOG=info
+    restart: "no"
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  lakekeeper:
+    image: "${LH_LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.1}"
+    command: ["serve"]
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      # Internal issuer (UDF-side tokens) is primary; the host-published issuer
+      # (harness-side tokens obtained via the mapped port) is added so both are
+      # accepted — Keycloak stamps `iss` from the request's host.
+      - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
+      - "LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:${LH_KEYCLOAK_PORT:-28080}/realms/iceberg"
+      - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+      - RUST_LOG=info,lakekeeper=info
+    # Built-in healthcheck subcommand — the image is distroless (no curl/wget).
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      lakekeeper-db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${LH_LAKEKEEPER_PORT:-28181}:8181"
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.32
+
+  # Task 1.3 — MinIO STS AssumeRole scoping. MinIO serves STS AssumeRole at its
+  # S3 endpoint (http://minio:9000/?Action=AssumeRole...) with NO enable flag;
+  # the vended credentials are scoped by the IAM policy attached to the caller's
+  # key. Lakekeeper (vended warehouse) authenticates to STS with the dedicated
+  # `lakekeeper` user below, so returned session creds are capped at the
+  # `warehouse` bucket. One-shot; idempotent on re-`up`.
+  minio-lakekeeper-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      printf '%s' '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::warehouse\",\"arn:aws:s3:::warehouse/*\"]}]}' > /tmp/lakekeeper-warehouse-policy.json;
+      mc admin policy create local lakekeeper-warehouse /tmp/lakekeeper-warehouse-policy.json || mc admin policy add local lakekeeper-warehouse /tmp/lakekeeper-warehouse-policy.json || true;
+      mc admin user add local lakekeeper lakekeeper-secret-key || true;
+      mc admin policy attach local lakekeeper-warehouse --user lakekeeper || mc admin policy set local lakekeeper-warehouse user=lakekeeper || true;
+      echo 'minio lakekeeper STS user + policy ready'
+      "
+    restart: "no"
+    networks:
+      - lakehouse
+
+  # OVERRIDE of the base `exasol` service — extends it, does not replace it.
+  # Exasol's exaconf rewrites /etc/hosts and /etc/resolv.conf on startup, so the
+  # ONLY channel by which the in-UDF DataFusion/catalog client resolves a
+  # docker-network service name is the static-host loop in the entrypoint. The
+  # base entrypoint injects only `minio` + `iceberg-rest`; this overlay's UDF
+  # must also reach `keycloak` (token) and `lakekeeper` (catalog), so the loop
+  # is re-declared here to inject all four (each checked independently). The
+  # base file is untouched; this is the compose-overlay extension point.
+  exasol:
+    extra_hosts:
+      - "keycloak:10.84.0.30"
+      - "lakekeeper:10.84.0.32"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ( while true; do
+            if [ -f /etc/hosts ]; then
+              grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 minio\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])keycloak([[:space:]]|$)' /etc/hosts || printf '10.84.0.30 keycloak\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])lakekeeper([[:space:]]|$)' /etc/hosts || printf '10.84.0.32 lakekeeper\n' >> /etc/hosts
+            fi
+            sleep 2
+          done ) &
+        exec "$(ls /opt/exasol/cos-*/docker/entrypoint.sh | head -1)" init-sc
