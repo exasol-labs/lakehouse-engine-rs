@@ -117,3 +117,12 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * *AND* the scan UDF SHALL register the column as the timezone-aware Arrow `Timestamp(_, Some("UTC"))`, so DataFusion timestamp comparisons, date-function evaluation, and predicate binding stay timezone-correct
 * *AND* the emit-boundary coercion SHALL cast that column to `Timestamp(_, None)` preserving the underlying UTC-instant value, so the emitted `TIMESTAMP` is the UTC wall-clock instant and no value is shifted
 * *AND* the declared Exasol column type MUST NOT distinguish `timestamptz` from `timestamp` at the Exasol SQL surface — a deliberate, named target-type trade-off, not a change to any emitted value
+
+### Scenario: A TIMESTAMP(p) EMITS string maps back to the microsecond Arrow timestamp
+
+* *GIVEN* an EMITS type string of the form `TIMESTAMP(p)` for an integer precision `p` in 0-9 — the shape the adapter now declares for a projected TIMESTAMP CAST expression once `exasol_type_from_json` (`vs-adapter/pushdown-planning`) reads `fractionalSecondsPrecision`
+* *WHEN* the scan resolves that column's Arrow coercion target via `exasol_type_to_arrow` at the emit boundary (`target_arrow_type`)
+* *THEN* `exasol_type_to_arrow` SHALL return `Some(DataType::Timestamp(TimeUnit::Microsecond, None))` for every `TIMESTAMP(p)`, `p` in 0-9, identical to the target it already returns for bare `TIMESTAMP` — because Arrow's Microsecond unit is this project's fixed internal representation for every Exasol TIMESTAMP precision, and the declared `p` only governs Exasol's own type check, never the Arrow unit
+* *AND* the function MUST NOT return `None` for a `TIMESTAMP(p)` string, so the column stays a timestamp and is NOT routed through the `Utf8`/string path — which would stringify the value and violate the `TIMESTAMP(p)` EMITS declaration
+* *AND* a bare `TIMESTAMP` string SHALL continue to map to `Some(DataType::Timestamp(TimeUnit::Microsecond, None))`, unchanged by this scenario
+* *AND* `exasol_type_to_arrow` SHALL leave its `TIMESTAMP WITH LOCAL TIME ZONE` exact-match arm unchanged, because `exasol_type_from_json`'s WLTZ branch short-circuits before any precision logic (`vs-adapter/pushdown-planning`, decision [3]) and emits the bare literal `TIMESTAMP WITH LOCAL TIME ZONE` with no `(p)` suffix, so no precision-aware WLTZ arm is ever needed
