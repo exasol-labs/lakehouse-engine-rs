@@ -116,6 +116,21 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     }
 }
 
+/// The positional EMITS identifier for a projection item at select-list index `index`.
+///
+/// A [`Column`](ProjectionItem::Column) keeps its real quoted source-column name, so an
+/// outer top-N `ORDER BY` that references a projected column by name still resolves. An
+/// [`Expr`](ProjectionItem::Expr) gets a positional-unique SYNTHETIC name (`_LH_PROJ_{index}`,
+/// matching the scan side's `raw_scan::build_scan_sql` aliasing), never its rendered SQL
+/// text, so repeated literals never collide into a duplicate EMITS name. Returns the
+/// already-quoted identifier.
+pub(super) fn emits_ident(item: &ProjectionItem, index: usize) -> String {
+    match item {
+        ProjectionItem::Column(name) => quote_ident(name),
+        ProjectionItem::Expr { .. } => quote_ident(&format!("_LH_PROJ_{index}")),
+    }
+}
+
 /// Build the row-scan SQL (no aggregates) as an OUTER UNGROUPED scalar scan over the
 /// nested distributor — no `SELECT * FROM (...)` materialization wrapper (decision
 /// [5]). Result-equivalence (decision [7]): with no outer GROUP BY the returned rows
@@ -144,7 +159,8 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
     let emits = proj_cols
         .iter()
         .zip(proj_types.iter())
-        .map(|(item, ty)| format!("{} {}", quote_ident(item.emit_name()), ty))
+        .enumerate()
+        .map(|(i, (item, ty))| format!("{} {}", emits_ident(item, i), ty))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -420,18 +436,28 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
 /// Extract the projected columns and their Exasol types from the pushdown request.
 ///
 /// For `column` nodes: returns the uppercase column name and its Exasol type.
-/// For scalar expression nodes (e.g. `function_scalar`): renders via the VS expression
-/// translator and returns the rendered SQL fragment with type `VARCHAR(2000000)`.
+/// For scalar expression nodes (e.g. `function_scalar`) and literals: renders via the VS
+/// expression translator and returns the rendered SQL fragment, typed by the item's
+/// declared `selectListDataTypes` entry (falling back to `VARCHAR(2000000)` only when the
+/// declared type is absent).
 /// If any select-list item can't be projected as-is (untranslatable scalar, or an
 /// aggregate/unknown node), the whole projection falls back to the full base table
 /// column set so Exasol can post-process the expression, GROUP BY, and aggregate —
-/// correctness over pushdown. The returned projection is always deduplicated by name,
-/// since duplicate EMITS column names are invalid in Exasol.
+/// correctness over pushdown. The returned projection is positional: exactly one
+/// item per select-list item, in select-list order.
 pub(super) fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
     project_columns(pushdown_req, extract_all_column_types(request))
+}
+
+/// Whether an Exasol declared type is a valid UDF EMITS output type.
+/// Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as an EMITS output
+/// (sqlCode 22002), so a rendered item declared that type declines to the
+/// full-base-row fallback instead of emitting an EMITS clause the scan rejects.
+fn is_valid_emits_output_type(ty: &str) -> bool {
+    ty != "TIMESTAMP WITH LOCAL TIME ZONE"
 }
 
 /// Resolve a pushdown request's select list into an ordered projection and its
@@ -516,16 +542,31 @@ pub(super) fn project_columns(
                         types.push(ty);
                     }
                     t if is_literal_selectlist_item(t) => {
-                        // A bare literal is NOT a projectable source column. Its
-                        // rendered SQL (e.g. `NULL`, `'x'`, `5`) is an expression,
-                        // never a column identifier — pushing it into the row-scan
-                        // projection would later be quoted as a phantom EMITS column
-                        // name (`"NULL"`) that DataFusion rejects (issue #52). The
-                        // grouped "count the groups" shape is handled correctly in
-                        // detect_group_by_aggregates; this is the row-scan backstop:
-                        // fall back to the full base row so Exasol post-processes the
-                        // literal projection itself.
-                        needs_full_fallback = true;
+                        // A bare literal renders to a constant SQL expression (e.g.
+                        // `NULL`, `'x'`, `5`) — push it positionally as an `Expr`,
+                        // exactly like the scalar-expression branch below, so the
+                        // emitted arity equals the select-list arity (issue #190).
+                        match render_expression_safe(e) {
+                            Some(sql_frag) => {
+                                let ty = declared_type
+                                    .clone()
+                                    .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
+                                if is_valid_emits_output_type(&ty) {
+                                    names.push(ProjectionItem::Expr { expr: sql_frag });
+                                    types.push(ty);
+                                } else {
+                                    // Declared type is not a valid EMITS output (e.g.
+                                    // TIMESTAMP WITH LOCAL TIME ZONE) — decline to the
+                                    // full-base-row fallback rather than emit a clause
+                                    // the scan rejects at scan time.
+                                    needs_full_fallback = true;
+                                }
+                            }
+                            None => {
+                                // Translator declined — fall back to projecting the full row.
+                                needs_full_fallback = true;
+                            }
+                        }
                     }
                     "function_scalar"
                     | "function_scalar_cast"
@@ -541,11 +582,17 @@ pub(super) fn project_columns(
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
-                                names.push(ProjectionItem::Expr { expr: sql_frag });
                                 let ty = declared_type
                                     .clone()
                                     .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
-                                types.push(ty);
+                                if is_valid_emits_output_type(&ty) {
+                                    names.push(ProjectionItem::Expr { expr: sql_frag });
+                                    types.push(ty);
+                                } else {
+                                    // Declared type is not a valid EMITS output — decline
+                                    // to the full-base-row fallback.
+                                    needs_full_fallback = true;
+                                }
                             }
                             None => {
                                 // Untranslatable — fall back to projecting the full row.
@@ -568,20 +615,7 @@ pub(super) fn project_columns(
         _ => full_row(),
     };
 
-    // Defensive backstop: duplicate EMITS column names are always invalid in Exasol,
-    // regardless of which path produced the projection. Dedup by the positional EMITS
-    // name, keeping the first occurrence and its type.
-    let mut seen = std::collections::HashSet::new();
-    let mut deduped_names = Vec::with_capacity(proj_names.len());
-    let mut deduped_types = Vec::with_capacity(proj_types.len());
-    for (name, ty) in proj_names.into_iter().zip(proj_types) {
-        if seen.insert(name.emit_name().to_string()) {
-            deduped_names.push(name);
-            deduped_types.push(ty);
-        }
-    }
-
-    Ok((deduped_names, deduped_types))
+    Ok((proj_names, proj_types))
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -2772,6 +2806,197 @@ mod tests {
             "an untranslatable CAST target must fall back to the full base row: {proj_cols:?}"
         );
         assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
+    }
+
+    /// A single projected literal renders to ONE positional `Expr` projection
+    /// item — not the full-base-row fallback (issue #190).
+    #[test]
+    fn selectlist_literal_rendered_as_positional_expr() {
+        let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal],
+                "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a single literal must not fall back to the full base row: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a rendered literal must be an Expr projection item: {proj_cols:?}"
+        );
+        assert_eq!(proj_cols[0].emit_name(), "1");
+        assert_eq!(proj_types[0], "DECIMAL(18,0)");
+    }
+
+    /// `SELECT 1, name, 1` yields three positional projection items — the two `1`
+    /// literals are NOT collapsed by value-based dedup (issue #190) — and
+    /// `emits_ident` assigns each a distinct EMITS identifier: the real quoted
+    /// column name for the `column` item, positional synthetic names for the two
+    /// `Expr` items.
+    #[test]
+    fn selectlist_duplicate_literals_keep_distinct_positions() {
+        let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+        let column = serde_json::json!({"type": "column", "name": "NAME"});
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal.clone(), column, literal],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 18, "scale": 0},
+                    {"type": "varchar", "size": 100},
+                    {"type": "decimal", "precision": 18, "scale": 0},
+                ],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+
+        assert_eq!(
+            proj_cols.len(),
+            3,
+            "the two identical literals must NOT be collapsed: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "position 0 must be a rendered Expr: {proj_cols:?}"
+        );
+        assert_eq!(proj_cols[1], ProjectionItem::Column("NAME".into()));
+        assert!(
+            matches!(proj_cols[2], ProjectionItem::Expr { .. }),
+            "position 2 must be a rendered Expr: {proj_cols:?}"
+        );
+
+        let ident_0 = emits_ident(&proj_cols[0], 0);
+        let ident_1 = emits_ident(&proj_cols[1], 1);
+        let ident_2 = emits_ident(&proj_cols[2], 2);
+        assert_eq!(ident_0, quote_ident("_LH_PROJ_0"));
+        assert_eq!(ident_1, quote_ident("NAME"));
+        assert_eq!(ident_2, quote_ident("_LH_PROJ_2"));
+        assert_ne!(
+            ident_0, ident_2,
+            "the two literal positions must not collide"
+        );
+        assert_ne!(ident_0, ident_1);
+        assert_ne!(ident_1, ident_2);
+    }
+
+    /// A bare literal select-list item projects exactly one column — proving the
+    /// full-row fallback is NOT taken for a plain literal (issue #190), even when
+    /// the table has more than one column available to fall back to.
+    #[test]
+    fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
+        let literal = serde_json::json!({"type": "literal_string", "value": "x"});
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal],
+                "selectListDataTypes": [{"type": "varchar", "size": 100}],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a bare literal must project exactly one column, not the full base row: {proj_cols:?}"
+        );
+    }
+
+    /// A literal declared `TIMESTAMP WITH LOCAL TIME ZONE` renders successfully
+    /// (via `render_expression_safe`) but declines to the full-base-row fallback
+    /// because Exasol rejects that type as a UDF EMITS output (sqlCode 22002) —
+    /// mirrors `selectlist_untranslatable_cast_falls_back_to_full_row`.
+    #[test]
+    fn selectlist_tstz_literal_falls_back_to_full_row() {
+        let literal = serde_json::json!({
+            "type": "literal_timestamp_utc",
+            "value": "2024-03-01 10:00:00"
+        });
+        // Confirm the literal actually renders — the decline must be due to the
+        // EMITS-type gate, not a render failure.
+        assert!(
+            render_expression_safe(&literal).is_some(),
+            "literal_timestamp_utc must render via render_expression_safe"
+        );
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal],
+                "selectListDataTypes": [{"type": "TIMESTAMP", "withLocalTimeZone": true}],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols,
+            vec![
+                ProjectionItem::Column("ID".into()),
+                ProjectionItem::Column("NAME".into()),
+            ],
+            "a TIMESTAMP WITH LOCAL TIME ZONE literal must fall back to the full base row: {proj_cols:?}"
+        );
+        assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
+    }
+
+    /// A plain `TIMESTAMP` (NOT with-local-time-zone) literal IS rendered as a
+    /// positional `Expr`, never declined — locking the exact-match boundary in
+    /// `is_valid_emits_output_type` so `TIMESTAMP` is never treated as a prefix of
+    /// `TIMESTAMP WITH LOCAL TIME ZONE`.
+    #[test]
+    fn selectlist_plain_timestamp_literal_rendered_as_expr() {
+        let literal = serde_json::json!({
+            "type": "literal_timestamp",
+            "value": "2024-03-01 10:00:00"
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal],
+                "selectListDataTypes": [{"type": "TIMESTAMP"}],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        assert_eq!(
+            proj_cols.len(),
+            1,
+            "a plain TIMESTAMP literal must not fall back to the full base row: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[0], ProjectionItem::Expr { .. }),
+            "a plain TIMESTAMP literal must be rendered as an Expr: {proj_cols:?}"
+        );
+        assert_eq!(proj_types[0], "TIMESTAMP");
     }
 
     /// An untranslatable select-list item falls back to the bare column.
