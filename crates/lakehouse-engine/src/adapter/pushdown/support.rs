@@ -436,8 +436,10 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
 /// Extract the projected columns and their Exasol types from the pushdown request.
 ///
 /// For `column` nodes: returns the uppercase column name and its Exasol type.
-/// For scalar expression nodes (e.g. `function_scalar`): renders via the VS expression
-/// translator and returns the rendered SQL fragment with type `VARCHAR(2000000)`.
+/// For scalar expression nodes (e.g. `function_scalar`) and literals: renders via the VS
+/// expression translator and returns the rendered SQL fragment, typed by the item's
+/// declared `selectListDataTypes` entry (falling back to `VARCHAR(2000000)` only when the
+/// declared type is absent).
 /// If any select-list item can't be projected as-is (untranslatable scalar, or an
 /// aggregate/unknown node), the whole projection falls back to the full base table
 /// column set so Exasol can post-process the expression, GROUP BY, and aggregate —

@@ -490,6 +490,7 @@ fn e2e_selectlist_literal_projection_pushdown() {
             "expected 3 columns (literal, name, literal): {cols:?}"
         );
         assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        assert_eq!(cols[2].len(), 20, "expected 20 rows: {cols:?}");
         for (i, (a, b)) in cols[0].iter().zip(cols[2].iter()).enumerate() {
             let a = parse_numeric(a);
             let b = parse_numeric(b);
