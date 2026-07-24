@@ -34,7 +34,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
-use lakehouse_engine::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{
+    AggKind, AggregatePlan, CommonScanSpec, FileEntry, ScanSpec, StorageProps,
+};
 use lakehouse_engine::scan::{
     build_alias_items, build_grouped_partial_agg_sql, build_partial_agg_sql_filtered,
     register_files, session_config_for_spec,
@@ -91,34 +93,18 @@ fn agg_spec(file_url: String) -> ScanSpec {
         .unwrap_or_else(|e| panic!("stat test parquet file {path}: {e}"))
         .len();
     ScanSpec {
-        table_root: String::new(),
-        files: vec![FileEntry::new(file_url, size)],
-        projection: Vec::new(),
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: StorageProps {
-            endpoint: "http://localhost:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "k".into(),
-            secret_key: "s".into(),
-            session_token: None,
-            allow_http: true,
-            path_style: true,
+        common: CommonScanSpec {
+            storage: StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            },
+            ..Default::default()
         },
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
+        files: vec![FileEntry::new(file_url, size)],
     }
 }
 
@@ -213,10 +199,10 @@ async fn single_group_agg_scan_prunes_to_referenced_columns() {
         column: Some("SCORE".into()),
         arg_expr: None,
     }];
-    spec.aggregates = Some(aggregates.clone());
+    spec.common.aggregates = Some(aggregates.clone());
 
     let plan = build_agg_physical_plan(&spec, |aliased_table| {
-        build_partial_agg_sql_filtered(&aggregates, aliased_table, spec.filter.as_deref())
+        build_partial_agg_sql_filtered(&aggregates, aliased_table, spec.common.filter.as_deref())
     })
     .await;
 
@@ -253,15 +239,15 @@ async fn grouped_agg_scan_prunes_to_referenced_columns() {
         column: Some("SCORE".into()),
         arg_expr: None,
     }];
-    spec.group_keys = Some(group_keys.clone());
-    spec.aggregates = Some(aggregates.clone());
+    spec.common.group_keys = Some(group_keys.clone());
+    spec.common.aggregates = Some(aggregates.clone());
 
     let plan = build_agg_physical_plan(&spec, |aliased_table| {
         build_grouped_partial_agg_sql(
             &group_keys,
             &aggregates,
             aliased_table,
-            spec.filter.as_deref(),
+            spec.common.filter.as_deref(),
         )
     })
     .await;

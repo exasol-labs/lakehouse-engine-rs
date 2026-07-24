@@ -339,9 +339,8 @@ pub fn local_stack_storage() -> StorageProps {
         region: "us-east-1".to_string(),
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 

@@ -13,9 +13,8 @@ pub(super) fn sample_storage() -> StorageProps {
         region: "us-east-1".into(),
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
-        session_token: None,
         allow_http: true,
-        path_style: true,
+        ..Default::default()
     }
 }
 
@@ -48,9 +47,8 @@ pub(super) fn static_storage() -> StorageProps {
         region: "us-east-1".into(),
         access_key: "STATIC_AK_SENTINEL".into(),
         secret_key: "STATIC_SK_SENTINEL".into(),
-        session_token: None,
-        allow_http: false,
         path_style: false,
+        ..Default::default()
     }
 }
 
@@ -88,26 +86,14 @@ pub(super) fn build_sql_for_fixture_n(
         .map(ProjectionItem::Column)
         .collect();
     let spec_template = ScanSpec {
-        table_root: String::new(),
+        common: CommonScanSpec {
+            projection: proj_items.clone(),
+            filter,
+            limit,
+            storage: sample_storage(),
+            ..Default::default()
+        },
         files: vec![],
-        projection: proj_items.clone(),
-        filter,
-        limit,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: sample_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
     };
     let files_with_sizes: Vec<FileEntry> =
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
@@ -197,26 +183,14 @@ pub(super) fn build_row_sql_with_root(
         .map(ProjectionItem::Column)
         .collect();
     let spec_template = ScanSpec {
-        table_root: table_root.to_string(),
+        common: CommonScanSpec {
+            table_root: table_root.to_string(),
+            projection: proj_items.clone(),
+            emit_exa_types: proj_types.clone(),
+            storage: sample_storage(),
+            ..Default::default()
+        },
         files: vec![],
-        projection: proj_items.clone(),
-        filter: None,
-        limit: None,
-        order_by: Vec::new(),
-        aggregates: None,
-        group_keys: None,
-        distinct: false,
-        emit_exa_types: proj_types.clone(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join: None,
-        storage: sample_storage(),
-        df_target_partitions: 1,
-        df_batch_size: 8192,
-        df_threads_per_udf: 1,
-        memory_pool_fraction: 0.6,
-        instance_overhead_mb: 200,
-        s3_max_connections: 8,
     };
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
