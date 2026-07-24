@@ -417,6 +417,139 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
         .unwrap_or_default()
 }
 
+/// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
+/// scan, using the column-type map from [`extract_all_column_types`].
+///
+/// Exasol implicitly casts a non-string `LIKE`/`REGEXP_LIKE` subject to VARCHAR
+/// before matching; DataFusion has no such coercion, so a pushed-down `LIKE` over a
+/// DATE / DECIMAL / integer column hard-fails at scan time
+/// (`There isn't a common type to coerce <Type> and Utf8 in LIKE expression`,
+/// issue #207). A `LIKE` `column` node never carries a `dataType` on the wire —
+/// column types live only in `involvedTables[0].columns` — so this type-aware
+/// decision belongs in the adapter, not in the stateless (and sibling-shared)
+/// `vs-expression` translator (decision-log [1]).
+///
+/// Walks the filter tree through the only node types that can nest a
+/// `predicate_like`/`predicate_like_regexp` in this codebase's expression grammar —
+/// `predicate_and` / `predicate_or` (children under `expressions`) and
+/// `predicate_not` (child under `expression`). A `LIKE` reachable only through some
+/// other node (e.g. buried in a `function_scalar_case` inside the filter) is out of
+/// scope, matching the single-table scope of this fix; it renders as before and is
+/// the pre-existing risk. Any node that is neither a junction nor a `LIKE` is
+/// returned unchanged — this guard only inspects `LIKE` subjects.
+///
+/// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
+/// is a bare `column` node, the subject name is uppercased (mirroring
+/// [`extract_all_column_types`]'s uppercasing convention) and looked up in
+/// `col_types`, then dispatched:
+///
+/// | Exasol type | Action |
+/// |-------------|--------|
+/// | `VARCHAR…` / `CHAR…` | leave the node unchanged |
+/// | `DATE` | rewrap the subject as `CAST(<col> AS VARCHAR)` (`function_scalar_cast`) |
+/// | any other type (DECIMAL, DOUBLE, BOOLEAN, TIMESTAMP, …) | decline the whole filter |
+/// | name not found in `col_types` (lookup miss) | decline the whole filter (fail-safe) |
+///
+/// A subject that is not a bare `column` (e.g. a computed scalar expression) leaves
+/// the `LIKE` node unchanged (out of scope, pre-existing behavior).
+///
+/// The DATE `CAST` is Exasol-faithful only under the default `NLS_DATE_FORMAT`
+/// (`YYYY-MM-DD`), which is both DataFusion's unconditional `Date32`→`Utf8` form and
+/// Exasol's default; an altered session format is an accepted tracked exception
+/// (#216, decision-log [8]).
+///
+/// Returns:
+/// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
+/// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
+///   tree propagates to the outer call, mirroring the all-or-nothing
+///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
+///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
+///   predicate natively (decision-log [3]).
+pub(super) fn like_subject_type_guard(
+    filter: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let node_type = filter.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match node_type {
+        // Junctions: recurse into every child; a single declined child (`None`)
+        // short-circuits the whole tree via `?`.
+        "predicate_and" | "predicate_or" => {
+            let mut out = filter.clone();
+            if let Some(Json::Array(children)) = filter.get("expressions") {
+                let mut rewritten = Vec::with_capacity(children.len());
+                for child in children {
+                    rewritten.push(like_subject_type_guard(child, col_types)?);
+                }
+                out["expressions"] = Json::Array(rewritten);
+            }
+            Some(out)
+        }
+        "predicate_not" => {
+            let mut out = filter.clone();
+            if let Some(child) = filter.get("expression") {
+                out["expression"] = like_subject_type_guard(child, col_types)?;
+            }
+            Some(out)
+        }
+        "predicate_like" | "predicate_like_regexp" => guard_like_subject(filter, col_types),
+        // Any other node (predicate_equal, column, literals, …) is not a LIKE and
+        // cannot nest one in this grammar — returned unchanged.
+        _ => Some(filter.clone()),
+    }
+}
+
+/// Type-check and, if needed, rewrite a single `predicate_like` /
+/// `predicate_like_regexp` node. See [`like_subject_type_guard`] for the dispatch
+/// table; returns `None` to decline the whole filter.
+fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let subject = like_node.get("expression");
+
+    // Only a bare `column` subject is in scope; anything else (a computed scalar
+    // expression) is left untouched.
+    let is_bare_column =
+        subject.and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("column");
+    if !is_bare_column {
+        return Some(like_node.clone());
+    }
+    let subject = subject.expect("is_bare_column implies expression is present");
+
+    // Uppercase the subject name before lookup, matching `extract_all_column_types`'s
+    // uppercasing (`support.rs:411`). A nameless column is unresolvable → fail-safe
+    // decline.
+    let name = subject
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_uppercase())?;
+    let exa_type = col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t.as_str());
+
+    match exa_type {
+        // String subject: DataFusion coerces it natively — leave unchanged.
+        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(like_node.clone()),
+        // DATE: rewrap the subject as CAST(<col> AS VARCHAR). `render_cast_target`'s
+        // DataFusion arm renders `{"type":"VARCHAR"}` as bare `VARCHAR` (no length),
+        // yielding `CAST(<col> AS VARCHAR)`; DataFusion's Date32→Utf8 cast is
+        // `YYYY-MM-DD`.
+        Some("DATE") => {
+            let mut out = like_node.clone();
+            out["expression"] = serde_json::json!({
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [subject.clone()],
+            });
+            Some(out)
+        }
+        // Every other non-string type (DECIMAL incl. integer DECIMAL(p,0), DOUBLE,
+        // BOOLEAN, TIMESTAMP, …) and a lookup miss decline the WHOLE filter: DataFusion's
+        // formatting of these to string diverges from Exasol's, so a native-eval
+        // fallback is safer than a silently-wrong or hard-failing cast (decision-log [2]).
+        _ => None,
+    }
+}
+
 /// Extract the projected columns and their Exasol types from the pushdown request.
 ///
 /// For `column` nodes: returns the uppercase column name and its Exasol type.
@@ -2885,6 +3018,232 @@ mod tests {
         assert!(
             safe.contains("access_key"),
             "label must be preserved: {safe}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scenario: like_subject_type_guard dispatches LIKE subjects by Exasol type
+    // (issue #207 regression coverage).
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
+    #[test]
+    fn like_guard_varchar_subject_unchanged() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "VARCHAR subject must be returned unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR.
+    /// Regression: under the pre-fix code (`filter_json_raw.and_then(render_df_filter_safe)`
+    /// with no guard) the tree is never mutated, so `expression` would still be the bare
+    /// `column` node — this assertion on the rewritten `function_scalar_cast` shape is
+    /// false under that old behavior.
+    #[test]
+    fn like_guard_date_subject_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": column.clone(),
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [column]
+            },
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: LIKE on a DECIMAL column declines the whole filter.
+    /// Regression: the pre-fix code has no decline mechanism at this layer — a DECIMAL
+    /// subject's `filter_json_raw` would pass straight through into `Some(...)` unmodified,
+    /// so asserting `None` here is false under that old behavior.
+    #[test]
+    fn like_guard_decimal_subject_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "amount"},
+            "pattern": {"type": "literal_string", "value": "9%"}
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "DECIMAL subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: LIKE on an integer column declines the whole filter. Exasol has no
+    /// separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
+    /// (confirmed via live payload capture this session).
+    #[test]
+    fn like_guard_integer_subject_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "quantity"},
+            "pattern": {"type": "literal_string", "value": "1%"}
+        });
+        let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "integer (DECIMAL(20,0)) subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: LIKE on a non-column subject (a computed scalar expression) is left
+    /// untouched, regardless of `col_types` — this is out of scope for the guard.
+    #[test]
+    fn like_guard_non_column_subject_untouched() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {
+                "type": "function_scalar",
+                "name": "UPPER",
+                "arguments": [{"type": "column", "name": "amount"}]
+            },
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        // Even a DECIMAL entry for the underlying column must not trigger a decline,
+        // since the LIKE subject itself is not a bare column.
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "non-column LIKE subject must be left unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a bare column whose name is not present in `col_types` (a
+    /// lookup miss) declines the whole filter (fail-safe).
+    #[test]
+    fn like_guard_unresolvable_column_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "mystery"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "unresolvable column subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: a nested non-string LIKE (inside a `predicate_and`) declines the
+    /// entire enclosing filter, not just the LIKE sub-node.
+    #[test]
+    fn like_guard_nested_decimal_declines_whole_filter() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "status"},
+                    "right": {"type": "literal_string", "value": "OPEN"}
+                },
+                {
+                    "type": "predicate_and",
+                    "expressions": [
+                        {
+                            "type": "predicate_like",
+                            "expression": {"type": "column", "name": "amount"},
+                            "pattern": {"type": "literal_string", "value": "9%"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let col_types = vec![
+            ("STATUS".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(9,2)".to_string()),
+        ];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a nested non-string LIKE must decline the whole top-level filter"
+        );
+    }
+
+    /// Scenario: REGEXP_LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR,
+    /// same as `predicate_like` — both node types dispatch through `guard_like_subject`.
+    #[test]
+    fn like_guard_regexp_date_subject_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let filter = serde_json::json!({
+            "type": "predicate_like_regexp",
+            "expression": column.clone(),
+            "pattern": {"type": "literal_string", "value": "2024.*"}
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "predicate_like_regexp",
+            "expression": {
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [column]
+            },
+            "pattern": {"type": "literal_string", "value": "2024.*"}
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "REGEXP_LIKE DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: a DECIMAL-typed LIKE wrapped in `predicate_not` declines the whole
+    /// filter — the decline must propagate through `predicate_not`, not just through
+    /// `predicate_and`/`predicate_or`.
+    #[test]
+    fn like_guard_not_wrapped_decimal_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_not",
+            "expression": {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "amount"},
+                "pattern": {"type": "literal_string", "value": "9%"}
+            }
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a DECIMAL LIKE inside predicate_not must decline the whole filter"
         );
     }
 }
