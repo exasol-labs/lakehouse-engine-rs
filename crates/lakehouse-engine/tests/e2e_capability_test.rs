@@ -23,7 +23,10 @@
 mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
-use common::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, seed_events};
+use common::seed::{
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, seed_events,
+    seed_typed_distinct_probe,
+};
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
 };
@@ -57,7 +60,15 @@ fn setup_e2e() {
         rt.block_on(async {
             seed_events(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
-                .expect("seed Iceberg events table")
+                .expect("seed Iceberg events table");
+            // Additive: `typed_distinct_probe` seeds into the SAME namespace
+            // (E2E_NAMESPACE) as `events`, so it becomes queryable through this
+            // file's single `MY_LAKEHOUSE` virtual schema below without a second
+            // VS. Used only by the #211 decimal-string-trimming regression
+            // tests further down this file.
+            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
+                .await
+                .expect("seed typed_distinct_probe table")
         });
 
         install_slc();
@@ -79,6 +90,10 @@ fn vs_dim_table() -> String {
 
 fn vs_fact_table() -> String {
     format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
+}
+
+fn vs_typed_table() -> String {
+    format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -894,4 +909,275 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
             "row {i}: CASE WHEN id > 10 THEN 'high' ELSE 'low' END must be 'low' for id<=3, got {case_val}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8.14  DECIMAL→string trailing-zero trimming (#211)
+// ---------------------------------------------------------------------------
+//
+// Exasol's own DECIMAL→VARCHAR conversion trims trailing scale zeros — and
+// drops the decimal point entirely when the fractional part is all zeros:
+// `30.00` becomes `"30"`, not `"30.00"`. Before the #211 fix, `CAST`, `||`
+// (CONCAT), and `LENGTH` over a DECIMAL column all silently rendered the
+// fixed-scale (untrimmed) string instead, producing silently-wrong results
+// rather than an error. This session's STATUS.md documents the live-captured
+// pre-fix values: `CAST(c_decimal_a AS VARCHAR(20))` returned `"10.50"` /
+// `"30.00"` / `"40.99"` (should be `"10.5"` / `"30"` / `"40.99"`),
+// `id||'-'||c_decimal_a` returned `"1-10.50"` / `"4-30.00"` (should be
+// `"1-10.5"` / `"4-30"`), and `LENGTH(c_decimal_a)` returned a uniform `5` for
+// every row instead of the correct 2/4/5 mix.
+//
+// Uses `typed_distinct_probe`'s `c_decimal_a` column (Exasol `DECIMAL(9,2)`,
+// 12 rows, ids 3 and 10 NULL — see `common/seed.rs`'s `typed_probe()`). The
+// raw unscaled values are reproduced below (the seed module keeps
+// `typed_probe()` private) so every expected string/length in this section is
+// computed independently in Rust from those raw values, never hand-guessed —
+// and never by calling the production `format_decimal_exasol_style` helper,
+// so this stays an independent oracle rather than a tautology check.
+
+/// `(id, unscaled_value)` for `typed_distinct_probe.c_decimal_a` (scale 2),
+/// copied from `common/seed.rs`'s `typed_probe().decimal_a`.
+const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
+    (1, Some(1050)),
+    (2, Some(2025)),
+    (3, None),
+    (4, Some(3000)),
+    (5, Some(1050)),
+    (6, Some(4099)),
+    (7, Some(1050)),
+    (8, Some(5000)),
+    (9, Some(2025)),
+    (10, None),
+    (11, Some(6000)),
+    (12, Some(3000)),
+];
+
+/// Independently reproduce Exasol's DECIMAL→VARCHAR trimming rule from a raw
+/// unscaled value + scale: render the full fixed-scale digit string, then
+/// trim trailing fractional zeros, dropping the decimal point too if the
+/// whole fraction is zero. This is a from-scratch implementation (not a call
+/// into `vs-expression`'s `format_decimal_exasol_style`), so it serves as this
+/// test's own expected-value oracle.
+fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
+    let negative = unscaled < 0;
+    let digits = unscaled.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let digits = if digits.len() <= scale {
+        format!("{}{digits}", "0".repeat(scale + 1 - digits.len()))
+    } else {
+        digits
+    };
+    let (int_part, frac_part) = digits.split_at(digits.len() - scale);
+    let frac_trimmed = frac_part.trim_end_matches('0');
+
+    let mut out = int_part.to_string();
+    if !frac_trimmed.is_empty() {
+        out.push('.');
+        out.push_str(frac_trimmed);
+    }
+    if negative {
+        out = format!("-{out}");
+    }
+    out
+}
+
+/// `exasol_trim_decimal_string` matches the documented Exasol trimming rule
+/// for every `c_decimal_a` value used by this section, pinning the oracle
+/// itself against the values this session live-captured (STATUS.md) before
+/// it is used to derive further expected results.
+#[test]
+fn exasol_trim_decimal_string_matches_documented_values() {
+    assert_eq!(exasol_trim_decimal_string(1050, 2), "10.5");
+    assert_eq!(exasol_trim_decimal_string(2025, 2), "20.25");
+    assert_eq!(exasol_trim_decimal_string(3000, 2), "30");
+    assert_eq!(exasol_trim_decimal_string(4099, 2), "40.99");
+    assert_eq!(exasol_trim_decimal_string(5000, 2), "50");
+    assert_eq!(exasol_trim_decimal_string(6000, 2), "60");
+}
+
+/// Explicit `CAST(c_decimal_a AS VARCHAR(20))` trims trailing scale zeros the
+/// way native Exasol does (#211).
+#[test]
+fn e2e_decimal_cast_trims_trailing_zeros() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, CAST(c_decimal_a AS VARCHAR(20)) FROM {} WHERE id IN (1,4,6) ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, CAST): {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
+
+    let expected = ["10.5", "30", "40.99"];
+    for (i, exp) in expected.iter().enumerate() {
+        let s = cols[1][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("CAST result at row {i} is not a string: {:?}", cols[1][i]));
+        assert_eq!(
+            s, *exp,
+            "row {i}: CAST(c_decimal_a AS VARCHAR(20)) must be {exp:?}, got {s:?} \
+             (pre-fix code returned the untrimmed fixed-scale string, e.g. \"10.50\")"
+        );
+    }
+}
+
+/// Implicit CONCAT (`||`) over a DECIMAL operand trims trailing scale zeros
+/// the way native Exasol does (#211).
+///
+/// `id` is projected alongside the CONCAT expression (not only embedded
+/// inside it) — an unrelated pre-existing pushdown limitation rejects `ORDER
+/// BY <col>` when `<col>` is not itself a top-level SELECT-list item (even
+/// when referenced inside another projected expression), reproducible on the
+/// baseline `events` table with a bare column and no decimal/CONCAT
+/// involved. Projecting `id` directly sidesteps that unrelated limitation so
+/// this test isolates the #211 CONCAT-trimming behavior only.
+#[test]
+fn e2e_decimal_concat_trims_trailing_zeros() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, id||'-'||c_decimal_a FROM {} WHERE id IN (1,4) ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, CONCAT): {cols:?}");
+    assert_eq!(cols[0].len(), 2, "expected 2 rows (id 1,4): {cols:?}");
+
+    let expected = ["1-10.5", "4-30"];
+    for (i, exp) in expected.iter().enumerate() {
+        let s = cols[1][i].as_str().unwrap_or_else(|| {
+            panic!("CONCAT result at row {i} is not a string: {:?}", cols[1][i])
+        });
+        assert_eq!(
+            s, *exp,
+            "row {i}: id||'-'||c_decimal_a must be {exp:?}, got {s:?} \
+             (pre-fix code returned \"1-10.50\" / \"4-30.00\")"
+        );
+    }
+}
+
+/// Implicit `LENGTH(c_decimal_a)` reflects the TRIMMED string's length, not
+/// the fixed-scale (untrimmed) string's length (#211).
+///
+/// `id` is projected alongside `LENGTH(...)` for the same reason as
+/// `e2e_decimal_concat_trims_trailing_zeros` above: `ORDER BY id` requires
+/// `id` to be a top-level SELECT-list item, an unrelated pre-existing
+/// pushdown limitation orthogonal to #211.
+#[test]
+fn e2e_decimal_length_reflects_trimmed_string() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, LENGTH(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
+
+    // "10.5"=4, "30"=2, "40.99"=5. Pre-fix code returned 5 for all three
+    // (untrimmed "10.50" / "30.00" / "40.99" are all 5 characters).
+    let expected = [4i64, 2, 5];
+    for (i, exp) in expected.iter().enumerate() {
+        let len = parse_int(&cols[1][i]);
+        assert_eq!(
+            len, *exp,
+            "row {i}: LENGTH(c_decimal_a) must be {exp}, got {len} \
+             (pre-fix code returned 5 uniformly)"
+        );
+    }
+}
+
+/// The headline #211 repro: `COUNT(*) FROM ... WHERE LENGTH(c_decimal_a) > N`
+/// must match native Exasol's own trimmed-string `LENGTH` semantics, not the
+/// untrimmed fixed-scale string's length. Also independently verifies every
+/// row's `LENGTH(c_decimal_a)` against a Rust-computed trimmed length, proving
+/// the per-row divergence mechanism (not just the final aggregate number) is
+/// fixed.
+#[test]
+fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let t = vs_typed_table();
+
+    // Expected trimmed LENGTH per row, computed from the seed's own unscaled
+    // c_decimal_a values (scale 2) via the independent oracle above — never
+    // hardcoded, never derived from the production formatter.
+    let expected_lengths: Vec<(i64, Option<i64>)> = TYPED_DECIMAL_A_UNSCALED
+        .iter()
+        .map(|&(id, unscaled)| {
+            (
+                id,
+                unscaled.map(|v| exasol_trim_decimal_string(v, 2).len() as i64),
+            )
+        })
+        .collect();
+
+    let expected_count = expected_lengths
+        .iter()
+        .filter(|(_, len)| len.is_some_and(|l| l > 4))
+        .count() as i64;
+    let untrimmed_count = expected_lengths
+        .iter()
+        .filter(|(_, len)| len.is_some())
+        .count() as i64;
+
+    // Every c_decimal_a value renders as exactly 5 characters BEFORE
+    // trimming ("XX.XX", scale 2, values 10.50..60.00), so a pre-fix build
+    // would match every one of the 10 non-NULL rows here. Asserting the
+    // trimmed count differs from that untrimmed count is what makes this
+    // test discriminate old vs. new code, rather than passing by accident.
+    assert_ne!(
+        expected_count, untrimmed_count,
+        "expected trimmed-length count must differ from the untrimmed-length \
+         (bug) count of {untrimmed_count} for this test to discriminate \
+         old vs. new code"
+    );
+
+    // Row-by-row check over all 12 seed rows.
+    let row_sql = format!("SELECT id, LENGTH(c_decimal_a) FROM {t} ORDER BY id");
+    let cols = conn.query_columns(&row_sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
+    assert_eq!(cols[0].len(), 12, "expected all 12 seed rows: {cols:?}");
+
+    for (i, &(expected_id, expected_len)) in expected_lengths.iter().enumerate() {
+        let id = parse_int(&cols[0][i]);
+        assert_eq!(
+            id, expected_id,
+            "row {i}: id must be {expected_id}, got {id}"
+        );
+        match expected_len {
+            Some(len) => {
+                let actual = parse_int(&cols[1][i]);
+                assert_eq!(
+                    actual, len,
+                    "id={id}: LENGTH(c_decimal_a) must be {len}, got {actual} \
+                     (a pre-fix build would return the untrimmed length 5 here)"
+                );
+            }
+            None => {
+                assert!(
+                    cols[1][i].is_null(),
+                    "id={id}: LENGTH(c_decimal_a) must be NULL for a NULL cell, got {:?}",
+                    cols[1][i]
+                );
+            }
+        }
+    }
+
+    // The headline COUNT(*) repro.
+    let count_sql = format!("SELECT COUNT(*) FROM {t} WHERE LENGTH(c_decimal_a) > 4");
+    let count_cols = conn.query_columns(&count_sql);
+    let actual_count = parse_int(&count_cols[0][0]);
+    assert_eq!(
+        actual_count, expected_count,
+        "COUNT(*) WHERE LENGTH(c_decimal_a) > 4 must be {expected_count} \
+         (trimmed-string LENGTH semantics), got {actual_count} — a pre-fix \
+         build would return {untrimmed_count} (every non-NULL row, via the \
+         untrimmed fixed-scale string length)"
+    );
 }
