@@ -28,7 +28,14 @@ instead of rejecting it for a column-count/type mismatch.
   aggregate request carries no `selectListDataTypes` (absent or empty), the
   empty path renders the full-row-projection shape while the non-empty path
   renders its `selectList`-derived shape, so the two can differ in column count
-  in that edge.
+  in that edge. A second such edge is the declined-ORDER-BY literal-only shape
+  (`vs-adapter/pushdown-planning-capability-extensions`): for a row-scan query
+  projecting only literals with an ORDER BY on an unprojected column, the
+  non-empty path falls back to the full base row (so the declined-ORDER-BY
+  wrapper resolves), while the empty path keeps the narrow literal-only
+  projection — so the two can differ in column count for that unsupported shape.
+  Both edges only ever affect shapes the adapter declines to push down; neither
+  returns wrong data.
 * Credentials MUST NOT appear in any empty-result SQL string or error message.
 * "Empty-aggregate semantics" follow single-node SQL over zero input rows: the
   COUNT family (`COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`) yields `0`;
@@ -41,8 +48,8 @@ instead of rejecting it for a column-count/type mismatch.
 * *GIVEN* a virtual schema over an Iceberg table backed by MinIO
 * *AND* a plain row-scan query (no aggregate, no GROUP BY) whose WHERE predicate prunes 100% of the table's data files at the Iceberg level
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL return a `pushdown` response that selects each projected column as `CAST(NULL AS <declared-type>)` and produces zero rows (`... FROM DUAL WHERE 1=0`)
-* *AND* the response's column count and per-column declared types SHALL equal those of the non-empty row-scan projection for the same request
+* *THEN* the adapter SHALL return a `pushdown` response that selects each projected item as `CAST(NULL AS <type>)` and produces zero rows (`WHERE 1=0`)
+* *AND* the response's column count and per-column declared types SHALL equal those of the non-empty row-scan projection for the same request, aliasing each item with the SAME positional-unique naming rule (bare-column items keep their real column name; expression and literal items get a positional-unique synthetic alias), so a pruned query whose select list contains repeated literals — such as `SELECT 1, name, 1` — still yields a valid zero-row SELECT with unique column aliases and the correct arity
 * *AND* the response MUST NOT invoke the scan SET UDF
 
 ### Scenario: Single-group aggregate with all files pruned returns one shape-correct empty row

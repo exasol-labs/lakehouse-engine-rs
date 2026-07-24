@@ -63,7 +63,7 @@ sum/count decomposition) is covered separately in
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the generated scan-driving SQL SHALL carry only the projected columns to the UDF, in the shard-invariant common spec spliced once as the scalar scan UDF's first-argument literal shared by all shards
 * *AND* the projected column names SHALL be the current Iceberg logical names carried in the common spec's logical schema, so the UDF's registered table exposes them and the field-id adapter maps each to the correct physical column per file
-* *AND* the scalar scan UDF's declared EMITS column list SHALL match the projected columns in order and type
+* *AND* the scalar scan UDF's declared EMITS column list SHALL match the projected items in order and type, named POSITIONALLY: a bare-column item SHALL keep its real (quoted) source-column name so an outer `ORDER BY` over a projected column still resolves, while an expression or literal item SHALL be named by a positional-unique synthetic EMITS identifier rather than its rendered SQL text, so two structurally identical expression or literal items never collapse into one column and never collide into a duplicate EMITS name Exasol rejects
 * *AND* the guarantee in this scenario SHALL govern ONLY the row-scan and join paths; an aggregate or GROUP BY request instead leaves the `projection` field empty (see `vs-adapter/pushdown-planning-single-group-agg` and `vs-adapter/pushdown-planning-grouped-agg`), so an empty `projection` on an aggregate scan spec is expected, not a lost projection
 
 ### Scenario: Filter predicate is pushed into the scan spec
