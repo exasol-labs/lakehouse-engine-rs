@@ -108,6 +108,28 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
+/// Snap a TIMESTAMP fractional-seconds precision to the nearest unit
+/// DataFusion 54's SQL frontend can parse in `CAST(x AS TIMESTAMP(p))`.
+///
+/// DataFusion 54 parses `TIMESTAMP(p)` only for `p` in `{0,3,6,9}`; any other
+/// value (1,2,4,5,7,8) is a parse error. This maps each precision to the
+/// nearest supported unit — `0→0, 1→0, 2→3, 4→3, 5→6, 7→6, 8→9`, with
+/// `0/3/6/9` mapping to themselves — and clamps anything above 9 to 9. The gaps
+/// have non-integer midpoints (1.5/4.5/7.5), so "nearest" is unambiguous. Only
+/// the DataFusion dialect needs this; Exasol's parser accepts every precision
+/// 0-9 verbatim. Pure integer arithmetic — no DataFusion types (this crate has
+/// no DataFusion dependency). Mirrors the colocated-pure-helper precedent of
+/// `format_decimal_exasol_style` (issue #211).
+fn snap_timestamp_precision(p: u64) -> u64 {
+    match p {
+        0..=1 => 0,
+        2..=4 => 3,
+        5..=7 => 6,
+        // 8, 9, and anything above 9 clamp to 9 (DataFusion's max).
+        _ => 9,
+    }
+}
+
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
 fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfError> {
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -146,18 +168,55 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
             // carries session-timezone / UTC-normalisation semantics that
             // DataFusion's plain TIMESTAMP does not reproduce, so it is not a
             // faithful target: decline it and let Exasol evaluate the CAST.
+            //
+            // WLTZ is evaluated FIRST and short-circuits before any precision
+            // logic — regardless of a present `fractionalSecondsPrecision`.
             if data_type.get("withLocalTimeZone").and_then(|v| v.as_bool()) == Some(true) {
-                Err(UdfError::User(
+                return Err(UdfError::User(
                     "unsupported CAST target type: TIMESTAMP WITH LOCAL TIME ZONE".into(),
-                ))
-            } else {
-                Ok("TIMESTAMP".to_string())
+                ));
+            }
+            // Read the TIMESTAMP fractional-seconds precision. The field is
+            // `fractionalSecondsPrecision` (a u64) — NOT `precision`, which
+            // Exasol uses only for DECIMAL/INTERVAL. Absent → bare TIMESTAMP
+            // (== Exasol's default TIMESTAMP(3)), unchanged in both dialects.
+            match data_type
+                .get("fractionalSecondsPrecision")
+                .and_then(|v| v.as_u64())
+            {
+                None => Ok("TIMESTAMP".to_string()),
+                // Exasol's own parser accepts any precision 0-9 verbatim.
+                Some(p) => match dialect {
+                    Dialect::Exasol => Ok(format!("TIMESTAMP({p})")),
+                    // DataFusion 54's SQL frontend parses TIMESTAMP(p) only for
+                    // p in {0,3,6,9}; snap to the nearest supported unit.
+                    Dialect::DataFusion => {
+                        Ok(format!("TIMESTAMP({})", snap_timestamp_precision(p)))
+                    }
+                },
             }
         }
         other => Err(UdfError::User(format!(
             "unsupported CAST target type: {other}"
         ))),
     }
+}
+
+/// Wrap an already-rendered SQL fragment so it reproduces Exasol's
+/// shortest-form DECIMAL→string conversion (trailing scale zeros trimmed).
+///
+/// This is a pure syntactic helper with NO type information of its own: it
+/// blindly casts `expr_sql` to text and strips a trailing run of zeros after
+/// a literal `.`, then drops a now-empty `.` entirely. The caller MUST have
+/// already confirmed `expr_sql` is a DECIMAL-typed expression before calling
+/// this — applying it to a non-decimal string that happens to end in zeros
+/// (e.g. `'foo100'`) would corrupt it. It is the shared reusable primitive
+/// behind issue #211's decimal-trim fix, wrapped by the `decimal_to_varchar_exasol`
+/// node below.
+fn format_decimal_exasol_style(expr_sql: &str) -> String {
+    format!(
+        "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
+    )
 }
 
 /// Render a CAST node body to `CAST(<expr> AS <target>)`.
@@ -475,6 +534,31 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
         "function_scalar_cast" => {
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
+        }
+        // Adapter-synthesized node (issue #211) — NEVER emitted by Exasol on the
+        // wire. Marks an expression argument already confirmed (by the adapter,
+        // `lakehouse-engine::adapter::pushdown::support`) to be a bare
+        // DECIMAL-typed column being stringified (CAST to VARCHAR/CHAR, CONCAT,
+        // LENGTH, ...); wraps the recursively-rendered argument with
+        // `format_decimal_exasol_style` to reproduce Exasol's shortest-form
+        // DECIMAL→string conversion (trailing scale zeros trimmed) instead of
+        // DataFusion's fixed-scale formatting.
+        "decimal_to_varchar_exasol" => {
+            let args = value("arguments")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| {
+                    UdfError::User("decimal_to_varchar_exasol missing 'arguments'".into())
+                })?;
+            if args.len() != 1 {
+                return Err(UdfError::User(format!(
+                    "decimal_to_varchar_exasol requires exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let inner = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
+                UdfError::User("decimal_to_varchar_exasol argument is null".into())
+            })?;
+            Ok(Some(format_decimal_exasol_style(&inner)))
         }
         "function_scalar" => {
             let fn_name = value("name")
@@ -1637,7 +1721,11 @@ mod tests {
 
     #[test]
     fn renders_cast_timestamp_without_local_time_zone() {
-        // Plain TIMESTAMP: Exasol sends {"type":"TIMESTAMP","withLocalTimeZone":false}.
+        // Plain TIMESTAMP with a present fractionalSecondsPrecision of 3:
+        // Exasol sends {"type":"TIMESTAMP","withLocalTimeZone":false,
+        // "fractionalSecondsPrecision":3}. A present precision now renders
+        // verbatim `TIMESTAMP(3)` (issue #212); 3 is a DataFusion-supported unit,
+        // so the DataFusion dialect renders it identically (identity snap).
         let expr = json!({
             "type": "function_scalar_cast",
             "name": "CAST",
@@ -1646,8 +1734,68 @@ mod tests {
         });
         assert_eq!(
             render_expression(&expr).unwrap(),
-            r#"CAST("X" AS TIMESTAMP)"#
+            r#"CAST("X" AS TIMESTAMP(3))"#
         );
+    }
+
+    #[test]
+    fn renders_cast_timestamp_precision_per_dialect() {
+        // Build a CAST-to-TIMESTAMP expression node with the given dataType.
+        fn cast(data_type: Json) -> Json {
+            json!({
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "arguments": [{"type": "column", "name": "x"}],
+                "dataType": data_type
+            })
+        }
+
+        // Exasol dialect renders any precision 0-9 VERBATIM (Exasol's parser
+        // accepts every fractional-seconds precision).
+        for p in [0u64, 6, 9] {
+            let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"CAST("X" AS TIMESTAMP({p}))"#),
+                "Exasol dialect must render TIMESTAMP({p}) verbatim"
+            );
+        }
+
+        // DataFusion dialect renders a supported precision VERBATIM (identity
+        // snap for 6).
+        let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 6}));
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"CAST("X" AS TIMESTAMP(6))"#
+        );
+
+        // DataFusion dialect SNAPS an unsupported precision to the nearest
+        // supported unit: 5 -> 6 (DataFusion 54 parses TIMESTAMP(p) only for
+        // {0,3,6,9}).
+        let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 5}));
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"CAST("X" AS TIMESTAMP(6))"#
+        );
+
+        // Absent precision renders bare TIMESTAMP in BOTH dialects (unchanged),
+        // whether the dataType omits withLocalTimeZone entirely or sets it false.
+        for data_type in [
+            json!({"type": "TIMESTAMP"}),
+            json!({"type": "TIMESTAMP", "withLocalTimeZone": false}),
+        ] {
+            let expr = cast(data_type.clone());
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                r#"CAST("X" AS TIMESTAMP)"#,
+                "DataFusion dialect: absent precision must render bare TIMESTAMP for {data_type}"
+            );
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                r#"CAST("X" AS TIMESTAMP)"#,
+                "Exasol dialect: absent precision must render bare TIMESTAMP for {data_type}"
+            );
+        }
     }
 
     #[test]
@@ -1701,6 +1849,60 @@ mod tests {
             "dataType": {"type": "VARCHAR", "size": 100}
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    }
+
+    // --- decimal_to_varchar_exasol (issue #211) ---
+    //
+    // Adapter-synthesized node, never sent by Exasol on the wire. Fixtures
+    // exercise the render arm in isolation (arity + wrapping), independent of
+    // the adapter-side rewrite that synthesizes this node (a later task).
+
+    #[test]
+    fn renders_decimal_to_varchar_exasol() {
+        let expr = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [{"type": "column", "name": "c_decimal_a"}]
+        });
+        let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
+        assert_eq!(render_expression(&expr).unwrap(), expected);
+        assert_eq!(render_expression_safe(&expr).unwrap(), expected);
+    }
+
+    #[test]
+    fn decimal_to_varchar_exasol_wrong_arity_errors() {
+        let no_args = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": []
+        });
+        let two_args = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [
+                {"type": "column", "name": "c_decimal_a"},
+                {"type": "column", "name": "c_decimal_b"}
+            ]
+        });
+        for expr in [&no_args, &two_args] {
+            assert!(
+                render_expression(expr).is_err(),
+                "decimal_to_varchar_exasol with non-unary arguments must raise: {expr}"
+            );
+            assert!(
+                render_expression_safe(expr).is_none(),
+                "decimal_to_varchar_exasol with non-unary arguments must be None in safe mode: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_decimal_exasol_style_renders_exact_regex_sql() {
+        // Pins the emitted SQL text itself (no DataFusion runtime involved).
+        // Runtime correctness of this regex against a real engine is covered
+        // by the E2E tests in `crates/lakehouse-engine/tests/e2e_capability_test.rs`
+        // (`e2e_decimal_cast_trims_trailing_zeros` and friends).
+        assert_eq!(
+            format_decimal_exasol_style("some_col"),
+            r#"regexp_replace(regexp_replace(CAST(some_col AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', '')"#
+        );
     }
 
     // --- Error / safe-mode ---
