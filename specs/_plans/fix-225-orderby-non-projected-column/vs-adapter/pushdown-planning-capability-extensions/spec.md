@@ -26,7 +26,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
   produced and never widen it further. Where that pre-existing fallback has already widened
   the derived projection, the returned query still carries more columns than the select
   list and Exasol still rejects it — a pre-existing gap outside these scenarios, tracked as
-  an accurately-scoped exception, `(#TBD-FULLROWARITY)`.
+  an accurately-scoped exception, `(#234)`.
 * A select-list item's quoted EMITS identifier is produced by ONE seam: the real
   source-column name for a bare column, the positional synthetic `_LH_PROJ_{index}` for a
   rendered expression. The per-shard EMITS clause and any outer wrapper's explicit column
@@ -60,7 +60,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *THEN* the adapter SHALL append each such sort-key column, resolved by name from `involvedTables[0].columns`, to the per-shard scan's projection and its declared EMITS list AFTER every item the derivation already produced, so every pre-existing item keeps its position and its unchanged EMITS identifier
 * *AND* the adapter MUST NOT widen the derived projection to the full base row, because the returned query would then carry one column per base-table column where Exasol positionally expects one per select-list item, which Exasol rejects with `sqlCode 04000`
 * *AND* the declined-`ORDER BY` wrapper SHALL name the derived projection's pre-extension items EXPLICITLY by their EMITS identifiers rather than using `SELECT *`, so each appended sort-key column is visible to the outer `ORDER BY` but absent from the returned result, and the returned column count and order EQUAL the derived projection's pre-extension column count and order
-* *AND* the returned result SHALL equal the same query evaluated over all matching rows on a single node, in the requested sort-key order, direction, and NULL placement, EXCEPT for a sort key whose column requires the JSON-fallback VARCHAR cast — which orders on the emitted JSON string rather than the native value, pre-existing behaviour on this declined path that this scenario does not change, tracked as an accurately-scoped exception, `(#TBD-JSONSORT)`
+* *AND* the returned result SHALL equal the same query evaluated over all matching rows on a single node, in the requested sort-key order, direction, and NULL placement, EXCEPT for a sort key whose column requires the JSON-fallback VARCHAR cast — which orders on the emitted JSON string rather than the native value, pre-existing behaviour on this declined path that this scenario does not change, tracked as an accurately-scoped exception, `(#233)`
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
