@@ -23,6 +23,7 @@ mod support;
 use support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
     extract_limit, extract_projection, like_subject_type_guard, order_by_present,
+    rewrite_decimal_stringifications,
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
@@ -182,10 +183,20 @@ pub async fn handle_pushdown(
 
     // The type guard runs on the RAW filter JSON before rendering: it may decline
     // (non-string LIKE subject with no safe rewrite, issue #207) or rewrap a DATE
-    // subject as CAST(.. AS VARCHAR). `filter_json_raw` itself is left completely
-    // unmodified for the later `resolve_file_list` Iceberg-level pruning call below.
+    // subject as CAST(.. AS VARCHAR). The decimal-stringification rewrite then runs
+    // on the (possibly guard-rewrapped) tree, replacing each directly-stringified
+    // bare DECIMAL column with a `decimal_to_varchar_exasol` node so the DataFusion
+    // filter reproduces Exasol's trailing-zero-trimmed DECIMAL→string form (issue
+    // #211, e.g. the headline `LENGTH(c_decimal_a) > 5` COUNT-divergence repro).
+    // It never declines (always returns a tree), so it composes as `.map`, and it
+    // leaves the DATE CAST the LIKE guard emits untouched (that argument is DATE,
+    // not DECIMAL). This whole chain feeds ONLY the DataFusion-bound scan filter;
+    // `filter_json_raw` itself is left completely unmodified for the later
+    // `resolve_file_list` Iceberg-level pruning call below, which must see the
+    // original, un-rewritten predicate tree.
     let filter = filter_json_raw
         .and_then(|f| like_subject_type_guard(f, &col_types))
+        .map(|f| rewrite_decimal_stringifications(&f, &col_types))
         .and_then(|f| render_df_filter_safe(&f));
 
     let limit = extract_limit(&pushdown_req);
@@ -748,6 +759,76 @@ mod tests {
         assert!(
             iceberg_pred.is_none(),
             "LIKE filter must produce no Iceberg predicate"
+        );
+    }
+
+    /// Wiring sanity: the WHERE-clause filter chain composes
+    /// `rewrite_decimal_stringifications` between `like_subject_type_guard` and
+    /// `render_df_filter_safe`, so a `LENGTH(<DECIMAL column>) > 5` predicate renders
+    /// with Exasol's trailing-zero-trim form wrapping the column (issue #211's
+    /// headline COUNT-divergence repro) — NOT a bare `character_length("C_DECIMAL_A")`
+    /// over DataFusion's untrimmed decimal→string. Reproduces `handle_pushdown`'s exact
+    /// composition (guard → rewrite → render) on the DataFusion-bound filter tree.
+    #[test]
+    fn where_filter_decimal_stringification_rewritten_to_trim() {
+        let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+        let filter_json = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {
+                "type": "function_scalar",
+                "name": "LENGTH",
+                "arguments": [{"type": "column", "name": "c_decimal_a"}]
+            },
+            "right": {"type": "literal_exactnumeric", "value": 5}
+        });
+
+        // The exact chain from `handle_pushdown` (mod.rs:187-190): the raw filter is
+        // guarded, then decimal-rewritten, then rendered for the DataFusion scan.
+        let rendered = Some(&filter_json)
+            .and_then(|f| like_subject_type_guard(f, &col_types))
+            .map(|f| rewrite_decimal_stringifications(&f, &col_types))
+            .and_then(|f| render_df_filter_safe(&f))
+            .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
+
+        assert!(
+            rendered.contains("regexp_replace(regexp_replace(CAST("),
+            "the rewritten filter must carry the Exasol decimal-trim form: {rendered}"
+        );
+        assert!(
+            !rendered.contains(r#"character_length("C_DECIMAL_A")"#),
+            "the filter must NOT stringify the bare decimal column untrimmed: {rendered}"
+        );
+    }
+
+    /// Exhaustive coverage: a DECIMAL column in a NON-stringifying WHERE
+    /// filter context (`c_decimal_a > 5`, a `predicate_greater` — not a stringifier)
+    /// renders EXACTLY as before this fix through the same wired chain
+    /// (`like_subject_type_guard` → `rewrite_decimal_stringifications` →
+    /// `render_df_filter_safe`) as `where_filter_decimal_stringification_rewritten_to_trim`
+    /// — the DECIMAL column stays a bare, unwrapped column reference, proving the
+    /// WHERE-path wiring doesn't over-wrap a non-stringifying context.
+    #[test]
+    fn filter_decimal_comparison_not_rewritten() {
+        let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
+        let filter_json = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "c_decimal_a"},
+            "right": {"type": "literal_exactnumeric", "value": 5}
+        });
+
+        let rendered = Some(&filter_json)
+            .and_then(|f| like_subject_type_guard(f, &col_types))
+            .map(|f| rewrite_decimal_stringifications(&f, &col_types))
+            .and_then(|f| render_df_filter_safe(&f))
+            .expect("c_decimal_a > 5 must render to a DataFusion filter");
+
+        assert_eq!(
+            rendered, r#"("C_DECIMAL_A" > 5)"#,
+            "a DECIMAL column in a comparison must stay a bare, unwrapped column reference: {rendered}"
+        );
+        assert!(
+            !rendered.contains("regexp_replace"),
+            "a non-stringifying filter context must not be trimmed: {rendered}"
         );
     }
 
