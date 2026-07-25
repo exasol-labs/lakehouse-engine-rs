@@ -565,11 +565,22 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
     // projection (an `{"expr":...}` scan-spec item), not the full-base-row
     // fallback (which would emit every base column as a bare-string `Column`
     // entry and yield the #205 column-count mismatch).
+    // `explain_virtual_sql` flattens EXPLAIN's result cells by joining them
+    // with a single space, so JSON tokens can end up split across a cell
+    // boundary — an exact-substring match on adjacent `"projection":[{"expr":`
+    // would be flaky. Instead check that an `"expr"` key occurs anywhere after
+    // the `"projection"` key, which still distinguishes a positional literal
+    // projection from the full-base-row fallback (bare `Column` string
+    // entries, no `"expr"` key at all).
     let pushed_sql = explain_virtual_sql(&mut conn, &primary_sql);
+    let projection_idx = pushed_sql.find(r#""projection""#);
+    let has_expr_after_projection = projection_idx
+        .and_then(|idx| pushed_sql[idx..].find(r#""expr""#))
+        .is_some();
     assert!(
-        pushed_sql.contains(r#""projection":[{"expr":"#),
+        has_expr_after_projection,
         "{primary_sql}'s inner derived-table scan must push a positional \
-         literal projection ('projection' containing an '{{\"expr\":' item), \
+         literal projection (an '\"expr\"' key after 'projection'), \
          not the full-base-row fallback (#205), got:\n{pushed_sql}"
     );
 }
