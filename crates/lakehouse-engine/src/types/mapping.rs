@@ -101,7 +101,10 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     if upper == "DATE" {
         return Some(DataType::Date32);
     }
-    if upper == "TIMESTAMP" {
+    if upper == "TIMESTAMP" || (upper.starts_with("TIMESTAMP(") && upper.ends_with(')')) {
+        // Every declared TIMESTAMP(p) precision collapses to the same Arrow
+        // microsecond representation; `p` is Exasol's own type-check concern,
+        // never the internal Arrow representation (see decision-log #212).
         return Some(DataType::Timestamp(TimeUnit::Microsecond, None));
     }
     if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
@@ -554,6 +557,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("{declared} must map to a concrete Arrow type"));
             assert_eq!(&arrow, expected_arrow, "wrong Arrow target for {declared}");
         }
+    }
+
+    /// Scenario: a `TIMESTAMP(p)` EMITS string (produced once the CAST renderer
+    /// and EMITS-type derivation stop collapsing precision to bare `TIMESTAMP`)
+    /// maps back to the same microsecond Arrow timestamp as bare `TIMESTAMP`,
+    /// regardless of the declared precision `p`. The project already collapses
+    /// every TIMESTAMP precision to one Arrow representation on the way in, so
+    /// the emit-boundary coercion mirrors that on the way out (issue #212).
+    #[test]
+    fn exasol_type_to_arrow_parses_timestamp_precision() {
+        let expected = Some(DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(exasol_type_to_arrow("TIMESTAMP(0)"), expected);
+        assert_eq!(exasol_type_to_arrow("TIMESTAMP(6)"), expected);
+        assert_eq!(exasol_type_to_arrow("TIMESTAMP(9)"), expected);
     }
 
     /// Scenario: the live bench failures map to the correct integer Arrow target.
