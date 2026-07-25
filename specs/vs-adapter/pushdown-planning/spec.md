@@ -35,6 +35,8 @@ sum/count decomposition) is covered separately in
 * The `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan and distributor scripts are co-deployed in the adapter script's schema, so this single source qualifies both.
 * The common spec's `projection` field carries the pushed-down projected columns ONLY for the row-scan and join dispatch paths. An aggregate or GROUP BY request leaves `projection` empty, because the aggregate scan-dispatch path derives its physical projection from the `aggregates`/`group_keys` fields rather than from `projection` (see `vs-adapter/pushdown-planning-single-group-agg` and `vs-adapter/pushdown-planning-grouped-agg`).
 * See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
+* A predicate node the adapter cannot faithfully translate is OMITTED from the scan spec; Exasol keeps and evaluates the predicate itself as a correctness backstop.
+* See `vs-adapter/pushdown-planning-like-type-coercion` for the type-aware LIKE/REGEXP_LIKE rule that dispatches on the subject column's Exasol type before rendering the filter.
 
 ## Scenarios
 
@@ -71,6 +73,7 @@ sum/count decomposition) is covered separately in
 * *GIVEN* a query with a WHERE predicate over a supported column and operator
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, omitting (never mistranslating) any node it cannot render
+* *AND* before translating a `predicate_like` or `predicate_like_regexp` whose subject is a bare `column` node, the adapter SHALL apply the type-aware LIKE rule (see `vs-adapter/pushdown-planning-like-type-coercion`), because DataFusion performs no implicit non-string-to-VARCHAR coercion and would hard-fail the scan on a LIKE over a non-string column
 * *AND* the adapter SHALL ALSO translate the soundly-translatable conjuncts into an `iceberg::expr::Predicate` applied to the Iceberg table scan as a file-pruning filter, dropping any node it cannot translate soundly rather than skipping a file that could match
 * *AND* the DataFusion scan SHALL always apply the full common-spec filter, so the Iceberg pruning filter only narrows which files are opened and never changes the result set
 
