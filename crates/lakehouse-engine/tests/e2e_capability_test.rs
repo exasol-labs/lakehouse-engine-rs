@@ -1022,3 +1022,202 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 8.12  ORDER BY on a column outside the select list (#225)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #225: `ORDER BY <col>` must push down correctly even
+/// when `<col>` is not itself a projected select-list item.
+///
+/// Pre-fix, the adapter widened the projection to the FULL base row whenever a
+/// pushed sort key was not a bare projected column, so the returned pushdown
+/// query's column count no longer matched the (unwidened) select list —
+/// Exasol rejects that positionally with `sqlCode 04000 "Expected number of
+/// columns is N but pushdown query has M"`. Post-fix, the sort key is appended
+/// as a HIDDEN extra scan/EMITS column and the declined-ORDER-BY wrapper
+/// selects only the ORIGINAL select-list items, so the returned arity always
+/// matches.
+///
+/// Case 1 is issue #225's own literal repro: `id` drives the ORDER BY but is
+/// not selected at all. Case 2 proves the hidden sort column actually DRIVES
+/// the ordering (not just that the query no longer errors) by sorting
+/// DESCENDING on `id` while selecting only `name`, and checking the returned
+/// row order.
+///
+/// Seed: id 1..20, score = 5.0 * id, name = "event-NN" (`common/seed.rs`).
+#[test]
+fn e2e_order_by_unprojected_column_bare_projection() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Case 1: #225's literal repro.
+    let sql = format!("SELECT score FROM {} WHERE id = 1 ORDER BY id", vs_table());
+
+    // Task 3.3: the pushed scan spec must carry the hidden sort key `ID` as an
+    // extra projection column, and the row-scan fan-out must NOT have widened
+    // to a full-base-row `SELECT * FROM (...)`. Scoped to the adapter's OWN
+    // emitted `"projection":[...]` scan-spec JSON array, not the whole SQL
+    // string (the EVENTS Iceberg schema's field names are lowercase, so an
+    // uppercase whole-string check like `!contains("EVENT_DATE")` would pass
+    // by casing accident rather than by actually proving the projection is
+    // narrow).
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("\"projection\":[\"SCORE\",\"ID\"]"),
+        "the scan spec's projection must carry the hidden sort key ID \
+         appended after the visible SCORE column, got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM ("),
+        "the row-scan fan-out must not widen to a full-base-row SELECT * \
+         (the #225 bug: 04000 arity mismatch), got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected exactly 1 column (score): {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row (id=1): {cols:?}");
+    let score = parse_numeric(&cols[0][0]);
+    assert!(
+        (score - 5.0).abs() < 0.001,
+        "id=1 must have score=5.0 (5.0*1), got {score}"
+    );
+
+    // Case 2: prove the hidden sort column actually drives the ordering (and
+    // is dropped from the visible result) by sorting DESCENDING on `id` while
+    // selecting only `name`.
+    let sql_desc = format!(
+        "SELECT name FROM {} WHERE id <= 5 ORDER BY id DESC",
+        vs_table()
+    );
+    let cols_desc = conn.query_columns(&sql_desc);
+    assert_eq!(
+        cols_desc.len(),
+        1,
+        "expected exactly 1 column (name): {cols_desc:?}"
+    );
+    assert_eq!(
+        cols_desc[0].len(),
+        5,
+        "expected exactly 5 rows (id 1..5): {cols_desc:?}"
+    );
+
+    let expected_names_desc = ["event-05", "event-04", "event-03", "event-02", "event-01"];
+    for (i, expected) in expected_names_desc.iter().enumerate() {
+        let n = cols_desc[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("name at row {i} is not a string: {:?}", cols_desc[0][i]));
+        assert_eq!(
+            n, *expected,
+            "row {i}: ORDER BY id DESC over ids 1..5 must yield name {expected}, got {n}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.13  ORDER BY on a column referenced only inside a projected expression (#225)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #225's OTHER repro shape: the ORDER BY sort key is
+/// referenced only INSIDE a computed select-list expression, never bare
+/// projected — exercising the fix via a `ProjectionItem::Expr` instead of a
+/// bare `ProjectionItem::Column`.
+///
+/// `id || '-' || name` pushes down as ONE `Expr` select-list item
+/// (`FN_CONCAT` is advertised, `adapter/capabilities.rs:87`, and the
+/// translator renders it as DataFusion `concat(...)`,
+/// `vs-expression/src/lib.rs:632`), so `id` never appears as a bare projected
+/// column even though it also drives the ORDER BY.
+///
+/// Pre-check (done live against the `typed_distinct_probe` seed table via
+/// `scripts/capture-pushdown-payload.sh` before writing this test): concat of
+/// an Int64 column (`ID`) with a VARCHAR literal executes correctly end to
+/// end (`"1-aa"`, `"2-AA"`, `"3-"` for `ID || '-' || C_VARCHAR`) — DataFusion
+/// 54.1's `concat()` coerces the non-string argument cleanly, unlike the
+/// LIKE-pushdown type-coercion bug fixed in `a6e829e`. No `CAST(id AS
+/// VARCHAR)` fallback is needed; the literal `||` repro is used as specified.
+///
+/// Seed: id 1..20, name = "event-NN" (`common/seed.rs`).
+#[test]
+fn e2e_order_by_column_referenced_only_in_projected_expression() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id || '-' || name FROM {} WHERE id <= 3 ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        1,
+        "expected exactly 1 column (id || '-' || name): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        3,
+        "expected exactly 3 rows (id 1..3): {cols:?}"
+    );
+
+    let expected = ["1-event-01", "2-event-02", "3-event-03"];
+    for (i, want) in expected.iter().enumerate() {
+        let v = cols[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("row {i} is not a string: {:?}", cols[0][i]));
+        assert_eq!(
+            v, *want,
+            "row {i}: id || '-' || name must be {want}, got {v}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.14  Issue #189 cross-verification (same root cause as #225)
+// ---------------------------------------------------------------------------
+
+/// Issue #189 ("ORDER BY on a non-projected column generates invalid pushdown
+/// (column not found)") reported the shape-equivalent live repro
+/// `SELECT c_acctbal FROM CUSTOMER WHERE c_custkey <= 5 ORDER BY c_custkey`
+/// against a remote Databricks-backed TPC-H `CUSTOMER` table — not reproducible
+/// on this local stack, which has no `CUSTOMER`/`c_acctbal` table. This test
+/// verifies the SAME root-cause shape against the locally seeded `dim_customer`
+/// table instead: a projected column (`c_name`) with an `ORDER BY` on a
+/// DIFFERENT, unprojected column (`c_custkey`).
+///
+/// Seed: `dim_customer` has 5 rows, `c_custkey` 1..=5, `c_name` =
+/// "customer-01".."customer-05" (`common/seed.rs::make_customer_batch`).
+#[test]
+fn e2e_issue_189_shape_equivalent_local_verification() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT c_name FROM {} WHERE c_custkey <= 5 ORDER BY c_custkey",
+        vs_dim_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        1,
+        "expected exactly 1 column (c_name): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "expected exactly 5 rows (custkey 1..=5): {cols:?}"
+    );
+
+    let expected = [
+        "customer-01",
+        "customer-02",
+        "customer-03",
+        "customer-04",
+        "customer-05",
+    ];
+    for (i, want) in expected.iter().enumerate() {
+        let v = cols[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("row {i} is not a string: {:?}", cols[0][i]));
+        assert_eq!(v, *want, "row {i}: c_name must be {want}, got {v}");
+    }
+}
