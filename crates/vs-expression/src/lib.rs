@@ -160,6 +160,23 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
     }
 }
 
+/// Wrap an already-rendered SQL fragment so it reproduces Exasol's
+/// shortest-form DECIMAL→string conversion (trailing scale zeros trimmed).
+///
+/// This is a pure syntactic helper with NO type information of its own: it
+/// blindly casts `expr_sql` to text and strips a trailing run of zeros after
+/// a literal `.`, then drops a now-empty `.` entirely. The caller MUST have
+/// already confirmed `expr_sql` is a DECIMAL-typed expression before calling
+/// this — applying it to a non-decimal string that happens to end in zeros
+/// (e.g. `'foo100'`) would corrupt it. It is the shared reusable primitive
+/// behind issue #211's decimal-trim fix, wrapped by the `decimal_to_varchar_exasol`
+/// node below.
+fn format_decimal_exasol_style(expr_sql: &str) -> String {
+    format!(
+        "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
+    )
+}
+
 /// Render a CAST node body to `CAST(<expr> AS <target>)`.
 ///
 /// Shared by both CAST encodings (see the `function_scalar_cast` top-level arm
@@ -475,6 +492,31 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
         "function_scalar_cast" => {
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
+        }
+        // Adapter-synthesized node (issue #211) — NEVER emitted by Exasol on the
+        // wire. Marks an expression argument already confirmed (by the adapter,
+        // `lakehouse-engine::adapter::pushdown::support`) to be a bare
+        // DECIMAL-typed column being stringified (CAST to VARCHAR/CHAR, CONCAT,
+        // LENGTH, ...); wraps the recursively-rendered argument with
+        // `format_decimal_exasol_style` to reproduce Exasol's shortest-form
+        // DECIMAL→string conversion (trailing scale zeros trimmed) instead of
+        // DataFusion's fixed-scale formatting.
+        "decimal_to_varchar_exasol" => {
+            let args = value("arguments")
+                .and_then(|a| a.as_array())
+                .ok_or_else(|| {
+                    UdfError::User("decimal_to_varchar_exasol missing 'arguments'".into())
+                })?;
+            if args.len() != 1 {
+                return Err(UdfError::User(format!(
+                    "decimal_to_varchar_exasol requires exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            let inner = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
+                UdfError::User("decimal_to_varchar_exasol argument is null".into())
+            })?;
+            Ok(Some(format_decimal_exasol_style(&inner)))
         }
         "function_scalar" => {
             let fn_name = value("name")
@@ -1697,6 +1739,60 @@ mod tests {
             "dataType": {"type": "VARCHAR", "size": 100}
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    }
+
+    // --- decimal_to_varchar_exasol (issue #211) ---
+    //
+    // Adapter-synthesized node, never sent by Exasol on the wire. Fixtures
+    // exercise the render arm in isolation (arity + wrapping), independent of
+    // the adapter-side rewrite that synthesizes this node (a later task).
+
+    #[test]
+    fn renders_decimal_to_varchar_exasol() {
+        let expr = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [{"type": "column", "name": "c_decimal_a"}]
+        });
+        let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
+        assert_eq!(render_expression(&expr).unwrap(), expected);
+        assert_eq!(render_expression_safe(&expr).unwrap(), expected);
+    }
+
+    #[test]
+    fn decimal_to_varchar_exasol_wrong_arity_errors() {
+        let no_args = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": []
+        });
+        let two_args = json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [
+                {"type": "column", "name": "c_decimal_a"},
+                {"type": "column", "name": "c_decimal_b"}
+            ]
+        });
+        for expr in [&no_args, &two_args] {
+            assert!(
+                render_expression(expr).is_err(),
+                "decimal_to_varchar_exasol with non-unary arguments must raise: {expr}"
+            );
+            assert!(
+                render_expression_safe(expr).is_none(),
+                "decimal_to_varchar_exasol with non-unary arguments must be None in safe mode: {expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_decimal_exasol_style_renders_exact_regex_sql() {
+        // Pins the emitted SQL text itself (no DataFusion runtime involved).
+        // Runtime correctness of this regex against a real engine is covered
+        // by the E2E tests in `crates/lakehouse-engine/tests/e2e_capability_test.rs`
+        // (`e2e_decimal_cast_trims_trailing_zeros` and friends).
+        assert_eq!(
+            format_decimal_exasol_style("some_col"),
+            r#"regexp_replace(regexp_replace(CAST(some_col AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', '')"#
+        );
     }
 
     // --- Error / safe-mode ---
