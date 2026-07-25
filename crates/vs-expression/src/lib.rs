@@ -712,7 +712,30 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
                     Ok(Some(format!("({left} % {right})")))
                 }
-                // String functions: name-mapping table
+                // String functions, Exasol dialect: rendered VERBATIM — original
+                // name, original argument order and count — because this SQL is
+                // parsed and evaluated by Exasol's own engine (the qualified
+                // single-table / N-scan join / grouped-merge wrappers), not
+                // DataFusion. This is what lets a declined 3-argument
+                // `INSTR(s, sub, start)` (issue #210's arity-decline guard) still
+                // evaluate correctly here: Exasol's own native `INSTR`/`LOCATE`
+                // already understands the optional start/occurrence arguments, so
+                // there is no name or arity translation to get wrong. Only the
+                // DataFusion dialect below needs the name-mapping table (DataFusion
+                // has no function of these exact names, or arities, as Exasol).
+                "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
+                | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
+                | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
+                | "UNICODE" | "UNICODECHR" | "INSTR" | "LOCATE"
+                    if dialect == Dialect::Exasol =>
+                {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    let rendered = render_args(args, dialect)?;
+                    Ok(Some(format!("{fn_name}({})", rendered.join(", "))))
+                }
+                // String functions: name-mapping table (DataFusion dialect)
                 "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
                 | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
                 | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
@@ -735,7 +758,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
-                // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring)
+                // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring).
+                // DataFusion dialect only — the Exasol-dialect arm above renders both verbatim.
                 // INSTR: arg[0]=string, arg[1]=substring → strpos(arg[0], arg[1])
                 // LOCATE: arg[0]=substring, arg[1]=string → strpos(arg[1], arg[0])
                 "INSTR" => {
