@@ -433,6 +433,308 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
         .unwrap_or_default()
 }
 
+/// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
+/// scan, using the column-type map from [`extract_all_column_types`].
+///
+/// Exasol implicitly casts a non-string `LIKE`/`REGEXP_LIKE` subject to VARCHAR
+/// before matching; DataFusion has no such coercion, so a pushed-down `LIKE` over a
+/// DATE / DECIMAL / integer column hard-fails at scan time
+/// (`There isn't a common type to coerce <Type> and Utf8 in LIKE expression`,
+/// issue #207). A `LIKE` `column` node never carries a `dataType` on the wire —
+/// column types live only in `involvedTables[0].columns` — so this type-aware
+/// decision belongs in the adapter, not in the stateless (and sibling-shared)
+/// `vs-expression` translator (decision-log [1]).
+///
+/// Walks the filter tree through the only node types that can nest a
+/// `predicate_like`/`predicate_like_regexp` in this codebase's expression grammar —
+/// `predicate_and` / `predicate_or` (children under `expressions`) and
+/// `predicate_not` (child under `expression`). A `LIKE` reachable only through some
+/// other node (e.g. buried in a `function_scalar_case` inside the filter) is out of
+/// scope, matching the single-table scope of this fix; it renders as before and is
+/// the pre-existing risk. Any node that is neither a junction nor a `LIKE` is
+/// returned unchanged — this guard only inspects `LIKE` subjects.
+///
+/// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
+/// is a bare `column` node, the subject name is uppercased (mirroring
+/// [`extract_all_column_types`]'s uppercasing convention) and looked up in
+/// `col_types`, then dispatched:
+///
+/// | Exasol type | Action |
+/// |-------------|--------|
+/// | `VARCHAR…` / `CHAR…` | leave the node unchanged |
+/// | `DATE` | rewrap the subject as `CAST(<col> AS VARCHAR)` (`function_scalar_cast`) |
+/// | any other type (DECIMAL, DOUBLE, BOOLEAN, TIMESTAMP, …) | decline the whole filter |
+/// | name not found in `col_types` (lookup miss) | decline the whole filter (fail-safe) |
+///
+/// A subject that is not a bare `column` (e.g. a computed scalar expression) leaves
+/// the `LIKE` node unchanged (out of scope, pre-existing behavior).
+///
+/// The DATE `CAST` is Exasol-faithful only under the default `NLS_DATE_FORMAT`
+/// (`YYYY-MM-DD`), which is both DataFusion's unconditional `Date32`→`Utf8` form and
+/// Exasol's default; an altered session format is an accepted tracked exception
+/// (#216, decision-log [8]).
+///
+/// Returns:
+/// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
+/// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
+///   tree propagates to the outer call, mirroring the all-or-nothing
+///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
+///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
+///   predicate natively (decision-log [3]).
+pub(super) fn like_subject_type_guard(
+    filter: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let node_type = filter.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match node_type {
+        // Junctions: recurse into every child; a single declined child (`None`)
+        // short-circuits the whole tree via `?`.
+        "predicate_and" | "predicate_or" => {
+            let mut out = filter.clone();
+            if let Some(Json::Array(children)) = filter.get("expressions") {
+                let mut rewritten = Vec::with_capacity(children.len());
+                for child in children {
+                    rewritten.push(like_subject_type_guard(child, col_types)?);
+                }
+                out["expressions"] = Json::Array(rewritten);
+            }
+            Some(out)
+        }
+        "predicate_not" => {
+            let mut out = filter.clone();
+            if let Some(child) = filter.get("expression") {
+                out["expression"] = like_subject_type_guard(child, col_types)?;
+            }
+            Some(out)
+        }
+        "predicate_like" | "predicate_like_regexp" => guard_like_subject(filter, col_types),
+        // Any other node (predicate_equal, column, literals, …) is not a LIKE and
+        // cannot nest one in this grammar — returned unchanged.
+        _ => Some(filter.clone()),
+    }
+}
+
+/// Type-check and, if needed, rewrite a single `predicate_like` /
+/// `predicate_like_regexp` node. See [`like_subject_type_guard`] for the dispatch
+/// table; returns `None` to decline the whole filter.
+fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let subject = like_node.get("expression");
+
+    // Only a bare `column` subject is in scope; anything else (a computed scalar
+    // expression) is left untouched.
+    let is_bare_column =
+        subject.and_then(|s| s.get("type")).and_then(|t| t.as_str()) == Some("column");
+    if !is_bare_column {
+        return Some(like_node.clone());
+    }
+    let subject = subject.expect("is_bare_column implies expression is present");
+
+    // Uppercase the subject name before lookup, matching `extract_all_column_types`'s
+    // uppercasing (`support.rs:411`). A nameless column is unresolvable → fail-safe
+    // decline.
+    let name = subject
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_uppercase())?;
+    let exa_type = col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t.as_str());
+
+    match exa_type {
+        // String subject: DataFusion coerces it natively — leave unchanged.
+        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(like_node.clone()),
+        // DATE: rewrap the subject as CAST(<col> AS VARCHAR). `render_cast_target`'s
+        // DataFusion arm renders `{"type":"VARCHAR"}` as bare `VARCHAR` (no length),
+        // yielding `CAST(<col> AS VARCHAR)`; DataFusion's Date32→Utf8 cast is
+        // `YYYY-MM-DD`.
+        Some("DATE") => {
+            let mut out = like_node.clone();
+            out["expression"] = serde_json::json!({
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [subject.clone()],
+            });
+            Some(out)
+        }
+        // Every other non-string type (DECIMAL incl. integer DECIMAL(p,0), DOUBLE,
+        // BOOLEAN, TIMESTAMP, …) and a lookup miss decline the WHOLE filter: DataFusion's
+        // formatting of these to string diverges from Exasol's, so a native-eval
+        // fallback is safer than a silently-wrong or hard-failing cast (decision-log [2]).
+        _ => None,
+    }
+}
+
+/// Rewrite every place a bare DECIMAL column is DIRECTLY stringified into a
+/// `decimal_to_varchar_exasol` node wrapping that column, so the rendered SQL
+/// reproduces Exasol's shortest-form DECIMAL→string conversion (trailing scale
+/// zeros trimmed) instead of DataFusion's fixed-declared-scale rendering
+/// (issue #211).
+///
+/// Exasol trims trailing scale zeros when converting a DECIMAL to string
+/// (`2912.00`→`'2912'`); DataFusion's `CAST(decimal AS VARCHAR)` and its implicit
+/// decimal→utf8 coercion (used by `CONCAT`/`||` and `LENGTH`) both render the full
+/// declared scale — a silent wrong-result divergence. A DECIMAL column carries no
+/// `dataType` on an expression node (types live only in
+/// `involvedTables[0].columns`), so this type-aware rewrite belongs in the adapter,
+/// not in the stateless `vs-expression` translator (mirrors [`like_subject_type_guard`]).
+///
+/// The three stringifier shapes rewritten (using the `col_types` map from
+/// [`extract_all_column_types`]) are, when the DIRECT argument is a bare DECIMAL
+/// column:
+///
+/// - `CAST(<decimal column> AS VARCHAR|CHAR)` — the WHOLE cast node is replaced with
+///   `{"type":"decimal_to_varchar_exasol","arguments":[<column>]}` (the synthesized
+///   node already produces the correct VARCHAR-typed trimmed string, so it is NOT
+///   nested inside the original CAST).
+/// - `CONCAT(...)` — each argument that is a bare DECIMAL column is replaced with a
+///   `decimal_to_varchar_exasol`-wrapping node; every other argument is left as-is.
+/// - `LENGTH(<decimal column>)` — its single argument is wrapped, same as CONCAT.
+///
+/// A DECIMAL column in ANY other context (arithmetic, comparison, `CAST` to a
+/// non-string target, a `LIKE` subject, etc.) is left untouched, and a
+/// non-DECIMAL column argument (or a computed-expression argument, whose type is
+/// not resolvable from `col_types`) is left untouched — the latter a tracked
+/// exception in the spec.
+///
+/// ## Post-order recursion is load-bearing
+///
+/// Children are rewritten FIRST (post-order), then the node's own stringifier check
+/// runs. This is what makes NESTED occurrences reachable: Exasol encodes `a||b||c`
+/// as NESTED `CONCAT(a, CONCAT(b, c))` (confirmed live for
+/// `id||'-'||c_decimal_a`), so a rewriter inspecting only the OUTER `CONCAT`'s direct
+/// arguments would never reach `c_decimal_a` (a direct argument only of the INNER
+/// `CONCAT`). The generic child-recursion walks every child-bearing field of this
+/// codebase's expression grammar — the array fields `expressions` / `arguments` /
+/// `results` and the single-child fields `expression` / `pattern` / `left` / `right`
+/// / `basis` — so a stringifier buried arbitrarily deep (inside a `CASE` branch,
+/// inside a logical connective, inside another `CONCAT`) is still found and rewritten.
+///
+/// Wired into `project_columns`'s select-list handling and the WHERE-clause
+/// filter chain.
+pub(super) fn rewrite_decimal_stringifications(
+    node: &Json,
+    col_types: &[(String, String)],
+) -> Json {
+    // A leaf (`column`, literal) or any non-object node has no recursable children
+    // and is not itself a stringifier — pass it through unchanged.
+    if !node.is_object() {
+        return node.clone();
+    }
+
+    // --- Step 1: post-order — rewrite every known child-bearing field FIRST, so a
+    // nested stringifier (e.g. CONCAT-in-CONCAT) is already resolved before this
+    // node's own check runs. Clone-and-replace, mirroring `like_subject_type_guard`.
+    let mut out = node.clone();
+    for field in ["expressions", "arguments", "results"] {
+        if let Some(Json::Array(children)) = node.get(field) {
+            let rewritten: Vec<Json> = children
+                .iter()
+                .map(|c| rewrite_decimal_stringifications(c, col_types))
+                .collect();
+            out[field] = Json::Array(rewritten);
+        }
+    }
+    for field in ["expression", "pattern", "left", "right", "basis"] {
+        match node.get(field) {
+            Some(child) if child.is_object() => {
+                out[field] = rewrite_decimal_stringifications(child, col_types);
+            }
+            _ => {}
+        }
+    }
+
+    // --- Step 2: with children already rewritten, check whether THIS node is one of
+    // the three stringifier shapes over a (still-)bare DECIMAL column argument.
+    let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match node_type {
+        "function_scalar_cast" => {
+            let target_is_string = out
+                .get("dataType")
+                .and_then(|d| d.get("type"))
+                .and_then(|t| t.as_str())
+                .map(|t| t.to_uppercase())
+                .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
+            if target_is_string
+                && let Some(Json::Array(args)) = out.get("arguments")
+                && let [arg] = args.as_slice()
+                && is_bare_decimal_column(arg, col_types)
+            {
+                // Replace the WHOLE cast node — `decimal_to_varchar_exasol` already
+                // yields the correct VARCHAR-typed trimmed string; do not re-nest it
+                // inside the original CAST.
+                return wrap_decimal_to_varchar(arg);
+            }
+            out
+        }
+        "function_scalar" => {
+            let fn_name = out
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            // CONCAT and LENGTH both implicitly stringify each DECIMAL argument.
+            // Per-argument replacement: wrap only the bare DECIMAL columns, leave
+            // literals, non-DECIMAL columns, and already-recursed nested nodes as-is.
+            if (fn_name == "CONCAT" || fn_name == "LENGTH")
+                && let Some(Json::Array(args)) = out.get("arguments")
+            {
+                let rewritten: Vec<Json> = args
+                    .iter()
+                    .map(|a| {
+                        if is_bare_decimal_column(a, col_types) {
+                            wrap_decimal_to_varchar(a)
+                        } else {
+                            a.clone()
+                        }
+                    })
+                    .collect();
+                out["arguments"] = Json::Array(rewritten);
+            }
+            out
+        }
+        // Any other node type (comparison predicate, arithmetic function, CAST to a
+        // non-string target, …): return the children-recursed node unchanged. A bare
+        // DECIMAL column that is a direct argument here is NOT wrapped — this is what
+        // keeps `c_decimal_a > 5` and `CAST(c_decimal_a AS DOUBLE)` untouched.
+        _ => out,
+    }
+}
+
+/// Whether `node` is a bare `column` node whose (uppercased) name resolves in
+/// `col_types` to an Exasol DECIMAL type. Integer columns are wire-encoded as
+/// `DECIMAL(p,0)`, so `.starts_with("DECIMAL")` also matches them (harmless: the
+/// trim is a no-op on a scale-0 value). Mirrors [`guard_like_subject`]'s uppercase
+/// + `col_types` lookup.
+fn is_bare_decimal_column(node: &Json, col_types: &[(String, String)]) -> bool {
+    if node.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return false;
+    }
+    let Some(name) = node
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_uppercase())
+    else {
+        return false;
+    };
+    col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .is_some_and(|(_, t)| t.starts_with("DECIMAL"))
+}
+
+/// Wrap a (bare-column) node in the adapter-synthesized `decimal_to_varchar_exasol`
+/// node that `vs-expression`'s `render_expression_inner` renders via
+/// `format_decimal_exasol_style`. This node is NEVER sent by Exasol on the wire — it
+/// only ever appears because this rewriter synthesizes it.
+fn wrap_decimal_to_varchar(column: &Json) -> Json {
+    serde_json::json!({
+        "type": "decimal_to_varchar_exasol",
+        "arguments": [column.clone()],
+    })
+}
+
 /// Extract the projected columns and their Exasol types from the pushdown request.
 ///
 /// For `column` nodes: returns the uppercase column name and its Exasol type.
@@ -528,6 +830,16 @@ pub(super) fn project_columns(
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
                     .map(exasol_type_from_json);
+                // Rewrite directly-stringified bare-DECIMAL columns into
+                // `decimal_to_varchar_exasol` so the rendered SQL reproduces Exasol's
+                // trimmed DECIMAL→string form (issue #211). The rewriter is a no-op
+                // passthrough for anything it does not recognize (bare columns, literals,
+                // other node types), so it is safe and correct to run unconditionally on
+                // every item before the dispatch below. Shadowing `e` with the owned
+                // rewritten node, then re-borrowing, keeps the rest of the loop body
+                // unchanged.
+                let e = rewrite_decimal_stringifications(e, &all_cols);
+                let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
@@ -570,6 +882,11 @@ pub(super) fn project_columns(
                     }
                     "function_scalar"
                     | "function_scalar_cast"
+                    // A `function_scalar_cast` of a bare DECIMAL column to VARCHAR/CHAR
+                    // is rewritten above into a TOP-LEVEL `decimal_to_varchar_exasol`
+                    // node; it must dispatch to the SAME `render_expression_safe` branch
+                    // rather than falling into the `_ =>` full-row fallback (issue #211).
+                    | "decimal_to_varchar_exasol"
                     | "function_scalar_extract"
                     | "function_scalar_case"
                     | "predicate_equal"
@@ -3110,6 +3427,719 @@ mod tests {
         assert!(
             safe.contains("access_key"),
             "label must be preserved: {safe}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Scenario: like_subject_type_guard dispatches LIKE subjects by Exasol type
+    // (issue #207 regression coverage).
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: LIKE on a VARCHAR or CHAR column pushes down unchanged.
+    #[test]
+    fn like_guard_varchar_subject_unchanged() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "VARCHAR subject must be returned unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR.
+    /// Regression: under the pre-fix code (`filter_json_raw.and_then(render_df_filter_safe)`
+    /// with no guard) the tree is never mutated, so `expression` would still be the bare
+    /// `column` node — this assertion on the rewritten `function_scalar_cast` shape is
+    /// false under that old behavior.
+    #[test]
+    fn like_guard_date_subject_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": column.clone(),
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [column]
+            },
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: LIKE on a DECIMAL column declines the whole filter.
+    /// Regression: the pre-fix code has no decline mechanism at this layer — a DECIMAL
+    /// subject's `filter_json_raw` would pass straight through into `Some(...)` unmodified,
+    /// so asserting `None` here is false under that old behavior.
+    #[test]
+    fn like_guard_decimal_subject_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "amount"},
+            "pattern": {"type": "literal_string", "value": "9%"}
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "DECIMAL subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: LIKE on an integer column declines the whole filter. Exasol has no
+    /// separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
+    /// (confirmed via live payload capture this session).
+    #[test]
+    fn like_guard_integer_subject_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "quantity"},
+            "pattern": {"type": "literal_string", "value": "1%"}
+        });
+        let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "integer (DECIMAL(20,0)) subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: LIKE on a non-column subject (a computed scalar expression) is left
+    /// untouched, regardless of `col_types` — this is out of scope for the guard.
+    #[test]
+    fn like_guard_non_column_subject_untouched() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {
+                "type": "function_scalar",
+                "name": "UPPER",
+                "arguments": [{"type": "column", "name": "amount"}]
+            },
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        // Even a DECIMAL entry for the underlying column must not trigger a decline,
+        // since the LIKE subject itself is not a bare column.
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "non-column LIKE subject must be left unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a bare column whose name is not present in `col_types` (a
+    /// lookup miss) declines the whole filter (fail-safe).
+    #[test]
+    fn like_guard_unresolvable_column_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "mystery"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "unresolvable column subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: a nested non-string LIKE (inside a `predicate_and`) declines the
+    /// entire enclosing filter, not just the LIKE sub-node.
+    #[test]
+    fn like_guard_nested_decimal_declines_whole_filter() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "status"},
+                    "right": {"type": "literal_string", "value": "OPEN"}
+                },
+                {
+                    "type": "predicate_and",
+                    "expressions": [
+                        {
+                            "type": "predicate_like",
+                            "expression": {"type": "column", "name": "amount"},
+                            "pattern": {"type": "literal_string", "value": "9%"}
+                        }
+                    ]
+                }
+            ]
+        });
+        let col_types = vec![
+            ("STATUS".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(9,2)".to_string()),
+        ];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a nested non-string LIKE must decline the whole top-level filter"
+        );
+    }
+
+    /// Scenario: REGEXP_LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR,
+    /// same as `predicate_like` — both node types dispatch through `guard_like_subject`.
+    #[test]
+    fn like_guard_regexp_date_subject_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let filter = serde_json::json!({
+            "type": "predicate_like_regexp",
+            "expression": column.clone(),
+            "pattern": {"type": "literal_string", "value": "2024.*"}
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "predicate_like_regexp",
+            "expression": {
+                "type": "function_scalar_cast",
+                "name": "CAST",
+                "dataType": {"type": "VARCHAR"},
+                "arguments": [column]
+            },
+            "pattern": {"type": "literal_string", "value": "2024.*"}
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "REGEXP_LIKE DATE subject must be rewrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: a DECIMAL-typed LIKE wrapped in `predicate_not` declines the whole
+    /// filter — the decline must propagate through `predicate_not`, not just through
+    /// `predicate_and`/`predicate_or`.
+    #[test]
+    fn like_guard_not_wrapped_decimal_declines() {
+        let filter = serde_json::json!({
+            "type": "predicate_not",
+            "expression": {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "amount"},
+                "pattern": {"type": "literal_string", "value": "9%"}
+            }
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a DECIMAL LIKE inside predicate_not must decline the whole filter"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // rewrite_decimal_stringifications — issue #211 decimal-trim JSON rewrite
+    // ---------------------------------------------------------------------------
+
+    /// The column-type map shared by the rewrite tests: one DECIMAL, one integer
+    /// DECIMAL(p,0), one VARCHAR, one DATE.
+    fn decimal_rewrite_col_types() -> Vec<(String, String)> {
+        vec![
+            ("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string()),
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+            ("D".to_string(), "DATE".to_string()),
+        ]
+    }
+
+    fn decimal_column() -> Json {
+        serde_json::json!({"type": "column", "name": "c_decimal_a"})
+    }
+
+    fn cast_to(target: &str, arg: Json) -> Json {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": target},
+            "arguments": [arg],
+        })
+    }
+
+    /// `CAST(<decimal column> AS VARCHAR)` → the WHOLE cast node is replaced by a
+    /// `decimal_to_varchar_exasol` node wrapping the column, which renders through
+    /// `format_decimal_exasol_style` (the trailing-zero-trim regexp form).
+    #[test]
+    fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
+        let node = cast_to("VARCHAR", decimal_column());
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        assert_eq!(
+            out.get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the whole CAST node must be replaced, not nested: {out}"
+        );
+        let inner = &out["arguments"][0];
+        assert_eq!(
+            inner.get("name").and_then(|n| n.as_str()),
+            Some("c_decimal_a"),
+            "the wrapped node must be the original column: {out}"
+        );
+        // Rendering proves it goes through the trimming regexp form.
+        let sql = render_expression_safe(&out).expect("must render");
+        assert!(
+            sql.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && sql.contains("regexp_replace"),
+            "must render via format_decimal_exasol_style: {sql}"
+        );
+    }
+
+    /// `CAST(<decimal column> AS CHAR)` is also a stringification → replaced.
+    #[test]
+    fn rewrite_cast_decimal_to_char_replaces_whole_node() {
+        let node = cast_to("CHAR", decimal_column());
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        assert_eq!(
+            out.get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "CAST AS CHAR over a DECIMAL column must also be rewritten: {out}"
+        );
+    }
+
+    /// The exact nested-CONCAT shape from the live capture
+    /// (`CONCAT(ID, CONCAT('-', C_DECIMAL_A))`, i.e. `id||'-'||c_decimal_a`): ONLY
+    /// `C_DECIMAL_A` (reachable only through the INNER CONCAT) gets wrapped; the
+    /// non-decimal `ID` column and the `'-'` literal are untouched, and the nested
+    /// structure is otherwise preserved. Guards the post-order-recursion BLOCKER.
+    #[test]
+    fn rewrite_nested_concat_wraps_only_inner_decimal() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "id"},
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "-"},
+                        {"type": "column", "name": "c_decimal_a"}
+                    ]
+                }
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        // Outer CONCAT preserved; ID (integer DECIMAL(20,0)) is itself decimal so it
+        // IS wrapped as a direct outer-CONCAT argument — but the OUTER structure and
+        // its argument count are preserved.
+        assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
+        let outer_args = out["arguments"].as_array().unwrap();
+        assert_eq!(
+            outer_args.len(),
+            2,
+            "outer CONCAT arg count preserved: {out}"
+        );
+
+        // The inner CONCAT node is still a CONCAT; its literal '-' is untouched and
+        // its C_DECIMAL_A argument is now wrapped.
+        let inner = &outer_args[1];
+        assert_eq!(inner.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
+        let inner_args = inner["arguments"].as_array().unwrap();
+        assert_eq!(
+            inner_args[0].get("type").and_then(|t| t.as_str()),
+            Some("literal_string"),
+            "the '-' literal must be untouched: {out}"
+        );
+        assert_eq!(
+            inner_args[1].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the inner C_DECIMAL_A must be wrapped (post-order recursion reached it): {out}"
+        );
+        assert_eq!(
+            inner_args[1]["arguments"][0]
+                .get("name")
+                .and_then(|n| n.as_str()),
+            Some("c_decimal_a"),
+        );
+    }
+
+    /// `CONCAT(NAME, C_DECIMAL_A)` — only the DECIMAL column is wrapped; the VARCHAR
+    /// column is left as a bare column reference.
+    #[test]
+    fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "column", "name": "c_decimal_a"}
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        let args = out["arguments"].as_array().unwrap();
+        assert_eq!(
+            args[0].get("type").and_then(|t| t.as_str()),
+            Some("column"),
+            "the VARCHAR column must stay a bare column: {out}"
+        );
+        assert_eq!(
+            args[1].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the DECIMAL column must be wrapped: {out}"
+        );
+    }
+
+    /// `LENGTH(<decimal column>)` → its single argument is wrapped.
+    #[test]
+    fn rewrite_length_wraps_decimal_argument() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [decimal_column()]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("LENGTH"));
+        assert_eq!(
+            out["arguments"][0].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "LENGTH's DECIMAL argument must be wrapped: {out}"
+        );
+    }
+
+    /// A non-DECIMAL bare column as a CAST / CONCAT / LENGTH argument is left
+    /// COMPLETELY unchanged (VARCHAR and DATE both).
+    #[test]
+    fn rewrite_non_decimal_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let cast_varchar = cast_to(
+            "VARCHAR",
+            serde_json::json!({"type": "column", "name": "name"}),
+        );
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast_varchar, &col_types),
+            cast_varchar,
+            "CAST of a VARCHAR column must be unchanged"
+        );
+
+        let length_date = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [{"type": "column", "name": "d"}]
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&length_date, &col_types),
+            length_date,
+            "LENGTH of a DATE column must be unchanged"
+        );
+    }
+
+    /// A computed-expression argument (e.g. `c_decimal_a * 2`) to a stringifier is
+    /// left unchanged — its type is not resolvable from `col_types`, a tracked
+    /// exception in the plan's scope. The argument is not a bare column, so neither
+    /// the CAST replacement nor the CONCAT per-argument wrap fires on it.
+    #[test]
+    fn rewrite_computed_expression_argument_unchanged() {
+        let computed = serde_json::json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        });
+        let col_types = decimal_rewrite_col_types();
+
+        let cast = cast_to("VARCHAR", computed.clone());
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast, &col_types),
+            cast,
+            "CAST of a computed DECIMAL expression must be left unchanged: it is not a bare column"
+        );
+
+        let concat = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [{"type": "column", "name": "name"}, computed]
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&concat, &col_types),
+            concat,
+            "a computed-expression CONCAT argument must be left unchanged"
+        );
+    }
+
+    /// A DECIMAL column in a NON-stringifying context is NOT wrapped: neither a
+    /// comparison predicate (`c_decimal_a > 5`) nor a CAST to a non-string target
+    /// (`CAST(c_decimal_a AS DOUBLE)`). Proves the recursion does not over-wrap.
+    #[test]
+    fn rewrite_non_stringifying_context_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let cmp = serde_json::json!({
+            "type": "predicate_greater",
+            "left": decimal_column(),
+            "right": {"type": "literal_exactnumeric", "value": 5}
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&cmp, &col_types),
+            cmp,
+            "a DECIMAL column in a comparison must not be wrapped"
+        );
+
+        let cast_double = cast_to("DOUBLE", decimal_column());
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast_double, &col_types),
+            cast_double,
+            "CAST(decimal AS DOUBLE) must not be wrapped"
+        );
+    }
+
+    /// A DECIMAL stringification reachable ONLY through a `function_scalar_case` THEN
+    /// branch (its `results` field) is still found and wrapped — proves the generic
+    /// child recursion covers CASE's `results`, not just `arguments`.
+    #[test]
+    fn rewrite_reaches_decimal_inside_case_then_branch() {
+        let node = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_greater",
+                    "left": {"type": "column", "name": "id"},
+                    "right": {"type": "literal_exactnumeric", "value": 0}
+                }
+            ],
+            "results": [
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "x"},
+                        {"type": "column", "name": "c_decimal_a"}
+                    ]
+                }
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        let then_concat = &out["results"][0];
+        assert_eq!(
+            then_concat.get("name").and_then(|n| n.as_str()),
+            Some("CONCAT"),
+            "the CASE THEN CONCAT must be preserved: {out}"
+        );
+        assert_eq!(
+            then_concat["arguments"][1]
+                .get("type")
+                .and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the DECIMAL inside the CASE THEN CONCAT must be wrapped: {out}"
+        );
+    }
+
+    /// Wiring sanity check: a select-list `CAST(c_decimal_a AS VARCHAR(20))` over a
+    /// bare DECIMAL column must
+    /// route through `render_expression_safe` — yielding a SINGLE `ProjectionItem::Expr`
+    /// carrying the trim, at the item's declared EMITS type — NOT degrade to the full
+    /// base-row fallback. This proves both wiring changes: the unconditional rewrite of
+    /// each select-list item AND `decimal_to_varchar_exasol` being recognized by the
+    /// scalar `item_type` match arm.
+    #[test]
+    fn selectlist_decimal_cast_routed_not_full_row_fallback() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", decimal_column()) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
+        });
+        let (items, types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the CAST-to-VARCHAR item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && expr.contains("regexp_replace"),
+            "the projected expression must render the trimmed DECIMAL→string form: {expr}"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(20)".to_string()],
+            "the EMITS type must stay the item's declared selectListDataTypes type"
+        );
+    }
+
+    /// Exhaustive coverage: the exact nested-CONCAT JSON shape confirmed
+    /// live for `id||'-'||c_decimal_a` (`CONCAT(ID, CONCAT('-', C_DECIMAL_A))`) as a
+    /// select-list item, through `project_columns`, renders `C_DECIMAL_A`'s CAST
+    /// fragment specifically wrapped in `format_decimal_exasol_style`'s
+    /// `regexp_replace` pair — proving the wiring (not just the isolated JSON rewrite
+    /// already covered by `rewrite_nested_concat_wraps_only_inner_decimal`) reaches
+    /// the nested inner-CONCAT argument at the `project_columns` level.
+    ///
+    /// `ID` is itself `DECIMAL(20,0)`, so it too is a direct outer-CONCAT argument and
+    /// gets the same (harmless, no-op-on-scale-0) trim wrapper — documented behavior
+    /// already asserted in `rewrite_nested_concat_wraps_only_inner_decimal`. This test
+    /// only asserts what's specific to `C_DECIMAL_A`: its CAST fragment sits inside
+    /// the trim wrapper.
+    #[test]
+    fn selectlist_nested_concat_decimal_arg_rewritten() {
+        let item = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "id"},
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "-"},
+                        decimal_column()
+                    ]
+                }
+            ]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the nested-CONCAT item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(r#"regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
+            "the inner C_DECIMAL_A argument must be rendered through the trim wrapper: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `LENGTH(c_decimal_a)` as a select-list item,
+    /// through `project_columns`, renders the trim-wrapped `character_length(...)` —
+    /// the LENGTH-over-DECIMAL wiring at the projection level (mirrors
+    /// `rewrite_length_wraps_decimal_argument`'s isolated JSON check).
+    #[test]
+    fn selectlist_length_decimal_arg_rewritten() {
+        let item = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [decimal_column()]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the LENGTH item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(
+                "character_length(regexp_replace(regexp_replace(CAST(\"C_DECIMAL_A\" AS VARCHAR)"
+            ),
+            "LENGTH over a DECIMAL column must render the trim-wrapped character_length: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `CAST(<VARCHAR column> AS VARCHAR(20))` through
+    /// `project_columns` renders EXACTLY as it did before this whole fix — a plain
+    /// CAST, with no `regexp_replace` / `decimal_to_varchar_exasol` involvement.
+    /// Proves the fix doesn't touch a non-DECIMAL stringification at the wired level.
+    #[test]
+    fn stringify_nondecimal_column_unchanged() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", serde_json::json!({"type": "column", "name": "name"})) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "must project a single expression: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert_eq!(
+            expr, r#"CAST("NAME" AS VARCHAR)"#,
+            "a CAST over a non-DECIMAL column must render unchanged, exactly as before this fix: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `CAST(c_decimal_a * 2 AS VARCHAR)` through
+    /// `project_columns` renders a plain, untrimmed CAST — proving the adapter-level
+    /// wiring correctly leaves the tracked-exception computed-argument case alone
+    /// (issue #223's scope), consistent with
+    /// `rewrite_computed_expression_argument_unchanged` at the wired level.
+    #[test]
+    fn stringify_computed_decimal_arg_untouched() {
+        let computed = serde_json::json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", computed) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "must project a single expression: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert_eq!(
+            expr, r#"CAST(("C_DECIMAL_A" * 2) AS VARCHAR)"#,
+            "a CAST of a computed DECIMAL expression must render unchanged: {expr}"
+        );
+        assert!(
+            !expr.contains("regexp_replace"),
+            "a computed-expression CAST must not be trimmed (tracked exception #223): {expr}"
         );
     }
 }
