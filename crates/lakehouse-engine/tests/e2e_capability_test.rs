@@ -521,6 +521,70 @@ fn e2e_selectlist_literal_projection_pushdown() {
     }
 }
 
+/// Regression for issue #205: `COUNT(*)` over a `LIMIT`-bearing derived table
+/// must not fail with a pushdown column-count mismatch. Exasol represents its
+/// "select any one column" contract for the inner derived-table request as a
+/// single-element `literal_null` select list once a LIMIT barrier separates
+/// the outer aggregate from the derived table — the same literal-select-list
+/// code path #190 fixed (`is_literal_selectlist_item` in
+/// `crates/lakehouse-engine/src/adapter/pushdown/support.rs`), so this guards
+/// that fix against a regression on the LIMIT-barrier trigger surface.
+#[test]
+fn e2e_count_star_over_limited_subselect_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+
+    // Primary shape: single projected column behind the LIMIT barrier.
+    let primary_sql = format!("SELECT COUNT(*) FROM (SELECT id FROM {table} LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&primary_sql),
+        5,
+        "COUNT(*) over a single-column LIMITed derived table must be 5: {primary_sql}"
+    );
+
+    // Two-column subselect variant.
+    let two_col_sql = format!("SELECT COUNT(*) FROM (SELECT id, name FROM {table} LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&two_col_sql),
+        5,
+        "COUNT(*) over a two-column LIMITed derived table must be 5: {two_col_sql}"
+    );
+
+    // WHERE + LIMIT variant.
+    let where_limit_sql =
+        format!("SELECT COUNT(*) FROM (SELECT id FROM {table} WHERE id <= 10 LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&where_limit_sql),
+        5,
+        "COUNT(*) over a WHERE+LIMITed derived table must be 5: {where_limit_sql}"
+    );
+
+    // Guard the pushdown shape itself, not only the numeric result: the inner
+    // derived-table scan for the primary shape must push a positional literal
+    // projection (an `{"expr":...}` scan-spec item), not the full-base-row
+    // fallback (which would emit every base column as a bare-string `Column`
+    // entry and yield the #205 column-count mismatch).
+    // `explain_virtual_sql` flattens EXPLAIN's result cells by joining them
+    // with a single space, so JSON tokens can end up split across a cell
+    // boundary — an exact-substring match on adjacent `"projection":[{"expr":`
+    // would be flaky. Instead check that an `"expr"` key occurs anywhere after
+    // the `"projection"` key, which still distinguishes a positional literal
+    // projection from the full-base-row fallback (bare `Column` string
+    // entries, no `"expr"` key at all).
+    let pushed_sql = explain_virtual_sql(&mut conn, &primary_sql);
+    let projection_idx = pushed_sql.find(r#""projection""#);
+    let has_expr_after_projection = projection_idx
+        .and_then(|idx| pushed_sql[idx..].find(r#""expr""#))
+        .is_some();
+    assert!(
+        has_expr_after_projection,
+        "{primary_sql}'s inner derived-table scan must push a positional \
+         literal projection (an '\"expr\"' key after 'projection'), \
+         not the full-base-row fallback (#205), got:\n{pushed_sql}"
+    );
+}
+
 /// Regression for issue #190: a query whose predicate prunes every Iceberg
 /// data file (`id > 1000` against a max seeded id of 20) must still accept a
 /// select list of repeated literals plus a real column. This exercises the
