@@ -841,6 +841,9 @@ mod tests {
                 .unwrap(),
         );
         let date: Arc<dyn arrow::array::Array> = Arc::new(Date32Array::from(vec![0, 1, 2]));
+        // Utf8View → Utf8 for a VARCHAR(2000000)-declared column; this is also the
+        // exact shape `decimal_to_varchar_exasol`'s `regexp_replace(...)` chain
+        // produces for a projected DECIMAL-column stringification (issue #211).
         let utf8view_to_varchar: Arc<dyn arrow::array::Array> =
             Arc::new(StringViewArray::from(vec!["a", "b", "c"]));
 
