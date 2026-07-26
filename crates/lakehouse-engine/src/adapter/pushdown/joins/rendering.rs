@@ -546,6 +546,78 @@ mod tests {
         );
     }
 
+    /// `string_function_arg_type_guard` (issue #210) reaches through the join-shared
+    /// `project_columns`, exercised across two calls into `extract_join_projection`
+    /// on the same detected join:
+    ///
+    /// (a) `UPPER(C_CUSTKEY)` (CUSTOMER's DECIMAL column) still projects as a single
+    ///     coerced `ProjectionItem::Expr` carrying the trimmed decimal-to-string
+    ///     form — proving coercion reaches through the join-shared `project_columns`,
+    ///     not just the single-table path.
+    /// (b) A decline falls back to the FULL projection over the UNION of BOTH
+    ///     joined tables' columns, not just one side.
+    ///
+    /// `join_request`'s fixture carries no DOUBLE-typed column on either side, so the
+    /// decline trigger used for (b) is the #228 ARITY decline instead —
+    /// `INSTR(C_NAME, 'b', 3)`, three arguments, over CUSTOMER's own VARCHAR column —
+    /// which reaches the exact same `None` path a type decline would, with no
+    /// fixture change.
+    #[test]
+    fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
+        let request = join_request(Json::Null, equi_condition());
+        let detected = detected_join(&request);
+
+        let mut coerce_request = request.clone();
+        coerce_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "function_scalar",
+                "name": "UPPER",
+                "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+            }
+        ]);
+        let (projection, _types) =
+            extract_join_projection(&coerce_request, &pd(&coerce_request), &detected)
+                .expect("projectable");
+        assert_eq!(
+            projection.len(),
+            1,
+            "UPPER(C_CUSTKEY) must project a single expression, not the full two-table \
+             row: {projection:?}"
+        );
+        let ProjectionItem::Expr { expr } = &projection[0] else {
+            panic!("must be a rendered expression, not a bare column: {projection:?}");
+        };
+        assert!(
+            expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_CUSTKEY" AS VARCHAR)"#),
+            "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
+             form: {expr}"
+        );
+
+        let mut decline_request = request.clone();
+        decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "function_scalar",
+                "name": "INSTR",
+                "arguments": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "literal_string", "value": "b"},
+                    {"type": "literal_exactnumeric", "value": 3}
+                ]
+            }
+        ]);
+        let (projection, _types) =
+            extract_join_projection(&decline_request, &pd(&decline_request), &detected)
+                .expect("projectable");
+        let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
+            + involved_table_columns(&decline_request, "ORDERS").len();
+        assert_eq!(
+            projection.len(),
+            expected_full_row_len,
+            "the arity-decline INSTR must fall back to the full projection over BOTH \
+             joined tables' columns, not a truncated strpos: {projection:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Per-side pruning: side-local conjunct attribution, projection narrowing,
     // and per-side filter pushdown in the fallback path.
