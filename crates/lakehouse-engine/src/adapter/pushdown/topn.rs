@@ -1,7 +1,7 @@
-use crate::scan::spec::{LogicalField, ProjectionItem, SortKey};
+use crate::scan::spec::{LogicalField, ProjectionItem, SortKey, render_order_by_clause};
 use serde_json::Value as Json;
 
-use super::support::extract_limit;
+use super::support::{emits_ident, extract_limit};
 
 // ---------------------------------------------------------------------------
 // Ordered top-N pushdown
@@ -172,6 +172,115 @@ pub(super) fn detect_topn(
     Some(keys)
 }
 
+// ---------------------------------------------------------------------------
+// Declined-ORDER-BY rendering (issues #225 / #189)
+// ---------------------------------------------------------------------------
+
+/// APPEND each sort-key column that the derived projection does not already emit,
+/// so the declined-`ORDER BY` wrapper's outer `ORDER BY` can bind against a column
+/// the per-shard scan actually emits.
+///
+/// The scan's emitted-column set and the query's VISIBLE column set are two
+/// different sets: an appended column is HIDDEN — emitted by the scan, reachable by
+/// the wrapper's `ORDER BY`, and dropped again by the wrapper's explicit visible
+/// select list ([`wrap_declined_order_by`]). This replaces the former full-base-row
+/// widening (issue #190), which forced the two sets equal and therefore returned
+/// every base column where Exasol positionally expects exactly the derived
+/// projection's column count — `sqlCode 04000` (issue #225).
+///
+/// APPEND-ONLY is load-bearing: every original index is preserved, so
+/// [`emits_ident`]'s positional `_LH_PROJ_{index}` and `raw_scan`'s matching
+/// `AS _LH_PROJ_{i}` alias stay aligned by construction, and the wrapper's visible
+/// prefix `0..visible_count` still names exactly the original items.
+///
+/// A column is appended AT MOST ONCE: the membership test re-scans `proj_cols` as it
+/// grows, so it dedupes against both the pre-existing [`ProjectionItem::Column`]
+/// entries and any column already appended earlier in this same call (two sort keys
+/// naming the same column). A repeated EMITS identifier would be a duplicate-column
+/// error.
+///
+/// A sort-key column absent from `col_types` is SKIPPED and left unresolved — the
+/// caller still renders it in the `ORDER BY`, exactly as before this fix. `col_types`
+/// is the full `involvedTables[0].columns` list and every pushed sort key is a real
+/// table column, so this is defensive and unreachable in practice; it deliberately
+/// adds no machinery (decision [6]).
+///
+/// `proj_cols` and `proj_types` are extended in lockstep, preserving the 1:1
+/// alignment the EMITS clause and the scan's per-column type coercion both rely on.
+pub(super) fn extend_projection_with_sort_keys(
+    proj_cols: &mut Vec<ProjectionItem>,
+    proj_types: &mut Vec<String>,
+    keys: &[SortKey],
+    col_types: &[(String, String)],
+) {
+    for key in keys {
+        let already_emitted = proj_cols
+            .iter()
+            .any(|p| matches!(p, ProjectionItem::Column(c) if *c == key.column));
+        if already_emitted {
+            continue;
+        }
+        let Some((name, exa_type)) = col_types.iter().find(|(name, _)| *name == key.column) else {
+            continue;
+        };
+        proj_cols.push(ProjectionItem::Column(name.clone()));
+        proj_types.push(exa_type.clone());
+    }
+}
+
+/// Wrap a declined-`ORDER BY` row-scan fan-out in a self-contained global
+/// `ORDER BY` (plus the original `LIMIT`, if any), naming ONLY the visible columns.
+///
+/// Once `ORDER_BY_COLUMN` is advertised Exasol delegates the ordering and NO LONGER
+/// re-applies its own backstop sort, so the adapter must reproduce that global sort
+/// in the SQL it returns even for shapes it does not optimize (add-topn-pushdown B6).
+///
+/// The outer select list is the `emits_ident` of each of the FIRST `visible_count`
+/// projection items — the derived projection as it stood before
+/// [`extend_projection_with_sort_keys`] appended any hidden sort-key column. Inner
+/// EMITS clause and outer select list therefore render through the ONE shared
+/// [`emits_ident`] seam and cannot drift, and the returned arity equals the derived
+/// projection's by construction (never `SELECT *` over a wider emitted row).
+///
+/// Two guards:
+/// - `keys` empty → `sql` is returned UNCHANGED. `render_order_by_clause(&[])` yields
+///   an empty string, so wrapping would emit an invalid bare `ORDER BY `. A non-empty
+///   `orderBy` CAN parse to zero keys, because [`parse_sort_key_element`] filters out
+///   non-column elements and elements missing `isAscending` / `nullsLast`.
+/// - `visible_count == 0` → falls back to `SELECT *`, since `SELECT  FROM (…)` is not
+///   valid SQL. An empty row-scan projection is itself already impossible, so this is
+///   a structural guard, not a reachable code path.
+pub(super) fn wrap_declined_order_by(
+    sql: &str,
+    proj_cols: &[ProjectionItem],
+    visible_count: usize,
+    keys: &[SortKey],
+    limit: Option<u64>,
+) -> String {
+    if keys.is_empty() {
+        return sql.to_string();
+    }
+    let visible_list = if visible_count == 0 {
+        "*".to_string()
+    } else {
+        proj_cols
+            .iter()
+            .take(visible_count)
+            .enumerate()
+            .map(|(i, item)| emits_ident(item, i))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut wrapped = format!(
+        "SELECT {visible_list} FROM ({sql}) ORDER BY {}",
+        render_order_by_clause(keys)
+    );
+    if let Some(n) = limit {
+        wrapped.push_str(&format!(" LIMIT {n}"));
+    }
+    wrapped
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::support::{
@@ -181,7 +290,7 @@ mod tests {
     use super::super::test_support::*;
     use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
     use super::*;
-    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, render_order_by_clause};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
     use vs_expression::render_df_filter_safe;
 
     // -----------------------------------------------------------------------
@@ -197,7 +306,7 @@ mod tests {
             .get("pushdownRequest")
             .cloned()
             .unwrap_or(Json::Null);
-        let (proj_cols, proj_types) = extract_projection(request, &pushdown_req).unwrap();
+        let (mut proj_cols, mut proj_types) = extract_projection(request, &pushdown_req).unwrap();
         let filter = pushdown_req
             .get("filter")
             .filter(|f| !f.is_null())
@@ -222,6 +331,22 @@ mod tests {
             None
         } else {
             limit
+        };
+
+        // Row-scan DECLINE path via the SHARED helpers the dispatcher calls, so this
+        // mirror cannot drift from the real wrapping shape. Position is load-bearing on
+        // both sides, exactly as in `build_dispatch_sql`: AFTER `detect_topn` (which
+        // must see the pre-extension projection) and BEFORE the `spec_template` below
+        // (whose `projection` / `emit_exa_types` must carry the appended hidden column
+        // that the EMITS clause is built from).
+        let visible_count = proj_cols.len();
+        let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
+        let declined_sort_keys = if declined_order_by {
+            let keys = parse_order_by_keys(&pushdown_req);
+            extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
+            keys
+        } else {
+            Vec::new()
         };
 
         let spec_template = ScanSpec {
@@ -252,24 +377,8 @@ mod tests {
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         );
-        // Mirror handle_pushdown's row-scan DECLINE wrapping (add-topn-pushdown B6).
-        let declined_order_by = has_order_by
-            && spec_template.common.order_by.is_empty()
-            && spec_template.common.aggregates.is_none();
         if declined_order_by {
-            let keys = parse_order_by_keys(&pushdown_req);
-            if keys.is_empty() {
-                sql
-            } else {
-                let mut wrapped = format!(
-                    "SELECT * FROM ({sql}) ORDER BY {}",
-                    render_order_by_clause(&keys)
-                );
-                if let Some(n) = limit {
-                    wrapped.push_str(&format!(" LIMIT {n}"));
-                }
-                wrapped
-            }
+            wrap_declined_order_by(&sql, &proj_cols, visible_count, &declined_sort_keys, limit)
         } else {
             sql
         }
@@ -334,10 +443,15 @@ mod tests {
     /// Decline (sort key not projected): `ORDER BY` is present but the sort column
     /// is not in the projection, so the bounded top-N declines. The PER-SHARD sort
     /// keys and LIMIT are still withheld from the common blob (anti-wrong-truncation
-    /// invariant, decision [4]), but the OUTER wrapper now renders a self-contained
+    /// invariant, decision [4]), but the OUTER wrapper renders a self-contained
     /// global `ORDER BY … LIMIT n` (add-topn-pushdown B6): once `ORDER_BY_COLUMN` is
     /// advertised Exasol no longer re-applies its own backstop sort/limit, so the
     /// adapter reproduces it in the returned SQL.
+    ///
+    /// The unprojected sort key `L_EXTENDEDPRICE` is APPENDED to the scan as a HIDDEN
+    /// column (issues #225 / #189) so that outer `ORDER BY` binds against a column the
+    /// scan actually emits, while the wrapper's visible select list still names only
+    /// `"L_ORDERKEY"` — the derived projection — keeping the returned arity at 1.
     #[test]
     fn order_by_present_without_topn_match_withholds_per_shard_limit() {
         // Project only L_ORDERKEY, but ORDER BY L_EXTENDEDPRICE (unprojected).
@@ -389,6 +503,22 @@ mod tests {
         assert!(
             sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
             "declined shape must render a self-contained outer ORDER BY … LIMIT: {sql}"
+        );
+        // The wrapper's VISIBLE select list is the derived projection alone; the
+        // appended sort key is emitted by the scan but dropped from the result.
+        assert!(
+            sql.contains(r#"SELECT "L_ORDERKEY" FROM ("#),
+            "wrapper must name only the derived projection, never SELECT *: {sql}"
+        );
+        assert_eq!(
+            outer_select_list(&sql),
+            "\"L_ORDERKEY\"",
+            "the hidden sort key must not be visible in the outer select list: {sql}"
+        );
+        assert!(
+            emits_clause(&sql).contains("\"L_EXTENDEDPRICE\""),
+            "the scan must EMIT the appended hidden sort key: {}",
+            emits_clause(&sql)
         );
         // But the PER-SHARD common blob still carries NO sort keys and NO limit:
         // the fan-out stays unbounded and unsorted (anti-wrong-truncation invariant).

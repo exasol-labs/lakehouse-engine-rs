@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
-    ScanSpec, StorageProps, render_order_by_clause,
+    ScanSpec, StorageProps,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -283,8 +283,8 @@ pub async fn handle_pushdown(
 pub(crate) fn build_dispatch_sql(
     request: &Json,
     pushdown_req: &Json,
-    proj_cols: Vec<ProjectionItem>,
-    proj_types: Vec<String>,
+    mut proj_cols: Vec<ProjectionItem>,
+    mut proj_types: Vec<String>,
     col_types: Vec<(String, String)>,
     filter: Option<String>,
     limit: Option<u64>,
@@ -564,6 +564,15 @@ pub(crate) fn build_dispatch_sql(
     // Ordered top-N applies ONLY to the pure row-scan path (no aggregates). On a
     // match the sort keys are carried into the common blob (per-shard bounded sort)
     // and the outer wrapper renders `ORDER BY … LIMIT n`.
+    //
+    // `proj_cols` is passed here EXACTLY as `extract_projection` derived it: the
+    // declined-path sort-key extension below deliberately runs AFTER this call
+    // (issues #225 / #189, decision [2]). Extending first — as the removed #190
+    // full-base-row widening did — would let an appended column make an otherwise
+    // ineligible shape match the bounded top-N, whose rendering path emits
+    // `proj_cols` directly as the FINAL visible EMITS with no wrapping SELECT. A
+    // hidden column would then leak into the result and reintroduce the very arity
+    // mismatch this fix removes.
     let topn = if aggregates.is_none() {
         detect_topn(request, pushdown_req, &proj_cols, &logical_schema)
     } else {
@@ -580,6 +589,39 @@ pub(crate) fn build_dispatch_sql(
         None
     } else {
         limit
+    };
+
+    // Row-scan DECLINE path, part 1 of 2 (issues #225 / #189): an ORDER BY was pushed
+    // but the shape did not match the bounded top-N (`order_by` empty). Such a sort
+    // key need not be emitted by the derived projection at all — it may name a
+    // different column, or be referenced only INSIDE a projected expression — so the
+    // scan's emitted-column set is EXTENDED with each missing sort-key column as a
+    // HIDDEN column. Part 2 (the wrapper, below) names only the visible columns
+    // explicitly, so every hidden column is dropped from the query's result again.
+    //
+    // `visible_count` is the number of projection items `extract_projection` already
+    // derived before this extension runs (`proj_cols.len()` at this point) — NOT
+    // necessarily the raw select-list arity. A separate, pre-existing fallback inside
+    // `extract_projection` / `project_columns` (`needs_full_fallback`) can already
+    // have widened `proj_cols` to the full base row for an untranslatable or
+    // EMITS-rejected select-list item, independent of this fix; that composed shape is
+    // a separate, pre-existing gap (see the capability-extensions spec) that this fix
+    // does not need to resolve.
+    //
+    // Position is load-bearing on BOTH sides. AFTER `detect_topn` (see its comment
+    // above), and BEFORE the `spec_template` literal below: that literal derives the
+    // common blob's `projection` and `emit_exa_types` from these same two vectors that
+    // `build_scan_driving_sql` renders the EMITS clause from, so extending afterwards
+    // would declare a hidden column in EMITS that the scan spec never projects — and
+    // the UDF would never emit it.
+    let visible_count = proj_cols.len();
+    let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
+    let declined_sort_keys = if declined_order_by {
+        let keys = parse_order_by_keys(pushdown_req);
+        topn::extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
+        keys
+    } else {
+        Vec::new()
     };
 
     // Computed once before the struct literal moves `aggregates` into its field:
@@ -639,33 +681,24 @@ pub(crate) fn build_dispatch_sql(
         distribute_udf_name,
     );
 
-    // Row-scan DECLINE path (add-topn-pushdown B6): an ORDER BY was pushed but the
-    // shape did not match the bounded top-N (`order_by` empty) — e.g. a sort key
-    // that is unprojected or JSON-fallback-typed, or a bare ORDER BY with no LIMIT.
+    // Row-scan DECLINE path, part 2 of 2 (add-topn-pushdown B6; issues #225 / #189).
     // Once ORDER_BY_COLUMN is advertised Exasol delegates the ordering and NO LONGER
     // re-applies its own backstop sort/limit on the returned rows, so the adapter
     // reproduces that former backstop as self-contained SQL: wrap the unbounded
-    // fan-out in a global ORDER BY (plus the original LIMIT, if any). The per-shard
-    // common blob still carries no sort keys and no LIMIT (anti-wrong-truncation
-    // invariant, decision [4]); this is the unoptimized correctness restoration, not
-    // the bounded per-shard top-N.
-    let declined_order_by = has_order_by
-        && spec_template.common.order_by.is_empty()
-        && spec_template.common.aggregates.is_none();
+    // fan-out in a global ORDER BY (plus the original LIMIT, if any).
+    //
+    // The wrapper names the FIRST `visible_count` projection items explicitly rather
+    // than `SELECT *`, so any sort-key column part 1 appended above stays HIDDEN — the
+    // outer ORDER BY binds against it, and it is dropped from the query's result. That
+    // is what keeps the returned column count equal to the derived projection's, which
+    // Exasol validates POSITIONALLY against the original select list (a wider row is
+    // rejected outright with `sqlCode 04000`, never re-projected).
+    //
+    // The per-shard common blob still carries no sort keys and no LIMIT
+    // (anti-wrong-truncation invariant, decision [4]); this is the unoptimized
+    // correctness restoration, not the bounded per-shard top-N.
     let sql = if declined_order_by {
-        let keys = parse_order_by_keys(pushdown_req);
-        if keys.is_empty() {
-            sql
-        } else {
-            let mut wrapped = format!(
-                "SELECT * FROM ({sql}) ORDER BY {}",
-                render_order_by_clause(&keys)
-            );
-            if let Some(n) = limit {
-                wrapped.push_str(&format!(" LIMIT {n}"));
-            }
-            wrapped
-        }
+        topn::wrap_declined_order_by(&sql, &proj_cols, visible_count, &declined_sort_keys, limit)
     } else {
         sql
     };
@@ -1373,6 +1406,434 @@ mod tests {
         assert_eq!(
             back.common.logical_schema, logical,
             "a default-less spec must round-trip unchanged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Declined-ORDER-BY hidden sort-key columns (issues #225 / #189)
+    // ---------------------------------------------------------------------------
+
+    /// The fixed four-column `EVENTS` universe every guard test projects against
+    /// (mirrors `dispatch_golden`'s `base_col_types`).
+    fn guard_col_types() -> Vec<(String, String)> {
+        vec![
+            ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+            ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+        ]
+    }
+
+    /// Wrap a `pushdownRequest` body with the fixed `EVENTS` `involvedTables` block
+    /// (mirrors `dispatch_golden::events_request`).
+    fn guard_events_request(pushdown_req: Json) -> Json {
+        serde_json::json!({
+            "involvedTables": [{
+                "name": "EVENTS",
+                "columns": [
+                    {"name": "REGION", "dataType": {"type": "varchar", "size": 2000000}},
+                    {"name": "NAME", "dataType": {"type": "varchar", "size": 2000000}},
+                    {"name": "AMOUNT", "dataType": {"type": "decimal", "precision": 18, "scale": 2}},
+                    {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                ],
+            }],
+            "pushdownRequest": pushdown_req,
+        })
+    }
+
+    /// Drive `build_dispatch_sql` — the real dispatcher, exactly as `dispatch_golden`
+    /// exercises it — for `request`/`proj_cols`/`proj_types`, returning the `sql`
+    /// field of its pushdown response. `has_order_by` is always `true`: every guard
+    /// test pushes an ORDER BY.
+    #[allow(clippy::too_many_arguments)]
+    fn guard_dispatch_sql(
+        request: &Json,
+        proj_cols: Vec<ProjectionItem>,
+        proj_types: Vec<String>,
+        limit: Option<u64>,
+        logical_schema: Vec<LogicalField>,
+    ) -> String {
+        let pushdown_req = pd(request);
+        let result = build_dispatch_sql(
+            request,
+            &pushdown_req,
+            proj_cols,
+            proj_types,
+            guard_col_types(),
+            None,
+            limit,
+            true,
+            &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+            "s3://warehouse/db/events".to_string(),
+            logical_schema,
+            Vec::new(),
+            &sample_storage(),
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            4,
+            8192,
+            2,
+            0.6,
+            200,
+            8,
+        )
+        .expect("build_dispatch_sql must succeed for this declined-ORDER-BY fixture");
+        result["sql"]
+            .as_str()
+            .expect("pushdown response must carry a sql field")
+            .to_string()
+    }
+
+    /// Scenario (pushdown-planning-capability-extensions, issues #225 / #189): a
+    /// literal-only select list (`SELECT 1 FROM EVENTS`) with an `ORDER BY` on a column
+    /// the derived projection does not emit (`NAME`) APPENDS that sort key to the scan
+    /// as a HIDDEN column, and the wrapper names only the visible item explicitly.
+    ///
+    /// This replaces the former full-base-row widening (issue #190), which forced the
+    /// scan's emitted set and the query's visible set equal and therefore returned all
+    /// four base columns where Exasol positionally expects the derived projection's one
+    /// — `sqlCode 04000 "Expected number of columns is 1 but pushdown query has N"`
+    /// (#225). The `REGION` / `AMOUNT` / `"ID"` absence assertions are what pin that.
+    ///
+    /// `logical_schema` is deliberately EMPTY so `detect_topn` declines regardless of
+    /// the projection (it requires a logical-schema entry per sort key), isolating the
+    /// extension + wrapper shape from the top-N-match decision. That also makes this
+    /// test order-blind by construction — the extend-after-`detect_topn` invariant is
+    /// pinned separately by `declined_order_by_extension_runs_after_topn_detection`.
+    #[test]
+    fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME"},
+                "isAscending": true,
+                "nullsLast": true
+            }],
+            "limit": {"numElements": 10}
+        }));
+        let proj_cols = vec![ProjectionItem::Expr {
+            expr: "1".to_string(),
+        }];
+        let proj_types = vec!["DECIMAL(1,0)".to_string()];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(10), Vec::new());
+
+        // The scan spec APPENDS the sort key AFTER the original expression item, so the
+        // per-shard scan actually emits the column the outer ORDER BY binds against.
+        assert!(
+            sql.contains(r#""projection":[{"expr":"1"},"NAME"]"#),
+            "sort key NAME must be APPENDED to the derived projection: {sql}"
+        );
+        assert!(
+            sql.contains(r#"EMITS ("_LH_PROJ_0" DECIMAL(1,0), "NAME" VARCHAR(2000000))"#),
+            "EMITS must carry the visible expression column plus the hidden sort key: {sql}"
+        );
+        // One visible column, matching the one-item derived projection: the wrapper's
+        // list is joined immediately ahead of ` FROM (`, so this pins the exact arity.
+        assert!(
+            sql.contains(r#"SELECT "_LH_PROJ_0" FROM ("#),
+            "the wrapper must name ONLY the visible projection item: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ORDER BY "NAME""#),
+            "the wrapper's outer ORDER BY must bind the hidden sort key: {sql}"
+        );
+        assert!(
+            !sql.contains("REGION") && !sql.contains("AMOUNT") && !sql.contains("\"ID\""),
+            "the projection must NOT widen to the full base row: {sql}"
+        );
+    }
+
+    /// Scenario (pushdown-planning-capability-extensions, issues #225 / #189), the
+    /// bare-column shape: `SELECT name FROM EVENTS ORDER BY id` — one bare-projected
+    /// column, an `ORDER BY` on a DIFFERENT unprojected column, no `LIMIT`.
+    ///
+    /// The scan's emitted set and the query's visible set are two different sets:
+    /// `"ID"` is EMITTED (so the outer `ORDER BY` can bind it) yet absent from the
+    /// visible select list, so the returned arity stays 1 — what Exasol validates
+    /// positionally. `SELECT *` would return 2 and be rejected with `04000`.
+    ///
+    /// The absent `LIMIT` is what makes `detect_topn` decline here (a top-N needs a
+    /// bound), so no `logical_schema` entry is required.
+    #[test]
+    fn declined_order_by_wrapper_selects_only_original_select_list() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "ID"},
+                "isAscending": true,
+                "nullsLast": true
+            }]
+        }));
+        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+        let proj_types = vec!["VARCHAR(2000000)".to_string()];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, None, Vec::new());
+
+        assert!(
+            sql.contains(r#"SELECT "NAME" FROM ("#),
+            "the wrapper must name exactly the one derived projection item: {sql}"
+        );
+        assert!(
+            emits_clause(&sql).contains("\"ID\""),
+            "the scan must EMIT the hidden sort key: {}",
+            emits_clause(&sql)
+        );
+        assert!(
+            !outer_select_list(&sql).contains("\"ID\""),
+            "the hidden sort key must NOT be visible in the outer select list: {}",
+            outer_select_list(&sql)
+        );
+        assert!(
+            sql.contains(r#"ORDER BY "ID""#),
+            "the wrapper's outer ORDER BY must bind the hidden sort key: {sql}"
+        );
+        assert!(
+            !sql.contains("SELECT *"),
+            "the wrapper must never fall back to SELECT * over the wider emitted row: {sql}"
+        );
+    }
+
+    /// Scenario (pushdown-planning-capability-extensions): hidden sort-key columns are
+    /// appended AT MOST ONCE. `ORDER BY name, id, name, id` over a projection that
+    /// already bare-projects `NAME` exercises BOTH dedupe paths in one fixture:
+    /// `NAME` is already emitted so it is never appended, and `ID` — named by two
+    /// sort keys — is appended exactly ONCE, because the membership test re-scans
+    /// `proj_cols` as it grows. A repeated EMITS identifier is a duplicate-column
+    /// error, so "not twice" is the assertion that matters.
+    #[test]
+    fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
+        let sort_key = |name: &str| {
+            serde_json::json!({
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": name},
+                "isAscending": true,
+                "nullsLast": true
+            })
+        };
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+            "orderBy": [
+                sort_key("NAME"),
+                sort_key("ID"),
+                sort_key("NAME"),
+                sort_key("ID"),
+            ]
+        }));
+        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+        let proj_types = vec!["VARCHAR(2000000)".to_string()];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, None, Vec::new());
+
+        assert!(
+            sql.contains(r#""projection":["NAME","ID"]"#),
+            "the already-projected NAME must not be re-appended and ID must be \
+             appended once: {sql}"
+        );
+        let emits = emits_clause(&sql);
+        assert_eq!(
+            emits.matches("\"NAME\"").count(),
+            1,
+            "the already-visible NAME must appear in EMITS exactly once: {emits}"
+        );
+        assert_eq!(
+            emits.matches("\"ID\"").count(),
+            1,
+            "a column named by two sort keys must be appended exactly once: {emits}"
+        );
+        assert_eq!(
+            outer_select_list(&sql),
+            "\"NAME\"",
+            "the extension must not change the VISIBLE column count: {sql}"
+        );
+    }
+
+    /// Companion scenario: when every pushed sort key IS already a bare-projected
+    /// column the extension is INERT — nothing appended, nothing widened — and the
+    /// legitimately matched bounded top-N still forms exactly as before.
+    ///
+    /// The matched path never reaches the declined-wrapper code at all: it renders
+    /// `proj_cols` directly as the FINAL visible EMITS with no wrapping
+    /// `SELECT … FROM (`, and carries the sort keys plus the limit into the per-shard
+    /// common blob. That is precisely why the extension must not run ahead of
+    /// `detect_topn` — a hidden column would leak straight into this path's result.
+    #[test]
+    fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME"},
+                "isAscending": true,
+                "nullsLast": true
+            }],
+            "limit": {"numElements": 5}
+        }));
+        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+        let proj_types = vec!["VARCHAR(2000000)".to_string()];
+        let logical_schema = vec![LogicalField {
+            field_id: 2,
+            name: "NAME".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+        }];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(5), logical_schema);
+
+        assert!(
+            sql.contains(r#""projection":["NAME"]"#),
+            "an already-projected sort key must leave the projection untouched: {sql}"
+        );
+        assert!(
+            !sql.contains("REGION") && !sql.contains("AMOUNT") && !sql.contains("\"ID\""),
+            "nothing must be appended or widened when the sort key is projected: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ORDER BY "NAME""#) && sql.contains("LIMIT 5"),
+            "a matched top-N must still form (sort key projected, native type): {sql}"
+        );
+        // The fan-out IS the outermost query: no declined-path wrapper around it.
+        assert!(
+            sql.starts_with("SELECT LAKEHOUSE_SCAN(") && !sql.contains(" FROM ("),
+            "a matched top-N must not be wrapped in an outer SELECT … FROM (: {sql}"
+        );
+        // Only the matched path pushes the bounded sort and the limit per shard.
+        let common = common_arg_literal(&sql);
+        assert!(
+            common.contains(r#""order_by":[{"column":"NAME","ascending":true,"nulls_last":true}]"#)
+                && common.contains(r#""limit":5"#),
+            "a matched top-N must carry the per-shard sort keys and limit: {common}"
+        );
+    }
+
+    /// The projection extension runs strictly AFTER `detect_topn` (decision [2]) — the
+    /// plan's most load-bearing ordering invariant, and one that is SILENT when
+    /// violated (a mis-ordered implementation reintroduces `04000` with a green suite).
+    ///
+    /// The fixture deliberately gives `detect_topn` everything it needs to MATCH
+    /// except a projected sort key: exactly one involved table, `ORDER BY "NAME"` ASC
+    /// NULLS LAST, a `LIMIT 5`, and a POPULATED `logical_schema` typing `NAME` as
+    /// `utf8` (not a JSON-fallback type). Only the CALL ORDER decides the outcome:
+    ///
+    /// - Correct order: `detect_topn` sees the pre-extension `[Expr("1")]`, finds
+    ///   `NAME` unprojected and declines; the declined path then appends `NAME` as a
+    ///   hidden column and renders the wrapper. Nothing per-shard.
+    /// - Extension first: `proj_cols` would already be `[Expr("1"), Column("NAME")]`,
+    ///   so every remaining `detect_topn` guard passes, the bounded top-N MATCHES,
+    ///   `"order_by"` and `"limit":5` land in the common blob, and NO wrapper is
+    ///   rendered — failing all three assertions below. That path emits `proj_cols` as
+    ///   the FINAL visible EMITS, so the hidden `NAME` would leak into the result too.
+    ///
+    /// A `detect_topn`-only assertion over the pre-extension projection cannot pin
+    /// this: it holds whatever the call order (see `topn.rs`'s
+    /// `unsupported_order_by_shape_declines_topn`). Nor can the sibling tests above —
+    /// they force the decline via an empty `logical_schema` or an absent `LIMIT`, both
+    /// order-blind.
+    #[test]
+    fn declined_order_by_extension_runs_after_topn_detection() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 1, "scale": 0}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME"},
+                "isAscending": true,
+                "nullsLast": true
+            }],
+            "limit": {"numElements": 5}
+        }));
+        let proj_cols = vec![ProjectionItem::Expr {
+            expr: "1".to_string(),
+        }];
+        let proj_types = vec!["DECIMAL(1,0)".to_string()];
+        // NAME as `utf8`: a native, non-JSON-fallback type, so the JSON-fallback guard
+        // would NOT be what declines the top-N had the extension already run.
+        let logical_schema = vec![LogicalField {
+            field_id: 2,
+            name: "NAME".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+        }];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(5), logical_schema);
+
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\""),
+            "the top-N must have DECLINED, so no per-shard limit may reach the common \
+             blob — the extension ran before detect_topn: {common}"
+        );
+        assert!(
+            !common.contains("order_by"),
+            "the top-N must have DECLINED, so no per-shard sort keys may reach the \
+             common blob — the extension ran before detect_topn: {common}"
+        );
+        assert!(
+            sql.contains(r#"SELECT "_LH_PROJ_0" FROM ("#),
+            "the declined path must render the hidden-column wrapper; a matched top-N \
+             renders none — the extension ran before detect_topn: {sql}"
+        );
+    }
+
+    /// The empty-parsed-keys guard: an `orderBy` array whose every element
+    /// `parse_sort_key_element` REJECTS makes `order_by_present` true (it only checks
+    /// array non-emptiness) while `parse_order_by_keys` yields ZERO keys. Both rejected
+    /// element kinds are exercised — a `function_scalar` expression sort key, and a
+    /// bare `column` node missing its `nullsLast` flag.
+    ///
+    /// `wrap_declined_order_by` must return the SQL UNCHANGED for that shape. Since
+    /// `render_order_by_clause(&[])` yields an empty string, a dropped guard would emit
+    /// a wrapper ending in an invalid bare `ORDER BY ` — a syntax error, which no arity
+    /// assertion elsewhere would catch. The pushed `LIMIT` stays withheld as well: the
+    /// adapter never renders a bare limit ahead of an ordering it did not itself render
+    /// (anti-wrong-truncation invariant, decision [4]).
+    #[test]
+    fn declined_order_by_unparseable_sort_key_emits_no_wrapper() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+            "orderBy": [
+                {
+                    "type": "order_by_element",
+                    "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
+                        {"type": "column", "name": "AMOUNT"}
+                    ]},
+                    "isAscending": true,
+                    "nullsLast": true
+                },
+                {
+                    "type": "order_by_element",
+                    "expression": {"type": "column", "name": "ID"},
+                    "isAscending": true
+                },
+            ],
+            "limit": {"numElements": 7}
+        }));
+        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+        let proj_types = vec!["VARCHAR(2000000)".to_string()];
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(7), Vec::new());
+
+        assert!(
+            !sql.contains("ORDER BY"),
+            "zero parsed sort keys must emit no ORDER BY at all, least of all a bare \
+             one: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT LAKEHOUSE_SCAN(") && !sql.contains(" FROM ("),
+            "zero parsed sort keys must leave the fan-out unwrapped: {sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT"),
+            "the limit stays withheld for an ordering the adapter did not render: {sql}"
         );
     }
 }

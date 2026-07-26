@@ -435,6 +435,191 @@ fn e2e_selectlist_expression_pushdown() {
     }
 }
 
+/// Regression for issue #190: a projected constant/literal select-list item
+/// must push down without collapsing to the full base-table row. Runs three
+/// literal-projection shapes over the full 20-row EVENTS table (no WHERE)
+/// and asserts both the emitted column arity and the constant value in every
+/// literal position — including BOTH positions of a duplicated literal,
+/// which pre-fix collapsed to arity 2 (value-based dedup) or failed with a
+/// column-count error (full-row fallback).
+#[test]
+fn e2e_selectlist_literal_projection_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+
+    // `SELECT 1 FROM <t>`: single literal column, all 20 rows, every value 1.
+    {
+        let sql = format!("SELECT 1 FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(cols.len(), 1, "expected 1 column (bare literal): {cols:?}");
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, v) in cols[0].iter().enumerate() {
+            let n = parse_numeric(v);
+            assert!(
+                (n - 1.0).abs() < f64::EPSILON,
+                "row {i}: literal column must be 1, got {n}"
+            );
+        }
+    }
+
+    // `SELECT 1, name FROM <t>`: literal + real column, arity 2.
+    {
+        let sql = format!("SELECT 1, name FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (literal, name): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        assert_eq!(cols[1].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, v) in cols[0].iter().enumerate() {
+            let n = parse_numeric(v);
+            assert!(
+                (n - 1.0).abs() < f64::EPSILON,
+                "row {i}: literal column must be 1, got {n}"
+            );
+        }
+        for (i, v) in cols[1].iter().enumerate() {
+            let name = v
+                .as_str()
+                .unwrap_or_else(|| panic!("row {i}: name is not a string: {v:?}"));
+            assert!(
+                name.to_lowercase().starts_with("event"),
+                "row {i}: name must start with \"event\", got {name}"
+            );
+        }
+    }
+
+    // `SELECT 1, name, 1 FROM <t>`: duplicated literal — the arity-3 regression
+    // case for issue #190. Both literal positions (0 and 2) must independently
+    // carry the constant 1; a pre-fix value-based dedup would have collapsed
+    // this to arity 2, and the full-row fallback would have errored on arity.
+    {
+        let sql = format!("SELECT 1, name, 1 FROM {table}");
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            3,
+            "expected 3 columns (literal, name, literal): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 20, "expected 20 rows: {cols:?}");
+        assert_eq!(cols[2].len(), 20, "expected 20 rows: {cols:?}");
+        for (i, (a, b)) in cols[0].iter().zip(cols[2].iter()).enumerate() {
+            let a = parse_numeric(a);
+            let b = parse_numeric(b);
+            assert!(
+                (a - 1.0).abs() < f64::EPSILON,
+                "row {i}: column 0 (first duplicated literal) must be 1, got {a}"
+            );
+            assert!(
+                (b - 1.0).abs() < f64::EPSILON,
+                "row {i}: column 2 (second duplicated literal) must be 1, got {b}"
+            );
+        }
+    }
+}
+
+/// Regression for issue #205: `COUNT(*)` over a `LIMIT`-bearing derived table
+/// must not fail with a pushdown column-count mismatch. Exasol represents its
+/// "select any one column" contract for the inner derived-table request as a
+/// single-element `literal_null` select list once a LIMIT barrier separates
+/// the outer aggregate from the derived table — the same literal-select-list
+/// code path #190 fixed (`is_literal_selectlist_item` in
+/// `crates/lakehouse-engine/src/adapter/pushdown/support.rs`), so this guards
+/// that fix against a regression on the LIMIT-barrier trigger surface.
+#[test]
+fn e2e_count_star_over_limited_subselect_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+
+    // Primary shape: single projected column behind the LIMIT barrier.
+    let primary_sql = format!("SELECT COUNT(*) FROM (SELECT id FROM {table} LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&primary_sql),
+        5,
+        "COUNT(*) over a single-column LIMITed derived table must be 5: {primary_sql}"
+    );
+
+    // Two-column subselect variant.
+    let two_col_sql = format!("SELECT COUNT(*) FROM (SELECT id, name FROM {table} LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&two_col_sql),
+        5,
+        "COUNT(*) over a two-column LIMITed derived table must be 5: {two_col_sql}"
+    );
+
+    // WHERE + LIMIT variant.
+    let where_limit_sql =
+        format!("SELECT COUNT(*) FROM (SELECT id FROM {table} WHERE id <= 10 LIMIT 5)");
+    assert_eq!(
+        conn.query_scalar_i64(&where_limit_sql),
+        5,
+        "COUNT(*) over a WHERE+LIMITed derived table must be 5: {where_limit_sql}"
+    );
+
+    // Guard the pushdown shape itself, not only the numeric result: the inner
+    // derived-table scan for the primary shape must push a positional literal
+    // projection (an `{"expr":...}` scan-spec item), not the full-base-row
+    // fallback (which would emit every base column as a bare-string `Column`
+    // entry and yield the #205 column-count mismatch).
+    // `explain_virtual_sql` flattens EXPLAIN's result cells by joining them
+    // with a single space, so JSON tokens can end up split across a cell
+    // boundary — an exact-substring match on adjacent `"projection":[{"expr":`
+    // would be flaky. Instead check that an `"expr"` key occurs anywhere after
+    // the `"projection"` key, which still distinguishes a positional literal
+    // projection from the full-base-row fallback (bare `Column` string
+    // entries, no `"expr"` key at all).
+    let pushed_sql = explain_virtual_sql(&mut conn, &primary_sql);
+    let projection_idx = pushed_sql.find(r#""projection""#);
+    let has_expr_after_projection = projection_idx
+        .and_then(|idx| pushed_sql[idx..].find(r#""expr""#))
+        .is_some();
+    assert!(
+        has_expr_after_projection,
+        "{primary_sql}'s inner derived-table scan must push a positional \
+         literal projection (an '\"expr\"' key after 'projection'), \
+         not the full-base-row fallback (#205), got:\n{pushed_sql}"
+    );
+}
+
+/// Regression for issue #190: a query whose predicate prunes every Iceberg
+/// data file (`id > 1000` against a max seeded id of 20) must still accept a
+/// select list of repeated literals plus a real column. This exercises the
+/// `empty_pushdown_sql` path with positional-unique synthetic EMITS aliases
+/// for the two `1` literals — proving Exasol accepts the zero-row shape
+/// rather than rejecting it on a duplicate-alias or arity error.
+#[test]
+fn e2e_all_files_pruned_literal_projection_empty_shape() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT 1, name, 1 FROM {} WHERE id > 1000", vs_table());
+    // `execute` panics if Exasol rejects the pushdown (a duplicate EMITS alias
+    // or a column-count mismatch), so reaching the assertions already proves
+    // Exasol accepted the empty-pushdown shape. Assert on the resultSet
+    // METADATA, not `query_columns`: that helper returns an empty vec for any
+    // zero-row result, so it cannot observe the column count of zero rows.
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let num_columns = result_set["numColumns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numColumns in resultSet: {resp}"));
+    assert_eq!(
+        num_columns, 3,
+        "expected 3 columns (literal, name, literal) even with all files pruned: {resp}"
+    );
+    let num_rows = result_set["numRows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numRows in resultSet: {resp}"));
+    assert_eq!(
+        num_rows, 0,
+        "all-files-pruned predicate must return zero rows: {resp}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8.7  HAVING clause pushdown
 // ---------------------------------------------------------------------------
@@ -806,7 +991,13 @@ fn e2e_time_between_matches_exasol() {
     let anchor = "TIMESTAMP '2024-01-01 02:30:00'";
 
     let hours_sql = format!("SELECT HOURS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &hours_sql, "date_part('epoch'");
+    // The projected expression now lands in the scan spec's JSON `projection`
+    // field, which is embedded as the single-quoted `LAKEHOUSE_SCAN('…')`
+    // argument, so its single quotes are doubled by SQL-string escaping
+    // (`date_part('epoch'` → `date_part(''epoch''`). Before the positional
+    // EMITS-naming change (#190) the expression also appeared verbatim as the
+    // EMITS identifier; it no longer does — the EMITS name is now `_LH_PROJ_0`.
+    assert_select_pushed_down(&mut conn, &hours_sql, "date_part(''epoch''");
     let hours = parse_numeric(&conn.query_columns(&hours_sql)[0][0]);
     assert!(
         (hours - 2.5).abs() < 1e-9,
@@ -814,7 +1005,7 @@ fn e2e_time_between_matches_exasol() {
     );
 
     let minutes_sql = format!("SELECT MINUTES_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &minutes_sql, "date_part('epoch'");
+    assert_select_pushed_down(&mut conn, &minutes_sql, "date_part(''epoch''");
     let minutes = parse_numeric(&conn.query_columns(&minutes_sql)[0][0]);
     assert!(
         (minutes - 150.0).abs() < 1e-9,
@@ -822,7 +1013,7 @@ fn e2e_time_between_matches_exasol() {
     );
 
     let seconds_sql = format!("SELECT SECONDS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    assert_select_pushed_down(&mut conn, &seconds_sql, "date_part('epoch'");
+    assert_select_pushed_down(&mut conn, &seconds_sql, "date_part(''epoch''");
     let seconds = parse_numeric(&conn.query_columns(&seconds_sql)[0][0]);
     assert!(
         (seconds - 9000.0).abs() < 1e-9,
@@ -907,6 +1098,155 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
         assert_eq!(
             case_val, "low",
             "row {i}: CASE WHEN id > 10 THEN 'high' ELSE 'low' END must be 'low' for id<=3, got {case_val}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 8.12  ORDER BY on a column outside the select list (#225)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #225: `ORDER BY <col>` must push down correctly even
+/// when `<col>` is not itself a projected select-list item.
+///
+/// Pre-fix, the adapter widened the projection to the FULL base row whenever a
+/// pushed sort key was not a bare projected column, so the returned pushdown
+/// query's column count no longer matched the (unwidened) select list —
+/// Exasol rejects that positionally with `sqlCode 04000 "Expected number of
+/// columns is N but pushdown query has M"`. Post-fix, the sort key is appended
+/// as a HIDDEN extra scan/EMITS column and the declined-ORDER-BY wrapper
+/// selects only the ORIGINAL select-list items, so the returned arity always
+/// matches.
+///
+/// Case 1 is issue #225's own literal repro: `id` drives the ORDER BY but is
+/// not selected at all. Case 2 proves the hidden sort column actually DRIVES
+/// the ordering (not just that the query no longer errors) by sorting
+/// DESCENDING on `id` while selecting only `name`, and checking the returned
+/// row order.
+///
+/// Seed: id 1..20, score = 5.0 * id, name = "event-NN" (`common/seed.rs`).
+#[test]
+fn e2e_order_by_unprojected_column_bare_projection() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Case 1: #225's literal repro.
+    let sql = format!("SELECT score FROM {} WHERE id = 1 ORDER BY id", vs_table());
+
+    // Task 3.3: the pushed scan spec must carry the hidden sort key `ID` as an
+    // extra projection column, and the row-scan fan-out must NOT have widened
+    // to a full-base-row `SELECT * FROM (...)`. Scoped to the adapter's OWN
+    // emitted `"projection":[...]` scan-spec JSON array, not the whole SQL
+    // string (the EVENTS Iceberg schema's field names are lowercase, so an
+    // uppercase whole-string check like `!contains("EVENT_DATE")` would pass
+    // by casing accident rather than by actually proving the projection is
+    // narrow).
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("\"projection\":[\"SCORE\",\"ID\"]"),
+        "the scan spec's projection must carry the hidden sort key ID \
+         appended after the visible SCORE column, got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("SELECT * FROM ("),
+        "the row-scan fan-out must not widen to a full-base-row SELECT * \
+         (the #225 bug: 04000 arity mismatch), got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected exactly 1 column (score): {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row (id=1): {cols:?}");
+    let score = parse_numeric(&cols[0][0]);
+    assert!(
+        (score - 5.0).abs() < 0.001,
+        "id=1 must have score=5.0 (5.0*1), got {score}"
+    );
+
+    // Case 2: prove the hidden sort column actually drives the ordering (and
+    // is dropped from the visible result) by sorting DESCENDING on `id` while
+    // selecting only `name`.
+    let sql_desc = format!(
+        "SELECT name FROM {} WHERE id <= 5 ORDER BY id DESC",
+        vs_table()
+    );
+    let cols_desc = conn.query_columns(&sql_desc);
+    assert_eq!(
+        cols_desc.len(),
+        1,
+        "expected exactly 1 column (name): {cols_desc:?}"
+    );
+    assert_eq!(
+        cols_desc[0].len(),
+        5,
+        "expected exactly 5 rows (id 1..5): {cols_desc:?}"
+    );
+
+    let expected_names_desc = ["event-05", "event-04", "event-03", "event-02", "event-01"];
+    for (i, expected) in expected_names_desc.iter().enumerate() {
+        let n = cols_desc[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("name at row {i} is not a string: {:?}", cols_desc[0][i]));
+        assert_eq!(
+            n, *expected,
+            "row {i}: ORDER BY id DESC over ids 1..5 must yield name {expected}, got {n}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.13  ORDER BY on a column referenced only inside a projected expression (#225)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #225's OTHER repro shape: the ORDER BY sort key is
+/// referenced only INSIDE a computed select-list expression, never bare
+/// projected — exercising the fix via a `ProjectionItem::Expr` instead of a
+/// bare `ProjectionItem::Column`.
+///
+/// `id || '-' || name` pushes down as ONE `Expr` select-list item
+/// (`FN_CONCAT` is advertised, `adapter/capabilities.rs:87`, and the
+/// translator renders it as DataFusion `concat(...)`,
+/// `vs-expression/src/lib.rs:632`), so `id` never appears as a bare projected
+/// column even though it also drives the ORDER BY.
+///
+/// Pre-check (done live against the `typed_distinct_probe` seed table via
+/// `scripts/capture-pushdown-payload.sh` before writing this test): concat of
+/// an Int64 column (`ID`) with a VARCHAR literal executes correctly end to
+/// end (`"1-aa"`, `"2-AA"`, `"3-"` for `ID || '-' || C_VARCHAR`) — DataFusion
+/// 54.1's `concat()` coerces the non-string argument cleanly, unlike the
+/// LIKE-pushdown type-coercion bug fixed in `a6e829e`. No `CAST(id AS
+/// VARCHAR)` fallback is needed; the literal `||` repro is used as specified.
+///
+/// Seed: id 1..20, name = "event-NN" (`common/seed.rs`).
+#[test]
+fn e2e_order_by_column_referenced_only_in_projected_expression() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id || '-' || name FROM {} WHERE id <= 3 ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        1,
+        "expected exactly 1 column (id || '-' || name): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        3,
+        "expected exactly 3 rows (id 1..3): {cols:?}"
+    );
+
+    let expected = ["1-event-01", "2-event-02", "3-event-03"];
+    for (i, want) in expected.iter().enumerate() {
+        let v = cols[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("row {i} is not a string: {:?}", cols[0][i]));
+        assert_eq!(
+            v, *want,
+            "row {i}: id || '-' || name must be {want}, got {v}"
         );
     }
 }
@@ -1020,6 +1360,57 @@ fn e2e_decimal_cast_trims_trailing_zeros() {
             "row {i}: CAST(c_decimal_a AS VARCHAR(20)) must be {exp:?}, got {s:?} \
              (pre-fix code returned the untrimmed fixed-scale string, e.g. \"10.50\")"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.15  Issue #189 cross-verification (same root cause as #225)
+// ---------------------------------------------------------------------------
+
+/// Issue #189 ("ORDER BY on a non-projected column generates invalid pushdown
+/// (column not found)") reported the shape-equivalent live repro
+/// `SELECT c_acctbal FROM CUSTOMER WHERE c_custkey <= 5 ORDER BY c_custkey`
+/// against a remote Databricks-backed TPC-H `CUSTOMER` table — not reproducible
+/// on this local stack, which has no `CUSTOMER`/`c_acctbal` table. This test
+/// verifies the SAME root-cause shape against the locally seeded `dim_customer`
+/// table instead: a projected column (`c_name`) with an `ORDER BY` on a
+/// DIFFERENT, unprojected column (`c_custkey`).
+///
+/// Seed: `dim_customer` has 5 rows, `c_custkey` 1..=5, `c_name` =
+/// "customer-01".."customer-05" (`common/seed.rs::make_customer_batch`).
+#[test]
+fn e2e_issue_189_shape_equivalent_local_verification() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT c_name FROM {} WHERE c_custkey <= 5 ORDER BY c_custkey",
+        vs_dim_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        1,
+        "expected exactly 1 column (c_name): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "expected exactly 5 rows (custkey 1..=5): {cols:?}"
+    );
+
+    let expected = [
+        "customer-01",
+        "customer-02",
+        "customer-03",
+        "customer-04",
+        "customer-05",
+    ];
+    for (i, want) in expected.iter().enumerate() {
+        let v = cols[0][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("row {i} is not a string: {:?}", cols[0][i]));
+        assert_eq!(v, *want, "row {i}: c_name must be {want}, got {v}");
     }
 }
 

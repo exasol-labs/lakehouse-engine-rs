@@ -64,6 +64,44 @@ fn is_empty_opt(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
+/// Whether a VS expression node type always yields a boolean result —
+/// literal booleans and the predicate family. Used to detect a boolean
+/// operand being converted to string (CAST or CONCAT/`||`) so the rendering
+/// can substitute Exasol's TRUE/FALSE casing instead of leaking DataFusion's
+/// lowercase boolean->Utf8 cast (#200).
+fn is_boolean_producing(kind: &str) -> bool {
+    matches!(
+        kind,
+        "literal_bool"
+            | "predicate_equal"
+            | "predicate_notequal"
+            | "predicate_less"
+            | "predicate_lessequal"
+            | "predicate_greater"
+            | "predicate_greaterequal"
+            | "predicate_and"
+            | "predicate_or"
+            | "predicate_not"
+            | "predicate_is_null"
+            | "predicate_is_not_null"
+            | "predicate_in_constlist"
+            | "predicate_between"
+            | "predicate_like"
+            | "predicate_like_regexp"
+    )
+}
+
+/// Render a boolean SQL fragment as an Exasol-cased, NULL-preserving string.
+///
+/// Exasol renders BOOLEAN as `TRUE`/`FALSE`; DataFusion's boolean->Utf8 cast
+/// kernel renders lowercase `true`/`false`. The simple-CASE form evaluates
+/// `bool_expr` once and falls through to `ELSE NULL` when it is NULL, so a
+/// NULL boolean converts to NULL rather than the string `'NULL'` or a
+/// coerced `'FALSE'` (#200).
+fn render_bool_to_string_case(bool_expr: &str) -> String {
+    format!("(CASE {bool_expr} WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)")
+}
+
 fn quote_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
@@ -238,6 +276,25 @@ fn render_cast(
         .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let target_type = render_cast_target(data_type, dialect)?;
+
+    // A boolean source cast to a string type must render Exasol's TRUE/FALSE
+    // casing, not DataFusion's lowercase boolean->Utf8 cast kernel (#200).
+    let target_is_string = matches!(
+        data_type
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(str::to_uppercase)
+            .as_deref(),
+        Some("VARCHAR") | Some("CHAR")
+    );
+    let source_is_boolean = args[0]
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(is_boolean_producing);
+    if target_is_string && source_is_boolean {
+        return Ok(Some(render_bool_to_string_case(&inner)));
+    }
+
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
@@ -695,7 +752,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
-                // MOD → (<l> % <r>) — DataFusion 54 exposes modulo only as the % operator
+                // MOD: DataFusion 54 exposes modulo only as the % operator, but
+                // Exasol's own parser rejects %  — it requires the MOD(a, b) form.
                 "MOD" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar MOD missing 'arguments'".into())
@@ -710,7 +768,43 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("MOD left operand is null".into()))?;
                     let right = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
-                    Ok(Some(format!("({left} % {right})")))
+                    Ok(Some(match dialect {
+                        Dialect::Exasol => format!("MOD({left}, {right})"),
+                        Dialect::DataFusion => format!("({left} % {right})"),
+                    }))
+                }
+                // CONCAT → the wire encoding of Exasol's `||` operator, so it
+                // is rendered as chained `||`, not DataFusion's concat()
+                // function: concat() silently ignores NULL arguments
+                // (`concat(NULL, 'x')` = `'x'`), while both Exasol's `||` and
+                // DataFusion's `||` operator propagate NULL (`NULL || 'x'` =
+                // `NULL`) — using concat() would drop the NULL-preservation
+                // this rewrite depends on. A boolean operand is rewritten to
+                // the Exasol-cased form before joining, since DataFusion's
+                // boolean->Utf8 cast (which `||` falls back to for a raw
+                // boolean operand) renders lowercase `true`/`false` (#200).
+                "CONCAT" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar CONCAT missing 'arguments'".into())
+                    })?;
+                    let rendered = args
+                        .iter()
+                        .map(|arg| {
+                            let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
+                                UdfError::User("CONCAT argument rendered to null".into())
+                            })?;
+                            let is_bool = arg
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(is_boolean_producing);
+                            Ok(if is_bool {
+                                render_bool_to_string_case(&r)
+                            } else {
+                                r
+                            })
+                        })
+                        .collect::<Result<Vec<String>, UdfError>>()?;
+                    Ok(Some(format!("({})", rendered.join(" || "))))
                 }
                 // String functions, Exasol dialect: rendered VERBATIM — original
                 // name, original argument order and count — because this SQL is
@@ -723,7 +817,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 // there is no name or arity translation to get wrong. Only the
                 // DataFusion dialect below needs the name-mapping table (DataFusion
                 // has no function of these exact names, or arities, as Exasol).
-                "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
+                // CONCAT is excluded here — it's rendered by the dedicated arm
+                // above (chained `||`) regardless of dialect.
+                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
                 | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
                 | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
                 | "UNICODE" | "UNICODECHR" | "INSTR" | "LOCATE"
@@ -736,7 +832,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     Ok(Some(format!("{fn_name}({})", rendered.join(", "))))
                 }
                 // String functions: name-mapping table (DataFusion dialect)
-                "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
+                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
                 | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
                 | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
                 | "UNICODE" | "UNICODECHR" => {
@@ -1729,6 +1825,49 @@ mod tests {
     }
 
     #[test]
+    fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
+        // #200: CAST(<bool> AS VARCHAR) must render Exasol's TRUE/FALSE
+        // casing, not DataFusion's lowercase boolean->Utf8 cast.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{
+                "type": "predicate_greater",
+                "left": {"type": "column", "name": "c_acctbal"},
+                "right": {"type": "literal_exactnumeric", "value": 0}
+            }],
+            "dataType": {"type": "VARCHAR", "size": 10}
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+        );
+    }
+
+    #[test]
+    fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
+        // A boolean-producing predicate other than a comparison (here
+        // `predicate_is_null`) is detected the same way, confirming the CASE
+        // rewrite isn't special-cased to `predicate_greater` alone. Runtime
+        // NULL-preservation itself (a NULL comparison falling through the
+        // CASE's `ELSE NULL`, never 'NULL' or a coerced 'FALSE') is exercised
+        // end-to-end in `boolean_to_string_casing_test.rs`.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{
+                "type": "predicate_is_null",
+                "expression": {"type": "column", "name": "x"}
+            }],
+            "dataType": {"type": "VARCHAR", "size": 10}
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE ("X" IS NULL) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+        );
+    }
+
+    #[test]
     fn renders_cast_boolean() {
         let expr = json!({
             "type": "function_scalar_cast",
@@ -2077,7 +2216,7 @@ mod tests {
         assert!(render_expression_safe(&expr).is_none());
     }
 
-    // --- MOD → % operator ---
+    // --- MOD → % operator (DataFusion) / MOD(...) (Exasol) ---
 
     #[test]
     fn renders_mod_as_operator() {
@@ -2092,13 +2231,30 @@ mod tests {
         assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
     }
 
+    #[test]
+    fn renders_mod_as_function_call_in_exasol_dialect() {
+        // https://github.com/exasol-labs/lakehouse-engine-rs/issues/197
+        // Exasol's parser rejects `%` — an Exasol-side wrapper (e.g. the
+        // COUNT(DISTINCT ...) outer wrapper) must render MOD(a, b) instead.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "MOD",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(render_expression_exasol(&expr).unwrap(), r#"MOD("A", 3)"#);
+        // DataFusion-dialect rendering of the same node must stay unchanged.
+        assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
+    }
+
     // --- String scalar functions (CONCAT/LENGTH→character_length/INSTR+LOCATE→strpos/...) ---
 
     #[test]
     fn renders_string_scalar_functions() {
         // Pass-through lowercased
         let cases_lower = [
-            "CONCAT",
             "LOWER",
             "UPPER",
             "TRIM",
@@ -2198,6 +2354,57 @@ mod tests {
             ]
         });
         assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+    }
+
+    // --- CONCAT → chained `||` (NULL-propagating, unlike DataFusion's concat()) ---
+
+    #[test]
+    fn renders_concat_as_chained_pipe_operator() {
+        // Two args: joined with `||`, not concat() — concat() silently turns a
+        // NULL operand into empty string (#200's GROUP BY repro shape).
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_string", "value": ""}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("S" || '')"#);
+
+        // Three args: chained, still no concat() call.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"},
+                {"type": "column", "name": "c"}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("A" || "B" || "C")"#);
+    }
+
+    #[test]
+    fn renders_concat_bool_operand_as_exasol_case() {
+        // A boolean-producing argument (here `predicate_equal`) is rewritten to
+        // the Exasol-cased CASE form before joining — DataFusion's `||` falls
+        // back to its lowercase boolean->Utf8 cast for a raw boolean operand
+        // otherwise (#200).
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "active"},
+                 "right": {"type": "literal_bool", "value": true}},
+                {"type": "literal_string", "value": ""}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) || '')"#
+        );
     }
 
     // --- CASE WHEN ... THEN ... ELSE ... END ---
