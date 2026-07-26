@@ -123,6 +123,49 @@ pub(super) fn common_arg_literal(sql: &str) -> &str {
     &rest[..end]
 }
 
+/// The contents of the scan UDF's `EMITS (...)` clause — the scan's EMITTED column
+/// set, which on a declined-`ORDER BY` path is WIDER than the query's visible column
+/// set (it also carries the appended hidden sort-key columns).
+///
+/// Extracted paren-balanced: the declared types carry their own parentheses
+/// (`DECIMAL(20,0)`), so the clause does not end at the first `)`. Exactly one
+/// `EMITS (` appears in a fan-out — the distributor call carries none (its LUA SET
+/// script declares a static EMITS).
+pub(super) fn emits_clause(sql: &str) -> &str {
+    let open = sql.find("EMITS (").expect("SQL must carry an EMITS clause") + "EMITS ".len();
+    let mut depth = 0usize;
+    for (offset, ch) in sql[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &sql[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("EMITS clause must be closed: {sql}");
+}
+
+/// The declined-`ORDER BY` wrapper's VISIBLE select list: everything between the
+/// leading `SELECT ` and the first ` FROM (`. A visible select list never contains
+/// ` FROM (` itself, so the first occurrence is always the wrapper's own — even for a
+/// multi-shard fan-out, which nests a second ` FROM (` inside.
+///
+/// Panics when the SQL carries no wrapper; use a `!sql.contains(" FROM (")`
+/// assertion for the no-wrapper cases instead.
+pub(super) fn outer_select_list(sql: &str) -> &str {
+    let list = sql
+        .strip_prefix("SELECT ")
+        .expect("SQL must start with SELECT");
+    let end = list
+        .find(" FROM (")
+        .expect("SQL must carry a wrapping outer SELECT … FROM (");
+    &list[..end]
+}
+
 /// A single-table request with the NQ4 shape: two projected columns and an
 /// `ORDER BY <projected col> DESC NULLS LAST LIMIT n`.
 pub(super) fn nq4_request() -> Json {

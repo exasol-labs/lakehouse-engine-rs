@@ -14,18 +14,34 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::{Decimal, Value};
+
+/// Error raised when a math kernel (SQRT/LN/LOG/ACOS/ASIN/...) produces `NaN`
+/// for an out-of-domain input. Native Exasol rejects these inputs outright
+/// (e.g. `data exception - squareroot of a negative number`); mirroring that,
+/// a `NaN` at the emit boundary must raise an error rather than silently
+/// coerce to `Value::Null`.
+fn nan_domain_error() -> UdfError {
+    UdfError::User(
+        "numeric value out of range: NaN result from an out-of-domain math operation \
+         (e.g. SQRT/LN/LOG of a negative number, or ACOS/ASIN outside [-1, 1])"
+            .to_string(),
+    )
+}
 
 /// Convert a single Arrow column value at row `row` to an SDK Value.
 ///
 /// Null → `Value::Null` regardless of type.
 /// Incompatible or out-of-range types → `Value::String` (JSON representation).
-pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
+/// A `NaN` DOUBLE/REAL value → `Err` (domain error), matching native Exasol's
+/// rejection of out-of-domain math results instead of silently emitting NULL.
+pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
     if col.is_null(row) {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let dt = col.data_type();
-    match dt {
+    Ok(match dt {
         DataType::Boolean => {
             let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
             Value::Bool(arr.value(row))
@@ -80,11 +96,19 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
         }
         DataType::Float32 => {
             let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            Value::Double(arr.value(row) as f64)
+            let v = arr.value(row);
+            if v.is_nan() {
+                return Err(nan_domain_error());
+            }
+            Value::Double(v as f64)
         }
         DataType::Float64 => {
             let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            Value::Double(arr.value(row))
+            let v = arr.value(row);
+            if v.is_nan() {
+                return Err(nan_domain_error());
+            }
+            Value::Double(v)
         }
         DataType::Utf8 => {
             let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
@@ -137,7 +161,7 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Value {
             let display = arrow_value_to_display_string(col, row);
             Value::String(display)
         }
-    }
+    })
 }
 
 /// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>).
@@ -151,7 +175,7 @@ pub fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Value>> {
     for row in 0..num_rows {
         let mut values = Vec::with_capacity(num_cols);
         for col in 0..num_cols {
-            values.push(arrow_value_at(batch.column(col), row));
+            values.push(arrow_value_at(batch.column(col), row).unwrap());
         }
         rows.push(values);
     }
@@ -324,6 +348,33 @@ mod tests {
             }
             other => panic!("expected Numeric, got {other:?}"),
         }
+    }
+
+    /// Scenario: out-of-domain math (e.g. `SQRT(-1)`) produces `NaN`, which must raise a
+    /// domain error at the emit boundary rather than silently becoming `Value::Null`
+    /// (issue #199). In-domain math (e.g. `SQRT(4)`) is unaffected.
+    #[test]
+    fn nan_double_and_float_are_domain_errors() {
+        // Float64: SQRT(-1.0) → NaN → Err
+        let mut f64b = Float64Builder::new();
+        f64b.append_value((-1.0_f64).sqrt());
+        let batch = single_col_batch("x", Arc::new(f64b.finish()));
+        assert!(arrow_value_at(batch.column(0), 0).is_err());
+
+        // Float32: ASIN(2.0) → NaN → Err
+        let mut f32b = Float32Builder::new();
+        f32b.append_value((2.0_f32).asin());
+        let batch = single_col_batch("x", Arc::new(f32b.finish()));
+        assert!(arrow_value_at(batch.column(0), 0).is_err());
+
+        // In-domain math is unaffected: SQRT(4.0) = 2.0 → Ok(Value::Double(2.0))
+        let mut ok_f64b = Float64Builder::new();
+        ok_f64b.append_value((4.0_f64).sqrt());
+        let batch = single_col_batch("x", Arc::new(ok_f64b.finish()));
+        assert_eq!(
+            arrow_value_at(batch.column(0), 0).unwrap(),
+            Value::Double(2.0)
+        );
     }
 
     /// Scenario: Incompatible columns (list/struct/map/binary) emit Value::String JSON;
