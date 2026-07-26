@@ -752,7 +752,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
-                // MOD → (<l> % <r>) — DataFusion 54 exposes modulo only as the % operator
+                // MOD: DataFusion 54 exposes modulo only as the % operator, but
+                // Exasol's own parser rejects %  — it requires the MOD(a, b) form.
                 "MOD" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar MOD missing 'arguments'".into())
@@ -767,7 +768,10 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("MOD left operand is null".into()))?;
                     let right = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("MOD right operand is null".into()))?;
-                    Ok(Some(format!("({left} % {right})")))
+                    Ok(Some(match dialect {
+                        Dialect::Exasol => format!("MOD({left}, {right})"),
+                        Dialect::DataFusion => format!("({left} % {right})"),
+                    }))
                 }
                 // CONCAT → the wire encoding of Exasol's `||` operator, so it
                 // is rendered as chained `||`, not DataFusion's concat()
@@ -2185,7 +2189,7 @@ mod tests {
         assert!(render_expression_safe(&expr).is_none());
     }
 
-    // --- MOD → % operator ---
+    // --- MOD → % operator (DataFusion) / MOD(...) (Exasol) ---
 
     #[test]
     fn renders_mod_as_operator() {
@@ -2197,6 +2201,24 @@ mod tests {
                 {"type": "literal_exactnumeric", "value": 3}
             ]
         });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
+    }
+
+    #[test]
+    fn renders_mod_as_function_call_in_exasol_dialect() {
+        // https://github.com/exasol-labs/lakehouse-engine-rs/issues/197
+        // Exasol's parser rejects `%` — an Exasol-side wrapper (e.g. the
+        // COUNT(DISTINCT ...) outer wrapper) must render MOD(a, b) instead.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "MOD",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(render_expression_exasol(&expr).unwrap(), r#"MOD("A", 3)"#);
+        // DataFusion-dialect rendering of the same node must stay unchanged.
         assert_eq!(render_expression(&expr).unwrap(), r#"("A" % 3)"#);
     }
 
