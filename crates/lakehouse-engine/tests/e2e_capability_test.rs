@@ -1572,3 +1572,477 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
          untrimmed fixed-scale string length)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8.15  String-function argument-type coercion repro (#210)
+// ---------------------------------------------------------------------------
+//
+// `crates/vs-expression/src/lib.rs`'s string-function family (`UPPER`,
+// `LOWER`, `TRIM`, `INSTR`, `LOCATE`, ...) used to hand every argument
+// straight to DataFusion with zero type inspection. Exasol implicitly
+// converts a numeric or DATE argument to VARCHAR before invoking a string
+// function; DataFusion refuses, and pre-fix the scan died at plan time with
+// `F-UDF-CL-RUST-9001 ... DataFusion SQL error: Error during planning ...
+// requires String, but received ...` — a hard error, not a native fallback.
+// The new `string_function_arg_type_guard` dispatches each string-position
+// argument on its Exasol column type before rendering: VARCHAR/CHAR pass
+// through unchanged, DATE is wrapped in `CAST(... AS VARCHAR)`, DECIMAL
+// reuses #211's trimmed `decimal_to_varchar_exasol` rendering, and every
+// other resolvable type (BOOLEAN, DOUBLE, TIMESTAMP) declines to native
+// Exasol evaluation (covered separately in section 8.16 below).
+//
+// Uses `typed_distinct_probe` (`vs_typed_table()`): `c_varchar`, `id`
+// (DECIMAL(20,0)), `c_decimal_a` (DECIMAL(9,2)), `c_date`. Reuses the #211
+// `TYPED_DECIMAL_A_UNSCALED` table and `exasol_trim_decimal_string` oracle
+// defined in section 8.14 above.
+
+/// `UPPER(c_varchar)` still pushes down and returns the uppercased string,
+/// guarding the new dispatch table's VARCHAR-passthrough `Coerce([0])`
+/// branch (#210) against a regression.
+///
+/// Unlike the other tests in this section, `UPPER(c_varchar)` never
+/// hard-failed pre-fix: `c_varchar` is already a string, so the type-blind
+/// original renderer already passed it straight through to DataFusion's
+/// `upper()` with no coercion needed. This test proves the new per-argument
+/// type dispatch — added to fix the OTHER (numeric/DATE) cases below — does
+/// not silently degrade this already-working VARCHAR case to the full-row
+/// fallback.
+///
+/// Seed: `typed_distinct_probe.c_varchar` for id=1 is `"aa"` (see
+/// `common/seed.rs`'s `typed_probe()`).
+#[test]
+fn e2e_upper_varchar_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT UPPER(c_varchar) FROM {} WHERE id = 1",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        1,
+        "expected 1 column (UPPER(c_varchar)): {cols:?}"
+    );
+    assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
+
+    let upper = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("UPPER(c_varchar) not a string: {:?}", cols[0][0]));
+    assert_eq!(
+        upper, "AA",
+        "UPPER(c_varchar) for id=1 (\"aa\") must be \"AA\", got {upper:?}"
+    );
+}
+
+/// `UPPER(id)` over the DECIMAL(20,0) `id` column returns the plain digit
+/// string, exercising the new DECIMAL-coercion branch of
+/// `string_function_arg_type_guard` (#210) for a scale-0 (integer) DECIMAL.
+///
+/// Pre-fix, `id` (a numeric argument) hard-failed with
+/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` inside the
+/// DataFusion scan, the same way #210's `UPPER(c_custkey)` repro did.
+/// Post-fix the argument is wrapped in the trimmed decimal-to-string
+/// rendering shared with #211; since `id`'s scale is 0 there is no
+/// fractional part to trim, so this really just confirms `UPPER('4')` =
+/// `'4'` — a bare digit string, no decimal point.
+#[test]
+fn e2e_upper_id_trims_to_plain_integer_string() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT UPPER(id) FROM {} WHERE id = 4", vs_typed_table());
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (UPPER(id)): {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected 1 row (id=4): {cols:?}");
+
+    let upper = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("UPPER(id) not a string: {:?}", cols[0][0]));
+    assert_eq!(
+        upper, "4",
+        "UPPER(id) for id=4 must be \"4\" (scale-0 DECIMAL, no decimal point), got {upper:?}"
+    );
+}
+
+/// `LTRIM(c_decimal_a)` returns the Exasol-trimmed decimal string (#210),
+/// reusing the #211 `exasol_trim_decimal_string` oracle and
+/// `TYPED_DECIMAL_A_UNSCALED` table from section 8.14.
+///
+/// Pre-fix, `c_decimal_a` (a DECIMAL column) hard-failed with
+/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` when passed to
+/// `LTRIM`, mirroring #210's `LTRIM(c_acctbal)` repro. Post-fix the argument
+/// is wrapped in the same trimmed decimal-to-string rendering #211 already
+/// proved for `CAST`/`CONCAT`/`LENGTH`. `LTRIM` strips no characters here —
+/// the trimmed string has no leading whitespace — so the expected value is
+/// simply the trimmed decimal string itself: id=1 -> "10.5", id=4 -> "30",
+/// id=6 -> "40.99" — the same three ids `e2e_decimal_cast_trims_trailing_zeros`
+/// uses, for consistency.
+#[test]
+fn e2e_ltrim_decimal_trims_trailing_zeros() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, LTRIM(c_decimal_a) FROM {} WHERE id IN (1,4,6) ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, LTRIM): {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
+
+    let ids = [1i64, 4, 6];
+    for (i, &expected_id) in ids.iter().enumerate() {
+        let id = parse_int(&cols[0][i]);
+        assert_eq!(
+            id, expected_id,
+            "row {i}: id must be {expected_id}, got {id}"
+        );
+
+        let unscaled = TYPED_DECIMAL_A_UNSCALED
+            .iter()
+            .find(|&&(row_id, _)| row_id == expected_id)
+            .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={expected_id}"))
+            .1
+            .unwrap_or_else(|| panic!("id={expected_id} c_decimal_a must not be NULL"));
+        let expected = exasol_trim_decimal_string(unscaled, 2);
+
+        let s = cols[1][i]
+            .as_str()
+            .unwrap_or_else(|| panic!("LTRIM result at row {i} is not a string: {:?}", cols[1][i]));
+        assert_eq!(
+            s, expected,
+            "row {i} (id={id}): LTRIM(c_decimal_a) must be {expected:?}, got {s:?}"
+        );
+    }
+}
+
+/// `LOWER(c_date)` returns Exasol's default `YYYY-MM-DD` textual DATE
+/// rendering (#210) — the same DATE-cast rationale `guard_like_subject`
+/// already applies for #207's `LIKE` subject guard.
+///
+/// Pre-fix, `c_date` (a DATE column) hard-failed with
+/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` when passed to
+/// `LOWER`, mirroring #210's `LOWER(l_shipdate)` repro. Post-fix the
+/// argument is wrapped in an explicit `CAST(... AS VARCHAR)`, matching
+/// Exasol's own `NLS_DATE_FORMAT` default.
+///
+/// Seed: `c_date` for id=1 is `BASE_DATE + 0` days. `common/seed.rs` defines
+/// `BASE_DATE = 19_723` (days since epoch) and separately documents
+/// `BASE_DATE + 182` as the literal date 2024-07-01 (`INITDEF_REAL_DATE_DAYS`
+/// comment), which confirms `BASE_DATE` itself is 2024-01-01 (Jan 1 + 182
+/// days = Jul 1 in the 2024 leap year: 31+29+31+30+31+30 = 182).
+#[test]
+fn e2e_lower_date_formats_as_iso() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT LOWER(c_date) FROM {} WHERE id = 1",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (LOWER(c_date)): {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
+
+    let lower = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("LOWER(c_date) not a string: {:?}", cols[0][0]));
+    assert_eq!(
+        lower, "2024-01-01",
+        "LOWER(c_date) for id=1 must be \"2024-01-01\", got {lower:?}"
+    );
+}
+
+/// `INSTR(c_decimal_a, '.')` returns the position of `.` WITHIN the trimmed
+/// decimal string (#210), not the untrimmed fixed-scale text.
+///
+/// Pre-fix, `c_decimal_a` hard-failed with `F-UDF-CL-RUST-9001 ... requires
+/// String, but received ...` when passed to `INSTR`, mirroring #210's
+/// `INSTR(c_custkey, '1')` repro. Post-fix the argument is wrapped in the
+/// #211 trimmed rendering before `strpos` is applied, so the returned
+/// position reflects the TRIMMED string, not the fixed-scale ("XX.XX")
+/// string. Positions are computed in Rust from `exasol_trim_decimal_string`'s
+/// output (`s.find('.').map(|i| i as i64 + 1).unwrap_or(0)`), never
+/// hardcoded: id=1 "10.5" -> 3, id=4 "30" -> 0 (no '.'), id=6 "40.99" -> 3.
+#[test]
+fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, INSTR(c_decimal_a, '.') FROM {} WHERE id IN (1,4,6) ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, INSTR): {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
+
+    let ids = [1i64, 4, 6];
+    for (i, &expected_id) in ids.iter().enumerate() {
+        let id = parse_int(&cols[0][i]);
+        assert_eq!(
+            id, expected_id,
+            "row {i}: id must be {expected_id}, got {id}"
+        );
+
+        let unscaled = TYPED_DECIMAL_A_UNSCALED
+            .iter()
+            .find(|&&(row_id, _)| row_id == expected_id)
+            .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={expected_id}"))
+            .1
+            .unwrap_or_else(|| panic!("id={expected_id} c_decimal_a must not be NULL"));
+        let trimmed = exasol_trim_decimal_string(unscaled, 2);
+        let expected_pos = trimmed.find('.').map(|i| i as i64 + 1).unwrap_or(0);
+
+        let pos = parse_int(&cols[1][i]);
+        assert_eq!(
+            pos, expected_pos,
+            "row {i} (id={id}): INSTR(c_decimal_a, '.') must be {expected_pos} \
+             (position within trimmed text {trimmed:?}), got {pos}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8.16  String-function argument-type decline native-oracle parity (#210)
+// ---------------------------------------------------------------------------
+//
+// BOOLEAN, DOUBLE, and TIMESTAMP are non-coercible resolvable types for
+// `string_function_arg_type_guard`: they are not VARCHAR/CHAR (pass through),
+// not DATE (CAST-wrapped), and not DECIMAL (trim-wrapped), so the guard
+// returns `None` and the whole select-list item degrades to the full base
+// row projection instead of hard-failing. Exasol's own SQL engine then
+// evaluates the string function over the raw returned column natively.
+//
+// Each comparison below is against an IN-SESSION NATIVE ORACLE: a second
+// query over a bare literal value, with NO virtual schema reference, run
+// over the SAME connection — so the comparison is not a tautology. A
+// regressed guard would either hard-fail (if it stopped declining) or
+// return DataFusion's own divergent text formatting (if something coerced
+// instead of declining); either way this comparison would catch it.
+//
+// Exasol's public Type Conversion Rules
+// (https://docs.exasol.com/db/latest/sql_references/data_types/typeconversionrules.htm)
+// document implicit BOOLEAN/TIMESTAMP-to-VARCHAR conversion as supported,
+// which is why `c_ts`/`c_bool` are included here alongside `c_double` rather
+// than omitted. If the native-oracle query for either ever fails against a
+// live Exasol container (an Exasol-side rejection of its own documented
+// implicit conversion, unrelated to this fix), drop that specific test and
+// record why here — never weaken its assertion to make it pass regardless.
+
+/// `UPPER(c_double)` over the virtual table declines pushdown and falls back
+/// to native Exasol evaluation, matching an in-session native oracle over a
+/// bare `DOUBLE` literal (#210).
+///
+/// Seed: `typed_distinct_probe.c_double` for id=1 is `0.5` (see
+/// `common/seed.rs`'s `typed_probe()`).
+#[test]
+fn e2e_upper_double_declines_to_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let vs_sql = format!(
+        "SELECT UPPER(c_double) FROM {} WHERE id = 1",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    assert_eq!(
+        vs_cols.len(),
+        1,
+        "expected 1 column (UPPER(c_double)): {vs_cols:?}"
+    );
+    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+    let vs_value = vs_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("UPPER(c_double) not a string: {:?}", vs_cols[0][0]));
+
+    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(0.5 AS DOUBLE))");
+    let oracle_value = oracle_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
+
+    assert_eq!(
+        vs_value, oracle_value,
+        "UPPER(c_double) over the VS must match the native Exasol oracle \
+         SELECT UPPER(CAST(0.5 AS DOUBLE)) (declined pushdown falls back to \
+         native evaluation), got vs={vs_value:?} oracle={oracle_value:?}"
+    );
+}
+
+/// `UPPER(c_ts)` over the virtual table declines pushdown the same way
+/// `UPPER(c_double)` does (#210) and matches an in-session native oracle over
+/// a bare `TIMESTAMP` literal.
+///
+/// Seed: `typed_distinct_probe.c_ts` for id=1 is `BASE_TS_MICROS + 100ms` =
+/// 2024-01-01 00:00:00.100 (see `common/seed.rs`'s `typed_probe()`; its
+/// `ts(100)` closure computes `BASE_TS_MICROS + 100 * 1_000` microseconds).
+/// See the section note above regarding live-stack verification of this case.
+#[test]
+fn e2e_upper_timestamp_declines_to_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let vs_sql = format!("SELECT UPPER(c_ts) FROM {} WHERE id = 1", vs_typed_table());
+    let vs_cols = conn.query_columns(&vs_sql);
+    assert_eq!(
+        vs_cols.len(),
+        1,
+        "expected 1 column (UPPER(c_ts)): {vs_cols:?}"
+    );
+    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+    let vs_value = vs_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("UPPER(c_ts) not a string: {:?}", vs_cols[0][0]));
+
+    let oracle_cols =
+        conn.query_columns("SELECT UPPER(CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS TIMESTAMP))");
+    let oracle_value = oracle_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
+
+    assert_eq!(
+        vs_value, oracle_value,
+        "UPPER(c_ts) over the VS must match the native Exasol oracle, got \
+         vs={vs_value:?} oracle={oracle_value:?}"
+    );
+}
+
+/// `UPPER(c_bool)` over the virtual table declines pushdown the same way
+/// `UPPER(c_double)` does (#210) and matches an in-session native oracle over
+/// a bare `BOOLEAN` literal. Exasol's implicit BOOLEAN-to-VARCHAR conversion
+/// renders `TRUE`/`FALSE` (Exasol Type Conversion Rules), so
+/// `UPPER(CAST(TRUE AS BOOLEAN))` -> `"TRUE"` is the expected oracle value.
+///
+/// Seed: `typed_distinct_probe.c_bool` for id=1 is `true` (see
+/// `common/seed.rs`'s `typed_probe()`). See the section note above regarding
+/// live-stack verification of this case.
+#[test]
+fn e2e_upper_boolean_declines_to_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let vs_sql = format!(
+        "SELECT UPPER(c_bool) FROM {} WHERE id = 1",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    assert_eq!(
+        vs_cols.len(),
+        1,
+        "expected 1 column (UPPER(c_bool)): {vs_cols:?}"
+    );
+    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+    let vs_value = vs_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("UPPER(c_bool) not a string: {:?}", vs_cols[0][0]));
+
+    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(TRUE AS BOOLEAN))");
+    let oracle_value = oracle_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
+
+    assert_eq!(
+        vs_value, oracle_value,
+        "UPPER(c_bool) over the VS must match the native Exasol oracle, got \
+         vs={vs_value:?} oracle={oracle_value:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.17  INSTR/LOCATE arity decline (#228)
+// ---------------------------------------------------------------------------
+//
+// `INSTR`/`LOCATE` beyond 2 arguments unconditionally decline, regardless of
+// argument type: `vs-expression`'s renderer reads only `args[0]`/`args[1]`
+// and drops the rest (#228), so coercing index 0 would let a truncated
+// rendering plan successfully and return a position computed as if the
+// start-position argument had never been given — a silent WRONG ANSWER,
+// where a hard DataFusion error would at least have been loud. Both wired
+// surfaces (select-list projection and WHERE-clause filter) are covered.
+
+/// Select-list `INSTR` beyond 2 arguments declines to native Exasol
+/// evaluation instead of coercing and silently truncating to a 2-argument
+/// `strpos` call (#228).
+///
+/// Seed: `typed_distinct_probe.c_varchar` for id=1 is `"aa"` (see
+/// `common/seed.rs`'s `typed_probe()`). Exasol's `INSTR('aa', 'a', 2)`
+/// searches for `'a'` starting AT position 2 — the second `'a'` in `"aa"` —
+/// and returns `2`. A regressed build that coerced `INSTR(c_varchar, 'a', 2)`
+/// down to a 2-argument `strpos(c_varchar, 'a')` (silently dropping the
+/// start-position argument) would instead return `1` (the FIRST `'a'`) — a
+/// different, silently wrong number, so this test discriminates
+/// correct-decline from silently-wrong-coerce.
+///
+/// The expected value of `2` is independently confirmed against a native
+/// in-session oracle (`SELECT INSTR('aa', 'a', 2)`, no virtual schema),
+/// pinning the oracle itself before using it to judge the VS result.
+#[test]
+fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = parse_int(&conn.query_columns("SELECT INSTR('aa', 'a', 2)")[0][0]);
+    assert_eq!(
+        oracle, 2,
+        "native oracle INSTR('aa', 'a', 2) must be 2, got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT INSTR(c_varchar, 'a', 2) FROM {} WHERE id = 1",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    assert_eq!(vs_cols.len(), 1, "expected 1 column (INSTR): {vs_cols:?}");
+    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+
+    let vs_value = parse_int(&vs_cols[0][0]);
+    assert_eq!(
+        vs_value, 2,
+        "INSTR(c_varchar, 'a', 2) for id=1 (\"aa\") must be 2 (native decline), \
+         got {vs_value} (a regressed coerce-not-decline build would return 1)"
+    );
+}
+
+/// WHERE-clause `INSTR` beyond 2 arguments declines to native Exasol
+/// evaluation instead of coercing and silently truncating (#228) — the
+/// WHERE-clause counterpart of the select-list case above.
+///
+/// Seed: `typed_distinct_probe.c_varchar` for id=4 is `"bb"` (length 2), see
+/// `common/seed.rs`'s `typed_probe()`. Exasol's `INSTR('bb', 'b', 3)`
+/// searches for `'b'` starting at position 3 — beyond the string's length —
+/// and returns `0` natively, so `WHERE INSTR(c_varchar, 'b', 3) = 0` matches
+/// id=4. A regressed build that coerced down to 2-argument
+/// `strpos(c_varchar, 'b')` (ignoring the start position) would compute `1`
+/// for id=4 (the first `'b'`), so `1 != 0` would make the predicate NEVER
+/// match id=4 — the discriminating check below.
+///
+/// The expected value of `0` is independently confirmed against a native
+/// in-session oracle (`SELECT INSTR('bb', 'b', 3)`, no virtual schema).
+#[test]
+fn e2e_instr_arity_decline_where_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = parse_int(&conn.query_columns("SELECT INSTR('bb', 'b', 3)")[0][0]);
+    assert_eq!(
+        oracle, 0,
+        "native oracle INSTR('bb', 'b', 3) must be 0, got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT id FROM {} WHERE INSTR(c_varchar, 'b', 3) = 0",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    assert_eq!(vs_cols.len(), 1, "expected 1 column (id): {vs_cols:?}");
+
+    let ids: Vec<i64> = vs_cols[0].iter().map(parse_int).collect();
+    assert!(
+        ids.contains(&4),
+        "WHERE INSTR(c_varchar, 'b', 3) = 0 must include id=4 (\"bb\", native \
+         decline gives 0), got ids={ids:?} (a regressed coerce build would \
+         compute strpos('bb','b')=1, never matching id=4)"
+    );
+}
