@@ -544,18 +544,11 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
     match exa_type {
         // String subject: DataFusion coerces it natively — leave unchanged.
         Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(like_node.clone()),
-        // DATE: rewrap the subject as CAST(<col> AS VARCHAR). `render_cast_target`'s
-        // DataFusion arm renders `{"type":"VARCHAR"}` as bare `VARCHAR` (no length),
-        // yielding `CAST(<col> AS VARCHAR)`; DataFusion's Date32→Utf8 cast is
-        // `YYYY-MM-DD`.
+        // DATE: rewrap the subject as CAST(<col> AS VARCHAR); DataFusion's Date32→Utf8
+        // cast is `YYYY-MM-DD`.
         Some("DATE") => {
             let mut out = like_node.clone();
-            out["expression"] = serde_json::json!({
-                "type": "function_scalar_cast",
-                "name": "CAST",
-                "dataType": {"type": "VARCHAR"},
-                "arguments": [subject.clone()],
-            });
+            out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
         // Every other non-string type (DECIMAL incl. integer DECIMAL(p,0), DOUBLE,
@@ -735,6 +728,212 @@ fn wrap_decimal_to_varchar(column: &Json) -> Json {
     })
 }
 
+/// Wrap a node in an explicit `CAST(<node> AS VARCHAR)` (`function_scalar_cast`).
+/// `render_cast_target`'s DataFusion arm renders `{"type":"VARCHAR"}` as bare
+/// `VARCHAR` (no length), yielding `CAST(<node> AS VARCHAR)`. Shared by
+/// [`guard_like_subject`] and [`coerce_string_position_arg`] so both DATE branches are
+/// provably identical.
+fn wrap_cast_to_varchar(node: &Json) -> Json {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": {"type": "VARCHAR"},
+        "arguments": [node.clone()],
+    })
+}
+
+/// Which arguments of an Exasol string function carry a STRING value — the ones
+/// Exasol implicitly converts to VARCHAR before evaluating, and which therefore have
+/// to be type-dispatched before the DataFusion scan sees them (issue #210). Returned
+/// by [`string_position_args`].
+#[derive(Debug, PartialEq, Eq)]
+enum StringPositionArgs {
+    /// Not a governed string function: the caller leaves the node unchanged and NEVER
+    /// declines on it. Covers `CHR` / `UNICODECHR` (their single argument is a genuine
+    /// integer codepoint) and every non-string function.
+    NotGoverned,
+    /// The string-position argument indices, every one guaranteed `< arg_count`.
+    Coerce(Vec<usize>),
+    /// Decline the whole tree: this function at this arity is not rendered faithfully.
+    Decline,
+}
+
+/// Resolve which of a string function's arguments are string positions, from its name
+/// and arity alone — a pure table, with no column types involved (those are
+/// [`coerce_string_position_arg`]'s job).
+///
+/// | Function | String-position indices |
+/// |----------|-------------------------|
+/// | `CONCAT`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `TRANSLATE` | all of `0..arg_count` |
+/// | `LOWER`, `UPPER`, `ASCII`, `INITCAP`, `REVERSE`, `LENGTH`, `OCTET_LENGTH`, `UNICODE`, `SUBSTR`, `REPEAT`, `LEFT`, `RIGHT` | `[0]` — every further argument is a genuine number (a start offset, a length, a repeat count) |
+/// | `LPAD`, `RPAD` | `[0, 2]` when the optional pad STRING is present, else `[0]` — never the numeric length at index 1 |
+/// | `INSTR`, `LOCATE` | `[0, 1]`, clamped to the arity, at two or fewer arguments; [`StringPositionArgs::Decline`] beyond two |
+/// | `CHR`, `UNICODECHR`, anything else | [`StringPositionArgs::NotGoverned`] |
+///
+/// `fn_name` is uppercased before matching, mirroring the uppercase-then-look-up
+/// convention of [`guard_like_subject`] / [`extract_all_column_types`]. Every returned
+/// index is filtered to `< arg_count`, so a caller may index `arguments` with it
+/// directly.
+///
+/// `INSTR` / `LOCATE` beyond two arguments DECLINE unconditionally on argument type,
+/// and that branch must not be "simplified" into a `Coerce(vec![0, 1])`:
+/// `vs-expression`'s `INSTR` / `LOCATE` arms
+/// (`crates/vs-expression/src/lib.rs:741-772`) read only `args[0]` / `args[1]` and
+/// silently drop the third and fourth, so coercing index 0 would let a TRUNCATED
+/// rendering plan successfully and return a position computed from offset 1 — a
+/// silently wrong answer, where today there is a loud DataFusion planning error
+/// (tracked as issue #228). Declining keeps those calls on native Exasol evaluation.
+///
+/// `LOCATE`'s argument REORDER does not affect this table: Exasol's
+/// `LOCATE(substring, string)` renders as `strpos(string, substring)`
+/// (`crates/vs-expression/src/lib.rs:757-772`), but that swap happens at RENDER time,
+/// after this dispatch — both of its indices are string positions either way.
+fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
+    let coerce_in_range = |indices: Vec<usize>| {
+        StringPositionArgs::Coerce(indices.into_iter().filter(|i| *i < arg_count).collect())
+    };
+    match fn_name.to_uppercase().as_str() {
+        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => {
+            coerce_in_range((0..arg_count).collect())
+        }
+        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
+        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => coerce_in_range(vec![0]),
+        "LPAD" | "RPAD" if arg_count > 2 => coerce_in_range(vec![0, 2]),
+        "LPAD" | "RPAD" => coerce_in_range(vec![0]),
+        "INSTR" | "LOCATE" if arg_count > 2 => StringPositionArgs::Decline,
+        "INSTR" | "LOCATE" => coerce_in_range(vec![0, 1]),
+        _ => StringPositionArgs::NotGoverned,
+    }
+}
+
+/// Make every pushed-down Exasol string function type-safe for the DataFusion scan,
+/// using the column-type map from [`extract_all_column_types`] (issue #210).
+///
+/// Exasol implicitly converts a numeric or DATE string-function argument to VARCHAR
+/// before evaluating; DataFusion refuses and the scan dies at PLAN time, so each
+/// string-position argument ([`string_position_args`] decides which those are) is
+/// dispatched on its Exasol type by [`coerce_string_position_arg`] before rendering.
+///
+/// Recursion is POST-ORDER over the same child-bearing fields as
+/// [`rewrite_decimal_stringifications`]. Both halves earn their keep: post-order is
+/// what coerces the INNER call of a nested `UPPER(TRIM(<decimal column>))` before the
+/// outer check runs (which then sees a non-column argument and cannot re-wrap it), and
+/// the broad field list is what reaches a string function under a COMPARISON predicate
+/// (`UPPER(c) = 'X'` is a `predicate_equal` with the function under `left`) — a node
+/// [`like_subject_type_guard`]'s junction-only recursion never descends into.
+///
+/// Returns:
+/// - `Some(tree)` — render this (possibly coerced) tree.
+/// - `None` — decline. A decline anywhere in the tree propagates to the outer call
+///   through `?`, mirroring [`like_subject_type_guard`]: the WHOLE filter is dropped so
+///   Exasol evaluates it natively, or the WHOLE select-list item falls back to the base
+///   row. A `NotGoverned` node never declines, whatever its arguments' types.
+///
+/// Runs BEFORE [`rewrite_decimal_stringifications`] at both wired surfaces: a coerced
+/// argument is no longer a bare column, so the decimal rewriter no-ops on it instead of
+/// double-wrapping.
+pub(super) fn string_function_arg_type_guard(
+    node: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    // A leaf (literal, `column`) or any non-object node has no recursable children and
+    // no function dispatch — pass it through unchanged.
+    if !node.is_object() {
+        return Some(node.clone());
+    }
+
+    // --- Step 1: post-order — guard every known child-bearing field FIRST, so a nested
+    // string function is already coerced before this node's own check runs. A declined
+    // child short-circuits the whole tree via `?`.
+    let mut out = node.clone();
+    for field in ["expressions", "arguments", "results"] {
+        if let Some(Json::Array(children)) = node.get(field) {
+            let rewritten: Option<Vec<Json>> = children
+                .iter()
+                .map(|c| string_function_arg_type_guard(c, col_types))
+                .collect();
+            out[field] = Json::Array(rewritten?);
+        }
+    }
+    for field in ["expression", "pattern", "left", "right", "basis"] {
+        match node.get(field) {
+            Some(child) if child.is_object() => {
+                out[field] = string_function_arg_type_guard(child, col_types)?;
+            }
+            _ => {}
+        }
+    }
+
+    // --- Step 2: with children already guarded, dispatch THIS node's own
+    // string-position arguments. Only a `function_scalar` can be a string function;
+    // every other node type is already fully handled by the recursion above.
+    if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
+        return Some(out);
+    }
+    // `fn_name` is passed un-uppercased: `string_position_args` uppercases it itself.
+    let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let arg_count = out
+        .get("arguments")
+        .and_then(|a| a.as_array())
+        .map_or(0, |a| a.len());
+    match string_position_args(fn_name, arg_count) {
+        // Not a governed string function: leave it alone WITHOUT declining, even over a
+        // non-coercible argument — `CHR`/`UNICODECHR` take a genuine integer codepoint.
+        StringPositionArgs::NotGoverned => Some(out),
+        // An arity `vs-expression` renders incompletely (#228) — decline it rather than
+        // push a truncated rendering.
+        StringPositionArgs::Decline => None,
+        StringPositionArgs::Coerce(indices) => {
+            // Every index is clamped to `arg_count` by `string_position_args`, so a
+            // non-empty `indices` implies `out["arguments"]` exists as an array —
+            // indexing it here can never synthesize a missing field.
+            for i in indices {
+                let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
+                out["arguments"][i] = coerced;
+            }
+            Some(out)
+        }
+    }
+}
+
+/// Type-dispatch ONE string-position argument, mirroring [`guard_like_subject`]'s
+/// uppercase-then-look-up convention:
+///
+/// | Exasol type | Action |
+/// |-------------|--------|
+/// | `VARCHAR…` / `CHAR…` | unchanged — DataFusion needs no help with a string |
+/// | `DATE` | `CAST(<col> AS VARCHAR)`, i.e. `YYYY-MM-DD` in both engines' defaults |
+/// | `DECIMAL…` (incl. integer `DECIMAL(p,0)`) | #211's trimmed `decimal_to_varchar_exasol` |
+/// | any other resolvable type, or a lookup miss | `None` — decline, fail-safe |
+///
+/// A non-`column` argument (a literal, a computed expression) is returned UNCHANGED:
+/// its type is not resolvable from `col_types`, a tracked exception (#223) that must not
+/// decline.
+fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return Some(arg.clone());
+    }
+    // A nameless column is unresolvable → fail-safe decline.
+    let name = arg
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|s| s.to_uppercase())?;
+    let exa_type = col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t.as_str());
+
+    match exa_type {
+        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(arg.clone()),
+        Some("DATE") => Some(wrap_cast_to_varchar(arg)),
+        Some(t) if t.starts_with("DECIMAL") => Some(wrap_decimal_to_varchar(arg)),
+        // BOOLEAN, DOUBLE PRECISION, TIMESTAMP, … and a lookup miss all decline: their
+        // text forms diverge between the two engines, so a cast would convert a crash
+        // into a wrong answer (same reasoning as `guard_like_subject`).
+        _ => None,
+    }
+}
+
 /// Extract the projected columns and their Exasol types from the pushdown request.
 ///
 /// For `column` nodes: returns the uppercase column name and its Exasol type.
@@ -830,6 +1029,22 @@ pub(super) fn project_columns(
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
                     .map(exasol_type_from_json);
+                // Guard every select-list item's string-function arguments against a
+                // non-coercible column type (issue #210) BEFORE the decimal-stringification
+                // rewrite below — guard first, decimal rewriter second, same as the
+                // WHERE-clause chain; see `string_function_arg_type_guard`'s doc for why the
+                // order is load-bearing. `project_columns` has THREE callers —
+                // `extract_projection` (single-table), `extract_join_projection`
+                // (`joins/rendering.rs`, whose `col_types` is the UNION of both joined
+                // tables' columns), and `joins/mod.rs`'s empty-side path — so this guard
+                // (and its ability to decline) reaches the broadcast-join SELECT list too,
+                // not just the single-table path. On `None` the item can't be safely pushed
+                // down at all; fall back to the full base row for the whole select list,
+                // like every other "untranslatable item" arm below.
+                let Some(e) = string_function_arg_type_guard(e, &all_cols) else {
+                    needs_full_fallback = true;
+                    continue;
+                };
                 // Rewrite directly-stringified bare-DECIMAL columns into
                 // `decimal_to_varchar_exasol` so the rendered SQL reproduces Exasol's
                 // trimmed DECIMAL→string form (issue #211). The rewriter is a no-op
@@ -838,7 +1053,7 @@ pub(super) fn project_columns(
                 // every item before the dispatch below. Shadowing `e` with the owned
                 // rewritten node, then re-borrowing, keeps the rest of the loop body
                 // unchanged.
-                let e = rewrite_decimal_stringifications(e, &all_cols);
+                let e = rewrite_decimal_stringifications(&e, &all_cols);
                 let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
@@ -3698,14 +3913,21 @@ mod tests {
     // rewrite_decimal_stringifications — issue #211 decimal-trim JSON rewrite
     // ---------------------------------------------------------------------------
 
-    /// The column-type map shared by the rewrite tests: one DECIMAL, one integer
-    /// DECIMAL(p,0), one VARCHAR, one DATE.
+    /// The column-type map shared by the rewrite and string-function-guard tests: one
+    /// DECIMAL, one integer DECIMAL(p,0), one VARCHAR, one DATE, plus the three
+    /// resolvable-but-non-coercible types the string-function guard must decline on
+    /// (issue #210). The three additions cannot disturb the #211 rewrite assertions:
+    /// those reference only the first four names, and every wired `project_columns`
+    /// test here projects a single expression rather than the full base row.
     fn decimal_rewrite_col_types() -> Vec<(String, String)> {
         vec![
             ("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string()),
             ("ID".to_string(), "DECIMAL(20,0)".to_string()),
             ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
             ("D".to_string(), "DATE".to_string()),
+            ("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string()),
+            ("C_BOOL_A".to_string(), "BOOLEAN".to_string()),
+            ("C_TS_A".to_string(), "TIMESTAMP".to_string()),
         ]
     }
 
@@ -4178,6 +4400,827 @@ mod tests {
         assert!(
             !expr.contains("regexp_replace"),
             "a computed-expression CAST must not be trimmed (tracked exception #223): {expr}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // project_columns wiring — issue #210 string_function_arg_type_guard, run
+    // BEFORE rewrite_decimal_stringifications on every select-list item
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `UPPER(c_decimal_a)` projects to a SINGLE expression carrying the
+    /// trimmed decimal-to-string form (#211's node, reached through the new guard),
+    /// at the item's declared `selectListDataTypes` type — not the full base row.
+    #[test]
+    fn selectlist_upper_decimal_arg_coerced_not_full_row() {
+        let item = string_fn("UPPER", vec![decimal_column()]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "UPPER(c_decimal_a) must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
+            "UPPER's DECIMAL argument must render through the trimmed decimal-to-string form: {expr}"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(2000000)".to_string()],
+            "the EMITS type must stay the item's declared selectListDataTypes type"
+        );
+    }
+
+    /// Scenario: `LOWER(c_date)` (the `d` fixture column, `DATE`-typed) projects a
+    /// single expression containing `CAST("D" AS VARCHAR)`.
+    #[test]
+    fn selectlist_lower_date_arg_cast_to_varchar() {
+        let item = string_fn("LOWER", vec![column("d")]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "LOWER(c_date) must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"CAST("D" AS VARCHAR)"#),
+            "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR): {expr}"
+        );
+    }
+
+    /// Scenario: `UPPER(c_double)` (the `c_double_a` fixture column) degrades to the
+    /// FULL base row with no error — `string_function_arg_type_guard` declines a
+    /// resolvable-but-non-coercible column type, and `project_columns` falls back
+    /// exactly like any other untranslatable select-list item.
+    #[test]
+    fn selectlist_string_fn_over_double_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let item = string_fn("UPPER", vec![column("c_double_a")]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "UPPER(c_double_a) must fall back to the full base row, not a truncated projection: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
+    }
+
+    /// Scenario: `INSTR(c_decimal_a, '.')` projects a single expression whose FIRST
+    /// `strpos` argument is the trimmed decimal form and whose SECOND argument is the
+    /// untouched string literal `'.'` — `INSTR(string, substring)` -> `strpos(string,
+    /// substring)`, so index 0 is the column being coerced, index 1 the literal left
+    /// alone since it is not a bare column.
+    #[test]
+    fn selectlist_instr_decimal_arg_coerces_first_position_only() {
+        let item = string_fn(
+            "INSTR",
+            vec![
+                decimal_column(),
+                serde_json::json!({"type": "literal_string", "value": "."}),
+            ],
+        );
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "INSTR(c_decimal_a, '.') must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.starts_with(
+                r#"strpos(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#
+            ),
+            "INSTR's first (string) argument must render the trimmed decimal form: {expr}"
+        );
+        assert!(
+            expr.ends_with("'.')"),
+            "INSTR's second (substring) argument, a literal, must be left untouched: {expr}"
+        );
+    }
+
+    /// Scenario: `INSTR(c_varchar, 'b', 3)` (three arguments, all effectively
+    /// VARCHAR/literal) degrades to the FULL base row rather than projecting a
+    /// truncated `strpos` call — the #228 arity-decline path. `vs-expression` reads
+    /// only `args[0]`/`args[1]` and silently drops the third; coercing index 0 here
+    /// would let a truncated rendering plan successfully, so
+    /// `string_position_args("INSTR", 3)` returns `Decline` regardless of every
+    /// argument already being VARCHAR/literal.
+    #[test]
+    fn selectlist_instr_with_start_position_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let item = string_fn(
+            "INSTR",
+            vec![
+                column("name"),
+                serde_json::json!({"type": "literal_string", "value": "b"}),
+                serde_json::json!({"type": "literal_exactnumeric", "value": 3}),
+            ],
+        );
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "the arity-decline INSTR must fall back to the full base row, not a truncated strpos: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // string_position_args — issue #210 string-position argument table
+    // ---------------------------------------------------------------------------
+
+    /// Every argument of `CONCAT`/`TRIM`/`LTRIM`/`RTRIM`/`REPLACE`/`TRANSLATE` is a
+    /// string position, at every arity Exasol can send.
+    #[test]
+    fn string_position_args_coerces_every_argument_of_all_string_functions() {
+        for name in ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"] {
+            assert_eq!(
+                string_position_args(name, 1),
+                StringPositionArgs::Coerce(vec![0]),
+                "{name}/1 must coerce index 0"
+            );
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0, 1]),
+                "{name}/2 must coerce both indices"
+            );
+            assert_eq!(
+                string_position_args(name, 3),
+                StringPositionArgs::Coerce(vec![0, 1, 2]),
+                "{name}/3 must coerce every index"
+            );
+        }
+    }
+
+    /// Only the FIRST argument of these is a string position; any further argument is
+    /// a genuine number (a start offset, a length, a repeat count).
+    #[test]
+    fn string_position_args_coerces_first_argument_only() {
+        for name in [
+            "LOWER",
+            "UPPER",
+            "ASCII",
+            "INITCAP",
+            "REVERSE",
+            "LENGTH",
+            "OCTET_LENGTH",
+            "UNICODE",
+            "SUBSTR",
+            "REPEAT",
+            "LEFT",
+            "RIGHT",
+        ] {
+            for arg_count in 1..=3 {
+                assert_eq!(
+                    string_position_args(name, arg_count),
+                    StringPositionArgs::Coerce(vec![0]),
+                    "{name}/{arg_count} must coerce index 0 only"
+                );
+            }
+        }
+    }
+
+    /// `LPAD`/`RPAD`'s numeric length argument (index 1) is always excluded, while
+    /// their PAD-string argument (index 2, present only at arity > 2) is still
+    /// coerced — the only mixed string/numeric arity in the table.
+    /// `SUBSTR`/`REPEAT`/`LEFT`/`RIGHT`'s single-numeric-argument exclusion is already
+    /// covered by `string_position_args_coerces_first_argument_only` above.
+    #[test]
+    fn string_position_args_excludes_numeric_arguments() {
+        for name in ["LPAD", "RPAD"] {
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0]),
+                "{name}/2 has no pad-string argument to coerce"
+            );
+            assert_eq!(
+                string_position_args(name, 3),
+                StringPositionArgs::Coerce(vec![0, 2]),
+                "{name}/3 must coerce the subject and the pad string, never the length"
+            );
+        }
+    }
+
+    /// `CHR`/`UNICODECHR` (their argument is a genuine integer codepoint) and every
+    /// non-string function are NOT governed — the caller leaves such a node alone and
+    /// never declines on it.
+    #[test]
+    fn string_position_args_not_governed_for_chr_and_non_string_functions() {
+        for name in ["CHR", "UNICODECHR", "ABS", "CASE"] {
+            for arg_count in 0..=3 {
+                assert_eq!(
+                    string_position_args(name, arg_count),
+                    StringPositionArgs::NotGoverned,
+                    "{name}/{arg_count} must not be governed"
+                );
+            }
+        }
+    }
+
+    /// The name is uppercased before matching, so a lowercase `fn_name` resolves
+    /// identically (mirrors `guard_like_subject`'s uppercase-then-look-up convention).
+    #[test]
+    fn string_position_args_matches_lowercase_function_name() {
+        assert_eq!(
+            string_position_args("upper", 1),
+            string_position_args("UPPER", 1),
+            "a lowercase name must resolve like its uppercase form"
+        );
+        assert_eq!(
+            string_position_args("upper", 1),
+            StringPositionArgs::Coerce(vec![0])
+        );
+        assert_eq!(
+            string_position_args("instr", 3),
+            StringPositionArgs::Decline,
+            "a lowercase name must reach the arity decline too"
+        );
+    }
+
+    /// No returned index may address past the end of the argument list — the caller
+    /// indexes `arguments` with them directly.
+    #[test]
+    fn string_position_args_never_returns_out_of_range_index() {
+        let governed = [
+            "CONCAT",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "REPLACE",
+            "TRANSLATE",
+            "LOWER",
+            "UPPER",
+            "ASCII",
+            "INITCAP",
+            "REVERSE",
+            "LENGTH",
+            "OCTET_LENGTH",
+            "UNICODE",
+            "SUBSTR",
+            "REPEAT",
+            "LEFT",
+            "RIGHT",
+            "LPAD",
+            "RPAD",
+            "INSTR",
+            "LOCATE",
+        ];
+        for name in governed {
+            for arg_count in 0..=5 {
+                if let StringPositionArgs::Coerce(indices) = string_position_args(name, arg_count) {
+                    for i in indices {
+                        assert!(
+                            i < arg_count,
+                            "{name}/{arg_count} returned out-of-range index {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `INSTR`/`LOCATE` beyond two arguments decline on ARITY ALONE, whatever the
+    /// argument types: `vs-expression` renders only `args[0]`/`args[1]` and silently
+    /// drops the rest (#228), so coercing index 0 would turn today's loud DataFusion
+    /// error into a silently wrong position. Exactly two arguments coerce both.
+    #[test]
+    fn string_position_args_declines_instr_locate_beyond_two_args() {
+        assert_eq!(
+            string_position_args("INSTR", 3),
+            StringPositionArgs::Decline,
+            "INSTR/3 drops its start-position argument — must decline"
+        );
+        assert_eq!(
+            string_position_args("INSTR", 4),
+            StringPositionArgs::Decline,
+            "INSTR/4 drops its start-position and occurrence arguments — must decline"
+        );
+        assert_eq!(
+            string_position_args("LOCATE", 3),
+            StringPositionArgs::Decline,
+            "LOCATE/3 drops its start-position argument — must decline"
+        );
+        for name in ["INSTR", "LOCATE"] {
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0, 1]),
+                "{name}/2 is rendered faithfully and must coerce both arguments"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // string_function_arg_type_guard — issue #210 string-function argument typing
+    // ---------------------------------------------------------------------------
+
+    fn column(name: &str) -> Json {
+        serde_json::json!({"type": "column", "name": name})
+    }
+
+    fn string_fn(name: &str, args: Vec<Json>) -> Json {
+        serde_json::json!({
+            "type": "function_scalar",
+            "name": name,
+            "arguments": args,
+        })
+    }
+
+    fn trimmed_decimal(name: &str) -> Json {
+        serde_json::json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [column(name)],
+        })
+    }
+
+    fn cast_varchar(name: &str) -> Json {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "VARCHAR"},
+            "arguments": [column(name)],
+        })
+    }
+
+    fn equals(left: Json, right: Json) -> Json {
+        serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
+    }
+
+    /// A non-object node has no children and no function dispatch — passed through.
+    #[test]
+    fn string_fn_guard_passes_through_non_object_node() {
+        let col_types = decimal_rewrite_col_types();
+        for node in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                string_function_arg_type_guard(&node, &col_types),
+                Some(node.clone()),
+                "a non-object node must be passed through: {node}"
+            );
+        }
+    }
+
+    /// Scenario: a string-position VARCHAR or CHAR column argument pushes down
+    /// unchanged — DataFusion needs no help with a genuine string.
+    #[test]
+    fn string_fn_guard_leaves_varchar_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+        for name in ["UPPER", "LOWER", "TRIM", "LTRIM", "CONCAT", "LENGTH"] {
+            let node = string_fn(name, vec![column("name")]);
+            assert_eq!(
+                string_function_arg_type_guard(&node, &col_types),
+                Some(node.clone()),
+                "{name} over a VARCHAR column must be unchanged"
+            );
+        }
+        // CHAR is dispatched by the same `starts_with` prefix pair as VARCHAR.
+        let char_types = vec![("C_CHAR_A".to_string(), "CHAR(10)".to_string())];
+        let node = string_fn("UPPER", vec![column("c_char_a")]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &char_types),
+            Some(node.clone()),
+            "a CHAR column argument must be unchanged"
+        );
+    }
+
+    /// Scenario: a string-position DECIMAL column argument renders through Exasol's
+    /// trimmed decimal-to-string form (#211's `decimal_to_varchar_exasol` node, reused
+    /// verbatim so decimal formatting keeps a single owner). Integer columns arrive as
+    /// `DECIMAL(p,0)` on the wire and are covered by the same branch.
+    #[test]
+    fn string_fn_guard_wraps_decimal_argument_in_trim() {
+        let col_types = decimal_rewrite_col_types();
+
+        let out =
+            string_function_arg_type_guard(&string_fn("UPPER", vec![decimal_column()]), &col_types);
+        assert_eq!(
+            out,
+            Some(string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")])),
+            "UPPER's DECIMAL argument must be wrapped in the trimmed-string node"
+        );
+
+        for name in ["TRIM", "LTRIM"] {
+            assert_eq!(
+                string_function_arg_type_guard(
+                    &string_fn(name, vec![decimal_column()]),
+                    &col_types
+                ),
+                Some(string_fn(name, vec![trimmed_decimal("c_decimal_a")])),
+                "{name}'s DECIMAL argument must be wrapped"
+            );
+        }
+
+        // Integer column (DECIMAL(20,0)) — issue #210's `UPPER(c_custkey)` repro shape.
+        assert_eq!(
+            string_function_arg_type_guard(&string_fn("UPPER", vec![column("id")]), &col_types),
+            Some(string_fn("UPPER", vec![trimmed_decimal("id")])),
+            "an integer DECIMAL(p,0) argument must be wrapped too"
+        );
+
+        // The wrapper is what renders Exasol's shortest form, not a plain CAST.
+        let sql = render_expression_safe(
+            &string_function_arg_type_guard(
+                &string_fn("UPPER", vec![decimal_column()]),
+                &col_types,
+            )
+            .expect("must not decline"),
+        )
+        .expect("must render");
+        assert_eq!(
+            sql,
+            r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', ''))"#,
+            "UPPER over a DECIMAL column must render the trimmed form: {sql}"
+        );
+    }
+
+    /// Scenario: a string-position DATE column argument is wrapped in an explicit
+    /// `CAST(<col> AS VARCHAR)` — DataFusion's Date32→Utf8 cast is `YYYY-MM-DD`, which
+    /// is also Exasol's default `NLS_DATE_FORMAT` (issue #210's `LOWER(l_shipdate)`).
+    #[test]
+    fn string_fn_guard_casts_date_argument_to_varchar() {
+        let col_types = decimal_rewrite_col_types();
+        assert_eq!(
+            string_function_arg_type_guard(&string_fn("LOWER", vec![column("d")]), &col_types),
+            Some(string_fn("LOWER", vec![cast_varchar("d")])),
+            "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: a resolvable but non-coercible column type declines. BOOLEAN, DOUBLE
+    /// and TIMESTAMP all have text forms that differ between the two engines
+    /// (`TRUE`/`true`, the space/`T` separator), so a cast would turn a crash into a
+    /// wrong answer — native Exasol evaluation is the only safe outcome.
+    #[test]
+    fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
+        let col_types = decimal_rewrite_col_types();
+        for col in ["c_bool_a", "c_double_a", "c_ts_a"] {
+            for name in ["UPPER", "TRIM", "CONCAT", "LENGTH"] {
+                assert_eq!(
+                    string_function_arg_type_guard(&string_fn(name, vec![column(col)]), &col_types),
+                    None,
+                    "{name} over {col} must decline"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a string-position argument whose column name does not resolve in
+    /// `col_types` declines fail-safe.
+    #[test]
+    fn string_fn_guard_declines_unresolved_column_name() {
+        let col_types = decimal_rewrite_col_types();
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("UPPER", vec![column("mystery")]),
+                &col_types
+            ),
+            None,
+            "an unresolvable column argument must decline"
+        );
+    }
+
+    /// A `column` node with no `name` field is unresolvable — same fail-safe decline.
+    #[test]
+    fn string_fn_guard_declines_nameless_column_node() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![serde_json::json!({"type": "column"})]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            None,
+            "a nameless column argument must decline"
+        );
+    }
+
+    /// The guard reaches a string function nested under a COMPARISON predicate (under
+    /// `left`) — the reach `like_subject_type_guard`'s junction-only recursion does not
+    /// have, and the shape issue #210's WHERE-clause repro takes.
+    #[test]
+    fn string_fn_guard_reaches_function_under_comparison_predicate() {
+        let col_types = decimal_rewrite_col_types();
+        let node = equals(
+            string_fn("UPPER", vec![decimal_column()]),
+            serde_json::json!({"type": "literal_string", "value": "X"}),
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(equals(
+                string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")]),
+                serde_json::json!({"type": "literal_string", "value": "X"}),
+            )),
+            "a string function under `left` must be coerced"
+        );
+    }
+
+    /// A decline anywhere in the tree propagates to the ROOT, so the caller declines
+    /// the whole filter / select-list item rather than pushing a partially-guarded tree.
+    #[test]
+    fn string_fn_guard_nested_decline_propagates_to_root() {
+        let col_types = decimal_rewrite_col_types();
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                equals(column("name"), serde_json::json!({"type": "literal_string", "value": "X"})),
+                {
+                    "type": "predicate_not",
+                    "expression": equals(
+                        string_fn("UPPER", vec![column("c_double_a")]),
+                        serde_json::json!({"type": "literal_string", "value": "X"})
+                    )
+                }
+            ]
+        });
+        assert_eq!(
+            string_function_arg_type_guard(&filter, &col_types),
+            None,
+            "a nested non-coercible string function must decline the whole tree"
+        );
+    }
+
+    /// Only string-position indices are coerced: `SUBSTR`'s start/length, `REPEAT`'s
+    /// count, `LEFT`/`RIGHT`'s length and `LPAD`'s length stay untouched, while
+    /// `LPAD`'s PAD-STRING argument is coerced. The numeric positions here hold a
+    /// DECIMAL column (`ID`), which WOULD be visibly rewritten if it were passed to
+    /// the type dispatch — a literal int could not tell the two designs apart.
+    #[test]
+    fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
+        let col_types = decimal_rewrite_col_types();
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("SUBSTR", vec![decimal_column(), column("id"), column("id")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "SUBSTR",
+                vec![trimmed_decimal("c_decimal_a"), column("id"), column("id")]
+            )),
+            "SUBSTR's start and length arguments must stay bare columns"
+        );
+
+        for name in ["REPEAT", "LEFT", "RIGHT"] {
+            assert_eq!(
+                string_function_arg_type_guard(
+                    &string_fn(name, vec![decimal_column(), column("id")]),
+                    &col_types
+                ),
+                Some(string_fn(
+                    name,
+                    vec![trimmed_decimal("c_decimal_a"), column("id")]
+                )),
+                "{name}'s numeric argument must stay a bare column"
+            );
+        }
+
+        // LPAD(str, length, pad): index 0 and 2 coerced, index 1 untouched.
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LPAD", vec![decimal_column(), column("id"), column("d")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LPAD",
+                vec![
+                    trimmed_decimal("c_decimal_a"),
+                    column("id"),
+                    cast_varchar("d")
+                ]
+            )),
+            "LPAD must coerce the subject and the pad string, never the length"
+        );
+
+        // A literal-int length is likewise never handed to the type dispatch.
+        let length_literal = serde_json::json!({"type": "literal_exactnumeric", "value": 10});
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LPAD", vec![decimal_column(), length_literal.clone()]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LPAD",
+                vec![trimmed_decimal("c_decimal_a"), length_literal]
+            )),
+            "a 2-argument LPAD must coerce index 0 only"
+        );
+    }
+
+    /// Scenario: `INSTR` and `LOCATE` coerce BOTH of their two arguments. `LOCATE`'s
+    /// render-time argument swap (`LOCATE(sub, str)` → `strpos(str, sub)`) happens
+    /// after this guard, so both indices are string positions in either order.
+    #[test]
+    fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
+        let col_types = decimal_rewrite_col_types();
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("INSTR", vec![decimal_column(), column("d")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "INSTR",
+                vec![trimmed_decimal("c_decimal_a"), cast_varchar("d")]
+            )),
+            "INSTR must coerce both of its arguments"
+        );
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LOCATE", vec![column("d"), decimal_column()]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LOCATE",
+                vec![cast_varchar("d"), trimmed_decimal("c_decimal_a")]
+            )),
+            "LOCATE must coerce both of its arguments"
+        );
+    }
+
+    /// Scenario: `INSTR` with 3 or 4 arguments and `LOCATE` with 3 decline THROUGH THE
+    /// GUARD even when every argument is a VARCHAR column — the arity, not a type, is
+    /// what declines (`vs-expression` drops the extra arguments, #228). The table-level
+    /// counterpart is `string_position_args_declines_instr_locate_beyond_two_args`.
+    #[test]
+    fn string_fn_guard_declines_instr_locate_beyond_two_args() {
+        let col_types = decimal_rewrite_col_types();
+        let start = serde_json::json!({"type": "literal_exactnumeric", "value": 3});
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("INSTR", vec![column("name"), column("name"), start.clone()]),
+                &col_types
+            ),
+            None,
+            "INSTR/3 over VARCHAR arguments must still decline"
+        );
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn(
+                    "INSTR",
+                    vec![column("name"), column("name"), start.clone(), start.clone()]
+                ),
+                &col_types
+            ),
+            None,
+            "INSTR/4 over VARCHAR arguments must still decline"
+        );
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LOCATE", vec![column("name"), column("name"), start]),
+                &col_types
+            ),
+            None,
+            "LOCATE/3 over VARCHAR arguments must still decline"
+        );
+    }
+
+    /// Scenario: `CHR`/`UNICODECHR` are excluded — their single argument is a genuine
+    /// integer codepoint, so it is neither coerced NOR a reason to decline (the
+    /// difference between "not governed" and "declines on a bad argument"). Their
+    /// children are still recursed.
+    #[test]
+    fn string_fn_guard_excludes_chr_and_unicodechr() {
+        let col_types = decimal_rewrite_col_types();
+        for name in ["CHR", "UNICODECHR"] {
+            for arg in ["id", "c_double_a"] {
+                let node = string_fn(name, vec![column(arg)]);
+                assert_eq!(
+                    string_function_arg_type_guard(&node, &col_types),
+                    Some(node.clone()),
+                    "{name}({arg}) must be left completely untouched"
+                );
+            }
+        }
+
+        // ... but a governed function nested INSIDE one is still reached.
+        let nested = string_fn("CHR", vec![string_fn("LENGTH", vec![decimal_column()])]);
+        assert_eq!(
+            string_function_arg_type_guard(&nested, &col_types),
+            Some(string_fn(
+                "CHR",
+                vec![string_fn("LENGTH", vec![trimmed_decimal("c_decimal_a")])]
+            )),
+            "a governed function under CHR must still be coerced"
+        );
+    }
+
+    /// A column name in any letter case resolves — the name is uppercased before the
+    /// `col_types` lookup, mirroring `extract_all_column_types`.
+    #[test]
+    fn string_fn_guard_resolves_case_mismatched_column_name() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![column("C_DeCiMaL_a")]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(string_fn("UPPER", vec![trimmed_decimal("C_DeCiMaL_a")])),
+            "a mixed-case column name must resolve against the uppercase map"
+        );
+    }
+
+    /// A non-bare-column string-position argument (a literal, or a computed
+    /// `c_decimal_a * 2`) is left unchanged and does NOT decline — a deliberate tracked
+    /// exception (#223), mirroring #211's convention for computed arguments.
+    #[test]
+    fn string_fn_guard_leaves_computed_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let literal = string_fn(
+            "UPPER",
+            vec![serde_json::json!({"type": "literal_string", "value": "x"})],
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&literal, &col_types),
+            Some(literal.clone()),
+            "a literal argument must be left unchanged without declining"
+        );
+
+        let computed = string_fn(
+            "UPPER",
+            vec![string_fn(
+                "MULT",
+                vec![
+                    decimal_column(),
+                    serde_json::json!({"type": "literal_exactnumeric", "value": 2}),
+                ],
+            )],
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&computed, &col_types),
+            Some(computed.clone()),
+            "a computed argument must be left unchanged without declining"
+        );
+    }
+
+    /// Post-order: the INNER string function's argument is coerced before the outer
+    /// function's own check runs, so `UPPER(TRIM(c_decimal_a))` coerces the `TRIM`
+    /// argument and leaves the (now non-column) `TRIM` node as UPPER's argument.
+    #[test]
+    fn string_fn_guard_coerces_inner_nested_string_function() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![string_fn("TRIM", vec![decimal_column()])]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(string_fn(
+                "UPPER",
+                vec![string_fn("TRIM", vec![trimmed_decimal("c_decimal_a")])]
+            )),
+            "the inner TRIM's DECIMAL argument must be coerced exactly once"
         );
     }
 }
