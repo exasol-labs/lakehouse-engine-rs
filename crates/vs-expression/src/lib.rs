@@ -819,10 +819,10 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 // has no function of these exact names, or arities, as Exasol).
                 // CONCAT is excluded here — it's rendered by the dedicated arm
                 // above (chained `||`) regardless of dialect.
-                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
-                | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
-                | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
-                | "UNICODE" | "UNICODECHR" | "INSTR" | "LOCATE"
+                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+                | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR" | "INITCAP" | "LEFT"
+                | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH" | "UNICODE" | "UNICODECHR"
+                | "INSTR" | "LOCATE"
                     if dialect == Dialect::Exasol =>
                 {
                     let args = args.ok_or_else(|| {
@@ -832,10 +832,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     Ok(Some(format!("{fn_name}({})", rendered.join(", "))))
                 }
                 // String functions: name-mapping table (DataFusion dialect)
-                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
-                | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
-                | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
-                | "UNICODE" | "UNICODECHR" => {
+                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+                | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR" | "INITCAP" | "LEFT"
+                | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH" | "UNICODE" | "UNICODECHR" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
