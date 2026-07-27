@@ -51,9 +51,7 @@ pub use grouped_agg::{
     GroupedAggregateDetection, GroupedSelectItem, build_grouped_aggregate_scan_sql,
     detect_group_by_aggregates, validate_agg_col_types,
 };
-use grouped_agg::{
-    GroupedOrderBy, build_grouped_order_by_clause, group_key_exasol_types, render_having_over_merge,
-};
+use grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, group_key_exasol_types};
 
 mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
@@ -341,12 +339,13 @@ pub(crate) fn build_dispatch_sql(
     // the empty-result path (`file_resolution::empty_result_sql`), so their output
     // shapes are identical by construction rather than by two hand-synced routing
     // trees. The 3-tier priority (grouped → single-group → row scan), the numeric
-    // gates, and the non-numeric-grouped-with-HAVING decline all live in the
-    // classifier; each arm below renders ONLY its own SQL. The fall-through arms
+    // gates, and the grouped HAVING merge-render — whose failure is a route to
+    // `GroupByWrapper`, not an error — all live in the classifier; each arm below
+    // renders ONLY its own SQL. The fall-through arms
     // (ordinary single-group aggregate, row scan) yield the shared `aggregates`
     // input the row-scan/partial-aggregate rendering below consumes (`Some` ordinary
     // plans for the aggregate sub-path, `None` for a row scan).
-    let aggregates = match classify_request_shape(pushdown_req, &col_types)? {
+    let aggregates = match classify_request_shape(pushdown_req, &col_types) {
         RequestShape::Grouped { detection, having } => {
             let GroupedAggregateDetection {
                 group_keys,
@@ -354,28 +353,12 @@ pub(crate) fn build_dispatch_sql(
                 plan_types: grouped_agg_types,
                 select_items,
             } = detection;
-            // Render the HAVING against the merge decomposition: each aggregate
-            // reference is rewritten to its merged expression (SUM(score) →
-            // SUM("PARTIAL_sum_0")). Applied in the OUTER wrapper only, never in
-            // the per-shard scan. If a HAVING is present but cannot be rendered
-            // over the merge, decline the grouped pushdown (Err) — silently
-            // dropping it would yield wrong results because Exasol will not
-            // re-apply a HAVING we advertised AGGREGATE_HAVING for. This is a
-            // RENDERING decline, distinct from the classifier's routing decline.
-            let having = match having {
-                Some(node) => match render_having_over_merge(node, &grouped_agg_plans) {
-                    Some(sql) => Some(sql),
-                    None => {
-                        return Err(UdfError::User(
-                            "grouped aggregate pushdown declined: HAVING references an \
-                             aggregate that cannot be merged or an unsupported node; \
-                             this is a hard error, not a native re-plan"
-                                .into(),
-                        ));
-                    }
-                },
-                None => None,
-            };
+            // `having` arrives ALREADY rendered over the merge decomposition (each
+            // aggregate reference rewritten to its merged expression, SUM(score) →
+            // SUM("PARTIAL_sum_0")) — the classifier renders it, because a HAVING
+            // that does not render routes to `GroupByWrapper` instead of reaching
+            // this arm.
+
             // Grouped aggregate pushdown path. Once ORDER_BY_COLUMN is advertised,
             // Exasol delegates any ORDER BY on the grouped output and NO LONGER
             // re-sorts the rows the adapter returns (add-topn-pushdown B6), so the

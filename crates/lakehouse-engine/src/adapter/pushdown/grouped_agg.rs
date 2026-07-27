@@ -1119,7 +1119,6 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::scan::spec::CommonScanSpec;
-    use vs_expression::render_expression_safe;
 
     /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
     /// CHAR/VARCHAR target must render the CAST target LENGTH-QUALIFIED
@@ -2921,7 +2920,8 @@ mod tests {
     /// A HAVING referencing an aggregate that is NOT present among the plans
     /// (e.g. `COUNT(*)` when only `SUM(score)` was projected) cannot be merged,
     /// so `render_having_over_merge` returns None — the signal for
-    /// `handle_pushdown` to DECLINE the pushdown rather than drop the HAVING.
+    /// `classify_request_shape` to route the request to `RequestShape::GroupByWrapper`
+    /// rather than drop the HAVING.
     #[test]
     fn render_having_over_merge_declines_unknown_aggregate() {
         let having = serde_json::json!({
@@ -3384,86 +3384,6 @@ mod tests {
         assert!(
             sql.contains("GREATEST"),
             "stddev_samp must keep GREATEST rounding guard: {sql}"
-        );
-    }
-
-    /// Regression: HAVING is present + grouped-path type-validation fails.
-    ///
-    /// Before the fix, `handle_pushdown` would fall through to the row-scan path
-    /// and silently discard the HAVING predicate — yielding wrong results because
-    /// the adapter advertised `AGGREGATE_HAVING` so Exasol does not re-apply it.
-    ///
-    /// This test proves the two components that the guard in `handle_pushdown`
-    /// relies on: (a) HAVING renders to `Some` for this request, and (b) type
-    /// validation fails for SUM over a non-numeric column. Together they mean the
-    /// guard `if having.is_some() && !validate_agg_col_types(...)` triggers and
-    /// the function returns an error instead of falling through.
-    #[test]
-    fn having_present_and_grouped_type_validation_fails_conditions_hold() {
-        // Pushdown request: GROUP BY aggregate with SUM over VARCHAR (non-numeric)
-        // and a simple HAVING predicate (column > literal — translatable by render_expression_safe).
-        //
-        // A HAVING with `function_aggregate` is NOT translatable by vs_expression, so we use a
-        // plain column comparison to exercise the "having renders to Some" side of the invariant.
-        let request = serde_json::json!({
-            "involvedTables": [{
-                "columns": [
-                    {"name": "REGION", "dataType": {"type": "VARCHAR", "size": 100}},
-                    {"name": "LABEL",  "dataType": {"type": "VARCHAR", "size": 50}},
-                    {"name": "SCORE",  "dataType": {"type": "DOUBLE"}},
-                ]
-            }],
-            "pushdownRequest": {
-                "aggregationType": "group_by",
-                "groupBy": [{"type": "column", "name": "REGION"}],
-                "selectList": [
-                    {"type": "column", "name": "REGION"},
-                    {
-                        "type": "function_aggregate",
-                        "name": "SUM",
-                        "arguments": [{"type": "column", "name": "LABEL"}]
-                    }
-                ],
-                "having": {
-                    "type": "predicate_greater",
-                    "left":  {"type": "column", "name": "SCORE"},
-                    "right": {"type": "literal_exactnumeric", "value": "100"}
-                }
-            }
-        });
-        let pushdown_req = request["pushdownRequest"].clone();
-        let col_types = extract_all_column_types(&request);
-
-        // (a) detect_group_by_aggregates must find a grouped path.
-        let detected = detect_group_by_aggregates(&pushdown_req);
-        assert!(
-            detected.is_some(),
-            "test setup: must detect grouped aggregates"
-        );
-        let grouped_plans = detected.unwrap().plans;
-
-        // (b) validate_agg_col_types must fail (SUM over VARCHAR is invalid).
-        assert!(
-            !validate_agg_col_types(&grouped_plans, &col_types),
-            "type validation must fail for SUM(VARCHAR)"
-        );
-
-        // (c) HAVING must render to Some — confirming it would be dropped without the guard.
-        let having = pushdown_req
-            .get("having")
-            .filter(|h| !h.is_null())
-            .and_then(render_expression_safe);
-        assert!(
-            having.is_some(),
-            "HAVING must render to Some — without the guard it would be silently dropped"
-        );
-
-        // Both conditions simultaneously: this is exactly the state that triggers the
-        // guard `if having.is_some() && !validate_agg_col_types(...)` in handle_pushdown.
-        // When both hold, handle_pushdown returns Err (not Ok with dropped HAVING).
-        assert!(
-            having.is_some() && !validate_agg_col_types(&grouped_plans, &col_types),
-            "guard condition must hold: having present AND type validation failed"
         );
     }
 

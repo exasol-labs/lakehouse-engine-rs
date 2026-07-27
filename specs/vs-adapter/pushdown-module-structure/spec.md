@@ -9,6 +9,26 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * `crate::adapter::pushdown` becomes a directory module (`pushdown/mod.rs` plus sibling files), so the import path `crate::adapter::pushdown::<name>` is unchanged for every consumer.
 * A cross-submodule private helper widens to the narrowest visibility that compiles (`pub(super)`), never to a broader public than it had before.
 * The CI/lint file-size guardrail (the second half of issue #129) is out of scope for this feature and remains open under issue #129.
+* This delta amends one clause set of the shared-classifier scenario: the classifier now
+  resolves the grouped HAVING's merge-rendering as part of the routing decision, and returns
+  the rendered fragment instead of the raw `having` node. Every other module-structure
+  scenario is unchanged.
+* The reason the rendering moves into the classifier is a routing reason, not a rendering
+  one: whether the HAVING can be rewritten over the `PARTIAL_*` merge columns decides WHICH
+  shape is available (partial/merge grouped, or the qualified single-table wrapper), so the
+  decision cannot be deferred to a path that has already committed to one shape. See
+  `vs-adapter/pushdown-planning-grouped-agg` for the fallback behavior this enables
+  (issue #195).
+* Each path still renders its own SQL: the non-empty dispatch path splices the classifier's
+  rendered HAVING fragment into the outer merge wrapper without re-rendering it, and the
+  empty path ignores it because a zero-row result satisfies any HAVING.
+* One rendering-level decline remains in the dispatcher — a grouped ORDER BY whose sort key
+  resolves to no grouped output column — because it does not change the reachable shape set.
+* This delta also removes the classifier's LAST grouped-tier hard error, the non-numeric
+  aggregate column type carrying a HAVING. It rested on the same disproven premise: the
+  qualified single-table wrapper renders the HAVING natively, so nothing is dropped. Both
+  grouped declines — gate failure and unmergeable HAVING — now share the one fall-through exit
+  to the wrapper, so the grouped tier returns `Ok` for every input.
 
 ## Scenarios
 
@@ -56,5 +76,8 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * *WHEN* the adapter plans a pushdown request, whether data files remain or every file is pruned
 * *THEN* the request shape SHALL be computed once by one shared classifier that both paths consume
 * *AND* each path SHALL render only its own SQL from the shared decision — the non-empty path its scan-driving SQL, the empty path its shape-correct empty response
-* *AND* a non-numeric grouped aggregate carrying a HAVING SHALL surface the same hard-error decline on both paths
-* *AND* the scan-driving SQL and the empty-result response MUST each be byte-identical to their pre-refactor output
+* *AND* the classifier SHALL additionally resolve the grouped HAVING's merge-rendering, because an unmergeable HAVING removes the partial/merge grouped shape from the reachable set and so is a routing decision, and SHALL carry the rendered HAVING fragment on the grouped shape it returns
+* *AND* the non-empty dispatch path SHALL splice that rendered fragment into its outer merge wrapper WITHOUT re-rendering it, and MUST NOT retain its own HAVING-rendering decline, so exactly one place decides whether a HAVING can be merged
+* *AND* the classifier SHALL raise NO grouped-tier hard error at all: a grouped request that does not decompose — for any reason, including a non-numeric aggregate column type whether or not a HAVING is present — SHALL fall through to the qualified single-table wrapper shape on both paths, because that wrapper renders the HAVING itself rather than dropping it
+* *AND* a grouped request whose HAVING cannot be merged SHALL surface the same qualified-single-table-wrapper shape on both paths — the scan-driving wrapper SQL on the non-empty path, the typed zero-row wrapper shape on the empty path
+* *AND* the scan-driving SQL and the empty-result response for every request whose HAVING merges unchanged MUST each remain byte-identical to their pre-delta output

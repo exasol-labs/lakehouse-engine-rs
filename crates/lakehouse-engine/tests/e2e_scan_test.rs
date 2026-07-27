@@ -2193,17 +2193,42 @@ fn test_group_by_expr_key_after_agg() {
     );
 }
 
-/// Aggregate-first GROUP BY combined with HAVING — exercises the HAVING-present
-/// outer-wrapper path with the aggregate ahead of the group key in the select
-/// list: `SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4) HAVING SUM(score) > n`.
+/// Aggregate-first GROUP BY combined with HAVING — covers four HAVING shapes
+/// against the same EVENTS fixture (per-group `SUM(score)` = {0: 300.0, 1:
+/// 225.0, 2: 250.0, 3: 275.0}; 5 rows per `MOD(id,4)` group, 20 rows total,
+/// seeded `name` values `event-01`..`event-20`, all unique):
 ///
-/// Group sums (from `test_group_by_agg_before_key`): {0: 300.0, 1: 225.0, 2:
-/// 250.0, 3: 275.0}. HAVING SUM(score) > 250.0 keeps groups 0 and 3 only.
+/// 1. **Matched control** — `SELECT SUM(score), MOD(id,4) ... HAVING
+///    SUM(score) > 250.0`, the aggregate ahead of the group key in the select
+///    list. The HAVING aggregate is selected, so this decomposes into the
+///    accelerated grouped partial/merge pushdown.
+/// 2. **Unmatched aggregate** (issue #195) — `SELECT MOD(id,4), COUNT(*) ...
+///    HAVING SUM(score) > 250.0`. `SUM(score)` is not in the select list, so
+///    `render_having_over_merge` cannot rewrite it over the merge; the request
+///    falls back to the qualified single-table wrapper (`LHS_T0`) instead of
+///    hard-erroring at `EXPLAIN VIRTUAL` time.
+/// 3. **Mixed AND junction** — same select list, `HAVING COUNT(*) > 0 AND
+///    SUM(score) > 250.0`. Only one conjunct matches a selected aggregate;
+///    the whole junction is unrenderable over the merge, so this also falls
+///    back to the wrapper.
+/// 4. **`COUNT(DISTINCT)` in HAVING** (issue #195's own repro shape) —
+///    `HAVING COUNT(DISTINCT name) > 4`/`> 5`. `parse_agg_item` rejects
+///    `distinct: true` unconditionally, so this is a third route to the same
+///    unrenderable-HAVING fallback. All `name` values are unique per group of
+///    5, so every group has exactly 5 distinct names: `> 4` keeps all 4
+///    groups and `> 5` keeps none — the pair that proves the HAVING was
+///    actually applied rather than silently dropped (a dropped HAVING would
+///    return all 4 groups for both thresholds).
+///
+/// Cases 2 and 3 assert the fallback shape inline via `explain_virtual_sql`:
+/// the pushed SQL must contain `LHS_T0` and must not contain `PARTIAL_`.
 #[test]
 fn test_group_by_agg_first_with_having() {
     setup_e2e();
     let mut conn = exa_conn();
 
+    // Case 1: matched control — HAVING aggregate is selected, decomposes into
+    // the accelerated grouped pushdown. Unchanged from before this fix.
     let sql = format!(
         "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
         vs_table()
@@ -2240,6 +2265,124 @@ fn test_group_by_agg_first_with_having() {
             "group key {key}: SUM(score) must satisfy HAVING > 250.0, got {sum}"
         );
     }
+
+    // Case 2: unmatched aggregate — SUM(score) is not selected, so the merge
+    // rewrite cannot find it. MUST succeed via the wrapper fallback, not error.
+    let unmatched_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
+        vs_table()
+    );
+    let unmatched_pushed_sql = explain_virtual_sql(&mut conn, &unmatched_sql);
+    assert!(
+        unmatched_pushed_sql.contains("LHS_T0"),
+        "unmatched-aggregate HAVING must fall back to the qualified single-table \
+         wrapper (pushed SQL must contain 'LHS_T0'), got:\n{unmatched_pushed_sql}"
+    );
+    assert!(
+        !unmatched_pushed_sql.contains("PARTIAL_"),
+        "unmatched-aggregate HAVING must NOT use the accelerated grouped \
+         partial/merge pushdown (pushed SQL must not contain 'PARTIAL_'), \
+         got:\n{unmatched_pushed_sql}"
+    );
+
+    let unmatched_cols = conn.query_columns(&unmatched_sql);
+    assert_eq!(
+        unmatched_cols.len(),
+        2,
+        "expected 2 columns (key, count): {unmatched_cols:?}"
+    );
+    let mut unmatched_pairs: Vec<(i64, i64)> = unmatched_cols[0]
+        .iter()
+        .zip(unmatched_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    unmatched_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        unmatched_pairs,
+        vec![(0i64, 5i64), (3, 5)],
+        "unmatched-aggregate HAVING must keep exactly groups 0 and 3, each with \
+         COUNT(*) = 5: {unmatched_pairs:?}"
+    );
+
+    // Case 3: mixed AND junction — one conjunct matches a selected aggregate,
+    // the other does not. The whole junction is unrenderable over the merge,
+    // so this must also fall back to the wrapper with the same result.
+    let mixed_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(*) > 0 AND SUM(score) > 250.0",
+        vs_table()
+    );
+    let mixed_pushed_sql = explain_virtual_sql(&mut conn, &mixed_sql);
+    assert!(
+        mixed_pushed_sql.contains("LHS_T0"),
+        "mixed-junction HAVING must fall back to the qualified single-table \
+         wrapper (pushed SQL must contain 'LHS_T0'), got:\n{mixed_pushed_sql}"
+    );
+    assert!(
+        !mixed_pushed_sql.contains("PARTIAL_"),
+        "mixed-junction HAVING must NOT use the accelerated grouped \
+         partial/merge pushdown (pushed SQL must not contain 'PARTIAL_'), \
+         got:\n{mixed_pushed_sql}"
+    );
+
+    let mixed_cols = conn.query_columns(&mixed_sql);
+    assert_eq!(
+        mixed_cols.len(),
+        2,
+        "expected 2 columns (key, count): {mixed_cols:?}"
+    );
+    let mut mixed_pairs: Vec<(i64, i64)> = mixed_cols[0]
+        .iter()
+        .zip(mixed_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    mixed_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        mixed_pairs,
+        vec![(0i64, 5i64), (3, 5)],
+        "mixed-junction HAVING must keep exactly groups 0 and 3, each with \
+         COUNT(*) = 5: {mixed_pairs:?}"
+    );
+
+    // Case 4: COUNT(DISTINCT) in HAVING (issue #195's own repro shape). Every
+    // group has exactly 5 distinct `name` values, so `> 4` keeps all 4 groups
+    // and `> 5` keeps none — the pair that proves the HAVING was applied.
+    let distinct_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(DISTINCT name) > 4",
+        vs_table()
+    );
+    let distinct_cols = conn.query_columns(&distinct_sql);
+    assert_eq!(
+        distinct_cols.len(),
+        2,
+        "expected 2 columns (key, count): {distinct_cols:?}"
+    );
+    let mut distinct_pairs: Vec<(i64, i64)> = distinct_cols[0]
+        .iter()
+        .zip(distinct_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    distinct_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        distinct_pairs,
+        vec![(0i64, 5i64), (1, 5), (2, 5), (3, 5)],
+        "COUNT(DISTINCT name) > 4 must keep all 4 groups, each with COUNT(*) = 5: \
+         {distinct_pairs:?}"
+    );
+
+    let distinct_zero_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(DISTINCT name) > 5",
+        vs_table()
+    );
+    assert_eq!(
+        conn.query_row_count(&distinct_zero_sql),
+        0,
+        "COUNT(DISTINCT name) > 5 must keep zero groups (every group has \
+         exactly 5 distinct names) — a non-zero result here would mean the \
+         HAVING was silently dropped rather than applied"
+    );
 }
 
 /// Expression-valued multi-key tuple GROUP BY — every key element is itself an

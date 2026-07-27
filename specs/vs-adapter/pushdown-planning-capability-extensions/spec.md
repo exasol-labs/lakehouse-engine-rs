@@ -17,6 +17,52 @@ translator or aggregate planner with a shard-associative partial/merge path.
   the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
   `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, the divergent date
   functions, and the bitwise operator functions do not and stay unadvertised.
+* This delta corrects one recorded claim, and only that claim: that a HAVING the adapter
+  cannot render is omitted from the returned SQL and re-applied by Exasol as a correctness
+  backstop. No such behavior exists, and relying on it would return wrong rows.
+* No code path omits a HAVING. The adapter has exactly two HAVING renderers, and neither
+  omits: `grouped_agg.rs::render_having_over_merge` (the partial/merge path) and
+  `joins/sql_builders.rs::qualified_join_having` (the qualified-wrapper and N-scan join path,
+  which raises `UdfError::User` on an unrenderable HAVING). The "omitted and retained by
+  Exasol" clause therefore described behavior that was never implemented, so no code can rely
+  on it regardless of how Exasol behaves.
+* The adapter's own code asserts the corrected HAVING rule in six places — `request_shape.rs`
+  lines 16, 70, and 85; `grouped_agg.rs` line 3394; `file_resolution.rs` line 1480; and
+  `mod.rs` line 363 — all stating that Exasol will not re-apply a HAVING the adapter advertised
+  `AGGREGATE_HAVING` for (`capabilities.rs` line 171). The recorded spec was the outlier.
+* Exasol's re-apply behavior varies by pushed shape, which is itself a reason no unrenderable
+  clause may depend on it. Live precedent under `add-topn-pushdown` B5/B6 (issues #225 / #189):
+  an `orderBy` pushed TOGETHER with a `limit` is fully delegated — Exasol re-applies neither, so
+  the withheld-limit fallback returned wrong, unsorted, unbounded rows and the adapter now
+  renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449, `mod.rs` lines
+  690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol keeps its own
+  top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs` lines 1133-1138).
+* The LIMIT half of the same comparison is false for the same reason as the HAVING half: no code
+  path omits an observable LIMIT, so there is nothing for an Exasol backstop to restore. The
+  adapter renders it everywhere it is observable — the grouped path passes `limit` straight
+  through (`mod.rs` line 405), and the row-scan declined-ORDER-BY path re-renders it in the outer
+  wrapper via `wrap_declined_order_by(…, limit)` (`mod.rs` lines 707-711). The single place
+  `effective_limit` drops it (`mod.rs` line 594, when an ORDER BY was pushed that the adapter did
+  not render) is structurally unreachable for the one shape it applies to, the single-group
+  aggregate: the adapter advertises `ORDER_BY_COLUMN` and NOT `ORDER_BY_EXPRESSION`
+  (`capabilities.rs` lines 45-46), so Exasol pushes an `orderBy` only over a bare projected
+  column, and a single-group aggregate's output has no bare column to sort on. Exasol therefore
+  never pushes an `orderBy` for that shape, so the drop site never executes — for ANY limit value,
+  `LIMIT 0` included.
+* This delta asserts nothing new about `ORDER_BY_COLUMN`. It deletes the false HAVING and LIMIT
+  comparison from the ORDER BY scenario's reliance clause and leaves that clause's ORDER BY
+  reliance exactly as recorded, so `vs-adapter/pushdown-planning-topn` — whose "Unsupported
+  ordered-query shapes decline the ordered-top-N path" scenario records the same ORDER BY
+  reliance for the same trigger set, and which makes no LIMIT-backstop claim of its own — needs
+  no amendment and is deliberately left untouched.
+* The correct handling for a HAVING the adapter cannot render over the partial/merge
+  decomposition is therefore neither omission nor an error: route the request to the qualified
+  single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows.
+  See `vs-adapter/pushdown-planning-grouped-agg` (issue #195).
+* This delta does NOT adjudicate the WHERE-filter backstop. An untranslatable WHERE predicate
+  is genuinely omitted from the scan spec (`vs_expression::render_df_filter_safe` returns
+  `None`), a distinct mechanism with its own capability story; the Background statement about
+  filter and select-list expressions stands as recorded. Only the HAVING claim is corrected.
 
 ## Scenarios
 
@@ -31,12 +77,13 @@ translator or aggregate planner with a shard-associative partial/merge path.
 
 ### Scenario: HAVING predicate is pushed into the grouped scan plan
 
-* *GIVEN* a grouped aggregate `pushdown` request carrying a `having` predicate over the grouped aggregates and/or group keys
+* *GIVEN* a grouped aggregate `pushdown` request carrying a `having` predicate over the grouped aggregates and group keys
 * *AND* the adapter advertises `AGGREGATE_HAVING`
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL render the HAVING predicate to a DataFusion SQL fragment using the same VS expression translator path used for WHERE predicates
 * *AND* the adapter SHALL apply the rendered HAVING predicate only in the OUTER wrapper SQL that merges the per-shard partial-aggregate rows, never inside the per-shard partial scan (a per-shard HAVING would discard groups that only meet the threshold after merge)
-* *AND* a HAVING predicate the adapter cannot translate SHALL be omitted from the wrapper SQL and retained by Exasol as a correctness backstop rather than producing an incorrect result
+* *AND* the adapter MUST NOT omit a HAVING it cannot render from the returned SQL, because Exasol does not re-apply a HAVING whose `AGGREGATE_HAVING` capability the adapter advertises — omission returns wrong rows
+* *AND* a HAVING the adapter cannot render over the partial/merge decomposition SHALL instead route the request to the qualified single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows so the predicate is preserved rather than dropped (see `vs-adapter/pushdown-planning-grouped-agg`, issue #195)
 
 ### Scenario: Decomposable statistical aggregate is pushed down via sufficient statistics
 
@@ -86,7 +133,7 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, or a request that also carries aggregates / group keys / a `having`)
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL fall back to the pre-existing scan plan for that shape without pushing a per-shard row limit ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-* *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows, exactly as it already retains a `LIMIT` and a `HAVING` it pushed as a correctness backstop
+* *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows
 
 ### Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
 
