@@ -66,6 +66,6 @@ Free and open-source. Community-supported. Licensed under [MIT](LICENSE).
 
 <div align="center">
 
-Built with Rust 🦀 for Exasol. Maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
+Built with Rust 🦀 and made with ❤️. Maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
 
 </div>
