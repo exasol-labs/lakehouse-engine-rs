@@ -1,10 +1,10 @@
 //! Golden dispatch-SQL baseline (issue #175 / plan
 //! `refactor-scan-spec-dispatch-dedup`, task 1.2).
 //!
-//! Nine committed fixtures under `testdata/dispatch_golden/` — five non-empty
+//! Ten committed fixtures under `testdata/dispatch_golden/` — five non-empty
 //! dispatch shapes rendered through the production [`build_dispatch_sql`] seam,
-//! and four empty shapes rendered through [`empty_result_sql`] — captured from
-//! the pre-dedup code. Every subsequent dedup task (2-5) MUST leave these nine
+//! and five empty shapes rendered through [`empty_result_sql`] — captured from
+//! the pre-dedup code. Every subsequent dedup task (2-5) MUST leave these ten
 //! fixtures byte-identical; a diff here is a regression, never an expected
 //! update. Every assertion is a full-string `assert_eq!` against the committed
 //! file — never `.contains(...)` or `.matches(...).count()`.
@@ -63,6 +63,20 @@ fn grouped_request() -> Json {
             {"type": "decimal", "precision": 36, "scale": 2},
         ],
     }))
+}
+
+/// `grouped_request()` plus a HAVING (`COUNT(*) > 0`) that matches no plan in
+/// its select list (only `SUM(AMOUNT)` is projected) — unrenderable over the
+/// merge, so it falls through to `RequestShape::GroupByWrapper` rather than
+/// staying `Grouped` (issue #195).
+fn unmergeable_having_request() -> Json {
+    let mut req = grouped_request();
+    req["pushdownRequest"]["having"] = serde_json::json!({
+        "type": "predicate_greater",
+        "left": agg_item("COUNT", None, false),
+        "right": {"type": "literal_exactnumeric", "value": 0},
+    });
+    req
 }
 
 /// Group-by fallback shape: `GROUP BY REGION`, `SUM(NAME)` where `NAME` is
@@ -308,6 +322,32 @@ fn empty_group_by_wrapper_matches_golden() {
     let actual = empty_sql(&group_by_fallback_request(), &[], &[]);
     let expected = include_str!("testdata/dispatch_golden/empty_group_by_wrapper.sql");
     assert_eq!(actual, expected);
+}
+
+/// An unmergeable HAVING (`COUNT(*) > 0` over a select list that only
+/// projects `SUM(AMOUNT)`) routes the empty path to the SAME `GroupByWrapper`
+/// shape the non-empty path commits to (issue #195), not the plain `Grouped`
+/// empty shape its HAVING-less sibling `grouped_request()` produces.
+///
+/// Both empty renderers type every column from `selectListDataTypes` at the
+/// same select-list index, so for this fixture (a plain group-key + one
+/// aggregate select list) their output is byte-identical — the golden text
+/// alone cannot distinguish `Grouped` from `GroupByWrapper`. The
+/// `classify_request_shape` assertion below is the actual regression guard.
+#[test]
+fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
+    let request = unmergeable_having_request();
+    let actual = empty_sql(&request, &[], &[]);
+    let expected = include_str!("testdata/dispatch_golden/empty_unmergeable_having.sql");
+    assert_eq!(actual, expected);
+
+    let pushdown_req = pd(&request);
+    let shape = classify_request_shape(&pushdown_req, &base_col_types());
+    assert!(
+        matches!(shape, RequestShape::GroupByWrapper),
+        "an unmergeable HAVING must route to GroupByWrapper, not stay classified as \
+         Grouped: {shape:?}"
+    );
 }
 
 /// Empty single-group-aggregate result SQL stays byte-identical to the
