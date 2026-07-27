@@ -4,13 +4,7 @@
 
 # Capability Support Overview
 
-Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates across
-shards and handles anything not pushed down.** These capabilities are identical for every table,
-whatever [catalog backend](catalogs.md) it lives in. A capability is advertised only if the VS can
-translate it (via the vs-expression translator) or decompose it into a correct partial/merge plan.
-Source of truth: `crates/lakehouse-engine/src/adapter/capabilities.rs`. For *how* the per-shard and
-parent-level split works, see [Architecture](architecture.md); the [docs index](index.md) lists the
-full guide set.
+Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates across shards and handles anything not pushed down.** These capabilities are identical for every table, whatever [catalog backend](catalogs.md) it lives in. A capability is advertised only if the adapter can translate it or decompose it into a correct partial/merge plan. For *how* the per-shard and parent-level split works, see [Architecture](architecture.md); the [docs index](index.md) lists the full guide set.
 
 ## Projection & expressions ✅
 

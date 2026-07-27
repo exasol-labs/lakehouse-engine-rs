@@ -26,15 +26,16 @@ GROUP BY l_returnflag;
 | Guide | What it covers |
 |-------|----------------|
 | [Install](install.md) | One-command install for Exasol SaaS, an automated two-command path for self-managed Exasol, and a manual curl/SQL fallback for restricted networks. Deploy the `.so`, register the Rust SLC, create the scripts, then point a Virtual Schema at your data. |
-| [Catalogs](catalogs.md) | Connect to Iceberg REST, AWS Glue, Lakekeeper, and Databricks Unity catalogs: CONNECTION objects, credentials, and object-storage access, with a tested-status callout per catalog. |
+| [Catalogs](catalogs.md) | Connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs: CONNECTION objects, credentials, and object-storage access. |
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
 | [Tuning](tuning.md) | Configuration parameters reference and runtime telemetry. |
+| [Debugging pushdown](debugging-pushdown.md) | Inspect exactly what the adapter pushes down for a query, using `EXPLAIN VIRTUAL`. |
 
 ## Start here
 
-- **Deploying for the first time?** Follow [Install](install.md), then [Catalogs](catalogs.md)
-  to point the VS at your data.
+- **Deploying for the first time?** Follow [Install](install.md), then [Catalogs](catalogs.md) to point the VS at your data.
 - **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
 - **Tuning a running deployment?** See [Capabilities](capabilities.md) and [Tuning](tuning.md).
+- **A query isn't pushing down the way you expect?** See [Debugging pushdown](debugging-pushdown.md).

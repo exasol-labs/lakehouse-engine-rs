@@ -4,17 +4,11 @@
 
 # Benchmark queries
 
-This page documents the **benchmark query set** so you can inspect and reproduce it. The suite is a
-TPC-H-derived set of 15 queries, each written to exercise a specific pushdown path (projection,
-filter, LIMIT, Top-N, single-group and GROUP BY aggregation, COUNT(DISTINCT), arithmetic-argument
-aggregates, and 3- and 4-way joins). It runs the full VS query path against a live system.
+This page documents the **benchmark query set** so you can inspect and reproduce it. The suite is a TPC-H-derived set of 15 queries, each written to exercise a specific pushdown path (projection, filter, LIMIT, Top-N, single-group and GROUP BY aggregation, COUNT(DISTINCT), arithmetic-argument aggregates, and 3- and 4-way joins). It runs the full VS query path against a live system.
 
 This page documents the query set only; it carries no timing or scaling numbers.
 
-The canonical queries live in [`bench/run.sh`](../bench/run.sh). Dialect-translated copies for
-cross-engine comparison exist in `bench/athena_compare.sh`, `bench/trino_compare.sh`,
-`bench/import_jdbc_trino.sh`, and `deploy/scripts/spark_queries.py`; the VS-dialect versions below
-are the source of truth. `${VS}` is the virtual schema name (the bench creates it as `TPCH`).
+The canonical queries live in [`bench/run.sh`](../bench/run.sh); dialect-translated copies exist for comparing against other engines. `${VS}` is the virtual schema name (the bench creates it as `TPCH`).
 
 ## Running it yourself
 
@@ -23,14 +17,10 @@ make bench                  # build the .so, run the suite, write bench/reports/
 ./bench/run.sh selftest      # offline self-check of the script's string logic (no DB needed)
 ```
 
-Configuration comes from a gitignored `bench/.env` (copy `bench/.env.example`). `BENCH_TARGET`
-picks the mode and defaults to `docker`:
+Configuration comes from a gitignored `bench/.env` (copy `bench/.env.example`). `BENCH_TARGET` picks the mode and defaults to `docker`:
 
-- **`docker` (default)** - self-contained. `docker compose up -d` brings up MinIO, an Iceberg REST
-  catalog, and Exasol; TPC-H is loaded into the local catalog by a cargo test binary
-  (`tpch_loader.rs`). No AWS and no `.env` are needed.
-- **`remote`** - runs against a real AWS Glue catalog and an external Exasol cluster. TPC-H must be
-  pre-loaded into Glue by the operator; remote mode never loads data. Required `.env` variables:
+- **`docker` (default)** — self-contained. `docker compose up -d` brings up MinIO, an Iceberg REST catalog, and Exasol; TPC-H is loaded into the local catalog automatically. No AWS and no `.env` are needed.
+- **`remote`** — runs against a real AWS Glue catalog and an external Exasol cluster. TPC-H must be pre-loaded into Glue by the operator; remote mode never loads data. Required `.env` variables:
 
   ```
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
@@ -38,13 +28,9 @@ picks the mode and defaults to `docker`:
   EXASOL_HOST, EXASOL_SYS_PASSWORD, BUCKETFS_WRITE_PASS
   ```
 
-Other knobs include `BENCH_WITH_DELETES` (re-run against 5%-position-deleted Iceberg v2
-merge-on-read copies), `BENCH_NR_OF_CORES`, `BENCH_PARALLELISM_FACTOR`, the `BENCH_DF_*` DataFusion
-threading knobs, and `BENCH_S3_MAX_CONNECTIONS`. For the full knob reference and how to interpret a
-run's output, see [`bench/README.md`](../bench/README.md).
+Other knobs include `BENCH_WITH_DELETES` (re-run against 5%-position-deleted Iceberg v2 merge-on-read copies), `BENCH_NR_OF_CORES`, `BENCH_PARALLELISM_FACTOR`, the `BENCH_DF_*` DataFusion threading knobs, and `BENCH_S3_MAX_CONNECTIONS`. For the full knob reference and how to interpret a run's output, see [`bench/README.md`](../bench/README.md).
 
-Each run writes a timestamped report to `bench/reports/<name>-<ts>.txt`. Those reports are
-gitignored and never committed; run the suite yourself to produce your own.
+Each run writes a timestamped report to `bench/reports/<name>-<ts>.txt`. Those reports are gitignored and never committed; run the suite yourself to produce your own.
 
 ## Query catalog
 
@@ -229,9 +215,7 @@ ORDER BY O_ORDERPRIORITY, O_ORDERSTATUS;
 
 ## Example remote catalog config
 
-For `BENCH_TARGET=remote`, `bench/.env` points the suite at an AWS Glue Iceberg REST catalog and an
-external Exasol cluster. The values below are placeholders; substitute your own. `GLUE_WAREHOUSE` is
-the Glue catalog id (your AWS account id), not an `s3://` path.
+For `BENCH_TARGET=remote`, `bench/.env` points the suite at an AWS Glue Iceberg REST catalog and an external Exasol cluster. The values below are placeholders; substitute your own. `GLUE_WAREHOUSE` is the Glue catalog id (your AWS account id), not an `s3://` path.
 
 ```bash
 BENCH_TARGET=remote
@@ -254,10 +238,8 @@ EXASOL_SYS_PASSWORD=<your-sys-password>
 BUCKETFS_WRITE_PASS=<your-bucketfs-write-password>
 ```
 
-If your deployment reaches the cluster over SSH, use a generic profile and key placeholder such as
-`<your-aws-profile>` and `<your-key-file>`; never commit real credentials or account ids.
+If your deployment reaches the cluster over SSH, use a generic profile and key placeholder such as `<your-aws-profile>` and `<your-key-file>`; never commit real credentials or account ids.
 
 ---
 
-Run the suite yourself with `make bench` to produce timing, scaling, and overhead numbers for
-your own environment; none are published here.
+Run the suite yourself with `make bench` to produce timing, scaling, and overhead numbers for your own environment; none are published here.

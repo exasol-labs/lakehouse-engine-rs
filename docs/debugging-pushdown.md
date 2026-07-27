@@ -1,38 +1,45 @@
-# Debugging: capturing what the adapter pushes down for a SQL statement
+[lakehouse-engine](../README.md) › [Docs](index.md) › Debugging pushdown
 
-`scripts/capture-pushdown-payload.sh` runs a caller-supplied SQL statement
-against the local Exasol + MinIO + Iceberg REST Docker stack and prints:
+---
 
-1. `EXPLAIN VIRTUAL` output — the SQL the adapter generates, including the
-   literal scan-spec JSON (filter/projection/limit) passed to the scan UDF.
-2. The real execution result — actual rows, or the actual runtime error text.
+# Debugging pushdown
 
-This replaces re-deriving throwaway instrumentation each time a pushdown bug
-needs a ground-truth payload (see commit `c827d1a` for the last one-off spike
-this makes unnecessary).
+When a query doesn't seem to push down the way [Capabilities](capabilities.md) says it should, `EXPLAIN VIRTUAL` is the tool: it shows exactly what the adapter generated for that statement, without running it.
 
-## Usage
+## Inspect what the adapter pushes down
+
+Run `EXPLAIN VIRTUAL` against your own Virtual Schema and query:
+
+```sql
+EXPLAIN VIRTUAL
+SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
+```
+
+The output includes the scan-spec JSON the adapter passed to the scan UDF — the literal projection, filter, and limit it decided to push down. Compare that against what you expected from [Capabilities](capabilities.md):
+
+- A predicate missing from the scan spec means it wasn't translated, so Exasol is filtering it after the scan instead of before. Check it against the [filter capability list](capabilities.md#filtering-) — an untranslatable expression shape (e.g. a function not listed there) is the usual cause.
+- A wider projection than expected means a column made it into the scan spec that your `SELECT` didn't ask for — check for a `WHERE`/`ORDER BY`/`GROUP BY` reference that implicitly requires it.
+- No `LIMIT` in the scan spec despite one in the query means the shape wasn't eligible for the bounded top-N pushdown (see [Capabilities: Ordered top-N](capabilities.md#filtering-)) — it still returns correct results, just via a full scan.
+
+Then run the query for real and compare the actual result against what the scan spec implies it should return.
+
+## Try it against the bundled local stack first
+
+If you don't yet have your own Virtual Schema deployed, `scripts/capture-pushdown-payload.sh` runs a query against the bundled local Docker stack (Exasol + MinIO + Iceberg REST) and prints both the `EXPLAIN VIRTUAL` output and the real result in one step, against a small seeded table:
 
 ```bash
 scripts/capture-pushdown-payload.sh 'SELECT COUNT(*) FROM {table} WHERE c_date LIKE '"'"'2024%'"'"''
 ```
 
-`{table}` is substituted with the seeded `typed_distinct_probe` Virtual Schema
-table name. The script builds the UDF `.so`, brings up `minio`/`iceberg-rest`/
-`exasol` (skipping the positional-delete `spark-iceberg-fixtures` job, not
-needed by this fixture), then runs the capture test.
-
-It leaves the stack running afterward so follow-up queries are cheap — tear it
-down yourself when done:
+`{table}` is substituted with the seeded probe table's name. The script builds the UDF `.so` and brings up the local stack if it isn't already running, then leaves it running afterward so follow-up queries are cheap — tear it down yourself when done:
 
 ```bash
 docker compose down -v
 ```
 
-## The seeded table (`typed_distinct_probe`, 12 rows)
+### The seeded table
 
-See `crates/lakehouse-engine/tests/common/seed.rs` (`seed_typed_distinct_probe`
-and the `TYPED_COL_*` constants) for the exact values. Columns:
+12 rows, one column per Arrow/Exasol type pairing, useful for probing type-specific pushdown behavior (e.g. decimal precision, date literals):
 
 | Column | Arrow type | Exasol type |
 |---|---|---|
@@ -46,10 +53,3 @@ and the `TYPED_COL_*` constants) for the exact values. Columns:
 | `c_bool` | Boolean | BOOLEAN |
 | `c_price` | Float64 | DOUBLE PRECISION |
 | `c_qty` | Int64 | DECIMAL(20,0) |
-
-## Adding a new repro table
-
-If a bug needs a shape `typed_distinct_probe` doesn't cover, add a new seed
-function to `common/seed.rs` and point `e2e_capture_pushdown.rs` at it — don't
-hardcode a one-off query set into the test; keep it driven by `CAPTURE_SQL` so
-later issues on this stack can reuse the same tool.

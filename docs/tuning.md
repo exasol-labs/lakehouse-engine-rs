@@ -4,16 +4,11 @@
 
 # Parameters & Telemetry
 
-Every knob, and how to see what a scan is doing. Set these properties on the
-`CREATE VIRTUAL SCHEMA` statement from [Install](install.md). Run the [Benchmark](benchmark.md)
-suite to find which values work best for your workload; for what the values mean
-architecturally, see [Architecture](architecture.md).
+Every knob, and how to see what a scan is doing. Set these properties on the `CREATE VIRTUAL SCHEMA` statement from [Install](install.md). Run the [Benchmark](benchmark.md) suite to find which values work best for your workload; for what the values mean architecturally, see [Architecture](architecture.md).
 
 ## Parameters
 
-All are `CREATE VIRTUAL SCHEMA` properties unless noted, resolved once at
-`createVirtualSchema` time and round-tripped through `adapterNotes`. Defaults are from
-`crates/lakehouse-engine/src/adapter/mod.rs`.
+All are `CREATE VIRTUAL SCHEMA` properties unless noted, fixed at `CREATE VIRTUAL SCHEMA` time — changing one means recreating the VS.
 
 | Property | Required | Default | Effect |
 |---|---|---|---|
@@ -29,55 +24,26 @@ All are `CREATE VIRTUAL SCHEMA` properties unless noted, resolved once at
 | `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
 | `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
 | `S3_MAX_CONNECTIONS` | no | `AUTO` | Object-store HTTP connection-pool budget per scan instance. `AUTO` derives from cores/threading; see below. |
-| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold (from Iceberg manifest sizes, no Parquet read) below which a two-table inner equi-join's smaller side is broadcast into every shard; above it, falls back to an unaccelerated two-scan join. See backlog BL-001 / plan `add-join-pushdown-broadcast`. |
+| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold (from Iceberg manifest sizes, no Parquet read) below which a two-table inner equi-join's smaller side is broadcast into every shard; above it, falls back to an unaccelerated two-scan join. |
 | `LAKEHOUSE_UDF_DEBUG_LEVEL` | no (env var) | `info` | `debug` emits per-scan phase telemetry; `info` is silent. See below. |
 
-The `LAKEHOUSE_SCAN` scalar EMIT script, the `LAKEHOUSE_DISTRIBUTE_FILES` distributor, and the
-distinct-merge script MUST be created in the same schema as `LAKEHOUSE_ADAPTER` — the adapter
-qualifies its calls to them from its own running-script schema, not a configured property.
+The `LAKEHOUSE_SCAN` scalar EMIT script, the `LAKEHOUSE_DISTRIBUTE_FILES` distributor, and the distinct-merge script MUST be created in the same schema as `LAKEHOUSE_ADAPTER` — the adapter qualifies its calls to them from its own running-script schema, not a configured property.
 
-**Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the
-per-instance limit is reported as 0 (unknown), a conservative default budget is used instead.
+**Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the per-instance limit is reported as 0 (unknown), a conservative default budget is used instead.
 
-**Quick recommendation:** for read-bound remote scans, set
-`DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<NR_OF_CORES>'`,
-`DATAFUSION_TARGET_PARTITIONS='<NR_OF_CORES>'` — ~39 % faster than the `AUTO` default on a full
-scan.
+**Quick recommendation:** for read-bound remote scans, set `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<NR_OF_CORES>'`, `DATAFUSION_TARGET_PARTITIONS='<NR_OF_CORES>'` — ~39 % faster than the `AUTO` default on a full scan.
 
 ### `S3_MAX_CONNECTIONS`
 
-Sizes the object store's HTTP client connection pool for the scan instance — how many
-connections to S3 the client keeps warm (idle, reusable) per host, via
-`pool_max_idle_per_host`. `object_store` 0.13.2 has no hard cap on in-flight request
-concurrency; this knob only bounds how many established connections stay open for reuse
-rather than being torn down and re-negotiated, so it is a best-effort lever on connection
-reuse, not a guaranteed ceiling on concurrent fetches. It says nothing about how many shards
-run (`PARALLELISM_FACTOR`) or how many CPU threads decode them (`DATAFUSION_THREADING_MODE`) —
-those remain separate, orthogonal axes.
+Sizes the object store's HTTP client connection pool for the scan instance — how many connections to S3 the client keeps warm (idle, reusable) per host. This knob has no hard cap on in-flight request concurrency; it only bounds how many established connections stay open for reuse rather than being torn down and re-negotiated, so it is a best-effort lever on connection reuse, not a guaranteed ceiling on concurrent fetches. It says nothing about how many shards run (`PARALLELISM_FACTOR`) or how many CPU threads decode them (`DATAFUSION_THREADING_MODE`) — those remain separate, orthogonal axes.
 
-- **Explicit value** — a positive integer is used verbatim (FIXED-like), e.g.
-  `S3_MAX_CONNECTIONS='64'`.
-- **Absent, invalid, or `0`** — AUTO-derives the budget as
-  `per_instance_threads × 4`, where `per_instance_threads` is the same AUTO thread budget
-  `auto_threads_per_udf` computes for `DATAFUSION_THREADING_MODE=AUTO`
-  (`nr_of_cores / udf_instances_per_node`, floored to `≥1`). The `×4` multiplier
-  oversubscribes the IO axis relative to the CPU axis on purpose: S3 fetches are
-  latency-bound, so a decode thread spends most of a byte-range GET waiting on a network
-  round-trip — keeping several requests in flight per thread hides that latency and keeps the
-  NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency). Idle pooled TCP
-  connections are cheap relative to OS threads, so this asymmetry is deliberate.
-- **`NR_OF_CORES` unknown (`0`)** — falls back to a built-in default of `16`, mirroring the
-  `0`-cores fallback used elsewhere in the adapter.
+- **Explicit value** — a positive integer is used verbatim (FIXED-like), e.g. `S3_MAX_CONNECTIONS='64'`.
+- **Absent, invalid, or `0`** — AUTO-derives the budget as `per_instance_threads × 4`, where `per_instance_threads` is the same thread budget `DATAFUSION_THREADING_MODE=AUTO` computes (cores available per instance, floored to `≥1`). The `×4` multiplier oversubscribes the IO axis relative to the CPU axis on purpose: S3 fetches are latency-bound, so a decode thread spends most of a byte-range GET waiting on a network round-trip — keeping several requests in flight per thread hides that latency and keeps the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency). Idle pooled TCP connections are cheap relative to OS threads, so this asymmetry is deliberate.
+- **`NR_OF_CORES` unknown (`0`)** — falls back to a built-in default of `16`.
 
-Applied via the object store's HTTP client, not DataFusion: `AmazonS3Builder::with_client_options`
-sets `ClientOptions::with_pool_max_idle_per_host(budget)` on the S3 client. It does **not**
-touch DataFusion's `target_partitions` — that remains the threading knob's job.
+This applies to the object store's HTTP client, not DataFusion — it does **not** touch DataFusion's `target_partitions`, which remains the threading knob's job.
 
-**When to tune it:** a live-cluster sweep (2026-07-02, `S3_MAX_CONNECTIONS` from `AUTO` up to
-128, on both the aggregate and raw full-emit paths) found it moved throughput by **< 2%** —
-this cluster's bottleneck was not connection-pool warmth. It remains a legitimate knob to try
-on a deployment with a different network profile (e.g. genuinely connection-churn-bound rather
-than latency-bound), but do not expect it to be the lever that closes a native-`IMPORT` gap.
+**When to tune it:** in practice this knob moves throughput far less than the threading and parallelism knobs above — on one production cluster, raising it from `AUTO` to well beyond the derived default changed throughput by under 2%. It remains a legitimate knob to try on a deployment with a different network profile (genuinely connection-churn-bound rather than latency-bound), but don't expect it to be the lever that closes a gap against a native bulk-load path — reach for `PARALLELISM_FACTOR` and the threading mode first.
 
 ## Telemetry
 
@@ -89,9 +55,7 @@ costs nothing at the production `info` level.
 ```sql
 ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<listener-host>:<port>';
 ```
-and build/deploy the scan script with `LAKEHOUSE_UDF_DEBUG_LEVEL=debug` (the bench harness
-wires this via `%udf_debug_level`). The listener must be reachable **from the cluster nodes**
-(a jumphost/private IP — a NAT'd local client cannot receive the connect-back).
+and build/deploy the scan script with the `LAKEHOUSE_UDF_DEBUG_LEVEL` environment variable set to `debug` (wired into the script source as `%udf_debug_level`). The listener must be reachable **from the cluster nodes** (a jumphost/private IP — a NAT'd local client cannot receive the connect-back).
 
 Capture it:
 ```sh
@@ -117,10 +81,8 @@ LHTELEM pid=12345 phase_startup_ms=110.2 phase_import_ms=650.8 phase_emit_ms=2.5
 
 ### Interpret
 
-- `import ≫ emit` → **read-bound** (S3 latency). More threads help; moving storage closer
-  helps most. This is the common case for remote scans.
-- `emit ≫ import` → **serialization-bound** (column coercion / IPC). Look at output types
-  (`BIGINT` coercion is expensive) and the decode-emit overlap lever.
+- `import ≫ emit` → **read-bound** (S3 latency). More threads help; moving storage closer helps most. This is the common case for remote scans.
+- `emit ≫ import` → **serialization-bound** (column coercion / IPC). Look at output types (`BIGINT` coercion is expensive) and the decode-emit overlap lever.
 - `startup` material relative to `body` → startup is worth attacking; otherwise negligible.
 
 Telemetry is best-effort: a failed write never fails the scan.

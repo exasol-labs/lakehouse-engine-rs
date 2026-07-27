@@ -34,29 +34,22 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 
 ## What this is
 
-`lakehouse-engine-rs` is an Exasol **Virtual Schema** that does more than translate and plan: it
-runs the [DataFusion](https://datafusion.apache.org/) engine on the node, in place. The VS stays
-thin — query translation, pushdown analysis, parallelization planning, result-schema mapping —
-while all execution happens in disposable, node-local DataFusion runtimes inside Rust UDFs. Files
-are sharded across nodes, scanned in parallel, then merged in Exasol.
+`lakehouse-engine-rs` is an In-Place Query Engine for lakehouses. It leverages Exasol **Virtual Schemas** and the [Apache DataFusion](https://datafusion.apache.org/) engine. The VS stays thin — query translation, pushdown analysis, parallelization planning, result-schema mapping — while all execution happens in disposable, node-local DataFusion runtimes inside Rust UDFs. Files are sharded across cluster nodes, scanned in parallel, then combined by Exasol.
 
 ## Documentation
 
 - [**docs/**](docs/index.md) — documentation index
 - [Install & deploy](docs/install.md) — build the `.so`, register the SLC, create scripts + CONNECTION + VS. If `exapump`/curl can't reach BucketFS directly (e.g. Exasol SaaS), see [Install](docs/install.md) for a fully manual path — curl/UI upload plus hand-run SQL, no Docker required
 - [Capabilities](docs/capabilities.md) — projection / filter / LIMIT / aggregation pushdown matrix
-- [`specs/`](specs/) — design source of truth (spec-driven development via the `speq` skill)
 
 ## License
 
-Community-supported. Licensed under [MIT](LICENSE).
+Free and open-source. Community-supported. Licensed under [MIT](LICENSE).
 
 ---
 
 <div align="center">
 
-Built with Rust 🦀 for Exasol.
-
-Community-supported, maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
+Built with Rust 🦀 for Exasol. Maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
 
 </div>
