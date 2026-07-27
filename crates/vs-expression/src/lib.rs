@@ -379,8 +379,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             // A `tableAlias` (injected by the caller for a multi-table render, e.g.
             // the join two-scan wrapper) qualifies the reference as
             // `"ALIAS"."NAME"`, disambiguating a name shared by two joined subqueries.
-            // Absent (the default single-table path), a bare quoted name is rendered
-            // exactly as before.
+            // For a single-relation target the caller strips `tableAlias` before
+            // calling this renderer, which then falls through to a bare quoted name.
             return Ok(Some(
                 match value("tableAlias")
                     .and_then(|a| a.as_str())
