@@ -236,30 +236,6 @@ pub(super) fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, |c| conjunct_single_side(c).is_none())
 }
 
-/// Deep-clone `expr` with every `tableAlias` key removed, so the reused
-/// `vs-expression` translator renders BARE column names.
-///
-/// Exasol sends each column node with BOTH its `tableName` and the query's
-/// `tableAlias` (e.g. `FROM fact_orders o` yields `tableAlias: "O"`), and the
-/// translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. A single-table
-/// fan-out ([`build_side_fan_out_sql`]) scans one relation exposing BARE uppercase
-/// column names, so an alias-qualified reference would not resolve against it — the
-/// fan-out's pushed filter must be bare, exactly like the single-table scan path.
-/// `tableName` is left intact (the translator ignores it; conjunct attribution has
-/// already read it upstream).
-pub(super) fn strip_table_alias(expr: &Json) -> Json {
-    match expr {
-        Json::Object(map) => Json::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "tableAlias")
-                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
-                .collect(),
-        ),
-        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
-        other => other.clone(),
-    }
-}
-
 /// Record the UPPERCASE name of every `column` node in `expr` attributed (by
 /// `tableName`, case-insensitive) to `table_name`, recursively.
 fn collect_side_column_names(
