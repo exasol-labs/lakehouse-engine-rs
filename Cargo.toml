@@ -10,8 +10,22 @@ members = ["crates/lakehouse-engine", "crates/vs-expression"]
 # individual crates must be addressed with `-p`.
 resolver = "2"
 
+# `cargo test` builds every file in crates/lakehouse-engine/tests/ into its own
+# executable, each statically linking the full DataFusion/Arrow/Iceberg tree —
+# linking, dominated by debug-info volume, costs far more than compiling.
+# Dependencies are ~all of those bytes and are never stepped through, so drop
+# their debug info entirely; workspace crates keep line tables. Backtraces still
+# resolve dependency function names (symbols, not debug info).
+#
+# NOTE: [profile.*] is NOT part of Swatinem/rust-cache's key but IS part of every
+# crate's fingerprint — editing this invalidates the whole dep cache. The
+# MANIFEST_PROFILE_HASH env-var in .github/workflows/ci.yml is what rotates the
+# cache key so that stays self-healing; don't remove it.
 [profile.dev]
 debug = 1
+
+[profile.dev.package."*"]
+debug = 0
 
 [workspace.package]
 license = "MIT"
