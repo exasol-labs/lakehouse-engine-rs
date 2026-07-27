@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use vs_expression::render_df_filter_safe;
 
 use super::super::file_resolution::relativize_shards_to_root;
-use super::super::support::{build_scan_driving_sql, extract_limit, quote_ident, shard_count};
+use super::super::support::{
+    build_scan_driving_sql, extract_limit, quote_ident, shard_count, strip_table_alias,
+};
 use super::super::topn::parse_sort_key_element;
 use super::planning::{
     DetectedJoin, JoinSides, ResolvedJoinSide, disjoint_schema_guard, involved_table_columns,
@@ -14,7 +16,7 @@ use super::rendering::{
     collect_column_tables, cross_side_residual_filter, extract_join_projection,
     projection_item_select_sql, referenced_side_columns, render_df_filter_qualified,
     render_expression_qualified, render_join_condition, render_selectlist_item_qualified,
-    side_local_filter, strip_table_alias,
+    side_local_filter,
 };
 
 /// The translator-reuse artifacts for a broadcast inner equi-join, rendered once

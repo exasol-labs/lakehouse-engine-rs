@@ -22,9 +22,10 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
-    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
-    EVO_NEW_COL, EVO_TOTAL_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
+    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS,
+    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
+    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
     PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
     SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns, seed_added_columns_initial_default,
     seed_events, seed_renamed_column,
@@ -102,6 +103,19 @@ fn vs_lineitem_table() -> String {
     format!("{VS_NAME}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
+/// `dim_customer` / `fact_orders` — seeded by `seed_events` (via
+/// `seed_star_schema`) alongside `events`, so already available under this
+/// file's `VS_NAME`. Used ONLY for the #193 outer-join-decline re-push shape,
+/// which `events` (a single table with no FK relationship) cannot express.
+fn vs_dim_table() -> String {
+    format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
+}
+
+/// `fact_orders` counterpart to [`vs_dim_table`] — same seeding, same scope.
+fn vs_fact_table() -> String {
+    format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -168,6 +182,79 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
             "name '{n}' does not match expected id {expected_id}"
         );
     }
+
+    // #193 regression: aliased FROM (`EVENTS e`) must resolve exactly like the
+    // unaliased query above, proving the aliased projection + filter + top-N
+    // shape strips the leaked `tableAlias` and resolves bare names. Ordering
+    // explicitly by score ASC pins the exact row set: with score = 5.0*id
+    // (seed.rs), the 5 lowest scores > 15.0 are ids 4..8.
+    let sql_aliased = format!(
+        "SELECT e.id, e.name, e.score FROM {} e WHERE e.score > 15.0 ORDER BY e.score LIMIT 5",
+        vs_table()
+    );
+    let cols_aliased = conn.query_columns(&sql_aliased);
+    assert_eq!(
+        cols_aliased.len(),
+        3,
+        "aliased query expected 3 columns (id, name, score): {cols_aliased:?}"
+    );
+    assert_eq!(
+        cols_aliased[0].len(),
+        5,
+        "aliased query expected exactly 5 rows from LIMIT 5: {cols_aliased:?}"
+    );
+    let aliased_ids: Vec<i64> = cols_aliased[0].iter().map(parse_int).collect();
+    let expected_aliased_ids: Vec<i64> = vec![4, 5, 6, 7, 8];
+    assert_eq!(
+        aliased_ids, expected_aliased_ids,
+        "aliased ORDER BY e.score LIMIT 5 must return the 5 lowest scores > 15.0 \
+         (ids 4..8, score = 5.0*id): {aliased_ids:?}"
+    );
+
+    // #193 regression: a scalar select-list expression over an aliased column
+    // (`e.score + 1`) must render the bare "SCORE" name under the scan
+    // relation, not the leaked "E"."SCORE". Row count matches
+    // SEED_ROWS_SCORE_GT_15 and every value is the filtered score + 1.
+    let sql_expr = format!(
+        "SELECT e.score + 1 FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    );
+    let cols_expr = conn.query_columns(&sql_expr);
+    assert_eq!(
+        cols_expr.len(),
+        1,
+        "scalar expression query expected 1 column: {cols_expr:?}"
+    );
+    assert_eq!(
+        cols_expr[0].len(),
+        SEED_ROWS_SCORE_GT_15,
+        "scalar expression query expected {SEED_ROWS_SCORE_GT_15} rows: {cols_expr:?}"
+    );
+    // score = 5.0*id, so score + 1 always ends in .0 with score % 5.0 == 0,
+    // meaning (score + 1) % 5.0 == 1.0 — this fails if the `+ 1` is dropped.
+    for v in &cols_expr[0] {
+        let plus_one = parse_numeric(v);
+        assert_eq!(
+            plus_one % 5.0,
+            1.0,
+            "e.score + 1 must equal a multiple of 5 plus 1 (score = 5.0*id), got {plus_one}"
+        );
+    }
+
+    // #193 regression: an UNQUALIFIED filter column (`score`, no `e.` prefix)
+    // under an aliased FROM. Exasol still stamps `tableAlias:"E"` on this
+    // column node even though the user wrote no qualifier — the leak this
+    // fix targets. Row count must match the same SEED_ROWS_SCORE_GT_15 the
+    // unaliased/qualified cases above use.
+    let row_count_unqualified = conn.query_row_count(&format!(
+        "SELECT id FROM {} e WHERE score > 15.0",
+        vs_table()
+    ));
+    assert_eq!(
+        row_count_unqualified, SEED_ROWS_SCORE_GT_15 as i64,
+        "unqualified filter under alias (FROM ... e WHERE score > 15.0) must \
+         return {SEED_ROWS_SCORE_GT_15} rows, got {row_count_unqualified}"
+    );
 }
 
 /// Create VS maps the Iceberg table schema to Exasol types correctly.
@@ -1215,6 +1302,127 @@ fn aggregate_count_col_returns_correct_value() {
     assert_eq!(
         count_star, SEED_ROWS_SCORE_GT_15 as i64,
         "COUNT(*) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_star}"
+    );
+
+    // #193 regression: the same COUNT(e.score) / COUNT(*) aggregates over an
+    // ALIASED FROM, with the filter column qualified by the alias. Expected
+    // values are the SAME SEED_ROWS_SCORE_GT_15 the unaliased case above
+    // asserts, proving alias stripping leaves single-group aggregate
+    // pushdown (aggregate args + filter) unchanged.
+    let cols_aliased_col = conn.query_columns(&format!(
+        "SELECT COUNT(e.score) FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    ));
+    let count_aliased_col = cols_aliased_col[0][0]
+        .as_i64()
+        .or_else(|| cols_aliased_col[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| {
+            panic!(
+                "aliased COUNT(e.score) result not integer: {:?}",
+                cols_aliased_col[0][0]
+            )
+        });
+    assert_eq!(
+        count_aliased_col, SEED_ROWS_SCORE_GT_15 as i64,
+        "aliased COUNT(e.score) WHERE e.score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, \
+         got {count_aliased_col}"
+    );
+
+    let cols_aliased_star = conn.query_columns(&format!(
+        "SELECT COUNT(*) FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    ));
+    let count_aliased_star = cols_aliased_star[0][0]
+        .as_i64()
+        .or_else(|| {
+            cols_aliased_star[0][0]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "aliased COUNT(*) result not integer: {:?}",
+                cols_aliased_star[0][0]
+            )
+        });
+    assert_eq!(
+        count_aliased_star, SEED_ROWS_SCORE_GT_15 as i64,
+        "aliased COUNT(*) WHERE e.score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, \
+         got {count_aliased_star}"
+    );
+
+    // #193 regression: a GROUP BY under an aliased FROM (group key + aggregate
+    // argument both alias-qualified). Grouping by the near-unique `id` under
+    // the same `e.score > 15.0` filter yields exactly SEED_ROWS_SCORE_GT_15
+    // groups (one per matching id), each with COUNT(e.score) == 1 — proving
+    // alias stripping applies to GROUP BY keys, not just filters/aggregates.
+    let cols_grouped = conn.query_columns(&format!(
+        "SELECT e.id, COUNT(e.score) FROM {} e WHERE e.score > 15.0 GROUP BY e.id",
+        vs_table()
+    ));
+    assert_eq!(
+        cols_grouped.len(),
+        2,
+        "grouped aliased query expected 2 columns (id, count): {cols_grouped:?}"
+    );
+    assert_eq!(
+        cols_grouped[0].len(),
+        SEED_ROWS_SCORE_GT_15,
+        "GROUP BY e.id WHERE e.score > 15.0 must yield {SEED_ROWS_SCORE_GT_15} groups \
+         (one per matching id), got {}",
+        cols_grouped[0].len()
+    );
+    for count in &cols_grouped[1] {
+        let c = count
+            .as_i64()
+            .or_else(|| count.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("grouped count not integer: {count:?}"));
+        assert_eq!(
+            c, 1,
+            "each group (unique id) must have COUNT(e.score) == 1, got {c}"
+        );
+    }
+}
+
+/// #193 regression: a declined outer join re-pushes a PLAIN single-table scan
+/// carrying the alias filter. The join gate hard-declines LEFT/RIGHT/FULL
+/// joins (see `pushdown-planning-join-fallback`); Exasol then falls back to
+/// executing the join itself over two adapter-returned single-table scans,
+/// each still carrying its own alias (`c`, `o`) on the WHERE filter. This is
+/// the one shape `events` cannot express (it has no FK relationship to join
+/// against), so it reuses the existing `dim_customer`/`fact_orders` star
+/// schema fixture instead of the events fixture the other cases use.
+///
+/// Every order's `O_CUSTKEY` cycles `1..=DIM_CUSTOMER_ROWS` across the seeded
+/// orders, so each of `C_CUSTKEY` 1, 2, 3 matches `FACT_ORDERS_ROWS /
+/// DIM_CUSTOMER_ROWS` orders and every customer has at least one order (no
+/// NULL-extended rows) — the LEFT JOIN filtered to `C_CUSTKEY <= 3` therefore
+/// yields exactly `3 * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS)` rows.
+#[test]
+fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} c LEFT JOIN {} o ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE c.C_CUSTKEY <= 3",
+        vs_dim_table(),
+        vs_fact_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "COUNT(*) must return one column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "COUNT(*) must return one row: {cols:?}");
+    let count = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("COUNT(*) result not integer: {:?}", cols[0][0]));
+    let expected_count = 3 * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS) as i64;
+    assert_eq!(
+        count,
+        expected_count,
+        "declined LEFT JOIN dim_customer c ... WHERE c.C_CUSTKEY <= 3 must yield \
+         {expected_count} rows (3 matching customers x {} orders each), got {count}",
+        FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS
     );
 }
 
