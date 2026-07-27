@@ -23,7 +23,7 @@ mod support;
 use support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
     extract_limit, extract_projection, like_subject_type_guard, order_by_present,
-    rewrite_decimal_stringifications, string_function_arg_type_guard,
+    rewrite_decimal_stringifications, string_function_arg_type_guard, strip_table_alias,
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
@@ -174,6 +174,12 @@ pub async fn handle_pushdown(
             .await;
         }
     }
+
+    // Single-table chokepoint (issue #193): strip every `tableAlias` here, after the
+    // join gate (which returned above on the original, alias-carrying request) and
+    // before the first read of `pushdown_req` below, so the shadowing rebind covers
+    // every downstream render. See `strip_table_alias`'s doc comment for why.
+    let pushdown_req = strip_table_alias(&pushdown_req);
 
     let (proj_cols, proj_types) = extract_projection(request, &pushdown_req)?;
 

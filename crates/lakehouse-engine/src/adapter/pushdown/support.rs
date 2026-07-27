@@ -433,6 +433,40 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
         .unwrap_or_default()
 }
 
+/// Deep-clone `expr` with every `tableAlias` key removed, so the reused
+/// `vs-expression` translator renders BARE column names.
+///
+/// Exasol stamps EVERY `column` node with the query's `tableAlias` as soon as the
+/// `FROM` aliases the table (`FROM fact_orders o` yields `tableAlias: "O"` on every
+/// column, even one written unqualified), and the translator emits `"ALIAS"."NAME"`
+/// whenever `tableAlias` is present. Every scan this adapter drives is a
+/// SINGLE-relation scan whose relation exposes BARE uppercase column names, so an
+/// alias-qualified reference does not resolve against it (`No field named
+/// "O"."O_ORDERDATE"`). Both such callers therefore strip first: the single-table
+/// pushdown chokepoint in `handle_pushdown` (issue #193) and the per-side join
+/// fan-out leg (`build_side_fan_out_sql`).
+///
+/// This is a CALLER-side concern, not a translator default: the join outer wrapper
+/// deliberately re-qualifies each column to its own subquery alias
+/// (`annotate_columns_with_alias`), which overwrites any `tableAlias` a caller left
+/// in place — so stripping upstream of it is harmless there too.
+///
+/// `tableName` is left intact (the translator ignores it; join conjunct attribution
+/// and the wrapper's re-qualification both read it, and both run on `tableName`
+/// alone).
+pub(super) fn strip_table_alias(expr: &Json) -> Json {
+    match expr {
+        Json::Object(map) => Json::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "tableAlias")
+                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
+                .collect(),
+        ),
+        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
 /// scan, using the column-type map from [`extract_all_column_types`].
 ///
@@ -1270,6 +1304,37 @@ mod tests {
     use super::*;
     use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
     use vs_expression::render_df_filter_safe;
+
+    /// `strip_table_alias` removes every `tableAlias` key at any nesting depth
+    /// (issue #193) while preserving `tableName` and `name`, recursing through
+    /// both nested objects and arrays.
+    #[test]
+    fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "PLUS",
+            "tableAlias": "O",
+            "arguments": [
+                {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
+                {"type": "literal_exactnumeric", "value": 1}
+            ]
+        });
+
+        let stripped = strip_table_alias(&expr);
+
+        assert_eq!(
+            stripped,
+            serde_json::json!({
+                "type": "function_scalar",
+                "name": "PLUS",
+                "arguments": [
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS"},
+                    {"type": "literal_exactnumeric", "value": 1}
+                ]
+            }),
+            "every tableAlias key must be gone at every depth, while name/tableName survive"
+        );
+    }
 
     /// `exasol_type_from_json` must read the `withLocalTimeZone` flag back off a
     /// `{"type":"timestamp", ...}` dataType JSON (the shape Exasol echoes back in
