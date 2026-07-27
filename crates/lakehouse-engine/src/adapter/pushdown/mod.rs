@@ -179,7 +179,7 @@ pub async fn handle_pushdown(
     // every downstream render. See `strip_table_alias`'s doc comment for why.
     let pushdown_req = strip_table_alias(&pushdown_req);
 
-    let (proj_cols, proj_types) = extract_projection(request, &pushdown_req)?;
+    let (proj_cols, proj_types, projection_widened) = extract_projection(request, &pushdown_req)?;
 
     let filter_json_raw = pushdown_req.get("filter").filter(|f| !f.is_null());
 
@@ -231,7 +231,13 @@ pub async fn handle_pushdown(
     let storage = &effective_storage;
 
     if files.is_empty() {
-        return empty_result_sql(&pushdown_req, &proj_cols, &proj_types, &col_types);
+        return empty_result_sql(
+            &pushdown_req,
+            &proj_cols,
+            &proj_types,
+            projection_widened,
+            &col_types,
+        );
     }
 
     // Compute G = shard_count(node_count, parallelism_factor, file_count) and
@@ -255,6 +261,7 @@ pub async fn handle_pushdown(
         &pushdown_req,
         proj_cols,
         proj_types,
+        projection_widened,
         col_types,
         filter,
         limit,
@@ -283,12 +290,17 @@ pub async fn handle_pushdown(
 /// `handle_pushdown` resolves the file list, shards it, and qualifies the UDF
 /// names before calling this; every parameter here is an already-resolved
 /// input from that resolution.
+///
+/// `projection_widened` is `extract_projection`'s widening signal for the
+/// `proj_cols`/`proj_types` pair passed alongside it: `true` means they are the full
+/// base row rather than one item per select-list item (#196).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dispatch_sql(
     request: &Json,
     pushdown_req: &Json,
     mut proj_cols: Vec<ProjectionItem>,
     mut proj_types: Vec<String>,
+    projection_widened: bool,
     col_types: Vec<(String, String)>,
     filter: Option<String>,
     limit: Option<u64>,
@@ -518,23 +530,30 @@ pub(crate) fn build_dispatch_sql(
         RequestShape::RowScan => {
             // A real (non-empty) selectList that `project_columns` could not render
             // item-for-item — e.g. `string_function_arg_type_guard` declining a
-            // select-list item's non-coercible argument type (issue #210) — falls
-            // back to the base-row projection (every source column, bare), whose
-            // column count no longer matches the pushed selectList's item count.
-            // Exasol's pushdown validation requires the returned SQL's column count
-            // to equal the selectList's, or it hard-errors (SQL state `04000`,
-            // "Expected number of columns is N but pushdown query has M") — the
-            // exact shape the `GroupByWrapper` and multi-`DISTINCT` decline routes
-            // above already guard against. Route it to the same qualified
-            // single-table wrapper: it renders the exact original select list (the
-            // declined function call included) as native Exasol SQL over a raw,
-            // referenced-column-only scan, so Exasol evaluates the call itself.
-            let select_list_len = pushdown_req
-                .get("selectList")
-                .and_then(|v| v.as_array())
-                .filter(|list| !list.is_empty())
-                .map(|list| list.len());
-            if select_list_len.is_some_and(|n| n != proj_cols.len()) {
+            // select-list item's non-coercible argument type (issue #210), or a
+            // declared type Exasol rejects as an EMITS output (#234) — widens to the
+            // base-row projection (every source column, bare) instead of one item per
+            // select-list item. Exasol's pushdown validation is positional: the
+            // returned SQL must carry exactly the selectList's columns, in its order,
+            // with its declared types, or it hard-errors — `04000` "Expected number of
+            // columns is N but pushdown query has M" when the counts differ, and
+            // `04000` "Data type mismatch in column number K" when they coincide but
+            // the types do not. Route a widened projection to the same qualified
+            // single-table wrapper the `GroupByWrapper` and multi-`DISTINCT` declines
+            // above use: it renders the exact original select list (the declined item
+            // included) as native Exasol SQL over a raw, referenced-column-only scan,
+            // so Exasol evaluates the item itself.
+            //
+            // The routing decision is `project_columns`'s OWN widening signal, piped
+            // here as `projection_widened` — never a comparison of `proj_cols.len()`
+            // against the selectList's item count. That count comparison, which this
+            // replaces, was a lossy re-derivation blind in two directions (#196): it
+            // missed every widening whose base-row column count happens to equal the
+            // select-list arity (reproduced live — a 10-item select list over a
+            // 10-column table returned `04000` "Data type mismatch in column number
+            // 10"), and being local to this arm it never ran on the empty-result or
+            // broadcast-join paths, which consume the same widened projection.
+            if projection_widened {
                 return qualified_single_table_fallback_pushdown(
                     request,
                     pushdown_req,
@@ -590,12 +609,10 @@ pub(crate) fn build_dispatch_sql(
     //
     // `visible_count` is the number of projection items `extract_projection` already
     // derived before this extension runs (`proj_cols.len()` at this point) — NOT
-    // necessarily the raw select-list arity. A separate, pre-existing fallback inside
-    // `extract_projection` / `project_columns` (`needs_full_fallback`) can already
-    // have widened `proj_cols` to the full base row for an untranslatable or
-    // EMITS-rejected select-list item, independent of this fix; that composed shape is
-    // a separate, pre-existing gap (see the capability-extensions spec) that this fix
-    // does not need to resolve.
+    // necessarily the raw select-list arity. A widened projection never reaches this
+    // point at all: the `RowScan` arm above returns to the qualified single-table
+    // wrapper on `projection_widened`, ahead of both `detect_topn` and this extension
+    // (#196), so `proj_cols` here is always the per-select-list-item derivation.
     //
     // Position is load-bearing on BOTH sides. AFTER `detect_topn` (see its comment
     // above), and BEFORE the `spec_template` literal below: that literal derives the
@@ -1434,11 +1451,17 @@ mod tests {
     /// exercises it — for `request`/`proj_cols`/`proj_types`, returning the `sql`
     /// field of its pushdown response. `has_order_by` is always `true`: every guard
     /// test pushes an ORDER BY.
+    ///
+    /// `projection_widened` is `extract_projection`'s widening signal for the
+    /// `proj_cols`/`proj_types` pair — the flag the dispatcher routes on (#196). The
+    /// declined-`ORDER BY` guard tests all pass `false`; the two widening-routing
+    /// tests pass the same inputs under both values.
     #[allow(clippy::too_many_arguments)]
     fn guard_dispatch_sql(
         request: &Json,
         proj_cols: Vec<ProjectionItem>,
         proj_types: Vec<String>,
+        projection_widened: bool,
         limit: Option<u64>,
         logical_schema: Vec<LogicalField>,
     ) -> String {
@@ -1448,6 +1471,7 @@ mod tests {
             &pushdown_req,
             proj_cols,
             proj_types,
+            projection_widened,
             guard_col_types(),
             None,
             limit,
@@ -1507,7 +1531,7 @@ mod tests {
         }];
         let proj_types = vec!["DECIMAL(1,0)".to_string()];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(10), Vec::new());
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, Some(10), Vec::new());
 
         // The scan spec APPENDS the sort key AFTER the original expression item, so the
         // per-shard scan actually emits the column the outer ORDER BY binds against.
@@ -1561,7 +1585,7 @@ mod tests {
         let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
         let proj_types = vec!["VARCHAR(2000000)".to_string()];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, None, Vec::new());
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
 
         assert!(
             sql.contains(r#"SELECT "NAME" FROM ("#),
@@ -1617,7 +1641,7 @@ mod tests {
         let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
         let proj_types = vec!["VARCHAR(2000000)".to_string()];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, None, Vec::new());
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
 
         assert!(
             sql.contains(r#""projection":["NAME","ID"]"#),
@@ -1674,7 +1698,14 @@ mod tests {
             initial_default: None,
         }];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(5), logical_schema);
+        let sql = guard_dispatch_sql(
+            &request,
+            proj_cols,
+            proj_types,
+            false,
+            Some(5),
+            logical_schema,
+        );
 
         assert!(
             sql.contains(r#""projection":["NAME"]"#),
@@ -1752,7 +1783,14 @@ mod tests {
             initial_default: None,
         }];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(5), logical_schema);
+        let sql = guard_dispatch_sql(
+            &request,
+            proj_cols,
+            proj_types,
+            false,
+            Some(5),
+            logical_schema,
+        );
 
         let common = common_arg_literal(&sql);
         assert!(
@@ -1809,7 +1847,7 @@ mod tests {
         let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
         let proj_types = vec!["VARCHAR(2000000)".to_string()];
 
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, Some(7), Vec::new());
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, Some(7), Vec::new());
 
         assert!(
             !sql.contains("ORDER BY"),
@@ -1823,6 +1861,125 @@ mod tests {
         assert!(
             !sql.contains("LIMIT"),
             "the limit stays withheld for an ordering the adapter did not render: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Widened-projection routing at coincidental arity (issues #196 / #234)
+    // ---------------------------------------------------------------------------
+
+    /// A `RequestShape::RowScan` request whose select-list arity EQUALS the base
+    /// table's column count: four bare `EVENTS` columns, plus an `ORDER BY` the
+    /// adapter does not match as a bounded top-N. Both routing tests below drive the
+    /// dispatcher with these identical inputs and differ ONLY in the widening flag.
+    fn widening_arity_coincidence_request() -> Json {
+        guard_events_request(serde_json::json!({
+            "selectList": [
+                {"type": "column", "name": "REGION", "tableName": "EVENTS"},
+                {"type": "column", "name": "NAME", "tableName": "EVENTS"},
+                {"type": "column", "name": "AMOUNT", "tableName": "EVENTS"},
+                {"type": "column", "name": "ID", "tableName": "EVENTS"},
+            ],
+            "selectListDataTypes": [
+                {"type": "varchar", "size": 2000000},
+                {"type": "varchar", "size": 2000000},
+                {"type": "decimal", "precision": 18, "scale": 2},
+                {"type": "decimal", "precision": 20, "scale": 0},
+            ],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME", "tableName": "EVENTS"},
+                "isAscending": true,
+                "nullsLast": true
+            }]
+        }))
+    }
+
+    /// The four-column full base row, as `project_columns` returns it when it widens.
+    fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>) {
+        let cols = guard_col_types()
+            .into_iter()
+            .map(|(name, ty)| (ProjectionItem::Column(name), ty))
+            .collect::<Vec<_>>();
+        (
+            cols.iter().map(|(c, _)| c.clone()).collect(),
+            cols.iter().map(|(_, t)| t.clone()).collect(),
+        )
+    }
+
+    /// Scenario (pushdown-planning-capability-extensions, issues #196 / #234): a
+    /// WIDENED derived projection routes to `qualified_single_table_fallback_pushdown`
+    /// even when its column count COINCIDES with the select-list arity.
+    ///
+    /// The count comparison this replaced was blind here — four base columns against
+    /// four select-list items looks like a clean per-item derivation, so the request
+    /// reached the raw scan path and Exasol rejected the positionally-mismatched types
+    /// (`04000` "Data type mismatch in column number N", reproduced live on a 10-item
+    /// select list over a 10-column table). Routing on the producer's own widening
+    /// signal cannot be fooled by the coincidence.
+    ///
+    /// The `ORDER BY` also pins the early-return POSITION: the wrapper's own outer
+    /// `ORDER BY` is what orders the result, so the widened projection never reached
+    /// `detect_topn` or the declined-`ORDER BY` hidden-sort-key extension.
+    #[test]
+    fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
+        let request = widening_arity_coincidence_request();
+        let (proj_cols, proj_types) = widening_arity_coincidence_projection();
+        assert_eq!(
+            proj_cols.len(),
+            request["pushdownRequest"]["selectList"]
+                .as_array()
+                .expect("fixture select list")
+                .len(),
+            "the fixture must hold the arity coincidence the count comparison missed"
+        );
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, true, None, Vec::new());
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0""#),
+            "a widened projection must route to the qualified single-table wrapper: {sql}"
+        );
+        assert!(
+            sql.contains(
+                r#"SELECT "LHS_T0"."REGION", "LHS_T0"."NAME", "LHS_T0"."AMOUNT", "LHS_T0"."ID" FROM ("#
+            ),
+            "the wrapper must render the ORIGINAL select list, qualified, so Exasol's \
+             positional validation sees its own items: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ORDER BY "LHS_T0"."NAME""#),
+            "the wrapper's own outer ORDER BY must order the result: {sql}"
+        );
+    }
+
+    /// The mirror of `dispatch_widened_projection_at_matching_arity_routes_to_wrapper`:
+    /// the SAME request and the SAME four-item projection with the widening flag CLEAR
+    /// — a genuine `SELECT region, name, amount, id ... ORDER BY name` — stays on the
+    /// ordinary scan path and is NOT wrapped in the qualified fallback.
+    ///
+    /// This pins the signal as load-bearing in BOTH directions: a later `, _`
+    /// destructuring that swallows the flag, or a hardcoded `true`, fails a host test
+    /// instead of silently unaccelerating every row scan.
+    #[test]
+    fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
+        let request = widening_arity_coincidence_request();
+        let (proj_cols, proj_types) = widening_arity_coincidence_projection();
+
+        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, None, Vec::new());
+
+        assert!(
+            !sql.contains("LHS_T0"),
+            "a per-select-list-item projection must NOT be routed to the qualified \
+             single-table wrapper: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("{SCAN_UDF_NAME}(")),
+            "the ordinary scan path must still drive the sharded scan UDF: {sql}"
+        );
+        assert!(
+            sql.contains(r#"SELECT "REGION", "NAME", "AMOUNT", "ID" FROM ("#),
+            "the scan path must emit the derived projection unqualified: {sql}"
         );
     }
 }

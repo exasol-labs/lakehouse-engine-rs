@@ -135,8 +135,8 @@ pub(super) async fn plan_join(
         for leaf in &join.tables {
             combined.extend(involved_table_columns(request, &leaf.table_name));
         }
-        let (proj_cols, proj_types) = project_columns(pushdown_req, combined.clone())?;
-        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, &combined);
+        let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
+        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined);
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);

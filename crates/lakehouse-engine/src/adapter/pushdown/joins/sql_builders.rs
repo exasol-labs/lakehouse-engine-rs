@@ -41,9 +41,10 @@ pub(crate) struct RenderedJoinPushdown {
 /// Broadcast is a two-table optimization, so `join.tables[0]`/`[1]` are the two
 /// involved tables and `join.conditions[0]` is the equi-condition. Returns
 /// `Ok(None)` — a clean decline, NOT an error — when the two tables share any
-/// column name (the guard fails) or the equi-condition cannot be rendered; the
-/// caller then falls through to the deterministic N-scan fallback, exactly as for
-/// any other join off the broadcast path. `Ok(Some(..))` carries the rendered join
+/// column name (the guard fails), the equi-condition cannot be rendered, or the
+/// derived projection widened to the full base row (#196); the caller then falls
+/// through to the deterministic N-scan fallback, exactly as for any other join off
+/// the broadcast path. `Ok(Some(..))` carries the rendered join
 /// condition, the cross-table WHERE filter, and the cross-table projection with its
 /// EMITS types. `Err` is reserved for a genuinely malformed request with no column
 /// metadata at all (the same contract [`project_columns`] enforces for the
@@ -72,7 +73,15 @@ pub(crate) fn render_broadcast_join(
         .filter(|f| !f.is_null())
         .and_then(render_df_filter_safe);
 
-    let (projection, projection_types) = extract_join_projection(request, pushdown_req, join)?;
+    let (projection, projection_types, widened) =
+        extract_join_projection(request, pushdown_req, join)?;
+    // The derived projection is the full two-table base row, not one item per
+    // select-list item, so a broadcast fan-out would emit the wrong column shape.
+    // Decline to the unified N-scan fallback, which re-renders the select list
+    // table-qualified in the Exasol dialect over its own wrapper (#196).
+    if widened {
+        return Ok(None);
+    }
 
     Ok(Some(RenderedJoinPushdown {
         condition,
@@ -897,6 +906,7 @@ mod tests {
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
+    use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
     /// The Q1-shape three-table inner-join pushdown request:
     /// `(SUPPLIER ⋈ NATION) ⋈ REGION`, all three in `TABLE_MAP`. Leaves in stable
@@ -1017,6 +1027,67 @@ mod tests {
         assert!(
             rendered.is_none(),
             "overlapping column names must decline broadcast rendering (Ok(None))"
+        );
+    }
+
+    /// A widened derived projection is the full two-table base row, not one item per
+    /// select-list item, so a broadcast fan-out would emit the wrong column shape.
+    /// `render_broadcast_join` must take its EXISTING clean-decline exit (`Ok(None)`,
+    /// never an error) and let the unified N-scan wrapper re-render the select list
+    /// table-qualified (#196).
+    ///
+    /// The widening trigger is issue #234's own: a rendered item whose declared type
+    /// is not a valid UDF EMITS output (`TIMESTAMP WITH LOCAL TIME ZONE`, sqlCode
+    /// 22002). The request carries no aggregate/GROUP BY/ORDER BY/LIMIT/HAVING, so it
+    /// genuinely reaches broadcast eligibility live rather than being skipped by
+    /// `join_requires_exasol_postprocessing`. The same request with an EMITS-valid
+    /// declared type renders, so the decline is caused by the widening alone.
+    #[test]
+    fn broadcast_join_declines_widened_projection() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {"type": "function_scalar", "name": "UPPER", "arguments": [
+                {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]},
+        ]);
+        let pushdown_req = pd(&request);
+        assert!(
+            !join_requires_exasol_postprocessing(&pushdown_req),
+            "the fixture must reach broadcast eligibility, not be skipped upstream"
+        );
+        let detected = detected_join(&request);
+
+        // Control: an EMITS-valid declared type does not widen, so broadcast renders.
+        let mut ok_req = request.clone();
+        ok_req["pushdownRequest"]["selectListDataTypes"] =
+            serde_json::json!([{"type": "varchar", "size": 100}]);
+        let (_, _, ok_widened) =
+            extract_join_projection(&ok_req, &pd(&ok_req), &detected).expect("projection derives");
+        assert!(!ok_widened, "the control fixture must NOT widen");
+        assert!(
+            render_broadcast_join(&ok_req, &pd(&ok_req), &detected)
+                .expect("the control must not error")
+                .is_some(),
+            "the control must render a broadcast plan, so only the widening differs"
+        );
+
+        // An EMITS-rejected declared type widens the projection to the full base row.
+        request["pushdownRequest"]["selectListDataTypes"] =
+            serde_json::json!([{"type": "timestamp", "withLocalTimeZone": true}]);
+        let pushdown_req = pd(&request);
+        let (projection, _, widened) = extract_join_projection(&request, &pushdown_req, &detected)
+            .expect("projection derives");
+        assert!(
+            widened && projection.len() == 4,
+            "precondition: the one-item select list must widen to the 4-column \
+             two-table base row"
+        );
+
+        assert!(
+            render_broadcast_join(&request, &pushdown_req, &detected)
+                .expect("a widened projection is a clean decline, NOT an error")
+                .is_none(),
+            "a widened projection must decline broadcast rendering (Ok(None)) so the \
+             request falls through to the unified N-scan fallback"
         );
     }
 
@@ -2110,6 +2181,103 @@ mod tests {
         assert!(
             !ssql.contains(" GROUP BY ") && ssql.contains(r#"AS "LHS_T0""#),
             "the single-group wrapper renders NO GROUP BY over the aliased scan: {ssql}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The one widening trigger the wrapper cannot render: a node type NEITHER
+    // dialect knows. Both wrapper entry points reach the same refusal site in
+    // `n_scan_join_select_items`, and both hard-error there — Exasol receives an
+    // error, never a wrong-shaped result. Pre-existing behaviour, pinned here (#196).
+    // -----------------------------------------------------------------------
+
+    /// A select-list node no dialect renders: the DataFusion dialect declines it (so
+    /// `project_columns` widens and the broadcast plan cleanly falls through), and
+    /// the Exasol dialect declines it too, so the N-scan wrapper's select list cannot
+    /// be rendered. That is a `UdfError::User`, NOT a silent full-row fallback.
+    #[test]
+    fn n_scan_join_untranslatable_select_item_is_hard_error() {
+        let unknown = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
+        assert!(
+            render_expression_safe(&unknown).is_none()
+                && render_expression_exasol_safe(&unknown).is_none(),
+            "the fixture node must be untranslatable under BOTH dialects"
+        );
+
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            unknown,
+        ]);
+        let pushdown_req = pd(&request);
+        let detected = detected_join(&request);
+        assert!(
+            render_broadcast_join(&request, &pushdown_req, &detected)
+                .expect("the broadcast decline is never an error")
+                .is_none(),
+            "the widened projection declines broadcast, so the request reaches the \
+             N-scan fallback"
+        );
+
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let err = build_n_scan_join_sql(
+            &request,
+            &pushdown_req,
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        )
+        .expect_err("an untranslatable select-list item must be a hard error");
+        assert!(
+            matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
+            "the refusal must come from the select-list render site: {err}"
+        );
+    }
+
+    /// The SINGLE-TABLE route to the same refusal site:
+    /// `qualified_single_table_fallback_pushdown` →
+    /// `build_qualified_single_table_fallback_sql` → `outer_wrapper_clauses` →
+    /// `n_scan_join_select_items`. This is the path the widened-projection dispatch
+    /// routing feeds most directly, so an untranslatable item must surface an error
+    /// there too — never a wrong-shaped result.
+    #[test]
+    fn qualified_single_table_untranslatable_select_item_is_hard_error() {
+        let request = serde_json::json!({
+            "involvedTables": [{"name": "T", "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]}],
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [
+                {"type": "column", "name": "ID", "tableName": "T"},
+                {"type": "no_such_node_type_in_either_dialect"},
+            ],
+        });
+        let col_types = vec![("ID".to_string(), "DECIMAL(20,0)".to_string())];
+        let base = CommonScanSpec {
+            storage: sample_storage(),
+            ..Default::default()
+        };
+        let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
+
+        let err = qualified_single_table_fallback_pushdown(
+            &request,
+            &pushdown_req,
+            &base,
+            None,
+            &shards,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        )
+        .expect_err("an untranslatable select-list item must be a hard error");
+        assert!(
+            matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
+            "the refusal must come from the shared select-list render site: {err}"
         );
     }
 }

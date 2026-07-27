@@ -980,10 +980,14 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
 /// column set so Exasol can post-process the expression, GROUP BY, and aggregate —
 /// correctness over pushdown. The returned projection is positional: exactly one
 /// item per select-list item, in select-list order.
+///
+/// The third element is the widening signal: `true` means the derived projection is
+/// the full base row, NOT one item per select-list item, so every consumer that owes
+/// Exasol a select-list-shaped result must route the request elsewhere (#196).
 pub(super) fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     project_columns(pushdown_req, extract_all_column_types(request))
 }
 
@@ -1004,10 +1008,21 @@ fn is_valid_emits_output_type(ty: &str) -> bool {
 /// logic here lets the join path reuse it verbatim — a projected column's EMITS
 /// type is looked up in whichever side owns it, with no bespoke join code — while
 /// the single-table path is unchanged.
+///
+/// The third element is the widening signal: `true` means the derived projection is
+/// the full base row, NOT one item per select-list item — a select-list item was
+/// untranslatable, EMITS-rejected, or a node type this function deliberately keeps
+/// off the projection (an aggregate), so the whole select list widened. It is the
+/// producer's own decision, piped out verbatim rather than re-derived downstream by
+/// comparing the projection's arity against the select list's: the two coincide
+/// whenever the base table happens to have as many columns as the query selects
+/// (#196). A `None`/empty/non-array select list is NOT a widening — the full base row
+/// is the correct answer there, and `false` keeps a genuine `SELECT *` on the scan
+/// path.
 pub(super) fn project_columns(
     pushdown_req: &Json,
     all_cols: Vec<(String, String)>,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     if all_cols.is_empty() {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
@@ -1036,6 +1051,14 @@ pub(super) fn project_columns(
         (names, types)
     };
 
+    // If any item can't be projected as-is (untranslatable scalar, EMITS-rejected
+    // declared type, or an aggregate/unknown node), we can't emit a per-item
+    // projection — repeating `first_col_name` would yield duplicate EMITS names.
+    // Instead project the full base row so Exasol has every column to post-process
+    // the expression, GROUP BY, and aggregate itself. Declared out here, not inside
+    // the select-list arm, because it is also this function's third return value —
+    // the widening signal its callers route on (#196).
+    let mut needs_full_fallback = false;
     let select_list = pushdown_req.get("selectList");
     let (proj_names, proj_types): (Vec<ProjectionItem>, Vec<String>) = match select_list {
         None | Some(Json::Null) => full_row(),
@@ -1053,12 +1076,6 @@ pub(super) fn project_columns(
                 .and_then(|v| v.as_array());
             let mut names = Vec::with_capacity(list.len());
             let mut types = Vec::with_capacity(list.len());
-            // If any item can't be projected as-is (untranslatable scalar, or an
-            // aggregate/unknown node), we can't emit a per-item projection — repeating
-            // `first_col_name` would yield duplicate EMITS names. Instead project the
-            // full base row so Exasol has every column to post-process the expression,
-            // GROUP BY, and aggregate itself.
-            let mut needs_full_fallback = false;
             for (i, e) in list.iter().enumerate() {
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
@@ -1129,6 +1146,13 @@ pub(super) fn project_columns(
                             }
                         }
                     }
+                    // This arm must list every remaining node type `render_expression_safe`
+                    // renders that isn't already handled by an earlier arm in this match,
+                    // EXCEPT `function_aggregate` — an aggregate must reach the aggregate
+                    // planner, not be evaluated per shard as a projection item — and
+                    // `predicate_greater` / `predicate_greaterequal`, which are unreachable
+                    // here: Exasol normalises `a > b` to `b < a` (`capabilities.rs:29-30`),
+                    // so a select-list `>` already arrives as `predicate_less` (#196).
                     "function_scalar"
                     | "function_scalar_cast"
                     // A `function_scalar_cast` of a bare DECIMAL column to VARCHAR/CHAR
@@ -1144,7 +1168,13 @@ pub(super) fn project_columns(
                     | "predicate_like"
                     | "predicate_and"
                     | "predicate_or"
-                    | "predicate_not" => {
+                    | "predicate_not"
+                    | "predicate_in_constlist"
+                    | "predicate_between"
+                    | "predicate_is_null"
+                    | "predicate_is_not_null"
+                    | "predicate_notequal"
+                    | "predicate_like_regexp" => {
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
@@ -1181,7 +1211,7 @@ pub(super) fn project_columns(
         _ => full_row(),
     };
 
-    Ok((proj_names, proj_types))
+    Ok((proj_names, proj_types, needs_full_fallback))
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -2015,7 +2045,7 @@ mod tests {
             ],
         });
 
-        let (names, types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (names, types, _widened) = extract_projection(&request, &pushdown_req).unwrap();
 
         let unique: std::collections::HashSet<&str> = names.iter().map(|p| p.emit_name()).collect();
         assert_eq!(
@@ -3256,7 +3286,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // The rendered expression should be carried as an Expr projection item, NOT
         // a bare Column — so the scan splices it verbatim instead of quoting it as a
         // phantom identifier.
@@ -3297,7 +3328,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3338,7 +3370,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3387,7 +3420,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3429,7 +3463,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // Full base row fallback: both table columns, as bare Column items —
         // not the single rendered expression.
         assert_eq!(
@@ -3460,7 +3495,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3500,7 +3536,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
 
         assert_eq!(
             proj_cols.len(),
@@ -3550,7 +3587,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3587,7 +3625,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols,
             vec![
@@ -3621,7 +3660,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3654,7 +3694,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // Fall back to the first column name
         assert_eq!(proj_cols.len(), 1);
         assert_eq!(proj_cols[0], "AMOUNT");
@@ -4291,7 +4332,7 @@ mod tests {
             "selectList": [ cast_to("VARCHAR", decimal_column()) ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
         });
-        let (items, types) =
+        let (items, types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4349,7 +4390,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4383,7 +4424,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4414,7 +4455,7 @@ mod tests {
             "selectList": [ cast_to("VARCHAR", serde_json::json!({"type": "column", "name": "name"})) ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4447,7 +4488,7 @@ mod tests {
             "selectList": [ cast_to("VARCHAR", computed) ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4483,7 +4524,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
         });
-        let (items, types) =
+        let (items, types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4514,7 +4555,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4543,7 +4584,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
         });
-        let (items, types) =
+        let (items, types, _widened) =
             project_columns(&pushdown_req, col_types.clone()).expect("must project");
 
         assert_eq!(
@@ -4581,7 +4622,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
 
         assert_eq!(
@@ -4626,7 +4667,7 @@ mod tests {
             "selectList": [ item ],
             "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
         });
-        let (items, _types) =
+        let (items, _types, _widened) =
             project_columns(&pushdown_req, col_types.clone()).expect("must project");
 
         assert_eq!(
@@ -4642,6 +4683,147 @@ mod tests {
             items, expected_names,
             "the full-row fallback must project every base column unchanged"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Select-list predicate node types added to the pushable whitelist (#196)
+    // ---------------------------------------------------------------------------
+
+    /// Each whitelisted select-list predicate node type (issue #196) renders as a
+    /// positional `ProjectionItem::Expr` carrying the rendered SQL fragment and the
+    /// declared `selectListDataTypes` type — not the full-base-row fallback.
+    #[test]
+    fn selectlist_predicate_node_projects_as_expr() {
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "predicate_in_constlist",
+                serde_json::json!({
+                    "type": "predicate_in_constlist",
+                    "expression": column("name"),
+                    "arguments": [
+                        {"type": "literal_string", "value": "a"},
+                        {"type": "literal_string", "value": "b"},
+                    ]
+                }),
+                r#"("NAME" IN ('a', 'b'))"#,
+            ),
+            (
+                "predicate_between",
+                serde_json::json!({
+                    "type": "predicate_between",
+                    "expression": column("id"),
+                    "left": {"type": "literal_exactnumeric", "value": 1},
+                    "right": {"type": "literal_exactnumeric", "value": 10},
+                }),
+                r#"("ID" BETWEEN 1 AND 10)"#,
+            ),
+            (
+                "predicate_is_null",
+                serde_json::json!({
+                    "type": "predicate_is_null",
+                    "expression": column("name"),
+                }),
+                r#"("NAME" IS NULL)"#,
+            ),
+            (
+                "predicate_is_not_null",
+                serde_json::json!({
+                    "type": "predicate_is_not_null",
+                    "expression": column("name"),
+                }),
+                r#"("NAME" IS NOT NULL)"#,
+            ),
+            (
+                "predicate_notequal",
+                serde_json::json!({
+                    "type": "predicate_notequal",
+                    "left": column("id"),
+                    "right": {"type": "literal_exactnumeric", "value": 5},
+                }),
+                r#"("ID" <> 5)"#,
+            ),
+            (
+                "predicate_like_regexp",
+                serde_json::json!({
+                    "type": "predicate_like_regexp",
+                    "expression": column("name"),
+                    "pattern": {"type": "literal_string", "value": "^a.*"},
+                }),
+                r#"regexp_like("NAME", '^a.*')"#,
+            ),
+        ];
+
+        for (node_type, item, expected_frag) in cases {
+            let pushdown_req = serde_json::json!({
+                "selectList": [ item ],
+                "selectListDataTypes": [ {"type": "boolean"} ],
+            });
+            let (items, types, _widened) =
+                project_columns(&pushdown_req, decimal_rewrite_col_types())
+                    .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
+
+            assert_eq!(
+                items.len(),
+                1,
+                "[{node_type}] must project a single expression, not the full base row: {items:?}"
+            );
+            let ProjectionItem::Expr { expr } = &items[0] else {
+                panic!(
+                    "[{node_type}] must be a rendered expression, not a full-row fallback: {items:?}"
+                );
+            };
+            assert_eq!(
+                expr, expected_frag,
+                "[{node_type}] rendered fragment mismatch"
+            );
+            assert_eq!(
+                types,
+                vec!["BOOLEAN".to_string()],
+                "[{node_type}] declared type mismatch"
+            );
+        }
+    }
+
+    /// A `function_aggregate` select-list item still widens to the full base row —
+    /// pinning the whitelist's one deliberate exclusion (#196) as intentional, not
+    /// incidental: an aggregate must reach the aggregate planner, not be evaluated
+    /// per shard as a projection item.
+    #[test]
+    fn selectlist_function_aggregate_still_widens_to_full_row() {
+        let item = serde_json::json!({
+            "type": "function_aggregate",
+            "name": "COUNT",
+            "arguments": [],
+            "distinct": false
+        });
+        let col_types = decimal_rewrite_col_types();
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "decimal", "precision": 20, "scale": 0} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert!(
+            widened,
+            "the widening must be REPORTED, not only performed: the dispatcher routes on \
+             this flag alone (#196)"
+        );
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "function_aggregate must widen to the full base row, not project as an Expr: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
     }
 
     // ---------------------------------------------------------------------------

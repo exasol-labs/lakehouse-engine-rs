@@ -306,7 +306,12 @@ mod tests {
             .get("pushdownRequest")
             .cloned()
             .unwrap_or(Json::Null);
-        let (mut proj_cols, mut proj_types) = extract_projection(request, &pushdown_req).unwrap();
+        let (mut proj_cols, mut proj_types, widened) =
+            extract_projection(request, &pushdown_req).unwrap();
+        assert!(
+            !widened,
+            "plan_scan_sql mirrors only the non-widened dispatch path; a widened fixture needs build_dispatch_sql, not this helper"
+        );
         let filter = pushdown_req
             .get("filter")
             .filter(|f| !f.is_null())
