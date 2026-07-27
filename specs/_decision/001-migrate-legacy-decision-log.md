@@ -286,7 +286,7 @@ The column-value contract between the scan UDF and the outer wrapper is purely p
 
 ### Context
 
-High-cardinality GROUP BY queries inside a scan UDF risk OOM-crashing the UDF process when DataFusion's intermediate state exceeds the per-instance memory budget. Exasol enforces a per-process heap limit via `setrlimit(RLIMIT_RSS)` (default 4096 MB) and stalls additional concurrent VMs once usage hits 80% of it (`[redacted]`). The per-instance limit is exposed in UDF metadata via `ctx.memory_limit()` (bytes; `0` = unbounded/unknown sentinel), provided by `language-container-rs:add-memory-limit-metadata`.
+High-cardinality GROUP BY queries inside a scan UDF risk OOM-crashing the UDF process when DataFusion's intermediate state exceeds the per-instance memory budget. Exasol enforces a per-process heap limit via `setrlimit(RLIMIT_RSS)` (default 4096 MB) and stalls additional concurrent VMs once usage hits 80% of it. The per-instance limit is exposed in UDF metadata via `ctx.memory_limit()` (bytes; `0` = unbounded/unknown sentinel).
 
 ### Decision
 
@@ -316,11 +316,11 @@ Memory use is bounded without a heuristic. Spill lets high-cardinality grouped q
 
 ### Context
 
-ADR-007 shipped `GROUP BY IPROC(), shard_key` to distribute scan shards across nodes. A corrected reading of the Exasol engine internals (verified in `[redacted]`/`script-languages`) shows that groups drive UDF *invocations*, not OS processes; parallel instances on a node are a fixed VM pool sized to `NR_OF_CORES` (`[redacted]`, `[redacted]`), and groups are multiplexed onto it (`[redacted]`). `GROUP BY IPROC()` yields exactly one group per node (`[redacted]`), capping parallelism at node count and leaving a node's other cores idle.
+ADR-007 shipped `GROUP BY IPROC(), shard_key` to distribute scan shards across nodes. A corrected reading of Exasol's engine behavior shows that groups drive UDF *invocations*, not OS processes; parallel instances on a node are a fixed VM pool sized to `NR_OF_CORES`, and groups are multiplexed onto it. `GROUP BY IPROC()` yields exactly one group per node, capping parallelism at node count and leaving a node's other cores idle.
 
 ### Decision
 
-Replace `GROUP BY IPROC(), shard_key` with `GROUP BY shard_key` over G oversubscribed work-unit shards, where `G = node_count × parallelism_factor` (`parallelism_factor` is a VS property, default 8), capped at 300 and clamped to `[1, file_count]`. The 300 cap keeps the group set in Exasol's round-robin distribution regime; above `max_dynamic_group_count` (default 300) Exasol hash-partitions groups instead (`[redacted]`). The `parallelism/iproc-sharding` feature is renamed to `parallelism/work-unit-sharding`. The balanced `partition_files` split is reused, passing G instead of node_count. The NPROC node-count capture (ADR-006) is retained to feed G.
+Replace `GROUP BY IPROC(), shard_key` with `GROUP BY shard_key` over G oversubscribed work-unit shards, where `G = node_count × parallelism_factor` (`parallelism_factor` is a VS property, default 8), capped at 300 and clamped to `[1, file_count]`. The 300 cap keeps the group set in Exasol's round-robin distribution regime; above `max_dynamic_group_count` (default 300) Exasol hash-partitions groups instead. The `parallelism/iproc-sharding` feature is renamed to `parallelism/work-unit-sharding`. The balanced `partition_files` split is reused, passing G instead of node_count. The NPROC node-count capture (ADR-006) is retained to feed G.
 
 ### Options Considered
 

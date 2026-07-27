@@ -582,9 +582,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(format!("({sql})")))
         }
         // Exasol sends CAST as its own top-level node type carrying the target
-        // in `dataType` (verified against the engine source
-        // `[redacted]` — `[redacted]`
-        // is the sole CAST emitter):
+        // in `dataType` (verified against the real Exasol wire shape):
         //   {"type":"function_scalar_cast","name":"CAST","dataType":{...},"arguments":[<src>]}
         // This is the shape real Exasol traffic hits; the nested
         // `function_scalar`+name=CAST arm below is a defensive alternate encoding.
@@ -672,8 +670,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 }
                 // CAST as a function_scalar (defensive alternate encoding).
                 // Real Exasol traffic emits CAST as the top-level
-                // `function_scalar_cast` node handled above (engine source
-                // `[redacted]` emits CAST exclusively that way); this arm is kept
+                // `function_scalar_cast` node handled above; this arm is kept
                 // defensively — like the REGEXP_LIKE alternate encoding below — and
                 // shares the same body via `render_cast`.
                 "CAST" => render_cast(args, value("dataType"), dialect),
@@ -1758,9 +1755,8 @@ mod tests {
     //
     // Fixtures use the real Exasol wire shape `{"type":"function_scalar_cast",
     // "name":"CAST","dataType":{...},"arguments":[...]}` — the shape the engine
-    // actually emits (verified against `[redacted]` `[redacted]`
-    // `[redacted]`), NOT the earlier `{"type":"function_scalar",...}`
-    // shape whose mismatch let a dispatch bug hide (CAST never reached its arm).
+    // actually emits, NOT the earlier `{"type":"function_scalar",...}` shape
+    // whose mismatch let a dispatch bug hide (CAST never reached its arm).
 
     #[test]
     fn renders_cast_varchar() {
