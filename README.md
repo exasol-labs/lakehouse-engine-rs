@@ -34,13 +34,29 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 
 ## What this is
 
-`lakehouse-engine-rs` is an In-Place Query Engine for lakehouses. It leverages Exasol **Virtual Schemas** and the [Apache DataFusion](https://datafusion.apache.org/) engine. The VS stays thin — query translation, pushdown analysis, parallelization planning, result-schema mapping — while all execution happens in disposable, node-local DataFusion runtimes inside Rust UDFs. Files are sharded across cluster nodes, scanned in parallel, then combined by Exasol.
+`lakehouse-engine-rs` is a query engine for lakehouses, delivered as an Exasol Virtual Schema.
+[Apache DataFusion](https://datafusion.apache.org/) executes inside stateless Rust UDFs — one
+session per invocation, discarded on completion. The engine resolves the Iceberg file list once
+per query and splits it into sharded work units that Exasol distributes across nodes and
+multiplexes onto each node's cores, so cluster parallelism and DataFusion's vectorized execution
+compound; no node scans another node's files. Pushed-down projection, filter, LIMIT, Top-N,
+aggregation, and broadcast-eligible inner equi-joins keep each scan lean, reaching Apache Iceberg
+and Databricks-managed Iceberg through the same path. Every query starts from source metadata,
+with nothing materialized or copied out.
 
 ## Documentation
 
-- [**docs/**](docs/index.md) — documentation index
-- [Install & deploy](docs/install.md) — build the `.so`, register the SLC, create scripts + CONNECTION + VS. If `exapump`/curl can't reach BucketFS directly (e.g. Exasol SaaS), see [Install](docs/install.md) for a fully manual path — curl/UI upload plus hand-run SQL, no Docker required
-- [Capabilities](docs/capabilities.md) — projection / filter / LIMIT / aggregation pushdown matrix
+Start at the [documentation index](docs/index.md), or go straight to a guide:
+
+| Guide | What it covers |
+|-------|----------------|
+| [Install](docs/install.md) | One-command install for Exasol SaaS, an automated two-command path for self-managed Exasol, and a manual curl/SQL fallback for restricted networks. Deploy the `.so`, register the Rust SLC, create the scripts, then point a Virtual Schema at your data. |
+| [Catalogs](docs/catalogs.md) | Connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs: CONNECTION objects, credentials, and object-storage access. |
+| [Benchmark](docs/benchmark.md) | The benchmark query set and how to run it yourself. |
+| [Architecture](docs/architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
+| [Capabilities](docs/capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
+| [Tuning](docs/tuning.md) | Configuration parameters reference and runtime telemetry. |
+| [Debugging pushdown](docs/debugging-pushdown.md) | Inspect exactly what the adapter pushes down for a query, using `EXPLAIN VIRTUAL`. |
 
 ## License
 
