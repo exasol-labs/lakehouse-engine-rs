@@ -163,7 +163,9 @@ fn single_group_agg_request() -> Json {
 /// [`build_dispatch_sql`] seam, over the fixed three-shard fixture and a fixed
 /// tuning/storage/schema common blob. `has_order_by` is always `false`: none
 /// of the five golden shapes exercise the ordered top-N or declined-order-by
-/// paths.
+/// paths. The widening flag is always `false` too — every golden shape derives
+/// one projection item per select-list item, so none routes to the qualified
+/// single-table wrapper.
 fn dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
@@ -193,6 +195,7 @@ fn dispatch_sql_with_pushdown_req(
         pushdown_req,
         proj_cols,
         proj_types,
+        false,
         base_col_types(),
         filter,
         limit,
@@ -219,11 +222,18 @@ fn dispatch_sql_with_pushdown_req(
 }
 
 /// Render the empty-result SQL for `request` through [`empty_result_sql`],
-/// over the same fixed column universe every non-empty golden uses.
+/// over the same fixed column universe every non-empty golden uses. Every captured
+/// fixture is a non-widened projection, so the widening signal is `false` here.
 fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]) -> String {
     let pushdown_req = pd(request);
-    let result = empty_result_sql(&pushdown_req, proj_cols, proj_types, &base_col_types())
-        .expect("empty_result_sql must succeed for this golden fixture");
+    let result = empty_result_sql(
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        false,
+        &base_col_types(),
+    )
+    .expect("empty_result_sql must succeed for this golden fixture");
     result["sql"]
         .as_str()
         .expect("pushdown response must carry a sql field")

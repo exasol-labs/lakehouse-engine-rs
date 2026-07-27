@@ -26,11 +26,15 @@ pub(super) fn render_join_condition(condition: &Json) -> Option<String> {
 /// side owns it. The caller must have already passed the [`disjoint_schema_guard`]
 /// so the union carries no name collision. Broadcast is a two-table optimization,
 /// so `join.tables[0]`/`[1]` are the two involved tables.
+///
+/// The third element is [`project_columns`]'s widening signal, forwarded verbatim:
+/// `true` means the derived projection is the full two-table base row, not one item
+/// per select-list item (#196).
 pub(super) fn extract_join_projection(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     let mut combined = involved_table_columns(request, &join.tables[0].table_name);
     combined.extend(involved_table_columns(request, &join.tables[1].table_name));
     project_columns(pushdown_req, combined)
@@ -469,7 +473,7 @@ mod tests {
     fn join_projection_emits_attribute_each_side_owning_type() {
         let request = join_request(Json::Null, equi_condition());
         let detected = detected_join(&request);
-        let (projection, types) =
+        let (projection, types, _widened) =
             extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
 
         assert_eq!(
@@ -506,7 +510,7 @@ mod tests {
         ]);
 
         let detected = detected_join(&request);
-        let (projection, _types) =
+        let (projection, _types, _widened) =
             extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
 
         assert_eq!(
@@ -551,7 +555,7 @@ mod tests {
                 "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
             }
         ]);
-        let (projection, _types) =
+        let (projection, _types, _widened) =
             extract_join_projection(&coerce_request, &pd(&coerce_request), &detected)
                 .expect("projectable");
         assert_eq!(
@@ -581,7 +585,7 @@ mod tests {
                 ]
             }
         ]);
-        let (projection, _types) =
+        let (projection, _types, _widened) =
             extract_join_projection(&decline_request, &pd(&decline_request), &detected)
                 .expect("projectable");
         let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()

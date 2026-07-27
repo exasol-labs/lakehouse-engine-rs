@@ -24,8 +24,8 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, seed_events,
-    seed_typed_distinct_probe,
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, ExpectedValue,
+    seed_events, seed_typed_distinct_probe,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -435,6 +435,514 @@ fn e2e_selectlist_expression_pushdown() {
     }
 }
 
+/// True if `"projection"` is followed somewhere later by an `"expr"` key —
+/// the signal that the pushed scan spec's projection carries a positional
+/// `Expr` item, not the full-base-row fallback (bare `Column` string
+/// entries, no `"expr"` key at all). Shared by every test in this file that
+/// needs this check — `explain_virtual_sql` flattens EXPLAIN's result cells
+/// by joining them with a single space, so JSON tokens can end up split
+/// across a cell boundary; an exact adjacent-substring match would be flaky.
+fn has_expr_after_projection(pushed_sql: &str) -> bool {
+    pushed_sql
+        .find(r#""projection""#)
+        .and_then(|idx| pushed_sql[idx..].find(r#""expr""#))
+        .is_some()
+}
+
+/// Regression for issue #196: `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, and
+/// `<>` select-list items must push down as a positional expression, not
+/// widen the derived projection to the full base row. Each predicate runs
+/// independently, over `EVENTS` (`vs_table()`) for the id-based predicates
+/// and `typed_distinct_probe` (`vs_typed_table()`) for the NULL-column
+/// predicates, and asserts BOTH the returned boolean values (computed from
+/// the real seeded rows) AND — via `has_expr_after_projection` — that the
+/// scan spec carries a positional `Expr` projection for the predicate item.
+#[test]
+fn e2e_selectlist_predicate_projection_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // IN (...): `id IN (1,2,3)` over ids 1..5.
+    {
+        let sql = format!(
+            "SELECT id, id IN (1,2,3) FROM {} WHERE id <= 5 ORDER BY id",
+            vs_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (id, IN predicate): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 5, "expected 5 rows (id 1..5): {cols:?}");
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            let expected = [1i64, 2, 3].contains(&id);
+            assert!(
+                ExpectedValue::Bool(expected).matches(&cols[1][i]),
+                "row {i} (id={id}): id IN (1,2,3) must be {expected}, got {:?}",
+                cols[1][i]
+            );
+        }
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            has_expr_after_projection(&pushed_sql),
+            "IN predicate select-list item must push a positional Expr \
+             projection, not the full-base-row fallback (#196), got:\n{pushed_sql}"
+        );
+    }
+
+    // BETWEEN ... AND ...: `id BETWEEN 2 AND 4` over ids 1..5.
+    {
+        let sql = format!(
+            "SELECT id, id BETWEEN 2 AND 4 FROM {} WHERE id <= 5 ORDER BY id",
+            vs_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (id, BETWEEN predicate): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 5, "expected 5 rows (id 1..5): {cols:?}");
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            let expected = (2..=4).contains(&id);
+            assert!(
+                ExpectedValue::Bool(expected).matches(&cols[1][i]),
+                "row {i} (id={id}): id BETWEEN 2 AND 4 must be {expected}, got {:?}",
+                cols[1][i]
+            );
+        }
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            has_expr_after_projection(&pushed_sql),
+            "BETWEEN predicate select-list item must push a positional Expr \
+             projection, not the full-base-row fallback (#196), got:\n{pushed_sql}"
+        );
+    }
+
+    // IS NULL: `c_decimal_a IS NULL` over typed_distinct_probe ids 1..4
+    // (id=3 is the only NULL c_decimal_a among these — see
+    // `common/seed.rs`'s `typed_probe()`, reproduced below as
+    // `TYPED_DECIMAL_A_UNSCALED`).
+    {
+        let sql = format!(
+            "SELECT id, c_decimal_a IS NULL FROM {} WHERE id <= 4 ORDER BY id",
+            vs_typed_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (id, IS NULL predicate): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 4, "expected 4 rows (id 1..4): {cols:?}");
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            let expected = TYPED_DECIMAL_A_UNSCALED
+                .iter()
+                .find(|&&(row_id, _)| row_id == id)
+                .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={id}"))
+                .1
+                .is_none();
+            assert!(
+                ExpectedValue::Bool(expected).matches(&cols[1][i]),
+                "row {i} (id={id}): c_decimal_a IS NULL must be {expected}, got {:?}",
+                cols[1][i]
+            );
+        }
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            has_expr_after_projection(&pushed_sql),
+            "IS NULL predicate select-list item must push a positional Expr \
+             projection, not the full-base-row fallback (#196), got:\n{pushed_sql}"
+        );
+    }
+
+    // IS NOT NULL: same column, negated.
+    {
+        let sql = format!(
+            "SELECT id, c_decimal_a IS NOT NULL FROM {} WHERE id <= 4 ORDER BY id",
+            vs_typed_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (id, IS NOT NULL predicate): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 4, "expected 4 rows (id 1..4): {cols:?}");
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            let expected = TYPED_DECIMAL_A_UNSCALED
+                .iter()
+                .find(|&&(row_id, _)| row_id == id)
+                .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={id}"))
+                .1
+                .is_some();
+            assert!(
+                ExpectedValue::Bool(expected).matches(&cols[1][i]),
+                "row {i} (id={id}): c_decimal_a IS NOT NULL must be {expected}, got {:?}",
+                cols[1][i]
+            );
+        }
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            has_expr_after_projection(&pushed_sql),
+            "IS NOT NULL predicate select-list item must push a positional \
+             Expr projection, not the full-base-row fallback (#196), got:\n{pushed_sql}"
+        );
+    }
+
+    // <> (not-equal): `id <> 3` over ids 1..5.
+    {
+        let sql = format!(
+            "SELECT id, id <> 3 FROM {} WHERE id <= 5 ORDER BY id",
+            vs_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(
+            cols.len(),
+            2,
+            "expected 2 columns (id, <> predicate): {cols:?}"
+        );
+        assert_eq!(cols[0].len(), 5, "expected 5 rows (id 1..5): {cols:?}");
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            let expected = id != 3;
+            assert!(
+                ExpectedValue::Bool(expected).matches(&cols[1][i]),
+                "row {i} (id={id}): id <> 3 must be {expected}, got {:?}",
+                cols[1][i]
+            );
+        }
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            has_expr_after_projection(&pushed_sql),
+            "<> predicate select-list item must push a positional Expr \
+             projection, not the full-base-row fallback (#196), got:\n{pushed_sql}"
+        );
+    }
+}
+
+/// One row of `typed_distinct_probe` (`id`, `c_decimal_b` unscaled scale-4,
+/// `c_double`, `c_varchar`, `c_bool`, `c_price`, `c_qty`). `c_decimal_a` is
+/// deliberately absent: it's already tracked for all 12 rows by
+/// `TYPED_DECIMAL_A_UNSCALED` (section 8.14, below), so `assert_typed_probe_prefix`
+/// looks it up from there instead of re-encoding it here. `c_qty` is never
+/// NULL; every other field mirrors its column's nullability.
+struct TypedProbeRow {
+    id: i64,
+    decimal_b: Option<i128>,
+    double: Option<f64>,
+    varchar: Option<&'static str>,
+    boolean: Option<bool>,
+    price: Option<f64>,
+    qty: i64,
+}
+
+/// Rows 1..=3 of `typed_distinct_probe`, copied from `common/seed.rs`'s
+/// `typed_probe()` (see its module doc for the full 12-row fixture). Row 3
+/// (index 2) is NULL in every optional column; `c_qty` is never NULL.
+const TYPED_ROWS_1_TO_3: [TypedProbeRow; 3] = [
+    TypedProbeRow {
+        id: 1,
+        decimal_b: Some(1_000_000_001),
+        double: Some(0.5),
+        varchar: Some("aa"),
+        boolean: Some(true),
+        price: Some(2.0),
+        qty: 3,
+    },
+    TypedProbeRow {
+        id: 2,
+        decimal_b: Some(2_000_000_002),
+        double: Some(1.5),
+        varchar: Some("AA"),
+        boolean: Some(true),
+        price: Some(3.0),
+        qty: 2,
+    },
+    TypedProbeRow {
+        id: 3,
+        decimal_b: None,
+        double: None,
+        varchar: None,
+        boolean: None,
+        price: None,
+        qty: 5,
+    },
+];
+
+/// Assert columns 0..=8 (`id`, `c_decimal_a`, `c_decimal_b`, `c_double`,
+/// `c_varchar`, `c_date`, `c_ts`, `c_bool`, `c_price`) of row `i` against
+/// `TYPED_ROWS_1_TO_3` (plus `TYPED_DECIMAL_A_UNSCALED` for `c_decimal_a`,
+/// looked up by `id`). `c_date`/`c_ts` are checked only for NULL-ness (their
+/// exact rendering is covered elsewhere, sections 8.14/8.16); every other
+/// nullable column is checked against its real seeded value. Shared by the
+/// two coincidental-arity widening tests below, which both project these
+/// same nine columns and vary only the tenth (widening) item.
+fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
+    let row = &TYPED_ROWS_1_TO_3[i];
+    assert_eq!(parse_int(&cols[0][i]), row.id, "row {i}: id mismatch");
+
+    let decimal_a = TYPED_DECIMAL_A_UNSCALED
+        .iter()
+        .find(|&&(row_id, _)| row_id == row.id)
+        .unwrap_or_else(|| panic!("no TYPED_DECIMAL_A_UNSCALED entry for id={}", row.id))
+        .1;
+    match decimal_a {
+        Some(unscaled) => assert!(
+            (parse_numeric(&cols[1][i]) - unscaled as f64 / 100.0).abs() < 0.001,
+            "row {i}: c_decimal_a mismatch, got {:?}",
+            cols[1][i]
+        ),
+        None => assert!(
+            cols[1][i].is_null(),
+            "row {i}: c_decimal_a must be NULL, got {:?}",
+            cols[1][i]
+        ),
+    }
+    match row.decimal_b {
+        Some(unscaled) => assert!(
+            (parse_numeric(&cols[2][i]) - unscaled as f64 / 10_000.0).abs() < 0.001,
+            "row {i}: c_decimal_b mismatch, got {:?}",
+            cols[2][i]
+        ),
+        None => assert!(
+            cols[2][i].is_null(),
+            "row {i}: c_decimal_b must be NULL, got {:?}",
+            cols[2][i]
+        ),
+    }
+    match row.double {
+        Some(d) => assert!(
+            (parse_numeric(&cols[3][i]) - d).abs() < 0.001,
+            "row {i}: c_double mismatch, got {:?}",
+            cols[3][i]
+        ),
+        None => assert!(
+            cols[3][i].is_null(),
+            "row {i}: c_double must be NULL, got {:?}",
+            cols[3][i]
+        ),
+    }
+    match row.varchar {
+        Some(s) => assert_eq!(
+            cols[4][i].as_str(),
+            Some(s),
+            "row {i}: c_varchar mismatch, got {:?}",
+            cols[4][i]
+        ),
+        None => assert!(
+            cols[4][i].is_null(),
+            "row {i}: c_varchar must be NULL, got {:?}",
+            cols[4][i]
+        ),
+    }
+    // Coupling note: `c_date`/`c_ts` are checked only for NULL-ness here, using
+    // `decimal_a` as the oracle rather than their own real values — this is
+    // correct only because row 3 (id=3) is NULL in every optional column of
+    // `typed_probe()`'s seed data (see `common/seed.rs`), so `decimal_a`'s
+    // null flag happens to double as the oracle for every other nullable
+    // column too, including these two. A future seed-data edit that breaks
+    // this coupling (a row NULL in `c_decimal_a` but not in `c_date`/`c_ts`,
+    // or vice versa) would silently invalidate these two assertions.
+    assert_eq!(
+        cols[5][i].is_null(),
+        decimal_a.is_none(),
+        "row {i}: c_date null-ness mismatch"
+    );
+    assert_eq!(
+        cols[6][i].is_null(),
+        decimal_a.is_none(),
+        "row {i}: c_ts null-ness mismatch"
+    );
+    match row.boolean {
+        Some(b) => assert!(
+            ExpectedValue::Bool(b).matches(&cols[7][i]),
+            "row {i}: c_bool mismatch, got {:?}",
+            cols[7][i]
+        ),
+        None => assert!(
+            cols[7][i].is_null(),
+            "row {i}: c_bool must be NULL, got {:?}",
+            cols[7][i]
+        ),
+    }
+    match row.price {
+        Some(p) => assert!(
+            (parse_numeric(&cols[8][i]) - p).abs() < 0.001,
+            "row {i}: c_price mismatch, got {:?}",
+            cols[8][i]
+        ),
+        None => assert!(
+            cols[8][i].is_null(),
+            "row {i}: c_price must be NULL, got {:?}",
+            cols[8][i]
+        ),
+    }
+}
+
+/// Arity-coincidence repro for issue #196/#234: a 10-item select list over
+/// `typed_distinct_probe` (10 columns) whose LAST item is `(c_qty BETWEEN 1
+/// AND 3)`. Pre-hardening, the dispatcher's arity-based safety net could not
+/// distinguish a widened 10-column projection from a genuine 10-item
+/// non-widened select list, and Exasol rejected the mismatched EMITS type at
+/// position 10 with `sqlCode 04000` ("Data type mismatch in column number
+/// 10 ... Expected BOOLEAN, but got DECIMAL(20,0)"). Task 1 of this plan
+/// whitelisted `predicate_between` as a pushable select-list item kind (see
+/// `selectlist_between_projects_as_expr` in
+/// `crates/lakehouse-engine/src/adapter/pushdown/support.rs`), so this item
+/// now projects as a positional `Expr` on the ORDINARY scan path — the
+/// projection is never widened, and the query never reaches
+/// `qualified_single_table_fallback_pushdown`. That non-widening is exactly
+/// what makes the 10-item/10-column arity coincidence harmless here: with no
+/// widening, there is nothing for a coincidence to mask. This asserts both
+/// the 10 correct columns AND (via `has_expr_after_projection`) the
+/// positional-`Expr` projection shape that proves no widening occurred.
+#[test]
+fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
+         c_ts, c_bool, c_price, (c_qty BETWEEN 1 AND 3) FROM {} WHERE id <= 3 \
+         ORDER BY id",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
+
+    for (i, row) in TYPED_ROWS_1_TO_3.iter().enumerate() {
+        assert_typed_probe_prefix(&cols, i);
+
+        let expected_between = (1..=3).contains(&row.qty);
+        assert!(
+            ExpectedValue::Bool(expected_between).matches(&cols[9][i]),
+            "row {i} (qty={}): c_qty BETWEEN 1 AND 3 must be \
+             {expected_between}, got {:?}",
+            row.qty,
+            cols[9][i]
+        );
+    }
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        has_expr_after_projection(&pushed_sql),
+        "the coincidental-arity BETWEEN item must push a positional Expr \
+         projection on the ordinary scan path, not widen to the full base \
+         row, got:\n{pushed_sql}"
+    );
+}
+
+/// A DIFFERENT widening trigger at the same coincidental arity, proving the
+/// hardened routing (#196/#234) is not predicate-specific: `LENGTH(c_double)`
+/// widens because issue #210's string-function argument-type guard declines
+/// a DOUBLE argument to `LENGTH` (a string function), not because of the
+/// predicate whitelist task 1 of this plan extended. Also covers the (#234)
+/// shape as a variant: the same widening (`LENGTH(score)`, DOUBLE argument)
+/// plus a trailing `ORDER BY id`, over a table (`EVENTS`, 5 columns) whose
+/// column count DIFFERS from the select-list arity (10) — the pre-existing
+/// arity-mismatch routing task 2.4 of this plan confirmed already includes
+/// `ORDER BY` columns.
+#[test]
+fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Base shape: matching arity (10 items, 10 real columns). `ORDER BY id`
+    // is only for this test's own deterministic row order, not the (#234)
+    // trigger — that variant follows below.
+    {
+        let sql = format!(
+            "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
+             c_ts, c_bool, c_price, LENGTH(c_double) FROM {} WHERE id <= 3 \
+             ORDER BY id",
+            vs_typed_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
+        assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
+
+        for (i, row) in TYPED_ROWS_1_TO_3.iter().enumerate() {
+            assert_typed_probe_prefix(&cols, i);
+
+            // LENGTH(c_double)'s implicit DOUBLE-to-VARCHAR rendering is
+            // Exasol-implementation-defined, so — matching section 8.16's
+            // convention — the expected value comes from Exasol's own
+            // in-session native oracle, not a hand-computed string length.
+            let oracle_sql = match row.double {
+                Some(d) => format!("SELECT LENGTH(CAST({d} AS DOUBLE))"),
+                None => "SELECT LENGTH(CAST(NULL AS DOUBLE))".to_string(),
+            };
+            let oracle_cols = conn.query_columns(&oracle_sql);
+            let oracle_value = &oracle_cols[0][0];
+            if oracle_value.is_null() {
+                assert!(
+                    cols[9][i].is_null(),
+                    "row {i}: LENGTH(c_double) must be NULL to match the \
+                     native oracle, got {:?}",
+                    cols[9][i]
+                );
+            } else {
+                assert_eq!(
+                    parse_int(&cols[9][i]),
+                    parse_int(oracle_value),
+                    "row {i}: LENGTH(c_double) must match the native oracle"
+                );
+            }
+        }
+
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed_sql.contains("LHS_T0"),
+            "a widened select list at matching arity must route through the \
+             qualified single-table wrapper (alias LHS_T0), got:\n{pushed_sql}"
+        );
+    }
+
+    // (#234) variant: same widening (`LENGTH(score)`, DOUBLE argument
+    // declined by #210's guard) plus a trailing `ORDER BY id`, over `EVENTS`
+    // (5 real columns) — a select-list arity (10) that DIFFERS from the
+    // table's column count, the shape #234 originally reported.
+    {
+        let sql = format!(
+            "SELECT id, score, name, event_date, event_ts, id, score, name, \
+             event_date, LENGTH(score) FROM {} WHERE id <= 3 ORDER BY id",
+            vs_table()
+        );
+        let cols = conn.query_columns(&sql);
+        assert_eq!(cols.len(), 10, "expected 10 columns: {cols:?}");
+        assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
+
+        for (i, id_val) in cols[0].iter().enumerate() {
+            let id = parse_int(id_val);
+            assert_eq!(id, (i + 1) as i64, "row {i}: id mismatch");
+
+            let score = 5.0 * id as f64;
+            let oracle_cols =
+                conn.query_columns(&format!("SELECT LENGTH(CAST({score} AS DOUBLE))"));
+            let expected_len = parse_int(&oracle_cols[0][0]);
+            assert_eq!(
+                parse_int(&cols[9][i]),
+                expected_len,
+                "row {i}: LENGTH(score) must match the native oracle"
+            );
+        }
+
+        let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed_sql.contains("LHS_T0"),
+            "the (#234) arity-mismatch variant must also route through the \
+             qualified single-table wrapper (alias LHS_T0), got:\n{pushed_sql}"
+        );
+    }
+}
+
 /// Regression for issue #190: a projected constant/literal select-list item
 /// must push down without collapsing to the full base-table row. Runs three
 /// literal-projection shapes over the full 20-row EVENTS table (no WHERE)
@@ -562,23 +1070,13 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
 
     // Guard the pushdown shape itself, not only the numeric result: the inner
     // derived-table scan for the primary shape must push a positional literal
-    // projection (an `{"expr":...}` scan-spec item), not the full-base-row
-    // fallback (which would emit every base column as a bare-string `Column`
-    // entry and yield the #205 column-count mismatch).
-    // `explain_virtual_sql` flattens EXPLAIN's result cells by joining them
-    // with a single space, so JSON tokens can end up split across a cell
-    // boundary — an exact-substring match on adjacent `"projection":[{"expr":`
-    // would be flaky. Instead check that an `"expr"` key occurs anywhere after
-    // the `"projection"` key, which still distinguishes a positional literal
-    // projection from the full-base-row fallback (bare `Column` string
-    // entries, no `"expr"` key at all).
+    // projection, not the full-base-row fallback (which would emit every
+    // base column and yield the #205 column-count mismatch). See
+    // `has_expr_after_projection`'s doc comment for why this is a substring
+    // check rather than an exact match.
     let pushed_sql = explain_virtual_sql(&mut conn, &primary_sql);
-    let projection_idx = pushed_sql.find(r#""projection""#);
-    let has_expr_after_projection = projection_idx
-        .and_then(|idx| pushed_sql[idx..].find(r#""expr""#))
-        .is_some();
     assert!(
-        has_expr_after_projection,
+        has_expr_after_projection(&pushed_sql),
         "{primary_sql}'s inner derived-table scan must push a positional \
          literal projection (an '\"expr\"' key after 'projection'), \
          not the full-base-row fallback (#205), got:\n{pushed_sql}"

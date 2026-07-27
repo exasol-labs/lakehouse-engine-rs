@@ -23,10 +23,12 @@ translator or aggregate planner with a shard-associative partial/merge path.
   "Projected constant whose declared EMITS type Exasol rejects declines to the full base
   row" scenario). The declined-`ORDER BY` rules below are stated against that derived
   projection, NOT against the raw select-list arity: they preserve whatever the derivation
-  produced and never widen it further. Where that pre-existing fallback has already widened
-  the derived projection, the returned query still carries more columns than the select
-  list and Exasol still rejects it — a pre-existing gap outside these scenarios, tracked as
-  an accurately-scoped exception, `(#234)`.
+  produced and never widen it further. A request whose derived projection that pre-existing
+  fallback has ALREADY widened never reaches these scenarios: the dispatcher routes it to the
+  qualified single-table wrapper first — on the widening signal itself, for every base-table
+  column count, including one coincidentally equal to the select-list arity — before the
+  declined-`ORDER BY` path runs (see "A widened derived projection routes to a native wrapper
+  on every path"). No exception is tracked here.
 * A select-list item's quoted EMITS identifier is produced by ONE seam: the real
   source-column name for a bare column, the positional synthetic `_LH_PROJ_{index}` for a
   rendered expression. The per-shard EMITS clause and any outer wrapper's explicit column

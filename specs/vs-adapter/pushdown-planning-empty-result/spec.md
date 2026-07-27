@@ -29,7 +29,7 @@ instead of rejecting it for a column-count/type mismatch.
   empty path renders the full-row-projection shape while the non-empty path
   renders its `selectList`-derived shape, so the two can differ in column count
   in that edge. A second such edge is the declined-ORDER-BY literal-only shape
-  (`vs-adapter/pushdown-planning-capability-extensions`): for a row-scan query
+  (`vs-adapter/pushdown-planning-literal-projection`): for a row-scan query
   projecting only literals with an ORDER BY on an unprojected column, the
   non-empty path falls back to the full base row (so the declined-ORDER-BY
   wrapper resolves), while the empty path keeps the narrow literal-only
