@@ -158,9 +158,25 @@ fn dispatch_sql(
     limit: Option<u64>,
 ) -> String {
     let pushdown_req = pd(request);
+    dispatch_sql_with_pushdown_req(request, &pushdown_req, proj_cols, proj_types, filter, limit)
+}
+
+/// Like [`dispatch_sql`], but takes the `pushdownRequest` body explicitly
+/// instead of deriving it (unstripped) from `request` — so a caller can drive
+/// [`build_dispatch_sql`] with a deliberately stripped OR deliberately
+/// alias-carrying `pushdown_req`, to pin the alias-leak fix (issue #193) at
+/// the dispatch level without touching the frozen golden fixtures above.
+fn dispatch_sql_with_pushdown_req(
+    request: &Json,
+    pushdown_req: &Json,
+    proj_cols: Vec<ProjectionItem>,
+    proj_types: Vec<String>,
+    filter: Option<String>,
+    limit: Option<u64>,
+) -> String {
     let result = build_dispatch_sql(
         request,
-        &pushdown_req,
+        pushdown_req,
         proj_cols,
         proj_types,
         base_col_types(),
@@ -181,7 +197,7 @@ fn dispatch_sql(
         200,
         8,
     )
-    .expect("build_dispatch_sql must succeed for this golden fixture");
+    .expect("build_dispatch_sql must succeed for this fixture");
     result["sql"]
         .as_str()
         .expect("pushdown response must carry a sql field")
@@ -311,4 +327,152 @@ fn empty_row_scan_matches_golden() {
     let actual = empty_sql(&row_scan_request(), &proj_cols, &proj_types);
     let expected = include_str!("testdata/dispatch_golden/empty_row_scan.sql");
     assert_eq!(actual, expected);
+}
+
+/// `grouped_request`'s `GROUP BY REGION` / `SUM(AMOUNT)` shape, but with every
+/// column node stamped `tableName: "EVENTS"` / `tableAlias: "E"` — the shape
+/// Exasol sends for an aliased single-table query (`FROM EVENTS e`, issue
+/// #193).
+fn aliased_grouped_request() -> Json {
+    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
+    events_request(serde_json::json!({
+        "aggregationType": "group_by",
+        "groupBy": [column("REGION")],
+        "selectList": [
+            column("REGION"),
+            {
+                "type": "function_aggregate",
+                "name": "SUM",
+                "arguments": [column("AMOUNT")],
+                "distinct": false,
+            },
+        ],
+        "selectListDataTypes": [
+            {"type": "varchar", "size": 2000000},
+            {"type": "decimal", "precision": 36, "scale": 2},
+        ],
+    }))
+}
+
+/// Regression for issue #193: an ALIASED single-table `GROUP BY` request,
+/// fed through `strip_table_alias` (the `handle_pushdown` chokepoint) into
+/// `build_dispatch_sql`, must render the GROUP BY key and the select-list
+/// aggregate argument as BARE `"REGION"` / `"AMOUNT"` — never
+/// `"E"."REGION"` / `"E"."AMOUNT"` — because the scan target this dispatches
+/// over exposes bare column names and does not resolve an alias-qualified
+/// reference. Stripping tableAlias is a no-op on rendering otherwise (the
+/// translator ignores the surviving `tableName`), so the output must be
+/// byte-identical to the unaliased `grouped_aggregate` golden fixture.
+#[test]
+fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
+    let request = aliased_grouped_request();
+    let raw_pushdown_req = pd(&request);
+    let stripped_pushdown_req = strip_table_alias(&raw_pushdown_req);
+
+    let actual = dispatch_sql_with_pushdown_req(
+        &request,
+        &stripped_pushdown_req,
+        Vec::new(),
+        Vec::new(),
+        Some(r#"("AMOUNT" > 100)"#.to_string()),
+        Some(50),
+    );
+
+    assert!(
+        actual.contains(r#""group_keys":["\"REGION\""]"#),
+        "GROUP BY key must render the bare column name, never alias-qualified: {actual}"
+    );
+    assert!(
+        actual.contains(r#"{"kind":"sum","column":"AMOUNT"}"#),
+        "the SUM aggregate argument must render the bare column name: {actual}"
+    );
+    assert!(
+        !actual.contains(r#""E"."#),
+        "no clause may carry the stale Exasol alias qualifier \"E\": {actual}"
+    );
+    let expected = include_str!("testdata/dispatch_golden/grouped_aggregate.sql");
+    assert_eq!(
+        actual, expected,
+        "an aliased request must render byte-identical to the unaliased golden once \
+         tableAlias is stripped upstream — the grouped partial/merge path never reads \
+         tableName either, so its surviving presence changes nothing"
+    );
+}
+
+/// `multi_count_distinct_decline_request`'s two-`COUNT(DISTINCT)` shape, but
+/// with every column node stamped `tableName: "EVENTS"` / `tableAlias: "E"` —
+/// the shape that routes to `qualified_single_table_fallback_pushdown`.
+fn aliased_multi_count_distinct_decline_request() -> Json {
+    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
+    events_request(serde_json::json!({
+        "selectList": [
+            {
+                "type": "function_aggregate",
+                "name": "COUNT",
+                "arguments": [column("ID")],
+                "distinct": true,
+            },
+            {
+                "type": "function_aggregate",
+                "name": "COUNT",
+                "arguments": [column("NAME")],
+                "distinct": true,
+            },
+        ],
+        "selectListDataTypes": [
+            {"type": "decimal", "precision": 18, "scale": 0},
+            {"type": "decimal", "precision": 18, "scale": 0},
+        ],
+    }))
+}
+
+/// Regression for issue #193's qualified-fallback guarantee: the multi-
+/// `COUNT(DISTINCT)` decline routes to `qualified_single_table_fallback_pushdown`
+/// (`build_qualified_single_table_fallback_sql`), which re-derives its
+/// `"LHS_T0"` qualification from each column's `tableName` via
+/// `annotate_columns_with_alias` — unconditionally overwriting any incoming
+/// `tableAlias`. So the wrapper must render identically qualified SQL whether
+/// the request carries a stale `tableAlias` or has already been stripped,
+/// and in both cases every reference must be qualified `"LHS_T0"."…"`.
+///
+/// Unlike the other golden requests, `tableName` is present here (the real
+/// Exasol wire shape always carries it), so this is deliberately NOT compared
+/// against the frozen `multi_count_distinct_decline` golden fixture: that
+/// fixture's columns carry no `tableName` at all, which is what makes ITS
+/// render come out bare rather than `"LHS_T0"`-qualified (`annotate_columns_
+/// with_alias` only qualifies a column whose `tableName` resolves).
+#[test]
+fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_presence() {
+    let request = aliased_multi_count_distinct_decline_request();
+    let raw_pushdown_req = pd(&request);
+    let stripped_pushdown_req = strip_table_alias(&raw_pushdown_req);
+
+    let sql_with_alias = dispatch_sql_with_pushdown_req(
+        &request,
+        &raw_pushdown_req,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let sql_stripped = dispatch_sql_with_pushdown_req(
+        &request,
+        &stripped_pushdown_req,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+
+    assert_eq!(
+        sql_with_alias, sql_stripped,
+        "a caller-supplied stale tableAlias must have no effect on the fallback \
+         wrapper's rendered SQL — it re-qualifies from tableName unconditionally"
+    );
+    assert!(
+        sql_with_alias.contains(r#""LHS_T0"."ID""#)
+            && sql_with_alias.contains(r#""LHS_T0"."NAME""#),
+        "the wrapper must qualify every column reference to its own subquery alias \
+         LHS_T0, whether or not the request carried a tableAlias: {sql_with_alias}"
+    );
 }

@@ -37,6 +37,7 @@ sum/count decomposition) is covered separately in
 * See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
 * A predicate node the adapter cannot faithfully translate is OMITTED from the scan spec; Exasol keeps and evaluates the predicate itself as a correctness backstop.
 * See `vs-adapter/pushdown-planning-like-type-coercion` for the type-aware LIKE/REGEXP_LIKE rule that dispatches on the subject column's Exasol type before rendering the filter.
+* When a query aliases a table in its `FROM` clause (`FROM customer c`), Exasol stamps a `tableAlias` on every `column` node in the pushdown request — including nodes the user wrote unqualified. The single scan relation exposes only bare column names, so an alias-qualified reference does not resolve; the single-table push therefore strips the alias before rendering (see `vs-adapter/pushdown-planning-alias-stripping`). The `crates/vs-expression` translator itself always honors a present `tableAlias` (`sql-comprehension/vs-expression-translator`); stripping is the single-table caller's responsibility.
 
 ## Scenarios
 
