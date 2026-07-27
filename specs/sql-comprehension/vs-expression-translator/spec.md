@@ -18,6 +18,8 @@ Exasol and DataFusion diverge on NULL handling inside an IN list: Exasol ignores
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the column name uppercased and double-quoted as a DataFusion identifier
 * *AND* any embedded double-quote characters in the name MUST be escaped by doubling
+* *AND* when the `column` node ALSO carries a non-empty `tableAlias`, the translator SHALL render the reference table-qualified as `"ALIAS"."NAME"` — the multi-relation form `vs-adapter/pushdown-planning-join-fallback` depends on
+* *AND* the translator MUST NOT drop a `tableAlias` on its own; removing a `tableAlias` so a single-relation scan target resolves bare names is the CALLER's responsibility (`vs-adapter/pushdown-planning`), NOT the translator's
 
 ### Scenario: Comparison predicates translate to binary operator expressions
 
