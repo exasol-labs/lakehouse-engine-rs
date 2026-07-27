@@ -40,6 +40,24 @@ instead of rejecting it for a column-count/type mismatch.
 * "Empty-aggregate semantics" follow single-node SQL over zero input rows: the
   COUNT family (`COUNT(*)`, `COUNT(col)`, `COUNT(DISTINCT col)`) yields `0`;
   `SUM`, `MIN`, `MAX`, `AVG`, and the `STDDEV`/`VARIANCE` family yield `NULL`.
+* This delta amends ONE clause of ONE scenario: the shared-classifier clause that
+  currently requires the empty and non-empty paths to derive "the HAVING-present
+  hard-error decline" from the shared request classifier. This plan deletes that
+  decline from the classifier entirely (`vs-adapter/pushdown-module-structure`,
+  `vs-adapter/pushdown-planning-grouped-agg`, issue #195), so the clause must be
+  amended or the recorded library would hold two contradictory normative statements
+  about the same classifier.
+* Nothing about the empty path's own behavior changes. The classifier is still the
+  single owner of the routing decision, and each path still renders its own shape
+  from it. Only the SET of outcomes that classifier can return narrows: the grouped
+  tier no longer returns an error, so a grouped request that does not decompose
+  yields the qualified single-table wrapper (`GroupByWrapper`) shape on both paths
+  instead of failing on both.
+* The empty path therefore gains no new branch: `empty_result_sql` re-invokes the
+  same classifier and already renders the `GroupByWrapper` shape, which is exactly
+  the shape a non-decomposable grouped request now classifies as.
+* The `selectListDataTypes` typing rule for the empty `GroupByWrapper` shape is
+  unchanged by this delta, including its documented absent/empty fall-back edge.
 
 ## Scenarios
 
@@ -92,5 +110,6 @@ instead of rejecting it for a column-count/type mismatch.
 * *WHEN* the adapter reaches the zero-files short-circuit
 * *THEN* the adapter SHALL choose the empty-result shape using the SAME plan-detection priority the non-empty path uses — grouped aggregate first, then single-group aggregate, then row scan
 * *AND* the single-group aggregate shape SHALL be chosen only when the aggregate column types pass the same numeric-type validation the non-empty path applies (so an aggregate the non-empty path demotes to a row scan produces the row-scan empty shape, not an aggregate shape)
-* *AND* the empty and non-empty paths SHALL derive that priority, those validation gates, and the HAVING-present hard-error decline from one shared request classifier, so the ROUTING decision is shared by construction rather than kept in lockstep by convention; each path then renders its own shape from that shared decision
+* *AND* the empty and non-empty paths SHALL derive that priority and those validation gates from one shared request classifier, so the ROUTING decision is shared by construction rather than kept in lockstep by convention; each path then renders its own shape from that shared decision
+* *AND* that shared classifier SHALL raise NO grouped-tier hard error, so a grouped request that does not decompose — for any reason, including a non-numeric aggregate column type or a HAVING the adapter cannot merge, whether or not a HAVING is present — SHALL yield the qualified single-table wrapper (`GroupByWrapper`) shape identically on the empty and non-empty paths, rather than the hard-error decline both paths previously surfaced (issue #195)
 * *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present — a positional shape Exasol accepts against it, not a raw row projection — and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)

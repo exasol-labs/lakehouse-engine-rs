@@ -650,9 +650,10 @@ pub async fn resolve_table_schema(
 /// Routing goes through the SAME shared [`classify_request_shape`] the non-empty
 /// dispatcher uses, so the empty and non-empty positional column shapes are
 /// identical by construction — the 3-tier priority (grouped → single-group → row
-/// scan), the `validate_agg_col_types` numeric gates, and the
-/// non-numeric-grouped-with-HAVING hard-error decline all live in the classifier,
-/// never re-derived here. Each arm renders only its own empty shape:
+/// scan), the `validate_agg_col_types` numeric gates, and the grouped HAVING
+/// merge-render — whose failure routes to `GroupByWrapper` rather than erroring —
+/// all live in the classifier, never re-derived here. Each arm renders only its own
+/// empty shape:
 /// - `Grouped` → zero rows in the full grouped output shape (`empty_grouped_sql`);
 /// - `GroupByWrapper` → a zero-row result typed from `selectListDataTypes`
 ///   (`empty_select_list_typed_sql`), falling back to the full-row empty shape when
@@ -668,7 +669,7 @@ pub(super) fn empty_result_sql(
     proj_types: &[String],
     col_types: &[(String, String)],
 ) -> Result<Json, UdfError> {
-    match classify_request_shape(pushdown_req, col_types)? {
+    match classify_request_shape(pushdown_req, col_types) {
         // A zero-row result satisfies any HAVING, so the classifier's `having` is
         // deliberately ignored on the empty path.
         RequestShape::Grouped { detection, .. } => {
@@ -1476,11 +1477,13 @@ mod tests {
         );
     }
 
-    /// A non-numeric grouped aggregate that also carries a HAVING cannot silently
-    /// demote (AGGREGATE_HAVING is advertised, so Exasol will not re-apply it):
-    /// the empty path must decline with the same `Err` the non-empty path returns.
+    /// A non-numeric grouped aggregate that also carries a HAVING no longer hard
+    /// errors: the classifier routes it to `GroupByWrapper` (the HAVING renders
+    /// natively over the wrapper rather than being dropped), so the empty path must
+    /// mirror the SAME selectList-typed empty shape as the no-HAVING sibling above,
+    /// not an `Err`.
     #[test]
-    fn empty_files_grouped_non_numeric_aggregate_with_having_declines() {
+    fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
         let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
         let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
         let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
@@ -1499,14 +1502,17 @@ mod tests {
             "having": {"type": "predicate_greater"},
         });
 
-        let err = empty_result_sql(&grouped_having, &proj, &proj_types, &col_types).unwrap_err();
-        match err {
-            UdfError::User(msg) => assert!(
-                msg.contains("HAVING present"),
-                "decline message must name the HAVING conflict: {msg}"
-            ),
-            other => panic!("expected UdfError::User, got {other:?}"),
-        }
+        let row_sql =
+            empty_result_sql(&grouped_having, &proj, &proj_types, &col_types).unwrap()["sql"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert_eq!(
+            row_sql,
+            "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS DECIMAL(36,2)) FROM DUAL WHERE 1=0",
+            "declined grouped aggregate with HAVING over zero files must produce the same \
+             selectList-typed empty shape as the wrapper it now falls through to, not an error"
+        );
     }
 
     // ---------------------------------------------------------------------------

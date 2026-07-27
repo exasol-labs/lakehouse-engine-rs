@@ -12,13 +12,18 @@ scalar scan's emitted partial rows on the user group keys. See
 `vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate` for
 scalar-function-wrapping-aggregates select items on this same path.
 
-When a grouped select item cannot be decomposed into supported partials, the adapter
-falls back to a qualified single-table wrapper whose inner sharded raw scan MUST project
-only the columns the request references (group keys, select-list aggregate arguments,
-filter, and any HAVING/ORDER BY columns), not the full base-table schema (issue #160).
-The narrowing is computed by a single shared referenced-column helper reused by the
-single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline
-(`vs-adapter/pushdown-planning-count-distinct`), so both decline paths narrow identically.
+When a grouped request cannot be decomposed into supported partials — an undecomposable
+select-list item, or a HAVING that references an aggregate absent from the select list —
+the adapter falls back to a qualified single-table wrapper that renders the grouped select
+list, GROUP BY, HAVING, ORDER BY, and LIMIT as ordinary Exasol SQL over a materialized
+sharded raw scan. The fallback is never an error: the wrapper preserves the HAVING
+natively, so the adapter keeps the `AGGREGATE_HAVING` contract it advertised (issue #195).
+The inner sharded raw scan MUST project only the columns the request references (group
+keys, select-list aggregate arguments, filter, and any HAVING/ORDER BY columns), not the
+full base-table schema (issue #160); the narrowing is computed by a single shared
+referenced-column helper reused by the single-group `COUNT(DISTINCT)` Case 2/3
+qualified-wrapper decline (`vs-adapter/pushdown-planning-count-distinct`), so both decline
+paths narrow identically.
 
 ## Background
 
@@ -62,6 +67,44 @@ single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline
 * The narrowing is a single shared helper reused by the single-group `COUNT(DISTINCT)`
   Case 2/3 qualified-wrapper decline, so both decline paths narrow through one
   mechanism, not two.
+* This delta adds one trigger to the existing qualified-single-table-wrapper fallback:
+  a HAVING referencing an aggregate absent from the select list. Before this delta that
+  shape returned `UdfError::User` from the dispatcher, surfacing to the client as SQL
+  state `22002` / `F-UDF-CL-RUST-9001` at `EXPLAIN VIRTUAL` time as well as at execution
+  time (issue #195). Every other grouped-aggregate scenario is unchanged.
+* `render_having_over_merge` rewrites each `function_aggregate` reference in the HAVING
+  to its merged `PARTIAL_*` expression, matched to the detected select-list aggregate
+  plans by `AggregatePlan` equality (kind plus source column). An aggregate with no
+  matching plan cannot be rewritten, because the outer merge wrapper's only columns are
+  `GK_*` and `PARTIAL_*` — the source column the aggregate names is not available there.
+* An AND/OR junction node collapses when ANY child fails to render, so a HAVING mixing
+  one matched aggregate with one unmatched aggregate fails as a whole, not partially.
+* Whether the HAVING can be merged therefore decides the request SHAPE, not merely the
+  SQL text: an unmergeable HAVING makes the partial/merge decomposition unavailable.
+  The shape decision is owned by the one shared classifier
+  (`vs-adapter/pushdown-module-structure`), so the non-empty dispatch path and the
+  fully-pruned zero-row path agree by construction.
+* The qualified single-table wrapper renders the HAVING through the `crates/vs-expression`
+  translator with aggregate names spliced verbatim over the materialized `LHS_T0` rows, so
+  Exasol's own engine evaluates it. The HAVING is preserved, never dropped — which is why
+  routing to the wrapper does not breach the advertised `AGGREGATE_HAVING` capability.
+* The referenced-column helper that narrows the wrapper's inner scan already walks the
+  `having` node's full expression tree, so an aggregate argument reachable only from the
+  HAVING is projected without further change.
+* After this delta NO grouped decline is a hard error. Both — a select-list aggregate that fails
+  the numeric-type gate, and a HAVING the adapter cannot render over the merge — fall through to
+  the qualified single-table wrapper, whether or not a HAVING is present. The wrapper renders the
+  HAVING itself, so nothing is dropped.
+* Routing a non-numeric aggregate to the wrapper hands Exasol a native aggregate over a VARCHAR.
+  That is Exasol's own expression to evaluate: where its implicit VARCHAR-to-numeric conversion
+  succeeds the query returns a correct result (a class of query that previously hard-errored), and
+  where it does not Exasol raises `22018` "invalid character value for cast" naming the offending
+  value — the same outcome the user's HAVING produces against a native table.
+* One decline outside this feature remains a hard error: a grouped ORDER BY whose sort key
+  resolves to no grouped output column, a rendering-level decline that stays in the dispatcher
+  because it does not change the reachable shape set. It is defensive — the adapter advertises
+  `ORDER_BY_COLUMN` and not `ORDER_BY_EXPRESSION`, so an aggregate sort key is never pushed, and a
+  group-key sort key always resolves.
 
 ## Scenarios
 
@@ -126,7 +169,7 @@ single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline
 
 ### Scenario: Adapter falls back to a qualified single-table wrapper for an undecomposable grouped aggregate shape
 
-* *GIVEN* a grouped `pushdown` request (`aggregationType: "group_by"`) whose select list contains an item the adapter cannot decompose into supported partials — an inner aggregate that is `DISTINCT`, a SUM/stat aggregate over a non-numeric type, an untranslatable aggregate argument, or a non-aggregate/non-group-key node
+* *GIVEN* a grouped `pushdown` request (`aggregationType: "group_by"`) the adapter cannot decompose into supported partials — a select-list item that is a `DISTINCT` inner aggregate, a SUM/stat aggregate over a non-numeric type (whether or not a HAVING is present), an untranslatable aggregate argument, or a non-aggregate/non-group-key node — or a `having` the adapter cannot render over the merge (issue #195)
 * *WHEN* the adapter processes the request
 * *THEN* the adapter MUST NOT emit a bare raw full-row `ScanSpec` for a grouped request (that would return a column count differing from the request's `selectList`, causing a client-facing `04000` "Expected number of columns is N but pushdown query has M")
 * *AND* the adapter SHALL instead render the exact grouped select list, GROUP BY, HAVING, ORDER BY, and LIMIT as ordinary Exasol SQL over a materialized single-table sharded raw scan — a qualified single-table wrapper analogous to the unified join fallback (`SELECT <grouped select list> FROM (<sharded raw fan-out>) GROUP BY ... HAVING ... ORDER BY ... LIMIT ...`) — so Exasol's core engine computes the aggregate over the returned rows
@@ -135,6 +178,19 @@ single-group `COUNT(DISTINCT)` Case 2/3 qualified-wrapper decline
 * *AND* the scalar-over-aggregate select items in that wrapper SHALL be rendered by the `crates/vs-expression` translator (aggregate names spliced verbatim, arguments recursed), since Exasol computes the aggregation over materialized rows rather than over merged partials
 * *AND* the wrapper's result column count and per-column types SHALL match Exasol's positional `selectListDataTypes` validation
 * *AND* the returned result SHALL equal the result of the same grouped query evaluated on a single node
+
+### Scenario: A HAVING the adapter cannot render over the merge falls back instead of erroring
+
+* *GIVEN* a grouped `pushdown` request carrying a `having` the adapter cannot rewrite over the `PARTIAL_*` merge columns, for any of its three reasons — an aggregate absent from the detected select-list plans (`SELECT MOD(id,4), COUNT(*) FROM t GROUP BY MOD(id,4) HAVING SUM(score) > 250.0`); such an aggregate as one operand of an AND/OR junction whose sibling operands DO match (`... HAVING COUNT(*) > 0 AND SUM(score) > 250.0`), which collapses the junction as a whole; or a `DISTINCT` aggregate, which has no partial/merge decomposition at all (`... HAVING COUNT(DISTINCT name) > 4`)
+* *AND* a grouped request whose select-list aggregate column type fails the numeric gate WHILE a `having` is present, which is the same decline reached by a different route
+* *WHEN* the adapter classifies the request shape
+* *THEN* the adapter SHALL attempt the HAVING merge-rendering while classifying the shape and, when the HAVING does not render or the numeric gate fails, SHALL classify the request as the qualified single-table wrapper shape rather than the partial/merge grouped shape
+* *AND* the adapter MUST NOT return an error for this shape at either `EXPLAIN VIRTUAL` plan time or execution time, because the wrapper renders the HAVING as ordinary Exasol SQL over materialized rows and therefore never drops a HAVING the adapter advertised `AGGREGATE_HAVING` for (issue #195)
+* *AND* the inner sharded raw scan's projection SHALL carry every column the HAVING references, so `HAVING SUM(score) > 250.0` projects `SCORE` even when no select-list item, group key, filter, or ORDER BY element names it
+* *AND* the returned result SHALL equal the result of the same grouped query evaluated on a single node, for the whole-predicate, mixed-junction, and `DISTINCT` shapes
+* *AND* for a non-numeric aggregate the wrapper's native SQL SHALL yield Exasol's own outcome for that expression — a correct result where Exasol's implicit VARCHAR-to-numeric conversion succeeds, or Exasol's own `22018` "invalid character value for cast" where it does not — which is the same outcome the user's HAVING would produce against a native table, never an adapter-level decline
+* *AND* a HAVING whose every referenced aggregate IS among the select-list plans SHALL still classify as the partial/merge grouped shape and SHALL still render its merged HAVING over the `PARTIAL_*` columns in the outer wrapper, unchanged by this delta
+* *AND* because one shared classifier owns the decision, the fully-pruned zero-row path SHALL return the wrapper-shaped typed empty result for the same request, never an error
 
 ### Scenario: Grouped aggregate scan spec leaves the projection field empty
 
