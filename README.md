@@ -1,13 +1,13 @@
 <div align="center">
 
-<img src="docs/assets/logo.svg" width="96" height="96" alt="lakehouse-engine-rs logo">
+<img src="docs/assets/logo.svg" width="128" height="128" alt="lakehouse-engine-rs logo">
 
 # lakehouse-engine-rs
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml)
-[![spec|driven](https://img.shields.io/badge/spec%7Cdriven-grey.svg)](specs/)
-[![Exasol|database](https://img.shields.io/badge/Exasol%7Cdatabase-grey.svg)](https://www.exasol.com)
+[![spec|driven](https://img.shields.io/badge/spec-driven-blueviolet.svg)](specs/)
+[![Exasol|database](https://img.shields.io/badge/Exasol-database-blue.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
 **In-place lakehouse query engine for Exasol — DataFusion in Rust UDFs, querying Iceberg and

@@ -21,9 +21,9 @@ recipe.
 | [Lakekeeper](#lakekeeper-oidc-via-keycloak--minio) | OAuth2 client-credentials (OIDC) | **CI E2E**: dedicated `e2e-lakekeeper` job on every push |
 | [Databricks Unity Catalog Iceberg REST](#databricks-unity-catalog-iceberg-rest) | token/OAuth2 (in theory) | **Untested**: template only, no Databricks-specific code |
 
-The steps here cover only the catalog CONNECTION and the Virtual Schema — steps 3-4 of
-[Install](install.md#3-create-the-catalog-connection). Get the `.so` onto BucketFS and create the
-scripts first (steps 1-2).
+The steps here cover only the catalog CONNECTION and the Virtual Schema — the
+[Point the VS at your data](install.md#point-the-vs-at-your-data) step of [Install](install.md). Get
+the `.so` onto BucketFS and create the scripts first.
 
 ## Connection fields
 
@@ -60,6 +60,11 @@ catalog vends short-lived credentials from `load_table` instead.
 
 Credential values never appear in error messages, logs, or `Debug` output. They travel to the scan
 UDF inside the per-query scan spec and are never stored in Virtual Schema properties.
+
+The Virtual Schema then names the CONNECTION. Its properties (`ICEBERG_NAMESPACE`, `ALLOW_HTTP`,
+and the tuning knobs) are documented in
+[Install: Point the VS at your data](install.md#point-the-vs-at-your-data) and [Tuning](tuning.md);
+this page repeats only the two properties every recipe needs.
 
 ## Local / generic Iceberg REST (no auth)
 

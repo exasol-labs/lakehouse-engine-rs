@@ -4,9 +4,10 @@
 
 # Parameters & Telemetry
 
-Every knob, and how to see what a scan is doing. For *which* values to set, see
-[Performance](performance.md); for what the values mean architecturally, see
-[Architecture](architecture.md).
+Every knob, and how to see what a scan is doing. Set these properties on the
+`CREATE VIRTUAL SCHEMA` statement from [Install](install.md). Run the [Benchmark](benchmark.md)
+suite to find which values work best for your workload; for what the values mean
+architecturally, see [Architecture](architecture.md).
 
 ## Parameters
 
@@ -41,7 +42,7 @@ per-instance limit is reported as 0 (unknown), a conservative default budget is 
 **Quick recommendation:** for read-bound remote scans, set
 `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<NR_OF_CORES>'`,
 `DATAFUSION_TARGET_PARTITIONS='<NR_OF_CORES>'` — ~39 % faster than the `AUTO` default on a full
-scan. See [Performance](performance.md).
+scan.
 
 ### `S3_MAX_CONNECTIONS`
 
@@ -76,8 +77,7 @@ touch DataFusion's `target_partitions` — that remains the threading knob's job
 128, on both the aggregate and raw full-emit paths) found it moved throughput by **< 2%** —
 this cluster's bottleneck was not connection-pool warmth. It remains a legitimate knob to try
 on a deployment with a different network profile (e.g. genuinely connection-churn-bound rather
-than latency-bound), but do not expect it to be the lever that closes a native-`IMPORT` gap. See
-[Performance](performance.md).
+than latency-bound), but do not expect it to be the lever that closes a native-`IMPORT` gap.
 
 ## Telemetry
 

@@ -4,94 +4,92 @@
 
 # Install & Deploy
 
-With the Rust SLC already installed and registered (see [Prerequisites](#prerequisites)), get
-the UDF `.so` onto BucketFS, then create the scripts, the catalog CONNECTION, and the Virtual
-Schema. Step 1 (getting the `.so` onto BucketFS) has two paths depending on your platform's
-BucketFS network access; steps 2-5 (scripts, CONNECTION, Virtual Schema, query) are identical
-either way and run on any Exasol cluster.
+Installing means getting the engine `.so` onto BucketFS and registering its scripts, then
+pointing a Virtual Schema at your data. Pick the path that matches where your Exasol runs:
 
-| Path | When to use |
-|---|---|
-| [1a. Automated](#1a-automated-build-and-upload) | `exapump`/curl has direct network access to both BucketFS and the DB SQL port (e.g. the bundled Docker stack, or an on-prem cluster reachable from your machine). One command per artifact. |
-| [1b. Manual](#1b-manual-download-and-upload) | No direct BucketFS network access — e.g. Exasol SaaS, which exposes only a BucketFS upload UI and REST API, not the raw BucketFS ports. Every step is a `curl`/SQL command or a UI action, no Docker or `exapump` BucketFS access required. |
+| You run on… | Path | What you run |
+|---|---|---|
+| **Exasol SaaS** | [One-command install](#exasol-saas-one-command-install) | One `curl … \| bash` |
+| **Self-managed Exasol reachable from your machine** (BucketFS + SQL ports open) | [Automated build and upload](#self-managed-automated-build-and-upload) | Two `make` commands, then [create the scripts](#create-the-scripts) |
+| **Restricted network** (no direct BucketFS access) | [Manual upload](#restricted-networks-manual-upload) | Download a release tarball, upload it, then [create the scripts](#create-the-scripts) |
 
-## Prerequisites
+Every path ends the same way: [point the VS at your data](#point-the-vs-at-your-data), then
+[query](#query). The catalog `CONNECTION` and the `CREATE VIRTUAL SCHEMA` statement are always
+manual, because they are specific to your dataset.
 
-- **Docker** — the `.so` is built inside `rust:1.94-bookworm` (glibc 2.36) to match the SLC.
-  Only needed for the automated path.
-- **Rust toolchain** — host unit tests only (`cargo test`, debug). Never `cargo build --release` on the host: a host-glibc `.so` fails to load inside Exasol.
-- **[`exapump`](https://github.com/exasol-labs/exapump)** — Exasol/BucketFS CLI used by the `make` targets. Only needed for the automated path.
-- **The Rust SLC installed and registered** — see
-  [language-container-rs](https://github.com/exasol-labs/language-container-rs) for install
-  instructions. The installed SLC version must match this project's `exasol-udf-sdk` /
-  `exasol-udf-macros` version (see `Cargo.toml`) — a mismatch fails the fingerprint smoke test
-  below.
-- **An Exasol cluster + BucketFS**, an **Iceberg REST catalog**, and **S3-compatible storage**.
-- All DSNs include `validateservercertificate=0` (self-signed Docker cert).
+All paths assume the **Rust SLC is already installed and registered**, at the version this
+project's `exasol-udf-sdk` / `exasol-udf-macros` targets (see `Cargo.toml`). A version mismatch
+fails the fingerprint smoke test. See
+[language-container-rs](https://github.com/exasol-labs/language-container-rs) for SLC install.
+The SaaS one-command path registers the SLC for you.
 
-## 0. Local stack (optional)
+## Exasol SaaS: one-command install
 
-For E2E or a throwaway environment, `docker-compose.yml` brings up Exasol + MinIO + an Iceberg REST catalog:
-
-```sh
-docker compose up -d
+```bash
+curl -fsSL https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/install-saas.sh \
+  | bash -s -- --account-id <ACCOUNT_ID> --database-id <DATABASE_ID> --profile <PROFILE>
 ```
 
-Default host ports (override via env): Exasol SQL `28563`, BucketFS `22581`, MinIO `19000`, Iceberg REST `18181`.
+This authenticates to Exasol SaaS and automates everything up to a query-ready install: it
+registers the Rust SLC, uploads the engine tarball over a presigned URL, runs the create-scripts
+DDL, and verifies the load with the fingerprint smoke test. It is idempotent (`CREATE OR REPLACE`,
+`CREATE SCHEMA IF NOT EXISTS`, and an in-place `SCRIPT_LANGUAGES` swap), so re-running it upgrades
+a prior install cleanly.
 
-## 1. Get the `.so` onto BucketFS
+| Flag | Value |
+|---|---|
+| `--account-id` | SaaS account id, from the SaaS web console |
+| `--database-id` | SaaS database id, from the SaaS web console |
+| `--profile` | An `exapump` named profile; its `password` supplies the SaaS access token |
 
-### 1a. Automated: build and upload
+When it finishes, skip straight to [point the VS at your data](#point-the-vs-at-your-data). The
+script stops before the catalog `CONNECTION` and `CREATE VIRTUAL SCHEMA`, which stay manual.
+
+## Self-managed: automated build and upload
+
+Use this when `exapump`/curl can reach both BucketFS and the DB SQL port directly, including the
+[bundled Docker stack](#local-dev-stack).
 
 ```sh
 make cross-musl-udf-build      # → target/release/liblakehouse_engine.so
 make bucketfs-upload-so        # → BucketFS /default/udf/liblakehouse_engine.so
 ```
 
-Rebuilds only when crate sources/manifests/lock change. One `.so` exports **both** entry points
-(VS adapter + scan SCALAR UDF). The `LAKEHOUSE_DISTRIBUTE_FILES` distributor is a separate LUA
-SET script created by plain DDL — no `.so` symbol.
+The build runs inside `rust:1.94-bookworm` (glibc 2.36, matching the SLC) and rebuilds only when
+crate sources, manifests, or the lockfile change. One `.so` exports **both** RUST entry points
+(VS adapter + scan SCALAR UDF). Requires Docker and [`exapump`](https://github.com/exasol-labs/exapump).
 
-Continue with [step 2](#2-create-the-scripts).
+Then [create the scripts](#create-the-scripts).
 
-### 1b. Manual: download and upload
+## Restricted networks: manual upload
 
-Use this path when `exapump`/curl can't reach BucketFS directly — e.g. **Exasol SaaS**, which
-exposes only a BucketFS upload UI and a presigned-URL REST API, never the raw BucketFS ports.
-No Docker, no Rust toolchain, no local build — every step below is either downloading a prebuilt
-release artifact, a plain `curl` command, or a UI action.
+Use this when `exapump`/curl cannot reach the raw BucketFS ports. Every step is a download, a
+`curl`, or a UI action. No Docker, no Rust toolchain, no local build.
 
-#### Download the release tarball
+### 1. Download the release tarball
 
 Every [GitHub Release](https://github.com/exasol-labs/lakehouse-engine-rs/releases) ships a
-prebuilt `lakehouse-engine.tar.gz`, already laid out as `udf/liblakehouse_engine.so` (executable
-bit set) — download it as-is, no repackaging needed:
+prebuilt `lakehouse-engine.tar.gz`, already laid out as `udf/liblakehouse_engine.so`:
 
 ```bash
 curl -fsSL -o lakehouse-engine.tar.gz \
   https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine.tar.gz
 ```
 
-Pin `<VERSION>` to the release you intend to run — e.g. `0.26.4` for the version this checkout's
-`Cargo.toml` is at. The `udf/liblakehouse_engine.so` layout inside the tarball is what determines
-the extracted path used for `%udf_object` in [step 2](#2-create-the-scripts).
+Pin `<VERSION>` to the release you intend to run. The `udf/liblakehouse_engine.so` layout inside
+the tarball determines the `%udf_object` path in [create the scripts](#create-the-scripts).
 
-#### Upload the tarball to BucketFS
+### 2. Upload the tarball to BucketFS
 
-Pick whichever channel your platform exposes:
+Pick whichever channel your platform exposes. BucketFS auto-extracts recognized archives on
+upload, so there is no separate extract step.
 
-##### a) BucketFS upload UI
-
-Any platform with a BucketFS file browser (e.g. Exasol SaaS's "Files" tab): drop
-`lakehouse-engine.tar.gz` at the bucket root. BucketFS auto-extracts recognized archives on
-upload, so there's no separate "extract" step. Lands at the same path as the automated path:
+**a) BucketFS upload UI.** Any platform with a file browser (e.g. Exasol SaaS's "Files" tab):
+drop `lakehouse-engine.tar.gz` at the bucket root. Lands at
 `buckets/bfsdefault/default/udf/liblakehouse_engine.so`.
 
-##### b) Raw HTTP PUT
-
-For an on-prem/Docker BucketFS that's reachable over the network, but without `exapump` or Docker
-installed locally — this is the same mechanism `bucketfs-upload-so` uses under the hood, given
-here Makefile-independent:
+**b) Raw HTTP PUT.** For an on-prem/Docker BucketFS reachable over the network but without
+`exapump` or Docker locally. This is what `bucketfs-upload-so` does under the hood:
 
 ```bash
 curl -X PUT -T lakehouse-engine.tar.gz \
@@ -99,25 +97,22 @@ curl -X PUT -T lakehouse-engine.tar.gz \
 ```
 
 `w` is the fixed BucketFS write-username; `--insecure` covers the self-signed Docker-db cert. Read
-the write password from `EXAConf` as the Makefile does, or from your platform's admin UI. Lands at
-the same path as the automated path: `buckets/bfsdefault/default/udf/liblakehouse_engine.so`.
+the write password from `EXAConf` or your platform's admin UI. Lands at
+`buckets/bfsdefault/default/udf/liblakehouse_engine.so`.
 
-##### c) Exasol SaaS REST API
+**c) Exasol SaaS REST API.** SaaS does not expose the raw BucketFS ports, so this is the only
+non-UI channel there. (The [one-command install](#exasol-saas-one-command-install) does this
+automatically; use this manual form only if you need the individual steps.) Auth is
+`Authorization: Bearer <PAT>`, a SaaS personal access token from the web console. The API needs
+your `accountID` and `databaseID`; there is no endpoint to discover them, so read `accountID` from
+the console and match `databaseID` by name:
 
-SaaS doesn't expose the raw BucketFS ports at all, so on SaaS this is the only path that isn't the
-UI. A couple of SaaS-specific things to know first:
+```bash
+curl -H "Authorization: Bearer <PAT>" \
+  https://cloud.exasol.com/api/v1/accounts/<accountID>/databases
+```
 
-- Auth is `Authorization: Bearer <PAT>` — a SaaS personal access token, from the SaaS web console.
-- The API needs your SaaS `accountID` and the target `databaseID` — there is **no** endpoint to
-  discover them; get `accountID` from the SaaS console, then confirm `databaseID` by listing
-  databases in that account and matching by name:
-  ```bash
-  curl -H "Authorization: Bearer <PAT>" \
-    https://cloud.exasol.com/api/v1/accounts/<accountID>/databases
-  ```
-  Use `cloud-staging.exasol.com` instead of `cloud.exasol.com` on the staging environment.
-
-Upload is a two-step presigned-URL dance:
+Use `cloud-staging.exasol.com` on staging. Upload is a two-step presigned-URL exchange:
 
 ```bash
 curl -X POST -H "Authorization: Bearer <PAT>" \
@@ -127,24 +122,24 @@ curl -X POST -H "Authorization: Bearer <PAT>" \
 curl -X PUT --upload-file lakehouse-engine.tar.gz "<presigned PUT URL>"
 ```
 
-The presigned URL expires in ~600s and is signed for `host` only — don't add extra headers, and
-run both commands back-to-back.
+The presigned URL expires in ~600s and is signed for `host` only, so add no extra headers and run
+both commands back-to-back. **SaaS lands the archive at a different path** than the other channels:
+`/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so`. Use that path in the next
+step.
 
-Verify with `GET .../files` (the tarball should be listed). **Extracted path differs from the
-other channels above**: SaaS lands an uploaded `<name>.tar.gz` at `/buckets/uploads/default/<name>/...`
-— e.g. `lakehouse-engine.tar.gz` extracts to
-`/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so` — instead of
-`buckets/bfsdefault/default/udf/liblakehouse_engine.so`.
+Then [create the scripts](#create-the-scripts).
 
-Continue with [step 2](#2-create-the-scripts).
+## Create the scripts
 
-## 2. Create the scripts
+The [SaaS one-command install](#exasol-saas-one-command-install) already did this. The two other
+paths need it once, after the `.so` is on BucketFS.
 
-Two RUST entry points come from the one `.so`, plus one plain LUA passthrough script; the SLC
-dispatches the RUST ones by script name. `%udf_object` depends on where your `.so` landed in
-step 1 — use whichever block below matches:
+One `.so` supplies both RUST entry points; the SLC dispatches them by script name. A third,
+plain-LUA passthrough script fans the file lists out across nodes. Set `%udf_object` to wherever
+your `.so` landed in the upload step:
 
-### If you used 1a, or 1b via BucketFS UI / raw HTTP PUT
+- Automated, or manual via UI / raw PUT: `buckets/bfsdefault/default/udf/liblakehouse_engine.so`
+- Manual via SaaS REST API: `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so`
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS LHVS;
@@ -168,143 +163,47 @@ end
 /
 ```
 
-### If you used 1b via Exasol SaaS REST API
+`LAKEHOUSE_SCAN` takes two `VARCHAR` arguments: `common` is the shard-invariant scan-spec blob and
+`files` is the per-shard file list. `EMITS (...)` is a placeholder; the adapter supplies concrete
+output columns per query. `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough that does the
+cross-node `GROUP BY shard_key` fan-out ahead of the scalar scan.
 
-Same DDL, `%udf_object` points at the SaaS extracted path instead:
-
-```sql
-CREATE SCHEMA IF NOT EXISTS LHVS;
-
-CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
-%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
-/
-
-CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
-EMITS (...) AS
-%udf_object /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so
-/
-
-CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
-EMITS (files VARCHAR(2000000)) AS
-function run(ctx)
-    repeat
-        ctx.emit(ctx.files)
-    until not ctx.next()
-end
-/
-```
-
-`LAKEHOUSE_SCAN` takes two `VARCHAR` arguments: `common` is the shard-invariant scan-spec blob
-(shared across all shards) and `files` is the per-shard file list; `EMITS (...)` is a placeholder —
-the adapter supplies concrete output columns per query.
-`LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough LUA SET script (not a Rust entry point) that
-does the cross-node `GROUP BY shard_key` fan-out of the per-shard file lists ahead of the scalar
-scan.
-
-Both RUST scripts and `LAKEHOUSE_DISTRIBUTE_FILES` MUST be created in the same schema as
-`LAKEHOUSE_ADAPTER` (here, `LHVS`) — the adapter qualifies its calls to them using its own
-running-script schema, not a configured property.
+All three scripts MUST live in the same schema as `LAKEHOUSE_ADAPTER` (here `LHVS`); the adapter
+qualifies its calls using its own running-script schema, not a configured property.
 
 ### Fingerprint smoke test (optional)
 
-No catalog credentials needed — this alone proves the `.so` loaded and its `exasol-udf-sdk`/rustc
-build matches the SLC. Especially useful after a manual (1b) upload:
+This needs no catalog credentials. It alone proves the `.so` loaded and its build matches the SLC,
+which is worth doing after a manual upload:
 
 ```sql
 SELECT LHVS.LAKEHOUSE_SCAN('x', 'y') EMITS (r VARCHAR(2000000)) FROM (SELECT 1);
 ```
 
 - `F-UDF-CL-RUST-9001: Fingerprint mismatch: expected <sdk>:rustc_<ver>, found <sdk>:rustc_<ver>`
-  → the registered SLC and this project's `exasol-udf-sdk`/`exasol-udf-macros` version (see
-  `Cargo.toml`) don't match; re-check the SLC version installed per the
-  [Prerequisites](#prerequisites).
-- Any other error (e.g. a scan-spec deserialization error) → a match — the placeholder arguments
-  just aren't a valid scan spec, which is expected.
+  means the registered SLC and this project's `exasol-udf-sdk` / `exasol-udf-macros` version do not
+  match; re-check the installed SLC.
+- Any other error (e.g. a scan-spec deserialization error) is a match: the placeholder arguments
+  just are not a valid scan spec, which is expected.
 
-## 3. Create the catalog CONNECTION
+## Point the VS at your data
 
-Catalog URI goes in `TO`; S3 + warehouse credentials go in the `IDENTIFIED BY` JSON password.
-The fields are the same across backends; only their values and a few flags differ.
-
-| JSON field | Required | Meaning |
-|---|---|---|
-| `warehouse` (or `wh`) | yes | Iceberg warehouse location (`s3://…`, or an AWS account id for Glue) |
-| `endpoint` | yes, except under SigV4 | S3 endpoint URL; optional when `use_sigv4` is on (e.g. AWS Glue) — see the Glue recipe below |
-| `region` | yes | S3 region |
-| `access_key` / `secret_key` | yes | S3 credentials |
-| `session_token` | no | Temporary STS token |
-| `path_style` | no | Path-style S3 addressing; defaults to `true` (MinIO-compatible) — set explicitly to `false` for AWS S3 |
-| `use_sigv4` | no | SigV4-sign the catalog REST requests (`true` for AWS Glue) |
-| `use_vended_credentials` | no | Take short-lived S3 credentials vended by the catalog (Glue) |
-
-Credential values never appear in error messages or logs, and are passed to the scan UDF
-inside the per-query scan spec — never stored in VS properties.
-
-### Local (MinIO + Iceberg REST)
-
-For the bundled Docker stack. Note the internal hostnames and `path_style: true`.
+Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. Here
+is a complete local (MinIO + Iceberg REST) example:
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   TO 'http://iceberg-rest:8181'
   USER ''
   IDENTIFIED BY '{
-    "warehouse":   "s3://warehouse/",
-    "endpoint":    "http://minio:9000",
-    "region":      "us-east-1",
-    "access_key":  "minioadmin",
-    "secret_key":  "minioadmin",
-    "path_style":  true
+    "warehouse":  "s3://warehouse/",
+    "endpoint":   "http://minio:9000",
+    "region":     "us-east-1",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "path_style": true
   }';
-```
 
-### Production (AWS Glue + S3)
-
-The validated production path. Catalog is the Glue Iceberg REST endpoint; `warehouse` is the
-AWS **account id** (not an `s3://` path); SigV4 is on. The adapter derives Glue's
-`catalogs/{account-id}` REST prefix internally — supply only the bare account id. `endpoint` is
-omitted: with `use_sigv4` on, a missing `endpoint` is not rejected, and with `path_style: false`
-the S3 client derives the standard AWS endpoint from `region` instead of using it.
-`use_vended_credentials` is also omitted — it defaults to `false`, and static credentials
-(`access_key`/`secret_key`/`session_token`) work as-is.
-
-```sql
-CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
-  TO 'https://glue.us-east-1.amazonaws.com/iceberg'
-  USER ''
-  IDENTIFIED BY '{
-    "warehouse":     "123456789012",
-    "region":        "us-east-1",
-    "access_key":    "AKIA...",
-    "secret_key":    "...",
-    "session_token": "...",
-    "path_style":    false,
-    "use_sigv4":     true
-  }';
-```
-
-Field differences at a glance:
-
-| Field | Local MinIO | AWS Glue |
-|---|---|---|
-| `TO` (catalog URI) | `http://iceberg-rest:8181` | `https://glue.<region>.amazonaws.com/iceberg` |
-| `warehouse` | `s3://warehouse/` | AWS account id, e.g. `123456789012` |
-| `endpoint` | `http://minio:9000` | omitted — derived from `region` |
-| `path_style` | `true` | `false` |
-| `use_sigv4` | `false` (omit) | `true` |
-| `use_vended_credentials` | `false` (omit) | `false` (omit) |
-
-### Databricks-managed Iceberg
-
-Databricks-managed tables are reached through the same Iceberg REST path: point `TO` at the
-Databricks Unity Catalog Iceberg REST endpoint and supply its auth in place of Glue's. The
-exact endpoint/auth shape for a Databricks workspace is not yet exercised by the test suite in
-this repo — treat the Glue recipe as the template and adjust the catalog URI and credential
-flags to the Databricks endpoint.
-
-## 4. Create the Virtual Schema
-
-```sql
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
@@ -312,18 +211,14 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
   ALLOW_HTTP         = 'true';
 ```
 
-| Property | Required | Meaning |
-|---|---|---|
-| `CATALOG_CONNECTION` | yes | Name of the CONNECTION object from step 3 |
-| `ICEBERG_NAMESPACE` | yes | Iceberg namespace; **every table in it** is exposed as a virtual table |
-| `ALLOW_HTTP` | no | `'true'` to allow plain-HTTP catalog/S3 (e.g. local MinIO) |
-| `PARALLELISM_FACTOR` | no | Work-unit oversubscription multiplier (G = node_count × factor, capped 300) |
-| `DATAFUSION_TARGET_PARTITIONS` | no | DataFusion target partition count per UDF |
-| `DATAFUSION_THREADS_PER_UDF` | no | DataFusion worker threads per UDF instance |
-| `MEMORY_POOL_FRACTION` | no | Fraction of the per-instance memory limit given to the DataFusion pool |
-| `INSTANCE_OVERHEAD_MB` | no | Reserved non-pool overhead per instance, in MB |
+`ICEBERG_NAMESPACE` exposes **every table in that namespace** as a virtual table. `ALLOW_HTTP =
+'true'` permits plain-HTTP catalog/S3 access (needed for local MinIO).
 
-## 5. Query
+- **AWS Glue, Databricks, and the full credential-JSON reference** are in [Catalogs](catalogs.md).
+- **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
+  and more) are in [Tuning](tuning.md).
+
+## Query
 
 ```sql
 SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
@@ -332,12 +227,30 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 Projection, filter predicates, `LIMIT`, and aggregation are pushed down. See
 [Capabilities](capabilities.md) for the full matrix.
 
+## Addressing
+
+The adapter UDF runs **inside** the Exasol container, so every address in the CONNECTION and the
+VS properties must resolve from there. Use internal hostnames (e.g. `iceberg-rest`, `minio`),
+never `localhost` or the Docker host gateway.
+
+## Local dev stack
+
+For E2E or a throwaway environment, `docker-compose.yml` brings up Exasol + MinIO + an Iceberg
+REST catalog:
+
+```sh
+docker compose up -d
+```
+
+Default host ports (override via env): Exasol SQL `28563`, BucketFS `22581`, MinIO `19000`,
+Iceberg REST `18181`. This local Exasol is reachable from your machine, so deploy to it with the
+[automated path](#self-managed-automated-build-and-upload).
+
 ## End-to-end tests
 
-`make test-e2e` builds the `.so`, then runs the Rust E2E suite against the bundled stack
-(Exasol + MinIO + Iceberg REST from `docker-compose.yml`). It seeds Iceberg tables
-in-process, runs serially (`--test-threads=1`), and **fails — never skips — if no Exasol is
-reachable**.
+`make test-e2e` builds the `.so`, then runs the Rust E2E suite against the bundled stack. It seeds
+Iceberg tables in-process, runs serially (`--test-threads=1`), and **fails, never skips, if no
+Exasol is reachable**:
 
 ```sh
 docker compose up -d
@@ -352,9 +265,4 @@ Port overrides (host side; defaults match `docker-compose.yml`):
 | `LH_BUCKETFS_PORT` | `22581` | BucketFS |
 | `LH_MINIO_PORT` | `19000` | MinIO S3 |
 | `LH_REST_PORT` | `18181` | Iceberg REST |
-
-## Addressing note
-
-The adapter UDF runs **inside** the Exasol container, so every address in the CONNECTION
-and the VS properties must resolve from there — use internal hostnames (e.g.
-`iceberg-rest`, `minio`), not `localhost` or the Docker host gateway.
+</content>

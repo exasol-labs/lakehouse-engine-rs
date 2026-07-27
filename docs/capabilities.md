@@ -5,10 +5,12 @@
 # Capability Support Overview
 
 Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates across
-shards and handles anything not pushed down.** A capability is advertised only if the VS can
-translate it (vs-expression translator) or decompose it into a correct partial/merge plan.
-Source of truth: `crates/lakehouse-engine/src/adapter/capabilities.rs`. For *how* the
-per-shard / parent-level split works, see [Architecture](architecture.md).
+shards and handles anything not pushed down.** These capabilities are identical for every table,
+whatever [catalog backend](catalogs.md) it lives in. A capability is advertised only if the VS can
+translate it (via the vs-expression translator) or decompose it into a correct partial/merge plan.
+Source of truth: `crates/lakehouse-engine/src/adapter/capabilities.rs`. For *how* the per-shard and
+parent-level split works, see [Architecture](architecture.md); the [docs index](index.md) lists the
+full guide set.
 
 ## Projection & expressions ✅
 
@@ -83,4 +85,4 @@ Not pushed to the scan — Exasol computes these on the returned partial results
 | `ORDER BY` over a join, `GROUP BY`, or an unprojected/JSON-fallback sort key | `SELECT a.x FROM a JOIN b ... ORDER BY a.x` | Not eligible for the ordered top-N pushdown above; the adapter still renders a correct final `ORDER BY`/`LIMIT` itself |
 | Grouped `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `SELECT k, COUNT(DISTINCT u) FROM t GROUP BY k` | Not decomposable into partial/merge — Exasol computes on returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
-| Geospatial, session fns | — | Exasol-side / unsupported |
+| Geospatial, session functions | — | Exasol-side / unsupported |
