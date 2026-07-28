@@ -26,7 +26,7 @@ ENGINE_SO_PATH="/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engin
 DEFAULT_SCHEMA="LHVS"
 RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#buckets/uploads/default/rustslc/exaudf/exaudfclient"
 
-# Generic-BucketFS (AppDB / Docker / on-premise) layout. Both paths are BUCKET-RELATIVE with no
+# Generic-BucketFS (Exasol AsApp / Docker / on-premise) layout. Both paths are BUCKET-RELATIVE with no
 # leading slash and no bucket segment, because that is the grammar `exapump bucketfs cp|ls|rm`
 # expects: exapump builds its URL as <scheme>://<bfs-host>:<bfs-port>/<bucket>/<path>, so the
 # bucket comes from --bfs-bucket / the profile's bfs_bucket, never from the path argument.
@@ -322,7 +322,7 @@ install.sh - install lakehouse-engine onto an Exasol database.
 
 Two install targets, auto-detected from the arguments:
   saas      Exasol SaaS      - selected by giving BOTH --account-id and --database-id
-  bucketfs  AppDB / Docker / on-premise - selected by giving NEITHER (the default)
+  bucketfs  Exasol AsApp / Docker / on-premise - selected by giving NEITHER (the default)
 
 Connectivity (both modes; exactly one of the three):
   --profile <name>          exapump named profile
@@ -478,7 +478,7 @@ validate_connectivity() {
 #
 # The mode is AUTO-DETECTED from the SaaS ids, because those ids are the only thing a SaaS install
 # needs that a BucketFS install cannot use: both given -> saas, neither given -> bucketfs (the
-# default target: AppDB, Docker, on-premise). Exactly one given is always a mistake and errors.
+# default target: Exasol AsApp, Docker, on-premise). Exactly one given is always a mistake and errors.
 # --target is an optional assertion: it never selects a mode, it only fails the run when the
 # caller's stated intent disagrees with what the flags actually describe.
 #

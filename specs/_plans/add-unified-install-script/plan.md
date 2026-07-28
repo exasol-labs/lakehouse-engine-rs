@@ -12,7 +12,7 @@
 ## Summary
 
 Add `deploy/scripts/install.sh`: one `curl | bash` installer that provisions `lakehouse-engine`
-onto **any** Exasol deployment — Exasol SaaS, or Exasol AppDB / Docker / on-premise (all three
+onto **any** Exasol deployment — Exasol SaaS, or Exasol AsApp / Docker / on-premise (all three
 reached through BucketFS via `exapump`). The script auto-detects its install target from the
 flags it was given, registers the Rust SLC (on by default, `--skip-slc` opts out), uploads the
 engine `.so`, creates the three `CREATE SCRIPT` objects in the deployment schema, and runs a
@@ -46,7 +46,7 @@ This plan supersedes PR #141: all three of its ADRs are carried forward here, tw
 (see `decision-log.md` decisions [2], [3], and [5]).
 
 The generalization is the substance of this plan. SaaS reaches its bucket through a control-plane
-REST API and a presigned-URL exchange; AppDB, Docker, and on-premise all reach theirs through the
+REST API and a presigned-URL exchange; Exasol AsApp, Docker, and on-premise all reach theirs through the
 raw BucketFS HTTP interface, which `exapump bucketfs` already speaks. Those are two genuinely
 different upload channels with two different path layouts, but everything either side of the
 upload — prerequisites, connectivity, version resolution, `SCRIPT_LANGUAGES`, the DDL, the smoke

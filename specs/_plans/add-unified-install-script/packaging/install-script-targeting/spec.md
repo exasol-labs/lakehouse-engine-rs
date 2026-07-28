@@ -1,6 +1,6 @@
 # Feature: Install Script — Targeting and Preflight
 
-Everything `deploy/scripts/install.sh` decides **before it touches the network**: which tools must be present, which credentials are required, which install target this run is for, which paths that target implies, and which artifact versions to fetch. The installer supports two targets — Exasol SaaS, and BucketFS (Exasol AppDB, Docker, and on-premise, which all speak the same BucketFS HTTP interface through `exapump`) — and detects which one it is installing to from the flags it was given, rather than from a required target flag. Every check in this feature runs before the first download, so a misconfigured run costs zero bytes and produces one named error.
+Everything `deploy/scripts/install.sh` decides **before it touches the network**: which tools must be present, which credentials are required, which install target this run is for, which paths that target implies, and which artifact versions to fetch. The installer supports two targets — Exasol SaaS, and BucketFS (Exasol AsApp, Docker, and on-premise, which all speak the same BucketFS HTTP interface through `exapump`) — and detects which one it is installing to from the flags it was given, rather than from a required target flag. Every check in this feature runs before the first download, so a misconfigured run costs zero bytes and produces one named error.
 
 This feature also owns the installer's own **distribution contract**: how the script reaches the operator's shell, and how a run is pinned for reproducibility.
 
@@ -66,7 +66,7 @@ Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereq
 * *GIVEN* an invocation for either target
 * *WHEN* `resolve_target_mode` runs, before any other validation
 * *THEN* supplying **both** `--account-id` and `--database-id` SHALL resolve the target mode to `saas`
-* *AND* supplying **neither** SHALL resolve it to `bucketfs`, the default target covering AppDB, Docker and on-premise
+* *AND* supplying **neither** SHALL resolve it to `bucketfs`, the default target covering Exasol AsApp, Docker and on-premise
 * *AND* supplying **exactly one** of the two SHALL exit non-zero, naming both flags and the Exasol SaaS web console as where to find them — a partial pair SHALL NEVER silently resolve to `bucketfs`
 * *AND* the mode SHALL be resolved FIRST, before the required-input and connectivity checks, because it doubles as the SaaS-id validation and every later step branches on it
 

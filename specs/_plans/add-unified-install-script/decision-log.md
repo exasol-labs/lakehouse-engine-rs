@@ -35,7 +35,7 @@ It never derives, and never reads the value of, the BucketFS write password. See
 ### [1] One script, target mode auto-detected from the SaaS id pair; `--target` asserts only
 
 - **Context:** SaaS reaches its bucket through a control-plane REST API and a presigned-URL
-  exchange. AppDB, Docker, and on-premise all reach theirs through the raw BucketFS HTTP interface
+  exchange. Exasol AsApp, Docker, and on-premise all reach theirs through the raw BucketFS HTTP interface
   that `exapump bucketfs` already speaks. Those two upload channels share no verb, no path grammar,
   and no credential — but prerequisites, connectivity, version resolution, `SCRIPT_LANGUAGES`, the
   DDL, the smoke test and the next-step template are identical across them.
@@ -369,7 +369,7 @@ It never derives, and never reads the value of, the BucketFS write password. See
 
   | Option | Verdict |
   |--------|---------|
-  | Real BucketFS E2E in CI; SaaS as a named tracked exception | ✓ Chosen — the BucketFS target covers AppDB, Docker and on-premise and is fully testable against a compose Exasol; naming the SaaS gap follows this repo's convention that a known deviation is an explicit tracked exception, never a silent gap |
+  | Real BucketFS E2E in CI; SaaS as a named tracked exception | ✓ Chosen — the BucketFS target covers Exasol AsApp, Docker and on-premise and is fully testable against a compose Exasol; naming the SaaS gap follows this repo's convention that a known deviation is an explicit tracked exception, never a silent gap |
   | Also mock the SaaS control plane in CI | ✗ Rejected — a mock re-asserts the same argv shapes the stubbed suite already covers, while proving nothing about the real API; it would read as SaaS coverage without being any |
   | Provision a real SaaS tenant and PAT as CI secrets | ✗ Rejected for now — needs a persistent tenant, a rotating PAT in repository secrets, and a cleanup story for every run's uploaded files; disproportionate to the current risk |
   | Ship with the stubbed suite only | ✗ Rejected — with no release gate between merge and a user's fetch, a DDL or path regression would reach users before any human ran the installer |

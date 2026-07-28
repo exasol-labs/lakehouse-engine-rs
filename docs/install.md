@@ -5,7 +5,7 @@
 # Install & Deploy
 
 `deploy/scripts/install.sh` is a single script that installs the engine on any Exasol
-deployment: Exasol SaaS, or Exasol AppDB, Docker, and on-premise (all three speak the same
+deployment: Exasol SaaS, or Exasol AsApp, Docker, and on-premise (all three speak the same
 BucketFS interface). One command detects your target, registers the Rust SLC, uploads the
 engine, creates the scripts, and runs a smoke test. After the command finishes, you point a
 Virtual Schema at your data. That last step stays manual because it is specific to your dataset.
@@ -44,7 +44,7 @@ curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.
 Give both `--account-id` and `--database-id` to select the SaaS target. Get both values from the
 SaaS web console.
 
-### Exasol AppDB, Docker, or on-premise (BucketFS)
+### Exasol AsApp, Docker, or on-premise (BucketFS)
 
 Give neither `--account-id` nor `--database-id` to select the BucketFS target. This target
 covers the [bundled Docker stack](#local-dev-stack) too.
@@ -203,7 +203,7 @@ These are the default host ports. Environment variables override them.
 - Iceberg REST `18181`
 
 You can reach this local Exasol from your machine. Install to it with the
-[BucketFS one-line command](#exasol-appdb-docker-or-on-premise-bucketfs).
+[BucketFS one-line command](#exasol-asapp-docker-or-on-premise-bucketfs).
 
 ## End-to-end tests
 

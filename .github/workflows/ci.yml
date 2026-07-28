@@ -276,7 +276,7 @@ jobs:
         run: make test-install
 
   # ── install script: real end-to-end run against a live BucketFS Exasol ──
-  # Proves the BucketFS target (AppDB/Docker/on-premise all speak the same
+  # Proves the BucketFS target (Exasol AsApp/Docker/on-premise all speak the same
   # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior
   # release fetched through the authenticated GitHub API — exactly what a
   # user's one-liner does. Does not depend on build-so / this PR's own .so:
