@@ -73,11 +73,11 @@ const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
 const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
 /// Pushdown-path fallback for `target_partitions` when the adapterNote is absent or
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_target_partitions`.)
+/// `resolve_df_fixed_count`.)
 const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
 /// Pushdown-path fallback for threads-per-UDF when the adapterNote is absent or
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_threads_per_udf`.)
+/// `resolve_df_fixed_count`.)
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
 // VS property and adapterNotes key names for the DataFusion batch_size parameter.
 const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
@@ -184,9 +184,9 @@ fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
 ) -> Result<(String, StorageProps, ConnectionCreds), UdfError> {
-    let resolved = read_connection(ctx, str_prop(props, PROP_CATALOG_CONNECTION))?;
+    let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION))?;
     let mut storage = storage_block(&resolved.creds);
-    storage.allow_http = str_prop(props, PROP_ALLOW_HTTP)
+    storage.allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     Ok((resolved.uri, storage, resolved.creds))
@@ -206,7 +206,7 @@ fn handle_create_virtual_schema(
     };
     let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
 
-    let iceberg_namespace = str_prop(&props, PROP_ICEBERG_NAMESPACE)
+    let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
         .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
         .to_string();
 
@@ -446,9 +446,14 @@ fn merge_set_properties(request: &Json) -> Json {
     Json::Object(merged)
 }
 
-fn str_prop<'a>(props: &'a Json, key: &str) -> Option<&'a str> {
-    props
-        .get(key)
+/// Read `key` from a JSON object as a non-empty string.
+///
+/// Returns `Some` only for a present, string-typed, non-empty value — absent,
+/// null, non-string, and empty-string all fall through to `None`, so callers
+/// can chain `.unwrap_or(default)` and treat every one of those cases as
+/// "use the default" uniformly.
+fn nonempty_str<'a>(obj: &'a Json, key: &str) -> Option<&'a str> {
+    obj.get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
@@ -694,7 +699,7 @@ fn build_adapter_notes(
 /// floored at `DEFAULT_PARALLELISM_FACTOR` so a dev VM or failed core-count
 /// lookup (nr_of_cores = 0) never collapses the factor below a useful minimum.
 fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_PARALLELISM_FACTOR)
+    nonempty_str(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
@@ -728,7 +733,7 @@ impl ThreadingMode {
 /// Parses `AUTO` / `FIXED` case-insensitively. An absent, empty, or unrecognized
 /// value resolves to `Auto`.
 fn resolve_threading_mode(props: &Json) -> ThreadingMode {
-    match str_prop(props, PROP_DF_THREADING_MODE) {
+    match nonempty_str(props, PROP_DF_THREADING_MODE) {
         Some(s) if s.eq_ignore_ascii_case("FIXED") => ThreadingMode::Fixed,
         _ => ThreadingMode::Auto,
     }
@@ -752,8 +757,8 @@ fn resolve_df_threading(
 ) -> (usize, usize) {
     match mode {
         ThreadingMode::Fixed => (
-            resolve_df_target_partitions(props, nr_of_cores),
-            resolve_df_threads_per_udf(props, nr_of_cores),
+            resolve_df_fixed_count(props, PROP_DF_TARGET_PARTITIONS, nr_of_cores),
+            resolve_df_fixed_count(props, PROP_DF_THREADS_PER_UDF, nr_of_cores),
         ),
         ThreadingMode::Auto => {
             let threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
@@ -775,27 +780,15 @@ fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usiz
     ((nr_of_cores as usize) / instances).max(1)
 }
 
-/// Read and validate the DATAFUSION_TARGET_PARTITIONS VS property.
+/// Read and validate a FIXED-mode DataFusion count property (target partitions or
+/// threads-per-UDF, selected by `key`).
 ///
 /// An explicit positive-integer property wins. When absent, empty, zero, or
 /// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
 /// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
 /// the default falls back to `1`, preserving prior single-threaded behavior.
-fn resolve_df_target_partitions(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_DF_TARGET_PARTITIONS)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or_else(|| (nr_of_cores as usize).max(1))
-}
-
-/// Read and validate the DATAFUSION_THREADS_PER_UDF VS property.
-///
-/// An explicit positive-integer property wins. When absent, empty, zero, or
-/// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
-/// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
-/// the default falls back to `1`, preserving prior single-threaded behavior.
-fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_DF_THREADS_PER_UDF)
+fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
+    nonempty_str(props, key)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| (nr_of_cores as usize).max(1))
@@ -808,8 +801,8 @@ fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
 /// partition/thread pair behind `DATAFUSION_THREADING_MODE`):
 ///
 /// * An explicit positive-integer `S3_MAX_CONNECTIONS` property is used verbatim
-///   (FIXED-like) — same `str_prop → parse → filter(>=1)` shape as
-///   `resolve_df_threads_per_udf`.
+///   (FIXED-like) — same `nonempty_str → parse → filter(>=1)` shape as
+///   `resolve_df_fixed_count`.
 /// * Absent/empty/zero/invalid triggers an AUTO derivation from `nr_of_cores` and
 ///   the per-node UDF-instance share. When `nr_of_cores == 0` (unknown) it falls
 ///   back to `DEFAULT_S3_MAX_CONNECTIONS`, mirroring the `0`-cores handling across
@@ -842,7 +835,7 @@ fn resolve_s3_max_connections(
     nr_of_cores: u32,
     udf_instances_per_node: usize,
 ) -> usize {
-    if let Some(explicit) = str_prop(props, PROP_S3_MAX_CONNECTIONS)
+    if let Some(explicit) = nonempty_str(props, PROP_S3_MAX_CONNECTIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
     {
@@ -863,7 +856,7 @@ fn resolve_s3_max_connections(
 /// invalid the default is `DEFAULT_DF_BATCH_SIZE` (8192, matching DataFusion's
 /// built-in default). A supplied value is clamped to ≥1.
 fn resolve_df_batch_size(props: &Json) -> usize {
-    str_prop(props, PROP_DF_BATCH_SIZE)
+    nonempty_str(props, PROP_DF_BATCH_SIZE)
         .and_then(|s| s.parse::<usize>().ok())
         .map(|n| n.max(1))
         .unwrap_or(DEFAULT_DF_BATCH_SIZE)
@@ -874,7 +867,7 @@ fn resolve_df_batch_size(props: &Json) -> usize {
 /// Accepts any value in the range (0.0, 1.0]. When the property is absent, empty,
 /// zero, out-of-range, or unparseable the default is `DEFAULT_MEMORY_POOL_FRACTION`.
 fn resolve_memory_pool_fraction(props: &Json) -> f64 {
-    str_prop(props, PROP_MEMORY_POOL_FRACTION)
+    nonempty_str(props, PROP_MEMORY_POOL_FRACTION)
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&x| x > 0.0 && x <= 1.0)
         .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION)
@@ -886,7 +879,7 @@ fn resolve_memory_pool_fraction(props: &Json) -> f64 {
 /// property is absent, empty, or unparseable the default is
 /// `DEFAULT_INSTANCE_OVERHEAD_MB`.
 fn resolve_instance_overhead_mb(props: &Json) -> u64 {
-    str_prop(props, PROP_INSTANCE_OVERHEAD_MB)
+    nonempty_str(props, PROP_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
 }
@@ -898,7 +891,7 @@ fn resolve_instance_overhead_mb(props: &Json) -> u64 {
 /// `DEFAULT_JOIN_BROADCAST_MAX_BYTES` (128 MiB). See backlog BL-001 / plan
 /// `add-join-pushdown-broadcast`.
 fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
-    str_prop(props, PROP_JOIN_BROADCAST_MAX_BYTES)
+    nonempty_str(props, PROP_JOIN_BROADCAST_MAX_BYTES)
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
@@ -911,7 +904,7 @@ fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
 /// non-numeric values, signalling that the caller should fall back to
 /// auto-detection via `std::thread::available_parallelism()`.
 fn parse_nr_of_cores_override(props: &Json) -> Option<u32> {
-    str_prop(props, PROP_NR_OF_CORES)
+    nonempty_str(props, PROP_NR_OF_CORES)
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n >= 1)
 }
@@ -1222,14 +1215,14 @@ mod tests {
         let merged = merge_set_properties(&req);
 
         // Request value wins over the persisted value.
-        assert_eq!(str_prop(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
+        assert_eq!(nonempty_str(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
         // A null request value removes the persisted property entirely.
         assert!(
             merged.get("ALLOW_HTTP").is_none(),
             "a null request value must unset the property"
         );
         // A persisted property the request does not mention is retained.
-        assert_eq!(str_prop(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
+        assert_eq!(nonempty_str(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
     }
 
     // Stub UdfContext whose `connection()` resolves successfully, so a
@@ -1815,20 +1808,32 @@ mod tests {
     #[test]
     fn df_target_partitions_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_target_partitions(&absent, 0), 1, "absent → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&absent, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "absent → 1"
+        );
 
         let zero = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" });
-        assert_eq!(resolve_df_target_partitions(&zero, 0), 1, "zero → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&zero, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "zero → 1"
+        );
 
         let invalid = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" });
-        assert_eq!(resolve_df_target_partitions(&invalid, 0), 1, "invalid → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&invalid, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "invalid → 1"
+        );
     }
 
     /// Scenario: An explicit positive DATAFUSION_TARGET_PARTITIONS property is used as-is.
     #[test]
     fn df_target_partitions_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
-        let val = resolve_df_target_partitions(&props, 0);
+        let val = resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0);
         assert_eq!(val, 4, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
@@ -1921,20 +1926,32 @@ mod tests {
     #[test]
     fn df_threads_per_udf_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_threads_per_udf(&absent, 0), 1, "absent → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&absent, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "absent → 1"
+        );
 
         let zero = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" });
-        assert_eq!(resolve_df_threads_per_udf(&zero, 0), 1, "zero → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&zero, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "zero → 1"
+        );
 
         let invalid = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "not-a-number" });
-        assert_eq!(resolve_df_threads_per_udf(&invalid, 0), 1, "invalid → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&invalid, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "invalid → 1"
+        );
     }
 
     /// Scenario: An explicit positive DATAFUSION_THREADS_PER_UDF property is used as-is.
     #[test]
     fn df_threads_per_udf_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-        let val = resolve_df_threads_per_udf(&props, 0);
+        let val = resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0);
         assert_eq!(val, 2, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
@@ -1978,7 +1995,7 @@ mod tests {
             "absent → default 0.6"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "" });
         assert_eq!(
             resolve_memory_pool_fraction(&empty),
@@ -2030,7 +2047,7 @@ mod tests {
             "absent → default 200"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "" });
         assert_eq!(
             resolve_instance_overhead_mb(&empty),
@@ -2081,7 +2098,7 @@ mod tests {
             "default must be exactly 128 MiB"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "" });
         assert_eq!(
             resolve_join_broadcast_max_bytes(&empty),
@@ -2239,7 +2256,7 @@ mod tests {
             "absent NR_OF_CORES must return None"
         );
 
-        // Empty string → None (str_prop filters empty strings).
+        // Empty string → None (nonempty_str filters empty strings).
         assert_eq!(
             parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "" })),
             None,
@@ -2284,7 +2301,7 @@ mod tests {
         let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
         // Even with nr_of_cores=8, explicit "3" must win.
         assert_eq!(
-            resolve_df_target_partitions(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
             3,
             "explicit DATAFUSION_TARGET_PARTITIONS must override nr_of_cores default"
         );
@@ -2295,7 +2312,7 @@ mod tests {
     fn df_target_partitions_defaults_to_nr_of_cores() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_target_partitions(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
             8,
             "absent property with nr_of_cores=8 must default to 8"
         );
@@ -2306,7 +2323,7 @@ mod tests {
     fn df_target_partitions_unknown_cores_defaults_to_1() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_target_partitions(&props, 0),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0),
             1,
             "absent property with nr_of_cores=0 (unknown) must default to 1"
         );
@@ -2318,7 +2335,7 @@ mod tests {
         let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
         // Even with nr_of_cores=16, explicit "2" must win.
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 16),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 16),
             2,
             "explicit DATAFUSION_THREADS_PER_UDF must override nr_of_cores default"
         );
@@ -2329,7 +2346,7 @@ mod tests {
     fn df_threads_per_udf_defaults_to_nr_of_cores() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 8),
             8,
             "absent property with nr_of_cores=8 must default to 8"
         );
@@ -2340,7 +2357,7 @@ mod tests {
     fn df_threads_per_udf_unknown_cores_defaults_to_1() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 0),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0),
             1,
             "absent property with nr_of_cores=0 (unknown) must default to 1"
         );
