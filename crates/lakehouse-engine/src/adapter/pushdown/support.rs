@@ -1495,9 +1495,10 @@ mod tests {
     }
 
     /// `walk_column_nodes` never invokes its callback for a non-container root —
-    /// `Json::Null`, a scalar string, a scalar number, or an empty object all fall
-    /// through the `_ => {}` arm untouched. Production hands the primitive exactly
-    /// such roots unguarded: `referenced_column_projection`
+    /// `Json::Null`, a scalar string, or a scalar number fall through the `_ => {}`
+    /// arm untouched, and an empty object matches `Json::Object` but has no `type`
+    /// key and no values to recurse into, so it is a no-op too. Production hands
+    /// the primitive exactly such roots unguarded: `referenced_column_projection`
     /// (`joins/sql_builders.rs`) and `referenced_side_columns` (`rendering.rs`)
     /// pass `pushdown_req.get("groupBy")` / `get("orderBy")` / `get("selectList")`
     /// straight through with no `is_null()` guard.
