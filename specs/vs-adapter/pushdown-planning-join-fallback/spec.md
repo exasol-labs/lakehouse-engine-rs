@@ -20,6 +20,25 @@ fallback has exactly one implementation for all N ≥ 2 involved tables.
 * Every clause the wrapper renders (join conditions, WHERE, select list, GROUP BY, HAVING, ORDER BY) uses table-qualified column references resolved from each `column` node's `tableName`, so the wrapper is correct whether or not two involved tables share a column name.
 * This ONE wrapper serves four production entry points, all reaching the same `ORDER BY`-rendering seam: a real inner equi-join of N ≥ 2 involved tables; a grouped request that did not decompose into the partial/merge shape (`GroupByWrapper`); a single-group request with more than one `COUNT(DISTINCT)` or a distinct mixed with an ordinary aggregate (the Case 2/3 count-distinct decline, `vs-adapter/pushdown-planning-count-distinct`); and a row scan whose derived projection the pre-existing fallback widened. Advertising `ORDER_BY_EXPRESSION` (`vs-adapter/pushdown-planning-order-by-capability`) makes an expression sort key reachable on ALL FOUR at once: the wrapper already renders arbitrary expressions for its own clauses through the qualified expression renderer, so relaxing the sort-key parser's bare-column gate is what makes an expression key render on every entry point, with no per-entry-point rendering work added. The `User` decline for an expression the renderer cannot render is stated once, in `vs-adapter/pushdown-planning-topn`, and covers this wrapper too.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
+* **This wrapper renders its own final window, so it owns the offset too (issue #191).** The
+  wrapper resolves its `LIMIT` from the request independently of the row-scan dispatcher's
+  withheld binding, and renders it on its own outer SELECT over limit-free, sort-free fan-out
+  legs. The offset therefore belongs on that same outer SELECT, through the one shared
+  limit-and-offset seam. All four entry points that reach this wrapper — an N-scan inner
+  equi-join, a non-decomposing grouped request, a Case 2/3 `COUNT(DISTINCT)` decline, and a
+  widened-projection row scan — share the single render site, so one seam change covers all
+  four with no per-entry-point work.
+* **Every LIMIT-carrying join reaches this wrapper, never broadcast.** The broadcast gate
+  excludes any request that needs Exasol post-processing, and a pushed `LIMIT` or `orderBy` is
+  exactly such a request. So every offset-bearing join shape lands here by construction; the
+  broadcast renderer emits no `LIMIT` or `ORDER BY` at all and needs no offset handling.
+* **Every offset-carrying request reaching this seam carries a resolvable ordering.** Verified
+  live on the four shapes that reach it with a non-zero `limit.offset`: a grouped
+  `COUNT(DISTINCT)` (`GROUP BY MOD(id,4)`, `ORDER BY 1 LIMIT 2 OFFSET 1`), a self-join ordered
+  by an ordinal, a self-join ordered by a qualified column, and a self-join with a `GROUP BY`.
+  All four pushed a non-empty `orderBy` alongside the offset. The wrapper therefore never has
+  to choose between a bare `OFFSET` and a failure, and MUST NOT be given a failure branch for
+  that choice.
 
 ## Scenarios
 
@@ -102,3 +121,16 @@ fallback has exactly one implementation for all N ≥ 2 involved tables.
 * *AND* the wrapper's visible SELECT list SHALL be UNCHANGED by the ordering — the sort expression is rendered inline in the `ORDER BY`, so NO hidden output column is added and the returned column count still equals the `selectList` item count Exasol validates positionally
 * *AND* the per-leg fan-out subqueries SHALL each project every column the sort expression names, via the SAME referenced-column narrowing helper that already walks the `orderBy` node's full expression tree, so the wrapper never references a column a leg does not emit
 * *AND* the returned result SHALL equal the same query with the same `ORDER BY` evaluated over all rows on a single node
+
+### Scenario: The qualified wrapper renders the request's OFFSET on every entry point that reaches it
+
+* *GIVEN* a `pushdown` request routed to the unified qualified wrapper, carrying a renderable non-empty `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m`
+* *WHEN* the adapter builds the wrapper SQL, for each of the four entry points that reach this wrapper: an N-scan inner equi-join, a non-decomposing grouped request, a Case 2/3 `COUNT(DISTINCT)` decline, and a widened-projection row scan
+* *THEN* the wrapper's outer SELECT SHALL render `ORDER BY <clause> LIMIT n OFFSET m`, in that clause order, through the SAME shared limit-and-offset seam every other wrapper uses
+* *AND* the per-leg fan-out subqueries SHALL remain limit-free and sort-free, so the outer SELECT is the ONLY place either bound is applied and no leg drops a row that the join or the window still needs
+* *AND* a request whose `limit.offset` is zero or absent SHALL produce byte-identical SQL to the pre-change output on all four entry points
+* *AND* the wrapper's visible SELECT list SHALL be UNCHANGED by the offset, so the returned column count still equals the `selectList` item count Exasol validates positionally
+* *AND* the adapter SHALL NOT render an `OFFSET` on a wrapper SELECT that renders no `ORDER BY`, because Exasol rejects that SQL with `sqlCode 42000` ("OFFSET not allowed in LIMIT without ORDER BY")
+* *AND* that state SHALL NOT be given a failure branch of its own, because it is unreachable: this wrapper resolves no `ORDER BY` clause ONLY when the request's `orderBy` is absent or empty, and a request carrying a non-zero `limit.offset` always carries a non-empty `orderBy` (see the offset-implies-ordering invariant in `vs-adapter/pushdown-planning-order-by-capability`) — an `orderBy` this wrapper cannot RENDER takes the separate `User` decline stated in `vs-adapter/pushdown-planning-topn`, which is a different state
+* *AND* the adapter MUST NOT introduce a hard client-facing `User` decline for that unreachable state, because this seam serves all four entry points above: a decline here would turn a previously-successful query into a hard failure on a branch no test exercises. The invariant SHALL instead be pinned by an assertion plus a unit test asserting that no emitted wrapper SQL contains an `OFFSET` token unpreceded by an `ORDER BY`, driven by the request shapes that actually reach this seam with an offset
+* *AND* the returned result SHALL equal the same query with the same `ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node

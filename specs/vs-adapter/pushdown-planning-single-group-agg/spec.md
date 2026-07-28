@@ -15,6 +15,20 @@ filter/LIMIT scenarios separate from aggregate-specific ones. See
 * The shard-invariant common spec's `projection` field is consulted only on the row-scan dispatch path. On the aggregate dispatch path the scan UDF reads the `aggregates` field and derives the DataFusion physical projection from the partial-aggregate query text, so `projection` is left empty.
 * A single-group `COUNT(DISTINCT ...)` is handled by a branch condition in detection, NOT by the ordinary partial/merge machinery. EXACTLY one `COUNT(DISTINCT col)`/`COUNT(DISTINCT expr)` and no other select-list item (Case 1) is decomposed into a dedicated DISTINCT row-scan fan-out (see `vs-adapter/pushdown-planning-count-distinct`). MORE THAN ONE distinct aggregate, or a distinct aggregate alongside any ordinary SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), MUST decline the fan-out and route to a qualified single-table wrapper — the same shape the grouped-aggregate decline fallback uses (`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`) — whose OWN rendered SQL computes every aggregate (including every DISTINCT) over a materialized sharded raw scan, so Exasol passes the one-row result through. The adapter MUST NOT return a bare row scan for such a request: Exasol never re-aggregates a declined pushdown, so raw source columns where `selectListDataTypes` expects the aggregate columns are rejected (`sqlCode 04000`, column-count mismatch). A distinct fan-out MUST NOT be composed as a SELECT-list scalar subquery either: Exasol rejects an emitting UDF call nested in a scalar subquery at compile time (`sqlCode 04000`, "emitting function in expression").
 * See `vs-adapter/pushdown-planning` for the shard-invariant common spec, file-list resolution, and non-aggregate pushdown scenarios.
+* **No offset can reach the one-row merge SELECT, so it renders none (issue #191).** Exasol
+  rejects an `OFFSET` in ANY ungrouped aggregated select with `sqlCode 42000` ("OFFSET not
+  allowed in aggregated selects") — verified live on `SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 5
+  OFFSET 2`, on `ORDER BY COUNT(*)`, and on a single-group aggregate over a join. The
+  statement fails at parse time, before the adapter is consulted, so the merge SELECT never
+  receives a non-zero `limit.offset`. This site therefore takes NO offset parameter, NO
+  collapse arithmetic, and NO failure branch: the unreachability is pinned by an assertion and
+  by an end-to-end assertion that the shape still fails with `sqlCode 42000`, which converts a
+  future Exasol build relaxing the rule into a test failure rather than a silent wrong answer.
+* **Exasol pushes no `orderBy` on an ungrouped aggregate request either.** Verified live:
+  `SELECT COUNT(*) FROM t ORDER BY COUNT(*) LIMIT 5` and `ORDER BY 1 LIMIT 5` both push `limit`
+  with `orderBy` ABSENT, because a one-row result admits exactly one ordering and Exasol
+  resolves it itself. So the merge SELECT renders no `ORDER BY` and needs none, and no
+  anti-wrong-truncation withholding applies to its `LIMIT`.
 
 ## Scenarios
 
@@ -71,3 +85,13 @@ filter/LIMIT scenarios separate from aggregate-specific ones. See
 * *AND* a select list carrying MORE THAN ONE distinct aggregate, OR a `COUNT(DISTINCT ...)` alongside any ordinary SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), SHALL decline the fan-out and route to a qualified single-table wrapper whose OWN rendered SQL computes every aggregate (including every DISTINCT) over a materialized sharded raw scan, so Exasol passes the one-row result through; the wrapper's output SHALL be N columns, one per select-list item
 * *AND* the wrapper's inner materialized scan projection SHALL be narrowed to only the columns the request references — including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references — via the shared referenced-column helper the grouped-aggregate fallback also uses (`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`; issue #160), NEVER the full base-table schema
 * *AND* the adapter MUST NOT return a bare row scan (`sqlCode 04000` column-count mismatch, since Exasol never re-aggregates a declined pushdown) and MUST NOT compose any distinct fan-out as a SELECT-list scalar subquery (`sqlCode 04000`, emitting UDF nested in a scalar subquery)
+
+### Scenario: The single-row aggregate merge renders no OFFSET, because no offset can reach it
+
+* *GIVEN* an ungrouped single-group aggregate query carrying a `LIMIT` and a non-zero `OFFSET` — for example `SELECT COUNT(*) FROM t ORDER BY 1 LIMIT 5 OFFSET 2`
+* *WHEN* the statement is submitted to Exasol
+* *THEN* Exasol SHALL reject it with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") without issuing a `pushdown` request, so the adapter's single-group aggregate merge SELECT SHALL never receive a non-zero `limit.offset`
+* *AND* the merge SELECT builder SHALL therefore take NO offset parameter and render NO `OFFSET`, keeping its existing `LIMIT n` rendering byte-identical to the pre-change output — including the `LIMIT 0` → zero-rows behaviour (issue #198)
+* *AND* the adapter MUST NOT add collapse arithmetic, offset rendering, or a `User` decline at this site, because no production request can execute that code and an untested branch here would be a live failure mode on an unreachable path
+* *AND* the unreachability SHALL be pinned by an assertion at the merge builder's call site AND by an end-to-end assertion that the example query still fails with `sqlCode 42000`, so a future Exasol build that relaxed the grammar rule surfaces as a test failure rather than as a silently wrong one-row result
+* *AND* the per-shard scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard's aggregate input is truncated

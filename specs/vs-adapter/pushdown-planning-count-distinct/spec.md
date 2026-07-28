@@ -54,8 +54,30 @@ engine rather than a fixed per-shard serialization cap.
   outer request. A per-shard LIMIT would drop shard-local distinct values before the merge
   counts them, producing a WRONG count — the same hazard the grouped-aggregate path already
   guards (`vs-adapter/pushdown-planning-grouped-agg`, "LIMIT is NOT pushed into per-shard
-  scan for a grouped query"). Any request-level LIMIT or OFFSET applies only to the outer
-  `COUNT(DISTINCT "V")` wrapper SELECT.
+  scan for a grouped query"). Any request-level LIMIT applies only to the outer
+  `COUNT(DISTINCT "V")` wrapper SELECT. This narrows to LIMIT alone: no request-level OFFSET
+  can ever reach this wrapper, because Exasol rejects an `OFFSET` in ANY ungrouped aggregated
+  select with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") at parse time,
+  before the adapter is consulted — verified live on `SELECT COUNT(DISTINCT id) FROM t ORDER
+  BY 1 LIMIT 5 OFFSET 2` and on a two-`COUNT(DISTINCT)` Case 2/3 select (issue #191).
+* **The limit withholding once implemented was dead code, and has been deleted (issue #191).**
+  Two rules require the lone-`COUNT(DISTINCT)` wrapper to render the request's LIMIT on
+  its own outer SELECT and to NOT withhold it because an unrendered `ORDER BY` is present: the
+  "LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan" scenario
+  below, and the single-row-aggregate scenario in
+  `vs-adapter/pushdown-planning-order-by-capability`. The withholding branch never fired,
+  because Exasol pushes NO `orderBy` on an ungrouped aggregate request (verified live: `SELECT
+  COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5` and `ORDER BY COUNT(DISTINCT id) LIMIT 5` both
+  push `limit` with `orderBy` ABSENT). Deleting the branch makes both rules hold BY
+  CONSTRUCTION rather than by an accident of what Exasol currently sends.
+* **No offset can reach this wrapper, so it renders none.** Exasol rejects an `OFFSET` in ANY
+  ungrouped aggregated select with `sqlCode 42000` ("OFFSET not allowed in aggregated selects")
+  — verified live on `SELECT COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` and on a
+  two-`COUNT(DISTINCT)` Case 2/3 select. The statement fails at parse time, before the adapter
+  is consulted. This wrapper therefore takes the SAME treatment as the single-group aggregate
+  merge (`vs-adapter/pushdown-planning-single-group-agg`): no offset parameter, no collapse
+  arithmetic, no failure branch, unreachability pinned by an assertion and an end-to-end
+  `sqlCode 42000` assertion.
 * Credentials MUST NOT appear in any returned SQL or error message.
 
 ## Scenarios
@@ -107,9 +129,11 @@ engine rather than a fixed per-shard serialization cap.
 
 ### Scenario: LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan
 
-* *GIVEN* a lone single-group `COUNT(DISTINCT col)` request (Case 1) that also carries a request-level LIMIT, OFFSET, or ORDER BY, e.g. `SELECT COUNT(DISTINCT c) FROM t LIMIT 1`
+* *GIVEN* a lone single-group `COUNT(DISTINCT col)` request (Case 1) that also carries a request-level LIMIT or ORDER BY, e.g. `SELECT COUNT(DISTINCT c) FROM t LIMIT 1` or `SELECT COUNT(DISTINCT c) FROM t ORDER BY 1 LIMIT 5`
 * *WHEN* the adapter builds the distinct-column fan-out and its shard-invariant common spec
 * *THEN* the distinct fan-out's shard-invariant common spec MUST NOT carry any LIMIT, OFFSET, or ORDER BY value from the outer request, so no per-shard DISTINCT sub-scan runs a bounded top-N that would drop shard-local distinct values before the merge counts them
-* *AND* any request-level LIMIT or OFFSET SHALL appear only on the outer `COUNT(DISTINCT "V")` wrapper SELECT, never on the per-shard fan-out sub-scan, matching how the grouped-aggregate path confines LIMIT to the outer merge
-* *AND* the merged distinct count SHALL therefore equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, exactly, regardless of any outer LIMIT, OFFSET, or ORDER BY
-* *AND* the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns …") SHALL confine any request-level LIMIT to the OUTER wrapper SELECT, keeping the inner materialized sharded scan LIMIT-free and sort-free, exactly as the grouped-aggregate qualified-wrapper fallback confines LIMIT to its outer SELECT
+* *AND* any request-level LIMIT SHALL appear only on the outer `COUNT(DISTINCT "V")` wrapper SELECT, never on the per-shard fan-out sub-scan, matching how the grouped-aggregate path confines LIMIT to the outer merge
+* *AND* the wrapper SHALL receive the request's RAW `limit`, and MUST NOT have it withheld on the grounds that an `ORDER BY` the adapter did not render is present — the withholding once implemented has been deleted as dead code, since it never fired (issue #191)
+* *AND* the wrapper SHALL render NO `OFFSET`, because a non-zero request `limit.offset` cannot reach it: Exasol rejects `SELECT COUNT(DISTINCT c) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") before issuing a `pushdown` request — so the adapter adds no offset rendering, no collapse arithmetic, and no failure branch here, pinning the unreachability with an assertion plus an end-to-end `sqlCode 42000` assertion
+* *AND* the merged distinct count SHALL therefore equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, exactly, whenever the request's `LIMIT` admits that row, and SHALL return zero rows for `LIMIT 0`
+* *AND* the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns …") SHALL confine any request-level LIMIT and OFFSET to the OUTER wrapper SELECT, keeping the inner materialized sharded scan LIMIT-free and sort-free, exactly as the grouped-aggregate qualified-wrapper fallback confines LIMIT to its outer SELECT
