@@ -258,6 +258,97 @@ jobs:
       - name: Check licenses and advisories
         run: cargo deny check licenses advisories
 
+  # ── install script: static checks + stubbed unit tests, no network ──────
+  # deploy/scripts/install.sh is fetched straight off `main` by every user's
+  # `curl | bash` one-liner (see docs/install.md) — there is no release gate
+  # between a merge and that fetch, so this job (and install-script-e2e below)
+  # must both be required checks AND block `release` (see release.needs).
+  install-script:
+    name: Install Script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh
+
+      - name: Unit tests (stubbed exapump/curl, no network)
+        run: make test-install
+
+  # ── install script: real end-to-end run against a live BucketFS Exasol ──
+  # Proves the BucketFS target (AppDB/Docker/on-premise all speak the same
+  # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior
+  # release fetched through the authenticated GitHub API — exactly what a
+  # user's one-liner does. Does not depend on build-so / this PR's own .so:
+  # this job tests the INSTALLER's mechanics (exapump bucketfs upload, DDL,
+  # SCRIPT_LANGUAGES registration, fingerprint smoke test), not query
+  # correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
+  # ponytail: only the `exasol` compose service is started (no MinIO/Iceberg
+  # REST/Spark fixtures) — this job never queries a Virtual Schema, so it
+  # doesn't need catalog/object-storage services. SaaS mode has no CI job:
+  # it needs a real SaaS tenant + PAT that CI doesn't have (tracked in #252).
+  install-script-e2e:
+    name: Install Script E2E (BucketFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Pull Exasol image
+        run: docker compose pull --quiet exasol
+
+      # Same root cause and fix as the `e2e` job: register_slc/create_engine_scripts
+      # spawn real Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
+      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
+      - name: Start stack (Exasol only)
+        run: docker compose up -d --wait exasol
+
+      - name: Install exapump
+        run: curl -fsSL https://raw.githubusercontent.com/exasol-labs/exapump/main/install.sh | sh
+
+      # Fresh container, so no exapump profile exists yet. Same BucketFS
+      # write-password extraction the Makefile's install-slc/bucketfs-upload-so
+      # targets already use — read straight out of EXAConf, no manual secret.
+      - name: Create exapump profile for the compose stack
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          BFSPASS=$(docker exec lakehouse-engine-rs-exasol-1 bash -c \
+            "awk '/\[\[Bucket.*default\]\]/{f=1} f&&/WritePasswd/{print \$3;exit}' /exa/etc/EXAConf | base64 -d")
+          exapump profile add ci-bucketfs \
+            --host localhost --port "${LH_EXASOL_PORT:-28563}" \
+            --user sys --password "${EXASOL_SYS_PASSWORD:-exasol}" \
+            --validate-certificate false \
+            --bfs-host localhost --bfs-port "${LH_BUCKETFS_PORT:-22581}" \
+            --bfs-write-password "$BFSPASS" \
+            --default
+
+      # No --lakehouse-version/--slc-version pin: fetches each repo's latest
+      # release, same as a real user's default invocation. GITHUB_TOKEN is the
+      # standard Actions-provided token — it already has read access to this
+      # (private) repo's own releases, and language-container-rs is public.
+      - name: Run install.sh (BucketFS target)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash deploy/scripts/install.sh --profile ci-bucketfs
+
+      - name: Dump Exasol logs on failure
+        if: failure()
+        run: |
+          docker compose ps || true
+          docker compose logs exasol | tail -150 || true
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
   # ── viability gate: full local Exasol + MinIO + Iceberg-REST stack ───────
   e2e:
     name: E2E
@@ -558,8 +649,11 @@ jobs:
     # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
     # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
     # build-so, a main push with failing tests would otherwise mint a tag +
-    # Release. No latency cost — the e2e jobs dominate the chain.
-    needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses]
+    # Release. No latency cost — the e2e jobs dominate the chain. install-script
+    # and install-script-e2e are listed for the same reason: install.sh is
+    # served straight off `main` (see its own job comment), so a broken script
+    # on `main` must never reach a release-gated push either.
+    needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -682,6 +776,11 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          # deploy/scripts/install.sh is deliberately NOT listed here. Users
+          # fetch it from the contents API on `main` (docs/install.md), and
+          # `?ref=<tag>` on that same API already covers pinning — a release
+          # asset would instead freeze installer bugs into every past release
+          # forever. Don't "fix" this by adding it back.
           files: |
             lakehouse-engine.tar.gz
             THIRD-PARTY-LICENSES.md
