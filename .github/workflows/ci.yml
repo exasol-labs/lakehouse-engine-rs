@@ -222,10 +222,6 @@ jobs:
         with:
           shared-key: workspace-rlib
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Save even when a test fails: the dep compile succeeded and is
-          # exactly what the cache keeps. Without this, a red test on main
-          # discards the save and every job stays cold until main is green.
-          cache-on-failure: "true"
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
       # never touches a live stack.
@@ -562,8 +558,8 @@ jobs:
     # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
     # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
     # build-so, a main push with failing tests would otherwise mint a tag +
-    # Release. No latency cost — e2e dominates the chain.
-    needs: [e2e, lint, unit-tests, licenses]
+    # Release. No latency cost — the e2e jobs dominate the chain.
+    needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
