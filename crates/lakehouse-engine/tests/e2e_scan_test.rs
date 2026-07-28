@@ -1124,8 +1124,9 @@ fn ordered_topn_pushes_down_matches_single_node() {
 /// Regression check: `ORDER BY score DESC` with NO `LIMIT` must decline the
 /// ordered-top-N pushdown — `detect_topn` requires a `limit` to be present
 /// (decision: the shape is "single table, no GROUP BY/aggregates/HAVING,
-/// limit present with no offset, ...") — and fall back to the pre-existing
-/// plan, relying on Exasol's own backstop `ORDER BY` for correctness. This
+/// limit present with a zero (or absent) offset, ...") — and fall back to
+/// the pre-existing plan, relying on Exasol's own backstop `ORDER BY` for
+/// correctness. This
 /// proves the new top-N capability did not silently widen what counts as
 /// "matched" in a way that breaks the existing, unchanged fallback behavior
 /// for a plain (unbounded) sort.
@@ -3286,5 +3287,345 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
         unique_group_count, 20,
         "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
          got {unique_group_count}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #191 — ORDER BY ... LIMIT n OFFSET m regression coverage
+// ---------------------------------------------------------------------------
+//
+// Before this fix, `LIMIT_WITH_OFFSET` was unadvertised: Exasol stripped the
+// `offset` from every pushdown request and applied neither bound itself, so
+// every one of these shapes silently returned ranks 1..n instead of the
+// requested (m+1)..(m+n) window. `render_limit_offset` (`support.rs`) is now
+// the single seam all three reachable wrapper sites route through; these
+// tests exercise each site end to end, plus the two shapes the design
+// declares permanently unreachable with a non-zero offset (S3, S4/S5), whose
+// `debug_assert!` guards compile out of the release-profile `.so` and so have
+// no live backstop other than these two canaries.
+
+/// The issue's literal repro: `ORDER BY score DESC LIMIT 12 OFFSET 3` over a
+/// PROJECTED sort key (`score` is in the select list). A non-zero offset
+/// always declines the per-shard bounded top-N (`detect_topn`'s guard is now
+/// a non-zero-offset test, not a presence test), so this renders on the
+/// declined row-scan wrapper (S1, `topn.rs`): `... GROUP BY shard_key)) ORDER
+/// BY "SCORE" DESC NULLS FIRST LIMIT 12 OFFSET 3`, live-verified via
+/// `EXPLAIN VIRTUAL` during this task.
+///
+/// Seeded data: `score = 5.0 * id` for id in 1..=20, so the ranks by score
+/// DESC are exactly ids 20,19,...,1 in order. Ranks 4-15 (LIMIT 12 OFFSET 3)
+/// are ids 17,16,...,6 — NOT ids 20..=9 (ranks 1-12), which is the #191 bug:
+/// silent collapse to OFFSET 0.
+#[test]
+fn ordered_limit_offset_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, score FROM {} ORDER BY score DESC LIMIT 12 OFFSET 3",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LIMIT 12 OFFSET 3"),
+        "a non-zero offset must render on the wrapper as LIMIT 12 OFFSET 3, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let expected_ids: Vec<i64> = (6..=17).rev().collect();
+    assert_eq!(
+        ids, expected_ids,
+        "ORDER BY score DESC LIMIT 12 OFFSET 3 must return ranks 4-15 \
+         ({expected_ids:?}), NOT ranks 1-12 (ids 20..=9) — the #191 silent \
+         collapse to OFFSET 0 — got {ids:?}"
+    );
+    let scores: Vec<f64> = cols[1].iter().map(parse_numeric).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        let expected_score = 5.0 * id as f64;
+        assert!(
+            (scores[i] - expected_score).abs() < 1e-9,
+            "row {i}: score for id {id} must be {expected_score}, got {}",
+            scores[i]
+        );
+    }
+}
+
+/// Same declined-row-scan-wrapper site (S1) as
+/// [`ordered_limit_offset_returns_shifted_window`], but with an UNPROJECTED
+/// sort key: `score` drives the ORDER BY but is not in the select list. This
+/// is the shape `add-topn-pushdown` (#225/#189) and `fix/198-orderby-expr-hidden-col`
+/// hardened against leaking a hidden internal sort column into the wrapper's
+/// select list; this test pins that the OFFSET renders correctly on top of
+/// that fix, not just on the simpler projected-sort-key case above.
+///
+/// `LIMIT 5 OFFSET 2` over score DESC ranks: rank 1-2 are ids 20,19; ranks 3-7
+/// (the requested window) are ids 18,17,16,15,14.
+#[test]
+fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} ORDER BY score DESC LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LIMIT 5 OFFSET 2"),
+        "a non-zero offset must render on the wrapper as LIMIT 5 OFFSET 2, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (id): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![18, 17, 16, 15, 14],
+        "ORDER BY score DESC LIMIT 5 OFFSET 2 (unprojected sort key) must \
+         return ranks 3-7 (ids 18,17,16,15,14), got {ids:?}"
+    );
+}
+
+/// The grouped merge wrapper (S2, `grouped_agg.rs`) renders the request's
+/// OFFSET alongside its LIMIT: `GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET
+/// 1`.
+///
+/// Seeded ids 1..=20 cycle `MOD(id,4)` through 1,2,3,0 repeating, so all four
+/// groups (k=0,1,2,3) have exactly 5 members each. Ranked by k ascending,
+/// `LIMIT 2 OFFSET 1` must return groups ranked 2-3 (k=1, k=2), NOT the
+/// groups ranked 1-2 (k=0, k=1) that the pre-fix silent-OFFSET-0 collapse
+/// would have produced.
+#[test]
+fn grouped_order_by_limit_offset_returns_shifted_groups() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id,4) AS k, COUNT(*) AS c FROM {} GROUP BY MOD(id,4) \
+         ORDER BY 1 LIMIT 2 OFFSET 1",
+        vs_table()
+    );
+
+    // Pin the render site: the same `group_keys` + `PARTIAL_` markers
+    // `assert_group_by_pushed_down` uses to evidence the grouped
+    // partial-aggregate builder (S2, `grouped_agg.rs`), not the qualified
+    // single-table wrapper (S6, which has no `group_keys`/`PARTIAL_` — see
+    // `qualified_wrapper_limit_offset_returns_shifted_window`'s `LHS_T0`
+    // check), plus the shifted-window shape itself.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("group_keys") && pushed_sql.contains("PARTIAL_"),
+        "GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1 must render via the \
+         grouped partial-aggregate builder (scan spec carries 'group_keys' \
+         and a 'PARTIAL_' column), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("GROUP BY") && pushed_sql.contains("LIMIT 2 OFFSET 1"),
+        "pushed SQL must carry a GROUP BY merge with LIMIT 2 OFFSET 1, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (k, c): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "LIMIT 2 OFFSET 1 must cap the result to exactly 2 groups: {cols:?}"
+    );
+    let ks: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let counts: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    assert_eq!(
+        ks,
+        vec![1, 2],
+        "GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1 must return groups \
+         ranked 2-3 (k=1, k=2), NOT ranks 1-2 (k=0, k=1), got {ks:?}"
+    );
+    assert_eq!(
+        counts,
+        vec![5, 5],
+        "each of the 4 MOD(id,4) groups has exactly 5 members, got {counts:?}"
+    );
+}
+
+/// The qualified single-table wrapper (S6, `joins/sql_builders.rs`) renders
+/// the request's OFFSET, exercised via its `GROUP BY` + `COUNT(DISTINCT)`
+/// entry point — capture row 8 in the plan (`GROUP BY MOD(id,4)` with
+/// `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2 OFFSET 1`).
+///
+/// Same seeded groups as
+/// [`grouped_order_by_limit_offset_returns_shifted_groups`] (k=0..3, 5
+/// members each, all distinct ids so `COUNT(DISTINCT id)` == `COUNT(*)` per
+/// group): the shifted window must return groups ranked 2-3 (k=1, k=2).
+#[test]
+fn qualified_wrapper_limit_offset_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id,4) AS k, COUNT(DISTINCT id) AS c FROM {} \
+         GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1",
+        vs_table()
+    );
+
+    // Pin the render site: `LHS_T0` is the qualified single-table wrapper's
+    // (S6, `joins/sql_builders.rs`) own aliasing scheme, the same marker used
+    // at `unmatched_pushed_sql.contains("LHS_T0")` above — distinct from the
+    // plain grouped-merge builder (S2), which never aliases `LHS_T0` and
+    // instead carries `group_keys`/`PARTIAL_` (see
+    // `grouped_order_by_limit_offset_returns_shifted_groups`).
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LHS_T0"),
+        "GROUP BY MOD(id,4) + COUNT(DISTINCT id) must render via the \
+         qualified single-table wrapper (pushed SQL must contain 'LHS_T0'), \
+         got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("LIMIT 2 OFFSET 1"),
+        "pushed SQL must carry LIMIT 2 OFFSET 1 on the qualified wrapper, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (k, c): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "LIMIT 2 OFFSET 1 must cap the result to exactly 2 groups: {cols:?}"
+    );
+    let ks: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let counts: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    assert_eq!(
+        ks,
+        vec![1, 2],
+        "GROUP BY MOD(id,4) + COUNT(DISTINCT id) ORDER BY 1 LIMIT 2 OFFSET 1 \
+         must return groups ranked 2-3 (k=1, k=2), NOT ranks 1-2 (k=0, k=1), \
+         got {ks:?}"
+    );
+    assert_eq!(
+        counts,
+        vec![5, 5],
+        "every group's 5 ids are distinct, so COUNT(DISTINCT id) == 5 per \
+         group, got {counts:?}"
+    );
+}
+
+/// Fact 6 canary (S4, S5 — grammar assertion). Exasol's grammar ties OFFSET
+/// to a non-aggregated select: `OFFSET` on an ungrouped aggregated select
+/// (`SELECT COUNT(*) ... ORDER BY 1 LIMIT 5 OFFSET 2`, no `GROUP BY`) is
+/// rejected by Exasol itself, BEFORE the adapter is ever consulted — this is
+/// the live, release-mode backstop for the `debug_assert!`s at the two
+/// one-row merge builders (`build_aggregate_scan_sql`,
+/// `build_count_distinct_scan_sql`, both in `support.rs`), which compile out
+/// of the release-profile `.so` and so guard nothing there. A future Exasol
+/// build that relaxes this grammar rule must fail this test rather than
+/// silently return the single aggregate row where an offset should apply.
+///
+/// Live-verified: Exasol's WebSocket response for this shape is
+/// `{"status":"error","exception":{"sqlCode":"42000","text":"OFFSET not
+/// allowed in aggregated selects ..."}}`.
+#[test]
+fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} ORDER BY 1 LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+    let resp = conn.try_execute(&sql);
+
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "OFFSET on a single-group aggregate must be rejected by Exasol \
+         itself (the adapter is never consulted), got: {resp}"
+    );
+    assert_eq!(
+        resp["exception"]["sqlCode"].as_str(),
+        Some("42000"),
+        "expected sqlCode 42000, got: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("OFFSET") && msg.contains("aggregated"),
+        "expected Exasol's 'OFFSET not allowed in aggregated selects' \
+         message, got: {msg}"
+    );
+}
+
+/// Fact 5 canary (S3 — unrenderable-ordering invariant). `HASH_MD5(id)` is an
+/// ordering Exasol cannot delegate to the adapter: for this shape Exasol
+/// pushes NEITHER `orderBy` NOR `limit` at all (live-verified via `EXPLAIN
+/// VIRTUAL`: the returned scan spec carries no `order_by` field and the
+/// pushed SQL carries no `LIMIT`/`OFFSET` token) and windows the result
+/// itself. This is the live backstop for the invariant `extract_offset(req) >
+/// 0 IMPLIES order_by_present(req)` that `build_row_scan_sql`'s
+/// `debug_assert!` (S3, `support.rs`) states but cannot enforce in the
+/// release-profile `.so`: if a future Exasol build ever pushed a bare `limit`
+/// with no `orderBy` for this shape, S3 would render ` LIMIT 5` with no
+/// ORDER BY and no OFFSET, silently reopening #191.
+///
+/// The VS-side query and a single-node native reference (no VS involved,
+/// `ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2` over a literal 1..=20 values
+/// list) must return the SAME 5 ids in the SAME order. The reference casts
+/// each literal to `DECIMAL(20,0)` — the VS's own `ID` column type (Arrow
+/// `Int64` maps to `DECIMAL(20,0)`, see this project's type-mapping table) —
+/// because `HASH_MD5` hashes the value's on-the-wire representation, so an
+/// uncast literal (which Exasol infers as a narrower `DECIMAL`) hashes
+/// differently and would produce a different (wrong) reference ordering;
+/// this was confirmed live during this task.
+#[test]
+fn unrenderable_ordering_with_offset_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed_sql.contains("\"order_by\":"),
+        "HASH_MD5(id) is an unrenderable ordering: the adapter's scan spec \
+         must carry no 'order_by' field, got:\n{pushed_sql}"
+    );
+    // The precise field-shaped marker, not a bare `contains("LIMIT")` — as in
+    // `ordered_topn_pushes_down_matches_single_node` and
+    // `order_by_without_limit_falls_back_correctly`, `explain_virtual_sql`
+    // echoes Exasol's own incoming `pushdownRequest`, which can carry a
+    // literal "LIMIT" token unrelated to the adapter's own scan spec, so a
+    // raw substring search would false-positive regardless of this shape.
+    assert!(
+        !pushed_sql.contains("\"limit\":"),
+        "HASH_MD5(id) is an unrenderable ordering: Exasol withholds the \
+         limit entirely (fact 5), so the adapter's scan spec must carry no \
+         'limit' field, got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (id): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(ids.len(), 5, "expected exactly 5 ids: {ids:?}");
+
+    let native_sql = "SELECT CAST(id AS DECIMAL(20,0)) AS id FROM (VALUES \
+         (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),\
+         (16),(17),(18),(19),(20)) AS t(id) \
+         ORDER BY HASH_MD5(CAST(id AS DECIMAL(20,0))) LIMIT 5 OFFSET 2";
+    let native_cols = conn.query_columns(native_sql);
+    let native_ids: Vec<i64> = native_cols[0].iter().map(parse_int).collect();
+
+    assert_eq!(
+        ids, native_ids,
+        "ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2 through the VS must match a \
+         single-node native evaluation of the same ordering over the same \
+         20 ids (no VS involved), got VS={ids:?} native={native_ids:?}"
     );
 }

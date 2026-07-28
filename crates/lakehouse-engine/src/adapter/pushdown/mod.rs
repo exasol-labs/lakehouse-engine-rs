@@ -422,6 +422,7 @@ pub(crate) fn build_dispatch_sql(
                 &aggregate_types,
                 &select_items,
                 grouped_limit,
+                support::extract_offset(pushdown_req),
                 &col_types,
                 udf_name,
                 distribute_udf_name,
@@ -463,12 +464,24 @@ pub(crate) fn build_dispatch_sql(
             // a dedicated DISTINCT row-scan counted by a native COUNT(DISTINCT "V").
             // The request-level LIMIT lands ONLY on that outer wrapper — never inside
             // the fan-out sub-scan (a leaked LIMIT would truncate a shard's local
-            // distinct set → a wrong count) — and is withheld entirely when an ORDER
-            // BY the adapter did not render is present (anti-wrong-truncation guard,
-            // decision [4]). The base spec carries no projection/aggregates/limit/
-            // order-by/distinct: the wrapper builder derives the fan-out from it.
+            // distinct set → a wrong count). The base spec carries no projection/
+            // aggregates/limit/order-by/distinct: the wrapper builder derives the
+            // fan-out from it.
+            //
+            // No offset ever reaches this site (fact 6, issue #191): Exasol rejects
+            // an OFFSET in ANY ungrouped aggregated select with sqlCode 42000 before
+            // the adapter is consulted, so `build_count_distinct_scan_sql` takes no
+            // offset parameter and this `debug_assert!` documents the invariant
+            // rather than guarding against something reachable (it compiles out of
+            // the release-profile `.so`; the live backstop is the e2e sqlCode 42000
+            // assertion).
             if is_lone_count_distinct(&items) {
-                let cd_limit = if has_order_by { None } else { limit };
+                debug_assert!(
+                    support::extract_offset(pushdown_req) == 0,
+                    "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
+                     (sqlCode 42000) before the adapter is consulted, so this wrapper \
+                     can never see a non-zero offset"
+                );
                 let base_spec = ScanSpec {
                     common: CommonScanSpec {
                         filter: filter.clone(),
@@ -481,7 +494,7 @@ pub(crate) fn build_dispatch_sql(
                     shards,
                     &items,
                     &col_types,
-                    cd_limit,
+                    limit,
                     udf_name,
                     distribute_udf_name,
                 );
@@ -581,6 +594,21 @@ pub(crate) fn build_dispatch_sql(
     };
     let order_by = topn.unwrap_or_default();
 
+    // Fact 5 (issue #191): `extract_offset(pushdown_req) > 0` NEVER arrives without a
+    // non-empty `orderBy` — Exasol's grammar requires an ORDER BY for a pushed OFFSET,
+    // and withholds `limit` entirely when it cannot delegate the ordering it cannot
+    // express (live capture, plan.md rows 1-13). The two guards below are CHAINED on
+    // `has_order_by`, not independent: a non-zero offset declines the bounded top-N
+    // (`detect_topn`, above) so `order_by` is empty here, which is what NULLS
+    // `effective_limit` next and keeps S3 (`build_row_scan_sql`) from ever rendering a
+    // `LIMIT`/`OFFSET` with no `ORDER BY` beside it. This `debug_assert!` documents the
+    // invariant only — it compiles out of the release-profile `.so`; the live backstop
+    // is Task 8's unrenderable-ordering e2e canary.
+    debug_assert!(
+        support::extract_offset(pushdown_req) == 0 || has_order_by,
+        "fact 5: a non-zero offset must never arrive without a non-empty orderBy"
+    );
+
     // Withhold the limit when an ORDER BY is present but the shape is not a matched
     // top-N (`order_by` empty): never a bare per-shard/outer LIMIT ahead of an
     // ordering the adapter did not render (decision [4]). A matched top-N keeps the
@@ -673,6 +701,21 @@ pub(crate) fn build_dispatch_sql(
     };
 
     let aggregate_types = aggregate_exasol_types(pushdown_req);
+    // Fact 6 (issue #191): when this call drives the ordinary single-group
+    // aggregate merge (`has_aggregates`, i.e. `build_aggregate_scan_sql`), no
+    // offset can ever reach it — Exasol rejects an OFFSET in ANY ungrouped
+    // aggregated select with sqlCode 42000 before the adapter is consulted, so
+    // `build_aggregate_scan_sql` takes no offset parameter. This `debug_assert!`
+    // documents that unreachability rather than guarding against it (it compiles
+    // out of the release-profile `.so`; the live backstop is the e2e sqlCode
+    // 42000 assertion). It says nothing about the row-scan sub-path this same
+    // call also drives when `has_aggregates` is false.
+    debug_assert!(
+        !has_aggregates || support::extract_offset(pushdown_req) == 0,
+        "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
+         (sqlCode 42000) before the adapter is consulted, so the single-group \
+         aggregate merge can never see a non-zero offset"
+    );
     let sql = build_scan_driving_sql(
         &spec_template,
         shards,
@@ -703,7 +746,14 @@ pub(crate) fn build_dispatch_sql(
     // (anti-wrong-truncation invariant, decision [4]); this is the unoptimized
     // correctness restoration, not the bounded per-shard top-N.
     let sql = if declined_order_by {
-        topn::wrap_declined_order_by(&sql, &proj_cols, visible_count, &declined_sort_keys, limit)
+        topn::wrap_declined_order_by(
+            &sql,
+            &proj_cols,
+            visible_count,
+            &declined_sort_keys,
+            limit,
+            support::extract_offset(pushdown_req),
+        )
     } else {
         sql
     };
@@ -1756,6 +1806,68 @@ mod tests {
         );
     }
 
+    /// S3 (`build_row_scan_sql`) is unreachable with an offset because the decline
+    /// (issue #191, fact 5) NULLS `effective_limit` before it ever reaches that
+    /// builder. Same fixture as
+    /// `declined_order_by_all_keys_projected_leaves_projection_untouched` — every
+    /// `detect_topn` guard would MATCH (single table, `NAME` projected as a bare
+    /// column, a populated non-JSON-fallback logical schema) — except this request
+    /// carries a NON-ZERO `offset`, which declines the bounded top-N and therefore
+    /// nulls `effective_limit`: neither the per-shard fan-out nor a bare outer
+    /// `LIMIT`/`OFFSET` may render ahead of the declined wrapper's own
+    /// `ORDER BY … LIMIT n OFFSET m` (through the shared `render_limit_offset` seam).
+    #[test]
+    fn nonzero_offset_nulls_the_effective_limit() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [{"type": "column", "name": "NAME"}],
+            "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME"},
+                "isAscending": true,
+                "nullsLast": true
+            }],
+            "limit": {"numElements": 5, "offset": 2}
+        }));
+        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
+        let proj_types = vec!["VARCHAR(2000000)".to_string()];
+        let logical_schema = vec![LogicalField {
+            field_id: 2,
+            name: "NAME".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+        }];
+
+        let sql = guard_dispatch_sql(
+            &request,
+            proj_cols,
+            proj_types,
+            false,
+            Some(5),
+            logical_schema,
+        );
+
+        // The declined wrapper renders the offset window exactly once, on its own
+        // ORDER BY — never a bare per-shard/outer LIMIT ahead of it.
+        assert_eq!(
+            sql.matches("LIMIT").count(),
+            1,
+            "effective_limit must be nulled: no LIMIT may reach the fan-out ahead of \
+             the declined wrapper's own window: {sql}"
+        );
+        assert!(
+            sql.contains(r#"ORDER BY "NAME" ASC NULLS LAST LIMIT 5 OFFSET 2"#),
+            "the declined wrapper must render the offset beside its own ORDER BY: {sql}"
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\"") && !common.contains("\"order_by\""),
+            "the per-shard common blob must carry neither bound once effective_limit \
+             is nulled: {common}"
+        );
+    }
+
     /// The projection extension runs strictly AFTER `detect_topn` (decision [2]) — the
     /// plan's most load-bearing ordering invariant, and one that is SILENT when
     /// violated (a mis-ordered implementation reintroduces `04000` with a green suite).
@@ -1956,6 +2068,63 @@ mod tests {
         assert!(
             sql.contains("LIMIT 7"),
             "an absent orderBy must not withhold the request LIMIT: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // COUNT(DISTINCT) wrapper limit withholding is dead code (issue #191)
+    // ---------------------------------------------------------------------------
+
+    /// Regression (issue #191, plan `fix-191-order-by-offset`): a lone
+    /// `COUNT(DISTINCT)` request (Case 1) carrying BOTH a request-level `orderBy`
+    /// and a request-level LIMIT must render that LIMIT on the outer wrapper.
+    /// The now-deleted withholding (`let cd_limit = if has_order_by { None } else
+    /// { limit };`) used to drop the limit in exactly this case — dead code,
+    /// because Exasol never actually pushes an `orderBy` on an ungrouped
+    /// aggregate request (fact 7), but the withholding branch fired on ANY
+    /// `orderBy` this fixture forces regardless of whether Exasol would send one.
+    #[test]
+    fn lone_count_distinct_with_order_by_still_renders_limit() {
+        let request = guard_events_request(serde_json::json!({
+            "selectList": [agg_item("COUNT", Some("ID"), true)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                "isAscending": true,
+                "nullsLast": true
+            }]
+        }));
+
+        let sql = guard_dispatch_sql(
+            &request,
+            Vec::new(),
+            Vec::new(),
+            false,
+            Some(10),
+            Vec::new(),
+        );
+
+        assert!(
+            sql.trim_end().ends_with("LIMIT 10"),
+            "the wrapper must render the request's raw limit even though an \
+             orderBy is present: {sql}"
+        );
+        assert!(
+            !sql.contains("OFFSET"),
+            "no offset can ever reach this wrapper (fact 6 — Exasol rejects OFFSET \
+             on an ungrouped aggregated select before the adapter is consulted): {sql}"
+        );
+        assert_eq!(
+            sql.matches("LIMIT").count(),
+            1,
+            "the LIMIT must land on the outer wrapper only, never leak into the \
+             per-shard distinct fan-out sub-scan: {sql}"
+        );
+        assert!(
+            !sql.contains("ORDER BY"),
+            "the per-shard fan-out stays sort-free: no per-shard scan spec ever \
+             carries an ORDER BY on this path: {sql}"
         );
     }
 

@@ -254,7 +254,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 /// "emitting function in expression").
 ///
 /// LIMIT/OFFSET/ORDER BY are NEVER pushed into the distinct fan-out (leaking one would
-/// truncate the per-shard distinct set → a wrong count); the caller-guarded `limit` is
+/// truncate the per-shard distinct set → a wrong count); the request's raw `limit` is
 /// applied only to the outer wrapper. The native `COUNT(DISTINCT "V")` yields exactly
 /// the type Exasol declares for a `COUNT(DISTINCT)`, so the count needs no output cast.
 ///
@@ -1273,6 +1273,38 @@ pub(super) fn extract_limit(pushdown_req: &Json) -> Option<u64> {
         .and_then(|n| n.as_u64())
 }
 
+/// Extract the OFFSET from the pushdown request; 0 when absent.
+///
+/// Exasol sends `limit.offset` only once `LIMIT_WITH_OFFSET` is advertised, and
+/// normalises an explicit `OFFSET 0` away entirely — so an absent key and a zero
+/// offset are the same request (verified live). Sibling of [`extract_limit`]
+/// rather than a widened return type: most call sites need the limit alone.
+pub(super) fn extract_offset(pushdown_req: &Json) -> u64 {
+    pushdown_req
+        .get("limit")
+        .and_then(|l| l.get("offset"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0)
+}
+
+/// Render the trailing window clause for a wrapper SELECT: the single seam every
+/// site that renders a final `LIMIT` shares.
+///
+/// A zero offset renders the pre-offset ` LIMIT {n}` string byte-for-byte, so an
+/// already-correct plan cannot change shape. Callers must render their own
+/// `ORDER BY` ahead of this: Exasol's grammar rejects an `OFFSET` without one.
+///
+/// The `(None, _)` arm silently drops a non-zero offset with no limit; this is
+/// unreachable in production — Exasol's grammar ties `OFFSET` to a `LIMIT` (fact 4),
+/// so a bare offset without one is rejected before it ever reaches this function.
+pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {
+    match (limit, offset) {
+        (None, _) => String::new(),
+        (Some(n), 0) => format!(" LIMIT {n}"),
+        (Some(n), m) => format!(" LIMIT {n} OFFSET {m}"),
+    }
+}
+
 /// Whether the pushdown request carries a non-empty `orderBy` array.
 ///
 /// Exasol sends `orderBy` only when the adapter advertises an `ORDER_BY_*`
@@ -2055,6 +2087,39 @@ mod tests {
 
         let req2 = serde_json::json!({"limit": {"numElements": 42}});
         assert_eq!(extract_limit(&req2), Some(42));
+    }
+
+    /// `extract_offset` is a sibling accessor of `extract_limit`: 0 when the
+    /// `offset` key is absent (the shape Exasol sends for a bare `LIMIT n` and,
+    /// verified live, also for an explicit `OFFSET 0`), the value otherwise.
+    #[test]
+    fn offset_extracted_from_pushdown_request() {
+        assert_eq!(extract_offset(&serde_json::json!({})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 42}})),
+            0
+        );
+        assert_eq!(extract_offset(&serde_json::json!({"offset": 3})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 12, "offset": 3}})),
+            3
+        );
+    }
+
+    /// The one rendering seam every reachable wrapper SELECT routes through.
+    /// The `offset == 0` arm MUST stay byte-identical to the pre-change
+    /// ` LIMIT {n}` splice — every existing SQL-shape assertion depends on it.
+    #[test]
+    fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
+        assert_eq!(render_limit_offset(None, 0), "");
+        assert_eq!(render_limit_offset(None, 3), "");
+
+        for n in [0_u64, 1, 12, u64::MAX] {
+            assert_eq!(render_limit_offset(Some(n), 0), format!(" LIMIT {n}"));
+        }
+
+        assert_eq!(render_limit_offset(Some(12), 3), " LIMIT 12 OFFSET 3");
+        assert_eq!(render_limit_offset(Some(0), 3), " LIMIT 0 OFFSET 3");
     }
 
     #[test]

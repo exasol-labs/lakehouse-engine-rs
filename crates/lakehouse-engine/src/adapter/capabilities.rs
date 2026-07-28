@@ -44,9 +44,12 @@ pub const CAPABILITIES: &[&str] = &[
     // ORDER BY pushdown: bare-column sort keys (add-topn-pushdown) and expression
     // sort keys (issue #198), backed by the declined row-scan wrapper, the grouped
     // merge, and the qualified wrapper — see docs/capabilities.md for the full
-    // explanation. LIMIT_WITH_OFFSET stays unadvertised — no backing path.
+    // explanation. LIMIT_WITH_OFFSET is now backed by the same three wrappers
+    // (issue #191); the per-shard bounded top-N never carries an offset — a
+    // non-zero offset always declines that path to the row-scan wrapper instead.
     "ORDER_BY_COLUMN",
     "ORDER_BY_EXPRESSION",
+    "LIMIT_WITH_OFFSET",
     // Arithmetic binary-operator functions (issue #59, task 1.2)
     "FN_ADD",
     "FN_SUB",
@@ -558,15 +561,15 @@ mod tests {
         // ORDER_BY_COLUMN backs the per-shard bounded top-N + Exasol-side merge.
         // Backing-path detail (incl. ORDER_BY_EXPRESSION, issue #198) is documented
         // once on the `CAPABILITIES` const above; its advertisement is covered by
-        // `advertises_order_by_column_and_expression`. OFFSET remains unadvertised —
-        // no backing path exists for it.
+        // `advertises_order_by_column_and_expression`. LIMIT_WITH_OFFSET (issue #191)
+        // is now backed by the same three wrappers — see docs/capabilities.md.
         assert!(
             cap_strs.contains(&"ORDER_BY_COLUMN"),
             "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
         );
         assert!(
-            !cap_strs.contains(&"LIMIT_WITH_OFFSET"),
-            "LIMIT_WITH_OFFSET must NOT be advertised: {cap_strs:?}"
+            cap_strs.contains(&"LIMIT_WITH_OFFSET"),
+            "LIMIT_WITH_OFFSET must be advertised: {cap_strs:?}"
         );
         // Inner equi-join pushdown is advertised (add-join-pushdown-broadcast);
         // outer joins, non-equi ("all condition") joins, and any Cartesian product
