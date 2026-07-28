@@ -356,24 +356,24 @@ test_extract_dsn_password() {
   assert_eq "extract_dsn_password: empty password segment yields empty output" "" "$pw"
 }
 
-test_read_profile_password() {
-  echo "== test_read_profile_password =="
+test_read_profile_key() {
+  echo "== test_read_profile_key =="
   local pw rc
 
-  pw="$( source "$INSTALLER"; read_profile_password "staging" "$EXAPUMP_CONFIG_FIXTURE" )"
-  assert_eq "read_profile_password: resolves staging's password" "SECRETPAT123" "$pw"
-  assert_not_contains "read_profile_password: never returns the other section's decoy" \
+  pw="$( source "$INSTALLER"; read_profile_key "staging" password "$EXAPUMP_CONFIG_FIXTURE" )"
+  assert_eq "read_profile_key: resolves staging's password" "SECRETPAT123" "$pw"
+  assert_not_contains "read_profile_key: never returns the other section's decoy" \
     "$pw" "DECOY_SHOULD_NEVER_BE_USED"
 
-  pw="$( source "$INSTALLER"; read_profile_password "no-such-profile" "$EXAPUMP_CONFIG_FIXTURE" )"
+  pw="$( source "$INSTALLER"; read_profile_key "no-such-profile" password "$EXAPUMP_CONFIG_FIXTURE" )"
   rc=$?
-  assert_rc_nonzero "read_profile_password: unknown profile fails" "$rc"
-  assert_eq "read_profile_password: no output for unknown profile" "" "$pw"
+  assert_rc_nonzero "read_profile_key: unknown profile fails" "$rc"
+  assert_eq "read_profile_key: no output for unknown profile" "" "$pw"
 
-  pw="$( source "$INSTALLER"; read_profile_password "staging" "$SANDBOX/does-not-exist.toml" )"
+  pw="$( source "$INSTALLER"; read_profile_key "staging" password "$SANDBOX/does-not-exist.toml" )"
   rc=$?
-  assert_rc_nonzero "read_profile_password: nonexistent config file fails" "$rc"
-  assert_eq "read_profile_password: no output for nonexistent config file" "" "$pw"
+  assert_rc_nonzero "read_profile_key: nonexistent config file fails" "$rc"
+  assert_eq "read_profile_key: no output for nonexistent config file" "" "$pw"
 
   local no_password_fixture="$SANDBOX/no-password-config.toml"
   cat > "$no_password_fixture" <<'TOML'
@@ -384,51 +384,51 @@ host = "some-host"
 host = "decoy-host"
 password = "SECRETPAT123"
 TOML
-  pw="$( source "$INSTALLER"; read_profile_password "nopass" "$no_password_fixture" )"
+  pw="$( source "$INSTALLER"; read_profile_key "nopass" password "$no_password_fixture" )"
   rc=$?
-  assert_rc_nonzero "read_profile_password: section with no password key before the next section fails" "$rc"
-  assert_eq "read_profile_password: no output when the password key is missing" "" "$pw"
+  assert_rc_nonzero "read_profile_key: section with no password key before the next section fails" "$rc"
+  assert_eq "read_profile_key: no output when the password key is missing" "" "$pw"
 }
 
-test_resolve_pat_per_mode() {
-  echo "== test_resolve_pat_per_mode =="
+test_resolve_saas_pat_per_mode() {
+  echo "== test_resolve_saas_pat_per_mode =="
   local result rc
 
   result="$(
     source "$INSTALLER"
     CONNECTIVITY_MODE="host"
     ARG_PASSWORD="SECRETPW456"
-    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+    if resolve_saas_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
   )"
-  assert_eq "resolve_pat: host mode derives from ARG_PASSWORD" "ok:SECRETPW456" "$result"
+  assert_eq "resolve_saas_pat: host mode derives from ARG_PASSWORD" "ok:SECRETPW456" "$result"
 
   result="$(
     source "$INSTALLER"
     CONNECTIVITY_MODE="dsn"
     ARG_DSN="exasol://user:SECRETPAT123@host:8563"
-    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+    if resolve_saas_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
   )"
-  assert_eq "resolve_pat: dsn mode derives from the DSN password segment" "ok:SECRETPAT123" "$result"
+  assert_eq "resolve_saas_pat: dsn mode derives from the DSN password segment" "ok:SECRETPAT123" "$result"
 
   result="$(
     source "$INSTALLER"
     CONNECTIVITY_MODE="profile"
     ARG_PROFILE="staging"
     EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
-    if resolve_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
+    if resolve_saas_pat; then printf 'ok:%s\n' "$RESOLVED_PAT"; else printf 'fail\n'; fi
   )"
-  assert_eq "resolve_pat: profile mode derives from the exapump config fixture" "ok:SECRETPAT123" "$result"
+  assert_eq "resolve_saas_pat: profile mode derives from the exapump config fixture" "ok:SECRETPAT123" "$result"
 
   local dsn_err
   dsn_err="$(
     source "$INSTALLER"
     CONNECTIVITY_MODE="dsn"
     ARG_DSN="exasol://host:8563"
-    resolve_pat 2>&1
+    resolve_saas_pat 2>&1
   )"
   rc=$?
-  assert_rc_nonzero "resolve_pat: dsn mode fails without a password segment" "$rc"
-  assert_not_contains "resolve_pat: dsn failure message names no credential value" "$dsn_err" "SECRETPAT123"
+  assert_rc_nonzero "resolve_saas_pat: dsn mode fails without a password segment" "$rc"
+  assert_not_contains "resolve_saas_pat: dsn failure message names no credential value" "$dsn_err" "SECRETPAT123"
 
   local profile_err
   profile_err="$(
@@ -436,14 +436,48 @@ test_resolve_pat_per_mode() {
     CONNECTIVITY_MODE="profile"
     ARG_PROFILE="no-such-profile"
     EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
-    resolve_pat 2>&1
+    resolve_saas_pat 2>&1
   )"
   rc=$?
-  assert_rc_nonzero "resolve_pat: profile mode fails for an unknown profile" "$rc"
-  assert_not_contains "resolve_pat: unknown-profile failure never leaks the fixture password" \
+  assert_rc_nonzero "resolve_saas_pat: profile mode fails for an unknown profile" "$rc"
+  assert_not_contains "resolve_saas_pat: unknown-profile failure never leaks the fixture password" \
     "$profile_err" "SECRETPAT123"
-  assert_not_contains "resolve_pat: unknown-profile failure never leaks the decoy password" \
+  assert_not_contains "resolve_saas_pat: unknown-profile failure never leaks the decoy password" \
     "$profile_err" "DECOY_SHOULD_NEVER_BE_USED"
+}
+
+test_resolve_target_mode_partial_saas_ids() {
+  echo "== test_resolve_target_mode_partial_saas_ids =="
+  local mode rc out
+
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; resolve_target_mode )"
+  rc=$?
+  assert_rc_zero "resolve_target_mode: both SaaS ids resolve a mode" "$rc"
+  assert_eq "resolve_target_mode: both SaaS ids resolve to saas" "saas" "$mode"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=""; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "resolve_target_mode: only --account-id fails" "$rc"
+  assert_contains "resolve_target_mode: partial-ids error names --account-id" "$out" "--account-id"
+  assert_contains "resolve_target_mode: partial-ids error names --database-id" "$out" "--database-id"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=DB1; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "resolve_target_mode: only --database-id fails" "$rc"
+  assert_contains "resolve_target_mode: partial-ids error names --account-id" "$out" "--account-id"
+  assert_contains "resolve_target_mode: partial-ids error names --database-id" "$out" "--database-id"
+}
+
+test_resolve_target_layout_saas_values() {
+  echo "== test_resolve_target_layout_saas_values =="
+  local so segment
+  so="$( source "$INSTALLER"; resolve_target_layout; printf '%s' "$TARGET_SO_UDF_OBJECT" )"
+  assert_eq "resolve_target_layout: saas TARGET_SO_UDF_OBJECT is the SaaS bucket .so path" \
+    "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so" "$so"
+
+  segment="$( source "$INSTALLER"; resolve_target_layout; printf '%s' "$TARGET_RUST_LANG_SEGMENT" )"
+  assert_eq "resolve_target_layout: saas TARGET_RUST_LANG_SEGMENT is the SaaS RUST alias" \
+    "$RUST_SEGMENT" "$segment"
 }
 
 test_missing_required_ids_fail_fast() {
@@ -499,7 +533,7 @@ test_version_resolution_default_and_override() {
 test_script_languages_append_preserves_existing() {
   echo "== test_script_languages_append_preserves_existing =="
   local out
-  out="$( source "$INSTALLER"; compute_script_languages "PYTHON3=builtin_python3 JAVA=builtin_java" )"
+  out="$( source "$INSTALLER"; compute_script_languages "PYTHON3=builtin_python3 JAVA=builtin_java" "$RUST_SEGMENT" )"
   assert_contains "append: preserves PYTHON3" "$out" "PYTHON3=builtin_python3"
   assert_contains "append: preserves JAVA" "$out" "JAVA=builtin_java"
   assert_contains "append: adds the exact RUST segment" "$out" "$RUST_SEGMENT"
@@ -511,12 +545,12 @@ test_script_languages_append_preserves_existing() {
 test_script_languages_replace_rust_idempotent() {
   echo "== test_script_languages_replace_rust_idempotent =="
   local out out2
-  out="$( source "$INSTALLER"; compute_script_languages "PYTHON3=p RUST=stale_alias JAVA=j" )"
+  out="$( source "$INSTALLER"; compute_script_languages "PYTHON3=p RUST=stale_alias JAVA=j" "$RUST_SEGMENT" )"
   assert_eq "replace: in place, non-RUST unchanged" \
     "PYTHON3=p $RUST_SEGMENT JAVA=j" "$out"
   assert_eq "replace: exactly one RUST entry" "1" "$(count_occurrences 'RUST=' "$out")"
   # Idempotency: feeding the result back yields an identical value.
-  out2="$( source "$INSTALLER"; compute_script_languages "$out" )"
+  out2="$( source "$INSTALLER"; compute_script_languages "$out" "$RUST_SEGMENT" )"
   assert_eq "replace: idempotent re-run" "$out" "$out2"
   assert_eq "replace: still exactly one RUST entry" "1" "$(count_occurrences 'RUST=' "$out2")"
 }
@@ -892,8 +926,10 @@ main() {
   test_dsn_mode_happy_path
   test_url_decode_roundtrip
   test_extract_dsn_password
-  test_read_profile_password
-  test_resolve_pat_per_mode
+  test_read_profile_key
+  test_resolve_saas_pat_per_mode
+  test_resolve_target_mode_partial_saas_ids
+  test_resolve_target_layout_saas_values
   test_missing_required_ids_fail_fast
   test_version_resolution_default_and_override
   test_script_languages_append_preserves_existing

@@ -42,6 +42,9 @@ ARG_SCHEMA="$DEFAULT_SCHEMA"
 ARG_HELP=0
 
 CONNECTIVITY_MODE=""
+TARGET_MODE=""
+TARGET_SO_UDF_OBJECT=""
+TARGET_RUST_LANG_SEGMENT=""
 HOST_DSN=""
 RESOLVED_PAT=""
 WORKDIR=""
@@ -230,15 +233,15 @@ exapump_config_path() {
   printf '%s\n' "${EXAPUMP_CONFIG:-$HOME/.exapump/config.toml}"
 }
 
-# Reads the `password` key out of the named `[profile]` TOML section in $config_path. Bounded
+# Reads the named `$key` out of the named `[profile]` TOML section in $config_path. Bounded
 # scan (same discipline as extract_asset_id_by_name's bounded JSON block): only lines between the
 # named section's own header and the next `[`-headed header (or EOF) are considered, so a
 # same-named key in a different section is never matched. Returns 1 with no output if the file,
 # section, or key is absent.
-read_profile_password() {
-  local profile="$1" config_path="$2" line trimmed_line
+read_profile_key() {
+  local profile="$1" key="$2" config_path="$3" line trimmed_line
   local other_section_re='^\[.*\][[:space:]]*$'
-  local password_re="^password[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'][[:space:]]*\$"
+  local key_re="^${key}[[:space:]]*=[[:space:]]*[\"']([^\"']*)[\"'][[:space:]]*\$"
   local in_section=0
 
   [[ -f "$config_path" ]] || return 1
@@ -252,7 +255,7 @@ read_profile_password() {
     if [[ "$line" =~ $other_section_re ]]; then
       return 1
     fi
-    if [[ "$line" =~ $password_re ]]; then
+    if [[ "$line" =~ $key_re ]]; then
       printf '%s\n' "${BASH_REMATCH[1]}"
       return 0
     fi
@@ -263,7 +266,7 @@ read_profile_password() {
 # Sets the global RESOLVED_PAT from whichever connectivity credential is already in use: on
 # Exasol SaaS the PAT IS the SQL password, so this derives the one REST bearer credential instead
 # of asking the user to supply it a second time. Never prints the resolved value.
-resolve_pat() {
+resolve_saas_pat() {
   case "$CONNECTIVITY_MODE" in
     host)
       RESOLVED_PAT="$ARG_PASSWORD"
@@ -279,7 +282,7 @@ resolve_pat() {
     profile)
       local config_path
       config_path="$(exapump_config_path)"
-      if ! RESOLVED_PAT="$(read_profile_password "$ARG_PROFILE" "$config_path")" || [[ -z "$RESOLVED_PAT" ]]; then
+      if ! RESOLVED_PAT="$(read_profile_key "$ARG_PROFILE" password "$config_path")" || [[ -z "$RESOLVED_PAT" ]]; then
         err "could not derive the SaaS REST credential: no 'password' key found for profile '$ARG_PROFILE' in $config_path."
         return 1
       fi
@@ -413,6 +416,35 @@ validate_connectivity() {
     fi
   fi
   printf '%s\n' "$chosen"
+  return 0
+}
+
+# --- Target mode & layout ----------------------------------------------------
+# Prints the resolved install target mode (saas) on stdout, or errors and returns 1. Reads the
+# ARG_* globals directly (consistent with the rest of the file). The SaaS target is selected by
+# giving BOTH --account-id and --database-id; it is currently the only supported target.
+resolve_target_mode() {
+  if [[ -n "$ARG_ACCOUNT_ID" && -n "$ARG_DATABASE_ID" ]]; then
+    printf '%s\n' "saas"
+    return 0
+  fi
+  if [[ -n "$ARG_ACCOUNT_ID" || -n "$ARG_DATABASE_ID" ]]; then
+    err "the Exasol SaaS target needs BOTH --account-id and --database-id; only one of the two was given."
+    return 1
+  fi
+  # TODO(bucketfs-mode): replace this arm with BucketFS target-mode resolution (AppDB, Docker,
+  # on-premise) once the exapump-based BucketFS install path exists.
+  err "BucketFS-target support is not yet implemented; pass --account-id and --database-id for Exasol SaaS."
+  return 1
+}
+
+# Seeds the mode-parameterized TARGET_* globals used by the install steps, so those steps never
+# read a target-specific constant directly. For the SaaS target they are the fixed SaaS constants;
+# the BucketFS target will derive them from its own bucket layout. Call only after
+# resolve_target_mode has resolved a mode.
+resolve_target_layout() {
+  TARGET_SO_UDF_OBJECT="$ENGINE_SO_PATH"
+  TARGET_RUST_LANG_SEGMENT="$RUST_LANG_SEGMENT"
   return 0
 }
 
@@ -592,7 +624,7 @@ read_script_languages() {
 # Appends the fixed RUST segment, or replaces a single existing RUST= segment in place,
 # preserving every other language entry and its order. Yields exactly one RUST= entry.
 compute_script_languages() {
-  local current="$1"
+  local current="$1" segment="$2"
   local restore_glob=0
   case "$-" in
     *f*) : ;;
@@ -609,7 +641,7 @@ compute_script_languages() {
       [[ -z "$tok" ]] && continue
       if [[ "$tok" == RUST=* ]]; then
         if [[ "$placed" -eq 0 ]]; then
-          result="${result:+$result }$RUST_LANG_SEGMENT"
+          result="${result:+$result }$segment"
           placed=1
         fi
       else
@@ -618,7 +650,7 @@ compute_script_languages() {
     done
   fi
   if [[ "$placed" -eq 0 ]]; then
-    result="${result:+$result }$RUST_LANG_SEGMENT"
+    result="${result:+$result }$segment"
   fi
   printf '%s\n' "$result"
 }
@@ -700,7 +732,7 @@ register_slc() {
   if ! current="$(read_script_languages)"; then
     return 1
   fi
-  new="$(compute_script_languages "$current")"
+  new="$(compute_script_languages "$current" "$TARGET_RUST_LANG_SEGMENT")"
   log "Setting SCRIPT_LANGUAGES (RUST segment append/replace)."
   if ! run_sql "ALTER SYSTEM SET SCRIPT_LANGUAGES='$new'" >/dev/null 2>&1; then
     err "ALTER SYSTEM SET SCRIPT_LANGUAGES failed. The connecting account likely lacks the SYSTEM (admin) privilege required to register a script language."
@@ -710,7 +742,7 @@ register_slc() {
 }
 
 create_engine_scripts() {
-  local schema="$ARG_SCHEMA" so="$ENGINE_SO_PATH" stmt
+  local schema="$ARG_SCHEMA" so="$TARGET_SO_UDF_OBJECT" stmt
   local -a statements=(
     "$(ddl_create_schema "$schema")"
     "$(ddl_adapter "$schema" "$so")"
@@ -801,6 +833,14 @@ main() {
   fi
 
   validate_required || exit 1
+  if ! TARGET_MODE="$(resolve_target_mode)"; then
+    exit 1
+  fi
+  if [[ "$TARGET_MODE" != "saas" ]]; then
+    err "unsupported install target mode '$TARGET_MODE'."
+    exit 1
+  fi
+  resolve_target_layout || exit 1
   if ! CONNECTIVITY_MODE="$(validate_connectivity)"; then
     exit 1
   fi
@@ -811,7 +851,7 @@ main() {
     HOST_DSN="exasol://$enc_user:$enc_password@$ARG_HOST?validateservercertificate=0"
   fi
   check_prereqs || exit 1
-  resolve_pat || exit 1
+  resolve_saas_pat || exit 1
 
   saas_db_reachable || exit 1
 
