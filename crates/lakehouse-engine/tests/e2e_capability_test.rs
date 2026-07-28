@@ -3058,3 +3058,659 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
         "LIMIT 0 over a one-row aggregate must return zero rows"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8.19  Issue #209 dialect-fix E2E parity + now-family withdrawal
+// ---------------------------------------------------------------------------
+//
+// `fix-vs-expression-dialect` makes every `vs-expression` rendering arm
+// dialect-aware, not only `CAST` targets. Pre-fix, a scalar function or
+// timestamp literal spliced into an Exasol-parsed wrapper SQL string (a
+// `COUNT(DISTINCT <expr>)` qualified single-table fallback, a grouped
+// scalar-over-aggregate merge SELECT, or a select-list `REGEXP_LIKE`/`CASE`)
+// rendered in DataFusion form regardless of dialect, so Exasol's own SQL
+// engine rejected the whole statement outright (`function or script X not
+// found`, 42000, or a syntax error) rather than returning a result.
+//
+// Issue #209 lists seven such repro queries against a real customer dataset
+// shaped like TPC-H (`c_acctbal`, `l_shipdate`, `l_discount`, `CUSTOMER`,
+// `LINEITEM`). That schema does not exist in this E2E stack's seed tables, so
+// every test below re-targets the SAME failure shape onto `events`
+// (`vs_table()`) or `typed_distinct_probe` (`vs_typed_table()`) columns
+// instead — matching the query SHAPE (the wrapper path exercised, the
+// function family involved) rather than the literal column names. The
+// `INSTR` case is a #210 REGRESSION GUARD, not a new-failure repro: `INSTR`
+// already had an Exasol-verbatim rendering arm before this plan, so it
+// already passed pre-fix; it is included to prove the surrounding
+// dialect-branching rework did not regress it.
+//
+// Every comparison below is against an IN-SESSION NATIVE Exasol oracle: a
+// second query — either a bare literal expression or a literal-reproduced
+// derived table — with NO virtual schema reference, run over the SAME
+// connection, so the comparison is not a tautology. Every oracle SQL string
+// and its expected value has been run against the pinned container
+// (`exasol/docker-db:2025.2.1`) during implementation; see each test's doc
+// comment for the specific verified facts (Exasol's Monday-start ISO-8601
+// week numbering, `REGEXP_LIKE`'s whole-string match semantics, `DBTIMEZONE`
+// defaulting to `EUROPE/BERLIN`, etc.) rather than relying on memory or
+// documentation alone.
+
+/// Parse a `SELECT SYSTIMESTAMP` value read back from Exasol into a
+/// `chrono::NaiveDateTime`.
+///
+/// Exasol renders this as `"<date> <time>.<6-digit microseconds>"` —
+/// space-separated, microsecond precision (empirically observed against the
+/// pinned container: e.g. `"2026-07-28 18:56:00.581000"`). The separator is
+/// normalized to `T` before parsing; the fractional-seconds format specifier
+/// (`%.f`) accepts any digit count, including none at all (e.g.
+/// `"2024-01-01T00:00:00"`), so a single format string covers every shape
+/// this function's caller produces.
+fn parse_exasol_timestamp(s: &str) -> chrono::NaiveDateTime {
+    let normalized = s.replacen(' ', "T", 1);
+    let fmt = "%Y-%m-%dT%H:%M:%S%.f";
+    chrono::NaiveDateTime::parse_from_str(&normalized, fmt).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse Exasol timestamp {s:?} (normalized {normalized:?}) with {fmt:?}: {e}"
+        )
+    })
+}
+
+#[test]
+fn parse_exasol_timestamp_accepts_space_and_t_separators_with_or_without_fraction() {
+    assert_eq!(
+        parse_exasol_timestamp("2026-07-28 18:56:00.581000"),
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+            .unwrap()
+            .and_hms_micro_opt(18, 56, 0, 581000)
+            .unwrap()
+    );
+    assert_eq!(
+        parse_exasol_timestamp("2026-07-28T18:56:00.581"),
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 28)
+            .unwrap()
+            .and_hms_milli_opt(18, 56, 0, 581)
+            .unwrap()
+    );
+    assert_eq!(
+        parse_exasol_timestamp("2024-01-01T00:00:00"),
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    );
+}
+
+/// Parse a JSON result value as an `Option<i64>`: `Value::Null` maps to
+/// `None`; every other value goes through [`parse_int`] (numeric or
+/// string-encoded integer).
+fn parse_int_opt(v: &serde_json::Value) -> Option<i64> {
+    if v.is_null() {
+        None
+    } else {
+        Some(parse_int(v))
+    }
+}
+
+/// Collect column-major `(group_col, value_col)` data into a map keyed by a
+/// stable string label for the group (`"true"`/`"false"`/`"NULL"` for a
+/// `BOOLEAN` grouping column), so comparing a VS query's grouped result to a
+/// native oracle's does not depend on either query's row order.
+fn grouped_by_label<T>(
+    keys: &[serde_json::Value],
+    values: &[serde_json::Value],
+    parse_value: impl Fn(&serde_json::Value) -> T,
+) -> std::collections::BTreeMap<String, T> {
+    keys.iter()
+        .zip(values.iter())
+        .map(|(k, v)| {
+            let label = match k {
+                serde_json::Value::Bool(b) => b.to_string(),
+                serde_json::Value::Null => "NULL".to_string(),
+                other => other.to_string(),
+            };
+            (label, parse_value(v))
+        })
+        .collect()
+}
+
+/// `COUNT(DISTINCT SIGN(c_price - 3))` compiles and matches an in-session
+/// native Exasol oracle (issue #209 repro: `COUNT(DISTINCT
+/// SIGN(c_acctbal))`). Pre-fix, `SIGN` rendered as DataFusion's
+/// `signum(...)` inside the Exasol-parsed qualified single-table wrapper
+/// SQL, so Exasol rejected the whole statement with `function or script
+/// SIGNUM not found` (42000).
+///
+/// Adapted to this stack's seed data (`typed_distinct_probe` has no
+/// `c_acctbal`-shaped column that varies sign): `SIGN(c_price - 3)`
+/// recentres `c_price` around zero. Seed (`common/seed.rs`'s
+/// `typed_probe()`): `c_price` per row = [2,3,NULL,4,2,5,2,3,6,4,NULL,5], so
+/// `c_price - 3` = [-1,0,NULL,1,-1,2,-1,0,3,1,NULL,2] and `SIGN(...)` over
+/// the non-NULL cells takes exactly the three values {-1, 0, 1}.
+/// Independently confirmed against a native in-session oracle over the same
+/// 12 reproduced values (verified against the pinned container: `COUNT(
+/// DISTINCT SIGN(v - 3))` = 3).
+#[test]
+fn e2e_count_distinct_sign_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT SIGN(v - 3)) FROM (\
+         SELECT 2.0 AS v UNION ALL SELECT 3.0 UNION ALL SELECT CAST(NULL AS DOUBLE) \
+         UNION ALL SELECT 4.0 UNION ALL SELECT 2.0 UNION ALL SELECT 5.0 \
+         UNION ALL SELECT 2.0 UNION ALL SELECT 3.0 UNION ALL SELECT 6.0 \
+         UNION ALL SELECT 4.0 UNION ALL SELECT CAST(NULL AS DOUBLE) UNION ALL SELECT 5.0\
+         )",
+    );
+    assert_eq!(
+        oracle, 3,
+        "native oracle COUNT(DISTINCT SIGN(v - 3)) must be 3 ({{-1,0,1}}), got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(DISTINCT SIGN(c_price - 3)) FROM {}",
+        vs_typed_table()
+    );
+    let vs_value = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_value, 3,
+        "COUNT(DISTINCT SIGN(c_price - 3)) over the VS must be 3 (matching the \
+         native oracle), got {vs_value}"
+    );
+}
+
+/// `COUNT(DISTINCT YEAR(...))` and `COUNT(DISTINCT WEEK(...))` both compile
+/// and match in-session native Exasol oracles (issue #209 repro: `COUNT(
+/// DISTINCT YEAR(l_shipdate))`, extended to `WEEK` from the same
+/// field-shortcut date family). Pre-fix, both rendered as DataFusion's
+/// `date_part('YEAR'/'WEEK', ...)` inside the Exasol-parsed qualified
+/// single-table wrapper SQL, so Exasol rejected the statement with
+/// `function or script DATE_PART not found` (42000).
+///
+/// Adapted to this stack's seed data (`events` has no `l_shipdate`-shaped
+/// column): `event_date` over the 20-row `events` table (`vs_table()`).
+/// Seed (this file's own header comment): `event_date` = 2024-01-01 +
+/// (id-1) days, id=1..20, spanning 2024-01-01..2024-01-20 with no NULLs.
+/// Every date falls in calendar year 2024, so `COUNT(DISTINCT
+/// YEAR(event_date))` = 1 — a trivial but still load-bearing check (a
+/// regressed build hard-fails before returning any row at all, rather than
+/// returning a wrong count). The span crosses two ISO-8601 week boundaries
+/// (2024-01-01 is a Monday, verified against the pinned container via
+/// `TO_CHAR(DATE '2024-01-01', 'IW')` = `"01"`): week 1 = Jan 1-7, week 2 =
+/// Jan 8-14, week 3 = Jan 15-21, so `COUNT(DISTINCT WEEK(event_date))` = 3.
+/// Both counts are independently confirmed against a native in-session
+/// oracle that reproduces the same 20-day span via `CONNECT BY LEVEL <= 20`
+/// (verified against the pinned container).
+#[test]
+fn e2e_count_distinct_date_field_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_year = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT y) FROM (SELECT YEAR(DATE '2024-01-01' + (LEVEL-1)) AS y \
+         FROM DUAL CONNECT BY LEVEL <= 20)",
+    );
+    assert_eq!(
+        oracle_year, 1,
+        "native oracle COUNT(DISTINCT YEAR(...)) over the 20-day span must be 1 \
+         (every date falls in 2024), got {oracle_year}"
+    );
+    let oracle_week = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT w) FROM (SELECT WEEK(DATE '2024-01-01' + (LEVEL-1)) AS w \
+         FROM DUAL CONNECT BY LEVEL <= 20)",
+    );
+    assert_eq!(
+        oracle_week, 3,
+        "native oracle COUNT(DISTINCT WEEK(...)) over the 20-day span must be 3 \
+         (Jan 1-7 / Jan 8-14 / Jan 15-20), got {oracle_week}"
+    );
+
+    let year_sql = format!(
+        "SELECT COUNT(DISTINCT YEAR(event_date)) FROM {}",
+        vs_table()
+    );
+    let vs_year = conn.query_scalar_i64(&year_sql);
+    assert_eq!(
+        vs_year, oracle_year,
+        "COUNT(DISTINCT YEAR(event_date)) over the VS must match the native \
+         oracle, got vs={vs_year} oracle={oracle_year}"
+    );
+
+    let week_sql = format!(
+        "SELECT COUNT(DISTINCT WEEK(event_date)) FROM {}",
+        vs_table()
+    );
+    let vs_week = conn.query_scalar_i64(&week_sql);
+    assert_eq!(
+        vs_week, oracle_week,
+        "COUNT(DISTINCT WEEK(event_date)) over the VS must match the native \
+         oracle, got vs={vs_week} oracle={oracle_week}"
+    );
+}
+
+/// `COUNT(DISTINCT HOURS_BETWEEN(...))` compiles and matches an in-session
+/// native Exasol oracle (issue #209 repro: the `HOURS_BETWEEN` family
+/// shipped in `add-date-arithmetic-pushdown`). Pre-fix, `HOURS_BETWEEN`
+/// rendered as DataFusion's `date_part('epoch', ...)` arithmetic inside the
+/// Exasol-parsed qualified single-table wrapper SQL, so Exasol rejected the
+/// statement with `function or script DATE_PART not found` (42000).
+///
+/// Uses `events` (`vs_table()`, 20 rows). Seed (this file's own header
+/// comment): `event_ts` = 2024-01-01T00:00:00Z + (id-1) hours, id=1..20, so
+/// `HOURS_BETWEEN(event_ts, TIMESTAMP '2024-01-01 00:00:00')` yields the
+/// integer hour offsets 0..19 — 20 distinct values, no NULLs, no collisions.
+/// Independently confirmed against a native in-session oracle that
+/// reproduces the same 20 offsets via `CONNECT BY LEVEL <= 20` and interval
+/// arithmetic (verified against the pinned container).
+#[test]
+fn e2e_count_distinct_hours_between_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT h) FROM (SELECT HOURS_BETWEEN(\
+         TIMESTAMP '2024-01-01 00:00:00' + ((LEVEL-1) * INTERVAL '1' HOUR), \
+         TIMESTAMP '2024-01-01 00:00:00') AS h FROM DUAL CONNECT BY LEVEL <= 20)",
+    );
+    assert_eq!(
+        oracle, 20,
+        "native oracle COUNT(DISTINCT HOURS_BETWEEN(...)) over the 20-hour \
+         span must be 20 (all offsets distinct), got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(DISTINCT HOURS_BETWEEN(event_ts, TIMESTAMP '2024-01-01 00:00:00')) \
+         FROM {}",
+        vs_table()
+    );
+    let vs_value = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_value, oracle,
+        "COUNT(DISTINCT HOURS_BETWEEN(event_ts, ...)) over the VS must match \
+         the native oracle, got vs={vs_value} oracle={oracle}"
+    );
+}
+
+/// `COUNT(DISTINCT INSTR(c_varchar, 'a'))` compiles and matches an
+/// in-session native Exasol oracle (issue #209 repro: `COUNT(DISTINCT
+/// INSTR(...))`). Unlike the other tests in this section, this is a #210
+/// REGRESSION GUARD, not a new-failure repro: `INSTR` already had an
+/// Exasol-verbatim rendering arm before this plan (#210), so this query
+/// already passed pre-fix; it is included to prove the surrounding
+/// dialect-branching rework did not regress it.
+///
+/// Seed (`common/seed.rs`'s `typed_probe()`): `c_varchar` per row = ["aa",
+/// "AA", NULL, "bb", "aa", "cc", "Aa", "dd", "BB", NULL, "ee", "cc"].
+/// `INSTR(v, 'a')` (case-sensitive) = [1, 0, NULL, 0, 1, 0, 2, 0, 0, NULL, 0,
+/// 0] — the position of the first lowercase `'a'`, or 0 if absent. Distinct
+/// non-NULL values: {0, 1, 2} = 3. Independently confirmed against a native
+/// in-session oracle over the same 12 reproduced values (verified against
+/// the pinned container).
+#[test]
+fn e2e_count_distinct_instr_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT INSTR(v, 'a')) FROM (\
+         SELECT 'aa' AS v UNION ALL SELECT 'AA' UNION ALL SELECT CAST(NULL AS VARCHAR(10)) \
+         UNION ALL SELECT 'bb' UNION ALL SELECT 'aa' UNION ALL SELECT 'cc' \
+         UNION ALL SELECT 'Aa' UNION ALL SELECT 'dd' UNION ALL SELECT 'BB' \
+         UNION ALL SELECT CAST(NULL AS VARCHAR(10)) UNION ALL SELECT 'ee' UNION ALL SELECT 'cc'\
+         )",
+    );
+    assert_eq!(
+        oracle, 3,
+        "native oracle COUNT(DISTINCT INSTR(v, 'a')) must be 3 ({{0,1,2}}), got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(DISTINCT INSTR(c_varchar, 'a')) FROM {}",
+        vs_typed_table()
+    );
+    let vs_value = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_value, 3,
+        "COUNT(DISTINCT INSTR(c_varchar, 'a')) over the VS must be 3 (matching \
+         the native oracle), got {vs_value}"
+    );
+}
+
+/// A grouped scalar-over-aggregate `SIGN(SUM(...) - <const>)` compiles and
+/// matches an in-session native Exasol oracle (issue #209 repro: grouped
+/// `SIGN(SUM(l_discount) - 0.5)`). Pre-fix, `SIGN` rendered as DataFusion's
+/// `signum(...)` inside the Exasol-parsed merge SQL, so Exasol rejected the
+/// whole statement with `function or script SIGNUM not found` (42000).
+///
+/// Adapted to this stack's seed data (`typed_distinct_probe` has no
+/// `l_discount`-shaped column): grouped by `c_bool`, `SIGN(SUM(c_price) -
+/// 10)`. Seed (`common/seed.rs`'s `typed_probe()`): `c_price` per row =
+/// [2,3,NULL,4,2,5,2,3,6,4,NULL,5]; `c_bool` per row =
+/// [T,T,NULL,F,T,T,T,F,T,NULL,T,T]. Grouped `SUM(c_price)`: TRUE group =
+/// 2+3+2+5+2+6+5 = 25 (id 11's NULL price excluded), FALSE group = 4+3 = 7,
+/// NULL group = 4 (id 3's NULL price excluded; id 10 contributes 4).
+/// `SIGN(SUM - 10)`: TRUE -> `SIGN(15)` = 1, FALSE -> `SIGN(-3)` = -1, NULL
+/// -> `SIGN(-6)` = -1. Independently confirmed against a native in-session
+/// oracle over the same 12 reproduced (bool, price) pairs (verified against
+/// the pinned container).
+#[test]
+fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_sql = "\
+        SELECT b, SIGN(SUM(p) - 10) FROM (\
+        SELECT TRUE AS b, 2.0 AS p UNION ALL SELECT TRUE, 3.0 \
+        UNION ALL SELECT CAST(NULL AS BOOLEAN), CAST(NULL AS DOUBLE) \
+        UNION ALL SELECT FALSE, 4.0 UNION ALL SELECT TRUE, 2.0 \
+        UNION ALL SELECT TRUE, 5.0 UNION ALL SELECT TRUE, 2.0 \
+        UNION ALL SELECT FALSE, 3.0 UNION ALL SELECT TRUE, 6.0 \
+        UNION ALL SELECT CAST(NULL AS BOOLEAN), 4.0 \
+        UNION ALL SELECT TRUE, CAST(NULL AS DOUBLE) UNION ALL SELECT TRUE, 5.0\
+        ) GROUP BY b";
+    let oracle_cols = conn.query_columns(oracle_sql);
+    let oracle_map = grouped_by_label(&oracle_cols[0], &oracle_cols[1], parse_int);
+    assert_eq!(
+        oracle_map,
+        std::collections::BTreeMap::from([
+            ("NULL".to_string(), -1i64),
+            ("false".to_string(), -1),
+            ("true".to_string(), 1),
+        ]),
+        "native oracle grouped SIGN(SUM(p) - 10) must be {{NULL: -1, false: \
+         -1, true: 1}}, got {oracle_map:?}"
+    );
+
+    let vs_sql = format!(
+        "SELECT c_bool, SIGN(SUM(c_price) - 10) FROM {} GROUP BY c_bool",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_map = grouped_by_label(&vs_cols[0], &vs_cols[1], parse_int);
+    assert_eq!(
+        vs_map, oracle_map,
+        "grouped SIGN(SUM(c_price) - 10) over the VS must match the native \
+         oracle, got vs={vs_map:?} oracle={oracle_map:?}"
+    );
+}
+
+/// A grouped scalar-over-aggregate `YEAR(MIN(...))` compiles and matches an
+/// in-session native Exasol oracle (issue #209 repro: grouped
+/// `YEAR(MIN(...))`). Pre-fix, `YEAR` rendered as DataFusion's
+/// `date_part('YEAR', ...)` inside the Exasol-parsed merge SQL, so Exasol
+/// rejected the whole statement with `function or script DATE_PART not
+/// found` (42000).
+///
+/// Grouped by `c_bool` over `typed_distinct_probe`, `YEAR(MIN(c_ts))`. Seed
+/// (`common/seed.rs`'s `typed_probe()`): `c_ts` millisecond offsets per row =
+/// [100,200,NULL,300,100,400,100,500,200,NULL,600,300]; `c_bool` per row =
+/// [T,T,NULL,F,T,T,T,F,T,NULL,T,T]. Grouped `MIN(c_ts)`: the TRUE group's
+/// minimum offset is 100ms (2024-01-01 00:00:00.100) -> `YEAR` = 2024; the
+/// FALSE group's minimum is 300ms -> `YEAR` = 2024; the NULL-`c_bool` group
+/// (ids 3 and 10) has `c_ts` NULL on BOTH its rows, so `MIN(c_ts)` = NULL and
+/// `YEAR(NULL)` = NULL — a deliberate null-propagation edge case.
+/// Independently confirmed against a native in-session oracle over the same
+/// 12 reproduced (bool, timestamp) pairs (verified against the pinned
+/// container).
+#[test]
+fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_sql = "\
+        SELECT b, YEAR(MIN(t)) FROM (\
+        SELECT TRUE AS b, TIMESTAMP '2024-01-01 00:00:00.100' AS t \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.200' \
+        UNION ALL SELECT CAST(NULL AS BOOLEAN), CAST(NULL AS TIMESTAMP) \
+        UNION ALL SELECT FALSE, TIMESTAMP '2024-01-01 00:00:00.300' \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.100' \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.400' \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.100' \
+        UNION ALL SELECT FALSE, TIMESTAMP '2024-01-01 00:00:00.500' \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.200' \
+        UNION ALL SELECT CAST(NULL AS BOOLEAN), CAST(NULL AS TIMESTAMP) \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.600' \
+        UNION ALL SELECT TRUE, TIMESTAMP '2024-01-01 00:00:00.300'\
+        ) GROUP BY b";
+    let oracle_cols = conn.query_columns(oracle_sql);
+    let oracle_map = grouped_by_label(&oracle_cols[0], &oracle_cols[1], parse_int_opt);
+    assert_eq!(
+        oracle_map,
+        std::collections::BTreeMap::from([
+            ("NULL".to_string(), None),
+            ("false".to_string(), Some(2024i64)),
+            ("true".to_string(), Some(2024)),
+        ]),
+        "native oracle grouped YEAR(MIN(t)) must be {{NULL: NULL, false: 2024, \
+         true: 2024}}, got {oracle_map:?}"
+    );
+
+    let vs_sql = format!(
+        "SELECT c_bool, YEAR(MIN(c_ts)) FROM {} GROUP BY c_bool",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_map = grouped_by_label(&vs_cols[0], &vs_cols[1], parse_int_opt);
+    assert_eq!(
+        vs_map, oracle_map,
+        "grouped YEAR(MIN(c_ts)) over the VS must match the native oracle, \
+         got vs={vs_map:?} oracle={oracle_map:?}"
+    );
+}
+
+/// A select-list `REGEXP_LIKE` inside `COUNT(DISTINCT ...)` compiles and
+/// matches an in-session native Exasol oracle (issue #209 repro: `SELECT
+/// COUNT(DISTINCT (c_name REGEXP_LIKE '^C')) FROM <vs>.CUSTOMER WHERE
+/// c_custkey <= 10000`). Pre-fix, the infix `REGEXP_LIKE` predicate rendered
+/// as DataFusion's `regexp_like(...)` function call inside the Exasol-parsed
+/// qualified single-table wrapper SQL, so Exasol rejected the statement with
+/// `syntax error, unexpected REGEXP_LIKE_` (42000).
+///
+/// The predicate MUST sit in the SELECT LIST, not the WHERE clause: a
+/// WHERE-clause `REGEXP_LIKE` is applied inside the scan by
+/// `build_qualified_single_table_fallback_sql`, rendered through the
+/// DataFusion trio, and never reaches the Exasol dialect at all — so it
+/// would pass identically with or without this plan's fix (plan
+/// `Verification` section).
+///
+/// Exasol's infix `REGEXP_LIKE` requires the WHOLE string to match the
+/// pattern (verified against the pinned container: `'aa' REGEXP_LIKE 'a'` =
+/// `false`, `'aa' REGEXP_LIKE 'a.*'` = `true`), so the pattern below is
+/// `'a.*'`, not a bare prefix anchor. Seed (`common/seed.rs`'s
+/// `typed_probe()`): `c_varchar` per row = ["aa", "AA", NULL, "bb", "aa",
+/// "cc", "Aa", "dd", "BB", NULL, "ee", "cc"]. Only the two `"aa"` rows
+/// (case-sensitive) match `'a.*'`; every other non-NULL value does not, so
+/// `COUNT(DISTINCT (c_varchar REGEXP_LIKE 'a.*'))` exercises both TRUE and
+/// FALSE = 2 distinct values. Independently confirmed against a native
+/// in-session oracle over the same 12 reproduced values (verified against
+/// the pinned container).
+#[test]
+fn e2e_count_distinct_regexp_like_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT (v REGEXP_LIKE 'a.*')) FROM (\
+         SELECT 'aa' AS v UNION ALL SELECT 'AA' UNION ALL SELECT CAST(NULL AS VARCHAR(10)) \
+         UNION ALL SELECT 'bb' UNION ALL SELECT 'aa' UNION ALL SELECT 'cc' \
+         UNION ALL SELECT 'Aa' UNION ALL SELECT 'dd' UNION ALL SELECT 'BB' \
+         UNION ALL SELECT CAST(NULL AS VARCHAR(10)) UNION ALL SELECT 'ee' UNION ALL SELECT 'cc'\
+         )",
+    );
+    assert_eq!(
+        oracle, 2,
+        "native oracle COUNT(DISTINCT (v REGEXP_LIKE 'a.*')) must be 2 (TRUE \
+         and FALSE both occur), got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(DISTINCT (c_varchar REGEXP_LIKE 'a.*')) FROM {}",
+        vs_typed_table()
+    );
+    let vs_value = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_value, 2,
+        "COUNT(DISTINCT (c_varchar REGEXP_LIKE 'a.*')) over the VS must be 2 \
+         (matching the native oracle), got {vs_value}"
+    );
+}
+
+/// A `CASE WHEN <col> > TIMESTAMP '<literal>' ...` comparison inside
+/// `COUNT(DISTINCT ...)` compiles and matches an in-session native Exasol
+/// oracle (issue #209 repro: `SELECT COUNT(DISTINCT CASE WHEN event_ts >
+/// TIMESTAMP '2020-01-01 00:00:00' THEN 1 ELSE 0 END) FROM
+/// <vs>.<typed_table>`). Pre-fix, the timestamp literal rendered with an
+/// explicit UTC offset via DataFusion's `arrow_cast(...)` inside the
+/// Exasol-parsed qualified single-table wrapper SQL, so Exasol rejected the
+/// statement with `function or script ARROW_CAST not found` (42000).
+///
+/// Seed (`common/seed.rs`'s `typed_probe()`): `c_ts` millisecond offsets per
+/// row = [100,200,NULL,300,100,400,100,500,200,NULL,600,300], all within
+/// 2024-01-01, so every non-NULL value is well after 2020-01-01 (`CASE`
+/// evaluates to 1). A NULL `c_ts` makes the `>` comparison unknown, so the
+/// `CASE` falls through to `ELSE 0` rather than propagating NULL — the two
+/// NULL rows (ids 3 and 10) therefore evaluate to 0, giving exactly the two
+/// distinct values {0, 1}. Independently confirmed against a native
+/// in-session oracle over the same 12 reproduced values (verified against
+/// the pinned container).
+#[test]
+fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle = conn.query_scalar_i64(
+        "SELECT COUNT(DISTINCT (CASE WHEN t > TIMESTAMP '2020-01-01 00:00:00' \
+         THEN 1 ELSE 0 END)) FROM (\
+         SELECT TIMESTAMP '2024-01-01 00:00:00.100' AS t \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.200' \
+         UNION ALL SELECT CAST(NULL AS TIMESTAMP) \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.300' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.100' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.400' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.100' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.500' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.200' \
+         UNION ALL SELECT CAST(NULL AS TIMESTAMP) \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.600' \
+         UNION ALL SELECT TIMESTAMP '2024-01-01 00:00:00.300'\
+         )",
+    );
+    assert_eq!(
+        oracle, 2,
+        "native oracle COUNT(DISTINCT CASE ...) must be 2 ({{0,1}}), got {oracle}"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(DISTINCT (CASE WHEN c_ts > TIMESTAMP '2020-01-01 00:00:00' \
+         THEN 1 ELSE 0 END)) FROM {}",
+        vs_typed_table()
+    );
+    let vs_value = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_value, 2,
+        "COUNT(DISTINCT CASE WHEN c_ts > TIMESTAMP '2020-01-01 00:00:00' ...) \
+         over the VS must be 2 (matching the native oracle), got {vs_value}"
+    );
+}
+
+/// The now-family withdrawal (`CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`,
+/// `SYSTIMESTAMP`) is correct: a select-list `SYSTIMESTAMP` over the virtual
+/// table is statement-constant and reflects Exasol's own `DBTIMEZONE`-zoned
+/// clock, rather than a scan-side `now()` evaluated once per shard in an
+/// unstated zone. `SYSTIMESTAMP` (not `CURRENT_TIMESTAMP`) is the probe
+/// because `CURRENT_TIMESTAMP` is declared `TIMESTAMP(3) WITH LOCAL TIME
+/// ZONE`, which fails `is_valid_emits_output_type`
+/// (`adapter/pushdown/support.rs:1016-1018`) and so never emits a pushed
+/// scan projection at all — it cannot show the defect either way.
+/// `SYSTIMESTAMP` is declared plain `TIMESTAMP(3)` and passes that gate.
+///
+/// Three assertions, per the plan:
+///
+/// (a) Precondition: `DBTIMEZONE` must not be `UTC` (read via `SELECT
+/// DBTIMEZONE`), or the offset comparison below is vacuous. The pinned
+/// container defaults to `EUROPE/BERLIN` (verified live); this MUST FAIL,
+/// not skip, if the zone is ever `UTC`.
+///
+/// (b) `SELECT SYSTIMESTAMP FROM <vs>.typed_distinct_probe` (2 data files,
+/// `TYPED_FILE_SPLIT`) returns exactly ONE distinct value across all rows —
+/// the statement-constancy Exasol guarantees. Pre-withdrawal this returned
+/// one distinct value PER SHARD, measured as two over this two-file table,
+/// because each UDF invocation evaluated `now()` independently.
+///
+/// (c) That single value is within 60 seconds of an in-session NATIVE
+/// Exasol oracle — a bare `SELECT SYSTIMESTAMP`, with NO virtual schema
+/// reference, run on the SAME connection. A 60s tolerance is deliberately
+/// loose: the two statements execute at different instants, while the
+/// defect this catches is a whole-zone offset of one hour or more. Exact
+/// equality is NOT asserted, and the probe is deliberately NOT a
+/// pure-constant predicate (e.g. `WHERE CURRENT_TIMESTAMP > TIMESTAMP
+/// '<t>'`) — Exasol constant-folds such a predicate before building the
+/// pushdown request, so nothing would be pushed and the test would pass in
+/// both states.
+#[test]
+fn e2e_now_family_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // (a) Precondition.
+    let tz_cols = conn.query_columns("SELECT DBTIMEZONE");
+    let db_timezone = tz_cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("DBTIMEZONE not a string: {:?}", tz_cols[0][0]))
+        .to_string();
+    assert_ne!(
+        db_timezone.to_uppercase(),
+        "UTC",
+        "DBTIMEZONE must not be UTC, or the offset comparison below is \
+         vacuous (a whole-zone-offset regression would be invisible), got \
+         {db_timezone:?}"
+    );
+
+    // (b) Statement-constancy across shards.
+    let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", vs_typed_table());
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_values: Vec<&str> = vs_cols[0]
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("SYSTIMESTAMP not a string: {v:?}"))
+        })
+        .collect();
+    assert!(
+        !vs_values.is_empty(),
+        "SELECT SYSTIMESTAMP FROM {} returned no rows",
+        vs_typed_table()
+    );
+    let distinct_vs: std::collections::HashSet<&str> = vs_values.iter().copied().collect();
+    assert_eq!(
+        distinct_vs.len(),
+        1,
+        "SELECT SYSTIMESTAMP FROM {} must return exactly one distinct value \
+         across all rows (statement-constancy Exasol guarantees); a \
+         regressed pushdown of now() into the scan instead returns one \
+         value PER SHARD (measured as two over this two-file table \
+         pre-withdrawal), got {distinct_vs:?}",
+        vs_typed_table()
+    );
+    let vs_ts = parse_exasol_timestamp(vs_values[0]);
+
+    // (c) Within 60s of an in-session native oracle, same connection.
+    let oracle_cols = conn.query_columns("SELECT SYSTIMESTAMP");
+    let oracle_str = oracle_cols[0][0].as_str().unwrap_or_else(|| {
+        panic!(
+            "native oracle SYSTIMESTAMP not a string: {:?}",
+            oracle_cols[0][0]
+        )
+    });
+    let oracle_ts = parse_exasol_timestamp(oracle_str);
+
+    let delta = (vs_ts - oracle_ts).num_seconds().abs();
+    assert!(
+        delta <= 60,
+        "VS SYSTIMESTAMP ({vs_ts}) must be within 60s of the native oracle \
+         SYSTIMESTAMP ({oracle_ts}); a regressed build pushing now() \
+         UTC-naively into the scan would diverge by a whole zone offset \
+         (>= 1h) from Exasol's own {db_timezone}-zoned clock, got \
+         delta={delta}s"
+    );
+}

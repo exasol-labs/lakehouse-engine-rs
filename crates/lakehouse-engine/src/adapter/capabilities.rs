@@ -112,9 +112,22 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_UNICODE",
     "FN_UNICODECHR",
     "FN_UPPER",
-    // Date/time scalar functions
-    "FN_CURRENT_DATE",
-    "FN_CURRENT_TIMESTAMP",
+    // Date/time scalar functions. FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/
+    // FN_SYSTIMESTAMP (the now-family) are NOT advertised: rendering Exasol's three
+    // distinct now-family semantics (session-zone CURRENT_TIMESTAMP, database-zone
+    // SYSTIMESTAMP, and their TO_DATE forms) needs SESSIONTIMEZONE/DBTIMEZONE, but
+    // neither reaches the scan UDF — the pushdown request carries no zone,
+    // CommonScanSpec carries no temporal field, the scan opens no connect-back
+    // session, and the SDK's UdfContext exposes no clock or zone. The scan can only
+    // read its own container clock in UTC, once per shard (a fresh SessionContext
+    // per invocation), so a pushed clock call would be evaluated G times with no
+    // statement anchor while Exasol's now-family is statement-constant. Measured
+    // live against Exasol 2025.2.1: a pushed SYSTIMESTAMP returned a value ~2 hours
+    // off native (UTC container clock vs EUROPE/BERLIN DBTIMEZONE/SESSIONTIMEZONE),
+    // and GROUP BY SYSTIMESTAMP over a two-file table returned two distinct
+    // timestamps against one statement-constant native value. Withdrawn so Exasol
+    // evaluates its own clock instead — see
+    // vs-adapter/pushdown-planning-capability-extensions.
     "FN_DATE_TRUNC",
     "FN_DAY",
     "FN_EXTRACT",
@@ -122,8 +135,6 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_MINUTE",
     "FN_MONTH",
     "FN_SECOND",
-    "FN_SYSDATE",
-    "FN_SYSTIMESTAMP",
     "FN_TO_DATE",
     "FN_TO_TIMESTAMP",
     "FN_YEAR",
@@ -340,6 +351,11 @@ mod tests {
         // FN_ADD_HOURS/FN_ADD_MINUTES were withdrawn after E2E parity (task 3.1):
         // the microsecond round-trip diverges on a DATE argument (Exasol infers
         // TIMESTAMP(0), the rendering yields TIMESTAMP(3), pushdown rejected).
+        // FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/FN_SYSTIMESTAMP (the
+        // now-family) were withdrawn: no time zone, clock, or statement anchor
+        // reaches the scan UDF, so no rendering matches Exasol's statement-constant,
+        // zone-aware now-family — see the CAPABILITIES const above and
+        // vs-adapter/pushdown-planning-capability-extensions.
         for name in &[
             "FN_DIV",
             "FN_TO_CHAR",
@@ -361,6 +377,10 @@ mod tests {
             "FN_DAYOFWEEK",
             "FN_LAST_DAY",
             "FN_CONVERT_TZ",
+            "FN_CURRENT_DATE",
+            "FN_CURRENT_TIMESTAMP",
+            "FN_SYSDATE",
+            "FN_SYSTIMESTAMP",
         ] {
             assert!(
                 !cap_strs.contains(name),
@@ -483,8 +503,6 @@ mod tests {
 
         // --- task 1.3: date/time scalar functions ---
         for name in &[
-            "FN_CURRENT_DATE",
-            "FN_CURRENT_TIMESTAMP",
             "FN_DATE_TRUNC",
             "FN_DAY",
             "FN_EXTRACT",
@@ -492,8 +510,6 @@ mod tests {
             "FN_MINUTE",
             "FN_MONTH",
             "FN_SECOND",
-            "FN_SYSDATE",
-            "FN_SYSTIMESTAMP",
             "FN_TO_DATE",
             "FN_TO_TIMESTAMP",
             "FN_YEAR",

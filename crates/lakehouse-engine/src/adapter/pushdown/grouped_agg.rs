@@ -2932,7 +2932,7 @@ mod tests {
             "wrapper item must be over merged partials: {soa}"
         );
         assert!(
-            soa.contains("SUM(\"PARTIAL_") && soa.contains("round("),
+            soa.contains("SUM(\"PARTIAL_") && soa.contains("ROUND("),
             "wrapper must render ROUND over merged SUM(PARTIAL_*) partials: {soa}"
         );
         assert!(
@@ -2979,7 +2979,7 @@ mod tests {
         );
         assert!(
             items[0].starts_with("CAST(")
-                && items[0].contains("round(")
+                && items[0].contains("ROUND(")
                 && items[0].contains("DECIMAL(5,2)"),
             "position 0 must be the scalar-over-aggregate, cast to its own type: {items:?}"
         );

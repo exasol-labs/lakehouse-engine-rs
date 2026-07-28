@@ -62,7 +62,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * *WHEN* `render_expression_exasol` processes the node
 * *THEN* the translator SHALL return `TIMESTAMP '<value>'` with the value single-quoted and internal single-quotes escaped by doubling, exactly as for `literal_string`, and the fragment MUST NOT contain `arrow_cast`, which Exasol rejects with `function or script ARROW_CAST not found` (SQL code 42000)
 * *AND* for `literal_timestamp_utc` the rendered value MUST be the value Exasol sent with NO `+00:00` offset appended, because Exasol's `TIMESTAMP` literal format has no offset field and the offset form raises `data exception - invalid character value for cast` (SQL code 22018)
-* *AND* a node whose `value` is absent or JSON `null` SHALL render as `NULL` in both dialects
+* *AND* a node whose `value` is absent or JSON `null` SHALL render as the bare `NULL` keyword in the Exasol dialect, for both node types, because `TIMESTAMP NULL` is an Exasol syntax error (`unexpected TIMESTAMP_`, SQL code 42000, verified on live Exasol 2025.2.1)
+* *AND* the DataFusion dialect SHALL keep its existing per-node-type rendering of that same absent-or-`null` `value` unchanged — `arrow_cast(NULL, 'Timestamp(Microsecond, None)')` for `literal_timestamp`, the bare `NULL` keyword for `literal_timestamp_utc` — an asymmetry that predates this change and is frozen by it, NOT aligned across the two node types
 * *AND* the DataFusion-dialect rendering of both node types MUST remain byte-identical to the preceding scenario, so the microsecond-typing guarantee the node-local scan depends on is unchanged
 <!-- /DELTA:NEW -->
 
