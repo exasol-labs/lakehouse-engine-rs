@@ -275,6 +275,12 @@ password = "SECRETPAT123"
 host = "bfs-decoy-host"
 password = "SECRETPAT123"
 bfs_write_password = "BFSWRITEPW789"
+
+[bfsprofile-custom-bucket]
+host = "bfs-decoy-host"
+password = "SECRETPAT123"
+bfs_write_password = "BFSWRITEPW789"
+bfs_bucket = "custom"
 TOML
 
 # --- engine-archive fixtures --------------------------------------------------
@@ -1167,6 +1173,75 @@ test_exapump_bfs_flags() {
   assert_eq "bfs flags: only the supplied subset is emitted" "--bfs-host bfshost" "$flags"
 }
 
+test_resolve_bfs_bucket_from_profile() {
+  echo "== test_resolve_bfs_bucket_from_profile =="
+  local bucket
+
+  # Profile names a non-default bucket, user gave no --bfs-bucket: must adopt the profile's
+  # bucket, so TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT (built from ARG_BFS_BUCKET) end up
+  # pointing at the SAME bucket exapump itself will upload into.
+  bucket="$(
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    resolve_bfs_bucket_from_profile
+    printf '%s' "$ARG_BFS_BUCKET"
+  )"
+  assert_eq "bucket drift: adopts the profile's bfs_bucket when none was given explicitly" "custom" "$bucket"
+
+  # An explicit --bfs-bucket always wins, even if the profile names a different one.
+  bucket="$(
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    ARG_BFS_BUCKET=explicit; ARG_BFS_BUCKET_SET=1
+    resolve_bfs_bucket_from_profile
+    printf '%s' "$ARG_BFS_BUCKET"
+  )"
+  assert_eq "bucket drift: an explicit --bfs-bucket is never overridden by the profile" "explicit" "$bucket"
+
+  # A profile with no bfs_bucket field at all: default is left untouched.
+  bucket="$(
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    resolve_bfs_bucket_from_profile
+    printf '%s' "$ARG_BFS_BUCKET"
+  )"
+  assert_eq "bucket drift: no-op when the profile has no bfs_bucket field" "default" "$bucket"
+
+  # saas mode / dsn / host connectivity: always a no-op, regardless of profile content.
+  bucket="$(
+    source "$INSTALLER"
+    TARGET_MODE=saas; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    resolve_bfs_bucket_from_profile
+    printf '%s' "$ARG_BFS_BUCKET"
+  )"
+  assert_eq "bucket drift: no-op in saas mode" "default" "$bucket"
+
+  bucket="$(
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; CONNECTIVITY_MODE=dsn
+    resolve_bfs_bucket_from_profile
+    printf '%s' "$ARG_BFS_BUCKET"
+  )"
+  assert_eq "bucket drift: no-op in dsn connectivity mode (no profile to read)" "default" "$bucket"
+
+  # End-to-end proof: after resolution, resolve_target_layout builds paths in the ADOPTED bucket.
+  local so
+  so="$(
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
+    EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
+    resolve_bfs_bucket_from_profile
+    resolve_target_layout
+    printf '%s' "$TARGET_SO_UDF_OBJECT"
+  )"
+  assert_eq "bucket drift: resolve_target_layout uses the profile-adopted bucket, not 'default'" \
+    "buckets/bfsdefault/custom/udf/liblakehouse_engine.so" "$so"
+}
+
 test_bucketfs_upload_argv_shape() {
   echo "== test_bucketfs_upload_argv_shape =="
   # profile mode: --profile is present, and only the explicitly-given --bfs-* overrides follow.
@@ -1513,6 +1588,7 @@ main() {
   test_target_flag_conflict_detection
   test_resolve_target_layout_bucketfs_values
   test_exapump_bfs_flags
+  test_resolve_bfs_bucket_from_profile
   test_bucketfs_upload_argv_shape
   test_bucketfs_upload_failure_surfaces_stderr
   test_bucketfs_verify_listed_and_wait

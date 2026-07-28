@@ -511,10 +511,30 @@ resolve_target_mode() {
   return 0
 }
 
+# If bucketfs mode + profile connectivity + no explicit --bfs-bucket, resolves ARG_BFS_BUCKET
+# from the profile's own bfs_bucket field. Must run before resolve_target_layout, and before
+# exapump_bfs_flags is ever consulted. Without this, ARG_BFS_BUCKET stays at its "default" default
+# while exapump itself resolves the profile's bfs_bucket for the actual upload -- an install that
+# passes every upload/verify step (they all target the bucket exapump picks) yet builds
+# %udf_object/RUST-alias paths (via resolve_target_layout) pointing at "default", so Exasol looks
+# for the .so in a bucket it was never uploaded to. A no-op in saas mode, dsn/host connectivity
+# mode (no profile to read), or when --bfs-bucket was already given explicitly.
+resolve_bfs_bucket_from_profile() {
+  if [[ "$TARGET_MODE" != "bucketfs" || "$CONNECTIVITY_MODE" != "profile" || "$ARG_BFS_BUCKET_SET" -eq 1 ]]; then
+    return 0
+  fi
+  local profile_bucket
+  if profile_bucket="$(read_profile_key "$ARG_PROFILE" bfs_bucket "$(exapump_config_path)")" && [[ -n "$profile_bucket" ]]; then
+    ARG_BFS_BUCKET="$profile_bucket"
+  fi
+  return 0
+}
+
 # Seeds the mode-parameterized TARGET_* globals used by the install steps, so those steps never
 # read a target-specific constant directly. Call only after resolve_target_mode has resolved a
-# mode. TARGET_SLC_BFS_PATH / TARGET_ENGINE_BFS_PATH are BucketFS-only (SaaS addresses its
-# uploads by presigned-URL file key instead, so they stay empty there).
+# mode, and after resolve_bfs_bucket_from_profile so ARG_BFS_BUCKET already reflects the bucket
+# exapump will actually use. TARGET_SLC_BFS_PATH / TARGET_ENGINE_BFS_PATH are BucketFS-only (SaaS
+# addresses its uploads by presigned-URL file key instead, so they stay empty there).
 resolve_target_layout() {
   case "$TARGET_MODE" in
     bucketfs)
@@ -1119,6 +1139,7 @@ main() {
   if ! CONNECTIVITY_MODE="$(validate_connectivity)"; then
     exit 1
   fi
+  resolve_bfs_bucket_from_profile
   resolve_target_layout || exit 1
   if [[ "$CONNECTIVITY_MODE" == "host" ]]; then
     local enc_user enc_password
