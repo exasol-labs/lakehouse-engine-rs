@@ -7,8 +7,13 @@ on:
     paths-ignore: ["specs/**"]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened]
     paths-ignore: ["specs/**"]
+  # Merge queue: required checks MUST run on merge_group or queued PRs hang
+  # forever waiting for a status that never reports. No path filter here —
+  # merge_group ignores paths-ignore anyway, so the full suite always runs
+  # against the speculative post-merge ref before it lands on main.
+  merge_group:
   workflow_dispatch:
 
 # Cancel a superseded run when a PR branch gets a new push (saves CI minutes,
@@ -35,13 +40,6 @@ jobs:
     # release build). 60 min is a safety backstop against a genuine hang, not
     # a tight budget.
     timeout-minutes: 60
-    # A PR base-retarget (e.g. a stacked PR's base branch merging) fires `edited`
-    # with no code change. Only an `edited` event that actually changed `base`
-    # should re-run CI — a plain title/body/label edit should not.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
@@ -126,11 +124,6 @@ jobs:
   lint:
     name: Check & Lint
     runs-on: ubuntu-latest
-    # See build-so's `if` — same base-retarget-vs-plain-edit guard.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       # Same rationale as build-so: reclaim ~12 GB before restoring the
       # shared cache and compiling on top of it, so clippy's --all-targets pass
@@ -182,11 +175,6 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    # See build-so's `if` — same base-retarget-vs-plain-edit guard.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       # Reclaim disk before restoring the shared cache + compiling the test
       # binaries, matching build-so/lint/e2e (avoids the ENOSPC that killed this
@@ -231,11 +219,6 @@ jobs:
   licenses:
     name: License Check
     runs-on: ubuntu-latest
-    # See build-so's `if` — same base-retarget-vs-plain-edit guard.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       - uses: actions/checkout@v7
 
@@ -262,10 +245,11 @@ jobs:
   e2e:
     name: E2E
     runs-on: ubuntu-latest
-    # build-so only — its .so artifact is all this job consumes. Also waiting on
-    # lint/unit-tests/licenses cost ~18 min of pure serialization to buy
-    # fail-fast that isn't load-bearing: `main` has no branch protection and no
-    # rulesets, so gating is reviewers reading a red check, not a blocked merge.
+    # build-so only — its .so artifact is all this job consumes. NOT also
+    # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
+    # serialization: all three are separately-required checks (ruleset + merge
+    # queue), so any red one blocks the merge on its own — e2e needn't wait on
+    # them to keep broken code off main.
     # Trade: a PR with a clippy error still burns a full E2E run; revert by
     # re-adding to `needs`. `release` lists them explicitly so main still can't
     # ship broken.
