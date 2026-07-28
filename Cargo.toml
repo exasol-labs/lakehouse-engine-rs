@@ -10,29 +10,22 @@ members = ["crates/lakehouse-engine", "crates/vs-expression"]
 # individual crates must be addressed with `-p`.
 resolver = "2"
 
-# `cargo test` builds every file in crates/lakehouse-engine/tests/ into its own
-# executable, each statically linking the full DataFusion/Arrow/Iceberg tree —
-# linking, dominated by debug-info volume, costs far more than compiling.
-# Dependencies are ~all of those bytes and are never stepped through, so drop
-# their debug info entirely; workspace crates keep line tables. Backtraces still
-# resolve dependency function names (symbols, not debug info).
-#
-# NOTE: [profile.*] is NOT part of Swatinem/rust-cache's key but IS part of every
-# crate's fingerprint — editing this invalidates the whole dep cache. The
-# MANIFEST_PROFILE_HASH env-var in .github/workflows/ci.yml is what rotates the
-# cache key so that stays self-healing; don't remove it.
-[profile.dev]
-debug = 1
-
-[profile.dev.package."*"]
-debug = 0
+# No [profile.*] here — it lives in .cargo/config.toml so CI's cache key tracks
+# it (rationale there; upstream Swatinem/rust-cache#268).
 
 [workspace.package]
 license = "MIT"
 
-[workspace.dependencies]
 # Shared single-version pins. Member crates reference these with
 # `{ workspace = true }`, optionally adding per-crate features.
+#
+# CAUTION: nothing in this file enters CI's cache key (same #268 blind spot as
+# profiles). Version bumps are covered indirectly via Cargo.lock, but a
+# `features`/`default-features` edit that doesn't move the lockfile rotates
+# nothing and poisons the cache permanently. Prefer declaring features on the
+# member crate — member manifests ARE hashed. If you change one here and CI
+# starts recompiling every run, bump `prefix-key` on ci.yml's cache steps.
+[workspace.dependencies]
 
 # Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
 arrow   = { version = "58", default-features = false }

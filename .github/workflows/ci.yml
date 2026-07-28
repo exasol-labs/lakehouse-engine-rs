@@ -47,12 +47,9 @@ jobs:
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
       # same ENOSPC class that killed lint/unit-tests. Reclaim ~12 GB up front.
       # (Latent until now because CI has only hit the warm path; a Cargo.lock
-      # bump forces the cold path.)
-      #
-      # Backgrounded (`&`): the rm costs 22–76s of critical path but the space
-      # isn't needed until the Docker build minutes later. Safe here because
-      # nothing in this job blocks on the reclaim completing; NOT safe in
-      # e2e/e2e-lakekeeper, where the very next step needs the space.
+      # bump forces the cold path.) Backgrounded (`&`) to keep 22–76s off the
+      # critical path — safe wherever nothing downstream blocks on the reclaim,
+      # which rules out e2e/e2e-lakekeeper (their next step needs the space).
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
 
@@ -76,12 +73,10 @@ jobs:
       # `docker-cargo-` prefix restores the most recent prior cache, so cargo
       # recompiles only the changed crates instead of the whole dep graph.
       #
-      # Split restore/save (not plain actions/cache@v6) so only main writes.
-      # GitHub caches are branch-scoped: every PR branch was minting its own
-      # ~600 MB exact-key copy, 12 of them totalling 7.5 GB against a 10 GB
-      # repo quota — while the `docker-cargo-` prefix fallback already makes
-      # main's entry perfectly usable from any branch. Pure waste; the quota
-      # overrun was evicting caches that matter.
+      # Split restore/save so only main writes. Caches are branch-scoped, so PR
+      # branches were each minting an exact-key copy — 12 of them, 7.5 GB
+      # against a 10 GB quota — even though the `docker-cargo-` prefix fallback
+      # already makes main's entry usable from any branch.
       - name: Restore Docker-side cargo registry and target/
         id: docker-cache
         uses: actions/cache/restore@v6
@@ -104,9 +99,8 @@ jobs:
       - name: Fix Docker-side build output ownership
         run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
 
-      # Save only from main (see the restore step), and only when the exact key
-      # missed — GitHub cache keys are immutable, so re-saving an exact hit is
-      # a guaranteed "already exists" warning and a wasted multi-GB upload.
+      # Main only (see the restore step), and only on an exact-key miss — keys
+      # are immutable, so re-saving a hit is a wasted multi-GB upload.
       - name: Save Docker-side cargo registry and target/
         if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -124,21 +118,19 @@ jobs:
 
   # ── fan-out: lint / unit-tests / licenses, all at t=0 ────────────────────
   # Nothing here waits on build-so (different toolchain: host vs the
-  # rust:1.94-bookworm container) — every job in this section starts
-  # immediately and `unit-tests` doubles as the shared-cache writer.
+  # rust:1.94-bookworm container); `unit-tests` doubles as the cache writer.
   lint:
     name: Check & Lint
     runs-on: ubuntu-latest
-    # See build-so's `if` — same base-retarget-vs-plain-edit guard. Previously
-    # inherited by cascade from the deleted `build` job this used to `need`.
+    # See build-so's `if` — same guard, previously inherited by cascade from
+    # the deleted `build` job this used to `need`.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.action != 'edited' ||
       github.event.changes.base != null
     steps:
-      # Same rationale (and the same `&` backgrounding) as build-so: reclaim
-      # ~12 GB before clippy's --all-targets pass ENOSPCs the ~21 GB runner
-      # disk, but off the critical path since nothing needs it immediately.
+      # Reclaim ~12 GB before clippy's --all-targets pass ENOSPCs the ~21 GB
+      # runner disk; backgrounded as in build-so.
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
 
@@ -167,18 +159,14 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # Read-only restore of the cache `unit-tests` writes (save-if:false), so
-      # readers never race to save their own copy. The env block and env-vars
-      # input MUST stay byte-identical across all four rust-cache steps — a
-      # divergence puts readers on a different key and permanently cold (#133).
-      # See the writer step in `unit-tests` for why the manifest hash is there.
+      # Read-only restore of the cache `unit-tests` writes; save-if:false so
+      # readers never race to save their own copy. Keep the inputs identical
+      # across all four rust-cache steps — a divergence leaves readers
+      # permanently cold (#133).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        env:
-          MANIFEST_PROFILE_HASH: ${{ hashFiles('Cargo.toml') }}
         with:
           shared-key: workspace-rlib
-          env-vars: MANIFEST_PROFILE_HASH
           save-if: "false"
 
       - name: Check formatting
@@ -190,17 +178,16 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    # See build-so's `if` — same base-retarget-vs-plain-edit guard. Previously
-    # inherited by cascade from the deleted `build` job this used to `need`.
+    # See build-so's `if` — same guard, previously inherited by cascade from
+    # the deleted `build` job this used to `need`.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.action != 'edited' ||
       github.event.changes.base != null
     steps:
-      # Reclaim disk before compiling the test binaries, matching build-so/lint
-      # (avoids the ENOSPC that killed this job); backgrounded for the same
-      # reason — checkout + toolchain setup run first, so the reclaim overlaps
-      # with them instead of adding 22–76s to the critical path.
+      # Reclaim disk before compiling the test binaries (avoids the ENOSPC that
+      # killed this job); backgrounded as in build-so — checkout + toolchain
+      # setup run first, so the reclaim overlaps with them.
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
 
@@ -215,47 +202,22 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # SOLE WRITER of the shared cache. Swatinem/rust-cache (not raw
-      # actions/cache) because it PRUNES target/ before saving: it strips this
-      # workspace's own crate artifacts + incremental data and keeps only
-      # dependency builds, so the cache stays small instead of ballooning with
-      # the full DataFusion/Arrow/Iceberg debug tree. `cargo test` emits .rlib —
-      # a superset of what clippy (.rmeta) and the E2E jobs need — so this
-      # writer's cache serves every reader.
+      # SOLE WRITER of the shared cache. rust-cache (not raw actions/cache)
+      # because it PRUNES target/ before saving — only dependency builds are
+      # kept, so the cache doesn't balloon with the full DataFusion/Arrow/
+      # Iceberg debug tree. `cargo test` emits .rlib, a superset of what clippy
+      # (.rmeta) and the E2E jobs need, so this writer serves every reader.
       #
-      # MANIFEST_PROFILE_HASH exists because rust-cache parses Cargo.toml and
-      # hashes ONLY its dependency sections — [profile.*] never enters the key —
-      # yet profile settings are part of every dependency's fingerprint. A
-      # `[profile.dev] debug = 1` edit therefore poisoned this cache under an
-      # unchanged key: every job got an EXACT hit, cargo rejected all 387
-      # artifacts and recompiled, and because the hit was exact rust-cache
-      # logged "Cache up-to-date." and skipped saving — immutable keys mean it
-      # could never self-heal. rust-cache ignores its `key` input when
-      # `shared-key` is set (mutually exclusive branches in its config.ts), so
-      # the hash goes in via env-vars instead: an env edit rotates the key, the
-      # hit is no longer exact, the save fires, and the poisoning heals itself.
-      # This replaces the old manual "-rlib suffix bump" workaround, which
-      # never covered profile edits — which is why it recurred.
-      #
-      # Cost, accepted: rust-cache v2.9.1 builds restoreKey = prefix+envHash and
-      # cacheKey = restoreKey+lockHash, so the env hash sits in the PREFIX, not
-      # the stripped suffix. Any root-Cargo.toml edit — a dep-pin bump, not just
-      # a profile edit — therefore loses prefix-fallback restore and goes fully
-      # cold. That over-invalidates; under-invalidating is the bug being fixed
-      # here, and hashing only the [profile.*] lines would need a $GITHUB_ENV
-      # shell step duplicated across all four cache steps to save it.
+      # What keys this cache against profile edits is .cargo/config.toml, NOT
+      # anything here — see the comment in that file. The old manual "bump the
+      # -rlib suffix" workaround is gone with it.
       #
       # save-if gates writes to main: PR branches would otherwise each mint a
       # branch-scoped duplicate against the repo's 10 GB cache quota.
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        env:
-          # hashFiles must be step-level: at workflow/job env it evaluates
-          # before checkout and returns the empty-tree hash.
-          MANIFEST_PROFILE_HASH: ${{ hashFiles('Cargo.toml') }}
         with:
           shared-key: workspace-rlib
-          env-vars: MANIFEST_PROFILE_HASH
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
@@ -277,12 +239,11 @@ jobs:
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
-      # Deliberately NOT caching ~/.cargo/registry here. The restore saved ~9s
-      # on a job that runs in well under a minute, while holding 2 GB across 12
-      # entries against the repo's 10 GB quota — evicting caches that actually
-      # matter. Without it `cargo deny`'s `cargo metadata` re-downloads the
-      # index each run and this job grows to ~2–3 min; that's off the critical
-      # path, so leave it. Don't "fix" this back.
+      # Deliberately NOT caching ~/.cargo/registry: it saved ~9s on a sub-minute
+      # job while holding 2 GB of the repo's 10 GB quota and evicting caches
+      # that matter. Without it `cargo deny`'s `cargo metadata` re-downloads the
+      # index and this job grows to ~2–3 min — off the critical path, so leave
+      # it. Don't "fix" this back.
       - name: Install cargo-deny
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
@@ -298,14 +259,13 @@ jobs:
   e2e:
     name: E2E
     runs-on: ubuntu-latest
-    # Only build-so — its .so artifact is the sole thing this job consumes.
-    # It used to also wait on lint/unit-tests/licenses, which cost ~18 min of
-    # pure serialization (build-so finished 16:35, e2e started 16:54) to buy
-    # fail-fast that isn't actually load-bearing: `main` has no branch
-    # protection and no rulesets, so merge gating is reviewers reading the red
-    # check on the PR, not a blocked merge. Accepted trade: a PR with a clippy
-    # error still burns a full E2E run. Revert by re-adding to `needs`.
-    # `release` re-adds them explicitly so a broken main can't still ship.
+    # build-so only — its .so artifact is all this job consumes. Also waiting on
+    # lint/unit-tests/licenses cost ~18 min of pure serialization to buy
+    # fail-fast that isn't load-bearing: `main` has no branch protection and no
+    # rulesets, so gating is reviewers reading a red check, not a blocked merge.
+    # Trade: a PR with a clippy error still burns a full E2E run; revert by
+    # re-adding to `needs`. `release` lists them explicitly so main still can't
+    # ship broken.
     needs: [build-so]
     # Observed 16-20 min end-to-end historically, but pre-test setup (disk
     # cleanup + image loads) has grown slower as the hosted runner image
@@ -353,15 +313,11 @@ jobs:
       # Read-only restore of the shared workspace cache to warm the host debug
       # build of the e2e test binary. save-if:false so this job doesn't prune
       # target/ (which would delete the .so downloaded into target/release/
-      # above) and doesn't save a redundant copy. env/env-vars must stay
-      # byte-identical to the writer in `unit-tests` — see that step.
+      # above) and doesn't save a redundant copy.
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        env:
-          MANIFEST_PROFILE_HASH: ${{ hashFiles('Cargo.toml') }}
         with:
           shared-key: workspace-rlib
-          env-vars: MANIFEST_PROFILE_HASH
           save-if: "false"
 
       # No tarball cache here (tried it, dropped it): restoring a GHA cache
@@ -499,11 +455,8 @@ jobs:
       # See the `e2e` job's identical step (and the writer in `unit-tests`).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        env:
-          MANIFEST_PROFILE_HASH: ${{ hashFiles('Cargo.toml') }}
         with:
           shared-key: workspace-rlib
-          env-vars: MANIFEST_PROFILE_HASH
           save-if: "false"
 
       - name: Pull stack images
@@ -599,10 +552,10 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    # lint/unit-tests/licenses are listed EXPLICITLY, not inherited: `e2e` used
-    # to `need` them, so releasing behind e2e gated on them transitively. Now
-    # that e2e only needs build-so, a main push with failing unit tests would
-    # otherwise mint a tag + GitHub Release. Costs no latency — e2e dominates.
+    # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
+    # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
+    # build-so, a main push with failing tests would otherwise mint a tag +
+    # Release. No latency cost — e2e dominates the chain.
     needs: [e2e, lint, unit-tests, licenses]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
