@@ -128,9 +128,13 @@ impl PartialEq<&str> for ProjectionItem {
 
 /// One ORDER BY sort key in a pushed-down ordered top-N plan.
 ///
-/// `column` is a bare, uppercase source-column identifier: only `ORDER_BY_COLUMN`
-/// is advertised as a capability (not `ORDER_BY_EXPRESSION`), so Exasol only ever
-/// sends bare column sort keys — see
+/// `column` is a bare, uppercase source-column identifier. This is a deliberately
+/// narrow gate for the per-shard bounded top-N (`TopK`) detection path, not a
+/// reflection of what Exasol can send: both `ORDER_BY_COLUMN` and
+/// `ORDER_BY_EXPRESSION` are advertised (issue #198), so Exasol may send an
+/// expression sort key too — those are parsed separately (`parse_sort_flags` in
+/// `adapter/pushdown/topn.rs`) and never construct a `SortKey`, keeping top-N
+/// eligibility restricted to bare columns — see
 /// `specs/_plans/add-topn-pushdown/decision-log.md` decision [3].
 ///
 /// `ascending` maps directly to Exasol's `orderBy[].isAscending`
@@ -156,29 +160,40 @@ impl SortKey {
     /// identifier is double-quoted with embedded quotes doubled — the same quoting
     /// the adapter and the scan use for column identifiers, and valid in both
     /// DataFusion SQL (per-shard) and Exasol SQL (merge).
-    fn render_order_by_element(&self) -> String {
+    pub fn render_order_by_element(&self) -> String {
         self.render_ordered(&format!("\"{}\"", self.column.replace('"', "\"\"")))
     }
 
-    /// Render this key's direction + NULL placement onto an already-rendered
-    /// ordering expression: `<expr> ASC|DESC NULLS FIRST|LAST`.
-    ///
-    /// `expr` may be a quoted column reference (the row-scan and per-shard sorts),
-    /// a positional output ordinal (the grouped-aggregate merge sort, whose output
-    /// columns are `GK_*`/merged aggregates, not the source names), or any other
-    /// valid ordering expression. Routing every ORDER BY the adapter emits through
-    /// this ONE direction/NULL seam is what structurally guarantees they agree on
-    /// direction and NULL placement — the correctness-critical top-N invariant
-    /// (decision [7]).
+    /// Render this key's flags onto an already-rendered ordering expression, via the
+    /// free [`render_ordered`] seam. `self.column` is deliberately unread: `expr`
+    /// carries the ordering target.
     pub fn render_ordered(&self, expr: &str) -> String {
-        let direction = if self.ascending { "ASC" } else { "DESC" };
-        let nulls = if self.nulls_last {
-            "NULLS LAST"
-        } else {
-            "NULLS FIRST"
-        };
-        format!("{expr} {direction} {nulls}")
+        render_ordered(expr, self.ascending, self.nulls_last)
     }
+}
+
+/// Render direction + NULL placement onto an already-rendered ordering expression:
+/// `<expr> ASC|DESC NULLS FIRST|LAST`.
+///
+/// `expr` may be a quoted column reference (the row-scan and per-shard sorts), a
+/// positional output ordinal (the grouped-aggregate merge sort, whose output columns
+/// are `GK_*`/merged aggregates, not the source names), a table-qualified or merged
+/// expression (the join wrapper and the grouped merge), or any other valid ordering
+/// expression. Routing every ORDER BY the adapter emits through this ONE
+/// direction/NULL seam is what structurally guarantees they agree on direction and
+/// NULL placement — the correctness-critical top-N invariant (decision [7]).
+///
+/// Callers holding a [`SortKey`] reach it through [`SortKey::render_ordered`];
+/// callers holding only a parsed flags pair (an expression sort key, which is no
+/// bare column and so yields no `SortKey`) call it directly.
+pub fn render_ordered(expr: &str, ascending: bool, nulls_last: bool) -> String {
+    let direction = if ascending { "ASC" } else { "DESC" };
+    let nulls = if nulls_last {
+        "NULLS LAST"
+    } else {
+        "NULLS FIRST"
+    };
+    format!("{expr} {direction} {nulls}")
 }
 
 /// Render a comma-separated `ORDER BY` element list from sort keys, in order —
@@ -1198,6 +1213,54 @@ mod tests {
         assert_eq!(
             legacy_plans[0].arg_expr, None,
             "missing arg_expr must default to None (backward-compat)"
+        );
+    }
+
+    /// The free [`render_ordered`] IS the direction/NULL seam, and
+    /// [`SortKey::render_ordered`] is a pure delegator to it: the two agree on every
+    /// flag combination, and the bare-column element list still renders exactly as
+    /// before. A second copy of this formatting is what the seam exists to prevent.
+    #[test]
+    fn render_ordered_free_fn_and_method_are_one_implementation() {
+        for (ascending, nulls_last, expected_suffix) in [
+            (true, true, "ASC NULLS LAST"),
+            (true, false, "ASC NULLS FIRST"),
+            (false, true, "DESC NULLS LAST"),
+            (false, false, "DESC NULLS FIRST"),
+        ] {
+            let key = SortKey {
+                column: "IGNORED".into(),
+                ascending,
+                nulls_last,
+            };
+            let expr = r#"ABS("C_PRICE")"#;
+            assert_eq!(
+                render_ordered(expr, ascending, nulls_last),
+                format!("{expr} {expected_suffix}"),
+                "free render_ordered must append direction + NULL placement"
+            );
+            assert_eq!(
+                key.render_ordered(expr),
+                render_ordered(expr, ascending, nulls_last),
+                "the method must delegate to the free function, not re-implement it"
+            );
+        }
+
+        // Regression: the bare-column element list is byte-identical to before.
+        assert_eq!(
+            render_order_by_clause(&[
+                SortKey {
+                    column: "L_EXTENDEDPRICE".into(),
+                    ascending: false,
+                    nulls_last: true,
+                },
+                SortKey {
+                    column: "L_ORDERKEY".into(),
+                    ascending: true,
+                    nulls_last: false,
+                },
+            ]),
+            r#""L_EXTENDEDPRICE" DESC NULLS LAST, "L_ORDERKEY" ASC NULLS FIRST"#
         );
     }
 

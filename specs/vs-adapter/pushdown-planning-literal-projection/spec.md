@@ -3,8 +3,10 @@
 Extends pushdown planning (`vs-adapter/pushdown-planning`) so a select list made up of bare
 literal/constant items — not only column references or scalar expressions — is projected
 positionally into the scan-driving query instead of triggering the full-base-row fallback,
-and records the two shapes where a literal-only projection still declines to the full base
-row (an EMITS-incompatible declared type; an ORDER BY on an unprojected column).
+and records the shape where a literal-only projection still declines to the full base
+row (an EMITS-incompatible declared type). A literal-only select list with an `ORDER BY` on
+an unprojected column is now covered by `vs-adapter/pushdown-planning-order-by-capability`'s
+hidden-sort-key-column rule instead of the full-base-row fallback.
 
 ## Background
 
@@ -34,10 +36,3 @@ row (an EMITS-incompatible declared type; an ORDER BY on an unprojected column).
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL push a rendered select-list item as a positional `Expr` ONLY when its declared EMITS type is a valid Exasol UDF EMITS output type, so an item declared `TIMESTAMP WITH LOCAL TIME ZONE` SHALL decline to the full-base-row fallback — the same path an untranslatable CAST takes — rather than emit an EMITS clause that fails at scan time
 * *AND* projected `TIMESTAMP WITH LOCAL TIME ZONE` constants SHALL remain unsupported — they hit the full-base-row fallback and Exasol post-processes the select list — an accurately-scoped tracked exception, `(#218)`
-
-### Scenario: Projected literal with an ORDER BY on an unprojected column declines to the full base row
-
-* *GIVEN* a row-scan `pushdown` request whose select list projects only literal/constant items and whose `orderBy` sorts on a source column absent from that projection (e.g. `SELECT 1 FROM t ORDER BY name LIMIT 5`), which the adapter cannot serve as a bounded top-N
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL project the full base row for this shape so the declined-ORDER-BY wrapper's outer `ORDER BY` resolves against emitted columns, and MUST NOT emit a narrowed literal-only projection whose declined-ORDER-BY wrapper references a column the scan no longer emits
-* *AND* this SHALL preserve the pre-fix behavior for this unsupported shape (a well-formed declined-ORDER-BY wrapper) rather than introduce a distinct scan-time failure mode

@@ -1,14 +1,17 @@
 # Feature: Pushdown Planning — Capability Extensions
 
 Extends pushdown planning (`vs-adapter/pushdown-planning`) with the getCapabilities-level
-capability advertisements the adapter has added since the base feature: arithmetic operator
-scalar functions, ordered top-N sort keys, CAST/unary-negation, and ISO week — plus the
-capabilities that were considered and deliberately kept absent (regexp scalar functions,
-bitwise operator functions). Each advertised capability is gated on a `crates/vs-expression`
-translator arm that renders it faithfully; each absent capability records why no faithful
-translation exists. Related capability-driven extensions — scalar select-list expression
-pushdown, HAVING pushdown, statistical aggregates, and literal projection — now live in their
-own sibling features (see the "See also" note at the end of the Background).
+capability advertisements for scalar and type-conversion functions the adapter has added
+since the base feature: arithmetic operator scalar functions, CAST/unary-negation, and ISO
+week — plus the capabilities that were considered and deliberately kept absent (regexp
+scalar functions, bitwise operator functions). Each advertised capability is gated on a
+`crates/vs-expression` translator arm that renders it faithfully; each absent capability
+records why no faithful translation exists. Ordered-sort-key capability advertisement
+(`ORDER_BY_COLUMN` / `ORDER_BY_EXPRESSION`) lives in its own sibling feature,
+`vs-adapter/pushdown-planning-order-by-capability`. Related capability-driven extensions —
+scalar select-list expression pushdown, HAVING pushdown, statistical aggregates, and literal
+projection — live in their own sibling features too (see the "See also" note at the end of
+the Background).
 
 ## Background
 
@@ -17,37 +20,18 @@ own sibling features (see the "See also" note at the end of the Background).
   `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, the divergent date
   functions, and the bitwise operator functions do not and stay unadvertised.
 * Credentials MUST NOT appear in any returned SQL or error message.
-* Exasol's re-apply behavior for a declined pushed clause varies by shape, which is why the
-  scenarios below are careful to state exactly what each capability's fallback does and does
-  not rely on Exasol to restore. Live precedent under `add-topn-pushdown` B5/B6 (issues #225 /
-  #189): an `orderBy` pushed TOGETHER with a `limit` is fully delegated — Exasol re-applies
-  neither, so the withheld-limit fallback returned wrong, unsorted, unbounded rows and the
-  adapter now renders a self-contained global `ORDER BY … LIMIT` (`topn.rs` lines 444-449,
-  `mod.rs` lines 690-694). An `orderBy` pushed WITHOUT a `limit` behaves differently: Exasol
-  keeps its own top-level `ORDER BY` and re-sorts the returned rows (`tests/e2e_scan_test.rs`
-  lines 1133-1138).
-* No code path omits an observable LIMIT, so there is nothing for an Exasol backstop to
-  restore. The adapter renders it everywhere it is observable — the grouped path passes
-  `limit` straight through (`mod.rs` line 405), and the row-scan declined-ORDER-BY path
-  re-renders it in the outer wrapper via `wrap_declined_order_by(…, limit)` (`mod.rs` lines
-  707-711). The single place `effective_limit` drops it (`mod.rs` line 594, when an ORDER BY
-  was pushed that the adapter did not render) is structurally unreachable for the one shape it
-  applies to, the single-group aggregate: the adapter advertises `ORDER_BY_COLUMN` and NOT
-  `ORDER_BY_EXPRESSION` (`capabilities.rs` lines 45-46), so Exasol pushes an `orderBy` only over
-  a bare projected column, and a single-group aggregate's output has no bare column to sort on.
-  Exasol therefore never pushes an `orderBy` for that shape, so the drop site never executes —
-  for ANY limit value, `LIMIT 0` included.
-* This delta asserts nothing new about `ORDER_BY_COLUMN` beyond the above. It leaves the ORDER
-  BY scenario's reliance clause exactly as recorded, so `vs-adapter/pushdown-planning-topn` —
-  whose "Unsupported ordered-query shapes decline the ordered-top-N path" scenario records the
-  same ORDER BY reliance for the same trigger set, and which makes no LIMIT-backstop claim of
-  its own — needs no amendment and is deliberately left untouched.
-* Iceberg spec compliance: checked, not engaged. This delta changes only which capabilities the
-  adapter advertises and how the corresponding expression/sort-key trees translate; it touches
-  no manifest, schema-resolution, field-id, or type-mapping surface, so no normative Iceberg
-  requirement applies and there is no deviation to fix or track.
-* See also: scalar/boolean select-list expression pushdown and widened-projection routing live
-  in `vs-adapter/pushdown-planning-selectlist-expressions`; HAVING pushdown and statistical
+* Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
+  spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
+  that could bear on this change are the ones governing what a reader must resolve —
+  schema/field-id resolution ("Schemas and Data Types", "Column Projection") and scan
+  planning ("Scan Planning", manifest/partition filtering). This feature touches none of
+  them: it changes only which scalar/type-conversion capabilities the adapter advertises,
+  reading no manifest and resolving no snapshot, field id, delete, or type mapping. No
+  normative requirement applies, so there is no deviation to fix and none to track.
+* See also: ordered-sort-key capability advertisement (`ORDER_BY_COLUMN` /
+  `ORDER_BY_EXPRESSION`) lives in `vs-adapter/pushdown-planning-order-by-capability`;
+  scalar/boolean select-list expression pushdown and widened-projection routing live in
+  `vs-adapter/pushdown-planning-selectlist-expressions`; HAVING pushdown and statistical
   aggregates live in `vs-adapter/pushdown-planning-aggregate-extensions`; literal/constant
   select-list projection lives in `vs-adapter/pushdown-planning-literal-projection`.
 
@@ -67,22 +51,6 @@ own sibling features (see the "See also" note at the end of the Background).
 * *WHEN* the `crates/vs-expression` translator cannot render a particular arithmetic node (e.g. an operator or operand shape it does not handle)
 * *THEN* the adapter SHALL fall back on the affected clause exactly as for any other untranslatable expression — a filter is omitted and retained by Exasol, a select-list expression falls back to projecting underlying columns, and an aggregate over the unrenderable argument falls back to row scanning
 * *AND* the adapter MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-
-### Scenario: ORDER_BY_COLUMN is advertised so ordered top-N queries can be pushed down
-
-* *GIVEN* the adapter's advertised capability set
-* *WHEN* Exasol requests `getCapabilities`
-* *THEN* the response SHALL advertise `ORDER_BY_COLUMN` so Exasol pushes column sort keys (with direction and NULL placement) and the accompanying `LIMIT` into the `pushdown` request, enabling the ordered-top-N partial/merge path in `vs-adapter/pushdown-planning-topn`
-* *AND* `ORDER_BY_EXPRESSION` SHALL remain absent, so Exasol never pushes an expression sort key the adapter has no bounded-sort path for
-* *AND* `LIMIT_WITH_OFFSET` SHALL remain absent, so Exasol never pushes an OFFSET and the ordered-top-N path needs no offset handling
-* *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised — advertising `ORDER_BY_COLUMN` MUST NOT introduce any additional join or cross-join capability
-
-### Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
-
-* *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, or a request that also carries aggregates / group keys / a `having`)
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL fall back to the pre-existing scan plan for that shape without pushing a per-shard row limit ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-* *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows
 
 ### Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
 

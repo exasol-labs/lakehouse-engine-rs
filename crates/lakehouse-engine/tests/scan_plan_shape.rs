@@ -446,6 +446,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         &[],                            // proj cols — unused on the aggregate path
         &[],                            // proj types — unused on the aggregate path
         None,                           // limit
+        None,                           // request_limit
         &[],                            // col_types — a product has no source column
         &["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
         "LAKEHOUSE_SCAN",
@@ -509,6 +510,7 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         &proj,
         &types,
         None,
+        None,
         &[],
         &[],
         "LAKEHOUSE_SCAN",
@@ -569,6 +571,7 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
         &proj,
         &types,
         Some(20),
+        None,
         &[],
         &[],
         "LAKEHOUSE_SCAN",
@@ -657,6 +660,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         &shards,
         &proj,
         &types,
+        None,
         None,
         &[],
         &[],

@@ -17,7 +17,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
   one: whether the HAVING can be rewritten over the `PARTIAL_*` merge columns decides WHICH
   shape is available (partial/merge grouped, or the qualified single-table wrapper), so the
   decision cannot be deferred to a path that has already committed to one shape. See
-  `vs-adapter/pushdown-planning-grouped-agg` for the fallback behavior this enables
+  `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback` for the fallback behavior this enables
   (issue #195).
 * Each path still renders its own SQL: the non-empty dispatch path splices the classifier's
   rendered HAVING fragment into the outer merge wrapper without re-rendering it, and the

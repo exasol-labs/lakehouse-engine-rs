@@ -1,4 +1,6 @@
-use crate::scan::spec::{CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec};
+use crate::scan::spec::{
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, render_ordered,
+};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
@@ -6,9 +8,10 @@ use vs_expression::render_df_filter_safe;
 
 use super::super::file_resolution::relativize_shards_to_root;
 use super::super::support::{
-    build_scan_driving_sql, extract_limit, quote_ident, shard_count, strip_table_alias,
+    build_scan_driving_sql, collect_all_column_names, extract_limit, quote_ident, shard_count,
+    strip_table_alias,
 };
-use super::super::topn::parse_sort_key_element;
+use super::super::topn::parse_sort_flags;
 use super::planning::{
     DetectedJoin, JoinSides, ResolvedJoinSide, disjoint_schema_guard, involved_table_columns,
 };
@@ -529,6 +532,7 @@ pub(super) fn build_side_fan_out_sql(
         &proj_cols,
         &proj_types,
         None,
+        None,
         &[],
         &[],
         udf_name,
@@ -593,6 +597,7 @@ pub(super) fn build_broadcast_join_sql(
         &rendered.projection,
         &rendered.projection_types,
         None,
+        None,
         &[],
         &[],
         udf_name,
@@ -650,9 +655,11 @@ fn qualified_join_having(
 }
 
 /// The N-scan wrapper's `ORDER BY` clause (without the keyword), table-qualified.
-/// `None` when the request carries no non-empty `orderBy`. Only bare-column sort
-/// keys are advertised (`ORDER_BY_COLUMN`); an element that is not a renderable bare
-/// column is a last-resort hard error (dropping it would return an unordered
+/// `None` when the request carries no non-empty `orderBy`. Any expression an
+/// involved-table column can render against — bare column or arbitrary
+/// expression tree — is rendered via [`render_expression_qualified`]; an element
+/// whose expression does not render (or whose direction/NULL-placement flags are
+/// absent) is a last-resort hard error (dropping it would return an unordered
 /// result Exasol delegated and no longer re-sorts; no native re-plan).
 fn qualified_join_order_by(
     pushdown_req: &Json,
@@ -675,37 +682,12 @@ fn qualified_join_order_by(
     };
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
-        let key = parse_sort_key_element(element).ok_or_else(decline)?;
+        let (ascending, nulls_last) = parse_sort_flags(element).ok_or_else(decline)?;
         let expr = element.get("expression").ok_or_else(decline)?;
         let rendered = render_expression_qualified(expr, alias_of).ok_or_else(decline)?;
-        parts.push(key.render_ordered(&rendered));
+        parts.push(render_ordered(&rendered, ascending, nulls_last));
     }
     Ok(Some(parts.join(", ")))
-}
-
-/// Record the UPPERCASE name of every `column` node in `expr`, recursively — the
-/// exhaustive walk that descends through scalar wrappers, CASE branches, and
-/// aggregate ARGUMENT sub-expressions, so a column nested inside `SUM(CASE WHEN
-/// region='R' THEN 1 END)` or `ROUND(100.0*SUM(x)/COUNT(*),2)` is surfaced, not just
-/// a top-level reference. A missed nested reference would leave the inner scan
-/// without a column the wrapper's rendered SQL names.
-fn collect_all_column_names(expr: &Json, out: &mut std::collections::HashSet<String>) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column")
-                && let Some(name) = map.get("name").and_then(|n| n.as_str())
-            {
-                out.insert(name.to_ascii_uppercase());
-            }
-            for value in map.values() {
-                collect_all_column_names(value, out);
-            }
-        }
-        Json::Array(items) => items
-            .iter()
-            .for_each(|item| collect_all_column_names(item, out)),
-        _ => {}
-    }
 }
 
 /// The subset of `all_cols` the qualified single-table wrapper actually references,
@@ -833,6 +815,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         shards,
         &proj_cols,
         &proj_types,
+        None,
         None,
         &[],
         &[],
@@ -1849,6 +1832,45 @@ mod tests {
         );
     }
 
+    /// An EXPRESSION (non-bare-column) ORDER BY key over a join — e.g.
+    /// `UPPER(orders.o_orderstatus)` — is rendered table-qualified in the unified
+    /// wrapper, with explicit direction + NULL placement, exactly like a bare
+    /// column (#198). Before this, `qualified_join_order_by` only accepted a bare
+    /// `column` expression node and declined (hard error) on anything else,
+    /// hiding a renderable ORDER BY expression behind a spurious pushdown failure.
+    #[test]
+    fn order_by_expression_renders_qualified_in_unified_wrapper() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["orderBy"] = serde_json::json!([
+            {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
+                {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+             "isAscending": false, "nullsLast": true},
+        ]);
+
+        assert!(join_requires_exasol_postprocessing(&pd(&request)));
+
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        )
+        .expect("ordered unified wrapper must build for a renderable expression sort key");
+        assert!(
+            sql.contains(r#"ORDER BY UPPER("LHS_T1"."O_ORDERDATE") DESC NULLS LAST"#),
+            "the expression ORDER BY key must be table-qualified with explicit \
+             direction/nulls, not declined: {sql}"
+        );
+    }
+
     /// `join_requires_exasol_postprocessing` fires for every clause the broadcast
     /// in-UDF join cannot serve, and is false for a plain projection+filter join.
     #[test]
@@ -2278,6 +2300,69 @@ mod tests {
         assert!(
             matches!(&err, UdfError::User(msg) if msg.contains("select-list item could not be rendered")),
             "the refusal must come from the shared select-list render site: {err}"
+        );
+    }
+
+    /// join-fallback scenario (#198, task 1.2), asserted at the FAMILY level: all
+    /// four qualified-wrapper entry points (N-scan join, grouped `GroupByWrapper`,
+    /// Case 2/3 `COUNT(DISTINCT)`, widened-projection row scan) reach this one
+    /// `outer_wrapper_clauses` seam, so asserting here covers every one of them at
+    /// once. A renderable EXPRESSION sort key must render table-qualified with its
+    /// direction and NULL placement — before #198 `qualified_join_order_by` accepted
+    /// only a bare `column` node and turned this into a spurious hard decline.
+    ///
+    /// The same fixture pins the trailing clause ORDER against regression: the
+    /// builder appends GROUP BY → HAVING → ORDER BY → LIMIT, and a `LIMIT` emitted
+    /// ahead of the `ORDER BY` would truncate BEFORE the sort — the unit-level
+    /// companion to the grouped top-N-groups e2e case's group-set equality.
+    #[test]
+    fn outer_wrapper_renders_qualified_expression_sort_key() {
+        let alias_of: HashMap<String, String> = [("T".to_string(), "LHS_T0".to_string())]
+            .into_iter()
+            .collect();
+        let aliases = vec!["LHS_T0".to_string()];
+        let cols_per_side = vec![vec![
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("NAME".to_string(), "VARCHAR(100)".to_string()),
+        ]];
+        // Group-key-only select list ordered by an expression the select list never
+        // names — issue #198's own shape — plus a LIMIT that must apply after it.
+        let pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+            "groupBy": [{"type": "column", "name": "ID", "tableName": "T"}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
+                    {"type": "column", "name": "NAME", "tableName": "T"}]},
+                "isAscending": false,
+                "nullsLast": true
+            }],
+            "limit": {"numElements": 4}
+        });
+
+        let clauses = outer_wrapper_clauses(&pushdown_req, &alias_of, &aliases, &cols_per_side)
+            .expect("a renderable expression sort key must render, not decline");
+
+        assert!(
+            clauses
+                .trailing
+                .contains(r#"ORDER BY UPPER("LHS_T0"."NAME") DESC NULLS LAST"#),
+            "the expression sort key must be table-qualified with explicit \
+             direction/nulls: {}",
+            clauses.trailing
+        );
+        let order_at = clauses
+            .trailing
+            .find("ORDER BY")
+            .expect("the trailing clauses must carry the ORDER BY");
+        let limit_at = clauses
+            .trailing
+            .find("LIMIT")
+            .expect("the trailing clauses must carry the LIMIT");
+        assert!(
+            order_at < limit_at,
+            "LIMIT must follow ORDER BY, or it truncates before the sort: {}",
+            clauses.trailing
         );
     }
 }

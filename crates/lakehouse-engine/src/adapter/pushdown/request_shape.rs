@@ -12,24 +12,25 @@
 //!   → row scan;
 //! - the [`validate_agg_col_types`] numeric-type gate on BOTH aggregate tiers (a
 //!   non-numeric aggregate demotes to the next shape);
-//! - whether a grouped HAVING renders over the partial/merge decomposition.
-//!   Renderability IS a routing predicate, so [`render_having_over_merge`] is
-//!   called HERE and its `None` routes to [`RequestShape::GroupByWrapper`] — which
-//!   renders the HAVING natively over the materialized rows — rather than dropping
-//!   it (issue #195).
+//! - whether a grouped HAVING renders over the partial/merge decomposition, and
+//!   whether a grouped ORDER BY resolves over it. Expressibility IS a routing
+//!   predicate, so [`render_having_over_merge`] and
+//!   [`build_grouped_order_by_clause`] are called HERE and their decline routes to
+//!   [`RequestShape::GroupByWrapper`] — which renders both natively over the
+//!   materialized rows — rather than dropping them (issue #195) or erroring
+//!   (issue #198).
 //!
-//! The grouped tier raises NO hard error. Every grouped decline — numeric-gate
-//! failure or an unrenderable HAVING, with or without a HAVING present — takes the
+//! The grouped tier raises NO hard error, and no rendering-level decline is left
+//! behind it. Every grouped decline — numeric-gate failure, an unrenderable HAVING,
+//! or an unresolvable merge ORDER BY, with or without either present — takes the
 //! same fall-through to `GroupByWrapper`.
 //!
 //! Each consumer renders only its own SQL from the returned shape; neither
-//! re-derives any part of this priority or these gates. The one rendering-level
-//! decline still living in the non-empty grouped rendering arm is an unresolvable
-//! grouped ORDER BY — rendering, not routing.
+//! re-derives any part of this priority or these gates.
 
 use serde_json::Value as Json;
 
-use super::grouped_agg::render_having_over_merge;
+use super::grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, render_having_over_merge};
 use super::single_group_agg::SingleGroupItem;
 use super::{
     GroupedAggregateDetection, detect_aggregates, detect_group_by_aggregates, ordinary_plans,
@@ -50,15 +51,23 @@ pub(super) enum RequestShape {
     /// it (a zero-row result already satisfies any HAVING). A HAVING that does not
     /// render over the merge never reaches this variant — it routes to
     /// [`RequestShape::GroupByWrapper`].
+    ///
+    /// `order_by` is the merge `ORDER BY` element list ALREADY RESOLVED over the
+    /// same decomposition (a group key as its positional output ordinal, an
+    /// aggregate as its merged `PARTIAL_*` expression), `None` when the request
+    /// carries no `orderBy`. Like `having`, an ordering that does not resolve never
+    /// reaches this variant.
     Grouped {
         detection: GroupedAggregateDetection,
         having: Option<String>,
+        order_by: Option<String>,
     },
     /// A GROUP BY request that did NOT decompose — an undecomposable select item, a
-    /// non-numeric aggregate that fell through the gate, or a HAVING that does not
-    /// render over the merge. Reached with or without a HAVING present; the wrapper
-    /// renders the HAVING natively over the materialized rows, so nothing is
-    /// dropped. It routes to the qualified single-table wrapper whose output columns
+    /// non-numeric aggregate that fell through the gate, a HAVING that does not
+    /// render over the merge, or an ORDER BY that does not resolve over it. Reached
+    /// with or without a HAVING or an ORDER BY present; the wrapper renders both
+    /// natively over the materialized rows, so nothing is dropped and nothing
+    /// errors. It routes to the qualified single-table wrapper whose output columns
     /// are the `selectList` items, NEVER a bare row scan (which would trip Exasol's
     /// positional column-count validation with SQL state `04000`).
     GroupByWrapper,
@@ -77,13 +86,14 @@ pub(super) enum RequestShape {
 ///
 /// Applies the 3-tier priority (grouped aggregate → single-group aggregate → row
 /// scan) with the [`validate_agg_col_types`] numeric gate on both aggregate tiers,
-/// and renders a grouped HAVING over the merge decomposition here, because whether
-/// it renders decides the shape.
+/// and resolves a grouped HAVING and a grouped ORDER BY over the merge decomposition
+/// here, because whether they can be expressed decides the shape.
 ///
-/// Every request resolves to a shape; both grouped declines — the numeric gate
-/// failing, and a HAVING that does not render over the merge — fall through to
-/// [`RequestShape::GroupByWrapper`], which renders the HAVING natively rather than
-/// dropping a predicate the adapter advertised AGGREGATE_HAVING for.
+/// Every request resolves to a shape; all three grouped declines — the numeric gate
+/// failing, a HAVING that does not render over the merge, and an ORDER BY that does
+/// not resolve over it — fall through to [`RequestShape::GroupByWrapper`], which
+/// renders both natively rather than dropping a predicate the adapter advertised
+/// AGGREGATE_HAVING for or an ordering it advertised ORDER_BY_* for.
 pub(super) fn classify_request_shape(
     pushdown_req: &Json,
     col_types: &[(String, String)],
@@ -94,11 +104,24 @@ pub(super) fn classify_request_shape(
         // non-numeric column (VARCHAR, DATE, …) would produce an opaque UDF error,
         // so it must demote rather than push down.
         if validate_agg_col_types(&detection.plans, col_types) {
+            // Resolve the merge ORDER BY HERE for the same reason as the HAVING
+            // below: the outer merge wrapper's only columns are `GK_*` and
+            // `PARTIAL_*`, so an aggregate absent from the select list has no
+            // partial to sort on and the adapter will not fabricate one (issue
+            // #198). `detect_group_by_aggregates` returns `Some` only for an
+            // `aggregationType` of `group_by`, so declining here is exactly the
+            // Tier 1b fall-through below.
+            let order_by = match build_grouped_order_by_clause(pushdown_req, &detection) {
+                Some(GroupedOrderBy::Clause(clause)) => Some(clause),
+                Some(GroupedOrderBy::Unresolvable) => return RequestShape::GroupByWrapper,
+                None => None,
+            };
             match pushdown_req.get("having").filter(|h| !h.is_null()) {
                 None => {
                     return RequestShape::Grouped {
                         detection,
                         having: None,
+                        order_by,
                     };
                 }
                 // Rewrite the HAVING over the merge HERE: the outer merge wrapper's
@@ -111,15 +134,17 @@ pub(super) fn classify_request_shape(
                         return RequestShape::Grouped {
                             detection,
                             having: Some(sql),
+                            order_by,
                         };
                     }
                 }
             }
         }
-        // Every grouped decline — numeric-gate failure or an unrenderable HAVING,
-        // with or without a HAVING — falls through to the GroupByWrapper tier below,
-        // which renders the HAVING natively over the materialized rows rather than
-        // dropping it (issue #195).
+        // Every grouped decline — numeric-gate failure, an unrenderable HAVING, or an
+        // unresolvable merge ORDER BY, with or without either present — falls through
+        // to the GroupByWrapper tier below, which renders both natively over the
+        // materialized rows rather than dropping them (issue #195) or erroring
+        // (issue #198).
     }
 
     // Tier 1b: a GROUP BY request that did not decompose above routes to the
@@ -345,6 +370,105 @@ mod tests {
             matches!(shape, RequestShape::GroupByWrapper),
             "a DISTINCT aggregate in the HAVING must fall through to the wrapper: {shape:?}"
         );
+    }
+
+    /// Issue #198's own grouped repro — a GROUP-KEY-ONLY select list ordered by an
+    /// aggregate absent from it, plus a `LIMIT` (`SELECT c_nationkey FROM CUSTOMER
+    /// GROUP BY c_nationkey ORDER BY SUM(c_acctbal) DESC LIMIT 5`) — reaches the
+    /// wrapper through an EMPTY aggregate-plan list: its lone select item classifies
+    /// as a group key, so grouped detection succeeds with zero plans, the numeric
+    /// gate passes vacuously, and the sort key then resolves against zero plans. It
+    /// is NOT filtered out ahead of detection, and it MUST NOT error.
+    #[test]
+    fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "REGION"}],
+            "selectList": [{"type": "column", "name": "REGION"}],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": agg_item("SUM", Some("AMOUNT"), false),
+                "isAscending": false,
+                "nullsLast": true,
+            }],
+            "limit": 5,
+        });
+        assert!(
+            detect_group_by_aggregates(&req)
+                .expect("a group-key-only select list still detects as grouped")
+                .plans
+                .is_empty(),
+            "the group-key-only shape must reach the classifier with an EMPTY plan list"
+        );
+        let shape = classify_request_shape(&req, &col_types());
+        assert!(
+            matches!(shape, RequestShape::GroupByWrapper),
+            "an aggregate sort key resolvable against no plan must route to the wrapper, not Err: {shape:?}"
+        );
+    }
+
+    /// The same unresolvable outcome from the OTHER direction: the select list
+    /// carries a DIFFERENT aggregate (`COUNT(*)`), so the plan list is NON-empty and
+    /// the sort key simply matches none of it. Same route, different plan-list state.
+    #[test]
+    fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "REGION"}],
+            "selectList": [
+                {"type": "column", "name": "REGION"},
+                agg_item("COUNT", None, false),
+            ],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": agg_item("SUM", Some("AMOUNT"), false),
+                "isAscending": false,
+                "nullsLast": true,
+            }],
+        });
+        assert_eq!(
+            detect_group_by_aggregates(&req)
+                .expect("grouped aggregate")
+                .plans
+                .len(),
+            1,
+            "this shape must reach the classifier with a NON-empty plan list"
+        );
+        let shape = classify_request_shape(&req, &col_types());
+        assert!(
+            matches!(shape, RequestShape::GroupByWrapper),
+            "a sort key matching none of the non-empty plans must route to the wrapper: {shape:?}"
+        );
+    }
+
+    /// A RESOLVABLE grouped `ORDER BY` still decomposes, and the classifier carries
+    /// the already-rendered clause on the shape — the dispatcher no longer resolves
+    /// it, so a classifier that always returned `None` here would silently drop
+    /// every grouped ordering.
+    #[test]
+    fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
+        let req = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "REGION"}],
+            "selectList": [
+                {"type": "column", "name": "REGION"},
+                agg_item("SUM", Some("AMOUNT"), false),
+            ],
+            "orderBy": [{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "REGION"},
+                "isAscending": true,
+                "nullsLast": true,
+            }],
+        });
+        match classify_request_shape(&req, &col_types()) {
+            RequestShape::Grouped { order_by, .. } => assert_eq!(
+                order_by.as_deref(),
+                Some("1 ASC NULLS LAST"),
+                "the classifier must carry the resolved merge ORDER BY"
+            ),
+            other => panic!("expected Grouped, got {other:?}"),
+        }
     }
 
     /// A single-group NUMERIC aggregate (no GROUP BY) classifies as single-group,

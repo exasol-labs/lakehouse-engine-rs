@@ -1,7 +1,7 @@
 /// Virtual Schema capabilities for the Lakehouse VS adapter.
 ///
-/// Reports projection, filter predicates, LIMIT, ORDER BY (bare column keys), and
-/// single-group aggregate pushdown.
+/// Reports projection, filter predicates, LIMIT, ORDER BY (bare-column and
+/// expression sort keys), and single-group aggregate pushdown.
 use serde_json::{Value as Json, json};
 
 /// The set of capabilities this VS adapter advertises to Exasol.
@@ -41,9 +41,12 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_PRED_REGEXP_LIKE",
     // LIMIT pushdown
     "LIMIT",
-    // ORDER BY pushdown: bare-column sort keys only (add-topn-pushdown).
-    // ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET stay unadvertised — no backing path.
+    // ORDER BY pushdown: bare-column sort keys (add-topn-pushdown) and expression
+    // sort keys (issue #198), backed by the declined row-scan wrapper, the grouped
+    // merge, and the qualified wrapper — see docs/capabilities.md for the full
+    // explanation. LIMIT_WITH_OFFSET stays unadvertised — no backing path.
     "ORDER_BY_COLUMN",
+    "ORDER_BY_EXPRESSION",
     // Arithmetic binary-operator functions (issue #59, task 1.2)
     "FN_ADD",
     "FN_SUB",
@@ -552,19 +555,19 @@ mod tests {
             !has_listagg,
             "LISTAGG/GROUP_CONCAT must not be advertised: {cap_strs:?}"
         );
-        // ORDER_BY_COLUMN is now advertised (add-topn-pushdown): a bare-column sort
-        // key backs the per-shard bounded top-N + Exasol-side merge. Expression sort
-        // keys and OFFSET remain unadvertised — no backing path exists for either.
+        // ORDER_BY_COLUMN backs the per-shard bounded top-N + Exasol-side merge.
+        // Backing-path detail (incl. ORDER_BY_EXPRESSION, issue #198) is documented
+        // once on the `CAPABILITIES` const above; its advertisement is covered by
+        // `advertises_order_by_column_and_expression`. OFFSET remains unadvertised —
+        // no backing path exists for it.
         assert!(
             cap_strs.contains(&"ORDER_BY_COLUMN"),
             "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
         );
-        for name in &["ORDER_BY_EXPRESSION", "LIMIT_WITH_OFFSET"] {
-            assert!(
-                !cap_strs.contains(name),
-                "{name} must NOT be advertised: {cap_strs:?}"
-            );
-        }
+        assert!(
+            !cap_strs.contains(&"LIMIT_WITH_OFFSET"),
+            "LIMIT_WITH_OFFSET must NOT be advertised: {cap_strs:?}"
+        );
         // Inner equi-join pushdown is advertised (add-join-pushdown-broadcast);
         // outer joins, non-equi ("all condition") joins, and any Cartesian product
         // remain out of scope and must not be advertised.
@@ -592,7 +595,24 @@ mod tests {
         }
     }
 
-    /// Scenario: Adapter advertises projection, filter, and LIMIT capabilities.
+    /// Scenario: Adapter advertises both bare-column and expression ORDER BY sort
+    /// keys (issue #198) — backing paths documented on the `CAPABILITIES` const above.
+    #[test]
+    fn advertises_order_by_column_and_expression() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        assert!(
+            cap_strs.contains(&"ORDER_BY_COLUMN"),
+            "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
+        );
+        assert!(
+            cap_strs.contains(&"ORDER_BY_EXPRESSION"),
+            "ORDER_BY_EXPRESSION must be advertised: {cap_strs:?}"
+        );
+    }
+
     #[test]
     fn reports_projection_filter_and_limit_capabilities() {
         let resp = get_capabilities_response();

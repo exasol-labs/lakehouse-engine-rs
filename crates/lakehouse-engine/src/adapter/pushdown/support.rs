@@ -81,6 +81,11 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 /// `aggregate_types` holds the Exasol-declared result type of each aggregate (from
 /// `aggregate_exasol_types`); the single-group merge casts each item to its declared
 /// type. Pass `&[]` to emit uncast merge items (row scans never read it).
+///
+/// `request_limit` is the RAW request limit, distinct from `limit` (which the
+/// row-scan sub-path renders unchanged). It is consumed ONLY by the aggregate
+/// sub-path: `LIMIT n` on a guaranteed one-row merge is a no-op for `n >= 1` and
+/// correct for `n = 0`. The row-scan sub-path ignores it entirely.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -88,6 +93,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
+    request_limit: Option<u64>,
     col_types: &[(String, String)],
     aggregate_types: &[String],
     udf_name: &str,
@@ -100,6 +106,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             aggregates,
             col_types,
             aggregate_types,
+            request_limit,
             udf_name,
             distribute_udf_name,
         )
@@ -195,6 +202,12 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
 /// The EMITS clause names and types follow the COLUMN CONTRACT defined in
 /// `crate::scan::build_partial_agg_sql`.  The outer merge SELECT consumes those
 /// exact column names.
+///
+/// `request_limit` renders as a trailing `LIMIT n` on the outer merge SELECT when
+/// `Some(n)` — a no-op over the guaranteed one-row merge for `n >= 1`, correct for
+/// `n = 0` (issue #198: a pushed `LIMIT 0` must return zero rows, not be silently
+/// dropped because the aggregate sub-path had no limit value to render before this
+/// parameter existed).
 #[allow(clippy::too_many_arguments)]
 fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -202,6 +215,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
     aggregate_types: &[String],
+    request_limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
@@ -217,7 +231,11 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // those partials equals the single-node aggregate (result-equivalence, [7]).
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
-    format!("SELECT {merge_select} FROM ({fan_out})")
+    let mut sql = format!("SELECT {merge_select} FROM ({fan_out})");
+    if let Some(n) = request_limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    sql
 }
 
 /// Build the outer wrapper SQL for a lone single-group `COUNT(DISTINCT ...)` — Case 1
@@ -1214,6 +1232,39 @@ pub(super) fn project_columns(
     Ok((proj_names, proj_types, needs_full_fallback))
 }
 
+/// Recursively collect every bare-column reference's UPPERCASE name found anywhere
+/// within `value` into `names` — walking arrays, objects, and nested `expression`
+/// wrappers alike, so it works uniformly over a `selectList`, a `filter`/`having`
+/// expression tree, or a `groupBy`/`orderBy` array for both of this function's
+/// callers (the topn hidden-column path and the join wrapper's column projection).
+/// Walking every nested field, not just top-level entries, matters because a column
+/// can be buried inside a function call or operator — e.g. `SUM(CASE WHEN
+/// region='R' THEN 1 END)` — and a missed nested reference would leave the inner
+/// scan without a column the wrapper's rendered SQL names.
+pub(super) fn collect_all_column_names(
+    value: &Json,
+    names: &mut std::collections::HashSet<String>,
+) {
+    match value {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column")
+                && let Some(name) = map.get("name").and_then(|n| n.as_str())
+            {
+                names.insert(name.to_uppercase());
+            }
+            for v in map.values() {
+                collect_all_column_names(v, names);
+            }
+        }
+        Json::Array(items) => {
+            for item in items {
+                collect_all_column_names(item, names);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Extract LIMIT from the pushdown request.
 pub(super) fn extract_limit(pushdown_req: &Json) -> Option<u64> {
     pushdown_req
@@ -1532,6 +1583,7 @@ mod tests {
             &shards,
             &[ProjectionItem::Column("ID".into())],
             &["DECIMAL(20,0)".to_string()],
+            None,
             None,
             &[],
             &[],
@@ -2109,6 +2161,7 @@ mod tests {
             &["AMOUNT".into()],
             &["DOUBLE PRECISION".to_string()],
             None,
+            None,
             &col_types,
             &[],
             SCAN_UDF_NAME,
@@ -2275,6 +2328,7 @@ mod tests {
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
@@ -2320,11 +2374,51 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         )
+    }
+
+    /// The aggregate merge SELECT renders `LIMIT n` on the outer wrapper when
+    /// `request_limit` is `Some(n)` — the render site issue #198 needs so a pushed
+    /// `LIMIT 0` over a one-row aggregate merge returns zero rows instead of being
+    /// silently dropped (no limit value reachable inside the aggregate sub-path
+    /// carried the request's raw limit before this parameter existed).
+    #[test]
+    fn aggregate_merge_renders_request_limit_when_some() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                aggregates: Some(plans),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &[],
+            &[],
+            None,
+            Some(0),
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        );
+        assert!(
+            sql.ends_with("LIMIT 0"),
+            "aggregate merge must render the request LIMIT: {sql}"
+        );
     }
 
     /// Aggregate wrapper merges partials: outer SELECT aggregates per-shard COUNT/SUM/MIN/MAX.
@@ -2516,6 +2610,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             &col_types,
             &aggregate_types,
             SCAN_UDF_NAME,
@@ -2549,6 +2644,7 @@ mod tests {
             &shards,
             &[],
             &[],
+            None,
             None,
             &[],
             &[],
@@ -3181,6 +3277,7 @@ mod tests {
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
@@ -3219,6 +3316,7 @@ mod tests {
             &shards,
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
+            None,
             None,
             &[],
             &[],

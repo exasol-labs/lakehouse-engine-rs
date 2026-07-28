@@ -2,13 +2,13 @@
 //!
 //! Extracted verbatim from the former flat `pushdown.rs`.
 
-use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec};
+use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec, render_ordered};
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
 use super::support::{build_fan_out_inner, exasol_type_from_json, quote_ident};
-use super::topn::parse_sort_key_element;
+use super::topn::parse_sort_flags;
 
 /// Classification of one `selectList` item in a grouped-aggregate pushdown.
 ///
@@ -508,17 +508,27 @@ pub(super) fn group_key_exasol_types(
 /// lexicographic VARCHAR `GK_*` staging column (a plain `ORDER BY "GK_0"` would sort
 /// `1,10,11,2,…`, corrupting a numeric order).
 ///
-/// Each bare-column sort key must map to a group key (a bare-column `ORDER BY` in a
-/// GROUP BY query is only legal on a grouped column). It is matched to its group-key
-/// slot exactly as `detect_group_by_aggregates` matches select items (rendered-SQL
-/// equality), then to that group key's `selectList` ordinal (its output position,
-/// since the outer SELECT is assembled in `selectList` order with no gaps). Returns
-/// `None` when there is no `orderBy`, and the caller declines the pushdown when a key
-/// is present but cannot be resolved to a grouped output column — a shape SQL forbids.
+/// A sort key that IS a group key is matched to its group-key slot exactly as
+/// `detect_group_by_aggregates` matches select items (rendered-SQL equality), then to
+/// that group key's `selectList` ordinal (its output position, since the outer SELECT
+/// is assembled in `selectList` order with no gaps).
+///
+/// A sort key that is an AGGREGATE among the detected plans is rewritten to that
+/// aggregate's MERGED expression over the `PARTIAL_*` columns by
+/// [`render_having_over_merge`] — the same rewriter and the same `AggregatePlan`
+/// equality match the merged HAVING uses. The merge wrapper is a GROUP BY query, so
+/// its `ORDER BY` may reference an aggregate expression directly; no hidden output
+/// column is added, so Exasol's positional `selectListDataTypes` validation of the
+/// visible SELECT list is unaffected.
+///
+/// Returns `None` when there is no `orderBy`. Anything else — an aggregate absent from
+/// the plans (no `PARTIAL_*` column exists and the adapter will not fabricate one), a
+/// bare column that is no group key, a node the merge rewriter does not express — is
+/// [`GroupedOrderBy::Unresolvable`], which routes the request to the qualified
+/// single-table wrapper (issue #198).
 pub(super) fn build_grouped_order_by_clause(
     pushdown_req: &Json,
-    group_keys: &[String],
-    select_items: &[GroupedSelectItem],
+    detection: &GroupedAggregateDetection,
 ) -> Option<GroupedOrderBy> {
     let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
     if elements.is_empty() {
@@ -526,41 +536,48 @@ pub(super) fn build_grouped_order_by_clause(
     }
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
-        let key = match parse_sort_key_element(element) {
-            Some(k) => k,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        // Flags only: an aggregate sort key is no bare `column` node, so
+        // `parse_sort_key_element` would yield no `SortKey` to render through. A
+        // missing flag is never defaulted — a wrong guess is a wrong order.
+        let Some((ascending, nulls_last)) = parse_sort_flags(element) else {
+            return Some(GroupedOrderBy::Unresolvable);
         };
-        let rendered = match element
-            .get("expression")
-            .and_then(|e| render_expression(e).ok())
-        {
-            Some(r) => r,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        let Some(expr) = element.get("expression") else {
+            return Some(GroupedOrderBy::Unresolvable);
         };
-        let slot = match group_keys.iter().position(|gk| *gk == rendered) {
-            Some(s) => s,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        let ordering = match group_key_output_ordinal(expr, detection) {
+            Some(ordinal) => ordinal.to_string(),
+            None => match render_having_over_merge(expr, &detection.plans) {
+                Some(merged) => merged,
+                None => return Some(GroupedOrderBy::Unresolvable),
+            },
         };
-        // Output position of this group key = its selectList ordinal (1-based for SQL).
-        let select_index = select_items.iter().find_map(|it| match it {
-            GroupedSelectItem::GroupKey {
-                group_key_slot,
-                select_index,
-            } if *group_key_slot == slot => Some(*select_index),
-            _ => None,
-        });
-        match select_index {
-            Some(idx) => parts.push(key.render_ordered(&(idx + 1).to_string())),
-            None => return Some(GroupedOrderBy::Unresolvable),
-        }
+        parts.push(render_ordered(&ordering, ascending, nulls_last));
     }
     Some(GroupedOrderBy::Clause(parts.join(", ")))
 }
 
+/// The 1-based merge-output ordinal of a sort-key expression that IS one of the
+/// group keys, or `None` when it is not a group key (or its group key has no
+/// `selectList` ordinal of its own).
+fn group_key_output_ordinal(expr: &Json, detection: &GroupedAggregateDetection) -> Option<usize> {
+    let rendered = render_expression(expr).ok()?;
+    let slot = detection.group_keys.iter().position(|gk| *gk == rendered)?;
+    detection.select_items.iter().find_map(|it| match it {
+        GroupedSelectItem::GroupKey {
+            group_key_slot,
+            select_index,
+        } if *group_key_slot == slot => Some(select_index + 1),
+        _ => None,
+    })
+}
+
 /// Outcome of resolving a grouped-aggregate merge `ORDER BY` (see
-/// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key that
-/// cannot be mapped to a grouped output column — the caller declines the pushdown
-/// as a hard error rather than emitting a merge that silently drops the ordering.
+/// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key the
+/// merge decomposition cannot express; `classify_request_shape` routes such a
+/// request to the qualified single-table wrapper, which renders the ordering
+/// natively over materialized rows, rather than emitting a merge that would silently
+/// drop it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GroupedOrderBy {
     Clause(String),
@@ -1455,7 +1472,7 @@ mod tests {
         let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
         // The group key ID is output column 1 → positional ordinal, explicit dir+nulls.
         assert_eq!(
-            build_grouped_order_by_clause(&req, &result.group_keys, &result.select_items),
+            build_grouped_order_by_clause(&req, &result),
             Some(GroupedOrderBy::Clause("1 ASC NULLS LAST".to_string())),
             "grouped ORDER BY must map the sort key to its 1-based output ordinal"
         );
@@ -1483,6 +1500,75 @@ mod tests {
         );
         // No LIMIT was requested, so none is rendered.
         assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
+    }
+
+    /// An `ORDER BY` on an aggregate that IS among the detected select-list plans
+    /// resolves to that aggregate's MERGED expression over the `PARTIAL_*` columns —
+    /// the same rewrite, by the same `AggregatePlan`-equality match, the merged
+    /// HAVING uses (issue #198). A group-key element mixed into the same `orderBy`
+    /// still renders as its positional output ordinal, unchanged.
+    #[test]
+    fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("SUM", Some("AMOUNT"), false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(36, 2)]),
+        );
+        req["orderBy"] = serde_json::json!([
+            {
+                "type": "order_by_element",
+                "expression": agg_item("SUM", Some("AMOUNT"), false),
+                "isAscending": false,
+                "nullsLast": true,
+            },
+            {
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "ID"},
+                "isAscending": true,
+                "nullsLast": false,
+            },
+        ]);
+
+        let detection = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        assert_eq!(
+            build_grouped_order_by_clause(&req, &detection),
+            Some(GroupedOrderBy::Clause(
+                r#"SUM("PARTIAL_sum_0") DESC NULLS LAST, 1 ASC NULLS FIRST"#.to_string()
+            )),
+            "an aggregate sort key must render as its merged partial, a group key as its ordinal"
+        );
+    }
+
+    /// An `ORDER BY` on an aggregate ABSENT from the detected plans has no
+    /// `PARTIAL_*` column to merge over, and the adapter does not fabricate one:
+    /// the resolution reports `Unresolvable`, which `classify_request_shape` turns
+    /// into a `GroupByWrapper` route (issue #198).
+    #[test]
+    fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
+        );
+        req["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": agg_item("SUM", Some("AMOUNT"), false),
+            "isAscending": false,
+            "nullsLast": true,
+        }]);
+
+        let detection = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        assert_eq!(
+            build_grouped_order_by_clause(&req, &detection),
+            Some(GroupedOrderBy::Unresolvable),
+            "an aggregate with no matching plan must not resolve to a fabricated partial"
+        );
     }
 
     /// Scalar expression in GROUP BY (e.g., function_scalar YEAR) renders via render_expression.

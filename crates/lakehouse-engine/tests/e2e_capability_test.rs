@@ -2544,3 +2544,517 @@ fn e2e_instr_arity_decline_where_matches_native_oracle() {
          compute strpos('bb','b')=1, never matching id=4)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 8.18  ORDER BY on an expression or aggregate outside the select list (#198)
+// ---------------------------------------------------------------------------
+//
+// `ORDER_BY_EXPRESSION` is advertised, so Exasol pushes a structured `orderBy`
+// for an expression or aggregate sort key instead of silently appending that
+// key to the `selectList` — the append is what surfaced pre-fix as an extra
+// result column named `HIDDEN_COL_n`. Every case below asserts BOTH halves:
+// no leaked column, AND the pushed ordering genuinely applied. The second half
+// is not redundant — advertising the capability with no backing path returns
+// rows in raw file order with no error at all, which is strictly worse than
+// the leak it replaces (plan decision-log [2], measured live).
+//
+// All cases run against `typed_distinct_probe` (`vs_typed_table()`), 12 rows,
+// `id` 1..12 with one row per `id`. Every expected ordering below is computed
+// by hand from `common/seed.rs`'s `typed_probe()`:
+//
+//   id       1  2     3  4  5  6  |  7  8  9  10    11  12
+//   c_price  2  3  NULL  4  2  5  |  2  3  6   4  NULL   5
+//   c_qty    3  2     5  1  3  2  |  6  4  1   2     3   4
+//
+// `c_price` is NULL for id 3 and 11; `c_qty` has no NULLs. Exasol's default
+// NULL placement is NULLS FIRST under DESC and NULLS LAST under ASC —
+// confirmed against a native in-session oracle
+// (`SELECT V FROM (SELECT 1 AS V UNION ALL SELECT NULL UNION ALL SELECT 3)
+// ORDER BY V DESC` → NULL, 3, 1) — and the adapter renders whichever
+// placement Exasol pushes on the wire, so the NULL rows' positions are part of
+// what these tests pin.
+
+/// Run `sql` and return `(column names, column-major data)`.
+///
+/// `query_columns` drops the result-set metadata, but a `HIDDEN_COL_n` leak is
+/// visible ONLY in the column NAMES — the arity alone does not distinguish a
+/// leaked sort key from a legitimately selected third column.
+fn query_named_columns(
+    conn: &mut ExaConn,
+    sql: &str,
+) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
+    let resp = conn.execute(sql);
+    let result_set = resp["responseData"]["results"][0]["resultSet"].clone();
+    let names: Vec<String> = result_set["columns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected result-set column metadata for:\n{sql}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let cols = conn.fetch_result_columns(&result_set);
+    (names, cols)
+}
+
+/// Assert the result leaked no synthetic `HIDDEN_COL_n` column (#198).
+fn assert_no_hidden_columns(names: &[String], sql: &str) {
+    assert!(
+        !names.iter().any(|n| n.starts_with("HIDDEN_COL")),
+        "result must not leak a synthetic HIDDEN_COL_n column (#198), got \
+         columns {names:?} for:\n{sql}"
+    );
+}
+
+/// Extract the REAL wire `pushdownRequest` object Exasol sent the adapter for
+/// `sql`, as parsed JSON.
+///
+/// `EXPLAIN VIRTUAL` returns the adapter-generated SQL *and* a column carrying
+/// the echoed adapter exchange (`getCapabilities` + `pushdown` request /
+/// response) as a JSON array. `explain_virtual_sql` flattens all of that into
+/// one blob, which is fine for substring-matching the generated SQL but too
+/// coarse to assert on Exasol's wire payload — a `contains("limit")` there also
+/// matches the adapter's own snake_case scan-spec keys, and misses an uppercase
+/// rendered `LIMIT`. This picks out the `pushdownRequest` object itself so its
+/// keys can be asserted directly.
+fn explain_virtual_pushdown_request(conn: &mut ExaConn, sql: &str) -> serde_json::Value {
+    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {sql}"));
+    let result_set = resp["responseData"]["results"][0]["resultSet"].clone();
+    conn.fetch_result_columns(&result_set)
+        .iter()
+        .flat_map(|col| col.iter())
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .flat_map(|v| v.as_array().cloned().unwrap_or_default())
+        .find_map(|entry| entry.get("pushdownRequest").cloned())
+        .unwrap_or_else(|| panic!("EXPLAIN VIRTUAL carried no echoed pushdownRequest for:\n{sql}"))
+}
+
+/// Collect a column's integer values as a set, for assertions over a group set
+/// whose internal row order is not deterministic (ties on the sort measure).
+fn int_set(values: &[serde_json::Value]) -> std::collections::HashSet<i64> {
+    values.iter().map(parse_int).collect()
+}
+
+/// Row scan: an expression sort key absent from the select list leaks no
+/// `HIDDEN_COL_n` and still orders the result correctly (#198, tasks 9.1/9.2).
+///
+/// Case 1 (single key) is the plan's row-scan repro. Its sort expression
+/// references only `c_price`, which is ALREADY a visible select-list column,
+/// so the declined-ORDER-BY wrapper must append NO extra scan column — the
+/// "at most once, never invented" rule.
+///
+/// Case 2 (two keys) adds a second key over `c_qty`, which is NOT selected, so
+/// exactly one hidden base column is appended after the two visible ones while
+/// `c_price` is still not duplicated. Both keys must render, with their own
+/// direction and NULL placement, or the second key's tie-break ordering below
+/// cannot hold.
+#[test]
+fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // --- Case 1: single expression sort key, not selected (task 9.1) -------
+    let sql = format!(
+        "SELECT id, c_price FROM {} WHERE id<=5 ORDER BY ABS(c_price) DESC",
+        vs_typed_table()
+    );
+
+    // The sort expression references only the already-projected C_PRICE, so
+    // the scan spec's projection must stay at the two visible columns.
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("\"projection\":[\"ID\",\"C_PRICE\"]"),
+        "ABS(c_price) references only the already-visible C_PRICE, so no extra \
+         hidden scan column may be appended, got:\n{pushed}"
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names,
+        vec!["ID".to_string(), "C_PRICE".to_string()],
+        "expected exactly the two visible select-list columns"
+    );
+    assert_eq!(cols[0].len(), 5, "expected 5 rows (id 1..5): {cols:?}");
+
+    // ids 1..5 prices 2, 3, NULL, 4, 2 → DESC NULLS FIRST:
+    // id 3 (NULL), id 4 (4), id 2 (3), then ids 1 and 5 tied at 2.
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        &ids[..3],
+        &[3, 4, 2],
+        "ORDER BY ABS(c_price) DESC over ids 1..5 must yield NULL first then \
+         4.0, 3.0, got ids={ids:?}"
+    );
+    assert_eq!(
+        int_set(&cols[0][3..5]),
+        std::collections::HashSet::from([1, 5]),
+        "ids 1 and 5 both have c_price 2.0 (tied last), got ids={ids:?}"
+    );
+
+    // --- Case 2: two expression sort keys, neither selected (task 9.2) -----
+    let sql2 = format!(
+        "SELECT id, c_price FROM {} ORDER BY ABS(c_price) DESC, c_qty+1 ASC",
+        vs_typed_table()
+    );
+
+    let pushed2 = explain_virtual_sql(&mut conn, &sql2);
+    assert!(
+        pushed2.contains("\"projection\":[\"ID\",\"C_PRICE\",\"C_QTY\"]"),
+        "the second key's base column C_QTY must be appended ONCE after the \
+         visible items, and C_PRICE must not be duplicated, got:\n{pushed2}"
+    );
+
+    let (names2, cols2) = query_named_columns(&mut conn, &sql2);
+    assert_no_hidden_columns(&names2, &sql2);
+    assert_eq!(
+        names2,
+        vec!["ID".to_string(), "C_PRICE".to_string()],
+        "the hidden C_QTY scan column must not reach the visible result"
+    );
+    assert_eq!(cols2[0].len(), 12, "expected all 12 rows: {cols2:?}");
+
+    // ABS(c_price) DESC NULLS FIRST, then c_qty+1 ASC:
+    //   NULL: id 11 (qty 3), id 3 (qty 5)
+    //   6.0:  id 9   | 5.0: id 6 (qty 2), id 12 (qty 4)
+    //   4.0:  id 4 (qty 1), id 10 (qty 2)
+    //   3.0:  id 2 (qty 2), id 8 (qty 4)
+    //   2.0:  ids 1 and 5 (both qty 3, fully tied), then id 7 (qty 6)
+    let ids2: Vec<i64> = cols2[0].iter().map(parse_int).collect();
+    assert_eq!(
+        &ids2[..9],
+        &[11, 3, 9, 6, 12, 4, 10, 2, 8],
+        "both sort keys must render: primary ABS(c_price) DESC NULLS FIRST, \
+         secondary c_qty+1 ASC as the tie-break, got ids={ids2:?}"
+    );
+    assert_eq!(
+        int_set(&cols2[0][9..11]),
+        std::collections::HashSet::from([1, 5]),
+        "ids 1 and 5 tie on BOTH keys (price 2.0, qty 3), got ids={ids2:?}"
+    );
+    assert_eq!(
+        ids2[11], 7,
+        "id 7 (price 2.0, qty 6) must sort last under the ASC tie-break, got \
+         ids={ids2:?}"
+    );
+}
+
+/// Grouped, issue #198's own repro shape: a group-key-only select list with an
+/// `ORDER BY` over an aggregate that is not selected, plus a `LIMIT` that must
+/// genuinely cut groups (task 9.3).
+///
+/// This routes through `RequestShape::GroupByWrapper` — the qualified
+/// single-table wrapper — so it is also the end-to-end coverage for that entry
+/// point of the wrapper family (task 1.2).
+///
+/// `id` has 12 distinct values over the 12-row seed (one group per row), so
+/// `LIMIT 4` drops 8 groups. `SUM(c_qty)` per `id` is just `c_qty`, whose top
+/// values are 6 (id 7), 5 (id 3), then 4 (ids 8 and 12) — the tie at the 4th
+/// position falls ENTIRELY inside the limit, so the returned group SET is
+/// deterministic even though the row order within that tie is not. Group-set
+/// EQUALITY is what proves the `LIMIT` is both rendered AND applied AFTER the
+/// `ORDER BY`: a limit applied before the ordering, or absent, fails it.
+/// `SUM(c_price)` is deliberately NOT used — `c_price` is NULL for ids 3 and
+/// 11, which would make the assertion depend on NULL placement under `DESC`.
+#[test]
+fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} GROUP BY id ORDER BY SUM(c_qty) DESC LIMIT 4",
+        vs_typed_table()
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names,
+        vec!["ID".to_string()],
+        "expected exactly the one visible group-key column"
+    );
+    assert_eq!(
+        cols[0].len(),
+        4,
+        "LIMIT 4 over 12 groups must return exactly 4 rows: {cols:?}"
+    );
+
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        int_set(&cols[0]),
+        std::collections::HashSet::from([7, 3, 8, 12]),
+        "the 4 returned groups must be the true top 4 by SUM(c_qty) \
+         (6, 5, 4, 4), got ids={ids:?} — a LIMIT applied before the ORDER BY, \
+         or not rendered at all, returns a different set"
+    );
+    assert_eq!(
+        &ids[..2],
+        &[7, 3],
+        "the two groups above the tie are unambiguously ordered: id 7 \
+         (SUM=6) then id 3 (SUM=5), got ids={ids:?}"
+    );
+}
+
+/// Grouped: an aggregate sort key absent from the select list leaks no
+/// `HIDDEN_COL_n` when a DIFFERENT aggregate is already selected — and the
+/// variant whose sort key IS selected keeps the partial/merge path (task 9.4).
+///
+/// Case 1 reaches `GroupedOrderBy::Unresolvable` with a NON-empty plan list
+/// (one `COUNT(*)` plan the sort key does not match), the same wrapper route
+/// as the group-key-only shape above but from a different plan-list state.
+///
+/// Case 2 is the control that must NOT route to the wrapper: `SUM(c_price)` is
+/// in the select list, so the sort key resolves against that plan's merged
+/// partial expression and the partial/merge decomposition is retained. It is
+/// distinguished from Case 1 by the scan spec carrying `group_keys` (a
+/// per-shard partial aggregation) and the merge SELECT ordering on
+/// `SUM("PARTIAL_sum_…")` rather than on a base column.
+///
+/// `c_bool` groups: true (ids 1,2,5,6,7,9,11,12), false (ids 4,8), NULL (ids
+/// 3,10). `SUM(c_price)` is 25 / 7 / 4 respectively — all non-NULL, so the
+/// group order under `DESC` is deterministic without depending on NULL
+/// placement.
+#[test]
+fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // --- Case 1: sort aggregate NOT selected, another aggregate selected ---
+    let sql = format!(
+        "SELECT c_bool, COUNT(*) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
+        vs_typed_table()
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names.len(),
+        2,
+        "expected exactly the 2 visible select-list columns, got {names:?}"
+    );
+    assert_eq!(cols[0].len(), 3, "expected 3 c_bool groups: {cols:?}");
+
+    let bools: Vec<Option<bool>> = cols[0].iter().map(|v| v.as_bool()).collect();
+    assert_eq!(
+        bools,
+        vec![Some(true), Some(false), None],
+        "groups must be ordered by the UNSELECTED SUM(c_price) DESC: \
+         true=25, false=7, NULL-group=4"
+    );
+    let counts: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    assert_eq!(
+        counts,
+        vec![8, 2, 2],
+        "COUNT(*) per c_bool group must be 8 / 2 / 2 in that order"
+    );
+
+    // --- Case 2: sort aggregate IS selected → partial/merge path retained --
+    let sql2 = format!(
+        "SELECT c_bool, SUM(c_price) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
+        vs_typed_table()
+    );
+
+    let pushed2 = explain_virtual_sql(&mut conn, &sql2);
+    assert!(
+        pushed2.contains("\"group_keys\":["),
+        "a sort key matching a select-list aggregate must KEEP the \
+         partial/merge path — the scan spec must carry group_keys, not fall \
+         back to the raw-row wrapper, got:\n{pushed2}"
+    );
+    assert!(
+        pushed2.contains("ORDER BY SUM(\"PARTIAL_sum_"),
+        "the merge ORDER BY must reference the merged partial column, not a \
+         base column, got:\n{pushed2}"
+    );
+
+    let (names2, cols2) = query_named_columns(&mut conn, &sql2);
+    assert_no_hidden_columns(&names2, &sql2);
+    assert_eq!(
+        names2.len(),
+        2,
+        "expected exactly the 2 visible select-list columns, got {names2:?}"
+    );
+    let bools2: Vec<Option<bool>> = cols2[0].iter().map(|v| v.as_bool()).collect();
+    assert_eq!(
+        bools2,
+        vec![Some(true), Some(false), None],
+        "partial/merge path must produce the same DESC group order"
+    );
+    let sums: Vec<f64> = cols2[1].iter().map(parse_numeric).collect();
+    for (got, want) in sums.iter().zip([25.0, 7.0, 4.0]) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "SUM(c_price) per group must be 25 / 7 / 4, got {sums:?}"
+        );
+    }
+}
+
+/// Control: the sort expression IS also a select-list item, so nothing is
+/// hidden and nothing is stripped (task 9.5).
+///
+/// The plan proved that this shape and the leaking one push a BYTE-IDENTICAL
+/// `selectList` while `ORDER_BY_EXPRESSION` is unadvertised — Exasol picks the
+/// client-facing name (`A` here, `HIDDEN_COL_2` there) server-side. So this
+/// case exists to prove the fix did not regress the shape that was already
+/// correct: the third column must survive, named `A`.
+///
+/// `ORDER BY ABS(c_price)` is ascending, so NULLs (ids 3 and 11) sort LAST.
+#[test]
+fn e2e_order_by_expression_also_selected_control() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, c_price, ABS(c_price) AS a FROM {} ORDER BY ABS(c_price)",
+        vs_typed_table()
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names,
+        vec!["ID".to_string(), "C_PRICE".to_string(), "A".to_string()],
+        "the genuinely selected sort expression must survive as column A"
+    );
+    assert_eq!(cols[0].len(), 12, "expected all 12 rows: {cols:?}");
+
+    // ASC NULLS LAST: 2,2,2,3,3,4,4,5,5,6 then the two NULLs (ids 3, 11).
+    let a: Vec<Option<f64>> = cols[2]
+        .iter()
+        .map(|v| {
+            if v.is_null() {
+                None
+            } else {
+                Some(parse_numeric(v))
+            }
+        })
+        .collect();
+    assert_eq!(
+        a,
+        vec![
+            Some(2.0),
+            Some(2.0),
+            Some(2.0),
+            Some(3.0),
+            Some(3.0),
+            Some(4.0),
+            Some(4.0),
+            Some(5.0),
+            Some(5.0),
+            Some(6.0),
+            None,
+            None,
+        ],
+        "ABS(c_price) ASC must be non-decreasing with the two NULLs last"
+    );
+    assert_eq!(
+        int_set(&cols[0][10..12]),
+        std::collections::HashSet::from([3, 11]),
+        "the trailing NULL rows must be ids 3 and 11"
+    );
+}
+
+/// Multi-`COUNT(DISTINCT)` (Case 2/3) with an aggregate `ORDER BY`: the second
+/// qualified-wrapper entry point returns a correct, leak-free result (task
+/// 9.6).
+///
+/// This shape declines the partial/merge path and routes to the qualified
+/// single-table wrapper, which is the seam task 1.2 relaxed.
+///
+/// MEASURED CAVEAT, same finding as plan decision-log [10]: this is an
+/// `aggregationType: "single_group"` request, and Exasol pushes NO structured
+/// `orderBy` for a single-group aggregate even with `ORDER_BY_EXPRESSION`
+/// advertised — sorting one row costs nothing to do client-side. Verified live
+/// for this exact query: the captured payload carries no `orderBy` key. So
+/// what this case pins end to end is that the wrapper route stays correct and
+/// leak-free under an aggregate `ORDER BY`; the wrapper's expression-sort-key
+/// RENDERING is proven by the unit test on `outer_wrapper_clauses`, which can
+/// feed the `orderBy` this shape never receives.
+///
+/// `c_bool` has 2 distinct non-NULL values, `id` has 12.
+#[test]
+fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(DISTINCT c_bool), COUNT(DISTINCT id) FROM {} \
+         ORDER BY COUNT(DISTINCT id) DESC",
+        vs_typed_table()
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("COUNT(DISTINCT \"LHS_T0\""),
+        "multi-COUNT(DISTINCT) must route to the qualified single-table \
+         wrapper, got:\n{pushed}"
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names.len(),
+        2,
+        "expected exactly the 2 visible select-list columns, got {names:?}"
+    );
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
+    assert_eq!(
+        parse_int(&cols[0][0]),
+        2,
+        "COUNT(DISTINCT c_bool) must be 2 (true/false, NULLs excluded)"
+    );
+    assert_eq!(parse_int(&cols[1][0]), 12, "COUNT(DISTINCT id) must be 12");
+}
+
+/// `LIMIT 0` over a one-row aggregate result returns ZERO rows, not one
+/// `COUNT = 0` row (task 9.9).
+///
+/// Pins decision-log [10]: for an `aggregationType: "single_group"` request
+/// Exasol keeps BOTH the sort and the truncation client-side, pushing neither
+/// wire key — so the zero rows here come from Exasol's own truncation, not from
+/// a `LIMIT 0` rendered on the adapter's merge SELECT (`request_limit` is
+/// `None`). Task 5.1's render site is covered by the `plan_scan_sql` unit test,
+/// which can feed the wire `limit: 0` this shape never receives.
+#[test]
+fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} ORDER BY COUNT(*) DESC LIMIT 0",
+        vs_typed_table()
+    );
+
+    // Assert on the wire payload itself, not on the flattened EXPLAIN blob:
+    // these keys DO appear here when Exasol pushes them (verified against a
+    // `ORDER BY <col> DESC LIMIT n` row scan on this same table).
+    let request = explain_virtual_pushdown_request(&mut conn, &sql);
+    assert!(
+        request.get("orderBy").is_none(),
+        "measured (decision-log [10]): Exasol pushes NO orderBy for a \
+         single-group aggregate; if this now fails, the shape changed and the \
+         zero-row assertion below needs re-deriving:\n{request:#}"
+    );
+    assert!(
+        request.get("limit").is_none(),
+        "measured (decision-log [10]): Exasol pushes NO limit for a \
+         single-group aggregate, so no LIMIT is rendered on the merge \
+         SELECT:\n{request:#}"
+    );
+
+    let (names, cols) = query_named_columns(&mut conn, &sql);
+    assert_no_hidden_columns(&names, &sql);
+    assert_eq!(
+        names.len(),
+        1,
+        "expected exactly 1 result column (COUNT(*)), got {names:?}"
+    );
+    assert!(
+        cols.iter().all(|c| c.is_empty()),
+        "LIMIT 0 must return ZERO rows, not one COUNT = 0 row: {cols:?}"
+    );
+    assert_eq!(
+        conn.query_row_count(&sql),
+        0,
+        "LIMIT 0 over a one-row aggregate must return zero rows"
+    );
+}
