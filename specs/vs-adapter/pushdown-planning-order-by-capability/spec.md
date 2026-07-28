@@ -2,14 +2,15 @@
 
 Extends pushdown planning (`vs-adapter/pushdown-planning`) with the getCapabilities-level
 advertisement of ordered-sort-key capabilities — `ORDER_BY_COLUMN` (bare column sort keys)
-and `ORDER_BY_EXPRESSION` (expression or aggregate sort keys, issue #198) — each gated on a
-correctness-safe rendering path across every ordered shape the adapter can reach. Per-path
-rendering mechanics live in the sibling pushdown-planning features:
-`vs-adapter/pushdown-planning-topn` (declined row-scan wrapper and the matched bounded
-top-N), `vs-adapter/pushdown-planning-grouped-agg` (grouped merge `ORDER BY`),
-`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback` (unresolvable grouped
-`ORDER BY`), and `vs-adapter/pushdown-planning-join-fallback` (the qualified single-table
-and N-scan join wrapper).
+and `ORDER_BY_EXPRESSION` (expression or aggregate sort keys, issue #198) — plus
+`LIMIT_WITH_OFFSET` (issue #191), each gated on a correctness-safe rendering path across
+every ordered shape the adapter can reach. Per-path rendering mechanics live in the sibling
+pushdown-planning features: `vs-adapter/pushdown-planning-topn` (declined row-scan wrapper
+and the matched bounded top-N), `vs-adapter/pushdown-planning-grouped-agg` (grouped merge
+`ORDER BY`), `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback` (unresolvable
+grouped `ORDER BY`), `vs-adapter/pushdown-planning-join-fallback` (the qualified
+single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-group-agg` and
+`vs-adapter/pushdown-planning-count-distinct` (the one-row merge SELECTs).
 
 ## Background
 
@@ -103,6 +104,55 @@ and N-scan join wrapper).
   type mapping is added or altered, and the hidden columns it emits are ordinary base columns
   already resolved through the existing projection path. No normative requirement applies, so
   there is no deviation to fix and none to track.
+* **Why `LIMIT_WITH_OFFSET` must be advertised (issue #191).** While it is unadvertised,
+  Exasol pushes `orderBy` for any ORDER BY query but strips the offset from the request AND
+  applies no offset itself. Verified live against the local Docker stack (Exasol + MinIO +
+  Iceberg REST, seeded `events` table, 20 rows, `score = 5.0 * id`): `SELECT id, score FROM t
+  ORDER BY score DESC LIMIT 12 OFFSET 3` pushed `"limit":{"numElements":12}` with NO `offset`
+  key, and the query returned ids 20…9 — ranks 1-12 — instead of the correct ids 17…6, ranks
+  4-15. The collapse is deterministic, not the non-deterministic ordering issue #191's title
+  describes; Exasol silently treats the OFFSET as 0. The same collapse reproduced on the
+  declined row-scan path and on a `GROUP BY MOD(id,4) ORDER BY MOD(id,4) LIMIT 2 OFFSET 1`.
+  No `pushdownRequest` field carries the offset while the capability is unadvertised, so no
+  adapter-side detection can recover it. Advertising the capability is the only mechanism
+  that surfaces it: Exasol then pushes `"limit":{"numElements":12,"offset":3}`, the same
+  semantics as the SQL clause, needing no absolute-position arithmetic.
+* **Why the offset advertisement and its rendering are inseparable.** Advertising
+  `LIMIT_WITH_OFFSET` makes Exasol delegate the ENTIRE final window: it then applies neither
+  the LIMIT nor the OFFSET itself. Verified live by flipping only the capability flag with no
+  other change — the query result was UNCHANGED (still ids 20…9), proving Exasol's own
+  windowing had gone away entirely and the adapter's returned SQL had become the only source
+  of truth. Advertising without rendering therefore replaces a wrongly-unshifted result with
+  a wrongly-UNBOUNDED one. The advertisement and the offset rendering on every reachable
+  wrapper MUST land at the same commit.
+* **Exasol's grammar constrains where an OFFSET may be rendered.** Verified live: `ORDER BY
+  score DESC OFFSET 3` with no LIMIT fails with `sqlCode 42000` ("unexpected OFFSET_");
+  `LIMIT 12 OFFSET 3` with no ORDER BY fails with `sqlCode 42000` ("OFFSET not allowed in
+  LIMIT without ORDER BY"); and an `OFFSET` in any UNGROUPED aggregated select fails with
+  `sqlCode 42000` ("OFFSET not allowed in aggregated selects") — reproduced on
+  `SELECT COUNT(*) … ORDER BY 1 LIMIT 5 OFFSET 2`, on `ORDER BY COUNT(*)`, on
+  `SELECT COUNT(DISTINCT id) …`, on a two-`COUNT(DISTINCT)` select, and on a single-group
+  aggregate over a join. A `GROUP BY` select accepts the OFFSET and pushes it. Two
+  consequences: a wrapper SELECT that renders NO `ORDER BY` MUST NOT render an `OFFSET` on
+  itself, because the returned SQL would be a syntax error rather than a correct result; and
+  the two one-row merge SELECTs — the single-group aggregate merge and the lone-`COUNT(DISTINCT)`
+  wrapper — can never receive an offset at all, because Exasol rejects such a statement before
+  the adapter is consulted.
+* **A non-zero `limit.offset` always arrives with a non-empty `orderBy` (the offset-implies-
+  ordering invariant).** Verified live across 11 offset-carrying shapes spanning all three
+  reachable render sites: a projected sort key, an ordinal sort key, a select-list alias, an
+  unprojected sort key, four grouped shapes (including an ordinal on the aggregate and a group
+  key absent from the select list), and three join shapes. Every one pushed a non-empty
+  `orderBy`. Two independent Exasol-side mechanisms enforce it: the grammar above makes the
+  user query carry an ORDER BY, and Exasol withholds `limit` ENTIRELY when it cannot delegate
+  that ordering — `SELECT id FROM t ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2` pushed NEITHER
+  `orderBy` NOR `limit`. So no adapter path has to handle an offset without a pushed ordering,
+  and no path SHALL be given a failure branch for that state.
+* **Exasol never pushes `offset: 0`, and never pushes an `orderBy` on an ungrouped aggregate.**
+  Verified live: `LIMIT 5 OFFSET 0` pushes `{"numElements":5}` with NO `offset` key,
+  byte-identical to a bare `LIMIT 5`; and `SELECT COUNT(DISTINCT id) FROM t ORDER BY 1 LIMIT 5`
+  pushes `limit` with `orderBy` ABSENT (likewise for `ORDER BY COUNT(*)` and
+  `ORDER BY COUNT(DISTINCT id)`), because Exasol resolves the no-op one-row ordering itself.
 
 ## Scenarios
 
@@ -114,7 +164,7 @@ and N-scan join wrapper).
 * *AND* the response SHALL advertise `ORDER_BY_EXPRESSION`, so Exasol pushes an expression or aggregate sort key as a structured `orderBy` element instead of silently appending it to the `selectList` as an extra result column (issue #198)
 * *AND* `ORDER_BY_EXPRESSION` SHALL be backed, at the SAME commit that advertises it, by a correctness-safe rendering path for every ordered shape the adapter can reach — the declined row-scan wrapper and the grouped merge (`vs-adapter/pushdown-planning-topn`, `vs-adapter/pushdown-planning-grouped-agg`), the qualified single-table wrapper, and the N-scan join wrapper — because Exasol delegates a pushed ordering and does not re-sort the returned rows
 * *AND* an expression sort key SHALL NOT make a request eligible for the bounded per-shard top-N: the per-shard sort key stays a bare column, so the scan-spec wire shape and the scan UDF are unchanged by this advertisement
-* *AND* `LIMIT_WITH_OFFSET` SHALL remain absent, so Exasol never pushes an OFFSET and no ordered path needs offset handling
+* *AND* the response SHALL advertise `LIMIT_WITH_OFFSET`, REPLACING the earlier rule that it remain absent: that rule rested on the assumption that Exasol re-applies an OFFSET the adapter never receives, which live verification disproved — with the capability unadvertised Exasol strips the offset from the request AND applies none itself, returning ranks 1..n instead of (m+1)..(m+n) (issue #191)
 * *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised — advertising the ORDER BY capabilities MUST NOT introduce any additional join or cross-join capability
 
 ### Scenario: ORDER BY on a column outside the derived projection emits the sort key as a hidden scan column
@@ -140,7 +190,7 @@ and N-scan join wrapper).
 * *GIVEN* a request whose result is exactly one row — an ungrouped single-group aggregate (`SELECT COUNT(*) FROM t ORDER BY COUNT(*) LIMIT 0`) or a lone `COUNT(DISTINCT)` — carrying a request `LIMIT`, for which advertising `ORDER_BY_EXPRESSION` now lets Exasol push an `orderBy` over an aggregate expression
 * *WHEN* the adapter builds the scan-driving SQL for that request
 * *THEN* the single-group aggregate merge SELECT SHALL render the request's `LIMIT` on ITSELF — the outer `SELECT <merge items> FROM (<fan-out>) LIMIT n` — so a pushed `LIMIT 0` returns ZERO rows rather than the one aggregate row, and SHALL do so for EVERY single-group aggregate request carrying a `LIMIT`, with or without a pushed `orderBy`, because that merge SELECT renders no `LIMIT` today in either case
-* *AND* the value the merge SELECT renders SHALL be the request's RAW `limit`, supplied to the merge builder as its own input, NOT the withholding-adjusted binding the row-scan paths share: for this shape that shared binding is always absent (an `orderBy` is present and no bounded top-N matched), so a rule that only changed the render site while reading the shared binding would render nothing at all
+* *AND* the value the merge SELECT renders SHALL be the request's RAW `limit`, supplied to the merge builder as its own input, NOT the withholding-adjusted binding the row-scan paths share: for this shape Exasol pushes no `orderBy`, so the shared binding is present and carries the raw limit — the merge builder takes it as its own input, so the rule holds regardless. This REPLACES the recorded reason "for this shape that shared binding is always absent (an `orderBy` is present and no bounded top-N matched)", whose premise live capture inverted: an ungrouped aggregate request pushes NO `orderBy` at all, so `has_order_by` is FALSE here and the shared binding is never withheld (issue #191). The rule's OUTCOME is unchanged; only its stated reason is corrected
 * *AND* the lone-`COUNT(DISTINCT)` wrapper SHALL likewise receive the request's `LIMIT` on its outer `SELECT COUNT(DISTINCT "V") FROM (<fan-out>)`, and MUST NOT have it withheld on the grounds that an `ORDER BY` the adapter did not render is present
 * *AND* the per-shard scan spec SHALL carry NO `LIMIT` for either shape, so the outer SELECT is the ONLY place a limit is applied and no shard's aggregate input or local distinct set is truncated
 * *AND* the adapter MAY leave that pushed `orderBy` unrendered for these two shapes ONLY, because a one-row result admits exactly one ordering, so no ordering the adapter omits is observable
@@ -162,6 +212,17 @@ and N-scan join wrapper).
 * *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and `ORDER_BY_EXPRESSION`, and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, an expression or aggregate sort key, or a request that also carries aggregates / group keys / a `having`)
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL fall back to the unoptimized declined path for that shape, carrying neither a per-shard row limit nor per-shard sort keys ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-* *AND* the adapter SHALL render the ordering ITSELF, as a self-contained global `ORDER BY` (plus the request's `LIMIT`, if any) wrapping the unbounded fan-out, and SHALL NOT rely on Exasol re-applying an `ORDER BY` it retains — once a sort-key capability is advertised Exasol delegates the pushed `orderBy` and does not re-sort the returned rows
+* *AND* the adapter SHALL render the ordering ITSELF, as a self-contained global `ORDER BY` (plus the request's full retained window — `LIMIT n`, and `OFFSET m` when non-zero) wrapping the unbounded fan-out, and SHALL NOT rely on Exasol re-applying an `ORDER BY` it retains — once a sort-key capability is advertised Exasol delegates the pushed `orderBy` and does not re-sort the returned rows, and once `LIMIT_WITH_OFFSET` is advertised it re-applies neither bound of the window either, so rendering the `LIMIT` alone returns the wrong window (issue #191). This REPLACES the recorded "plus the request's `LIMIT`, if any"
 * *AND* that wrapper SHALL preserve the derived projection's pre-extension column count and order, emitting any column the ordering needs but the projection lacks as a hidden scan column, so a declined `ORDER BY` never becomes an Exasol column-count rejection nor a reference to a column the scan does not emit
 * *AND* for EVERY reachable ordered shape the outcome SHALL be exactly one of two: the ordering is rendered faithfully, or the pushdown declines with a `User` error naming the unrenderable key — never a result that is both silently unordered and successful, and never a result carrying a column the client did not select
+
+### Scenario: LIMIT_WITH_OFFSET is advertised only together with offset rendering on every wrapper that renders a final window
+
+* *GIVEN* the adapter advertises `LIMIT_WITH_OFFSET`, so Exasol pushes `limit.offset` and applies neither the LIMIT nor the OFFSET itself
+* *WHEN* the adapter builds the scan-driving SQL for any request carrying a non-zero `limit.offset`
+* *THEN* EVERY wrapper SELECT that a non-zero offset can REACH SHALL render that offset alongside its `LIMIT`, through ONE shared limit-and-offset rendering seam rather than a per-wrapper string splice, so no reachable ordered shape can drop the offset: the declined row-scan wrapper (`vs-adapter/pushdown-planning-topn`), the grouped merge (`vs-adapter/pushdown-planning-grouped-agg`), and the qualified single-table and N-scan join wrapper (`vs-adapter/pushdown-planning-join-fallback`)
+* *AND* every render site an offset CANNOT reach SHALL be left without offset rendering, collapse arithmetic, or a failure branch, and SHALL instead be pinned by a test: the matched bounded top-N's row-scan SQL (unreachable because a non-zero offset declines the bounded path, which then withholds the limit — `vs-adapter/pushdown-planning-topn`), the single-group aggregate merge, and the lone-`COUNT(DISTINCT)` wrapper (both unreachable because Exasol rejects an `OFFSET` in an ungrouped aggregated select before the adapter is consulted — `vs-adapter/pushdown-planning-single-group-agg`, `vs-adapter/pushdown-planning-count-distinct`)
+* *AND* each such unreachability claim SHALL be pinned by a LIVE end-to-end assertion in addition to any `debug_assert!`, because a `debug_assert!` is compiled out of the release-profile `.so` the adapter ships as and therefore guards nothing in production: the grammar rule behind the two one-row merge SELECTs SHALL be asserted by an end-to-end `sqlCode 42000` rejection, and the offset-implies-ordering invariant behind the matched bounded top-N's row-scan SQL SHALL be asserted by an end-to-end query whose ordering Exasol cannot delegate (`ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2`), whose result MUST equal the same window evaluated on a single node — so the invariant breaking in EITHER direction, a bare pushed `limit` with no `orderBy` or a newly delegated unrenderable ordering, fails a test rather than silently returning wrong rows
+* *AND* the shared seam SHALL render byte-identical SQL to the pre-change output when the offset is zero or absent, so advertising the capability changes no already-correct plan
+* *AND* NO offset value SHALL be carried into any per-shard scan spec, because a per-shard OFFSET would skip a different row set on every shard and cannot compose into a global window; the scan-spec wire shape and the scan UDF SHALL be unchanged by this advertisement
+* *AND* the returned result SHALL equal the same `ORDER BY … LIMIT n OFFSET m` evaluated over all matching rows on a single node, for a plain row scan, a declined-sort-key row scan, a grouped aggregate, and a qualified-wrapper shape

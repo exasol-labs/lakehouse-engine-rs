@@ -34,8 +34,10 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 `ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
 (no join, no `GROUP BY`), and every sort key must be a bare projected column. DataFusion runs a
 `TopK`, not a full sort. Each shard emits only its own local top-`n` rows. Exasol then merges the
-`shard_count × n` rows with a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` remains
-unadvertised.
+`shard_count × n` rows with a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` is now advertised
+(issue #191). The per-shard bounded top-N never carries an offset. A non-zero offset always
+declines to the row-scan wrapper. That wrapper renders the full `ORDER BY ... LIMIT n OFFSET m`
+window itself.
 
 The adapter also advertises `ORDER_BY_EXPRESSION` (issue #198). A sort key that is an expression,
 not a bare column, does not qualify for the bounded top-N above. Three paths still render the

@@ -8,8 +8,8 @@ use vs_expression::render_df_filter_safe;
 
 use super::super::file_resolution::relativize_shards_to_root;
 use super::super::support::{
-    build_scan_driving_sql, collect_all_column_names, extract_limit, quote_ident, shard_count,
-    strip_table_alias,
+    build_scan_driving_sql, collect_all_column_names, extract_limit, extract_offset, quote_ident,
+    render_limit_offset, shard_count, strip_table_alias,
 };
 use super::super::topn::parse_sort_flags;
 use super::planning::{
@@ -236,6 +236,9 @@ fn n_scan_join_select_items(
 /// wrapper, after its WHERE. The declining precedence is preserved by computing the
 /// clauses in order: SELECT item, GROUP BY, HAVING, ORDER BY (so the first
 /// unrenderable clause is the one that surfaces its hard error).
+///
+/// The window (`LIMIT n [OFFSET m]`) is rendered LAST, through the shared
+/// [`render_limit_offset`] seam, so it applies after the sort rather than before it.
 struct OuterWrapperClauses {
     select: String,
     trailing: String,
@@ -252,6 +255,16 @@ fn outer_wrapper_clauses(
     let having = qualified_join_having(pushdown_req, alias_of)?;
     let order_by = qualified_join_order_by(pushdown_req, alias_of)?;
     let limit = extract_limit(pushdown_req);
+    let offset = extract_offset(pushdown_req);
+    // Exasol withholds `limit` ENTIRELY when it cannot delegate an ordering, so an
+    // offset never arrives without a non-empty `orderBy` (#191, verified live). Pinned,
+    // not enforced: a decline here would be a hard client-facing failure on all four
+    // wrapper entry points, guarding a state no request can reach.
+    debug_assert!(
+        offset == 0 || order_by.is_some(),
+        "fact 5: Exasol withholds `limit` entirely when it cannot delegate an ordering, \
+         so a non-zero offset must never arrive without a non-empty orderBy"
+    );
 
     let select = if select_items.is_empty() {
         "*".to_string()
@@ -273,9 +286,7 @@ fn outer_wrapper_clauses(
     if let Some(clause) = order_by {
         trailing.push_str(&format!(" ORDER BY {clause}"));
     }
-    if let Some(n) = limit {
-        trailing.push_str(&format!(" LIMIT {n}"));
-    }
+    trailing.push_str(&render_limit_offset(limit, offset));
 
     Ok(OuterWrapperClauses { select, trailing })
 }
@@ -2364,5 +2375,175 @@ mod tests {
             "LIMIT must follow ORDER BY, or it truncates before the sort: {}",
             clauses.trailing
         );
+    }
+
+    /// The trailing clause suffix the qualified wrapper renders for `pushdown_req`,
+    /// against the seeded `events` table under the single `LHS_T0` alias. A self-join's
+    /// alias map collapses to ONE entry — both legs carry the same `tableName` — so
+    /// this is exactly what the seam sees for capture rows 9-11 too.
+    fn seam_trailing(pushdown_req: &Json) -> Result<String, UdfError> {
+        let alias_of = HashMap::from([("EVENTS".to_string(), "LHS_T0".to_string())]);
+        let aliases = vec!["LHS_T0".to_string()];
+        let cols_per_side = vec![vec![
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("NAME".to_string(), "VARCHAR(100)".to_string()),
+            ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        ]];
+        outer_wrapper_clauses(pushdown_req, &alias_of, &aliases, &cols_per_side)
+            .map(|clauses| clauses.trailing)
+    }
+
+    /// The FOUR live-captured offset-carrying request shapes that reach this seam
+    /// (#191 reachability capture rows 8-11), as
+    /// `(shape, pushdown_req, expected trailing tail)`:
+    ///
+    /// - row 8: `GROUP BY MOD(id,4)` with `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2
+    ///   OFFSET 1` — the qualified single-table (N = 1) wrapper entry point
+    /// - row 9: self-join, `ORDER BY 1 LIMIT 5 OFFSET 2`
+    /// - row 10: self-join, `ORDER BY a.id LIMIT 5 OFFSET 2` (sort key outside the
+    ///   select list)
+    /// - row 11: self-join + `GROUP BY a.id`, `ORDER BY 1 LIMIT 5 OFFSET 2`
+    ///
+    /// Every one carries a non-empty `orderBy` beside its offset — fact 5, which is
+    /// what makes the offset-without-`ORDER BY` state unreachable rather than guarded.
+    fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
+        let id = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS"});
+        let mod_key = serde_json::json!({
+            "type": "function_scalar", "name": "MOD",
+            "arguments": [id.clone(), {"type": "literal_exactnumeric", "value": 4}]
+        });
+        let ascending = |expr: &Json| {
+            serde_json::json!({
+                "type": "order_by_element", "expression": expr,
+                "isAscending": true, "nullsLast": false
+            })
+        };
+        let count_distinct_id = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT",
+            "arguments": [id.clone()], "distinct": true
+        });
+        let count_star = serde_json::json!({
+            "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
+        });
+        let score = serde_json::json!({"type": "column", "name": "SCORE", "tableName": "EVENTS"});
+
+        vec![
+            (
+                "row 8: grouped COUNT(DISTINCT) qualified wrapper",
+                serde_json::json!({
+                    "aggregationType": "group_by",
+                    "selectList": [mod_key.clone(), count_distinct_id],
+                    "groupBy": [mod_key.clone()],
+                    "orderBy": [ascending(&mod_key)],
+                    "limit": {"numElements": 2, "offset": 1},
+                }),
+                r#" ORDER BY MOD("LHS_T0"."ID", 4) ASC NULLS FIRST LIMIT 2 OFFSET 1"#,
+            ),
+            (
+                "row 9: self-join, ORDER BY ordinal over a projected column",
+                serde_json::json!({
+                    "selectList": [id.clone(), score],
+                    "orderBy": [ascending(&id)],
+                    "limit": {"numElements": 5, "offset": 2},
+                }),
+                r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
+            ),
+            (
+                "row 10: self-join, sort key outside the select list",
+                serde_json::json!({
+                    "selectList": [{"type": "column", "name": "NAME", "tableName": "EVENTS"}],
+                    "orderBy": [ascending(&id)],
+                    "limit": {"numElements": 5, "offset": 2},
+                }),
+                r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
+            ),
+            (
+                "row 11: self-join + GROUP BY",
+                serde_json::json!({
+                    "aggregationType": "group_by",
+                    "selectList": [id.clone(), count_star],
+                    "groupBy": [id.clone()],
+                    "orderBy": [ascending(&id)],
+                    "limit": {"numElements": 5, "offset": 2},
+                }),
+                r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
+            ),
+        ]
+    }
+
+    /// join-fallback scenario (#191): the qualified wrapper renders the request's
+    /// OFFSET on every entry point that reaches it — all four reach this one
+    /// `outer_wrapper_clauses` seam, so the four live-captured offset-carrying shapes
+    /// are asserted here at the family level.
+    ///
+    /// The trailing tail must be exactly ` ORDER BY <clause> LIMIT n OFFSET m`: the
+    /// window follows the sort (an OFFSET ahead of the ORDER BY would skip rows before
+    /// the ordering is established) and the OFFSET follows its own LIMIT (Exasol's
+    /// grammar rejects a bare OFFSET).
+    #[test]
+    fn qualified_wrapper_renders_limit_offset() {
+        for (shape, pushdown_req, expected_tail) in offset_carrying_seam_fixtures() {
+            let trailing = seam_trailing(&pushdown_req)
+                .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
+            assert!(
+                trailing.ends_with(expected_tail),
+                "{shape}: trailing must end with `{expected_tail}`, got `{trailing}`"
+            );
+        }
+    }
+
+    /// The same four shapes, plus the un-ordered control, pinned against the OTHER
+    /// half of Exasol's OFFSET grammar: an `OFFSET` is only legal after an `ORDER BY`
+    /// (`sqlCode 42000` otherwise). So no rendered trailing clause may carry an
+    /// `OFFSET` token that is not preceded by an `ORDER BY` — and a request with
+    /// neither an `orderBy` nor an offset must carry no `OFFSET` token at all.
+    #[test]
+    fn qualified_wrapper_never_renders_offset_without_order_by() {
+        let mut cases: Vec<(&str, Json)> = offset_carrying_seam_fixtures()
+            .into_iter()
+            .map(|(shape, req, _)| (shape, req))
+            .collect();
+        cases.push((
+            "control: limit, no orderBy, no offset",
+            serde_json::json!({
+                "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+                "limit": {"numElements": 5},
+            }),
+        ));
+
+        for (shape, pushdown_req) in cases {
+            let trailing = seam_trailing(&pushdown_req)
+                .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
+            if let Some(offset_at) = trailing.find("OFFSET") {
+                let order_at = trailing.find("ORDER BY").unwrap_or(usize::MAX);
+                assert!(
+                    order_at < offset_at,
+                    "{shape}: an OFFSET with no preceding ORDER BY is sqlCode 42000: \
+                     `{trailing}`"
+                );
+            }
+        }
+    }
+
+    /// A request with no `orderBy` and no offset — the overwhelming majority — must
+    /// stay BYTE-IDENTICAL to the pre-#191 rendering, so the shared seam cannot
+    /// change the shape of an already-correct plan. The full-SQL goldens
+    /// (`golden_n_scan_join_sql_unchanged`,
+    /// `golden_grouped_qualified_fallback_sql_unchanged`) freeze the limit-free
+    /// wrappers; this freezes the trailing window itself.
+    #[test]
+    fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
+        let mut pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "limit": {"numElements": 5},
+        });
+        let bare = seam_trailing(&pushdown_req).expect("a plain limited request must render");
+        assert_eq!(bare, " LIMIT 5");
+
+        // Exasol normalises `OFFSET 0` away, but an explicit zero must render the
+        // same string if it ever arrives.
+        pushdown_req["limit"] = serde_json::json!({"numElements": 5, "offset": 0});
+        let zero = seam_trailing(&pushdown_req).expect("an explicit zero offset must render");
+        assert_eq!(zero, bare);
     }
 }

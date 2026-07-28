@@ -3,7 +3,9 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_exasol_safe;
 
-use super::support::{collect_all_column_names, emits_ident, extract_limit};
+use super::support::{
+    collect_all_column_names, emits_ident, extract_limit, extract_offset, render_limit_offset,
+};
 
 // ---------------------------------------------------------------------------
 // Ordered top-N pushdown
@@ -224,8 +226,13 @@ pub(super) fn ensure_every_sort_key_renders(keys: &[ParsedSortKey]) -> Result<()
 /// - not a GROUP BY aggregate request (`aggregationType != "group_by"` and no
 ///   non-empty `groupBy`),
 /// - no `having`,
-/// - `limit` present with no `offset` (`LIMIT_WITH_OFFSET` is unadvertised, so an
-///   offset should never appear — declined defensively if it does),
+/// - `limit` present with a NON-ZERO `offset` absent: a real offset declines, because
+///   a per-shard `LIMIT n OFFSET m` would skip each shard's OWN first m rows and does
+///   not compose into a global window (issue #191). The decline routes the request to
+///   the row-scan wrapper, which renders the whole `ORDER BY … LIMIT n OFFSET m`
+///   itself. A ZERO offset is the same request as an absent one — Exasol normalises
+///   `OFFSET 0` away — so it must still match, which is why this is a non-zero test
+///   and not an `offset`-key presence test,
 /// - a non-empty `orderBy` in which EVERY element is a bare `column` node whose
 ///   uppercased name is one of the projected columns (`ProjectionItem::Column`),
 /// - EVERY sort key column resolves to an Arrow type that does NOT require the
@@ -260,13 +267,9 @@ pub(super) fn detect_topn(
     proj_cols: &[ProjectionItem],
     logical_schema: &[LogicalField],
 ) -> Option<Vec<SortKey>> {
-    // A top-N needs a bound. Limit must be present with no offset.
+    // A top-N needs a bound. Limit must be present, with a zero (or absent) offset.
     extract_limit(pushdown_req)?;
-    if pushdown_req
-        .get("limit")
-        .and_then(|l| l.get("offset"))
-        .is_some()
-    {
+    if extract_offset(pushdown_req) != 0 {
         return None;
     }
 
@@ -400,7 +403,15 @@ pub(super) fn extend_projection_with_sort_keys(
 }
 
 /// Wrap a declined-`ORDER BY` row-scan fan-out in a self-contained global
-/// `ORDER BY` (plus the original `LIMIT`, if any), naming ONLY the visible columns.
+/// `ORDER BY` (plus the original window — `LIMIT n`, or `LIMIT n OFFSET m` — if any),
+/// naming ONLY the visible columns.
+///
+/// The window renders through the shared [`render_limit_offset`] seam, so a zero
+/// offset produces the pre-offset string byte-for-byte and a non-zero one (issue #191)
+/// renders here rather than in the fan-out: a per-shard `LIMIT n OFFSET m` would skip
+/// each shard's OWN first m rows and does not compose. Exasol's grammar rejects an
+/// `OFFSET` without an `ORDER BY`, and the empty-`order_by` early return below is what
+/// makes that structural — the window is only ever appended to a rendered `ORDER BY`.
 ///
 /// Once `ORDER_BY_COLUMN` is advertised Exasol delegates the ordering and NO LONGER
 /// re-applies its own backstop sort, so the adapter must reproduce that global sort
@@ -434,6 +445,7 @@ pub(super) fn wrap_declined_order_by(
     visible_count: usize,
     keys: &[ParsedSortKey],
     limit: Option<u64>,
+    offset: u64,
 ) -> String {
     let order_by = keys
         .iter()
@@ -454,11 +466,10 @@ pub(super) fn wrap_declined_order_by(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut wrapped = format!("SELECT {visible_list} FROM ({sql}) ORDER BY {order_by}");
-    if let Some(n) = limit {
-        wrapped.push_str(&format!(" LIMIT {n}"));
-    }
-    wrapped
+    format!(
+        "SELECT {visible_list} FROM ({sql}) ORDER BY {order_by}{}",
+        render_limit_offset(limit, offset)
+    )
 }
 
 #[cfg(test)]
@@ -575,7 +586,14 @@ mod tests {
             DISTRIBUTE_FILES_UDF_NAME,
         );
         if declined_order_by {
-            wrap_declined_order_by(&sql, &proj_cols, visible_count, &declined_sort_keys, limit)
+            wrap_declined_order_by(
+                &sql,
+                &proj_cols,
+                visible_count,
+                &declined_sort_keys,
+                limit,
+                extract_offset(&pushdown_req),
+            )
         } else {
             sql
         }
@@ -679,6 +697,104 @@ mod tests {
         assert!(
             common.contains(r#""limit":20"#),
             "common blob must carry the per-shard limit: {common}"
+        );
+    }
+
+    /// A NON-ZERO `limit.offset` DECLINES the bounded per-shard top-N, and the window
+    /// is rendered ONCE — on the declined wrapper, beside the `ORDER BY` it renders
+    /// itself: `ORDER BY … LIMIT n OFFSET m` (issue #191). A per-shard
+    /// `LIMIT n OFFSET m` would skip each shard's OWN first m rows and does not
+    /// compose, so the fan-out stays unbounded and unsorted.
+    #[test]
+    fn nonzero_offset_declines_bounded_topn() {
+        let mut request = nq4_request();
+        request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 20, "offset": 5});
+        let projected = vec![
+            ProjectionItem::Column("L_ORDERKEY".into()),
+            ProjectionItem::Column("L_EXTENDEDPRICE".into()),
+        ];
+        assert!(
+            detect_topn(
+                &request,
+                &pd(&request),
+                &projected,
+                &lineitem_logical_schema()
+            )
+            .is_none(),
+            "a non-zero offset must decline the bounded top-N path"
+        );
+
+        let files = vec![
+            ("s3://w/part-0.parquet".to_string(), 1000u64),
+            ("s3://w/part-1.parquet".to_string(), 1000u64),
+        ];
+        let sql = plan_scan_sql(&request, files, 2);
+
+        assert!(
+            sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20 OFFSET 5"#),
+            "the declined wrapper must render the full window beside its ORDER BY: {sql}"
+        );
+        assert_eq!(
+            sql.matches("OFFSET").count(),
+            1,
+            "the offset belongs on the wrapper alone, never in the fan-out: {sql}"
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\"") && !common.contains("order_by"),
+            "the per-shard fan-out must carry neither the limit nor the sort keys: {common}"
+        );
+    }
+
+    /// `offset: 0` is the SAME request as an ABSENT `offset` key (Exasol normalises an
+    /// explicit `OFFSET 0` away), so it must still MATCH the bounded top-N and yield
+    /// byte-identical SQL: the guard is a non-zero test, not a presence test. A
+    /// presence test behaves identically on today's Exasol but would silently decline
+    /// every ordered LIMIT query cluster-wide on a future build that does attach
+    /// `offset: 0`.
+    #[test]
+    fn zero_offset_still_matches_bounded_topn_byte_identically() {
+        let baseline = nq4_request();
+        let mut zero_offset = nq4_request();
+        zero_offset["pushdownRequest"]["limit"] =
+            serde_json::json!({"numElements": 20, "offset": 0});
+        let projected = vec![
+            ProjectionItem::Column("L_ORDERKEY".into()),
+            ProjectionItem::Column("L_EXTENDEDPRICE".into()),
+        ];
+        let matched = detect_topn(
+            &baseline,
+            &pd(&baseline),
+            &projected,
+            &lineitem_logical_schema(),
+        );
+        assert!(matched.is_some(), "sanity: the baseline shape must match");
+        assert_eq!(
+            detect_topn(
+                &zero_offset,
+                &pd(&zero_offset),
+                &projected,
+                &lineitem_logical_schema()
+            ),
+            matched,
+            "offset 0 must match the bounded top-N exactly as an absent offset does"
+        );
+
+        let files = || {
+            vec![
+                ("s3://w/part-0.parquet".to_string(), 1000u64),
+                ("s3://w/part-1.parquet".to_string(), 1000u64),
+            ]
+        };
+        let baseline_sql = plan_scan_sql(&baseline, files(), 2);
+        assert_eq!(
+            plan_scan_sql(&zero_offset, files(), 2),
+            baseline_sql,
+            "a zero offset must not change one byte of the generated SQL"
+        );
+        assert!(
+            baseline_sql.contains(" LIMIT 20") && !baseline_sql.contains("OFFSET"),
+            "the matched bounded top-N renders its LIMIT and no OFFSET: {baseline_sql}"
         );
     }
 

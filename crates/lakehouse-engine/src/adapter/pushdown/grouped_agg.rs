@@ -7,7 +7,9 @@ use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
-use super::support::{build_fan_out_inner, exasol_type_from_json, quote_ident};
+use super::support::{
+    build_fan_out_inner, exasol_type_from_json, quote_ident, render_limit_offset,
+};
 use super::topn::parse_sort_flags;
 
 /// Classification of one `selectList` item in a grouped-aggregate pushdown.
@@ -492,10 +494,12 @@ pub(super) fn group_key_exasol_types(
 /// only (after `GROUP BY`). Never pushed into the shard scan — a per-shard HAVING would
 /// incorrectly discard groups that only clear the threshold after merging across shards.
 ///
-/// ## LIMIT
+/// ## LIMIT / OFFSET
 ///
-/// LIMIT is never pushed into a shard spec for grouped queries (shard emits all
-/// partial groups; the outer wrapper applies the final LIMIT when needed).
+/// LIMIT and OFFSET are never pushed into a shard spec for grouped queries (shard
+/// emits all partial groups; the outer wrapper applies the final `LIMIT n OFFSET m`
+/// when needed, through the shared [`render_limit_offset`] seam — a zero offset
+/// renders the pre-offset ` LIMIT {n}` string byte-for-byte, fix-191-order-by-offset).
 /// Build the explicit final `ORDER BY` element list for a grouped-aggregate merge.
 ///
 /// Once `ORDER_BY_COLUMN` is advertised Exasol delegates the ORDER BY and no longer
@@ -597,6 +601,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregate_types: &[String],
     select_items: &[GroupedSelectItem],
     limit: Option<u64>,
+    offset: u64,
     col_types: &[(String, String)],
     udf_name: &str,
     distribute_udf_name: &str,
@@ -704,9 +709,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         sql.push_str(ob);
     }
 
-    if let Some(n) = limit {
-        sql.push_str(&format!(" LIMIT {n}"));
-    }
+    sql.push_str(&render_limit_offset(limit, offset));
     sql
 }
 
@@ -1488,6 +1491,7 @@ mod tests {
             &[],
             &result.select_items,
             None,
+            0,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -1700,6 +1704,7 @@ mod tests {
             &[],
             &result.select_items,
             None,
+            0,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -1970,6 +1975,7 @@ mod tests {
             &aggregate_types,
             &result.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2055,6 +2061,7 @@ mod tests {
             &[],
             &select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2228,6 +2235,7 @@ mod tests {
             &[],
             &keys_first_select_items(1, 1),
             Some(100),
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2245,6 +2253,171 @@ mod tests {
         assert!(
             sql.contains("LIMIT 100"),
             "outer wrapper should still apply the final LIMIT: {sql}"
+        );
+    }
+
+    /// A nonzero offset must never reach the per-shard fan-out spec: the common
+    /// blob shared by every shard carries neither "limit" nor an "offset" key —
+    /// there is no offset field on `CommonScanSpec` at all (design invariant: no
+    /// `ScanSpec`/UDF wire change), so this also pins that no such field leaks into
+    /// the shared JSON. The outer wrapper is the only place the offset renders
+    /// (fix-191-order-by-offset).
+    #[test]
+    fn grouped_merge_offset_never_reaches_per_shard_spec() {
+        let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
+        let g = shard_count(1, 1, files.len());
+        let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                limit: Some(100),
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec!["\"REGION\"".into()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &["\"REGION\"".to_string()],
+            &[],
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[],
+            &keys_first_select_items(1, 1),
+            Some(100),
+            3,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            Some("1 ASC NULLS LAST"),
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\"") && !common.contains("\"offset\""),
+            "grouped common blob must NOT carry limit or offset: {common}"
+        );
+        assert!(
+            sql.contains("ORDER BY 1 ASC NULLS LAST LIMIT 100 OFFSET 3"),
+            "outer wrapper applies the final ORDER BY ... LIMIT ... OFFSET: {sql}"
+        );
+    }
+
+    /// Byte-identical requirement (fix-191-order-by-offset): a zero offset renders
+    /// the exact pre-change ` LIMIT {n}` string with no OFFSET token, so every
+    /// already-correct SQL-shape assertion for the grouped-agg path keeps passing
+    /// unchanged.
+    #[test]
+    fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
+        let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
+        let g = shard_count(1, 1, files.len());
+        let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                limit: Some(100),
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec!["\"REGION\"".into()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &["\"REGION\"".to_string()],
+            &[],
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[],
+            &keys_first_select_items(1, 1),
+            Some(100),
+            0,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            None,
+        );
+        assert!(
+            sql.ends_with(" LIMIT 100"),
+            "zero offset must render the bare pre-offset LIMIT clause: {sql}"
+        );
+        assert!(
+            !sql.contains("OFFSET"),
+            "zero offset must never render an OFFSET token: {sql}"
+        );
+    }
+
+    /// The grouped merge renders `GROUP BY … ORDER BY … LIMIT n OFFSET m` in that
+    /// exact clause order (fix-191-order-by-offset, capture rows 5-8):
+    /// `render_limit_offset` is the shared seam every reachable wrapper calls, and
+    /// this pins the grouped merge's wiring into it.
+    #[test]
+    fn grouped_merge_renders_limit_offset_in_clause_order() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
+        );
+        req["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": {"type": "column", "name": "ID"},
+            "isAscending": true,
+            "nullsLast": true,
+        }]);
+
+        let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        let group_key_types =
+            group_key_exasol_types(&req, &result.group_keys, &result.select_items);
+        let sql = build_grouped_aggregate_scan_sql(
+            &grouped_spec(&result),
+            &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
+            &result.group_keys,
+            &group_key_types,
+            &result.plans,
+            &[],
+            &result.select_items,
+            Some(2),
+            1,
+            &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            Some("1 ASC NULLS LAST"),
+        );
+        assert!(
+            sql.ends_with(" ORDER BY 1 ASC NULLS LAST LIMIT 2 OFFSET 1"),
+            "merge SQL must render GROUP BY … ORDER BY … LIMIT n OFFSET m in that order: {sql}"
+        );
+        let group_by_pos = sql.find("GROUP BY").expect("must contain GROUP BY");
+        let order_by_pos = sql.find(" ORDER BY").expect("must contain ORDER BY");
+        let limit_pos = sql.find(" LIMIT").expect("must contain LIMIT");
+        let offset_pos = sql.find(" OFFSET").expect("must contain OFFSET");
+        assert!(
+            group_by_pos < order_by_pos && order_by_pos < limit_pos && limit_pos < offset_pos,
+            "clauses must appear in GROUP BY, ORDER BY, LIMIT, OFFSET order: {sql}"
         );
     }
 
@@ -2377,6 +2550,7 @@ mod tests {
             &aggregate_types,
             &select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2636,6 +2810,7 @@ mod tests {
             &d.plan_types,
             &d.select_items,
             None,
+            0,
             &soa_col_types(),
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2985,6 +3160,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -3067,6 +3243,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -3149,6 +3326,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             Some(2),
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -3510,6 +3688,7 @@ mod tests {
             &[],
             &keys_first_select_items(1, 1),
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
