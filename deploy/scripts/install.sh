@@ -57,6 +57,7 @@ ARG_BFS_PORT=""
 ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
 ARG_BFS_BUCKET_SET=0
 ARG_BFS_WRITE_PASSWORD=""
+ARG_SKIP_SLC=0
 ARG_HELP=0
 
 CONNECTIVITY_MODE=""
@@ -317,31 +318,53 @@ resolve_saas_pat() {
 
 usage() {
   cat <<'USAGE'
-install-saas.sh - install lakehouse-engine onto an Exasol SaaS database.
+install.sh - install lakehouse-engine onto an Exasol database.
 
-Required:
-  --account-id <id>        SaaS account id (from the SaaS web console)
-  --database-id <id>       SaaS database id (from the SaaS web console)
-  --github-token <token>   GitHub token with read access to the private lakehouse-engine-rs
-                           repo (or set GITHUB_TOKEN)
+Two install targets, auto-detected from the arguments:
+  saas      Exasol SaaS      - selected by giving BOTH --account-id and --database-id
+  bucketfs  AppDB / Docker / on-premise - selected by giving NEITHER (the default)
 
-Connectivity (exactly one mode):
-  --profile <name>         exapump named profile
-  --dsn <dsn>              direct exapump DSN (or set EXAPUMP_DSN)
+Connectivity (both modes; exactly one of the three):
+  --profile <name>          exapump named profile
+  --dsn <dsn>               direct exapump DSN (or set EXAPUMP_DSN)
   --host <host:port> --user <u> --password <p>
-                           direct connection assembled into a DSN;
-                           --host MUST include the port (e.g. myhost:8563) — there is no --port flag
+                            direct connection assembled into a DSN; --host MUST include the port
+                            (e.g. myhost:8563) - there is no --port flag
 
-  The SaaS REST API credential (Bearer token) is derived automatically from whichever
-  connectivity mode is used above -- on Exasol SaaS the PAT IS the SQL password, so there is no
-  separate flag for it.
+Required in both modes:
+  --github-token <token>    GitHub token with read access to the private lakehouse-engine-rs
+                            repo (or set GITHUB_TOKEN)
 
-Optional:
-  --staging                target cloud-staging.exasol.com (default: cloud.exasol.com)
-  --schema <name>          deployment schema (default: LHVS)
-  --lakehouse-version <v>  pin the engine version (default: latest release)
-  --slc-version <v>        pin the SLC version (default: latest release)
-  --help                   show this help
+SaaS target only:
+  --account-id <id>         SaaS account id (from the SaaS web console)
+  --database-id <id>        SaaS database id (from the SaaS web console)
+  --staging                 target cloud-staging.exasol.com (default: cloud.exasol.com)
+
+  The SaaS REST credential (Bearer token) is derived automatically from whichever connectivity
+  mode is used above - on Exasol SaaS the PAT IS the SQL password, so there is no flag for it.
+
+BucketFS target only:
+  --bfs-host <host>         BucketFS host (default: the profile's bfs_host, else its host)
+  --bfs-port <port>         BucketFS port (default: the profile's bfs_port, else 2581)
+  --bfs-bucket <name>       BucketFS bucket (default: default)
+  --bfs-write-password <p>  BucketFS write password (default: the profile's bfs_write_password)
+
+  Uploads go through `exapump bucketfs cp`, which reads its connection from the exapump profile
+  and the --bfs-* overrides only - it accepts no DSN or user/password flags. So with --dsn or
+  --host connectivity, --bfs-host AND --bfs-write-password must both be given explicitly.
+
+Both modes:
+  --target <saas|bucketfs>  assert the auto-detected target; fails on disagreement
+  --schema <name>           deployment schema (default: LHVS)
+  --lakehouse-version <v>   pin the engine version (default: latest release)
+  --slc-version <v>         pin the SLC version (default: latest release)
+  --skip-slc                do not download, upload or register the Rust SLC; install the engine
+                            against the SLC already registered on the database
+  --help                    show this help
+
+Examples:
+  install.sh --account-id ACC --database-id DB --profile saas-prod
+  install.sh --profile my-exasol --bfs-write-password "$BFSPASS"
 
 The script stops at a query-ready product install and prints a CONNECTION / VIRTUAL SCHEMA
 template as the next step; it does not create catalog objects.
@@ -368,13 +391,15 @@ parse_args() {
   ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
   ARG_BFS_BUCKET_SET=0
   ARG_BFS_WRITE_PASSWORD=""
+  ARG_SKIP_SLC=0
   ARG_HELP=0
 
   while [[ $# -gt 0 ]]; do
     local flag="$1"
     case "$flag" in
-      --staging) ARG_STAGING=1; shift; continue ;;
-      --help|-h) ARG_HELP=1; shift; continue ;;
+      --staging)  ARG_STAGING=1; shift; continue ;;
+      --skip-slc) ARG_SKIP_SLC=1; shift; continue ;;
+      --help|-h)  ARG_HELP=1; shift; continue ;;
       --account-id|--database-id|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
       --target|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password) ;;
       *) err "unknown argument: $flag"; return 1 ;;
@@ -1123,7 +1148,11 @@ main() {
   trap 'rm -rf "$WORKDIR"' EXIT
 
   resolve_versions || exit 1
-  register_slc || exit 1
+  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+    log "Skipping SLC registration (--skip-slc)."
+  else
+    register_slc || exit 1
+  fi
   install_engine || exit 1
   run_smoke_test || exit 1
 

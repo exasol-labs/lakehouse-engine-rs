@@ -1424,6 +1424,61 @@ test_tar_required_only_in_bucketfs_mode() {
   assert_not_contains "no tar + saas: never complains about tar" "$LAST_OUT" "'tar' not found"
 }
 
+test_skip_slc_gating() {
+  echo "== test_skip_slc_gating =="
+  # BucketFS mode (the newer, riskier path): --skip-slc drops the SLC download, the SLC upload and
+  # the ALTER SYSTEM, but leaves the engine install, the DDL and the smoke test untouched.
+  reset_env
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}" --skip-slc
+  assert_rc_zero "skip-slc bfs: install still succeeds" "$LAST_RC"
+  assert_contains "skip-slc bfs: says why the SLC step was skipped" "$LAST_OUT" "Skipping SLC registration (--skip-slc)"
+  local log; log="$(log_content)"
+  assert_not_contains "skip-slc bfs: SLC never uploaded" "$log" "slc/lakehouse-rustslc.tar.gz"
+  assert_not_contains "skip-slc bfs: SLC asset never downloaded" "$log" "language-container-rs/releases/tags"
+  assert_not_contains "skip-slc bfs: SCRIPT_LANGUAGES never read" "$log" "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS"
+  assert_not_contains "skip-slc bfs: ALTER SYSTEM never issued" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+  # ... while everything downstream of the SLC still runs.
+  assert_contains "skip-slc bfs: engine .so still uploaded" "$log" "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
+  assert_contains "skip-slc bfs: DDL still created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
+  assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_SCAN('x', 'y')"
+  assert_contains "skip-slc bfs: still prints the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
+  # The SLC VERSION is still resolved and reported, so the user can see what the DB must already have.
+  assert_contains "skip-slc bfs: SLC version still reported" "$LAST_OUT" "Resolved language-container (SLC) version"
+
+  # SaaS mode gates on the same flag.
+  reset_env
+  run_file "${HAPPY_ARGS[@]}" --skip-slc
+  assert_rc_zero "skip-slc saas: install still succeeds" "$LAST_RC"
+  log="$(log_content)"
+  assert_not_contains "skip-slc saas: SLC never uploaded" "$log" "/files/rustslc.tar.gz"
+  assert_contains "skip-slc saas: engine still uploaded" "$log" "/files/lakehouse-engine.tar.gz"
+
+  # Default (no --skip-slc) still does the whole thing.
+  reset_env
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_zero "default: install succeeds" "$LAST_RC"
+  assert_not_contains "default: no skip notice" "$LAST_OUT" "Skipping SLC registration"
+  log="$(log_content)"
+  assert_contains "default: SLC uploaded" "$log" "slc/lakehouse-rustslc.tar.gz"
+  assert_contains "default: ALTER SYSTEM issued" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+}
+
+test_usage_is_mode_aware() {
+  echo "== test_usage_is_mode_aware =="
+  reset_env
+  run_file --help
+  assert_rc_zero "usage: --help exits 0" "$LAST_RC"
+  assert_contains "usage: names this script" "$LAST_OUT" "install.sh"
+  assert_not_contains "usage: no leftover install-saas.sh program name" "$LAST_OUT" "install-saas.sh"
+  assert_contains "usage: documents the saas target" "$LAST_OUT" "--account-id"
+  assert_contains "usage: documents the bucketfs target" "$LAST_OUT" "--bfs-write-password"
+  assert_contains "usage: documents --target" "$LAST_OUT" "--target <saas|bucketfs>"
+  assert_contains "usage: documents --skip-slc" "$LAST_OUT" "--skip-slc"
+  assert_contains "usage: gives a saas example" "$LAST_OUT" "install.sh --account-id ACC --database-id DB --profile"
+  assert_contains "usage: gives a bucketfs example" "$LAST_OUT" "install.sh --profile my-exasol --bfs-write-password"
+  assert_eq "usage: --help makes no network/SQL call" "" "$(log_content)"
+}
+
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
@@ -1467,6 +1522,8 @@ main() {
   test_bucketfs_full_run_artifact_shapes
   test_saas_run_never_touches_bucketfs
   test_tar_required_only_in_bucketfs_mode
+  test_skip_slc_gating
+  test_usage_is_mode_aware
 
   echo ""
   echo "=================================================="
