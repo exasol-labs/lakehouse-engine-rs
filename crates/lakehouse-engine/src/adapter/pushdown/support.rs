@@ -1294,7 +1294,7 @@ pub(super) fn extract_offset(pushdown_req: &Json) -> u64 {
 /// already-correct plan cannot change shape. Callers must render their own
 /// `ORDER BY` ahead of this: Exasol's grammar rejects an `OFFSET` without one.
 ///
-/// The `(None, m>0)` arm silently drops a non-zero offset with no limit; this is
+/// The `(None, _)` arm silently drops a non-zero offset with no limit; this is
 /// unreachable in production — Exasol's grammar ties `OFFSET` to a `LIMIT` (fact 4),
 /// so a bare offset without one is rejected before it ever reaches this function.
 pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {

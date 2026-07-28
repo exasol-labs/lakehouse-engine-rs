@@ -26,6 +26,7 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 | Comparison | `FN_PRED_EQUAL`, `FN_PRED_NOTEQUAL`, `FN_PRED_LESS`, `FN_PRED_LESSEQUAL`, `FN_PRED_BETWEEN`, `FN_PRED_IN_CONSTLIST`, `FN_PRED_IS_NULL`, `FN_PRED_IS_NOT_NULL`, `FN_PRED_LIKE`, `FN_PRED_LIKE_ESCAPE`, `FN_PRED_REGEXP_LIKE` | `WHERE qty BETWEEN 1 AND 10` |
 | Literals | `LITERAL_BOOL`, `LITERAL_DATE`, `LITERAL_DOUBLE`, `LITERAL_EXACTNUMERIC`, `LITERAL_NULL`, `LITERAL_STRING`, `LITERAL_TIMESTAMP`, `LITERAL_TIMESTAMP_UTC` | `WHERE d = DATE '2024-01-01'` |
 | Limit | `LIMIT` | `... LIMIT 100` |
+| Limit with offset | `LIMIT_WITH_OFFSET` | `... LIMIT 20 OFFSET 40` |
 | Ordered top-N | `ORDER_BY_COLUMN` | `... ORDER BY price DESC LIMIT 20` |
 | Ordered by expression | `ORDER_BY_EXPRESSION` | `... ORDER BY price * discount DESC` |
 
