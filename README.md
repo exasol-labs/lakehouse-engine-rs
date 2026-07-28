@@ -10,8 +10,8 @@
 [![Exasol|database](https://img.shields.io/badge/Exasol-database-blue.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-**In-place lakehouse query engine for Exasol — DataFusion in Rust UDFs, querying Iceberg and
-Databricks tables straight from SQL.**
+**In-place lakehouse query engine for Exasol. DataFusion runs in Rust UDFs and queries Iceberg
+and Databricks tables straight from SQL.**
 
 </div>
 
@@ -19,7 +19,8 @@ Databricks tables straight from SQL.**
 
 ## Quick start
 
-Once deployed (see [Install](docs/install.md)), create a Virtual Schema and query it:
+After you deploy the engine (see [Install](docs/install.md)), create a Virtual Schema. Then query
+the schema:
 
 ```sql
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
@@ -34,15 +35,20 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 
 ## What this is
 
-`lakehouse-engine-rs` is a query engine for lakehouses, delivered as an Exasol Virtual Schema.
-[Apache DataFusion](https://datafusion.apache.org/) executes inside stateless Rust UDFs — one
-session per invocation, discarded on completion. The engine resolves the Iceberg file list once
-per query and splits it into sharded work units that Exasol distributes across nodes and
-multiplexes onto each node's cores, so cluster parallelism and DataFusion's vectorized execution
-compound; no node scans another node's files. Pushed-down projection, filter, LIMIT, Top-N,
-aggregation, and broadcast-eligible inner equi-joins keep each scan lean, reaching Apache Iceberg
-and Databricks-managed Iceberg through the same path. Every query starts from source metadata,
-with nothing materialized or copied out.
+`lakehouse-engine-rs` is a query engine for lakehouses. The engine is an Exasol Virtual Schema.
+
+- **Execution model.** [Apache DataFusion](https://datafusion.apache.org/) runs inside stateless
+  Rust UDFs. Each invocation creates one session, and the engine discards that session on
+  completion.
+- **Sharding.** The engine resolves the Iceberg file list once per query and splits it into
+  sharded work units. Exasol distributes the work units across the nodes and multiplexes them onto
+  the cores of each node. Cluster parallelism and the vectorized execution of DataFusion therefore
+  compound. No node scans the files of another node.
+- **Pushdown.** Pushed-down projection, filter, LIMIT, Top-N, aggregation, and broadcast-eligible
+  inner equi-joins keep each scan lean. The same path reaches Apache Iceberg and
+  Databricks-managed Iceberg.
+- **No materialization.** Every query starts from source metadata. The engine materializes nothing
+  and copies nothing out.
 
 ## Documentation
 
@@ -50,13 +56,13 @@ Start at the [documentation index](docs/index.md), or go straight to a guide:
 
 | Guide | What it covers |
 |-------|----------------|
-| [Install](docs/install.md) | One-command install for Exasol SaaS, an automated two-command path for self-managed Exasol, and a manual curl/SQL fallback for restricted networks. Deploy the `.so`, register the Rust SLC, create the scripts, then point a Virtual Schema at your data. |
-| [Catalogs](docs/catalogs.md) | Connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs: CONNECTION objects, credentials, and object-storage access. |
+| [Install](docs/install.md) | Three install paths: one command for Exasol SaaS, an automated two-command path for self-managed Exasol, and a manual curl/SQL fallback for restricted networks. The steps deploy the `.so`, register the Rust SLC, create the scripts, and point a Virtual Schema at your data. |
+| [Catalogs](docs/catalogs.md) | How to connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs. Covers CONNECTION objects, credentials, and object-storage access. |
 | [Benchmark](docs/benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](docs/architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](docs/capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
 | [Tuning](docs/tuning.md) | Configuration parameters reference and runtime telemetry. |
-| [Debugging pushdown](docs/debugging-pushdown.md) | Inspect exactly what the adapter pushes down for a query, using `EXPLAIN VIRTUAL`. |
+| [Debugging pushdown](docs/debugging-pushdown.md) | How to see exactly what the adapter pushes down for a query, with `EXPLAIN VIRTUAL`. |
 
 ## License
 

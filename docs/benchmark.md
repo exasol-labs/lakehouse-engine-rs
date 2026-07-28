@@ -4,11 +4,26 @@
 
 # Benchmark queries
 
-This page documents the **benchmark query set** so you can inspect and reproduce it. The suite is a TPC-H-derived set of 15 queries, each written to exercise a specific pushdown path (projection, filter, LIMIT, Top-N, single-group and GROUP BY aggregation, COUNT(DISTINCT), arithmetic-argument aggregates, and 3- and 4-way joins). It runs the full VS query path against a live system.
+This page documents the **benchmark query set** so you can inspect and reproduce it. The suite is a
+TPC-H-derived set of 15 queries. Each query exercises one specific pushdown path:
 
-This page documents the query set only; it carries no timing or scaling numbers.
+- projection
+- filter
+- LIMIT
+- Top-N
+- single-group aggregation
+- GROUP BY aggregation
+- COUNT(DISTINCT)
+- arithmetic-argument aggregates
+- 3-way and 4-way joins
 
-The canonical queries live in [`bench/run.sh`](../bench/run.sh); dialect-translated copies exist for comparing against other engines. `${VS}` is the virtual schema name (the bench creates it as `TPCH`).
+The suite runs the full VS query path against a live system.
+
+This page documents the query set only. It carries no timing or scaling numbers.
+
+The canonical queries live in [`bench/run.sh`](../bench/run.sh). Dialect-translated copies exist for
+comparison against other engines. `${VS}` is the virtual schema name. The bench creates it as
+`TPCH`.
 
 ## Running it yourself
 
@@ -17,10 +32,14 @@ make bench                  # build the .so, run the suite, write bench/reports/
 ./bench/run.sh selftest      # offline self-check of the script's string logic (no DB needed)
 ```
 
-Configuration comes from a gitignored `bench/.env` (copy `bench/.env.example`). `BENCH_TARGET` picks the mode and defaults to `docker`:
+The configuration comes from a gitignored `bench/.env` file. Copy `bench/.env.example` to create it.
+`BENCH_TARGET` selects the mode. The default is `docker`:
 
-- **`docker` (default)** — self-contained. `docker compose up -d` brings up MinIO, an Iceberg REST catalog, and Exasol; TPC-H is loaded into the local catalog automatically. No AWS and no `.env` are needed.
-- **`remote`** — runs against a real AWS Glue catalog and an external Exasol cluster. TPC-H must be pre-loaded into Glue by the operator; remote mode never loads data. Required `.env` variables:
+- **`docker` (default)** — self-contained. `docker compose up -d` starts MinIO, an Iceberg REST
+  catalog, and Exasol. The bench loads TPC-H into the local catalog automatically. This mode needs
+  no AWS account and no `.env` file.
+- **`remote`** — runs against a real AWS Glue catalog and an external Exasol cluster. The operator
+  must pre-load TPC-H into Glue. Remote mode never loads data. Required `.env` variables:
 
   ```
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
@@ -28,19 +47,35 @@ Configuration comes from a gitignored `bench/.env` (copy `bench/.env.example`). 
   EXASOL_HOST, EXASOL_SYS_PASSWORD, BUCKETFS_WRITE_PASS
   ```
 
-Other knobs include `BENCH_WITH_DELETES` (re-run against 5%-position-deleted Iceberg v2 merge-on-read copies), `BENCH_NR_OF_CORES`, `BENCH_PARALLELISM_FACTOR`, the `BENCH_DF_*` DataFusion threading knobs, and `BENCH_S3_MAX_CONNECTIONS`. For the full knob reference and how to interpret a run's output, see [`bench/README.md`](../bench/README.md).
+Other configuration variables include:
 
-Each run writes a timestamped report to `bench/reports/<name>-<ts>.txt`. Those reports are gitignored and never committed; run the suite yourself to produce your own.
+- `BENCH_WITH_DELETES` — re-runs the suite against 5%-position-deleted Iceberg v2 merge-on-read
+  copies
+- `BENCH_NR_OF_CORES`
+- `BENCH_PARALLELISM_FACTOR`
+- the `BENCH_DF_*` DataFusion threading variables
+- `BENCH_S3_MAX_CONNECTIONS`
+
+For the full variable reference and instructions to read the output of a run, see
+[`bench/README.md`](../bench/README.md).
+
+Each run writes a timestamped report to `bench/reports/<name>-<ts>.txt`. The reports are gitignored
+and never committed. Run the suite yourself to produce your own reports.
 
 ## Query catalog
 
-Two groups: `Q1`-`Q9b` cover the core join and aggregate shapes; `NQ1`-`NQ5` probe specific
-pushdown targets (arithmetic aggregates, LIKE/IN filters, Top-N, a 4-way join, and GROUP BY +
-HAVING).
+The catalog has two groups. `Q1`-`Q9b` cover the core join and aggregate shapes. `NQ1`-`NQ5` test
+specific pushdown targets:
+
+- arithmetic aggregates
+- LIKE and IN filters
+- Top-N
+- a 4-way join
+- GROUP BY with HAVING
 
 ### Q1 - supplier × nation × region (wiring check)
 
-3-way join and small-table sanity check.
+3-way join and small-table check.
 
 ```sql
 SELECT n.N_NAME, r.R_NAME, COUNT(*) AS suppliers
@@ -53,7 +88,7 @@ ORDER BY n.N_NAME;
 
 ### Q2 - customer × orders × lineitem (big 3-way scan)
 
-Full 3-way join across the largest tables; pure join throughput.
+Full 3-way join across the largest tables. This query measures join throughput only.
 
 ```sql
 SELECT COUNT(*) AS rows_joined
@@ -77,7 +112,7 @@ ORDER BY o.O_ORDERPRIORITY;
 
 ### Q4 - lineitem pricing summary (TPC-H Q1 shape)
 
-Canonical TPC-H Q1; multi-column aggregate pushdown.
+Canonical TPC-H Q1. It uses multi-column aggregate pushdown.
 
 ```sql
 SELECT L_RETURNFLAG, L_LINESTATUS,
@@ -91,7 +126,8 @@ ORDER BY L_RETURNFLAG, L_LINESTATUS;
 
 ### Q5 - orders × lineitem GROUP BY, no filter
 
-Q3 without the `WHERE`; isolates the filter pushdown's contribution against Q3.
+Q3 without the `WHERE` clause. A comparison with Q3 isolates the contribution of the filter
+pushdown.
 
 ```sql
 SELECT o.O_ORDERPRIORITY, COUNT(*) AS cnt, SUM(l.L_EXTENDEDPRICE) AS revenue
@@ -103,7 +139,7 @@ ORDER BY o.O_ORDERPRIORITY;
 
 ### Q6 - lineitem pricing summary, no filter
 
-Q4 without the `WHERE`; an unfiltered aggregate scan over the full table.
+Q4 without the `WHERE` clause. It is an unfiltered aggregate scan over the full table.
 
 ```sql
 SELECT L_RETURNFLAG, L_LINESTATUS,
@@ -116,7 +152,7 @@ ORDER BY L_RETURNFLAG, L_LINESTATUS;
 
 ### Q7 - high-cardinality GROUP BY
 
-A GROUP BY with roughly 45M distinct groups; stresses the aggregate and shuffle path.
+A GROUP BY with approximately 45M distinct groups. It puts load on the aggregate and shuffle path.
 
 ```sql
 SELECT COUNT(*) FROM (
@@ -128,7 +164,8 @@ SELECT COUNT(*) FROM (
 
 ### Q8 - highly selective filter
 
-A single-day equality filter matching under 0.05% of rows; filter-pushdown selectivity.
+A single-day equality filter that matches less than 0.05% of the rows. It measures filter-pushdown
+selectivity.
 
 ```sql
 SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPDATE = DATE '1995-06-15';
@@ -136,7 +173,7 @@ SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPDATE = DATE '1995-06-15';
 
 ### Q9a - narrow projection
 
-Single-column full scan; minimal projection width.
+Single-column full scan with the minimum projection width.
 
 ```sql
 SELECT SUM(L_QUANTITY) FROM ${VS}.LINEITEM;
@@ -192,7 +229,7 @@ WHERE p.P_SIZE = 15 AND p.P_TYPE LIKE '%BRASS%' AND n.N_NAME = 'GERMANY';
 
 ### NQ4 - Top-N (ORDER BY + LIMIT)
 
-Top-N pushdown: a per-shard bounded sort merged Exasol-side.
+Top-N pushdown. Each shard does a bounded sort, and Exasol merges the results.
 
 ```sql
 SELECT L_ORDERKEY, L_EXTENDEDPRICE
@@ -213,9 +250,11 @@ HAVING COUNT(*) > 1000000
 ORDER BY O_ORDERPRIORITY, O_ORDERSTATUS;
 ```
 
-## Example remote catalog config
+## Example remote catalog configuration
 
-For `BENCH_TARGET=remote`, `bench/.env` points the suite at an AWS Glue Iceberg REST catalog and an external Exasol cluster. The values below are placeholders; substitute your own. `GLUE_WAREHOUSE` is the Glue catalog id (your AWS account id), not an `s3://` path.
+For `BENCH_TARGET=remote`, `bench/.env` points the suite at an AWS Glue Iceberg REST catalog and an
+external Exasol cluster. The values below are placeholders. Replace them with your own values.
+`GLUE_WAREHOUSE` is the Glue catalog id, which is your AWS account id. It is not an `s3://` path.
 
 ```bash
 BENCH_TARGET=remote
@@ -238,8 +277,10 @@ EXASOL_SYS_PASSWORD=<your-sys-password>
 BUCKETFS_WRITE_PASS=<your-bucketfs-write-password>
 ```
 
-If your deployment reaches the cluster over SSH, use a generic profile and key placeholder such as `<your-aws-profile>` and `<your-key-file>`; never commit real credentials or account ids.
+If your deployment reaches the cluster over SSH, use generic profile and key placeholders such as
+`<your-aws-profile>` and `<your-key-file>`. Never commit real credentials or account ids.
 
 ---
 
-Run the suite yourself with `make bench` to produce timing, scaling, and overhead numbers for your own environment; none are published here.
+Run the suite with `make bench` to produce timing, scaling, and overhead numbers for your own
+environment. This page publishes no such numbers.
