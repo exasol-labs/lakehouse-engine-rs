@@ -163,16 +163,15 @@ Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereq
 * *AND* it SHALL give one example invocation per target
 * *AND* it SHALL make no network call, no SQL call, and SHALL require no credential
 
-### Scenario: A flag belonging to the other target is accepted and ignored
+### Scenario: A flag belonging to the other target is rejected, not silently ignored
 
-* *GIVEN* an invocation carrying a flag its resolved target does not use — for example `--staging` on a BucketFS run, or `--bfs-port` on a SaaS run
+* *GIVEN* an invocation carrying a flag its resolved target does not use — `--staging` with neither `--account-id` nor `--database-id` given (BucketFS detected), or any of `--bfs-host`/`--bfs-port`/`--bfs-bucket`/`--bfs-write-password` given alongside both `--account-id` and `--database-id` (SaaS detected)
 * *WHEN* the installer runs
-* *THEN* the flag SHALL be parsed and then ignored, and the run SHALL proceed normally: `--staging` is read only by the SaaS base resolution, and the `--bfs-*` values are read only by BucketFS I/O
-* *AND* the installer SHALL NOT reject such a flag as a cross-mode conflict — the ONLY targeting conflicts it detects are a `--target` value that disagrees with the detected mode, and a partial SaaS id pair
-* *AND* this SHALL be recorded as a named limitation rather than a deliberate affordance, because a mistyped or leftover cross-mode flag is silently inert instead of prompting the operator to check which target they actually selected; rejecting cross-mode flags would be a strict improvement and is not implemented (tracked with the installer's other follow-ups in issue #252)
+* *THEN* `resolve_target_mode` SHALL fail before any network call, naming the conflicting flag(s) and the detected mode, rather than parsing the flag and silently proceeding
+* *AND* an untouched `--bfs-bucket` default (no `--bfs-bucket` given) SHALL NOT be treated as a conflict on a SaaS run — only a flag the caller actually supplied counts
+* *AND* the full set of targeting conflicts the installer SHALL detect is: a `--target` value disagreeing with the detected mode, a partial SaaS id pair, `--staging` without both SaaS ids, and any `--bfs-*` flag given together with both SaaS ids — closing what was tracked as a named limitation during initial implementation, when a cross-mode flag was briefly accepted and ignored
 
 ## Limitations
 
-* **Cross-mode flags are not rejected.** See the scenario above. Only `--target` disagreement and a partial SaaS id pair are treated as targeting errors.
 * **A BucketFS write password containing whitespace is unsupported** when passed as `--bfs-write-password`, because the `--bfs-*` override list is deliberately word-split by its caller. The supported route for such a password is the profile's `bfs_write_password` key, which the installer never reads.
 * **Coupling to `exapump`'s configuration shape.** Profile-mode SaaS PAT derivation and profile-mode `bfs_bucket` / `bfs_write_password` resolution all parse `${EXAPUMP_CONFIG:-$HOME/.exapump/config.toml}` directly, assuming flat `[profile]` sections with quoted scalar values. If `exapump` changes that location or format, these three reads must change with it.
