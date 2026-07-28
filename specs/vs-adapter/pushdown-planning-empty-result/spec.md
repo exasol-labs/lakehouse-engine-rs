@@ -44,7 +44,7 @@ instead of rejecting it for a column-count/type mismatch.
   currently requires the empty and non-empty paths to derive "the HAVING-present
   hard-error decline" from the shared request classifier. This plan deletes that
   decline from the classifier entirely (`vs-adapter/pushdown-module-structure`,
-  `vs-adapter/pushdown-planning-grouped-agg`, issue #195), so the clause must be
+  `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`, issue #195), so the clause must be
   amended or the recorded library would hold two contradictory normative statements
   about the same classifier.
 * Nothing about the empty path's own behavior changes. The classifier is still the

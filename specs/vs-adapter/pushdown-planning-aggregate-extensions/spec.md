@@ -34,7 +34,7 @@ being pushed as a partial/merge plan.
 * The correct handling for a HAVING the adapter cannot render over the partial/merge
   decomposition is therefore neither omission nor an error: route the request to the qualified
   single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows.
-  See `vs-adapter/pushdown-planning-grouped-agg` (issue #195).
+  See `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback` (issue #195).
 * This delta does NOT adjudicate the WHERE-filter backstop. An untranslatable WHERE predicate
   is genuinely omitted from the scan spec (`vs_expression::render_df_filter_safe` returns
   `None`), a distinct mechanism with its own capability story; the Background statement about
@@ -55,7 +55,7 @@ being pushed as a partial/merge plan.
 * *THEN* the adapter SHALL render the HAVING predicate to a DataFusion SQL fragment using the same VS expression translator path used for WHERE predicates
 * *AND* the adapter SHALL apply the rendered HAVING predicate only in the OUTER wrapper SQL that merges the per-shard partial-aggregate rows, never inside the per-shard partial scan (a per-shard HAVING would discard groups that only meet the threshold after merge)
 * *AND* the adapter MUST NOT omit a HAVING it cannot render from the returned SQL, because Exasol does not re-apply a HAVING whose `AGGREGATE_HAVING` capability the adapter advertises — omission returns wrong rows
-* *AND* a HAVING the adapter cannot render over the partial/merge decomposition SHALL instead route the request to the qualified single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows so the predicate is preserved rather than dropped (see `vs-adapter/pushdown-planning-grouped-agg`, issue #195)
+* *AND* a HAVING the adapter cannot render over the partial/merge decomposition SHALL instead route the request to the qualified single-table wrapper, which renders the HAVING as ordinary Exasol SQL over materialized rows so the predicate is preserved rather than dropped (see `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`, issue #195)
 
 ### Scenario: Decomposable statistical aggregate is pushed down via sufficient statistics
 

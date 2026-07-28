@@ -18,7 +18,7 @@ engine rather than a fixed per-shard serialization cap.
   more than one distinct aggregate, or a distinct aggregate alongside any ordinary
   SUM/MIN/MAX/COUNT/AVG aggregate (Case 2/3), MUST decline the fan-out and route to a
   qualified single-table wrapper — the same shape the grouped-aggregate decline fallback uses
-  (`vs-adapter/pushdown-planning-grouped-agg`). The wrapper renders the exact single-group
+  (`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`). The wrapper renders the exact single-group
   select list, every aggregate (including each `COUNT(DISTINCT)`) spliced verbatim, over a
   materialized sharded raw scan aliased once, so the adapter's OWN SQL produces the one-row
   aggregated result and Exasol only passes it through. A BARE row scan MUST NOT be returned for
@@ -102,7 +102,7 @@ engine rather than a fixed per-shard serialization cap.
 * *THEN* the adapter MUST NOT build any DISTINCT row-scan fan-out or compose a distinct count as a SELECT-list scalar subquery — Exasol rejects an emitting UDF call nested in a scalar subquery at compile time (`sqlCode 04000`)
 * *AND* the adapter MUST NOT return a bare row scan of the source columns — Exasol never re-aggregates a declined pushdown, so a raw-column response where `selectListDataTypes` expects N aggregate columns is rejected at pushdown-validation time (`sqlCode 04000`, column-count mismatch)
 * *AND* the adapter SHALL decline the fan-out and return a qualified single-table wrapper — `SELECT <the exact select list, every aggregate incl. each COUNT(DISTINCT) spliced verbatim> FROM (<materialized sharded raw scan> AS <alias>)` — so the adapter's OWN SQL computes every aggregate, including every DISTINCT, and Exasol passes the one-row result through unchanged; the wrapper's output SHALL be N columns, one per select-list item
-* *AND* the inner materialized scan's projection SHALL be narrowed to only the columns the request references — including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references — NEVER the full table schema, via the same referenced-column helper the grouped-aggregate qualified-wrapper fallback uses (`vs-adapter/pushdown-planning-grouped-agg`; issue #160)
+* *AND* the inner materialized scan's projection SHALL be narrowed to only the columns the request references — including columns nested inside aggregate arguments and CASE branches, plus filter, HAVING, and ORDER BY references — NEVER the full table schema, via the same referenced-column helper the grouped-aggregate qualified-wrapper fallback uses (`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`; issue #160)
 * *AND* every returned aggregate value, including each `COUNT(DISTINCT col)`, SHALL equal the corresponding aggregate evaluated over all rows on a single node
 
 ### Scenario: LIMIT, OFFSET, and ORDER BY are NOT pushed into the distinct fan-out sub-scan

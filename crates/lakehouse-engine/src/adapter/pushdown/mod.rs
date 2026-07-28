@@ -47,11 +47,11 @@ pub use single_group_agg::{detect_aggregates, ordinary_plans};
 use single_group_agg::{has_distinct, is_lone_count_distinct};
 
 mod grouped_agg;
+use grouped_agg::group_key_exasol_types;
 pub use grouped_agg::{
     GroupedAggregateDetection, GroupedSelectItem, build_grouped_aggregate_scan_sql,
     detect_group_by_aggregates, validate_agg_col_types,
 };
-use grouped_agg::{GroupedOrderBy, build_grouped_order_by_clause, group_key_exasol_types};
 
 mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
@@ -358,7 +358,11 @@ pub(crate) fn build_dispatch_sql(
     // input the row-scan/partial-aggregate rendering below consumes (`Some` ordinary
     // plans for the aggregate sub-path, `None` for a row scan).
     let aggregates = match classify_request_shape(pushdown_req, &col_types) {
-        RequestShape::Grouped { detection, having } => {
+        RequestShape::Grouped {
+            detection,
+            having,
+            order_by: grouped_order_by,
+        } => {
             let GroupedAggregateDetection {
                 group_keys,
                 plans: grouped_agg_plans,
@@ -371,26 +375,15 @@ pub(crate) fn build_dispatch_sql(
             // that does not render routes to `GroupByWrapper` instead of reaching
             // this arm.
 
-            // Grouped aggregate pushdown path. Once ORDER_BY_COLUMN is advertised,
-            // Exasol delegates any ORDER BY on the grouped output and NO LONGER
-            // re-sorts the rows the adapter returns (add-topn-pushdown B6), so the
-            // merge SQL must render its own explicit final ORDER BY over the grouped
-            // output columns. Resolve it now: a pushed sort key that cannot be mapped
-            // to a grouped output column is a shape SQL forbids — decline the pushdown
-            // as a hard error rather than emit an unsorted merge.
-            let grouped_order_by =
-                match build_grouped_order_by_clause(pushdown_req, &group_keys, &select_items) {
-                    Some(GroupedOrderBy::Clause(clause)) => Some(clause),
-                    Some(GroupedOrderBy::Unresolvable) => {
-                        return Err(UdfError::User(
-                            "grouped aggregate pushdown declined: ORDER BY references a \
-                         column that is not a grouped output column; this is a hard \
-                         error, not a native re-plan"
-                                .into(),
-                        ));
-                    }
-                    None => None,
-                };
+            // `grouped_order_by` likewise arrives ALREADY RESOLVED over the merge
+            // decomposition (a group key as its positional output ordinal, an
+            // aggregate as its merged PARTIAL_* expression). Once ORDER_BY_COLUMN is
+            // advertised Exasol delegates any ORDER BY on the grouped output and NO
+            // LONGER re-sorts the rows the adapter returns (add-topn-pushdown B6), so
+            // the merge SQL must render its own explicit final ORDER BY — and an
+            // ordering the merge cannot express routes to `GroupByWrapper` instead of
+            // reaching this arm (issue #198).
+
             // With the ordering now rendered explicitly, the outer LIMIT is a true
             // global top-N over the merged groups, so it is safe to apply. When there
             // is no ORDER BY it stays a plain grouped LIMIT (unchanged). The per-shard
@@ -624,6 +617,11 @@ pub(crate) fn build_dispatch_sql(
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(pushdown_req);
+        // Correctness-safety guard (issue #198): Exasol delegated this ordering and no
+        // longer re-sorts, so a key that renders nothing must decline HERE — before the
+        // projection is extended and before any SQL is built. Rendering only the
+        // surviving keys would answer a different query than the one asked, silently.
+        topn::ensure_every_sort_key_renders(&keys)?;
         topn::extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
         keys
     } else {
@@ -681,6 +679,7 @@ pub(crate) fn build_dispatch_sql(
         &proj_cols,
         &proj_types,
         effective_limit,
+        limit,
         &col_types,
         &aggregate_types,
         udf_name,
@@ -1456,7 +1455,6 @@ mod tests {
     /// `proj_cols`/`proj_types` pair — the flag the dispatcher routes on (#196). The
     /// declined-`ORDER BY` guard tests all pass `false`; the two widening-routing
     /// tests pass the same inputs under both values.
-    #[allow(clippy::too_many_arguments)]
     fn guard_dispatch_sql(
         request: &Json,
         proj_cols: Vec<ProjectionItem>,
@@ -1465,8 +1463,38 @@ mod tests {
         limit: Option<u64>,
         logical_schema: Vec<LogicalField>,
     ) -> String {
+        let result = guard_dispatch_result(
+            request,
+            proj_cols,
+            proj_types,
+            projection_widened,
+            limit,
+            logical_schema,
+        )
+        .expect("build_dispatch_sql must succeed for this declined-ORDER-BY fixture");
+        result["sql"]
+            .as_str()
+            .expect("pushdown response must carry a sql field")
+            .to_string()
+    }
+
+    /// [`guard_dispatch_sql`] WITHOUT the success expectation, for the decline
+    /// assertions: an unrenderable pushed sort key is a `User` error, not SQL.
+    ///
+    /// `has_order_by` is DERIVED here via the production `order_by_present` rather
+    /// than hardcoded, so a fixture carrying no `orderBy` exercises the real
+    /// non-declined route.
+    fn guard_dispatch_result(
+        request: &Json,
+        proj_cols: Vec<ProjectionItem>,
+        proj_types: Vec<String>,
+        projection_widened: bool,
+        limit: Option<u64>,
+        logical_schema: Vec<LogicalField>,
+    ) -> Result<Json, UdfError> {
         let pushdown_req = pd(request);
-        let result = build_dispatch_sql(
+        let has_order_by = order_by_present(&pushdown_req);
+        build_dispatch_sql(
             request,
             &pushdown_req,
             proj_cols,
@@ -1475,7 +1503,7 @@ mod tests {
             guard_col_types(),
             None,
             limit,
-            true,
+            has_order_by,
             &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
             "s3://warehouse/db/events".to_string(),
             logical_schema,
@@ -1490,11 +1518,6 @@ mod tests {
             200,
             8,
         )
-        .expect("build_dispatch_sql must succeed for this declined-ORDER-BY fixture");
-        result["sql"]
-            .as_str()
-            .expect("pushdown response must carry a sql field")
-            .to_string()
     }
 
     /// Scenario (pushdown-planning-capability-extensions, issues #225 / #189): a
@@ -1810,57 +1833,129 @@ mod tests {
         );
     }
 
-    /// The empty-parsed-keys guard: an `orderBy` array whose every element
-    /// `parse_sort_key_element` REJECTS makes `order_by_present` true (it only checks
-    /// array non-emptiness) while `parse_order_by_keys` yields ZERO keys. Both rejected
-    /// element kinds are exercised — a `function_scalar` expression sort key, and a
-    /// bare `column` node missing its `nullsLast` flag.
+    /// Scenario (pushdown-planning-capability-extensions, issue #198): "An ORDER BY
+    /// the adapter cannot bound as a top-N remains correctness-safe."
     ///
-    /// `wrap_declined_order_by` must return the SQL UNCHANGED for that shape. Since
-    /// `render_order_by_clause(&[])` yields an empty string, a dropped guard would emit
-    /// a wrapper ending in an invalid bare `ORDER BY ` — a syntax error, which no arity
-    /// assertion elsewhere would catch. The pushed `LIMIT` stays withheld as well: the
-    /// adapter never renders a bare limit ahead of an ordering it did not itself render
-    /// (anti-wrong-truncation invariant, decision [4]).
+    /// Exasol DELEGATES a pushed ordering and no longer re-applies its own backstop
+    /// sort, so the declined row-scan path has exactly two correctness-safe outcomes:
+    /// render the ordering in FULL, or decline with a `User` error naming the key.
+    /// Returning SQL that reproduces only PART of the pushed ordering is the
+    /// silent-wrong-order outcome this guard exists to make unreachable.
+    ///
+    /// Three facets, and facet (b) is why the guard tests ANY unrenderable element
+    /// rather than ALL of them:
+    /// (a) every element unrenderable — both kinds: an expression node NEITHER
+    ///     dialect knows, and a bare `column` node missing its `nullsLast` flag
+    ///     (direction / NULL placement is never silently defaulted). This SUPERSEDES
+    ///     `fix-225`'s "return the unwrapped SQL unchanged" rule for a NON-EMPTY
+    ///     `orderBy`.
+    /// (b) MIXED — one renderable key and one not. An `all`-shaped guard would pass
+    ///     this through and render a partial ordering, which is precisely the silent
+    ///     corruption; only the unrenderable key's own ordering would be lost, and
+    ///     nothing downstream would notice.
+    /// (c) ABSENT `orderBy` — unchanged: the unwrapped fan-out, no wrapper, no
+    ///     decline. Nothing was delegated, so nothing must be reproduced.
     #[test]
-    fn declined_order_by_unparseable_sort_key_emits_no_wrapper() {
-        let request = guard_events_request(serde_json::json!({
+    fn declined_order_by_renders_every_reachable_ordering_or_declines() {
+        let unrenderable_expression = serde_json::json!({
+            "type": "order_by_element",
+            "expression": {"type": "no_such_node_type_in_either_dialect"},
+            "isAscending": true,
+            "nullsLast": true
+        });
+        // A bare column node whose NULL placement is absent: renderable as an
+        // identifier, but not as an ORDER BY element.
+        let column_missing_nulls_last = serde_json::json!({
+            "type": "order_by_element",
+            "expression": {"type": "column", "name": "ID"},
+            "isAscending": true
+        });
+        let renderable_expression = serde_json::json!({
+            "type": "order_by_element",
+            "expression": {
+                "type": "function_scalar",
+                "name": "ABS",
+                "arguments": [{"type": "column", "name": "AMOUNT", "tableName": "EVENTS"}]
+            },
+            "isAscending": false,
+            "nullsLast": true
+        });
+        let declining_shapes = [
+            (
+                "every element unrenderable",
+                serde_json::json!([unrenderable_expression, column_missing_nulls_last]),
+            ),
+            (
+                "renderable key first, unrenderable second",
+                serde_json::json!([renderable_expression, unrenderable_expression]),
+            ),
+            (
+                "unrenderable key first, renderable second",
+                serde_json::json!([unrenderable_expression, renderable_expression]),
+            ),
+        ];
+
+        for (facet, order_by) in declining_shapes {
+            let request = guard_events_request(serde_json::json!({
+                "selectList": [{"type": "column", "name": "NAME"}],
+                "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+                "orderBy": order_by,
+                "limit": {"numElements": 7}
+            }));
+            let err = guard_dispatch_result(
+                &request,
+                vec![ProjectionItem::Column("NAME".to_string())],
+                vec!["VARCHAR(2000000)".to_string()],
+                false,
+                Some(7),
+                Vec::new(),
+            )
+            .expect_err(&format!(
+                "{facet}: a pushed ordering the adapter cannot reproduce in full must \
+                 decline, never return SQL"
+            ));
+            match err {
+                UdfError::User(msg) => {
+                    assert!(
+                        msg.contains("ORDER BY") && msg.contains("declined"),
+                        "{facet}: the decline must name the unrenderable ORDER BY key: {msg}"
+                    );
+                    assert!(
+                        msg.contains("not a native re-plan"),
+                        "{facet}: the decline is a HARD error — Exasol does not re-plan \
+                         natively, so the message must not imply a retry: {msg}"
+                    );
+                }
+                other => panic!("{facet}: must be a User decline, got {other:?}"),
+            }
+        }
+
+        // (c) No `orderBy` at all: nothing was delegated, so the fan-out is returned
+        // unwrapped and the LIMIT is NOT withheld.
+        let unordered = guard_events_request(serde_json::json!({
             "selectList": [{"type": "column", "name": "NAME"}],
             "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
-            "orderBy": [
-                {
-                    "type": "order_by_element",
-                    "expression": {"type": "function_scalar", "name": "ABS", "arguments": [
-                        {"type": "column", "name": "AMOUNT"}
-                    ]},
-                    "isAscending": true,
-                    "nullsLast": true
-                },
-                {
-                    "type": "order_by_element",
-                    "expression": {"type": "column", "name": "ID"},
-                    "isAscending": true
-                },
-            ],
             "limit": {"numElements": 7}
         }));
-        let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
-        let proj_types = vec!["VARCHAR(2000000)".to_string()];
-
-        let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, Some(7), Vec::new());
-
+        let sql = guard_dispatch_sql(
+            &unordered,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            false,
+            Some(7),
+            Vec::new(),
+        );
         assert!(
             !sql.contains("ORDER BY"),
-            "zero parsed sort keys must emit no ORDER BY at all, least of all a bare \
-             one: {sql}"
+            "an absent orderBy must emit no ORDER BY at all: {sql}"
         );
         assert!(
             sql.starts_with("SELECT LAKEHOUSE_SCAN(") && !sql.contains(" FROM ("),
-            "zero parsed sort keys must leave the fan-out unwrapped: {sql}"
+            "an absent orderBy must leave the fan-out unwrapped: {sql}"
         );
         assert!(
-            !sql.contains("LIMIT"),
-            "the limit stays withheld for an ordering the adapter did not render: {sql}"
+            sql.contains("LIMIT 7"),
+            "an absent orderBy must not withhold the request LIMIT: {sql}"
         );
     }
 

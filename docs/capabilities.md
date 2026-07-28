@@ -27,17 +27,27 @@ Translated predicates prune whole data files via Iceberg manifest stats, then sk
 | Literals | `LITERAL_BOOL`, `LITERAL_DATE`, `LITERAL_DOUBLE`, `LITERAL_EXACTNUMERIC`, `LITERAL_NULL`, `LITERAL_STRING`, `LITERAL_TIMESTAMP`, `LITERAL_TIMESTAMP_UTC` | `WHERE d = DATE '2024-01-01'` |
 | Limit | `LIMIT` | `... LIMIT 100` |
 | Ordered top-N | `ORDER_BY_COLUMN` | `... ORDER BY price DESC LIMIT 20` |
+| Ordered by expression | `ORDER_BY_EXPRESSION` | `... ORDER BY price * discount DESC` |
 
 `FN_PRED_GREATER` / `FN_PRED_GREATEREQUAL` are not Exasol capability names — Exasol normalises `a > b` to `b < a` before it reaches the adapter.
 
 `ORDER BY ... LIMIT n` over a single table (no join, no `GROUP BY`) with every sort key a bare
 projected column pushes down as a per-shard bounded top-N (a DataFusion `TopK`, not a full sort):
 each shard emits only its own local top-`n` rows, and Exasol merges the `shard_count × n` rows with
-a final `ORDER BY ... LIMIT n`. `ORDER_BY_EXPRESSION` (sort-by-expression) and `LIMIT_WITH_OFFSET`
-remain unadvertised. Any `ORDER BY` shape the adapter can't bound this way (a join, a `GROUP BY`, an
-unprojected or JSON-fallback-typed sort key) still returns correct results — the adapter renders its
-own explicit final `ORDER BY`/`LIMIT` around the unoptimized full scan, since Exasol no longer
-re-sorts once `ORDER_BY_COLUMN` is advertised.
+a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` remains unadvertised.
+
+`ORDER_BY_EXPRESSION` is advertised too (issue #198): a sort key that is an expression, not a bare
+column, does not qualify for the bounded top-N above, but it is not a silent-wrong-order gap either
+— three paths render it correctly. The single-table/no-join, no-`GROUP BY` row-scan wrapper appends
+the expression's referenced base columns as hidden columns and renders the sort expression in the
+Exasol dialect over them (an unbounded full scan, correctness only — no per-shard top-N). The
+grouped-merge path renders an aggregate `ORDER BY` over the partial/merge columns, or routes to the
+plain `GROUP BY` wrapper when the sort key isn't an aggregate or group key. The qualified
+single-table/N-scan join wrapper renders any sortable expression directly, since it already
+qualifies column references. Any `ORDER BY` shape none of these paths can render still returns
+correct results — the adapter renders its own explicit final `ORDER BY`/`LIMIT` around the
+unoptimized full scan, since Exasol no longer re-sorts once `ORDER_BY_COLUMN` and
+`ORDER_BY_EXPRESSION` are advertised.
 
 ## Scalar functions ✅
 
