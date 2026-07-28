@@ -6,7 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
+    # ready_for_review so CI fires when a draft is marked ready (the draft
+    # guard on the root jobs skips draft-PR runs).
+    types: [opened, synchronize, reopened, ready_for_review]
   # Merge queue: required checks MUST run on merge_group or queued PRs hang
   # forever waiting for a status that never reports.
   merge_group:
@@ -32,6 +34,9 @@ jobs:
   build-so:
     name: Build release .so (Docker)
     runs-on: ubuntu-latest
+    # Skip draft PRs; still run on push/merge_group (where pull_request is null).
+    # e2e/e2e-lakekeeper cascade-skip via `needs: [build-so]`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
     # release build). 60 min is a safety backstop against a genuine hang, not
     # a tight budget.
