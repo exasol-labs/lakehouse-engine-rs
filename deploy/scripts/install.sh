@@ -481,6 +481,10 @@ validate_connectivity() {
 # default target: AppDB, Docker, on-premise). Exactly one given is always a mistake and errors.
 # --target is an optional assertion: it never selects a mode, it only fails the run when the
 # caller's stated intent disagrees with what the flags actually describe.
+#
+# Also rejects flags that only make sense for the OTHER target: --staging when no SaaS ids were
+# given, or any --bfs-* flag when both SaaS ids were given. A silently-ignored flag here would
+# read as "I told it to use staging / a custom bucket" while the run quietly did something else.
 resolve_target_mode() {
   local detected=""
   if [[ -n "$ARG_ACCOUNT_ID" && -n "$ARG_DATABASE_ID" ]]; then
@@ -490,6 +494,22 @@ resolve_target_mode() {
     return 1
   else
     detected="bucketfs"
+  fi
+
+  if [[ "$detected" == "bucketfs" && "$ARG_STAGING" -eq 1 ]]; then
+    err "--staging is a SaaS-only flag, but no --account-id/--database-id were given (BucketFS target detected). Drop --staging, or pass both ids for an Exasol SaaS install."
+    return 1
+  fi
+  if [[ "$detected" == "saas" ]]; then
+    local bfs_flags_given=""
+    [[ -n "$ARG_BFS_HOST" ]] && bfs_flags_given="$bfs_flags_given --bfs-host"
+    [[ -n "$ARG_BFS_PORT" ]] && bfs_flags_given="$bfs_flags_given --bfs-port"
+    [[ "$ARG_BFS_BUCKET_SET" -eq 1 ]] && bfs_flags_given="$bfs_flags_given --bfs-bucket"
+    [[ -n "$ARG_BFS_WRITE_PASSWORD" ]] && bfs_flags_given="$bfs_flags_given --bfs-write-password"
+    if [[ -n "$bfs_flags_given" ]]; then
+      err "BucketFS-only flag(s)$bfs_flags_given were given, but --account-id and --database-id were both given too (Exasol SaaS target detected). SaaS uploads go through its own REST API, not BucketFS -- drop the BucketFS flag(s), or drop --account-id/--database-id for a BucketFS install."
+      return 1
+    fi
   fi
 
   if [[ -n "$ARG_TARGET" ]]; then

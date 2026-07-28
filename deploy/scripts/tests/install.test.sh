@@ -1103,6 +1103,43 @@ test_target_flag_conflict_detection() {
   run_file --target bucketfs "${HAPPY_ARGS[@]}"
   assert_rc_nonzero "--target bucketfs against SaaS ids: full run refuses" "$LAST_RC"
   assert_eq "--target conflict: no network call made" "" "$(log_content)"
+
+  # --staging only means anything on a SaaS run; giving it with no SaaS ids is a mistake, not a
+  # silently-ignored no-op.
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; ARG_STAGING=1; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--staging with no SaaS ids: nonzero" "$rc"
+  assert_contains "--staging with no SaaS ids: names --staging" "$out" "--staging"
+  assert_contains "--staging with no SaaS ids: names the detected mode" "$out" "BucketFS"
+
+  reset_env
+  run_file --staging "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_nonzero "--staging against a full bucketfs run: refuses" "$LAST_RC"
+  assert_eq "--staging conflict: no network call made" "" "$(log_content)"
+
+  # Any --bfs-* flag only means anything on a BucketFS run; giving one alongside both SaaS ids is
+  # a mistake, not a silently-ignored no-op.
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; ARG_BFS_HOST=somehost; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--bfs-host with both SaaS ids: nonzero" "$rc"
+  assert_contains "--bfs-host with both SaaS ids: names --bfs-host" "$out" "--bfs-host"
+  assert_contains "--bfs-host with both SaaS ids: names the detected mode" "$out" "SaaS"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--bfs-bucket with both SaaS ids: nonzero" "$rc"
+  assert_contains "--bfs-bucket with both SaaS ids: names --bfs-bucket" "$out" "--bfs-bucket"
+
+  # A --bfs-bucket left at its unset default must NOT be mistaken for an explicit flag.
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; resolve_target_mode )"
+  rc=$?
+  assert_rc_zero "saas with untouched --bfs-bucket default: still passes" "$rc"
+  assert_eq "saas with untouched --bfs-bucket default: yields saas" "saas" "$mode"
+
+  reset_env
+  run_file --bfs-write-password whatever "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "--bfs-write-password against a full saas run: refuses" "$LAST_RC"
+  assert_eq "--bfs-write-password conflict: no network call made" "" "$(log_content)"
 }
 
 test_resolve_target_layout_bucketfs_values() {
