@@ -47,11 +47,12 @@ jobs:
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
       # same ENOSPC class that killed lint/unit-tests. Reclaim ~12 GB up front.
       # (Latent until now because CI has only hit the warm path; a Cargo.lock
-      # bump forces the cold path.) Backgrounded (`&`) to keep 22–76s off the
-      # critical path — safe wherever nothing downstream blocks on the reclaim,
-      # which rules out e2e/e2e-lakekeeper (their next step needs the space).
+      # bump forces the cold path.) Kept synchronous in every job: backgrounding
+      # it with `&` saves 22–76s but makes the step exit 0 before the space
+      # exists, and the multi-GB cache restore two steps down is exactly the
+      # ENOSPC-on-a-tight-disk case documented in `e2e`.
       - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
       - uses: actions/checkout@v7
 
@@ -130,9 +131,9 @@ jobs:
       github.event.changes.base != null
     steps:
       # Reclaim ~12 GB before clippy's --all-targets pass ENOSPCs the ~21 GB
-      # runner disk; backgrounded as in build-so.
+      # runner disk. Synchronous — see build-so.
       - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
       - uses: actions/checkout@v7
 
@@ -186,10 +187,9 @@ jobs:
       github.event.changes.base != null
     steps:
       # Reclaim disk before compiling the test binaries (avoids the ENOSPC that
-      # killed this job); backgrounded as in build-so — checkout + toolchain
-      # setup run first, so the reclaim overlaps with them.
+      # killed this job). Synchronous — see build-so.
       - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet &
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
       - uses: actions/checkout@v7
 

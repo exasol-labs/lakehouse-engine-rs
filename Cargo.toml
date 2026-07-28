@@ -24,7 +24,9 @@ license = "MIT"
 # `features`/`default-features` edit that doesn't move the lockfile rotates
 # nothing and poisons the cache permanently. Prefer declaring features on the
 # member crate — member manifests ARE hashed. If you change one here and CI
-# starts recompiling every run, bump `prefix-key` on ci.yml's cache steps.
+# starts recompiling every run, bust the cache by hand: bump the `shared-key`
+# suffix (`workspace-rlib` → `workspace-rlib2`) on ALL FOUR rust-cache steps in
+# ci.yml at once — a partial bump leaves the readers permanently cold (#133).
 [workspace.dependencies]
 
 # Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
