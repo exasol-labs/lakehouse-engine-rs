@@ -4,11 +4,13 @@
 
 # Install & Deploy
 
-`deploy/scripts/install.sh` is a single script that installs the engine on any Exasol
-deployment: Exasol SaaS, or Exasol AsApp, Docker, and on-premise (all three speak the same
-BucketFS interface). One command detects your target, registers the Rust SLC, uploads the
-engine, creates the scripts, and runs a smoke test. After the command finishes, you point a
-Virtual Schema at your data. That last step stays manual because it is specific to your dataset.
+`deploy/scripts/install.sh` installs the engine on any Exasol deployment. This includes Exasol
+SaaS, Exasol AsApp, Docker, and on-premise. Exasol AsApp, Docker, and on-premise all use the same
+BucketFS interface.
+
+One command detects your target, registers the Rust SLC, uploads the engine, creates the scripts,
+and runs a smoke test. After the command finishes, you point a Virtual Schema at your data. That
+last step stays manual because it is specific to your dataset.
 
 The [build-from-source](#appendix-build-from-source) and [fully manual](#appendix-manual-install-on-a-restricted-network)
 paths still work. If the one-line command does not fit your environment, use them instead. One
@@ -84,7 +86,7 @@ You still need a configured `exapump` profile for this second form. See
    presigned-URL exchange.
 4. It creates the schema (`LHVS` by default) and its three scripts: `LAKEHOUSE_ADAPTER`,
    `LAKEHOUSE_SCAN`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
-5. It runs a fingerprint smoke test. The test confirms that the uploaded file matches the
+5. It runs a fingerprint smoke test. The test checks that the uploaded file matches the
    registered SLC.
 6. It stops there and prints a `CONNECTION` and `CREATE VIRTUAL SCHEMA` template for you to edit.
    It creates no dataset-specific object itself.
@@ -107,7 +109,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--bfs-port <port>` | BucketFS target only. Default: the profile's `bfs_port`, else `2581`. |
 | `--bfs-bucket <name>` | BucketFS target only. Default: `default`. |
 | `--bfs-write-password <p>` | BucketFS target only. Default: the profile's `bfs_write_password`. |
-| `--target <saas\|bucketfs>` | Both targets. Asserts the target you expect. The command stops with an error if it does not match the target it detected. |
+| `--target <saas\|bucketfs>` | Both targets. Asserts the target you expect. If it does not match the detected target, the command stops with an error. |
 | `--schema <name>` | Both targets. Default: `LHVS`. |
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
 | `--slc-version <v>` | Both targets. Pins the SLC version. Default: latest release. |
@@ -229,8 +231,7 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 
 ## Appendix: build from source
 
-If you develop the engine itself, or you want a build that the one-line command does not cover,
-use this path.
+If you develop the engine, or if the one-line command does not cover your build, use this path.
 
 ```sh
 make cross-musl-udf-build      # → target/release/liblakehouse_engine.so
@@ -241,8 +242,8 @@ The build runs inside `rust:1.94-bookworm` (glibc 2.36, which matches the SLC). 
 when crate sources, manifests, or the lockfile change. One `.so` exports **both** RUST entry
 points (VS adapter + scan SCALAR UDF). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already
-registered, because it uploads only the engine file, not the SLC. Register the SLC once, before
-you use this path. Run the [one-line command](#install-with-one-command) without `--skip-slc`,
+registered, because it uploads only the engine file, not the SLC. Before you use this path,
+register the SLC once. Run the [one-line command](#install-with-one-command) without `--skip-slc`,
 or follow [language-container-rs](https://github.com/exasol-labs/language-container-rs) for a
 standalone SLC install.
 
@@ -283,7 +284,7 @@ The archive contains the file at `udf/liblakehouse_engine.so`.
 Pick the channel that your platform exposes. BucketFS extracts an uploaded `X.tar.gz`
 automatically, into a new sibling directory named `X`. There is no separate extract step. This
 extraction adds one directory level. Upload `lakehouse-engine.tar.gz` inside a directory named
-`udf/`, and it extracts to `udf/lakehouse-engine/`. The `.so` inside that directory then lands
+`udf/`. It extracts to `udf/lakehouse-engine/`. The `.so` inside that directory then lands
 at `udf/lakehouse-engine/udf/liblakehouse_engine.so`.
 
 **a) BucketFS upload UI.** Use this channel on any platform with a file browser, for example the
@@ -309,7 +310,7 @@ non-UI channel on SaaS. The [one-line command](#install-with-one-command) runs t
 you. If you need the individual steps, use this manual form instead. Authentication uses
 `Authorization: Bearer <PAT>`, a SaaS personal access token from the web console. The API needs
 your `accountID` and `databaseID`. No endpoint returns them together. Read `accountID` from the
-console, then match `databaseID` by name:
+console. Then match `databaseID` by name:
 
 ```bash
 curl -H "Authorization: Bearer <PAT>" \
