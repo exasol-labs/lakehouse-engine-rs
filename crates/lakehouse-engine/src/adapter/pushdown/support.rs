@@ -1272,6 +1272,45 @@ pub(super) fn project_columns(
     Ok((proj_names, proj_types, needs_full_fallback))
 }
 
+/// Walk every `column` node reachable from `expr`, invoking `f` once per node found.
+///
+/// Owns both the recursion and the `type == "column"` test because every current
+/// caller acts only on `column` nodes — pushing that test back into each caller's
+/// closure would just relocate one duplication into three smaller ones. Traversal
+/// is blind (every object field, every array element) rather than schema-aware,
+/// because a collect rebuilds nothing: blind descent is what reaches a column
+/// buried inside a `CASE` or a function call, and it is safe precisely because
+/// nothing here reconstructs the tree. This MUST NOT be merged with issue #257's
+/// curated post-order rewrite primitive — that primitive edits the tree in place
+/// and so cannot blindly descend into a node's own `dataType`/`name` sub-objects,
+/// which a rewrite must leave untouched but a collect may safely enter.
+///
+/// Case folding is deliberately NOT owned here — each callback applies its own, and the
+/// current callers deliberately disagree: `collect_all_column_names` below folds with
+/// Unicode `to_uppercase`, while `collect_column_tables` and `collect_side_column_names`
+/// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
+/// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
+/// under ASCII — and no test in this crate uses a non-ASCII column name, so unifying them
+/// would silently change behavior while the whole suite still passed.
+pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
+                f(map);
+            }
+            for v in map.values() {
+                walk_column_nodes(v, &mut *f);
+            }
+        }
+        Json::Array(items) => {
+            for item in items {
+                walk_column_nodes(item, &mut *f);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Recursively collect every bare-column reference's UPPERCASE name found anywhere
 /// within `value` into `names` — walking arrays, objects, and nested `expression`
 /// wrappers alike, so it works uniformly over a `selectList`, a `filter`/`having`
@@ -1285,24 +1324,11 @@ pub(super) fn collect_all_column_names(
     value: &Json,
     names: &mut std::collections::HashSet<String>,
 ) {
-    match value {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column")
-                && let Some(name) = map.get("name").and_then(|n| n.as_str())
-            {
-                names.insert(name.to_uppercase());
-            }
-            for v in map.values() {
-                collect_all_column_names(v, names);
-            }
+    walk_column_nodes(value, &mut |map| {
+        if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
+            names.insert(name.to_uppercase());
         }
-        Json::Array(items) => {
-            for item in items {
-                collect_all_column_names(item, names);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -1457,6 +1483,79 @@ mod tests {
     use super::*;
     use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
     use vs_expression::render_df_filter_safe;
+
+    /// `walk_column_nodes` fires its callback exactly once per `column` node
+    /// wherever one is nested — inside a function's `arguments` array, a `CASE`'s
+    /// `results`, a comparison predicate's `left`/`right`, and even a `column`
+    /// node's own child object — and never for a non-`column` object, a scalar,
+    /// or an array node itself.
+    #[test]
+    fn walk_column_nodes_visits_every_nested_column_node_once() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "PLUS",
+            "arguments": [
+                {"type": "column", "name": "A", "tableName": "T"},
+                {"type": "literal_exactnumeric", "value": 1}
+            ],
+            "case": {
+                "type": "case",
+                "results": [
+                    {"type": "column", "name": "B"},
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            },
+            "predicate": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C"},
+                "right": {
+                    "type": "column",
+                    "name": "D",
+                    "nested": {"type": "column", "name": "E"}
+                }
+            }
+        });
+
+        let mut visited = Vec::new();
+        walk_column_nodes(&expr, &mut |map| {
+            visited.push(
+                map.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        });
+        visited.sort();
+
+        assert_eq!(
+            visited,
+            vec!["A", "B", "C", "D", "E"],
+            "every column node must fire exactly once, including one nested inside another column node"
+        );
+    }
+
+    /// `walk_column_nodes` never invokes its callback for a non-container root —
+    /// `Json::Null`, a scalar string, or a scalar number fall through the `_ => {}`
+    /// arm untouched, and an empty object matches `Json::Object` but has no `type`
+    /// key and no values to recurse into, so it is a no-op too. Production hands
+    /// the primitive exactly such roots unguarded: `referenced_column_projection`
+    /// (`joins/sql_builders.rs`) and `referenced_side_columns` (`rendering.rs`)
+    /// pass `pushdown_req.get("groupBy")` / `get("orderBy")` / `get("selectList")`
+    /// straight through with no `is_null()` guard.
+    #[test]
+    fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
+        let mut invocations: usize = 0;
+
+        walk_column_nodes(&serde_json::Value::Null, &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!("REGION"), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!(7), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!({}), &mut |_| invocations += 1);
+
+        assert_eq!(
+            invocations, 0,
+            "a null, scalar, or empty-object root must be a no-op: groupBy/orderBy/selectList reach walk_column_nodes unguarded"
+        );
+    }
 
     /// `strip_table_alias` removes every `tableAlias` key at any nesting depth
     /// (issue #193) while preserving `tableName` and `name`, recursing through
