@@ -18,10 +18,16 @@ arithmetic, string, and conditional functions.
   becomes wrapper SQL text parsed and evaluated by Exasol's own core engine, not by DataFusion.
   Every date/time function in this feature is an Exasol function that Exasol's compiler itself
   emitted, so the Exasol dialect renders the original name, the original argument order, and the
-  original argument count — no name mapping, no re-shaping. This makes Exasol-dialect parity
-  structural rather than tested: Exasol evaluates the same call it sent, so no divergence is
-  possible. Only the DataFusion dialect needs the `date_part`/epoch-arithmetic translations below
-  (issue #209). Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`):
+  original argument count — no name mapping, no re-shaping. Every date/time `function_scalar` name
+  this feature translates is declared `VerbatimCall` in the crate's one declaration of translated
+  names (see `sql-comprehension/vs-expression-translator`), except the four now-family names, which
+  are declared `BareKeyword`. A declared name's Exasol rendering is produced by the declaration's own
+  branch, ahead of every per-name arm, so no per-name arm can reach it and it cannot diverge from the
+  name Exasol sent. `EXTRACT` is the one exception in this feature: it is the separate node type
+  `function_scalar_extract`, so it branches on dialect inside its own arm and is held in place by its
+  own sweep row instead. Only the DataFusion dialect needs the `date_part`/epoch-arithmetic
+  translations below (issue #209). Verified on live Exasol 2025.2.1 (the image pinned in
+  `docker-compose.yml`):
   `DATE_PART` is not an Exasol function
   (`function or script DATE_PART not found`, SQL code 42000), so every `date_part`-based rendering
   is a hard compilation error in Exasol-dialect wrapper SQL.
@@ -41,8 +47,9 @@ arithmetic, string, and conditional functions.
   that depend on Exasol session state or whose DataFusion equivalent diverges in result are left
   unsupported (the node returns an error in raising mode, `None` in the safe variants), so the
   adapter omits them and Exasol post-processes them as a correctness backstop. This parity gate
-  governs the DataFusion dialect, which decides what the node-local scan evaluates; it does not
-  govern the Exasol dialect, whose verbatim rendering cannot diverge.
+  governs the DataFusion dialect, which decides what the node-local scan evaluates. It does not
+  govern the Exasol dialect, which renders the name Exasol sent and so has nothing to reach parity
+  with.
 * `WEEK` is translated because Exasol `WEEK` and DataFusion 54 `date_part('week', …)` are both
   ISO-8601. The Exasol dialect renders `WEEK(…)` and inherits Exasol's own week numbering directly.
 * Date-difference functions are translated for the subset whose DataFusion

@@ -23,15 +23,15 @@ function of the same name; a documented set needs explicit aliasing: `SIGN`→`s
 Exasol and Exasol has no function of the aliased name. The rule is therefore inverted and uniform:
 an Exasol scalar function renders VERBATIM — original name, original argument order, original
 argument count — because Exasol's own compiler emitted that call and Exasol can evaluate exactly
-what it sent. The names eligible for verbatim rendering are declared exactly once in the crate, and
-both the Exasol-dialect guard and the enforcing sweep test read that one declaration (see
-`sql-comprehension/vs-expression-translator`), so a name that joins a DataFusion arm without joining
-the declared set fails a test instead of silently rendering DataFusion SQL on the Exasol path.
-Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`), the aliases are hard
-compilation errors there: `SIGNUM` and `STRPOS` both return `function or script <NAME> not found`
-(SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
+what it sent. Every translated `function_scalar` name is declared exactly once in the crate with its
+Exasol-dialect form, and that one declaration both gates the dispatch and drives the enforcing sweep
+test (see `sql-comprehension/vs-expression-translator`). A name that joins a DataFusion arm without
+joining the declaration is therefore not translated at all, rather than silently rendering DataFusion
+SQL on the Exasol path. Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`),
+the aliases are hard compilation errors there: `SIGNUM` and `STRPOS` both return `function or script
+<NAME> not found` (SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
 
-Four constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
+Five constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
 both dialects, because verbatim is either impossible or wrong for them:
 
 | Construct | Why it is not rendered verbatim |
@@ -40,6 +40,7 @@ both dialects, because verbatim is either impossible or wrong for them:
 | `MOD` | Exasol requires `MOD(a, b)`, DataFusion offers only the `%` operator (issue #197). Its arm branches on dialect and validates arity, which the verbatim rule does not. |
 | `CONCAT` | Both dialects render chained `\|\|`, never `concat()`: `concat()` silently drops NULL arguments while `\|\|` propagates NULL, and a boolean operand needs Exasol's `TRUE`/`FALSE` casing (issue #200). |
 | `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
+| `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding; both dialects render `CASE WHEN … THEN … END`, so there is no call form to render verbatim. This is the `function_scalar`+`name=CASE` alternate encoding, distinct from the `function_scalar_case` node type scenario below. |
 
 The scalar regexp functions (`REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT`)
 are deliberately not translated. Re-verified for issue #106 against the pinned DataFusion 54.0.0
@@ -135,6 +136,17 @@ predicate, which stays advertised and whose per-dialect rendering is specified i
 * *AND* `ZEROIFNULL` SHALL render as `coalesce(<arg>, 0)`
 * *AND* `render_expression_exasol` SHALL render `NULLIFZERO(<arg>)` / `ZEROIFNULL(<arg>)` verbatim, because both are native Exasol functions and the rewrite exists only to reach a DataFusion equivalent
 <!-- /DELTA:CHANGED -->
+
+<!-- DELTA:NEW -->
+### Scenario: NULLIF translates to the DataFusion nullif call
+
+* *GIVEN* a VS expression node of type `function_scalar` named `NULLIF` with two arguments, distinct from the `function_scalar_case` node type that carries Exasol's own expansion of `NULLIF(...)` and whose rendering the CASE scenario above specifies
+* *WHEN* `render_expression` processes the node
+* *THEN* the translator SHALL return `nullif(<a>, <b>)` over the recursively rendered arguments
+* *AND* `render_expression_exasol` SHALL return `NULLIF(<a>, <b>)` under the same verbatim rule as the other Exasol scalar functions, because `NULLIF` is a native Exasol function and the lower-cased call is a DataFusion form
+* *AND* an argument count other than two SHALL return an error in raising mode and `None` in the safe variants in the DataFusion dialect
+* *AND* the Exasol dialect SHALL NOT impose that arity check, for the reason given in the math-function scenario above: Exasol's compiler emitted a call its own engine accepts
+<!-- /DELTA:NEW -->
 
 <!-- DELTA:CHANGED -->
 ### Scenario: Regexp scalar functions are deliberately not translated
