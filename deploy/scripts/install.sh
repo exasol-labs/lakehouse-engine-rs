@@ -106,6 +106,8 @@ url_decode() {
   for ((i = 0; i < len; i++)); do
     c="${s:i:1}"
     if [[ "$c" == "%" && $((i + 2)) -lt len ]]; then
+      # shellcheck disable=SC2059  # the inner printf emits only octal digits (0-7), never a
+      # format specifier, so the outer printf's format string is always a plain "\NNN" escape.
       out+="$(printf "\\$(printf '%03o' "0x${s:i+1:2}")")"
       i=$((i + 2))
     else
@@ -142,16 +144,22 @@ extract_dsn_password() {
 # rest of the still-escaped query string, rather than the bare algorithm name.
 json_unescape() {
   local rest="$1" out="" chunk hex dec ch
+  # shellcheck disable=SC1003  # a literal single backslash inside single quotes, not an
+  # escape attempt -- this is the correct, portable way to match/emit one '\' character.
   while [[ "$rest" == *'\'* ]]; do
     chunk="${rest%%\\*}"
     out+="$chunk"
     rest="${rest#*\\}"
+    # shellcheck disable=SC1003  # the \\*) branch's '\' is a literal one-character backslash
+    # string, not an escape attempt -- directives can't attach to a single case branch, so this
+    # covers the whole case statement below.
     case "$rest" in
       u[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]*)
         hex="${rest:1:4}"
         rest="${rest:5}"
         dec=$((16#$hex))
         if [[ "$dec" -lt 128 ]]; then
+          # shellcheck disable=SC2059  # same octal-only guarantee as url_decode() above.
           ch="$(printf "\\$(printf '%03o' "$dec")")"
         else
           ch="?"

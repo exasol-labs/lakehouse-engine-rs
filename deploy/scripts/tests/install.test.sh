@@ -332,6 +332,9 @@ run_file() {
 }
 
 run_stdin() {
+  # shellcheck disable=SC2002  # deliberate: this models the real `curl | bash` one-liner as a
+  # PIPE, not a redirect -- a redirect would still feed stdin correctly, but it would not be
+  # testing the pipe shape the docs actually tell users to run.
   LAST_OUT="$( cat "$INSTALLER" | ( export PATH="$RUN_PATH"; exec "$BASH_BIN" -s -- "$@" ) 2>&1 )"
   LAST_RC=$?
 }
@@ -722,6 +725,8 @@ test_presigned_url_json_unescaping() {
   # the first collapses into the previous one's value -- exactly the live failure mode seen
   # against Exasol SaaS staging (HTTP 400 AuthorizationQueryParametersError on the PUT).
   local raw escaped_url
+  # shellcheck disable=SC1003  # each '\' argument is a literal one-character backslash string,
+  # not an escape attempt -- %s substitutes it to build a literal "&" in the fixture JSON.
   raw="$(printf '{"url":"https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256%su0026X-Amz-Credential=abc%su0026X-Amz-Signature=xyz"}' '\' '\')"
   escaped_url="$(
     export PATH="$STUBDIR:$ORIG_PATH"
