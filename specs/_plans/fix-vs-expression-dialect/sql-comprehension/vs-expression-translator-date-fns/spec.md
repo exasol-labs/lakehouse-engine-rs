@@ -20,8 +20,8 @@ arithmetic, string, and conditional functions.
   emitted, so the Exasol dialect renders the original name, the original argument order, and the
   original argument count — no name mapping, no re-shaping. Every date/time `function_scalar` name
   this feature translates is declared `VerbatimCall` in the crate's one declaration of translated
-  names (see `sql-comprehension/vs-expression-translator`), except the four now-family names, which
-  are declared `BareKeyword`. A declared name's Exasol rendering is produced by the declaration's own
+  names (see `sql-comprehension/vs-expression-translator`). A declared name's Exasol rendering is
+  produced by the declaration's own
   branch, ahead of every per-name arm, so no per-name arm can reach it and it cannot diverge from the
   name Exasol sent. `EXTRACT` is the one exception in this feature: it is the separate node type
   `function_scalar_extract`, so it branches on dialect inside its own arm and is held in place by its
@@ -31,9 +31,20 @@ arithmetic, string, and conditional functions.
   `DATE_PART` is not an Exasol function
   (`function or script DATE_PART not found`, SQL code 42000), so every `date_part`-based rendering
   is a hard compilation error in Exasol-dialect wrapper SQL.
-* The dialect split is a rendering-time concern only. It changes no capability advertisement: every
-  function named below stays advertised, because the DataFusion dialect still governs what the
-  node-local scan can evaluate.
+* The dialect split is a rendering-time concern for every function below except the now-family.
+  Every other function named below stays advertised, because the DataFusion dialect still governs
+  what the node-local scan can evaluate, and each takes its datetime from its own arguments.
+* **The now-family is withdrawn from pushdown instead of re-rendered.** `CURRENT_DATE`, `SYSDATE`,
+  `CURRENT_TIMESTAMP`, and `SYSTIMESTAMP` are no longer translated in either dialect, and
+  `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, and `FN_SYSTIMESTAMP` are no longer
+  advertised (see `vs-adapter/pushdown-planning-capability-extensions`). Renaming them would not
+  have made them correct. Exasol's four names are three semantics over one instant:
+  `CURRENT_TIMESTAMP` reads it in the session time zone, `SYSTIMESTAMP` reads the same instant in the
+  database time zone, and `CURRENT_DATE`/`SYSDATE` are `TO_DATE` of each. The scan UDF receives
+  neither zone, opens no connect-back session, and gets no statement anchor, so it can only read its
+  own container clock in UTC — once per shard, G times per statement, while Exasol's now-family is
+  statement-constant. Exasol never delegates an unadvertised capability, so withdrawal makes all four
+  correct by handing them back to the engine that owns the clock.
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:CHANGED -->
@@ -178,15 +189,28 @@ arithmetic, string, and conditional functions.
 * *AND* `render_expression_exasol` SHALL return `DATE_TRUNC(<unit_sql>, <source_sql>)` — Exasol's own PostgreSQL-compatible `DATE_TRUNC` takes the same argument order, so the unit literal Exasol sent is forwarded unchanged and Exasol applies its own `NLS_FIRST_DAY_OF_WEEK` for the `'week'` unit
 <!-- /DELTA:CHANGED -->
 
-<!-- DELTA:CHANGED -->
+<!-- DELTA:REMOVED -->
 ### Scenario: CURRENT_DATE and CURRENT_TIMESTAMP translate to DataFusion now-family calls
 
 * *GIVEN* a VS expression node of type `function_scalar` named `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `SYSDATE`, or `SYSTIMESTAMP` with no datetime-dependent arguments
 * *WHEN* `render_expression` processes the node
 * *THEN* `CURRENT_DATE`/`SYSDATE` SHALL render as `current_date()` and `CURRENT_TIMESTAMP`/`SYSTIMESTAMP` SHALL render as `now()`
 * *AND* the translator MUST NOT depend on any Exasol session state to render these nodes
-* *AND* `render_expression_exasol` SHALL render each of the four names as its own bare Exasol keyword — `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` — with no parentheses and no collapsing of one name onto another, so Exasol applies its own session-time-vs-database-time distinction instead of the translator silently mapping `SYSDATE` onto `CURRENT_DATE`
-<!-- /DELTA:CHANGED -->
+<!-- /DELTA:REMOVED -->
+
+The scenario above is reproduced verbatim from the recorded library so the removal target is unambiguous. It is REMOVED rather than amended: the four names are no longer translated in either dialect, so no rendering rule replaces it. The scenario below states the decline instead.
+
+<!-- DELTA:NEW -->
+### Scenario: The now-family is not translated in either dialect
+
+* *GIVEN* a VS expression node of type `function_scalar` named `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, or `SYSTIMESTAMP`
+* *WHEN* `render_expression` or `render_expression_exasol` processes the node in raising mode
+* *THEN* the translator SHALL return an error naming the unsupported function, identically in both dialects
+* *AND* `render_expression_safe` and `render_expression_exasol_safe` SHALL each return `None` for the same node without panicking
+* *AND* the four names MUST NOT appear in the crate's declaration of translated `function_scalar` names, so the gate declines them before any per-name arm is reached and no per-name arm for them remains reachable
+* *AND* `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, and `FN_SYSTIMESTAMP` MUST NOT be advertised, so Exasol never pushes a now-family node and evaluates its own clock instead (see `vs-adapter/pushdown-planning-capability-extensions`)
+* *AND* the reason SHALL be the scan's missing clock context, not a rendering defect: the scan UDF receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE`, holds no statement anchor, and reads its container clock in UTC once per shard, so no rendering of these four names on the scan path can match Exasol
+<!-- /DELTA:NEW -->
 
 <!-- DELTA:CHANGED -->
 ### Scenario: TO_DATE and TO_TIMESTAMP translate to DataFusion conversion calls
