@@ -4,20 +4,20 @@
 
 # Capability Support Overview
 
-Mental model: **DataFusion does per-shard work inside the UDF; Exasol coordinates across shards and handles anything not pushed down.** These capabilities are identical for every table, whatever [catalog backend](catalogs.md) it lives in. A capability is advertised only if the adapter can translate it or decompose it into a correct partial/merge plan. For *how* the per-shard and parent-level split works, see [Architecture](architecture.md); the [docs index](index.md) lists the full guide set.
+Mental model: **DataFusion does the per-shard work inside the UDF. Exasol coordinates across shards and computes everything that is not pushed down.** These capabilities are the same for every table, in every [catalog backend](catalogs.md). The adapter advertises a capability only when it can translate that capability or decompose it into a correct partial/merge plan. The [Architecture](architecture.md) page describes the split between per-shard and parent-level work. The [docs index](index.md) lists the full guide set.
 
-## Projection & expressions ✅
+## Projection & expressions
 
-Reads only projected columns; select-list expressions are evaluated during the scan, then passed through.
+The scan reads only the projected columns. The scan also evaluates select-list expressions and passes the results through.
 
 | Capability | Example |
 |---|---|
 | `SELECTLIST_PROJECTION` | `SELECT id, name` |
 | `SELECTLIST_EXPRESSIONS` | `SELECT price * 1.2` |
 
-## Filtering ✅
+## Filtering
 
-Translated predicates prune whole data files via Iceberg manifest stats, then skip row-groups/rows during the scan; Exasol re-checks only what it couldn't translate. A bare `LIMIT` (no `ORDER BY`) stops the scan early per shard and is re-applied as a cross-shard backstop.
+Translated predicates prune whole data files with Iceberg manifest stats. The predicates then skip row-groups and rows during the scan. Exasol re-checks only the predicates that the adapter cannot translate. A bare `LIMIT` (no `ORDER BY`) stops the scan early in each shard. Exasol re-applies that `LIMIT` as a cross-shard backstop.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -29,29 +29,45 @@ Translated predicates prune whole data files via Iceberg manifest stats, then sk
 | Ordered top-N | `ORDER_BY_COLUMN` | `... ORDER BY price DESC LIMIT 20` |
 | Ordered by expression | `ORDER_BY_EXPRESSION` | `... ORDER BY price * discount DESC` |
 
-`FN_PRED_GREATER` / `FN_PRED_GREATEREQUAL` are not Exasol capability names — Exasol normalises `a > b` to `b < a` before it reaches the adapter.
+`FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` are not Exasol capability names. Exasol normalizes `a > b` to `b < a` before the predicate reaches the adapter.
 
-`ORDER BY ... LIMIT n` over a single table (no join, no `GROUP BY`) with every sort key a bare
-projected column pushes down as a per-shard bounded top-N (a DataFusion `TopK`, not a full sort):
-each shard emits only its own local top-`n` rows, and Exasol merges the `shard_count × n` rows with
-a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` remains unadvertised.
+`ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
+(no join, no `GROUP BY`), and every sort key must be a bare projected column. DataFusion runs a
+`TopK`, not a full sort. Each shard emits only its own local top-`n` rows. Exasol then merges the
+`shard_count × n` rows with a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` remains
+unadvertised.
 
-`ORDER_BY_EXPRESSION` is advertised too (issue #198): a sort key that is an expression, not a bare
-column, does not qualify for the bounded top-N above, but it is not a silent-wrong-order gap either
-— three paths render it correctly. The single-table/no-join, no-`GROUP BY` row-scan wrapper appends
-the expression's referenced base columns as hidden columns and renders the sort expression in the
-Exasol dialect over them (an unbounded full scan, correctness only — no per-shard top-N). The
-grouped-merge path renders an aggregate `ORDER BY` over the partial/merge columns, or routes to the
-plain `GROUP BY` wrapper when the sort key isn't an aggregate or group key. The qualified
-single-table/N-scan join wrapper renders any sortable expression directly, since it already
-qualifies column references. Any `ORDER BY` shape none of these paths can render still returns
-correct results — the adapter renders its own explicit final `ORDER BY`/`LIMIT` around the
-unoptimized full scan, since Exasol no longer re-sorts once `ORDER_BY_COLUMN` and
-`ORDER_BY_EXPRESSION` are advertised.
+The adapter also advertises `ORDER_BY_EXPRESSION` (issue #198). A sort key that is an expression,
+not a bare column, does not qualify for the bounded top-N above. Three paths still render the
+result in the correct order:
 
-## Scalar functions ✅
+- The single-table, no-join, no-`GROUP BY` row-scan wrapper adds the base columns of the
+  expression as hidden columns, then renders the sort expression in the Exasol dialect over them.
+  This path gives correctness only, as an unbounded full scan, not a per-shard top-N.
+- The grouped-merge path renders an aggregate `ORDER BY` over the partial and merge columns. When
+  the sort key is not an aggregate or a group key, this path routes to the plain `GROUP BY`
+  wrapper instead.
+- The qualified single-table, N-scan join wrapper renders any sortable expression directly,
+  because it already qualifies column references.
 
-Computed during the scan, then passed through.
+When none of these three paths can render an `ORDER BY` shape, the adapter still returns correct
+results. It renders its own explicit final `ORDER BY` and `LIMIT` around the unoptimized full
+scan, because Exasol no longer re-sorts once the adapter advertises `ORDER_BY_COLUMN` and
+`ORDER_BY_EXPRESSION`.
+
+The adapter also cannot bound these `ORDER BY` shapes as a per-shard top-N:
+
+- a join
+- a `GROUP BY`
+- an unprojected sort key
+- a JSON-fallback-typed sort key
+
+These shapes still return correct results the same way: the adapter generates its own explicit
+final `ORDER BY` and `LIMIT` around the unoptimized full scan.
+
+## Scalar functions
+
+The scan computes these functions and passes the results through.
 
 | Family | Capabilities | Example |
 |---|---|---|
@@ -61,9 +77,9 @@ Computed during the scan, then passed through.
 | Date / time | `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_DATE_TRUNC`, `FN_DAY`, `FN_EXTRACT`, `FN_HOUR`, `FN_MINUTE`, `FN_MONTH`, `FN_SECOND`, `FN_SYSDATE`, `FN_SYSTIMESTAMP`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 
-## Aggregation ✅
+## Aggregation
 
-Partial aggregate per shard → merged by Exasol.
+Each shard computes a partial aggregate. Exasol merges the partial aggregates.
 
 | Capability group | Capabilities | Example |
 |---|---|---|
@@ -73,20 +89,27 @@ Partial aggregate per shard → merged by Exasol.
 | Group by | `AGGREGATE_GROUP_BY_COLUMN`, `AGGREGATE_GROUP_BY_EXPRESSION`, `AGGREGATE_GROUP_BY_TUPLE` | `SELECT k1, k2, SUM(v) GROUP BY k1, k2` |
 | Having | `AGGREGATE_HAVING` | `... HAVING SUM(v) > 100` |
 
-Aggregate arguments may be a column or a scalar expression (e.g. `SUM(LENGTH(c))`, or a two-column
-binary arithmetic expression like `SUM(price * discount)`). `COUNT` emits partial sum/count and
-`AVG` emits sum + count (not an average); statistical aggregates emit sufficient stats (n, Σx, Σx²);
-single-group `COUNT(DISTINCT col|expr)` emits a per-shard local distinct set (JSON), merged by a
-scalar UDF. Exasol combines them into the final result.
+An aggregate argument can be a column or a scalar expression. Examples are `SUM(LENGTH(c))` and a
+two-column binary arithmetic expression such as `SUM(price * discount)`.
 
-## Handled by Exasol 🤝
+Each aggregate emits partial values instead of a final value:
 
-Not pushed to the scan — Exasol computes these on the returned partial results. Correct and fast; just not decomposable into a partial/merge plan.
+- `COUNT` emits a partial sum/count.
+- `AVG` emits a sum and a count, not an average.
+- Statistical aggregates emit sufficient stats (n, Σx, Σx²).
+- Single-group `COUNT(DISTINCT col|expr)` emits a per-shard local distinct set as JSON. A scalar UDF
+  merges these sets.
+
+Exasol combines these partial values into the final result.
+
+## Handled by Exasol
+
+The adapter does not push these capabilities to the scan. Exasol computes them on the returned partial results. The results are correct and fast. These capabilities are not decomposable into a partial/merge plan.
 
 | Capability | Example | Where it runs |
 |---|---|---|
 | JOIN (`JOIN_TYPE_*`, `JOIN_CONDITION_*`) | `FROM a JOIN b ON a.id = b.id` | Usable via multi-table VS: Exasol pushes down each table, then joins the result sets |
-| `ORDER BY` over a join, `GROUP BY`, or an unprojected/JSON-fallback sort key | `SELECT a.x FROM a JOIN b ... ORDER BY a.x` | Not eligible for the ordered top-N pushdown above; the adapter still renders a correct final `ORDER BY`/`LIMIT` itself |
-| Grouped `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `SELECT k, COUNT(DISTINCT u) FROM t GROUP BY k` | Not decomposable into partial/merge — Exasol computes on returned rows |
+| `ORDER BY` over a join, `GROUP BY`, or an unprojected/JSON-fallback sort key | `SELECT a.x FROM a JOIN b ... ORDER BY a.x` | Not eligible for the ordered top-N pushdown. The adapter generates a correct final `ORDER BY`/`LIMIT` itself |
+| Grouped `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `SELECT k, COUNT(DISTINCT u) FROM t GROUP BY k` | Not decomposable into partial/merge. Exasol computes on the returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
 | Geospatial, session functions | — | Exasol-side / unsupported |

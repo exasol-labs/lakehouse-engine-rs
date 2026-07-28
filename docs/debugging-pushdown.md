@@ -4,7 +4,7 @@
 
 # Debugging pushdown
 
-When a query doesn't seem to push down the way [Capabilities](capabilities.md) says it should, `EXPLAIN VIRTUAL` is the tool: it shows exactly what the adapter generated for that statement, without running it.
+If a query does not push down as [Capabilities](capabilities.md) describes, use `EXPLAIN VIRTUAL`. It shows what the adapter generated for that statement, and it does not run the statement.
 
 ## Inspect what the adapter pushes down
 
@@ -15,23 +15,23 @@ EXPLAIN VIRTUAL
 SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 ```
 
-The output includes the scan-spec JSON the adapter passed to the scan UDF — the literal projection, filter, and limit it decided to push down. Compare that against what you expected from [Capabilities](capabilities.md):
+The output includes the scan-spec JSON that the adapter passed to the scan UDF. This JSON gives the literal projection, filter, and limit that the adapter pushed down. Compare the scan spec with the behavior that [Capabilities](capabilities.md) describes:
 
-- A predicate missing from the scan spec means it wasn't translated, so Exasol is filtering it after the scan instead of before. Check it against the [filter capability list](capabilities.md#filtering-) — an untranslatable expression shape (e.g. a function not listed there) is the usual cause.
-- A wider projection than expected means a column made it into the scan spec that your `SELECT` didn't ask for — check for a `WHERE`/`ORDER BY`/`GROUP BY` reference that implicitly requires it.
-- No `LIMIT` in the scan spec despite one in the query means the shape wasn't eligible for the bounded top-N pushdown (see [Capabilities: Ordered top-N](capabilities.md#filtering-)) — it still returns correct results, just via a full scan.
+- A predicate that is absent from the scan spec was not translated. Exasol then filters that predicate after the scan instead of before the scan. Compare the predicate with the [filter capability list](capabilities.md#filtering). The usual cause is an expression shape that the adapter cannot translate, for example a function that the list does not name.
+- A projection that is wider than expected contains a column that your `SELECT` does not request. Look for a `WHERE`, `ORDER BY`, or `GROUP BY` reference that requires this column.
+- A query that has a `LIMIT`, but whose scan spec has none, is not eligible for the bounded top-N pushdown. See [Capabilities: Ordered top-N](capabilities.md#filtering). The query still returns correct results, through a full scan.
 
-Then run the query for real and compare the actual result against what the scan spec implies it should return.
+Then run the query. Compare the actual result with the result that the scan spec implies.
 
 ## Try it against the bundled local stack first
 
-If you don't yet have your own Virtual Schema deployed, `scripts/capture-pushdown-payload.sh` runs a query against the bundled local Docker stack (Exasol + MinIO + Iceberg REST) and prints both the `EXPLAIN VIRTUAL` output and the real result in one step, against a small seeded table:
+If you have no Virtual Schema deployed yet, use `scripts/capture-pushdown-payload.sh`. The script runs a query against the bundled local Docker stack (Exasol + MinIO + Iceberg REST) and a small seeded table. It prints the `EXPLAIN VIRTUAL` output and the real result in one step.
 
 ```bash
 scripts/capture-pushdown-payload.sh 'SELECT COUNT(*) FROM {table} WHERE c_date LIKE '"'"'2024%'"'"''
 ```
 
-`{table}` is substituted with the seeded probe table's name. The script builds the UDF `.so` and brings up the local stack if it isn't already running, then leaves it running afterward so follow-up queries are cheap — tear it down yourself when done:
+The script replaces `{table}` with the name of the seeded probe table. It builds the UDF `.so`. If the local stack is not running, the script starts it. The script leaves the stack running afterwards, so follow-up queries are cheap. Remove the stack yourself when you are done:
 
 ```bash
 docker compose down -v
@@ -39,7 +39,7 @@ docker compose down -v
 
 ### The seeded table
 
-12 rows, one column per Arrow/Exasol type pairing, useful for probing type-specific pushdown behavior (e.g. decimal precision, date literals):
+The table has 12 rows and one column for each Arrow/Exasol type pairing. Use it to probe type-specific pushdown behavior, for example decimal precision and date literals:
 
 | Column | Arrow type | Exasol type |
 |---|---|---|
