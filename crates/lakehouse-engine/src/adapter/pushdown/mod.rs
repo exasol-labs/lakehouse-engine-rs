@@ -185,12 +185,17 @@ pub async fn handle_pushdown(
 
     let col_types = extract_all_column_types(request);
 
-    // The type guard runs on the RAW filter JSON before rendering: it may decline
+    // The type guard runs on the RAW filter JSON before rendering. `like_subject_type_guard`
+    // walks the WHOLE curated expression tree through the shared `rewrite_expr_tree`
+    // post-order primitive — reaching a `LIKE` nested inside a `function_scalar_case`,
+    // under a comparison operand, or inside a scalar function's `arguments`, not only
+    // a `LIKE` under `predicate_and`/`predicate_or`/`predicate_not` — so it may decline
+    // the ENTIRE filter to native Exasol evaluation from anywhere in that tree
     // (non-string LIKE subject with no safe rewrite, issue #207) or rewrap a DATE
-    // subject as CAST(.. AS VARCHAR). `string_function_arg_type_guard` runs next,
-    // over the whole tree (not just LIKE subjects — it reaches a string function
-    // nested under any comparison predicate too), dispatching every Exasol string
-    // function's string-position arguments on their Exasol column type: a bare
+    // subject as CAST(.. AS VARCHAR). `string_function_arg_type_guard` runs next, over
+    // the same shared `rewrite_expr_tree` primitive — reaching, among other places, a
+    // string function nested under any comparison predicate — dispatching every Exasol
+    // string function's string-position arguments on their Exasol column type: a bare
     // DECIMAL argument is wrapped into a `decimal_to_varchar_exasol` node, a DATE
     // argument into `CAST(.. AS VARCHAR)`, and an argument whose type has no safe
     // text form (BOOLEAN, DOUBLE PRECISION, TIMESTAMP, …) declines the whole filter
@@ -202,11 +207,11 @@ pub async fn handle_pushdown(
     // `LENGTH(c_decimal_a) > 5` COUNT-divergence repro). The new guard MUST precede
     // this rewrite, not follow it — see `string_function_arg_type_guard`'s doc for
     // why the order is load-bearing. This rewrite never declines (always returns a
-    // tree), so it composes as `.map`, and it leaves the DATE CAST either
-    // earlier guard emits untouched (that argument is DATE, not DECIMAL). This whole
-    // chain feeds ONLY the DataFusion-bound scan filter; `filter_json_raw` itself is
-    // left completely unmodified for the later `resolve_file_list` Iceberg-level
-    // pruning call below, which must see the original, un-rewritten predicate tree.
+    // tree), so it composes as `.map`, and it leaves the DATE CAST either earlier
+    // guard emits untouched (that argument is DATE, not DECIMAL). This whole chain
+    // feeds ONLY the DataFusion-bound scan filter; `filter_json_raw` itself is left
+    // completely unmodified for the later `resolve_file_list` Iceberg-level pruning
+    // call below, which must see the original, un-rewritten predicate tree.
     let filter = filter_json_raw
         .and_then(|f| like_subject_type_guard(f, &col_types))
         .and_then(|f| string_function_arg_type_guard(&f, &col_types))
@@ -946,12 +951,10 @@ mod tests {
     }
 
     /// `UPPER(c_decimal_a) = 'X'` is a `predicate_equal`, whose `function_scalar` sits
-    /// under `left` — a node `like_subject_type_guard`'s junction-only recursion
-    /// (`predicate_and`/`predicate_or`/`predicate_not`) never descends into. Only
-    /// `string_function_arg_type_guard`'s broader post-order recursion (copied from
-    /// `rewrite_decimal_stringifications`) reaches it, coercing the DECIMAL argument
-    /// into the trimmed `decimal_to_varchar_exasol` form through the FULL wired chain
-    /// (issue #210).
+    /// under `left`. `string_function_arg_type_guard`'s post-order recursion — sharing
+    /// `rewrite_expr_tree`'s broad curated field list with `rewrite_decimal_stringifications`
+    /// — reaches it there, coercing the DECIMAL argument into the trimmed
+    /// `decimal_to_varchar_exasol` form through the FULL wired chain (issue #210).
     #[test]
     fn where_filter_string_fn_under_comparison_predicate_coerced() {
         let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -1041,6 +1044,47 @@ mod tests {
             "the DECIMAL argument nested inside the LIKE subject's UPPER call must be \
              coerced into the Exasol decimal-trim form, even though guard_like_subject \
              itself leaves this non-bare-column LIKE subject untouched: {rendered}"
+        );
+    }
+
+    /// Regression (#207 blind spot), through the FULL wired chain: a DECIMAL-typed
+    /// LIKE buried inside a `function_scalar_case`'s `arguments`, itself nested under
+    /// `predicate_equal`'s `left`, must decline the whole filter — a `LIKE` at this
+    /// non-junction position is type-guarded like any other.
+    #[test]
+    fn where_filter_like_decimal_inside_case_declines_whole_filter() {
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+        let filter_json = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {
+                "type": "function_scalar_case",
+                "name": "CASE",
+                "arguments": [
+                    {
+                        "type": "predicate_like",
+                        "expression": {"type": "column", "name": "amount"},
+                        "pattern": {"type": "literal_string", "value": "9%"}
+                    }
+                ],
+                "results": [
+                    {"type": "literal_exactnumeric", "value": 1},
+                    {"type": "literal_exactnumeric", "value": 0}
+                ]
+            },
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        });
+
+        let rendered = Some(&filter_json)
+            .and_then(|f| like_subject_type_guard(f, &col_types))
+            .and_then(|f| string_function_arg_type_guard(&f, &col_types))
+            .map(|f| rewrite_decimal_stringifications(&f, &col_types))
+            .and_then(|f| render_df_filter_safe(&f));
+
+        assert!(
+            rendered.is_none(),
+            "a DECIMAL LIKE buried inside a function_scalar_case under predicate_equal's \
+             left must decline the whole filter through the full wired chain, not push a \
+             possibly-wrong native comparison: {rendered:?}"
         );
     }
 
