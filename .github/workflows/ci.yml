@@ -47,10 +47,7 @@ jobs:
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
       # same ENOSPC class that killed lint/unit-tests. Reclaim ~12 GB up front.
       # (Latent until now because CI has only hit the warm path; a Cargo.lock
-      # bump forces the cold path.) Kept synchronous in every job: backgrounding
-      # it with `&` saves 22–76s but makes the step exit 0 before the space
-      # exists, and the multi-GB cache restore two steps down is exactly the
-      # ENOSPC-on-a-tight-disk case documented in `e2e`.
+      # bump forces the cold path.)
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
@@ -123,15 +120,15 @@ jobs:
   lint:
     name: Check & Lint
     runs-on: ubuntu-latest
-    # See build-so's `if` — same guard, previously inherited by cascade from
-    # the deleted `build` job this used to `need`.
+    # See build-so's `if` — same base-retarget-vs-plain-edit guard.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.action != 'edited' ||
       github.event.changes.base != null
     steps:
-      # Reclaim ~12 GB before clippy's --all-targets pass ENOSPCs the ~21 GB
-      # runner disk. Synchronous — see build-so.
+      # Same rationale as build-so: reclaim ~12 GB before restoring the
+      # shared cache and compiling on top of it, so clippy's --all-targets pass
+      # doesn't ENOSPC on the ~21 GB default runner disk.
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
@@ -179,15 +176,15 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    # See build-so's `if` — same guard, previously inherited by cascade from
-    # the deleted `build` job this used to `need`.
+    # See build-so's `if` — same base-retarget-vs-plain-edit guard.
     if: >-
       github.event_name != 'pull_request' ||
       github.event.action != 'edited' ||
       github.event.changes.base != null
     steps:
-      # Reclaim disk before compiling the test binaries (avoids the ENOSPC that
-      # killed this job). Synchronous — see build-so.
+      # Reclaim disk before restoring the shared cache + compiling the test
+      # binaries, matching build-so/lint/e2e (avoids the ENOSPC that killed this
+      # job).
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
