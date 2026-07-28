@@ -17,9 +17,7 @@ The arithmetic operator nodes and every decline in this feature behave identical
 
 A conversion or operator node is translated only when its DataFusion 54 result matches Exasol. Exasol `DIV` returns the integer quotient by truncating toward zero — verified live: `DIV(-7,2) = -3` and `DIV(15.7,6.2) = 2` — and raises a division-by-zero error (SQL state 22012). DataFusion 54 has no `div` builtin; its `/` truncates only integer operands and divides non-integer operands fractionally, and float division by zero yields infinity instead of an error. No single rendering reproduces `DIV` across every operand type, so `DIV` stays unsupported. DataFusion 54 `to_char` uses strftime masks rather than Exasol's Oracle-style format models and rejects numeric formatting, and DataFusion 54 has no `to_number`. These three functions are therefore left unsupported and fall back to Exasol. The bitwise operator functions (`BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_NOT`, `BIT_LSHIFT`, `BIT_RSHIFT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, `BIT_TO_NUM`) are likewise unsupported: Exasol defines them over an unsigned 64-bit integer domain that DataFusion's signed-integer operators and the `Int64` → `DECIMAL(20,0)` mapping do not reproduce, and six of the eleven have no DataFusion builtin at all (issue #108).
 
-<!-- DELTA:CHANGED -->
-The `crates/vs-expression` crate stays a pure, stateless, sibling-shared JSON-to-SQL translator with no column-type context. The adapter-synthesized node type `decimal_to_varchar_exasol` and the crate-visible pure helper `format_decimal_exasol_style` let an adapter that has already resolved a column as DECIMAL inject an Exasol-faithful DECIMAL→string trim without the translator inspecting types (see `vs-adapter/pushdown-planning-decimal-string-format`). `format_decimal_exasol_style` emits DataFusion-dialect SQL only: it hardcodes `CAST(<f> AS VARCHAR)` with no length, which Exasol's parser rejects (`syntax error, unexpected ')', expecting '('`, SQL code 42000, verified on live Exasol 2025.1.x — the same length-less-VARCHAR constraint `vs-expression-translator-cast` records). The Exasol dialect therefore does not call the helper at all; it needs no emulation, because Exasol's own `CAST(<decimal> AS VARCHAR(n))` already produces the shortest form the helper exists to reproduce (verified: `CAST(1.500 AS VARCHAR(2000000))` → `1.5`, `CAST(100.000 AS VARCHAR(2000000))` → `100`) — issue #209.
-<!-- /DELTA:CHANGED -->
+The `crates/vs-expression` crate stays a pure, stateless, sibling-shared JSON-to-SQL translator with no column-type context. The adapter-synthesized node type `decimal_to_varchar_exasol` and the crate-visible pure helper `format_decimal_exasol_style` let an adapter that has already resolved a column as DECIMAL inject an Exasol-faithful DECIMAL→string trim without the translator inspecting types (see `vs-adapter/pushdown-planning-decimal-string-format`).
 
 ## Scenarios
 
@@ -83,26 +81,13 @@ The `crates/vs-expression` crate stays a pure, stateless, sibling-shared JSON-to
 * *AND* for `BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_LSHIFT`, and `BIT_RSHIFT` — which map to DataFusion's `&`, `|`, `#`, `<<`, and `>>` operators — the translator MUST NOT render them and the adapter SHALL let Exasol evaluate the function, because Exasol defines them over unsigned 64-bit integers (`0`–`18446744073709551615`, result `DECIMAL(20,0)`) while DataFusion's operators act on the operand's signed Arrow integer type (Iceberg carries only signed `int`/`long`, no unsigned primitive) — a bit-63-set result reads as a large positive value in Exasol but negative under signed `Int64`, `BIT_RSHIFT`'s signed `>>` is arithmetic (sign-extending) versus Exasol's logical (zero-fill), and the value/type-blind translator cannot restrict rendering to the safe non-negative, bit-63-clear operand subset because operand types and values are not carried in the node (the same limitation the `DIV` decline records)
 * *AND* for `BIT_NOT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, and `BIT_TO_NUM` the translator MUST NOT render them because DataFusion 54.0.0 provides no matching operator or scalar function: its SQL planner (`parse_sql_unary_op`) supports only logical `NOT`, unary `+`, and unary `-`, rejecting unary `~` with `not_impl_err`, and `datafusion-functions` 54.0.0 registers no bit-rotate, bit-test, bit-set, or bits-to-number scalar function (its only `bit`-named function is the string `bit_length`, out of scope here)
 
-<!-- DELTA:CHANGED -->
 ### Scenario: Decimal-to-VARCHAR node renders Exasol-trimmed string
 
 * *GIVEN* a VS expression node of type `decimal_to_varchar_exasol` carrying a single `arguments` entry, an adapter-synthesized node the `crates/lakehouse-engine` pushdown layer injects in place of a confirmed-DECIMAL-typed stringification point (never emitted by Exasol on the wire; see `vs-adapter/pushdown-planning-decimal-string-format`)
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL render the single argument recursively, then wrap the rendered SQL fragment with the crate-visible `format_decimal_exasol_style` helper, so the emitted DataFusion SQL reproduces Exasol's shortest-form DECIMAL→string conversion (trailing scale zeros trimmed)
-* *AND* a `decimal_to_varchar_exasol` node whose argument count is not exactly one SHALL return an error in raising mode and `None` in the safe variants, in BOTH dialects
+* *AND* a `decimal_to_varchar_exasol` node whose argument count is not exactly one SHALL return an error in raising mode and `None` in the safe variants
 * *AND* the translator SHALL apply neither column-type inspection nor any type decision of its own for this node — the caller has already confirmed the wrapped argument is DECIMAL-typed, keeping `vs-expression` a pure, stateless, sibling-shared translator
-<!-- /DELTA:CHANGED -->
-
-<!-- DELTA:NEW -->
-### Scenario: Decimal-to-VARCHAR node defers to Exasol's own formatting in the Exasol dialect
-
-* *GIVEN* the same `decimal_to_varchar_exasol` node as the preceding scenario
-* *WHEN* `render_expression_exasol` processes the node
-* *THEN* the translator SHALL render the single argument recursively in the Exasol dialect and return `CAST(<arg_sql> AS VARCHAR(2000000))`, using the same absent-size fallback width `vs-expression-translator-cast` defines for an Exasol-dialect character CAST target
-* *AND* the rendered fragment MUST NOT call `format_decimal_exasol_style` and MUST NOT contain `regexp_replace` — the helper's hardcoded length-less `CAST(<f> AS VARCHAR)` fails to parse in Exasol (`syntax error, unexpected ')', expecting '('`, SQL code 42000) — and SHALL instead rely on Exasol's own DECIMAL→VARCHAR conversion for the trim, which is faithful by construction because the helper was written to imitate exactly that conversion
-* *AND* `format_decimal_exasol_style` SHALL remain a DataFusion-dialect-only helper with an unchanged signature and body, so the dialect decision lives in the node's arm and the helper keeps one caller and one contract
-* *AND* the DataFusion-dialect rendering of the same node MUST remain byte-identical to the preceding scenario
-<!-- /DELTA:NEW -->
 
 ### Scenario: format_decimal_exasol_style reproduces Exasol shortest-form decimal formatting
 

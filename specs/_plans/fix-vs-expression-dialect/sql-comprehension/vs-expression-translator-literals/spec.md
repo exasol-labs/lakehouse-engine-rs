@@ -19,7 +19,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 <!-- DELTA:NEW -->
 * `arrow_cast` is a DataFusion-only function. In the Exasol dialect the fragment becomes wrapper SQL
   text parsed by Exasol's core engine, which rejects it with `function or script ARROW_CAST not
-  found` (SQL code 42000, verified on live Exasol 2025.1.x) — so a timestamp literal reaching any
+  found` (SQL code 42000, verified on live Exasol 2025.2.1, the image pinned in
+  `docker-compose.yml`) — so a timestamp literal reaching any
   Exasol-parsed wrapper is a hard compilation error today (issue #209). The Exasol dialect renders
   the bare `TIMESTAMP '<value>'` literal instead: that is the form Exasol's own compiler sent, so
   Exasol re-parses its own literal and the `Timestamp(Nanosecond)` hazard that motivates
@@ -28,7 +29,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   appended in the Exasol dialect: Exasol's `TIMESTAMP` literal format is
   `YYYY-MM-DD HH24:MI:SS.FF9` with no offset field, and the offset form raises
   `data exception - invalid character value for cast` (SQL code 22018, verified on live Exasol
-  2025.1.x). The value Exasol sends for a UTC timestamp literal is already UTC-normalised, and the
+  2025.2.1). The value Exasol sends for a UTC timestamp literal is already UTC-normalised, and the
   project maps Iceberg `timestamptz` to plain Exasol `TIMESTAMP` (see `specs/mission.md` and the
   project data-type table), so the wrapper's counterpart column is a plain UTC `TIMESTAMP` and the
   offset carries no information Exasol needs.

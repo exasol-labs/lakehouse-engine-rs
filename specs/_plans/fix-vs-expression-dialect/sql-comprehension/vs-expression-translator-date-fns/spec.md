@@ -21,7 +21,8 @@ arithmetic, string, and conditional functions.
   original argument count — no name mapping, no re-shaping. This makes Exasol-dialect parity
   structural rather than tested: Exasol evaluates the same call it sent, so no divergence is
   possible. Only the DataFusion dialect needs the `date_part`/epoch-arithmetic translations below
-  (issue #209). Verified on live Exasol 2025.1.x: `DATE_PART` is not an Exasol function
+  (issue #209). Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`):
+  `DATE_PART` is not an Exasol function
   (`function or script DATE_PART not found`, SQL code 42000), so every `date_part`-based rendering
   is a hard compilation error in Exasol-dialect wrapper SQL.
 * The dialect split is a rendering-time concern only. It changes no capability advertisement: every

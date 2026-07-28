@@ -23,12 +23,15 @@ function of the same name; a documented set needs explicit aliasing: `SIGN`→`s
 Exasol and Exasol has no function of the aliased name. The rule is therefore inverted and uniform:
 an Exasol scalar function renders VERBATIM — original name, original argument order, original
 argument count — because Exasol's own compiler emitted that call and Exasol can evaluate exactly
-what it sent. Verbatim rendering makes Exasol-dialect parity structural rather than tested: there is
-no mapping that can drift. Verified on live Exasol 2025.1.x, the aliases are hard compilation
-errors there: `SIGNUM` and `STRPOS` both return `function or script <NAME> not found` (SQL code
-42000), and `%` is rejected by Exasol's parser (issue #197).
+what it sent. The names eligible for verbatim rendering are declared exactly once in the crate, and
+both the Exasol-dialect guard and the enforcing sweep test read that one declaration (see
+`sql-comprehension/vs-expression-translator`), so a name that joins a DataFusion arm without joining
+the declared set fails a test instead of silently rendering DataFusion SQL on the Exasol path.
+Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`), the aliases are hard
+compilation errors there: `SIGNUM` and `STRPOS` both return `function or script <NAME> not found`
+(SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
 
-Three constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
+Four constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
 both dialects, because verbatim is either impossible or wrong for them:
 
 | Construct | Why it is not rendered verbatim |
@@ -36,6 +39,7 @@ both dialects, because verbatim is either impossible or wrong for them:
 | `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` | Wire names for operators, not Exasol function names — Exasol has no function called `ADD`. Both dialects render `(<l> + <r>)` and the rest. |
 | `MOD` | Exasol requires `MOD(a, b)`, DataFusion offers only the `%` operator (issue #197). Its arm branches on dialect and validates arity, which the verbatim rule does not. |
 | `CONCAT` | Both dialects render chained `\|\|`, never `concat()`: `concat()` silently drops NULL arguments while `\|\|` propagates NULL, and a boolean operand needs Exasol's `TRUE`/`FALSE` casing (issue #200). |
+| `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
 
 The scalar regexp functions (`REGEXP_REPLACE`, `REGEXP_SUBSTR`, `REGEXP_INSTR`, `REGEXP_COUNT`)
 are deliberately not translated. Re-verified for issue #106 against the pinned DataFusion 54.0.0
