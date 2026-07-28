@@ -9,6 +9,8 @@
 # key — so an edit here rotates the exact key (save fires, self-heals) while
 # prefix-fallback restore stays warm. Config profiles override manifest ones,
 # so don't reintroduce `[profile.*]` in Cargo.toml — it would be silently dead.
+# build-so's docker-cargo cache also hashes this file (see ci.yml) so a future
+# [profile.release] here rotates that key too instead of poisoning it.
 
 [profile.dev]
 debug = 1

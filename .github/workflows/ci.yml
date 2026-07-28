@@ -82,7 +82,13 @@ jobs:
           path: |
             ~/.cargo-docker-registry
             target/
-          key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # .cargo/config.toml is in the key for the same reason rust-cache
+          # hashes it (see that file): a future [profile.release] edit there
+          # would change every release fingerprint without moving Cargo.lock —
+          # exact hit, save skipped, permanently poisoned. The prefix fallback
+          # keeps unrelated (e.g. dev-profile) edits warm; cost is one
+          # redundant re-save on main per config edit.
+          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
             docker-cargo-
 
@@ -106,7 +112,7 @@ jobs:
           path: |
             ~/.cargo-docker-registry
             target/
-          key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
 
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v7
@@ -216,6 +222,10 @@ jobs:
         with:
           shared-key: workspace-rlib
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Save even when a test fails: the dep compile succeeded and is
+          # exactly what the cache keeps. Without this, a red test on main
+          # discards the save and every job stays cold until main is green.
+          cache-on-failure: "true"
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
       # never touches a live stack.
