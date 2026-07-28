@@ -26,6 +26,18 @@ ENGINE_SO_PATH="/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engin
 DEFAULT_SCHEMA="LHVS"
 RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#buckets/uploads/default/rustslc/exaudf/exaudfclient"
 
+# Generic-BucketFS (AppDB / Docker / on-premise) layout. Both paths are BUCKET-RELATIVE with no
+# leading slash and no bucket segment, because that is the grammar `exapump bucketfs cp|ls|rm`
+# expects: exapump builds its URL as <scheme>://<bfs-host>:<bfs-port>/<bucket>/<path>, so the
+# bucket comes from --bfs-bucket / the profile's bfs_bucket, never from the path argument.
+# (Verified against a live Exasol container: `exapump bucketfs cp f /default/x/f` with bucket
+# 'default' creates 'default/x/f' INSIDE the default bucket, and `exapump bucketfs ls /default`
+# fails with "Path not found".) The bucket DOES appear in the %udf_object / RUST alias strings
+# below, because those are read by the Exasol engine, not by exapump.
+DEFAULT_BFS_BUCKET="default"
+BFS_SLC_PATH="slc/lakehouse-rustslc.tar.gz"
+BFS_ENGINE_SO_PATH="udf/liblakehouse_engine.so"
+
 # --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
 ARG_DATABASE_ID=""
@@ -39,12 +51,20 @@ ARG_STAGING=0
 ARG_LAKEHOUSE_VERSION=""
 ARG_SLC_VERSION=""
 ARG_SCHEMA="$DEFAULT_SCHEMA"
+ARG_TARGET=""
+ARG_BFS_HOST=""
+ARG_BFS_PORT=""
+ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
+ARG_BFS_BUCKET_SET=0
+ARG_BFS_WRITE_PASSWORD=""
 ARG_HELP=0
 
 CONNECTIVITY_MODE=""
 TARGET_MODE=""
 TARGET_SO_UDF_OBJECT=""
 TARGET_RUST_LANG_SEGMENT=""
+TARGET_SLC_BFS_PATH=""
+TARGET_ENGINE_BFS_PATH=""
 HOST_DSN=""
 RESOLVED_PAT=""
 WORKDIR=""
@@ -342,6 +362,12 @@ parse_args() {
   ARG_LAKEHOUSE_VERSION=""
   ARG_SLC_VERSION=""
   ARG_SCHEMA="$DEFAULT_SCHEMA"
+  ARG_TARGET=""
+  ARG_BFS_HOST=""
+  ARG_BFS_PORT=""
+  ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
+  ARG_BFS_BUCKET_SET=0
+  ARG_BFS_WRITE_PASSWORD=""
   ARG_HELP=0
 
   while [[ $# -gt 0 ]]; do
@@ -350,6 +376,7 @@ parse_args() {
       --staging) ARG_STAGING=1; shift; continue ;;
       --help|-h) ARG_HELP=1; shift; continue ;;
       --account-id|--database-id|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
+      --target|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password) ;;
       *) err "unknown argument: $flag"; return 1 ;;
     esac
     if [[ $# -lt 2 ]]; then
@@ -369,22 +396,23 @@ parse_args() {
       --schema)            ARG_SCHEMA="$value" ;;
       --lakehouse-version) ARG_LAKEHOUSE_VERSION="$value" ;;
       --slc-version)       ARG_SLC_VERSION="$value" ;;
+      --target)            ARG_TARGET="$value" ;;
+      --bfs-host)          ARG_BFS_HOST="$value" ;;
+      --bfs-port)          ARG_BFS_PORT="$value" ;;
+      --bfs-bucket)        ARG_BFS_BUCKET="$value"; ARG_BFS_BUCKET_SET=1 ;;
+      --bfs-write-password) ARG_BFS_WRITE_PASSWORD="$value" ;;
     esac
     shift 2
   done
   return 0
 }
 
+# Mode-independent required fields. The SaaS-specific requirement (BOTH --account-id and
+# --database-id) is enforced by resolve_target_mode itself -- having both IS what selects the SaaS
+# target -- so main() must resolve the target mode BEFORE calling this. The BucketFS-specific
+# requirements live in validate_bucketfs_required.
 validate_required() {
   local missing=0
-  if [[ -z "$ARG_ACCOUNT_ID" ]]; then
-    err "missing --account-id (find it in the Exasol SaaS web console)"
-    missing=1
-  fi
-  if [[ -z "$ARG_DATABASE_ID" ]]; then
-    err "missing --database-id (find it in the Exasol SaaS web console under your database)"
-    missing=1
-  fi
   if [[ -z "$ARG_GITHUB_TOKEN" ]]; then
     err "missing GitHub token: pass --github-token or set GITHUB_TOKEN (a token with read access to the private $ENGINE_REPO repository)"
     missing=1
@@ -420,38 +448,108 @@ validate_connectivity() {
 }
 
 # --- Target mode & layout ----------------------------------------------------
-# Prints the resolved install target mode (saas) on stdout, or errors and returns 1. Reads the
-# ARG_* globals directly (consistent with the rest of the file). The SaaS target is selected by
-# giving BOTH --account-id and --database-id; it is currently the only supported target.
+# Prints the resolved install target mode (saas|bucketfs) on stdout, or errors and returns 1.
+# Reads the ARG_* globals directly (consistent with the rest of the file).
+#
+# The mode is AUTO-DETECTED from the SaaS ids, because those ids are the only thing a SaaS install
+# needs that a BucketFS install cannot use: both given -> saas, neither given -> bucketfs (the
+# default target: AppDB, Docker, on-premise). Exactly one given is always a mistake and errors.
+# --target is an optional assertion: it never selects a mode, it only fails the run when the
+# caller's stated intent disagrees with what the flags actually describe.
 resolve_target_mode() {
+  local detected=""
   if [[ -n "$ARG_ACCOUNT_ID" && -n "$ARG_DATABASE_ID" ]]; then
-    printf '%s\n' "saas"
-    return 0
-  fi
-  if [[ -n "$ARG_ACCOUNT_ID" || -n "$ARG_DATABASE_ID" ]]; then
-    err "the Exasol SaaS target needs BOTH --account-id and --database-id; only one of the two was given."
+    detected="saas"
+  elif [[ -n "$ARG_ACCOUNT_ID" || -n "$ARG_DATABASE_ID" ]]; then
+    err "the Exasol SaaS target needs BOTH --account-id and --database-id; only one of the two was given. Find both in the Exasol SaaS web console."
     return 1
+  else
+    detected="bucketfs"
   fi
-  # TODO(bucketfs-mode): replace this arm with BucketFS target-mode resolution (AppDB, Docker,
-  # on-premise) once the exapump-based BucketFS install path exists.
-  err "BucketFS-target support is not yet implemented; pass --account-id and --database-id for Exasol SaaS."
-  return 1
+
+  if [[ -n "$ARG_TARGET" ]]; then
+    case "$ARG_TARGET" in
+      saas|bucketfs) ;;
+      *) err "--target must be 'saas' or 'bucketfs'; got '$ARG_TARGET'."; return 1 ;;
+    esac
+    if [[ "$ARG_TARGET" != "$detected" ]]; then
+      if [[ "$detected" == "saas" ]]; then
+        err "--target $ARG_TARGET conflicts with the detected target mode 'saas': --account-id and --database-id were both given, which selects the Exasol SaaS target. Drop those two ids for a BucketFS install."
+      else
+        err "--target $ARG_TARGET conflicts with the detected target mode 'bucketfs': neither --account-id nor --database-id was given, which selects the BucketFS target. Pass both ids for an Exasol SaaS install."
+      fi
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$detected"
+  return 0
 }
 
 # Seeds the mode-parameterized TARGET_* globals used by the install steps, so those steps never
-# read a target-specific constant directly. For the SaaS target they are the fixed SaaS constants;
-# the BucketFS target will derive them from its own bucket layout. Call only after
-# resolve_target_mode has resolved a mode.
+# read a target-specific constant directly. Call only after resolve_target_mode has resolved a
+# mode. TARGET_SLC_BFS_PATH / TARGET_ENGINE_BFS_PATH are BucketFS-only (SaaS addresses its
+# uploads by presigned-URL file key instead, so they stay empty there).
 resolve_target_layout() {
-  TARGET_SO_UDF_OBJECT="$ENGINE_SO_PATH"
-  TARGET_RUST_LANG_SEGMENT="$RUST_LANG_SEGMENT"
+  case "$TARGET_MODE" in
+    bucketfs)
+      TARGET_SO_UDF_OBJECT="buckets/bfsdefault/$ARG_BFS_BUCKET/udf/liblakehouse_engine.so"
+      TARGET_RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///bfsdefault/$ARG_BFS_BUCKET/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/$ARG_BFS_BUCKET/slc/lakehouse-rustslc/exaudf/exaudfclient"
+      TARGET_SLC_BFS_PATH="$BFS_SLC_PATH"
+      TARGET_ENGINE_BFS_PATH="$BFS_ENGINE_SO_PATH"
+      ;;
+    saas|*)
+      TARGET_SO_UDF_OBJECT="$ENGINE_SO_PATH"
+      TARGET_RUST_LANG_SEGMENT="$RUST_LANG_SEGMENT"
+      TARGET_SLC_BFS_PATH=""
+      TARGET_ENGINE_BFS_PATH=""
+      ;;
+  esac
   return 0
+}
+
+# BucketFS-target required fields. Runs BEFORE any network call, so a missing write password can
+# never cost a download. `exapump bucketfs` has NO --dsn/--host/--user/--password flags of its own
+# (unlike `exapump sql`), so outside profile connectivity mode there is nothing to fall back on and
+# --bfs-host plus --bfs-write-password must be supplied explicitly.
+validate_bucketfs_required() {
+  local missing=0
+  case "$CONNECTIVITY_MODE" in
+    profile)
+      if [[ -z "$ARG_BFS_WRITE_PASSWORD" ]]; then
+        local config_path resolved
+        config_path="$(exapump_config_path)"
+        if ! resolved="$(read_profile_key "$ARG_PROFILE" bfs_write_password "$config_path")" || [[ -z "$resolved" ]]; then
+          err "missing the BucketFS write password: pass --bfs-write-password, or add a 'bfs_write_password' key to the [$ARG_PROFILE] section of $config_path."
+          missing=1
+        fi
+      fi
+      ;;
+    dsn|host)
+      if [[ -z "$ARG_BFS_WRITE_PASSWORD" ]]; then
+        err "missing --bfs-write-password: 'exapump bucketfs' takes no DSN or user/password flags, so in $CONNECTIVITY_MODE connectivity mode the BucketFS write password must be given explicitly (or switch to --profile and set 'bfs_write_password' there)."
+        missing=1
+      fi
+      if [[ -z "$ARG_BFS_HOST" ]]; then
+        err "missing --bfs-host: 'exapump bucketfs' takes no DSN or host flags, so in $CONNECTIVITY_MODE connectivity mode the BucketFS host must be given explicitly (or switch to --profile and set 'bfs_host' there)."
+        missing=1
+      fi
+      ;;
+    *)
+      err "internal error: connectivity mode not resolved"
+      return 1
+      ;;
+  esac
+  [[ "$missing" -eq 0 ]]
 }
 
 check_prereqs() {
   local ok=1
   have_cmd exapump || { err "required tool 'exapump' not found on PATH. Install it: https://github.com/exasol-labs/exapump"; ok=0; }
   have_cmd curl    || { err "required tool 'curl' not found on PATH. Install it via your OS package manager: https://curl.se/"; ok=0; }
+  if [[ "$TARGET_MODE" == "bucketfs" ]]; then
+    have_cmd tar   || { err "required tool 'tar' not found on PATH. The BucketFS install target extracts liblakehouse_engine.so out of the engine archive locally before uploading it. Install it via your OS package manager."; ok=0; }
+  fi
   [[ "$ok" -eq 1 ]]
 }
 
@@ -573,6 +671,139 @@ saas_upload_file() {
   fi
   log "Uploaded and verified $filename."
   return 0
+}
+
+# --- BucketFS helpers (exapump) ----------------------------------------------
+# Prints, space-separated, ONLY the --bfs-* overrides the caller actually supplied. This is the
+# single place that decides which BucketFS flags accompany every `exapump bucketfs` call; anything
+# not listed here is left to exapump's own resolution (profile field, then smart default:
+# bfs_host falls back to the profile's host, bfs_port to 2581, bfs_bucket to "default").
+#
+# The result is meant to be word-split by the caller, so no value may contain whitespace. That is
+# true of a host, a port and a bucket name by construction; a BucketFS write password containing a
+# space is the one unsupported case -- pass it through the profile's bfs_write_password instead.
+exapump_bfs_flags() {
+  local out=""
+  if [[ -n "$ARG_BFS_HOST" ]]; then out="$out --bfs-host $ARG_BFS_HOST"; fi
+  if [[ -n "$ARG_BFS_PORT" ]]; then out="$out --bfs-port $ARG_BFS_PORT"; fi
+  if [[ "$ARG_BFS_BUCKET_SET" -eq 1 ]]; then out="$out --bfs-bucket $ARG_BFS_BUCKET"; fi
+  if [[ -n "$ARG_BFS_WRITE_PASSWORD" ]]; then out="$out --bfs-write-password $ARG_BFS_WRITE_PASSWORD"; fi
+  printf '%s\n' "${out# }"
+  return 0
+}
+
+# Runs `exapump bucketfs <args...>` with this run's connectivity flag and BucketFS overrides
+# appended. Globbing is disabled around the deliberate word-split of exapump_bfs_flags so a '*'
+# inside a password can never expand into file names. stdin is /dev/null so the subprocess cannot
+# consume the piped script body.
+exapump_bucketfs() {
+  local conn_arg="" restore_glob=0 rc
+  if [[ "$CONNECTIVITY_MODE" == "profile" ]]; then conn_arg="--profile $ARG_PROFILE"; fi
+  case "$-" in
+    *f*) : ;;
+    *)   restore_glob=1; set -f ;;
+  esac
+  # shellcheck disable=SC2046,SC2086  # intentional word-splitting; see exapump_bfs_flags
+  exapump bucketfs "$@" $conn_arg $(exapump_bfs_flags) </dev/null
+  rc=$?
+  [[ "$restore_glob" -eq 1 ]] && set +f
+  return "$rc"
+}
+
+# Preflight, analogous to saas_db_reachable: an empty-path listing of the target bucket. exapump
+# resolves the bucket itself (--bfs-bucket / profile), so no path argument is passed -- a bucket
+# name IS NOT a valid path component for `exapump bucketfs ls`.
+bucketfs_reachable() {
+  local out
+  if ! out="$(exapump_bucketfs ls 2>&1)"; then
+    err "BucketFS bucket '$ARG_BFS_BUCKET' is not reachable: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
+    return 1
+  fi
+  return 0
+}
+
+# Uploads one local file to a bucket-relative BucketFS path. Always via `exapump bucketfs cp`,
+# never a raw HTTP PUT.
+bucketfs_upload_file() {
+  local local_path="$1" bucket_path="$2" out
+  if ! out="$(exapump_bucketfs cp "$local_path" "$bucket_path" 2>&1)"; then
+    err "BucketFS upload of '$local_path' to bucket path '$bucket_path' failed. exapump said: $out"
+    return 1
+  fi
+  log "Uploaded $local_path to BucketFS path $bucket_path."
+  return 0
+}
+
+# Analogous to saas_verify_listed: lists the parent directory and requires the basename to appear
+# as a WHOLE listing entry. A line-exact comparison (not a substring test) is what keeps
+# 'liblakehouse_engine.so' from matching a stored 'liblakehouse_engine.so.bak'.
+bucketfs_verify_listed() {
+  local bucket_path="$1" parent base out line
+  base="${bucket_path##*/}"
+  parent="${bucket_path%/*}"
+  [[ "$parent" == "$bucket_path" ]] && parent=""
+  if ! out="$(exapump_bucketfs ls "$parent" 2>/dev/null)"; then
+    return 1
+  fi
+  while IFS= read -r line; do
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ "$line" == "$base" ]] && return 0
+  done <<EOF_BFS_LS
+$out
+EOF_BFS_LS
+  return 1
+}
+
+# Bounded retry around bucketfs_verify_listed. BucketFS unpacks an uploaded .tar.gz
+# asynchronously, so a path can be accepted by the PUT and still be absent from the very next
+# listing; this waits for it rather than racing it.
+bucketfs_wait_for_path() {
+  local bucket_path="$1" tries="${2:-5}" sleep_seconds="${3:-2}" i=1
+  while [[ "$i" -le "$tries" ]]; do
+    if bucketfs_verify_listed "$bucket_path"; then
+      log "Verified BucketFS path $bucket_path."
+      return 0
+    fi
+    if [[ "$i" -lt "$tries" ]]; then
+      sleep "$sleep_seconds"
+    fi
+    i=$((i + 1))
+  done
+  err "BucketFS path '$bucket_path' did not appear in the bucket listing after $tries tries. The upload reported success, so check that bucket '$ARG_BFS_BUCKET' is the bucket the database actually reads."
+  return 1
+}
+
+# Unpacks the engine release archive locally and prints the path of the extracted .so. The
+# BucketFS target uploads that bare .so (see install_engine for why), so the member must exist.
+extract_engine_so() {
+  local tarball_path="$1" destdir="$2" so_path out
+  if ! out="$(mkdir -p "$destdir" 2>&1)"; then
+    err "could not create the extraction directory '$destdir': $out"
+    return 1
+  fi
+  if ! out="$(tar -xzf "$tarball_path" -C "$destdir" 2>&1)"; then
+    err "could not extract the engine archive '$tarball_path' into '$destdir': $out"
+    return 1
+  fi
+  so_path="$destdir/udf/liblakehouse_engine.so"
+  if [[ ! -s "$so_path" ]]; then
+    err "the engine archive '$tarball_path' does not contain a non-empty member 'udf/liblakehouse_engine.so' (looked for '$so_path' after extraction)."
+    return 1
+  fi
+  printf '%s\n' "$so_path"
+  return 0
+}
+
+# --- Upload dispatch ---------------------------------------------------------
+# The ONE seam between the two target modes: SaaS addresses an upload by its files-API key,
+# BucketFS by its bucket-relative path. Each mode ignores the other's argument.
+upload_artifact() {
+  local local_path="$1" saas_key="$2" bfs_path="$3"
+  case "$TARGET_MODE" in
+    saas)     saas_upload_file "$local_path" "$saas_key" ;;
+    bucketfs) bucketfs_upload_file "$local_path" "$bfs_path" ;;
+    *)        err "internal error: install target mode not resolved"; return 1 ;;
+  esac
 }
 
 # --- SQL execution -----------------------------------------------------------
@@ -727,7 +958,13 @@ download_engine() {
 register_slc() {
   log "Installing Rust SLC $RESOLVED_SLC_VERSION ..."
   download_slc || return 1
-  saas_upload_file "$WORKDIR/rustslc.tar.gz" "rustslc.tar.gz" || return 1
+  # The SLC goes up as a TARBALL in both modes: BucketFS itself must auto-extract it, because the
+  # RUST alias points at the extracted rustslc/ directory, not at the archive.
+  upload_artifact "$WORKDIR/rustslc.tar.gz" "rustslc.tar.gz" "$TARGET_SLC_BFS_PATH" || return 1
+  if [[ "$TARGET_MODE" == "bucketfs" ]]; then
+    # SaaS verifies synchronously inside saas_upload_file; BucketFS needs the bounded wait.
+    bucketfs_wait_for_path "$TARGET_SLC_BFS_PATH" || return 1
+  fi
   local current new
   if ! current="$(read_script_languages)"; then
     return 1
@@ -758,10 +995,25 @@ create_engine_scripts() {
   return 0
 }
 
+# Deliberate artifact-shape asymmetry between the two targets:
+#  * SaaS uploads the engine TARBALL and lets the SaaS bucket auto-extract it into the layout
+#    ENGINE_SO_PATH already encodes.
+#  * BucketFS extracts locally and uploads the BARE .so to udf/liblakehouse_engine.so -- the exact
+#    path `make bucketfs-upload-so` has always used and every E2E test's %udf_object points at.
+#    Only the SLC relies on BucketFS archive auto-extraction, in both modes.
 install_engine() {
   log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION ..."
   download_engine || return 1
-  saas_upload_file "$WORKDIR/$ENGINE_ASSET" "$ENGINE_ASSET" || return 1
+  if [[ "$TARGET_MODE" == "bucketfs" ]]; then
+    local so_path
+    if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
+      return 1
+    fi
+    upload_artifact "$so_path" "" "$TARGET_ENGINE_BFS_PATH" || return 1
+    bucketfs_wait_for_path "$TARGET_ENGINE_BFS_PATH" || return 1
+  else
+    upload_artifact "$WORKDIR/$ENGINE_ASSET" "$ENGINE_ASSET" "" || return 1
+  fi
   create_engine_scripts || return 1
   return 0
 }
@@ -832,18 +1084,17 @@ main() {
     exit 0
   fi
 
-  validate_required || exit 1
+  # The target mode is resolved FIRST: it doubles as the --account-id/--database-id validation, and
+  # every later step (which fields are required, which tools are needed, which preflight runs)
+  # branches on it.
   if ! TARGET_MODE="$(resolve_target_mode)"; then
     exit 1
   fi
-  if [[ "$TARGET_MODE" != "saas" ]]; then
-    err "unsupported install target mode '$TARGET_MODE'."
-    exit 1
-  fi
-  resolve_target_layout || exit 1
+  validate_required || exit 1
   if ! CONNECTIVITY_MODE="$(validate_connectivity)"; then
     exit 1
   fi
+  resolve_target_layout || exit 1
   if [[ "$CONNECTIVITY_MODE" == "host" ]]; then
     local enc_user enc_password
     enc_user="$(url_encode "$ARG_USER")"
@@ -851,9 +1102,19 @@ main() {
     HOST_DSN="exasol://$enc_user:$enc_password@$ARG_HOST?validateservercertificate=0"
   fi
   check_prereqs || exit 1
-  resolve_saas_pat || exit 1
 
-  saas_db_reachable || exit 1
+  # Per-target credential derivation + reachability preflight. Both arms must complete before the
+  # first download, so a misconfigured run costs no bytes.
+  case "$TARGET_MODE" in
+    saas)
+      resolve_saas_pat || exit 1
+      saas_db_reachable || exit 1
+      ;;
+    bucketfs)
+      validate_bucketfs_required || exit 1
+      bucketfs_reachable || exit 1
+      ;;
+  esac
 
   if ! WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/lhvs-install.XXXXXX" 2>/dev/null)"; then
     err "failed to create a temporary working directory."

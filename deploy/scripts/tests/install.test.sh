@@ -61,6 +61,69 @@ write_exapump_stub() {
 #!/usr/bin/env bash
 printf 'exapump %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 if [[ "${STUB_REPORT_STDIN:-0}" == "1" ]]; then _sd="$(cat)"; [[ -n "$_sd" ]] && printf 'STDIN_LEAK[exapump %s]\n' "$*" >> "${STUB_LOG:-/dev/null}"; fi
+
+# --- `exapump bucketfs <cp|ls|rm>` -------------------------------------------
+# Models a real bucket well enough to exercise the installer's verify/retry logic: `cp` records
+# the destination in a state file, `ls <prefix>` reports that state's immediate children (exiting
+# non-zero on no match, exactly as the real CLI's "Path not found"), and `ls` with no path is the
+# always-succeeding top-level reachability probe.
+if [[ "${1:-}" == "bucketfs" ]]; then
+  _sub="${2:-}"
+  shift 2 2>/dev/null || true
+  _pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password|--bfs-read-password|--bfs-tls|--bfs-validate-certificate)
+        shift 2 ;;
+      -r|--recursive) shift ;;
+      *) _pos+=("$1"); shift ;;
+    esac
+  done
+  _state="${STUB_BFS_STATE:-/dev/null}"
+  case "$_sub" in
+    cp)
+      if [[ "${EXAPUMP_BFS_CP_FAIL:-0}" == "1" ]]; then
+        echo "Error: BucketFS returned HTTP 403 Forbidden" >&2
+        exit 1
+      fi
+      printf '%s\n' "${_pos[1]:-}" >> "$_state"
+      echo "Uploaded ${_pos[0]:-} to ${_pos[1]:-}" >&2
+      exit 0 ;;
+    ls)
+      if [[ "${EXAPUMP_BFS_LS_FAIL:-0}" == "1" ]]; then
+        echo "Error: BucketFS is not reachable at stub-bfs-host:2581" >&2
+        exit 1
+      fi
+      _prefix="${_pos[0]:-}"
+      if [[ -z "$_prefix" ]]; then
+        # Top-level probe: always succeeds, even against an empty bucket.
+        if [[ -f "$_state" ]]; then
+          while IFS= read -r _e; do [[ -n "$_e" ]] && printf '%s\n' "${_e%%/*}"; done < "$_state"
+        fi
+        exit 0
+      fi
+      if [[ "${EXAPUMP_BFS_NEVER_LIST:-0}" == "1" ]]; then exit 1; fi
+      # Simulate BucketFS's asynchronous unpack: the first N path listings find nothing.
+      _delay="${EXAPUMP_BFS_LS_DELAY:-0}"
+      if [[ "$_delay" -gt 0 ]]; then
+        _cf="$_state.delay"
+        _n=0; [[ -f "$_cf" ]] && _n="$(cat "$_cf")"
+        _n=$((_n + 1)); printf '%s' "$_n" > "$_cf"
+        if [[ "$_n" -le "$_delay" ]]; then exit 1; fi
+      fi
+      [[ -f "$_state" ]] || exit 1
+      _found=0
+      while IFS= read -r _e; do
+        case "$_e" in
+          "$_prefix"/*) _rest="${_e#"$_prefix"/}"; printf '%s\n' "${_rest%%/*}"; _found=1 ;;
+        esac
+      done < "$_state"
+      [[ "$_found" -eq 1 ]] || exit 1
+      exit 0 ;;
+    *) exit 0 ;;
+  esac
+fi
+
 sql="${!#}"
 case "$sql" in
   *"SELECT SYSTEM_VALUE FROM EXA_PARAMETERS"*)
@@ -169,7 +232,15 @@ else
       exit 0 ;;
     */releases/assets/*)
       # GET /repos/<repo>/releases/assets/<id> (Accept: octet-stream) -> writes bytes to -o path.
-      [[ -n "$outfile" ]] && printf 'stub-asset-bytes\n' > "$outfile"
+      # GH_ASSET_TARBALL delivers a REAL fixture archive instead, which the BucketFS target needs
+      # because it extracts the engine asset locally.
+      if [[ -n "$outfile" ]]; then
+        if [[ -n "${GH_ASSET_TARBALL:-}" ]]; then
+          cat "$GH_ASSET_TARBALL" > "$outfile"
+        else
+          printf 'stub-asset-bytes\n' > "$outfile"
+        fi
+      fi
       exit 0 ;;
     *)
       if [[ "${CURL_DB_UNREACHABLE:-0}" == "1" ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
@@ -199,11 +270,44 @@ password = "DECOY_SHOULD_NEVER_BE_USED"
 [staging]
 host = "decoy-host"
 password = "SECRETPAT123"
+
+[bfsprofile]
+host = "bfs-decoy-host"
+password = "SECRETPAT123"
+bfs_write_password = "BFSWRITEPW789"
 TOML
 
+# --- engine-archive fixtures --------------------------------------------------
+# GOOD: contains udf/liblakehouse_engine.so, the member the BucketFS target extracts and uploads.
+# BAD:  a well-formed .tar.gz WITHOUT that member, to prove extract_engine_so names what is absent.
+mkdir -p "$SANDBOX/fixture-good/udf" "$SANDBOX/fixture-bad/other"
+printf 'fake-elf-bytes\n' > "$SANDBOX/fixture-good/udf/liblakehouse_engine.so"
+printf 'unrelated\n' > "$SANDBOX/fixture-bad/other/readme.txt"
+ENGINE_TARBALL_GOOD="$SANDBOX/engine-good.tar.gz"
+ENGINE_TARBALL_BAD="$SANDBOX/engine-bad.tar.gz"
+tar -czf "$ENGINE_TARBALL_GOOD" -C "$SANDBOX/fixture-good" udf
+tar -czf "$ENGINE_TARBALL_BAD" -C "$SANDBOX/fixture-bad" other
+
+# --- a PATH with no `tar` -----------------------------------------------------
+# A symlink farm holding exactly the external commands install.sh needs, minus tar. Used as the
+# WHOLE PATH so `command -v tar` genuinely fails while everything else still works.
+NOTAR_DIR="$SANDBOX/no-tar"
+mkdir -p "$NOTAR_DIR"
+write_exapump_stub "$NOTAR_DIR"
+write_curl_stub "$NOTAR_DIR"
+# `bash` is in the farm because the stubs' `#!/usr/bin/env bash` shebang resolves it through PATH.
+for _c in bash env mktemp mv rm cat tr cut mkdir sleep; do
+  _p="$(command -v "$_c" 2>/dev/null)" && ln -sf "$_p" "$NOTAR_DIR/$_c"
+done
+unset _c _p
+
+STUB_BFS_STATE="$SANDBOX/bfs-state.txt"
+export STUB_BFS_STATE
+
 reset_env() {
-  unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING 2>/dev/null || true
+  unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
+  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
   # Stub non-empty token so happy-path runs don't each have to set it individually.
@@ -212,6 +316,8 @@ reset_env() {
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
+  : > "$STUB_BFS_STATE"
+  rm -f "$STUB_BFS_STATE.delay"
 }
 
 run_file() {
@@ -235,6 +341,18 @@ log_content() { printf '%s' "$(<"$STUB_LOG")"; }
 
 # Common valid arguments for a happy-path run (profile connectivity mode).
 HAPPY_ARGS=(--account-id ACC1 --database-id DB1 --profile staging)
+
+# BucketFS-target happy path: no SaaS ids at all, and a profile that carries bfs_write_password.
+BFS_HAPPY_ARGS=(--profile bfsprofile)
+
+BFS_RUST_SEGMENT="RUST=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"
+BFS_SO_UDF_OBJECT="buckets/bfsdefault/default/udf/liblakehouse_engine.so"
+
+# Runs the installer against the BucketFS target with a real engine-archive fixture in place.
+run_file_bfs() {
+  export GH_ASSET_TARBALL="$ENGINE_TARBALL_GOOD"
+  run_file "$@"
+}
 
 # ============================================================================
 # Scenario tests
@@ -917,6 +1035,396 @@ test_stdin_piped_invocation_no_body_consumption() {
 }
 
 # ============================================================================
+# BucketFS target mode
+# ============================================================================
+
+test_resolve_target_mode_bucketfs_autodetect() {
+  echo "== test_resolve_target_mode_bucketfs_autodetect =="
+  local mode rc out
+
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; resolve_target_mode )"
+  rc=$?
+  assert_rc_zero "autodetect: neither SaaS id resolves a mode" "$rc"
+  assert_eq "autodetect: neither SaaS id resolves to bucketfs (the default target)" "bucketfs" "$mode"
+
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; resolve_target_mode )"
+  assert_eq "autodetect: both SaaS ids still resolve to saas" "saas" "$mode"
+
+  # Exactly-one-set stays an error in both directions (unchanged behaviour).
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=""; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "autodetect: exactly one id is still an error, never bucketfs" "$rc"
+  assert_not_contains "autodetect: partial pair never silently becomes bucketfs" "$out" "bucketfs"
+}
+
+test_target_flag_conflict_detection() {
+  echo "== test_target_flag_conflict_detection =="
+  local mode rc out
+
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; ARG_TARGET=bucketfs; resolve_target_mode )"
+  rc=$?
+  assert_rc_zero "--target: agreeing bucketfs assertion passes" "$rc"
+  assert_eq "--target: agreeing bucketfs assertion yields bucketfs" "bucketfs" "$mode"
+
+  mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; ARG_TARGET=saas; resolve_target_mode )"
+  rc=$?
+  assert_rc_zero "--target: agreeing saas assertion passes" "$rc"
+  assert_eq "--target: agreeing saas assertion yields saas" "saas" "$mode"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; ARG_TARGET=saas; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--target saas with no ids: nonzero" "$rc"
+  assert_contains "--target saas with no ids: names the flag" "$out" "--target saas"
+  assert_contains "--target saas with no ids: names the detected mode" "$out" "'bucketfs'"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; ARG_TARGET=bucketfs; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--target bucketfs with both ids: nonzero" "$rc"
+  assert_contains "--target bucketfs with both ids: names the flag" "$out" "--target bucketfs"
+  assert_contains "--target bucketfs with both ids: names the detected mode" "$out" "'saas'"
+
+  out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; ARG_TARGET=nonsense; resolve_target_mode 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "--target: an unknown value is rejected" "$rc"
+  assert_contains "--target: unknown value lists the two valid ones" "$out" "'saas' or 'bucketfs'"
+
+  # End to end through parse_args: the flag is accepted and takes a value.
+  reset_env
+  run_file --target saas "${HAPPY_ARGS[@]}"
+  assert_rc_zero "--target saas: full saas run still succeeds" "$LAST_RC"
+
+  reset_env
+  run_file --target bucketfs "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "--target bucketfs against SaaS ids: full run refuses" "$LAST_RC"
+  assert_eq "--target conflict: no network call made" "" "$(log_content)"
+}
+
+test_resolve_target_layout_bucketfs_values() {
+  echo "== test_resolve_target_layout_bucketfs_values =="
+  local so segment slc engine
+
+  so="$( source "$INSTALLER"; TARGET_MODE=bucketfs; resolve_target_layout; printf '%s' "$TARGET_SO_UDF_OBJECT" )"
+  assert_eq "layout bucketfs: %udf_object is the generic bfsdefault .so path" "$BFS_SO_UDF_OBJECT" "$so"
+
+  segment="$( source "$INSTALLER"; TARGET_MODE=bucketfs; resolve_target_layout; printf '%s' "$TARGET_RUST_LANG_SEGMENT" )"
+  assert_eq "layout bucketfs: RUST alias is the generic bfsdefault segment" "$BFS_RUST_SEGMENT" "$segment"
+
+  slc="$( source "$INSTALLER"; TARGET_MODE=bucketfs; resolve_target_layout; printf '%s' "$TARGET_SLC_BFS_PATH" )"
+  assert_eq "layout bucketfs: SLC upload path is bucket-relative (no bucket segment, no leading /)" \
+    "slc/lakehouse-rustslc.tar.gz" "$slc"
+
+  engine="$( source "$INSTALLER"; TARGET_MODE=bucketfs; resolve_target_layout; printf '%s' "$TARGET_ENGINE_BFS_PATH" )"
+  assert_eq "layout bucketfs: engine upload path is bucket-relative" \
+    "udf/liblakehouse_engine.so" "$engine"
+
+  # --bfs-bucket propagates into every place the BUCKET NAME belongs: the %udf_object path and both
+  # halves of the RUST alias. It must NOT appear in the exapump upload paths -- exapump selects the
+  # bucket via --bfs-bucket and prefixes it onto the path itself.
+  so="$( source "$INSTALLER"; TARGET_MODE=bucketfs; ARG_BFS_BUCKET=other; resolve_target_layout; printf '%s' "$TARGET_SO_UDF_OBJECT" )"
+  assert_eq "layout --bfs-bucket other: %udf_object carries the bucket" \
+    "buckets/bfsdefault/other/udf/liblakehouse_engine.so" "$so"
+
+  segment="$( source "$INSTALLER"; TARGET_MODE=bucketfs; ARG_BFS_BUCKET=other; resolve_target_layout; printf '%s' "$TARGET_RUST_LANG_SEGMENT" )"
+  assert_eq "layout --bfs-bucket other: RUST alias carries the bucket in both halves" \
+    "RUST=localzmq+protobuf:///bfsdefault/other/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/other/slc/lakehouse-rustslc/exaudf/exaudfclient" \
+    "$segment"
+
+  slc="$( source "$INSTALLER"; TARGET_MODE=bucketfs; ARG_BFS_BUCKET=other; resolve_target_layout; printf '%s' "$TARGET_SLC_BFS_PATH" )"
+  assert_eq "layout --bfs-bucket other: SLC upload path stays bucket-relative" \
+    "slc/lakehouse-rustslc.tar.gz" "$slc"
+
+  # SaaS mode leaves the BucketFS-only globals empty.
+  slc="$( source "$INSTALLER"; TARGET_MODE=saas; resolve_target_layout; printf '%s' "$TARGET_SLC_BFS_PATH" )"
+  assert_eq "layout saas: no SLC BucketFS path" "" "$slc"
+  engine="$( source "$INSTALLER"; TARGET_MODE=saas; resolve_target_layout; printf '%s' "$TARGET_ENGINE_BFS_PATH" )"
+  assert_eq "layout saas: no engine BucketFS path" "" "$engine"
+}
+
+test_exapump_bfs_flags() {
+  echo "== test_exapump_bfs_flags =="
+  local flags
+
+  flags="$( source "$INSTALLER"; exapump_bfs_flags )"
+  assert_eq "bfs flags: nothing given -> nothing emitted (exapump resolves from the profile)" "" "$flags"
+
+  # The default bucket is a DEFAULT, not something the user gave: it must not be echoed back.
+  flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=default; ARG_BFS_BUCKET_SET=0; exapump_bfs_flags )"
+  assert_eq "bfs flags: an unsupplied --bfs-bucket default is not echoed back" "" "$flags"
+
+  flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; exapump_bfs_flags )"
+  assert_eq "bfs flags: an explicit --bfs-bucket is echoed back" "--bfs-bucket other" "$flags"
+
+  flags="$(
+    source "$INSTALLER"
+    ARG_BFS_HOST=bfshost; ARG_BFS_PORT=2581; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1
+    ARG_BFS_WRITE_PASSWORD=BFSWRITEPW789
+    exapump_bfs_flags
+  )"
+  assert_eq "bfs flags: everything given is echoed back exactly, in flag order" \
+    "--bfs-host bfshost --bfs-port 2581 --bfs-bucket other --bfs-write-password BFSWRITEPW789" "$flags"
+
+  flags="$( source "$INSTALLER"; ARG_BFS_HOST=bfshost; exapump_bfs_flags )"
+  assert_eq "bfs flags: only the supplied subset is emitted" "--bfs-host bfshost" "$flags"
+}
+
+test_bucketfs_upload_argv_shape() {
+  echo "== test_bucketfs_upload_argv_shape =="
+  # profile mode: --profile is present, and only the explicitly-given --bfs-* overrides follow.
+  reset_env
+  local rc
+  rc="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; TARGET_MODE=bucketfs
+    if bucketfs_upload_file "/tmp/local.so" "udf/liblakehouse_engine.so" >/dev/null 2>&1; then echo 0; else echo 1; fi
+  )"
+  assert_eq "upload argv profile: succeeds" "0" "$rc"
+  local log; log="$(log_content)"
+  assert_contains "upload argv profile: exact cp shape" "$log" \
+    "exapump bucketfs cp /tmp/local.so udf/liblakehouse_engine.so --profile bfsprofile"
+  assert_not_contains "upload argv profile: never a raw curl PUT" "$log" "curl"
+
+  # dsn mode: no --profile at all; the required explicit --bfs-* overrides carry the connection.
+  reset_env
+  rc="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=dsn; ARG_DSN="exasol://u:p@h:8563"; TARGET_MODE=bucketfs
+    ARG_BFS_HOST=bfshost; ARG_BFS_WRITE_PASSWORD=BFSWRITEPW789
+    if bucketfs_upload_file "/tmp/local.so" "udf/liblakehouse_engine.so" >/dev/null 2>&1; then echo 0; else echo 1; fi
+  )"
+  assert_eq "upload argv dsn: succeeds" "0" "$rc"
+  log="$(log_content)"
+  assert_contains "upload argv dsn: exact cp shape with the bfs overrides" "$log" \
+    "exapump bucketfs cp /tmp/local.so udf/liblakehouse_engine.so --bfs-host bfshost --bfs-write-password BFSWRITEPW789"
+  assert_not_contains "upload argv dsn: no --profile flag (there is no profile in dsn mode)" "$log" "--profile"
+  assert_not_contains "upload argv dsn: exapump bucketfs is never given a -d/--dsn (it has no such flag)" "$log" "bucketfs cp /tmp/local.so udf/liblakehouse_engine.so -d"
+}
+
+test_bucketfs_upload_failure_surfaces_stderr() {
+  echo "== test_bucketfs_upload_failure_surfaces_stderr =="
+  reset_env
+  local out
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_CP_FAIL=1
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; TARGET_MODE=bucketfs
+    bucketfs_upload_file "/tmp/local.so" "udf/liblakehouse_engine.so" 2>&1
+  )"
+  local rc=$?
+  assert_rc_nonzero "upload fail: nonzero" "$rc"
+  assert_contains "upload fail: names the local file" "$out" "/tmp/local.so"
+  assert_contains "upload fail: names the bucket path" "$out" "udf/liblakehouse_engine.so"
+  assert_contains "upload fail: surfaces exapump's own stderr verbatim" "$out" "BucketFS returned HTTP 403 Forbidden"
+}
+
+test_bucketfs_verify_listed_and_wait() {
+  echo "== test_bucketfs_verify_listed_and_wait =="
+  reset_env
+  # Whole-token match: a stored 'liblakehouse_engine.so.bak' must not satisfy a check for
+  # 'liblakehouse_engine.so'.
+  printf 'udf/liblakehouse_engine.so.bak\n' > "$STUB_BFS_STATE"
+  local answer
+  answer="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile
+    if bucketfs_verify_listed "udf/liblakehouse_engine.so"; then echo yes; else echo no; fi
+  )"
+  assert_eq "verify listed: no false positive on a longer stored name" "no" "$answer"
+
+  printf 'udf/liblakehouse_engine.so\n' >> "$STUB_BFS_STATE"
+  answer="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile
+    if bucketfs_verify_listed "udf/liblakehouse_engine.so"; then echo yes; else echo no; fi
+  )"
+  assert_eq "verify listed: an exact entry verifies" "yes" "$answer"
+
+  # Retry-then-hit: the first two listings find nothing (async unpack), the third succeeds.
+  reset_env
+  printf 'slc/lakehouse-rustslc.tar.gz\n' > "$STUB_BFS_STATE"
+  local out rc
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_LS_DELAY=2
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_wait_for_path "slc/lakehouse-rustslc.tar.gz" 5 0 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "wait for path: retries past an asynchronous unpack and then succeeds" "$rc"
+  assert_contains "wait for path: reports the verified path" "$out" "slc/lakehouse-rustslc.tar.gz"
+  assert_eq "wait for path: took exactly 3 ls attempts (2 misses + 1 hit)" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
+
+  # Retry-then-fail: names the path and the try count, never hangs.
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_NEVER_LIST=1
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_wait_for_path "slc/lakehouse-rustslc.tar.gz" 3 0 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "wait for path: gives up nonzero after the cap" "$rc"
+  assert_contains "wait for path: failure names the path" "$out" "slc/lakehouse-rustslc.tar.gz"
+  assert_contains "wait for path: failure names the try count" "$out" "3 tries"
+  assert_eq "wait for path: capped at exactly 3 ls attempts" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
+}
+
+test_bucketfs_reachable_preflight() {
+  echo "== test_bucketfs_reachable_preflight =="
+  reset_env
+  export EXAPUMP_BFS_LS_FAIL=1
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_nonzero "bfs preflight: unreachable bucket exits nonzero" "$LAST_RC"
+  assert_contains "bfs preflight: names the bucket" "$LAST_OUT" "bucket 'default'"
+  assert_contains "bfs preflight: points at the likely cause" "$LAST_OUT" "--bfs-host"
+  assert_contains "bfs preflight: surfaces exapump's own diagnostic" "$LAST_OUT" "not reachable at stub-bfs-host"
+  local log; log="$(log_content)"
+  assert_not_contains "bfs preflight: fails before any release download" "$log" "releases/"
+}
+
+test_validate_bucketfs_required_before_any_call() {
+  echo "== test_validate_bucketfs_required_before_any_call =="
+  # profile mode, profile has no bfs_write_password and none was passed.
+  reset_env
+  run_file_bfs --profile staging
+  assert_rc_nonzero "bfs required: missing write password exits nonzero" "$LAST_RC"
+  assert_contains "bfs required: names the flag" "$LAST_OUT" "--bfs-write-password"
+  assert_contains "bfs required: names the config key" "$LAST_OUT" "bfs_write_password"
+  assert_contains "bfs required: names the profile section" "$LAST_OUT" "[staging]"
+  assert_eq "bfs required: fails BEFORE any curl/exapump call is made" "" "$(log_content)"
+
+  # profile mode with the password supplied directly still proceeds even if the profile lacks it.
+  reset_env
+  run_file_bfs --profile staging --bfs-write-password BFSWRITEPW789
+  assert_rc_zero "bfs required: an explicit --bfs-write-password satisfies profile mode" "$LAST_RC"
+
+  # dsn mode: no profile to fall back on, so BOTH --bfs-host and --bfs-write-password are required.
+  reset_env
+  run_file_bfs --dsn "exasol://user:SECRETPAT123@dsnhost:8563"
+  assert_rc_nonzero "bfs required dsn: nonzero" "$LAST_RC"
+  assert_contains "bfs required dsn: names --bfs-write-password" "$LAST_OUT" "--bfs-write-password"
+  assert_contains "bfs required dsn: names --bfs-host" "$LAST_OUT" "--bfs-host"
+  assert_contains "bfs required dsn: explains exapump bucketfs takes no DSN" "$LAST_OUT" "no DSN"
+  assert_eq "bfs required dsn: fails before any call" "" "$(log_content)"
+
+  reset_env
+  run_file_bfs --dsn "exasol://user:SECRETPAT123@dsnhost:8563" --bfs-host bfshost --bfs-write-password BFSWRITEPW789
+  assert_rc_zero "bfs required dsn: both flags given proceeds to success" "$LAST_RC"
+
+  # host mode: same requirement.
+  reset_env
+  run_file_bfs --host myhost:8563 --user u --password p
+  assert_rc_nonzero "bfs required host: nonzero" "$LAST_RC"
+  assert_contains "bfs required host: names --bfs-host" "$LAST_OUT" "--bfs-host"
+  assert_eq "bfs required host: fails before any call" "" "$(log_content)"
+}
+
+test_extract_engine_so() {
+  echo "== test_extract_engine_so =="
+  local out rc
+
+  out="$( source "$INSTALLER"; extract_engine_so "$ENGINE_TARBALL_GOOD" "$SANDBOX/extract-ok" )"
+  rc=$?
+  assert_rc_zero "extract: a well-formed engine archive extracts" "$rc"
+  assert_eq "extract: prints the extracted .so path" "$SANDBOX/extract-ok/udf/liblakehouse_engine.so" "$out"
+  if [[ -s "$SANDBOX/extract-ok/udf/liblakehouse_engine.so" ]]; then
+    pass "extract: the extracted .so exists and is non-empty"
+  else
+    fail "extract: the extracted .so exists and is non-empty"
+  fi
+
+  out="$( source "$INSTALLER"; extract_engine_so "$ENGINE_TARBALL_BAD" "$SANDBOX/extract-bad" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "extract: an archive without the .so member fails" "$rc"
+  assert_contains "extract: error names the expected member" "$out" "udf/liblakehouse_engine.so"
+  assert_contains "extract: error names the archive" "$out" "engine-bad.tar.gz"
+
+  out="$( source "$INSTALLER"; extract_engine_so "$SANDBOX/no-such-archive.tar.gz" "$SANDBOX/extract-missing" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "extract: a missing archive fails" "$rc"
+  assert_contains "extract: missing-archive error names the archive" "$out" "no-such-archive.tar.gz"
+}
+
+test_bucketfs_full_run_artifact_shapes() {
+  echo "== test_bucketfs_full_run_artifact_shapes =="
+  reset_env
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_zero "bfs run: install succeeds" "$LAST_RC"
+  assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "bfs run: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
+  local log; log="$(log_content)"
+
+  # The SLC goes up as a TARBALL (BucketFS must auto-extract it).
+  assert_contains "bfs run: SLC uploaded as a tarball to the bucket-relative slc/ path" "$log" \
+    "bucketfs cp "
+  assert_contains "bfs run: SLC destination is slc/lakehouse-rustslc.tar.gz" "$log" \
+    "rustslc.tar.gz slc/lakehouse-rustslc.tar.gz"
+
+  # The ENGINE goes up as a BARE .so, extracted locally first -- never the tarball.
+  assert_contains "bfs run: engine uploaded as the extracted bare .so" "$log" \
+    "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
+  assert_not_contains "bfs run: the engine TARBALL is never uploaded to BucketFS" "$log" \
+    "lakehouse-engine.tar.gz udf/"
+
+  # Nothing SaaS is touched at all.
+  assert_not_contains "bfs run: never contacts the SaaS control plane" "$log" "cloud.exasol.com"
+  assert_not_contains "bfs run: never calls the SaaS accounts API" "$log" "/api/v1/accounts"
+  assert_not_contains "bfs run: no presigned POST dance" "$log" "-X POST"
+  assert_not_contains "bfs run: no raw HTTP PUT upload" "$log" "--upload-file"
+
+  # DDL and SCRIPT_LANGUAGES use the generic bfsdefault layout.
+  assert_contains "bfs run: %udf_object uses the bfsdefault .so path" "$log" "$BFS_SO_UDF_OBJECT"
+  assert_contains "bfs run: ALTER SYSTEM registers the bfsdefault RUST alias" "$log" "$BFS_RUST_SEGMENT"
+  assert_contains "bfs run: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
+
+  # Both uploads are verified through a listing before the run proceeds.
+  assert_contains "bfs run: verifies the SLC path by listing" "$log" "exapump bucketfs ls slc"
+  assert_contains "bfs run: verifies the engine path by listing" "$log" "exapump bucketfs ls udf"
+
+  # --bfs-bucket propagates end to end.
+  reset_env
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}" --bfs-bucket other
+  assert_rc_zero "bfs run --bfs-bucket other: install succeeds" "$LAST_RC"
+  log="$(log_content)"
+  assert_contains "bfs run --bfs-bucket other: exapump is told the bucket" "$log" "--bfs-bucket other"
+  assert_contains "bfs run --bfs-bucket other: %udf_object carries it" "$log" "buckets/bfsdefault/other/udf/liblakehouse_engine.so"
+  assert_not_contains "bfs run --bfs-bucket other: no stale default-bucket .so path in the DDL" "$log" \
+    "buckets/bfsdefault/default/udf"
+}
+
+test_saas_run_never_touches_bucketfs() {
+  echo "== test_saas_run_never_touches_bucketfs =="
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "saas run: still succeeds" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_not_contains "saas run: never invokes exapump bucketfs" "$log" "exapump bucketfs"
+  assert_contains "saas run: still uploads the engine TARBALL via the files API" "$log" "/files/lakehouse-engine.tar.gz"
+  assert_contains "saas run: SLC still uploaded as a tarball too" "$log" "/files/rustslc.tar.gz"
+}
+
+test_tar_required_only_in_bucketfs_mode() {
+  echo "== test_tar_required_only_in_bucketfs_mode =="
+  reset_env
+  RUN_PATH="$NOTAR_DIR"
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_nonzero "no tar + bucketfs: nonzero exit" "$LAST_RC"
+  assert_contains "no tar + bucketfs: names tar" "$LAST_OUT" "'tar' not found"
+  assert_eq "no tar + bucketfs: fails before any call" "" "$(log_content)"
+
+  reset_env
+  RUN_PATH="$NOTAR_DIR"
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "no tar + saas: install still succeeds (SaaS uploads the tarball as-is)" "$LAST_RC"
+  assert_not_contains "no tar + saas: never complains about tar" "$LAST_OUT" "'tar' not found"
+}
+
+# ============================================================================
 main() {
   test_missing_prereq_fails_fast
   test_missing_github_token_fails_fast
@@ -946,6 +1454,19 @@ main() {
   test_target_base_default_and_override
   test_external_failure_actionable
   test_stdin_piped_invocation_no_body_consumption
+  test_resolve_target_mode_bucketfs_autodetect
+  test_target_flag_conflict_detection
+  test_resolve_target_layout_bucketfs_values
+  test_exapump_bfs_flags
+  test_bucketfs_upload_argv_shape
+  test_bucketfs_upload_failure_surfaces_stderr
+  test_bucketfs_verify_listed_and_wait
+  test_bucketfs_reachable_preflight
+  test_validate_bucketfs_required_before_any_call
+  test_extract_engine_so
+  test_bucketfs_full_run_artifact_shapes
+  test_saas_run_never_touches_bucketfs
+  test_tar_required_only_in_bucketfs_mode
 
   echo ""
   echo "=================================================="
