@@ -24,6 +24,7 @@ VS_SO   := target/release/liblakehouse_engine.so
 VS_SRCS := $(shell find crates/lakehouse-engine/src crates/vs-expression/src -name '*.rs') \
            crates/lakehouse-engine/Cargo.toml \
            crates/vs-expression/Cargo.toml \
+           .cargo/config.toml \
            Cargo.lock
 
 # Persistent cargo registry volume — downloads happen once, not on every docker

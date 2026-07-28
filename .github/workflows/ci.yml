@@ -419,8 +419,8 @@ jobs:
   # Mirrors the `e2e` job's setup steps; the compose overlay adds Keycloak +
   # Lakekeeper + its Postgres backend on top of the base stack (reuses base
   # `minio` and `exasol`). Independent of `e2e` (same upstream `needs`, no
-  # dependency between the two) so they run in parallel; not a `release` gate
-  # — only `e2e` is (see the `release` job's `needs`).
+  # dependency between the two) so they run in parallel; gates `release`
+  # alongside `e2e` (see the `release` job's `needs`).
   e2e-lakekeeper:
     name: E2E (Lakekeeper)
     runs-on: ubuntu-latest
