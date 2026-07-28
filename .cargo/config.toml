@@ -1,0 +1,24 @@
+# Dev profile lives HERE, not in Cargo.toml, so CI's cache key tracks it.
+# Swatinem/rust-cache hashes each workspace *member* manifest, but this
+# workspace's root is virtual — not a package — so the root Cargo.toml is never
+# read, and `[profile.*]` (only legal there) never enters the key. A profile
+# edit then poisons the cache under an unchanged key forever: exact hit, cargo
+# rejects every artifact, and rust-cache skips the save because the hit was
+# exact. Upstream Swatinem/rust-cache#268, open since 2025-10-05, no fix.
+# rust-cache DOES raw-hash .cargo/config.toml, into the strippable part of the
+# key — so an edit here rotates the exact key (save fires, self-heals) while
+# prefix-fallback restore stays warm. Config profiles override manifest ones,
+# so don't reintroduce `[profile.*]` in Cargo.toml — it would be silently dead.
+# build-so's docker-cargo cache also hashes this file (see ci.yml) so a future
+# [profile.release] here rotates that key too instead of poisoning it.
+
+[profile.dev]
+debug = 1
+
+# `cargo test` links 29 separate test binaries against the full
+# DataFusion/Arrow/Iceberg tree; debug-info volume dominates link time and
+# dependencies are ~all of those bytes. Backtraces keep dependency function
+# names (symbols, not debug info); `"*"` does not match workspace members, so
+# their debuggability is unchanged.
+[profile.dev.package."*"]
+debug = 0
