@@ -1,11 +1,12 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageProps};
+use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::super::credentials::CatalogSession;
 use super::super::file_resolution::resolve_file_list_with_session;
-use super::super::support::{exasol_type_from_json, extract_limit, order_by_present};
+use super::super::support::{extract_limit, order_by_present};
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///

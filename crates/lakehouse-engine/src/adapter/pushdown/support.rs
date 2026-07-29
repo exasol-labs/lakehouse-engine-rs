@@ -14,6 +14,7 @@ use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
 };
+use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_safe;
@@ -1399,56 +1400,6 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// Derive an Exasol type string from the VS column dataType JSON.
-pub(super) fn exasol_type_from_json(dt: &Json) -> String {
-    let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
-    match type_name.to_lowercase().as_str() {
-        "boolean" => "BOOLEAN".to_string(),
-        "decimal" => {
-            let p = dt.get("precision").and_then(|v| v.as_u64()).unwrap_or(18);
-            let s = dt.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
-            if p <= 36 && s <= 36 {
-                format!("DECIMAL({p},{s})")
-            } else {
-                "VARCHAR(2000000)".to_string()
-            }
-        }
-        "double" => "DOUBLE PRECISION".to_string(),
-        "date" => "DATE".to_string(),
-        "timestamp" => {
-            let with_local_time_zone = dt
-                .get("withLocalTimeZone")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if with_local_time_zone {
-                "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
-            } else {
-                match dt
-                    .get("fractionalSecondsPrecision")
-                    .and_then(|v| v.as_u64())
-                {
-                    Some(p) => format!("TIMESTAMP({p})"),
-                    None => "TIMESTAMP".to_string(),
-                }
-            }
-        }
-        _ => {
-            // VARCHAR, CHAR, and all others.
-            let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
-            let capped = size.min(2000000);
-            let is_ascii = dt
-                .get("characterSet")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-            if is_ascii {
-                format!("VARCHAR({capped}) ASCII")
-            } else {
-                format!("VARCHAR({capped})")
-            }
-        }
-    }
-}
-
 /// Resolve the Exasol-declared type of each aggregate select-list item, in order.
 ///
 /// Aggregates appear as `function_aggregate` items in `selectList`; the parallel
@@ -1599,74 +1550,6 @@ mod tests {
             }),
             "every tableAlias key must be gone at every depth, while name/tableName survive"
         );
-    }
-
-    /// `exasol_type_from_json` must read the `withLocalTimeZone` flag back off a
-    /// `{"type":"timestamp", ...}` dataType JSON (the shape Exasol echoes back in
-    /// `involvedTables[].columns[].dataType` for a VS column declared via
-    /// `exasol_type_to_json`), not just the bare `"type"` string — otherwise a
-    /// TIMESTAMP WITH LOCAL TIME ZONE column round-trips back into the pushdown
-    /// path as plain TIMESTAMP and Exasol rejects the EMITS type mismatch.
-    #[test]
-    fn exasol_type_from_json_reads_with_local_time_zone_flag() {
-        let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
-        assert_eq!(
-            exasol_type_from_json(&tstz),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
-        );
-
-        let ts = serde_json::json!({"type": "timestamp"});
-        assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
-    }
-
-    /// `exasol_type_from_json` must read `fractionalSecondsPrecision` back off a
-    /// `{"type":"timestamp", ...}` dataType JSON and render it as `TIMESTAMP(p)` — the
-    /// field is `fractionalSecondsPrecision`, not `precision` (that key is
-    /// DECIMAL/INTERVAL-only in Exasol's data-type API). Absent precision still falls
-    /// back to bare `TIMESTAMP`, and `withLocalTimeZone: true` still takes precedence
-    /// over precision (no `(p)` suffix on WLTZ), matching issue #212's collapse-point-1
-    /// fix.
-    #[test]
-    fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
-        let ts0 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
-        assert_eq!(exasol_type_from_json(&ts0), "TIMESTAMP(0)");
-
-        let ts6 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 6});
-        assert_eq!(exasol_type_from_json(&ts6), "TIMESTAMP(6)");
-
-        let ts9 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 9});
-        assert_eq!(exasol_type_from_json(&ts9), "TIMESTAMP(9)");
-
-        let ts_absent = serde_json::json!({"type": "timestamp"});
-        assert_eq!(exasol_type_from_json(&ts_absent), "TIMESTAMP");
-
-        let tstz_with_precision = serde_json::json!({
-            "type": "timestamp",
-            "withLocalTimeZone": true,
-            "fractionalSecondsPrecision": 7
-        });
-        assert_eq!(
-            exasol_type_from_json(&tstz_with_precision),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
-        );
-    }
-
-    /// `exasol_type_from_json` must read the `characterSet` field back off a
-    /// `{"type":"varchar", ...}` dataType JSON (Exasol's wire format for CHAR/VARCHAR
-    /// select-list items, e.g. `{"type":"CHAR","size":3,"characterSet":"ASCII"}` as
-    /// confirmed by `vs-expression`'s `renders_cast_char_as_varchar` test) and append
-    /// `" ASCII"` when it is `"ASCII"` (case-insensitively) — otherwise a CASE/literal
-    /// expression Exasol declares as `VARCHAR(n) ASCII` round-trips back through our
-    /// EMITS clause as bare `VARCHAR(n)`, which Exasol's type checker treats as
-    /// `VARCHAR(n) UTF8` by default, causing a "Data type mismatch" pushdown error
-    /// (issue #136 follow-up).
-    #[test]
-    fn exasol_type_from_json_propagates_ascii_character_set() {
-        let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
-        assert_eq!(exasol_type_from_json(&ascii), "VARCHAR(4) ASCII");
-
-        let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
-        assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
     }
 
     // ---------------------------------------------------------------------------

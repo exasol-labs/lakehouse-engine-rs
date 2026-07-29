@@ -4,6 +4,9 @@
 # Serena MCP workspace cache
 .serena/
 
+# Claude local settings
+.claude/
+
 # IDEs
 .idea
 *.iml
