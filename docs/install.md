@@ -18,7 +18,9 @@ example is a network with no path to GitHub.
 
 ## Prerequisites
 
-- `curl` and `tar` on the machine that runs the install command.
+- `curl` on the machine that runs the install command. `tar` is also required for BucketFS
+  targets (the install script extracts `liblakehouse_engine.so` out of the engine archive
+  locally before uploading it); SaaS targets upload the tarball as-is and don't need it.
 - [`exapump`](https://github.com/exasol-labs/exapump), with at least one profile already
   configured (`exapump profile add <name> --host <host> --user <user> --password <password>`,
   or `exapump profile init`). This is true for BucketFS targets even when you connect with
@@ -344,8 +346,10 @@ One `.so` supplies both RUST entry points. The SLC dispatches them by script nam
 script, a plain-LUA passthrough, fans the file lists out across nodes. Set `%udf_object` to the
 path where your `.so` landed in the upload step:
 
-- Build from source, or manual upload via UI or raw PUT:
-  `buckets/bfsdefault/default/udf/lakehouse-engine/udf/liblakehouse_engine.so`
+- [Build from source](#appendix-build-from-source) (`make bucketfs-upload-so` uploads the bare
+  `.so`, no auto-extract): `buckets/bfsdefault/default/udf/liblakehouse_engine.so`
+- Manual upload via UI or raw PUT (BucketFS auto-extracts the tarball, adding one directory
+  level): `buckets/bfsdefault/default/udf/lakehouse-engine/udf/liblakehouse_engine.so`
 - Manual upload via the SaaS REST API:
   `/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so`
 
@@ -353,12 +357,12 @@ path where your `.so` landed in the upload step:
 CREATE SCHEMA IF NOT EXISTS LHVS;
 
 CREATE OR REPLACE RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER AS
-%udf_object buckets/bfsdefault/default/udf/lakehouse-engine/udf/liblakehouse_engine.so
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
 CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
-%udf_object buckets/bfsdefault/default/udf/lakehouse-engine/udf/liblakehouse_engine.so
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
 CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))

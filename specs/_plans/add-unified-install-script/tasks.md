@@ -115,5 +115,4 @@
       `packaging/install-script-slc-registration`, `packaging/install-script-deploy` — named without
       the old branch's `saas-` prefix, since the feature is no longer SaaS-specific.
 - [x] 8.3 Name every known limitation in a spec rather than leaving it implicit: no SaaS CI job
-      (#252); `ALTER SYSTEM` under SaaS default privileges never confirmed; cross-mode flags
-      accepted and ignored rather than rejected.
+      (#252); `ALTER SYSTEM` under SaaS default privileges never confirmed.

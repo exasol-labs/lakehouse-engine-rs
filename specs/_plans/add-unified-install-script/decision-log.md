@@ -59,9 +59,9 @@ It never derives, and never reads the value of, the BucketFS write password. See
   `resolve_target_layout`, not a new `if` in ten places. The cost is that a caller who forgets one
   SaaS id gets a targeting error rather than a SaaS-specific one — mitigated by naming both flags
   and the SaaS web console in the message. A caller who passes a cross-mode flag that its resolved
-  mode does not use (for example `--staging` on a BucketFS install, or `--bfs-port` on a SaaS
-  install) has it **accepted and ignored**; only `--target` disagreement and the partial-id pair
-  are errors. See the limitations section of `packaging/install-script-targeting/spec.md`.
+  mode does not use (for example `--staging` on a BucketFS install, or any `--bfs-*` flag on a SaaS
+  install) gets a targeting error, same as `--target` disagreement and the partial-id pair. See
+  `packaging/install-script-targeting/spec.md`.
 - **Promotes to ADR:** yes
 
 ### [2] Idempotent `SCRIPT_LANGUAGES` read-modify-write with a **mode-resolved** segment

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# One-command installer that provisions lakehouse-engine onto an Exasol SaaS database:
-# registers the Rust SLC, uploads and registers the engine .so plus its three scripts, and
-# verifies the load with a fingerprint smoke test. Stops at a query-ready product install and
-# prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does NOT create catalog objects.
+# One-command installer that provisions lakehouse-engine onto an Exasol SaaS or BucketFS
+# database: registers the Rust SLC, uploads and registers the engine .so plus its three
+# scripts, and verifies the load with a fingerprint smoke test. Stops at a query-ready
+# product install and prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does
+# NOT create catalog objects.
 #
 # Distributed one-liner (piped into bash over stdin):
 #   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -105,7 +106,7 @@ url_decode() {
   local len=${#s}
   for ((i = 0; i < len; i++)); do
     c="${s:i:1}"
-    if [[ "$c" == "%" && $((i + 2)) -lt len ]]; then
+    if [[ "$c" == "%" && $((i + 2)) -lt len && "${s:i+1:2}" =~ ^[0-9A-Fa-f]{2}$ ]]; then
       # shellcheck disable=SC2059  # the inner printf emits only octal digits (0-7), never a
       # format specifier, so the outer printf's format string is always a plain "\NNN" escape.
       out+="$(printf "\\$(printf '%03o' "0x${s:i+1:2}")")"
@@ -747,10 +748,16 @@ saas_upload_file() {
 }
 
 # --- BucketFS helpers (exapump) ----------------------------------------------
-# Prints, space-separated, ONLY the --bfs-* overrides the caller actually supplied. This is the
-# single place that decides which BucketFS flags accompany every `exapump bucketfs` call; anything
-# not listed here is left to exapump's own resolution (profile field, then smart default:
-# bfs_host falls back to the profile's host, bfs_port to 2581, bfs_bucket to "default").
+# Prints, space-separated, the --bfs-* overrides passed to every `exapump bucketfs` call. Host,
+# port and write-password are passed only when the caller actually supplied them, leaving those
+# to exapump's own resolution (profile field, then smart default). The bucket is the one exception:
+# ARG_BFS_BUCKET is ALWAYS passed, using its fully-resolved value (explicit --bfs-bucket, or the
+# profile's bfs_bucket via resolve_bfs_bucket_from_profile, or the script's own "default" fallback)
+# -- never left to exapump's own bucket resolution. Without this, dsn/host connectivity mode (which
+# has no profile of its own) could still have exapump silently resolve the bucket from whatever
+# default profile happens to exist in ~/.exapump/config.toml, diverging from the "default" bucket
+# this script assumes when building TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT -- an upload that
+# succeeds against one bucket while the DDL points at another.
 #
 # The result is meant to be word-split by the caller, so no value may contain whitespace. That is
 # true of a host, a port and a bucket name by construction; a BucketFS write password containing a
@@ -759,7 +766,7 @@ exapump_bfs_flags() {
   local out=""
   if [[ -n "$ARG_BFS_HOST" ]]; then out="$out --bfs-host $ARG_BFS_HOST"; fi
   if [[ -n "$ARG_BFS_PORT" ]]; then out="$out --bfs-port $ARG_BFS_PORT"; fi
-  if [[ "$ARG_BFS_BUCKET_SET" -eq 1 ]]; then out="$out --bfs-bucket $ARG_BFS_BUCKET"; fi
+  out="$out --bfs-bucket $ARG_BFS_BUCKET"
   if [[ -n "$ARG_BFS_WRITE_PASSWORD" ]]; then out="$out --bfs-write-password $ARG_BFS_WRITE_PASSWORD"; fi
   printf '%s\n' "${out# }"
   return 0

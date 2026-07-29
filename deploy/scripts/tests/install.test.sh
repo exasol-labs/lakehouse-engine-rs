@@ -1192,12 +1192,14 @@ test_exapump_bfs_flags() {
   echo "== test_exapump_bfs_flags =="
   local flags
 
+  # The bucket is ALWAYS emitted, even at its "default" default -- never left to exapump's own
+  # bucket resolution, so a stray default profile in ~/.exapump/config.toml can't diverge from the
+  # bucket path this script assumes when building TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT.
   flags="$( source "$INSTALLER"; exapump_bfs_flags )"
-  assert_eq "bfs flags: nothing given -> nothing emitted (exapump resolves from the profile)" "" "$flags"
+  assert_eq "bfs flags: nothing given -> only the resolved default bucket is emitted" "--bfs-bucket default" "$flags"
 
-  # The default bucket is a DEFAULT, not something the user gave: it must not be echoed back.
   flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=default; ARG_BFS_BUCKET_SET=0; exapump_bfs_flags )"
-  assert_eq "bfs flags: an unsupplied --bfs-bucket default is not echoed back" "" "$flags"
+  assert_eq "bfs flags: an unsupplied --bfs-bucket default is still echoed back" "--bfs-bucket default" "$flags"
 
   flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; exapump_bfs_flags )"
   assert_eq "bfs flags: an explicit --bfs-bucket is echoed back" "--bfs-bucket other" "$flags"
@@ -1212,7 +1214,7 @@ test_exapump_bfs_flags() {
     "--bfs-host bfshost --bfs-port 2581 --bfs-bucket other --bfs-write-password BFSWRITEPW789" "$flags"
 
   flags="$( source "$INSTALLER"; ARG_BFS_HOST=bfshost; exapump_bfs_flags )"
-  assert_eq "bfs flags: only the supplied subset is emitted" "--bfs-host bfshost" "$flags"
+  assert_eq "bfs flags: the resolved bucket accompanies any other supplied subset" "--bfs-host bfshost --bfs-bucket default" "$flags"
 }
 
 test_resolve_bfs_bucket_from_profile() {
@@ -1313,7 +1315,7 @@ test_bucketfs_upload_argv_shape() {
   assert_eq "upload argv dsn: succeeds" "0" "$rc"
   log="$(log_content)"
   assert_contains "upload argv dsn: exact cp shape with the bfs overrides" "$log" \
-    "exapump bucketfs cp /tmp/local.so udf/liblakehouse_engine.so --bfs-host bfshost --bfs-write-password BFSWRITEPW789"
+    "exapump bucketfs cp /tmp/local.so udf/liblakehouse_engine.so --bfs-host bfshost --bfs-bucket default --bfs-write-password BFSWRITEPW789"
   assert_not_contains "upload argv dsn: no --profile flag (there is no profile in dsn mode)" "$log" "--profile"
   assert_not_contains "upload argv dsn: exapump bucketfs is never given a -d/--dsn (it has no such flag)" "$log" "bucketfs cp /tmp/local.so udf/liblakehouse_engine.so -d"
 }
