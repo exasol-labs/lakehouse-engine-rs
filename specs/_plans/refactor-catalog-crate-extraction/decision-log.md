@@ -1,0 +1,138 @@
+# Decision Log: refactor-catalog-crate-extraction
+
+## Interview
+
+Planned in **headless mode** (`/speq:plan-pr`). No live interview took place; the orchestrator supplied issue [#204](https://github.com/exasol-labs/lakehouse-engine-rs/issues/204) verbatim as the full intent, plus one explicit scoping instruction. The exchanges below record what was supplied and what was assumed in place of an answer.
+
+**Q:** What is the change?
+**A:** Issue #204, `refactor(catalog): extract catalog HTTP/session code into a dedicated crate`. `CatalogSession` is `pub(crate)`, so `resolve_file_list` cannot take it and plan `refactor-catalog-http-session` (#185) had to ship a public single-use wrapper over a `pub(crate)` core. Extract the catalog HTTP/session code into a dedicated crate (issue suggests `lakehouse-catalog`), make `CatalogSession` genuinely `pub`, let `resolve_file_list` take `&CatalogSession`, retire the wrapper. Additionally redraw the vended-credentials public boundary: expose the concept-level `resolve_vended_storage`, demote `extract_vended_keys` / `merge_vended_into_storage` to crate-private, migrate the probe assertions, and normalize the extractors to uniform `Option` semantics.
+
+**Q:** What is the open question the issue explicitly defers to `/speq:plan`?
+**A:** The shared-type boundary. The catalog code depends on `ConnectionCreds` (`adapter/connection.rs`) and `CatalogProps` / `StorageProps` (`scan/spec.rs`), and `scan/spec.rs` types are used engine-wide. The issue does not prescribe a layout; it requires the boundary decision be settled first. Answered by decision [1].
+
+**Q:** Issue #214 (the `resolve_vended_storage` consolidation this issue builds on) has NOT landed — `grep -rn "resolve_vended_storage" crates/` returns nothing, and `pushdown/mod.rs` still re-exports `extract_vended_keys` / `merge_vended_into_storage` directly. Does this plan (a) fold in #214's work as its own first step, (b) block on #214 as an unmet prerequisite, or (c) something else? Give it real weight.
+**A:** Assumed in headless mode, answered by decision [2]: **(c)**. Fold the consolidation in, but deliver it ONCE in its final shape rather than executing #214's deliberately-constrained intermediate form first. #214 closes as subsumed.
+
+**Q:** Anything else in scope?
+**A:** The orchestrator confirmed the four related specs to read before deciding (`pushdown-catalog-session`, `connection-credentials`, `rest-catalog-oauth-auth`, `adapter-module-structure` / `pushdown-module-structure`) and required an explicit statement of how the frozen public-surface baseline changes. Answered by decisions [7] and [8].
+
+## Design Decisions
+
+### [1] `lakehouse-catalog` owns the three credential/config types; no shared-types crate
+
+- **Decision:** Two crates, not three. `StorageProps`, `CatalogProps`, and `ConnectionCreds` are declared exactly once, in `lakehouse-catalog`, and re-exported from `lakehouse_engine::scan::spec` and `lakehouse_engine::adapter::connection` at their pre-move paths and visibilities. Every consuming file compiles with no `use`-path edit. The Exasol-facing parsers (`read_connection`, `validate_creds`, `parse_creds`, `storage_block`, `catalog_block`, `REQUIRED_KEY`) stay in the engine.
+- **Alternatives:**
+  - *A third `lakehouse-types` crate holding all three.* Rejected. It groups by technical role, which `/speq:design-philosophy` names as the wrong axis ("group modules by reason to change, not by technical role"), and it separates `ConnectionCreds` from every function that interprets it.
+  - *Leave the types in `lakehouse-engine`.* Impossible: `lakehouse-catalog` would need `lakehouse-engine`, a cycle.
+  - *Give `lakehouse-catalog` its own parallel `CatalogAuthConfig` / `S3Config` and convert at the boundary (Dependency Inversion).* Rejected. It duplicates ~10 of `ConnectionCreds`' 14 fields and the whole of `StorageProps`, needs conversions in both directions (`resolve_vended_storage` returns effective storage), and is the back-door duplication `/speq:design-philosophy` warns about — two modules independently encoding one S3 config shape, on a struct that must stay byte-stable on the UDF wire. It also forces every one of the 1,805 moved test lines to stop constructing `ConnectionCreds`, turning a verbatim move into a mechanical rewrite.
+- **Rationale:** The three types split cleanly on evidence, not taste. `CatalogProps` is mis-homed today: `vs-adapter/rest-catalog-oauth-auth` records that `ScanSpec` carries no catalog block, and no `scan/*.rs` module names it — moving it is a correction. `ConnectionCreds` appears in 11 files, all planning-layer, none in `scan/`. Only `StorageProps` has two genuine owners (28 files, and it crosses the UDF boundary inside `CommonScanSpec`), and the catalog is the side that PRODUCES it: a `loadTable` response vends the S3 keys, region, endpoint, and path-style. Placing the definition with the producer and re-exporting at the consumer's path keeps one definition, one serde contract, and zero conversion code. The cost is a naming smell — the S3 storage config lives in a crate named "catalog" — which the crate doc comment states outright, and which is smaller than any of the alternatives' costs.
+- **Promotes to ADR:** yes
+
+### [2] Issue #214 is absorbed and closed as subsumed, not executed first and not blocked on
+
+- **Decision:** This plan performs the `resolve_vended_storage` consolidation itself, once, directly in its final shape: concept-level, `pub` on `lakehouse-catalog`, with the seven mechanism functions crate-private and the extractors normalized to uniform `Option`. Issue #214 closes as subsumed. The plan does not block on it, and does not execute its intermediate form.
+- **Alternatives:**
+  - *(b) Block on #214 as an unmet prerequisite.* Rejected. #214's only stated purpose is to prepare #204. Blocking produces no work, and leaves this plan waiting on an issue whose deliverable this plan is about to redraw anyway.
+  - *(a) Execute #214 verbatim as task 1, then redraw.* Rejected. #214's defining constraint is "zero public-surface change", which exists ONLY because the pushdown façade is frozen. #204 unfreezes it in the same change. Executing #214 first therefore means deliberately building a `pub(super) fn resolve_vended_storage` inside `credentials.rs` whose only reason for that shape is a constraint this plan deletes, then moving and re-visibility-ing it. It also keeps `extract_vended_keys` and `merge_vended_into_storage` `pub` on the façade across one extra commit, so both smells the issue names persist a commit longer for no verification benefit.
+- **Rationale:** One consolidation, one review, one behavior-parity gate. The risk that folding in raises — a bigger single change — is answered by ORDERING rather than by splitting into two issues: the code moves VERBATIM first (task 3.2, parity gate = the existing suite unedited), and only then is the logic consolidated (task 4.1, parity gate = the six absence/precedence cases). That gives the same two falsifiable checkpoints #214-then-#204 would have given, without building a throwaway intermediate shape.
+- **Promotes to ADR:** yes
+
+### [3] The crate boundary is drawn at catalog access, not at Iceberg file planning
+
+- **Decision:** `resolve_file_list`, `plan_files_from_table`, `ensure_supported_delete_mechanisms`, `build_logical_schema`, `parse_name_mapping`, `empty_result_sql`, and `relativize_shards_to_root` STAY in `lakehouse-engine`. The crate takes catalog authentication, the session, the `loadTable` GET, namespace enumeration, SigV4 signing, vended-storage resolution, the credential types, and credential redaction.
+- **Alternatives:** *Move file resolution into the crate too, so `resolve_file_list` is a `lakehouse-catalog` function.* Rejected — it drags `FileEntry`, `LogicalField`, `NameMappingEntry`, `DeleteFileRef`, and the Arrow type-tag mapping across the boundary, which makes the catalog crate own the scan-spec wire format: a second responsibility and a far larger blast radius than the issue asks for.
+- **Rationale:** The issue's title is "extract catalog HTTP/session code". File planning consumes the catalog's output; it is not catalog access. Keeping it out is what lets the crate's manifest exclude `arrow`, `parquet`, `datafusion`, and `object_store` as direct dependencies, which is the machine-checkable form of the boundary.
+- **Promotes to ADR:** yes
+
+### [4] Credential redaction and SigV4 signing move with the credentials
+
+- **Decision:** `redact_credentials`, `redact_secret_values` (from `scan/emit.rs`), `redact_catalog_error` (from `pushdown/support.rs`), and `sign_request` (from `adapter/sigv4.rs`) move into `lakehouse-catalog`. The first two are re-exported from `lakehouse_engine::scan::emit` so their scan-layer callers are unedited. `redact_catalog_error`'s engine declaration is DELETED rather than kept as a pass-through, and `sign_request` becomes crate-private.
+- **Alternatives:**
+  - *Leave redaction in the engine and duplicate a small copy in the crate.* Rejected — duplicating a security-relevant pattern list is the worst possible instance of back-door duplication.
+  - *Pass a redaction closure into the catalog crate.* Rejected — a parameter for something every call site would supply identically.
+- **Rationale:** These functions redact exactly what this crate handles: S3 keys, STS tokens, bearer tokens, and SigV4 `Authorization` headers. Keeping them out would force either duplication or an injected callback. `redact_catalog_error`'s engine copy is a one-line body calling `redact_credentials` with the same argument — the pass-through red flag `vs-adapter/adapter-module-structure` already records — so it is deleted, not forwarded. `sign_request` reaches crate-private only because `list_namespace_tables` moves with it (decision [5]).
+- **Promotes to ADR:** no
+
+### [5] `list_namespace_tables` moves with the catalog code
+
+- **Decision:** Namespace enumeration moves into `lakehouse-catalog` and off the pushdown façade. `adapter/mod.rs` imports it from the crate.
+- **Alternatives:** *Leave it in `pushdown/namespace.rs`.* Rejected — it is catalog HTTP (its own SigV4-signed GETs plus a `RestCatalog` branch), and leaving it behind would force `build_rest_catalog`, `glue_catalog_prefix`, and `sign_request` to stay `pub` on the new crate purely to serve one engine-side caller.
+- **Rationale:** Moving one caller makes three items crate-private. That is a strictly narrower public surface for a mechanical relocation. It does NOT adopt `CatalogSession` — namespace enumeration keeps its own auth branch, which stays out of scope.
+- **Promotes to ADR:** no
+
+### [6] `resolve_table_schema` takes `&CatalogSession` and createVirtualSchema hoists one session
+
+- **Decision:** Both wrappers retire, not just one. `resolve_table_schema(&CatalogSession, …)` matches `resolve_file_list(&CatalogSession, …)`, and `adapter/mod.rs` builds one session before the table-enumeration loop instead of one per table.
+- **Alternatives:** *Retire only `resolve_file_list`'s wrapper and defer the createVirtualSchema loop to a follow-up issue.* Rejected — it leaves two sibling entry points on one crate with contradictory contracts (one takes a session, one builds N), which is the API inconsistency this plan exists to remove, and the fix is roughly ten lines at the seam the plan is already editing.
+- **Rationale:** The per-table session build was accepted in #185 ONLY because `resolve_table_schema` could not name a `pub(crate)` type in a public signature — the exact constraint #204 lifts. This is a behavior change (a createVirtualSchema speedup, and an OAuth failure surfacing before the loop rather than at the first table), so it is spec'd, not slipped in.
+- **Residual benefit, stated honestly:** the saving is N-1 grants out of N+1, not N-1 out of N. `adapter/mod.rs:246` calls `list_namespace_tables` before the schema loop, and on the non-SigV4 path that builds a `RestCatalog` whose `iceberg-catalog-rest` 0.10.0 client runs its own `client_credentials` exchange (`client.rs:123`) and its own `/v1/config` handshake (`catalog.rs:430`), independent of any `CatalogSession`. A createVirtualSchema request therefore goes from N+1 grants to 2, never to 1. That independent grant REMAINS, and folding namespace enumeration onto the session stays out of scope per `vs-adapter/pushdown-catalog-session`'s existing out-of-scope Background bullet. The decision still stands on its primary justification — one crate must not expose two sibling entry points with contradictory contracts — rather than on the throughput number.
+- **Promotes to ADR:** no
+
+### [7] The frozen façade is redrawn once and stays frozen; exactly three items leave
+
+- **Decision:** `extract_vended_keys` and `merge_vended_into_storage` leave (demoted to crate-private) and `list_namespace_tables` leaves (relocated). Nothing else changes: the in-crate probe goes 25 → 22 items, the external probe 15 → 12. `resolve_file_list` and `resolve_table_schema` keep their names and `pub` visibility while their first parameter changes. `resolve_vended_storage` is NOT added to the pushdown façade; it lives only on `lakehouse_catalog`'s own surface, guarded by that crate's own external-vantage probe.
+- **Alternatives:** *Re-export `resolve_vended_storage` and `CatalogSession` on the pushdown façade so the existing probe keeps naming a vended concept.* Rejected — it re-creates exactly the coupling the redraw removes: an engine-side probe asserting a catalog-crate concept through an alias.
+- **Rationale:** A signature change is not a surface change, so the two file-resolution entry points stay on the baseline. The three departures are the minimum the extraction forces. Freezing resumes immediately at the new baseline; a further change still needs its own delta.
+- **Promotes to ADR:** no
+
+### [8] The probe files become their own baseline; the archived `.txt` citation is retired
+
+- **Decision:** Both pushdown probes stop citing `specs/_plans/refactor-adapter-pushdown-modules/public-surface-baseline.txt` and state that their own `use` list IS the baseline.
+- **Alternatives:** *Write a fresh baseline `.txt` under this plan's directory.* Rejected — `/speq:record` would archive it into the gitignored `specs/_recorded/` tree exactly as it did the last one, reproducing the dangling reference on a two-plan cycle.
+- **Rationale:** The cited file does not exist: `/speq:record` archived it with plan `refactor-adapter-pushdown-modules`, and this project gitignores `specs/_recorded/`. A `use` list that fails the build is a stronger baseline than a text file nothing reads. `src/scan_surface_probe.rs` has the same dangling citation, to `specs/_plans/refactor-scan-modules/plan.md`; it belongs to a different feature and is left untouched by this plan.
+- **Promotes to ADR:** no
+
+### [9] The crate keeps `UdfError`, and is named `lakehouse-catalog`
+
+- **Decision:** `lakehouse-catalog` (directory `crates/lakehouse-catalog`, lib `lakehouse_catalog`, version `0.1.0`), erroring with `exasol_udf_sdk::error::UdfError`.
+- **Alternatives:** *A crate-local error enum plus `From` impls.* Rejected — it edits every `?` site in the moved code for no behavioral gain. *A different name reflecting that the crate also owns storage config and redaction.* Rejected — the issue names `lakehouse-catalog`, and `vs-expression` sets the precedent of a short domain name; the crate doc comment states the full responsibility instead.
+- **Rationale:** `vs-expression` already depends on `exasol-udf-sdk`, so an Exasol-adjacent error type is the house convention, and Iceberg REST makes credential vending a first-class catalog concern, so the name is defensible even though the crate owns more than HTTP.
+- **Promotes to ADR:** no
+
+### [10] Three specs need no delta
+
+- **Decision:** `vs-adapter/connection-credentials`, `vs-adapter/rest-catalog-oauth-auth`, and `vs-adapter/adapter-module-structure` are checked and left unedited.
+- **Alternatives:** *Add Background-only deltas noting the relocation.* Rejected — a delta with no scenario marker adds noise with no verification value, and these specs are the characterization gate precisely because they stay unedited.
+- **Rationale:** None of the three names a module path that the extraction invalidates. `connection-credentials` and `rest-catalog-oauth-auth` speak of "the adapter" throughout and describe behavior that is unchanged. `adapter-module-structure` constrains `nonempty_str` and the FIXED-mode resolver pair in `adapter/mod.rs` and `adapter/connection.rs`; both files survive, both scenarios hold, and neither mentions `adapter/sigv4.rs` or the `ConnectionCreds` declaration site.
+- **Promotes to ADR:** no
+
+### [11] Iceberg REST compliance is re-confirmed, not assumed
+
+- **Decision:** Quote the current normative text for `StorageCredential.prefix`, the `LoadTableResult` storage-credentials rule, and the enumerated AWS config keys into the affected specs, and record the two deliberate readings the consolidation preserves.
+- **Alternatives:** *Rely on the quotes already recorded in `specs/_decision/024-refactor-catalog-http-session.md`.* Rejected — CLAUDE.md requires checking the live spec, and #024's quotes cover the `/v1/config` and OAuth premise, not the vended-credential precedence this plan consolidates.
+- **Rationale:** Verified against `apache/iceberg` `open-api/rest-catalog-open-api.yaml` (main). Two readings are deliberate and PRESERVED rather than introduced: "check `storage-credentials` before `config`" is read per credential SET (a matched entry is authoritative for all six values, with no per-key fallback to the flat map), and `s3.endpoint` / `s3.path-style-access` are read under the schema's `additionalProperties: string` allowance because the spec's enumerated AWS list omits them. Neither is a deviation, and neither changes here.
+- **Promotes to ADR:** no
+
+## Review Findings
+
+<!-- Populated by plan-reviewer blockers and, after implementation, by code review. -->
+
+### [1] [plan-review] Makefile `VS_SRCS` never sees the new crate, so both E2E gates go vacuous
+
+- **Finding:** Feasibility `[HIDDEN_DEPENDENCY]`. plan.md asserted "No workflow edit is required". `Makefile:24` hardcodes `VS_SRCS` to `crates/lakehouse-engine/src crates/vs-expression/src` plus two manifests, `.cargo/config.toml`, and `Cargo.lock`. Verified: neither `crates/lakehouse-catalog/src/**`, nor `crates/lakehouse-catalog/Cargo.toml`, nor the root workspace `Cargo.toml` would be listed. Once task 1.1 lands (which does move `Cargo.lock`), every subsequent catalog-only edit leaves `$(VS_SO)` up to date and the container build is skipped, so `make test-e2e` and `make test-e2e-lakekeeper` — this plan's named parity gates for `resolve_vended_storage` — run a stale `.so` and pass without testing the change.
+- **Direction change:** Added task 1.2 (repair `VS_SRCS` before any catalog code moves, verified by touching a catalog source file and confirming a rebuild), sequenced it inside Group A ahead of everything else with an explicit dependency note. Rewrote the Requirements "CI" row to separate what needs no edit (`.github/workflows`) from what does (the `Makefile` staleness list). Added an AND-clause to `vs-adapter/catalog-crate-structure` Scenario 1 making the guard a normative part of the boundary, plus a Background bullet naming the failure mode as a silently vacuous gate rather than a build error.
+- **Promotes to ADR:** no
+
+### [2] [plan-review] The recorded façade scenario contradicts the redraw scenario after merge
+
+- **Finding:** Requirement Quality `[REQUIREMENT_CONFLICT]`. The recorded `vs-adapter/pushdown-module-structure` scenario "Public pushdown façade resolves at every pre-refactor path" (`spec.md:79`) requires the item set to "diff empty against the captured baseline" and every pre-refactor path to "still resolve to the same item". The new scenario removes three items. After `/speq:record` merges the delta, the feature file would hold two scenarios asserting contradictory things about one item set, with nothing saying which governs — and a Background bullet cannot override a normative clause. The same planner had applied the correct treatment to the two conflicting `pushdown-catalog-session` scenarios and missed it here.
+- **Direction change:** Reproduced the recorded scenario in the delta inside a `DELTA:CHANGED` block, re-anchoring only its two conflicting clauses on the post-redraw baselines (22-item in-crate probe, 12-item external probe) and naming the three released items; left the consumer-compile and probe clauses intact. Added the one-line "why this is amended" note beneath it, matching the two `DELTA:REMOVED` notes elsewhere in this plan, plus a Background bullet recording the amendment. Used `DELTA:CHANGED` rather than the finding's suggested `DELTA:AMENDED`: the validator accepts only `NEW`, `CHANGED`, and `REMOVED`, and `CHANGED` carries exactly the "existing scenario modified in place" semantics the Fix describes.
+- **Promotes to ADR:** no
+
+### [3] [plan-review] One moved test cannot satisfy both the MUST-NOT-name rule and the tests-move-verbatim rule
+
+- **Finding:** Requirement Quality `[REQUIREMENT_CONFLICT]`. `catalog-crate-structure` Scenario 1 forbids the crate from naming `ScanSpec`, `CommonScanSpec`, and `FileEntry`; Scenario 4 and task 3.2 require all 1,805 test lines to move verbatim with no test deleted or weakened. Verified: `credentials.rs:757` imports exactly those three types, and `credentials.rs:2094 catalog_auth_secrets_never_in_scan_spec_with_vending` builds a `ScanSpec` and asserts its serialized JSON carries no catalog-auth field. All three requirements cannot hold, and the test at risk is the only regression test for the no-catalog-secret-in-the-scan-spec guarantee.
+- **Direction change:** Audited the full 1,805 lines for engine-only types and confirmed this is the ONLY case — `LogicalField`, `NameMappingEntry`, `DeleteFileRef`, `ProjectionItem`, `build_scan_driving_sql`, `SCAN_UDF_NAME`, and `relativize_shards_to_root` appear in neither moved test module. Added an explicit single-case exception clause to Scenario 4 naming the test, requiring it to stay in `lakehouse-engine` with its name and assertions intact, plus a companion clause forbidding any other moved test from naming an engine-only type so the exception stays closed. Added the relocation instruction and the audit result to task 3.2, and a Background bullet explaining that the rule wins at the one place the two meet because the test asserts an engine property.
+- **Promotes to ADR:** no
+
+### [4] [plan-review] The one-grant-per-createVirtualSchema claim was false
+
+- **Finding:** Requirement Quality `[REQUIREMENT_CONFLICT]`. The scenario clause "the OAuth2 grant and the `/v1/config` lookup SHALL each run at most ONCE for the whole request" and the matching plan.md Impact sentence were both untrue, and contradicted the same spec file's own out-of-scope bullet. Verified in the vendored sources: `adapter/mod.rs:246` calls `list_namespace_tables` before the schema loop; the non-SigV4 path reaches `build_rest_catalog`, whose injected `credential` / `oauth2-server-uri` / `scope` props drive `iceberg-catalog-rest` 0.10.0's own `exchange_credential_for_token` (`client.rs:123`, `params.insert("grant_type", "client_credentials")`) and its own config handshake (`catalog.rs:430`). Post-change cost is two grants and two config lookups, not one of each. Because the plan enforces the claim "STRUCTURALLY, not counted", no test would ever have exposed it.
+- **Direction change:** Rewrote the scenario's second AND-clause to bind only the schema loop, and added a following clause stating that namespace enumeration retains its own independent handshake so a request still performs two grants in total. Corrected plan.md § Impact to "one grant for the schema loop instead of N, alongside the namespace-listing catalog's own unchanged grant", with the code citations. Scoped the Verification coverage note the same way. Also corrected decision-log [6], whose Rationale carried the same false number, and added the residual-benefit paragraph the `[SCOPE_CREEP]` advisory asked for — N-1 of N+1, not N-1 of N — noting the decision now rests on the API-consistency argument rather than the throughput number.
+- **Promotes to ADR:** no
+
+### [5] [plan-review] No task supplies the shared test fixtures the moved test modules need
+
+- **Finding:** Task Breakdown `[TRACEABILITY_GAP]`. `credentials.rs:755` and `namespace.rs:277` both open with `use super::super::test_support::*;`. Verified call counts: 15 in `credentials.rs` (9 `base_creds`, 6 `static_storage`) and 2 in `namespace.rs:375-376`. `crates/lakehouse-engine/src/adapter/pushdown/test_support.rs` cannot move — it opens with `use super::*` and names `ProjectionItem`, `ScanSpec`, `CommonScanSpec`, `FileEntry`, `DeleteFileRef`, `build_scan_driving_sql`, `SCAN_UDF_NAME`, `relativize_shards_to_root`, and `crate::adapter::sharding::partition_files_by_bytes`. Task 3.2's parity gate was therefore unreachable: the crate would not compile until 17 fixture calls resolved. Duplicating the fixtures per module is barred by the recorded "a test helper shared across submodules MUST live in one shared support module" rule.
+- **Direction change:** Inserted task 3.0 creating `crates/lakehouse-catalog/src/test_support.rs` with `base_creds` and `static_storage` copied verbatim from the engine's `test_support.rs:23` and `:44`, leaving the engine-side declarations in place for the engine tests that still use them. Placed 3.0 in Group C (it needs 2.1's types but not 2.2's redaction) and recorded that Groups D and E both depend on it. Added an AND-clause to `catalog-crate-structure` Scenario 4 requiring the crate to carry its own `#[cfg(test)]` support module for the two shared fixtures, with a Background bullet explaining why copying two fixtures is narrower than moving the module and still satisfies the one-support-module rule. Also confirmed `sigv4.rs`'s test module needs only `use super::*`, so task 3.1 carries no fixture dependency.
+- **Promotes to ADR:** no
