@@ -6,7 +6,7 @@ use vs_expression::{
     render_df_filter_exasol_safe, render_expression_exasol_safe, render_expression_safe,
 };
 
-use super::super::support::{project_columns, quote_ident};
+use super::super::support::{project_columns, quote_ident, walk_column_nodes};
 use super::planning::{DetectedJoin, involved_table_columns};
 
 /// Render a join's equi-condition node to a DataFusion SQL boolean expression via
@@ -129,26 +129,15 @@ pub(super) fn collect_column_tables(
     has_untagged: &mut bool,
     any_column: &mut bool,
 ) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                *any_column = true;
-                match map.get("tableName").and_then(|t| t.as_str()) {
-                    Some(tn) => {
-                        tables.insert(tn.to_ascii_uppercase());
-                    }
-                    None => *has_untagged = true,
-                }
+    walk_column_nodes(expr, &mut |map| {
+        *any_column = true;
+        match map.get("tableName").and_then(|t| t.as_str()) {
+            Some(tn) => {
+                tables.insert(tn.to_ascii_uppercase());
             }
-            for value in map.values() {
-                collect_column_tables(value, tables, has_untagged, any_column);
-            }
+            None => *has_untagged = true,
         }
-        Json::Array(items) => items
-            .iter()
-            .for_each(|item| collect_column_tables(item, tables, has_untagged, any_column)),
-        _ => {}
-    }
+    });
 }
 
 /// The single side a conjunct is local to — `Some(UPPERCASE table name)` iff every
@@ -247,26 +236,15 @@ fn collect_side_column_names(
     table_name: &str,
     out: &mut std::collections::HashSet<String>,
 ) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                let tn = map.get("tableName").and_then(|t| t.as_str());
-                let name = map.get("name").and_then(|n| n.as_str());
-                if let (Some(tn), Some(name)) = (tn, name)
-                    && tn.eq_ignore_ascii_case(table_name)
-                {
-                    out.insert(name.to_ascii_uppercase());
-                }
-            }
-            for value in map.values() {
-                collect_side_column_names(value, table_name, out);
-            }
+    walk_column_nodes(expr, &mut |map| {
+        let tn = map.get("tableName").and_then(|t| t.as_str());
+        let name = map.get("name").and_then(|n| n.as_str());
+        if let (Some(tn), Some(name)) = (tn, name)
+            && tn.eq_ignore_ascii_case(table_name)
+        {
+            out.insert(name.to_ascii_uppercase());
         }
-        Json::Array(items) => items
-            .iter()
-            .for_each(|item| collect_side_column_names(item, table_name, out)),
-        _ => {}
-    }
+    });
 }
 
 /// The subset of `full_cols` this side actually contributes to the outer two-scan
