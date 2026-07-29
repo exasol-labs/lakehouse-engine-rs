@@ -631,10 +631,7 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 ///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
 ///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
 ///   predicate natively (decision-log [3]).
-pub(super) fn like_subject_type_guard(
-    filter: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
+fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
     rewrite_expr_tree(
         filter,
         &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
@@ -734,8 +731,10 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 /// stringifier buried arbitrarily deep (inside a `CASE` branch, inside a logical
 /// connective, inside another `CONCAT`) is still found and rewritten.
 ///
-/// Wired into `project_columns`'s select-list handling and the WHERE-clause
-/// filter chain.
+/// Reached via [`apply_filter_type_rewrites`] (the WHERE-clause filter chain) and
+/// [`apply_select_item_type_rewrites`] (`project_columns`'s select-list handling) —
+/// those two pipeline functions are this pass's only PRODUCTION callers (the pass
+/// corpus in `mod tests` calls it directly).
 ///
 /// The closure passed to [`rewrite_expr_tree`] is statically always-`Some` — it has
 /// no decline path, only unconditional per-node-type rewrites — so `rewrite_expr_tree`
@@ -744,10 +743,7 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 /// `Option`-returning signature, not a real decline path; it deliberately falls back
 /// to a clone rather than panicking, so a change that somehow broke the invariant
 /// would degrade to a no-op rewrite instead of taking down query planning.
-pub(super) fn rewrite_decimal_stringifications(
-    node: &Json,
-    col_types: &[(String, String)],
-) -> Json {
+fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)]) -> Json {
     rewrite_expr_tree(node, &|out: &Json| {
         // With children already rewritten (by `rewrite_expr_tree`'s post-order
         // traversal), check whether THIS node is one of the three stringifier shapes
@@ -945,13 +941,11 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 ///   Exasol evaluates it natively, or the WHOLE select-list item falls back to the base
 ///   row. A `NotGoverned` node never declines, whatever its arguments' types.
 ///
-/// Runs BEFORE [`rewrite_decimal_stringifications`] at both wired surfaces: a coerced
-/// argument is no longer a bare column, so the decimal rewriter no-ops on it instead of
-/// double-wrapping.
-pub(super) fn string_function_arg_type_guard(
-    node: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
+/// Runs BEFORE [`rewrite_decimal_stringifications`] in both pipeline functions that
+/// chain the two — [`apply_filter_type_rewrites`] and [`apply_select_item_type_rewrites`]
+/// — which are the sole enforcers of that ordering: a coerced argument is no longer a
+/// bare column, so the decimal rewriter no-ops on it instead of double-wrapping.
+fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
     rewrite_expr_tree(node, &|out: &Json| {
         // With children already guarded (by `rewrite_expr_tree`'s post-order
         // traversal), dispatch THIS node's own string-position arguments. Only a
@@ -1024,6 +1018,66 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
         // into a wrong answer (same reasoning as `guard_like_subject`).
         _ => None,
     }
+}
+
+/// Run the ordered type-rewrite pass sequence over a WHERE-clause filter tree, before
+/// it is rendered for the DataFusion scan: [`like_subject_type_guard`] →
+/// [`string_function_arg_type_guard`] → [`rewrite_decimal_stringifications`].
+///
+/// - [`like_subject_type_guard`] (issue #207): may decline the whole filter, or
+///   rewrap a DATE subject.
+/// - [`string_function_arg_type_guard`] (issue #210): coerces string-position
+///   arguments, or declines.
+/// - [`rewrite_decimal_stringifications`] (issue #211): runs last, never declines.
+///
+/// The string-function guard MUST run BEFORE the decimal rewrite, not after: a
+/// coerced argument is no longer a bare column, so the decimal rewriter no-ops on it
+/// instead of double-wrapping it into two trim wrappers — see
+/// [`string_function_arg_type_guard`]'s doc for the full argument.
+///
+/// The three passes disagree on fallibility — the first two decline via `Option`,
+/// the decimal rewrite never declines — so this function is also the fallibility
+/// bridge: `?` propagates either guard's decline, and the infallible decimal pass's
+/// plain `Json` return is wrapped in `Some`, sparing every caller from re-deriving
+/// that bridge itself.
+///
+/// Returns:
+/// - `Some(tree)` — this (possibly rewritten) tree is safe to render.
+/// - `None` — a guard declined somewhere in the tree; the whole filter is dropped.
+pub(super) fn apply_filter_type_rewrites(
+    filter: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let filter = like_subject_type_guard(filter, col_types)?;
+    let filter = string_function_arg_type_guard(&filter, col_types)?;
+    Some(rewrite_decimal_stringifications(&filter, col_types))
+}
+
+/// Run the ordered type-rewrite pass sequence over one select-list item, before it is
+/// projected for the DataFusion scan: [`string_function_arg_type_guard`] →
+/// [`rewrite_decimal_stringifications`].
+///
+/// [`string_function_arg_type_guard`] guards the item's string-function arguments
+/// against a non-coercible column type (issue #210) FIRST; [`rewrite_decimal_stringifications`]
+/// then rewrites any directly-stringified bare DECIMAL column into a
+/// `decimal_to_varchar_exasol` node (issue #211). The guard must run first — see
+/// [`string_function_arg_type_guard`]'s doc for why the order is load-bearing — and the
+/// decimal rewrite is a no-op passthrough for anything it does not recognize, so it is
+/// safe to run unconditionally on every item that survives the guard.
+///
+/// Unlike [`apply_filter_type_rewrites`], this pipeline runs no LIKE-subject guard: a
+/// select-list item is not yet wired to [`like_subject_type_guard`]. This is a TRACKED
+/// GAP (issue #219), NOT an invariant that a select-list item can never be a LIKE
+/// subject — issue #219 documents `SELECT c_date LIKE '2024%' FROM …` hitting the same
+/// DataFusion coercion failure the filter-side guard exists to prevent, and a
+/// `function_scalar_case`-nested LIKE reaches it too.
+///
+/// Returns:
+/// - `Some(tree)` — this (possibly rewritten) item is safe to project.
+/// - `None` — the string-function guard declined; the caller must fall back.
+fn apply_select_item_type_rewrites(item: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let item = string_function_arg_type_guard(item, col_types)?;
+    Some(rewrite_decimal_stringifications(&item, col_types))
 }
 
 /// Extract the projected columns and their Exasol types from the pushdown request.
@@ -1138,31 +1192,18 @@ pub(super) fn project_columns(
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
                     .map(exasol_type_from_json);
-                // Guard every select-list item's string-function arguments against a
-                // non-coercible column type (issue #210) BEFORE the decimal-stringification
-                // rewrite below — guard first, decimal rewriter second, same as the
-                // WHERE-clause chain; see `string_function_arg_type_guard`'s doc for why the
-                // order is load-bearing. `project_columns` has THREE callers —
-                // `extract_projection` (single-table), `extract_join_projection`
-                // (`joins/rendering.rs`, whose `col_types` is the UNION of both joined
-                // tables' columns), and `joins/mod.rs`'s empty-side path — so this guard
-                // (and its ability to decline) reaches the broadcast-join SELECT list too,
-                // not just the single-table path. On `None` the item can't be safely pushed
-                // down at all; fall back to the full base row for the whole select list,
-                // like every other "untranslatable item" arm below.
-                let Some(e) = string_function_arg_type_guard(e, &all_cols) else {
+                // On `None` the item can't be
+                // safely pushed down at all; fall back to the full base row for the
+                // whole select list, like every other "untranslatable item" arm below.
+                // `project_columns` has THREE callers — `extract_projection`
+                // (single-table), `extract_join_projection` (`joins/rendering.rs`,
+                // whose `col_types` is the UNION of both joined tables' columns), and
+                // `joins/mod.rs`'s empty-side path — so this decline reaches the
+                // broadcast-join SELECT list too, not just the single-table path.
+                let Some(e) = apply_select_item_type_rewrites(e, &all_cols) else {
                     needs_full_fallback = true;
                     continue;
                 };
-                // Rewrite directly-stringified bare-DECIMAL columns into
-                // `decimal_to_varchar_exasol` so the rendered SQL reproduces Exasol's
-                // trimmed DECIMAL→string form (issue #211). The rewriter is a no-op
-                // passthrough for anything it does not recognize (bare columns, literals,
-                // other node types), so it is safe and correct to run unconditionally on
-                // every item before the dispatch below. Shadowing `e` with the owned
-                // rewritten node, then re-borrowing, keeps the rest of the loop body
-                // unchanged.
-                let e = rewrite_decimal_stringifications(&e, &all_cols);
                 let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
@@ -4164,6 +4205,35 @@ mod tests {
         assert_eq!(
             result, None,
             "DECIMAL subject must decline the whole filter"
+        );
+    }
+
+    /// Scenario: a `predicate_like` over a DECIMAL-typed column pins the two pipelines'
+    /// pass-list difference. `apply_filter_type_rewrites` runs `like_subject_type_guard`
+    /// and declines (`None`), matching `like_guard_decimal_subject_declines` above.
+    /// `apply_select_item_type_rewrites` runs no LIKE-subject guard at all — a TRACKED
+    /// GAP (issue #219), NOT desired behavior — so it returns `Some` with the node
+    /// unchanged. Closing #219 is expected to flip the `Some` half of this assertion to
+    /// `None`; until then this test fails if the two pass lists are ever silently
+    /// unified.
+    #[test]
+    fn select_list_pipeline_omits_like_pass_pending_219() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "amount"},
+            "pattern": {"type": "literal_string", "value": "9%"}
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        assert_eq!(
+            apply_filter_type_rewrites(&filter, &col_types),
+            None,
+            "filter pipeline's LIKE-subject guard must decline a DECIMAL subject"
+        );
+        assert_eq!(
+            apply_select_item_type_rewrites(&filter, &col_types),
+            Some(filter.clone()),
+            "select-list pipeline runs no LIKE-subject guard (#219 tracked gap): the node must pass through unchanged"
         );
     }
 
