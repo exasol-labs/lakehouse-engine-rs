@@ -21,7 +21,7 @@ use vs_expression::render_df_filter_safe;
 
 mod support;
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, apply_filter_type_rewrites,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, apply_type_rewrites,
     extract_all_column_types, extract_limit, extract_projection, order_by_present,
     strip_table_alias,
 };
@@ -190,7 +190,7 @@ pub async fn handle_pushdown(
     // `resolve_file_list` Iceberg-level pruning call below, which must see the
     // original, un-rewritten predicate tree.
     let filter = filter_json_raw
-        .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+        .and_then(|f| apply_type_rewrites(f, &col_types))
         .and_then(|f| render_df_filter_safe(&f));
 
     let limit = extract_limit(&pushdown_req);
@@ -852,7 +852,7 @@ mod tests {
     /// no-op — a composition `string_function_arg_type_guard`'s own unit tests cannot
     /// observe, since `rewrite_decimal_stringifications` is only chained after it here.
     /// Calls the same pipeline function `handle_pushdown` calls
-    /// (`apply_filter_type_rewrites`, then `render_df_filter_safe`) on the
+    /// (`apply_type_rewrites`, then `render_df_filter_safe`) on the
     /// DataFusion-bound filter tree.
     #[test]
     fn where_filter_decimal_stringification_rewritten_to_trim() {
@@ -868,7 +868,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f))
             .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
@@ -888,7 +888,7 @@ mod tests {
     /// Exhaustive coverage: a DECIMAL column in a NON-stringifying WHERE
     /// filter context (`c_decimal_a > 5`, a `predicate_greater` — not a stringifier)
     /// renders EXACTLY as before this fix through the same pipeline function
-    /// (`apply_filter_type_rewrites`) as
+    /// (`apply_type_rewrites`) as
     /// `where_filter_decimal_stringification_rewritten_to_trim` — the DECIMAL column
     /// stays a bare, unwrapped column reference, proving the WHERE-path wiring doesn't
     /// over-wrap a non-stringifying context. `predicate_greater` is not a
@@ -904,7 +904,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f))
             .expect("c_decimal_a > 5 must render to a DataFusion filter");
 
@@ -938,7 +938,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f))
             .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
@@ -969,7 +969,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f));
 
         assert!(
@@ -999,7 +999,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f))
             .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
@@ -1040,7 +1040,7 @@ mod tests {
         });
 
         let rendered = Some(&filter_json)
-            .and_then(|f| apply_filter_type_rewrites(f, &col_types))
+            .and_then(|f| apply_type_rewrites(f, &col_types))
             .and_then(|f| render_df_filter_safe(&f));
 
         assert!(

@@ -576,6 +576,87 @@ mod tests {
         );
     }
 
+    /// `like_subject_type_guard` (issue #219) reaches through the join-shared
+    /// `project_columns`, exercised across two calls into `extract_join_projection`
+    /// on the same detected join — the select-list analog of
+    /// [`join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity`]:
+    ///
+    /// (a) `C_NAME LIKE 'A%'` (CUSTOMER's VARCHAR(100) column) still projects as a
+    ///     single `ProjectionItem::Expr`, proving the guard's pass-through for a
+    ///     string subject reaches the broadcast-join SELECT list.
+    /// (b) `C_CUSTKEY LIKE '1%'` (CUSTOMER's DECIMAL column) declines and falls back
+    ///     to the FULL projection over the UNION of BOTH joined tables' columns —
+    ///     the reach this plan wires by adding `like_subject_type_guard` as the
+    ///     first pass of `apply_type_rewrites`.
+    #[test]
+    fn join_projection_like_guard_reaches_join_select_list() {
+        let request = join_request(Json::Null, equi_condition());
+        let detected = detected_join(&request);
+
+        let mut string_request = request.clone();
+        string_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                "pattern": {"type": "literal_string", "value": "A%"}
+            }
+        ]);
+        let (projection, _types, widened) =
+            extract_join_projection(&string_request, &pd(&string_request), &detected)
+                .expect("projectable");
+        assert!(
+            !widened,
+            "a VARCHAR subject must keep the broadcast projection, not widen to the \
+             full row: {projection:?}"
+        );
+        assert_eq!(
+            projection.len(),
+            1,
+            "C_NAME LIKE 'A%' must project a single expression, not the full two-table \
+             row: {projection:?}"
+        );
+        let ProjectionItem::Expr { expr } = &projection[0] else {
+            panic!("must be a rendered expression, not a bare column: {projection:?}");
+        };
+        assert!(
+            expr.contains("C_NAME") && expr.contains("LIKE"),
+            "the VARCHAR subject must render as a LIKE expression over C_NAME: {expr}"
+        );
+
+        let mut decline_request = request.clone();
+        decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                "pattern": {"type": "literal_string", "value": "1%"}
+            }
+        ]);
+        let (projection, _types, widened) =
+            extract_join_projection(&decline_request, &pd(&decline_request), &detected)
+                .expect("projectable");
+        assert!(
+            widened,
+            "the widening flag is what declines the broadcast join to the N-scan \
+             fallback (joins/sql_builders.rs:85); a DECIMAL-subject LIKE must set it: \
+             {projection:?}"
+        );
+        let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
+            + involved_table_columns(&decline_request, "ORDERS").len();
+        assert_eq!(
+            projection.len(),
+            expected_full_row_len,
+            "a DECIMAL-subject LIKE must fall back to the full projection over BOTH \
+             joined tables' columns, not an unguarded LIKE: {projection:?}"
+        );
+        assert!(
+            projection
+                .iter()
+                .all(|item| matches!(item, ProjectionItem::Column(_))),
+            "the fallback projection must be bare columns, not a same-length vector \
+             of rendered Expr items: {projection:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Per-side pruning: side-local conjunct attribution, projection narrowing,
     // and per-side filter pushdown in the fallback path.
