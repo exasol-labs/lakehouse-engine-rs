@@ -168,6 +168,20 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
+# Pure-bash unit tests for deploy/scripts/install.sh. Stubs exapump and curl on
+# a temp PATH — no live Exasol, no network. CI's install-script job runs this;
+# install-script-e2e (docker-based, real Exasol) is separate and lives only in
+# ci.yml, since it needs a live compose stack this target does not bring up.
+test-install:
+	bash deploy/scripts/tests/install.test.sh
+
+# Optional: gated on shellcheck being present locally so it's not a hard
+# prereq for `make`. CI's install-script job runs shellcheck unconditionally.
+lint-install:
+	@command -v shellcheck >/dev/null 2>&1 \
+	  && shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh \
+	  || echo "shellcheck not installed locally — skipping (CI enforces it)"
+
 # Manually-invoked live benchmark: docker (self-contained local stack) or remote
 # (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
 # working-tree .so, then runs bench/run.sh, which reads config from a gitignored
@@ -175,4 +189,4 @@ lint:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench test-install lint-install
