@@ -4,10 +4,14 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 
 ## Background
 
-The `crates/vs-expression` crate exposes three public entry points:
+The `crates/vs-expression` crate exposes six public entry points in two dialect trios. The DataFusion trio feeds DataFusion's SQL frontend inside the scan UDF:
 - `render_expression` — raising mode, returns `Err` for unsupported nodes
 - `render_expression_safe` — returns `None` for unsupported nodes, never panics
 - `render_df_filter_safe` — same as `render_expression_safe` but also returns `None` for trivially-true results (e.g. `TRUE`, `NULL`) so the adapter can omit no-op filters from the scan spec
+
+The Exasol trio — `render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe` — carries the same three contracts for fragments Exasol's own core engine parses.
+
+The arithmetic operator nodes and every decline in this feature behave identically in both dialects: `+`, `-`, `*`, `/`, and unary `-` are the same syntax in both parsers, and a declined function is declined in both because the adapter advertises one capability set for both dialects.
 
 A conversion or operator node is translated only when its DataFusion 54 result matches Exasol. Exasol `DIV` returns the integer quotient by truncating toward zero — verified live: `DIV(-7,2) = -3` and `DIV(15.7,6.2) = 2` — and raises a division-by-zero error (SQL state 22012). DataFusion 54 has no `div` builtin; its `/` truncates only integer operands and divides non-integer operands fractionally, and float division by zero yields infinity instead of an error. No single rendering reproduces `DIV` across every operand type, so `DIV` stays unsupported. DataFusion 54 `to_char` uses strftime masks rather than Exasol's Oracle-style format models and rejects numeric formatting, and DataFusion 54 has no `to_number`. These three functions are therefore left unsupported and fall back to Exasol. The bitwise operator functions (`BIT_AND`, `BIT_OR`, `BIT_XOR`, `BIT_NOT`, `BIT_LSHIFT`, `BIT_RSHIFT`, `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, `BIT_TO_NUM`) are likewise unsupported: Exasol defines them over an unsigned 64-bit integer domain that DataFusion's signed-integer operators and the `Int64` → `DECIMAL(20,0)` mapping do not reproduce, and six of the eleven have no DataFusion builtin at all (issue #108).
 
@@ -19,8 +23,8 @@ The `crates/vs-expression` crate stays a pure, stateless, sibling-shared JSON-to
 
 * *GIVEN* a VS expression node of type `function_scalar` whose `name` is the Exasol scalar-function name for a binary arithmetic operator — addition, subtraction, multiplication, or floating-point division — or for unary negation
 * *AND* the exact `name` strings Exasol emits for these operators have been verified against live `EXPLAIN VIRTUAL` output for an arithmetic pushdown (so the translator matches what Exasol actually sends, e.g. `MULT` for `*`, not an assumed `MUL`)
-* *WHEN* `render_expression` processes the node
-* *THEN* the binary arithmetic nodes SHALL return `(<left> <op> <right>)` where the operators are `+`, `-`, `*`, `/` respectively, for operands that are themselves any renderable expression (including two bare column references, e.g. `(L_EXTENDEDPRICE * L_DISCOUNT)`)
+* *WHEN* `render_expression` or `render_expression_exasol` processes the node
+* *THEN* the binary arithmetic nodes SHALL return `(<left> <op> <right>)` where the operators are `+`, `-`, `*`, `/` respectively, for operands that are themselves any renderable expression (including two bare column references, e.g. `(L_EXTENDEDPRICE * L_DISCOUNT)`), byte-identically in BOTH dialects — the operator syntax is shared by both parsers, and these five wire names are NOT Exasol function names (Exasol has no function called `ADD`), so the Exasol dialect's verbatim rule for named functions MUST NOT be applied to them
 * *AND* unary negation SHALL return `(-<operand>)` and SHALL compose inside an aggregate argument (e.g. `SUM(-<operand>)`) so it flows through the arithmetic-aggregate decomposition path
 * *AND* the set of arithmetic `name` strings the translator matches SHALL correspond exactly to the arithmetic operator capabilities the adapter advertises (`vs-adapter/pushdown-planning-capability-extensions`) — `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, and `FN_NEG` — so no advertised operator is left unrenderable and no rendered operator is left unadvertised
 * *AND* Exasol integer division (`DIV`) SHALL NOT be matched here and `FN_DIV` SHALL NOT be advertised
@@ -44,6 +48,7 @@ The `crates/vs-expression` crate stays a pure, stateless, sibling-shared JSON-to
 * *GIVEN* a call to `render_df_filter_safe` with an expression that renders to `TRUE` or `NULL`
 * *WHEN* the safe entry-point evaluates the result
 * *THEN* it SHALL return `None` so the adapter omits the redundant filter from the scan spec
+* *AND* `render_df_filter_exasol_safe` SHALL suppress the same two trivially-true results, so the outer WHERE residual of the N-scan join wrapper omits a no-op conjunct on the Exasol path too
 
 ### Scenario: Integer division DIV is deliberately not translated
 

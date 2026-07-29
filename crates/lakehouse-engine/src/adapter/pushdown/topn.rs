@@ -947,9 +947,19 @@ mod tests {
     /// A declined `ORDER BY` on an EXPRESSION renders that expression in the Exasol
     /// dialect on the outer wrapper and emits the base columns it references as
     /// HIDDEN scan columns — the expression-key twin of the bare-column case above
-    /// (issue #198). The referenced column is absent from the select list, so it is
-    /// APPENDED to the scan's emitted set and dropped again by the wrapper's explicit
-    /// visible select list, keeping the returned arity at the derived projection's 1.
+    /// (issue #198).
+    ///
+    /// The rendered name is Exasol's own `ABS`, not DataFusion's `abs`: this wrapper
+    /// is parsed by Exasol's core engine, so the Exasol dialect reproduces the call
+    /// Exasol sent (issue #209).
+    ///
+    /// `("L_EXTENDEDPRICE" + "L_ORDERKEY")` renders identically in both dialects,
+    /// because `ADD` is an operator wire name the gate's `<NAME>(<args>)` rule
+    /// cannot derive — not because the two dialects disagree on its shape.
+    ///
+    /// The referenced column is absent from the select list, so it is APPENDED to
+    /// the scan's emitted set and dropped again by the wrapper's explicit visible
+    /// select list, keeping the returned arity at the derived projection's 1.
     #[test]
     fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
         let request = lineitem_order_by_request(
@@ -964,7 +974,7 @@ mod tests {
         let sql = plan_scan_sql(&request, files, 2);
 
         assert!(
-            sql.contains(r#"ORDER BY abs("L_EXTENDEDPRICE") DESC NULLS LAST LIMIT 20"#),
+            sql.contains(r#"ORDER BY ABS("L_EXTENDEDPRICE") DESC NULLS LAST LIMIT 20"#),
             "the expression sort key must be rendered on the outer wrapper: {sql}"
         );
         assert_eq!(
@@ -1014,7 +1024,7 @@ mod tests {
 
         assert!(
             sql.contains(
-                r#"ORDER BY abs("L_EXTENDEDPRICE") DESC NULLS LAST, ("L_EXTENDEDPRICE" + "L_ORDERKEY") ASC NULLS FIRST"#
+                r#"ORDER BY ABS("L_EXTENDEDPRICE") DESC NULLS LAST, ("L_EXTENDEDPRICE" + "L_ORDERKEY") ASC NULLS FIRST"#
             ),
             "both expression sort keys must render, in clause order: {sql}"
         );
@@ -1068,7 +1078,7 @@ mod tests {
         let sql = plan_scan_sql(&request, files, 1);
 
         assert!(
-            sql.contains(r#"ORDER BY abs("L_EXTENDEDPRICE") DESC NULLS LAST LIMIT 20"#),
+            sql.contains(r#"ORDER BY ABS("L_EXTENDEDPRICE") DESC NULLS LAST LIMIT 20"#),
             "the declined wrapper must render the ordering and the outer LIMIT: {sql}"
         );
         assert_eq!(

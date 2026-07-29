@@ -39,6 +39,17 @@ gap — but it must still be named as a deliberate trade-off in the spec, not le
 - Use `exapump` for all Exasol/BucketFS interaction.
 - DSNs must include `validateservercertificate=0` (self-signed Docker cert).
 
+## Verification discipline
+
+- A reported bug MUST be reproduced locally against the Docker Exasol container before it is
+  fixed. Do not trust an issue's claimed repro, a capability list, or code inspection alone —
+  run the query.
+- A claimed SQL capability gap or limitation MUST be verified against a live Exasol system
+  (`EXPLAIN VIRTUAL`, an actual pushed query, or an E2E test), not assumed from documentation,
+  memory, or a capability registry (`capabilities.rs`) alone.
+- No assumptions about SQL capabilities, syntax, or pushdown reachability without checking them
+  against a running Exasol instance.
+
 ## Bench harness gotchas
 
 - **A stray `bench/.env` silently redirects `make bench`/`bench/run.sh` at a remote target.**
