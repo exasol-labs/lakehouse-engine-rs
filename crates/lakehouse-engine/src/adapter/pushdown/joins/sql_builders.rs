@@ -4,7 +4,7 @@ use crate::scan::spec::{
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::render_df_filter_safe;
+use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 use super::super::file_resolution::relativize_shards_to_root;
 use super::super::support::{
@@ -16,10 +16,9 @@ use super::planning::{
     DetectedJoin, JoinSides, ResolvedJoinSide, disjoint_schema_guard, involved_table_columns,
 };
 use super::rendering::{
-    collect_column_tables, cross_side_residual_filter, extract_join_projection,
-    projection_item_select_sql, referenced_side_columns, render_df_filter_qualified,
-    render_expression_qualified, render_join_condition, render_selectlist_item_qualified,
-    side_local_filter,
+    column_tables, cross_side_residual_filter, extract_join_projection, projection_item_select_sql,
+    referenced_clause_values, referenced_side_columns, render_df_filter_qualified,
+    render_expression_qualified, side_local_filter,
 };
 
 /// The translator-reuse artifacts for a broadcast inner equi-join, rendered once
@@ -66,7 +65,9 @@ pub(crate) fn render_broadcast_join(
         return Ok(None);
     }
 
-    let condition = match render_join_condition(&join.conditions[0]) {
+    // Uses `render_expression_safe`, not the filter renderer, so a boolean is
+    // returned verbatim rather than suppressed as trivially true.
+    let condition = match render_expression_safe(&join.conditions[0]) {
         Some(condition) => condition,
         None => return Ok(None),
     };
@@ -119,7 +120,7 @@ fn build_n_scan_alias_map(
 /// Each condition GREEDILY attaches to the earliest join point where every table it
 /// touches is in scope — the join point that brings its highest-indexed leg in.
 /// Scope is resolved by the SET of `tableName`s the raw condition references
-/// (via [`collect_column_tables`]), NEVER by column name, so two legs sharing a
+/// (via [`column_tables`]), NEVER by column name, so two legs sharing a
 /// column name can never fool the attachment. A join point with no attached
 /// condition renders `ON 1=1`.
 fn build_n_scan_join_from(
@@ -139,26 +140,22 @@ fn build_n_scan_join_from(
     let mut on_at: Vec<Vec<String>> = vec![Vec::new(); aliases.len()];
     let mut residual: Vec<String> = Vec::new();
     for (raw, rendered) in raw_conditions.iter().zip(conditions) {
-        let mut tables = std::collections::HashSet::new();
-        let mut has_untagged = false;
-        let mut any_column = false;
-        collect_column_tables(raw, &mut tables, &mut has_untagged, &mut any_column);
+        let (tables, has_untagged, any_column) = column_tables(raw);
         let resolvable =
             any_column && !has_untagged && tables.iter().all(|t| leg_index.contains_key(t));
-        match resolvable
-            .then(|| tables.iter().map(|t| leg_index[t]).max())
-            .flatten()
+        // The earliest join point in scope is the one bringing the
+        // highest-indexed leg in; clamp to a real join point (≥ 1, ≤ last).
+        // Guard `last_join_point >= 1` (i.e. at least one join exists) first:
+        // with a single leg there is no join point to attach to (and
+        // `clamp(1, 0)` would panic since min > max), so fall through to
+        // residual; behavior for N≥2 is unchanged.
+        if resolvable
+            && last_join_point >= 1
+            && let Some(m) = tables.iter().map(|t| leg_index[t]).max()
         {
-            // The earliest join point in scope is the one bringing the
-            // highest-indexed leg in; clamp to a real join point (≥ 1, ≤ last).
-            // Guard `last_join_point >= 1` (i.e. at least one join exists) first:
-            // with a single leg there is no join point to attach to (and
-            // `clamp(1, 0)` would panic since min > max), so fall through to
-            // residual; behavior for N≥2 is unchanged.
-            Some(m) if last_join_point >= 1 => {
-                on_at[m.clamp(1, last_join_point)].push(rendered.clone())
-            }
-            _ => residual.push(rendered.clone()),
+            on_at[m.clamp(1, last_join_point)].push(rendered.clone());
+        } else {
+            residual.push(rendered.clone());
         }
     }
 
@@ -199,6 +196,41 @@ fn n_full_row_qualified_items(
         .collect()
 }
 
+/// Shard one join side's files into G byte-balanced work units and root-relativize
+/// them for [`build_scan_driving_sql`]: `shard_count` → `partition_files_by_bytes` →
+/// `relativize_shards_to_root`. The shared prefix of [`build_side_fan_out_sql`]
+/// (over its own side) and [`build_broadcast_join_sql`] (over the fact side).
+///
+/// Takes `&ResolvedJoinSide` rather than separate `files`/`table_root` arguments:
+/// both call sites already hold one, so the tighter signature cannot be called
+/// with a mismatched files/root pair.
+fn shard_side(side: &ResolvedJoinSide, tuning: &JoinScanTuning) -> Vec<Vec<FileEntry>> {
+    let g = shard_count(
+        tuning.cluster_nodes,
+        tuning.parallelism_factor,
+        side.files.len(),
+    );
+    let shards = crate::adapter::sharding::partition_files_by_bytes(side.files.clone(), g);
+    relativize_shards_to_root(shards, &side.table_root)
+}
+
+/// The shared `User` decline template for the six qualified N-scan render sites —
+/// a select-list item, an involved table's missing column metadata, a join
+/// condition, a GROUP BY key, HAVING, or an ORDER BY key that cannot be rendered.
+/// Each caller passes only its own clause fragment; the surrounding sentence (hard
+/// error, no native re-plan) is the one decision this constructor owns.
+///
+/// Not merged with [`super::ineligible_join_decline`]: that one covers a single,
+/// separate case — a join `from` shape the adapter cannot render into ANY SQL at
+/// all (wrong join type or malformed tree) — and its message inserts an extra
+/// clause (`the adapter cannot render this join shape, `) before the shared tail,
+/// so it is a different sentence, not a seventh instance of this one.
+fn join_render_decline(clause: &str) -> UdfError {
+    UdfError::User(format!(
+        "join pushdown declined: {clause}; this is a hard error, not a native re-plan"
+    ))
+}
+
 /// The N-scan wrapper's outer SELECT list, table-qualified. An absent/empty select
 /// list projects every column of all involved tables in side order. An item that
 /// cannot be rendered is a last-resort hard error (no native re-plan).
@@ -212,11 +244,9 @@ fn n_scan_join_select_items(
         Some(Json::Array(list)) if !list.is_empty() => {
             let mut items = Vec::with_capacity(list.len());
             for item in list {
-                let sql = render_selectlist_item_qualified(item, alias_of).ok_or_else(|| {
-                    UdfError::User(
-                        "join pushdown declined: a select-list item could not be rendered for the \
-                         qualified N-scan join; this is a hard error, not a native re-plan"
-                            .into(),
+                let sql = render_expression_qualified(item, alias_of).ok_or_else(|| {
+                    join_render_decline(
+                        "a select-list item could not be rendered for the qualified N-scan join",
                     )
                 })?;
                 items.push(ProjectionItem::Expr { expr: sql });
@@ -334,11 +364,9 @@ pub(super) fn build_n_scan_join_sql(
         .map(|s| involved_table_columns(request, &s.table_name))
         .collect();
     if cols_per_side.iter().any(|c| c.is_empty()) {
-        return Err(UdfError::User(
-            "join pushdown declined: an involved table carries no column metadata, so the \
-             unaccelerated N-scan fallback cannot be built; this is a hard error, not a \
-             native re-plan"
-                .into(),
+        return Err(join_render_decline(
+            "an involved table carries no column metadata, so the unaccelerated N-scan \
+             fallback cannot be built",
         ));
     }
 
@@ -351,10 +379,8 @@ pub(super) fn build_n_scan_join_sql(
     let mut conditions = Vec::with_capacity(join.conditions.len());
     for cond in &join.conditions {
         let rendered = render_expression_qualified(cond, &alias_of).ok_or_else(|| {
-            UdfError::User(
-                "join pushdown declined: a join condition could not be rendered against the \
-                 qualified N-scan schema; this is a hard error, not a native re-plan"
-                    .into(),
+            join_render_decline(
+                "a join condition could not be rendered against the qualified N-scan schema",
             )
         })?;
         conditions.push(rendered);
@@ -514,13 +540,7 @@ pub(super) fn build_side_fan_out_sql(
         .collect();
     let proj_types: Vec<String> = columns.iter().map(|(_, ty)| ty.clone()).collect();
 
-    let g = shard_count(
-        tuning.cluster_nodes,
-        tuning.parallelism_factor,
-        side.files.len(),
-    );
-    let shards = crate::adapter::sharding::partition_files_by_bytes(side.files.clone(), g);
-    let shards = relativize_shards_to_root(shards, &side.table_root);
+    let shards = shard_side(side, tuning);
 
     // Render BARE (strip Exasol's `tableAlias`): the fan-out is a single-table
     // scan whose relation exposes bare uppercase column names, so an
@@ -576,13 +596,7 @@ pub(super) fn build_broadcast_join_sql(
     let fact = &sides.fact;
     let dimension = &sides.dimension;
 
-    let g = shard_count(
-        tuning.cluster_nodes,
-        tuning.parallelism_factor,
-        fact.files.len(),
-    );
-    let shards = crate::adapter::sharding::partition_files_by_bytes(fact.files.clone(), g);
-    let shards = relativize_shards_to_root(shards, &fact.table_root);
+    let shards = shard_side(fact, tuning);
 
     let join = JoinSpec {
         table_root: dimension.table_root.clone(),
@@ -634,10 +648,8 @@ fn qualified_join_group_by(
     let mut parts = Vec::with_capacity(keys.len());
     for key in keys {
         parts.push(render_expression_qualified(key, alias_of).ok_or_else(|| {
-            UdfError::User(
-                "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
-                 N-scan join; this is a hard error, not a native re-plan"
-                    .into(),
+            join_render_decline(
+                "a GROUP BY key could not be rendered for the qualified N-scan join",
             )
         })?);
     }
@@ -654,11 +666,7 @@ fn qualified_join_having(
     match pushdown_req.get("having").filter(|h| !h.is_null()) {
         Some(having) => Ok(Some(
             render_expression_qualified(having, alias_of).ok_or_else(|| {
-                UdfError::User(
-                    "join pushdown declined: HAVING could not be rendered for the qualified \
-                     N-scan join; this is a hard error, not a native re-plan"
-                        .into(),
-                )
+                join_render_decline("HAVING could not be rendered for the qualified N-scan join")
             })?,
         )),
         None => Ok(None),
@@ -685,11 +693,7 @@ fn qualified_join_order_by(
         None => return Ok(None),
     };
     let decline = || {
-        UdfError::User(
-            "join pushdown declined: an ORDER BY key could not be rendered for the qualified \
-             N-scan join; this is a hard error, not a native re-plan"
-                .into(),
-        )
+        join_render_decline("an ORDER BY key could not be rendered for the qualified N-scan join")
     };
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
@@ -706,32 +710,20 @@ fn qualified_join_order_by(
 /// inner-scan projection for BOTH decline wrappers (grouped and single-group Case
 /// 2/3), replacing the old whole-table `full_row_projection` (issue #160).
 ///
-/// Walks the FULL expression tree of every clause the wrapper renders — the SELECT
-/// list, WHERE filter, GROUP BY keys, HAVING, and ORDER BY — via
-/// [`collect_all_column_names`], so every column the rendered SQL names is projected
-/// and none is missing at runtime. Column order and Exasol types are preserved from
-/// `all_cols`. Always returns at least one column (an empty EMITS clause is invalid
-/// in Exasol): when the request references no source column it falls back to the
-/// first column of `all_cols`.
+/// Walks the FULL expression tree of every clause the wrapper renders — the clause set
+/// [`referenced_clause_values`] owns — collecting through [`collect_all_column_names`]'
+/// Unicode fold, so every column the rendered SQL names is projected and none is
+/// missing at runtime. Column order and Exasol types are preserved from `all_cols`.
+/// Always returns at least one column (an empty EMITS clause is invalid in Exasol):
+/// when the request references no source column it falls back to the first column of
+/// `all_cols`, unlike [`referenced_side_columns`], whose empty-narrowing fallback is
+/// its whole column set.
 pub(in super::super) fn referenced_column_projection(
     pushdown_req: &Json,
     all_cols: &[(String, String)],
 ) -> (Vec<ProjectionItem>, Vec<String>) {
     let mut names = std::collections::HashSet::new();
-    if let Some(list) = pushdown_req.get("selectList") {
-        collect_all_column_names(list, &mut names);
-    }
-    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
-        collect_all_column_names(f, &mut names);
-    }
-    for key in ["groupBy", "orderBy"] {
-        if let Some(v) = pushdown_req.get(key) {
-            collect_all_column_names(v, &mut names);
-        }
-    }
-    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
-        collect_all_column_names(h, &mut names);
-    }
+    referenced_clause_values(pushdown_req, |v| collect_all_column_names(v, &mut names));
 
     let mut cols = Vec::new();
     let mut types = Vec::new();
@@ -1695,13 +1687,13 @@ mod tests {
 
     /// A select item that is a SCALAR FUNCTION WRAPPING AGGREGATES — e.g.
     /// `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)`
-    /// — renders through `render_selectlist_item_qualified` (NOT `None`, no decline),
+    /// — renders through `render_expression_qualified` (NOT `None`, no decline),
     /// with its nested aggregates spliced verbatim and its nested column argument
     /// table-qualified to the owning side. Before the vs-expression aggregate arm +
     /// seam unification this recursed into the translator's catch-all and returned
     /// `None`, declining the whole grouped-join pushdown at every arity.
     #[test]
-    fn render_selectlist_item_qualified_renders_scalar_over_aggregate() {
+    fn render_expression_qualified_renders_scalar_over_aggregate() {
         let alias_of = seam_alias_of();
         let sum_case = serde_json::json!({
             "type": "function_aggregate", "name": "SUM", "distinct": false,
@@ -1726,7 +1718,7 @@ mod tests {
                 {"type": "literal_exactnumeric", "value": 2}]
         });
 
-        let sql = render_selectlist_item_qualified(&item, &alias_of)
+        let sql = render_expression_qualified(&item, &alias_of)
             .expect("a scalar-over-aggregate item must render, never decline to None");
         assert!(
             sql.contains(r#"SUM(CASE WHEN ("LHS_T2"."L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
@@ -1739,12 +1731,12 @@ mod tests {
     }
 
     /// A byte-compatibility guard: a TOP-LEVEL bare aggregate renders through the
-    /// unified `render_selectlist_item_qualified` byte-identically to the
+    /// unified `render_expression_qualified` byte-identically to the
     /// former dedicated `render_aggregate_qualified` — a single-arg aggregate as
     /// `NAME("ALIAS"."COL")`, `COUNT(*)` as `COUNT(*)`, and `DISTINCT` preserved. The
     /// exact expected strings are captured here so any future drift at the seam fails.
     #[test]
-    fn render_selectlist_item_qualified_top_level_aggregate_byte_compatible() {
+    fn render_expression_qualified_top_level_aggregate_byte_compatible() {
         let alias_of = seam_alias_of();
 
         let sum = serde_json::json!({
@@ -1752,7 +1744,7 @@ mod tests {
             "arguments": [{"type": "column", "name": "O_TOTALPRICE", "tableName": "ORDERS"}]
         });
         assert_eq!(
-            render_selectlist_item_qualified(&sum, &alias_of).as_deref(),
+            render_expression_qualified(&sum, &alias_of).as_deref(),
             Some(r#"SUM("LHS_T1"."O_TOTALPRICE")"#)
         );
 
@@ -1760,7 +1752,7 @@ mod tests {
             "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
         });
         assert_eq!(
-            render_selectlist_item_qualified(&count_star, &alias_of).as_deref(),
+            render_expression_qualified(&count_star, &alias_of).as_deref(),
             Some("COUNT(*)")
         );
 
@@ -1769,7 +1761,7 @@ mod tests {
             "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
         });
         assert_eq!(
-            render_selectlist_item_qualified(&count_distinct, &alias_of).as_deref(),
+            render_expression_qualified(&count_distinct, &alias_of).as_deref(),
             Some(r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#)
         );
     }
@@ -1793,7 +1785,7 @@ mod tests {
                 "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
             }]
         });
-        let sql = render_selectlist_item_qualified(&item, &alias_of)
+        let sql = render_expression_qualified(&item, &alias_of)
             .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
         assert!(
             sql.contains("VARCHAR(20)"),
@@ -2017,6 +2009,129 @@ mod tests {
         );
     }
 
+    /// Pins the full text of all six qualified N-scan render-decline messages, now
+    /// produced through the shared `join_render_decline` template rather than as six
+    /// separate `UdfError::User` string literals: a future reword of the template or
+    /// of any caller's clause fragment fails here. Each case is triggered directly
+    /// against the producing function with a node of an unrecognized `type`, which
+    /// the `vs-expression` translator declines to render (`None`), rather than through
+    /// the full `build_n_scan_join_sql` pipeline where that is unnecessary.
+    #[test]
+    fn golden_n_scan_render_decline_messages_unchanged() {
+        fn user_message(err: UdfError) -> String {
+            match err {
+                UdfError::User(msg) => msg,
+                other => panic!("expected a User decline, got {other:?}"),
+            }
+        }
+        let unrenderable = || serde_json::json!({"type": "totally_unsupported_node_type"});
+        let alias_of: HashMap<String, String> = HashMap::new();
+
+        // n_scan_join_select_items: an unrenderable select-list item.
+        let select_list_req = serde_json::json!({ "selectList": [unrenderable()] });
+        let msg = user_message(
+            n_scan_join_select_items(&select_list_req, &alias_of, &[], &[])
+                .expect_err("an unrenderable select-list item must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: a select-list item could not be rendered for the \
+             qualified N-scan join; this is a hard error, not a native re-plan"
+        );
+
+        // build_n_scan_join_sql: an involved table carries no column metadata.
+        let mut no_columns_request = join_request(Json::Null, equi_condition());
+        no_columns_request["involvedTables"][1]["columns"] = serde_json::json!([]);
+        let no_columns_sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let msg = user_message(
+            build_n_scan_join_sql(
+                &no_columns_request,
+                &pd(&no_columns_request),
+                &detected_join(&no_columns_request),
+                &no_columns_sides,
+                &two_scan_tuning(),
+                "SCAN",
+                "DISTRIBUTE",
+            )
+            .expect_err("an involved table with no column metadata must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: an involved table carries no column metadata, so the \
+             unaccelerated N-scan fallback cannot be built; this is a hard error, not a \
+             native re-plan"
+        );
+
+        // build_n_scan_join_sql: an unrenderable join condition.
+        let bad_condition_request = join_request(Json::Null, unrenderable());
+        let bad_condition_sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let msg = user_message(
+            build_n_scan_join_sql(
+                &bad_condition_request,
+                &pd(&bad_condition_request),
+                &detected_join(&bad_condition_request),
+                &bad_condition_sides,
+                &two_scan_tuning(),
+                "SCAN",
+                "DISTRIBUTE",
+            )
+            .expect_err("an unrenderable join condition must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: a join condition could not be rendered against the \
+             qualified N-scan schema; this is a hard error, not a native re-plan"
+        );
+
+        // qualified_join_group_by: an unrenderable GROUP BY key.
+        let group_by_req = serde_json::json!({ "groupBy": [unrenderable()] });
+        let msg = user_message(
+            qualified_join_group_by(&group_by_req, &alias_of)
+                .expect_err("an unrenderable GROUP BY key must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: a GROUP BY key could not be rendered for the qualified \
+             N-scan join; this is a hard error, not a native re-plan"
+        );
+
+        // qualified_join_having: an unrenderable HAVING expression.
+        let having_req = serde_json::json!({ "having": unrenderable() });
+        let msg = user_message(
+            qualified_join_having(&having_req, &alias_of)
+                .expect_err("an unrenderable HAVING expression must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: HAVING could not be rendered for the qualified \
+             N-scan join; this is a hard error, not a native re-plan"
+        );
+
+        // qualified_join_order_by: an unrenderable ORDER BY expression.
+        let order_by_req = serde_json::json!({
+            "orderBy": [{
+                "isAscending": true,
+                "nullsLast": false,
+                "expression": unrenderable(),
+            }],
+        });
+        let msg = user_message(
+            qualified_join_order_by(&order_by_req, &alias_of)
+                .expect_err("an unrenderable ORDER BY expression must decline"),
+        );
+        assert_eq!(
+            msg,
+            "join pushdown declined: an ORDER BY key could not be rendered for the qualified \
+             N-scan join; this is a hard error, not a native re-plan"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Shared referenced-column narrowing (issue #160)
     // -----------------------------------------------------------------------
@@ -2215,6 +2330,69 @@ mod tests {
             !ssql.contains(" GROUP BY ") && ssql.contains(r#"AS "LHS_T0""#),
             "the single-group wrapper renders NO GROUP BY over the aliased scan: {ssql}"
         );
+    }
+
+    /// `referenced_column_projection` keeps narrowing through the remaining clauses
+    /// when the SELECT list is absent or empty — it MUST NOT acquire
+    /// `referenced_side_columns`' absent/empty-`selectList` short-circuit, which
+    /// returns every column without inspecting another clause. The two routines share
+    /// one clause walk but keep divergent fallback policies, and this is the
+    /// divergence a naive merge would silently erase.
+    #[test]
+    fn referenced_column_projection_narrows_without_select_list() {
+        let all_cols = vec![
+            ("GK".to_string(), "VARCHAR(10)".to_string()),
+            ("FCOL".to_string(), "DECIMAL(18,0)".to_string()),
+            ("IRRELEVANT_COL".to_string(), "VARCHAR(10)".to_string()),
+        ];
+        let filter = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+            "right": {"type": "literal_exactnumeric", "value": 5},
+        });
+
+        for req in [
+            serde_json::json!({"filter": filter.clone()}),
+            serde_json::json!({"selectList": [], "filter": filter.clone()}),
+        ] {
+            let (proj, types) = referenced_column_projection(&req, &all_cols);
+            assert_eq!(
+                proj,
+                vec![ProjectionItem::Column("FCOL".to_string())],
+                "an absent/empty select list must still narrow through the filter to \
+                 ONLY the filter's column, never short-circuit to every column: {req}"
+            );
+            assert_eq!(
+                types,
+                vec!["DECIMAL(18,0)".to_string()],
+                "types stay positionally aligned with the narrowed column"
+            );
+        }
+    }
+
+    /// A request naming no source column at all still yields exactly one projected
+    /// column — the FIRST of `all_cols` — because an empty Exasol `EMITS` clause is
+    /// invalid. That first-column fallback is `referenced_column_projection`'s own
+    /// policy; `referenced_side_columns` falls back to its full column set instead,
+    /// and the two MUST stay divergent.
+    #[test]
+    fn referenced_column_projection_falls_back_to_first_column() {
+        let all_cols = vec![
+            ("A".to_string(), "DECIMAL(18,0)".to_string()),
+            ("B".to_string(), "VARCHAR(10)".to_string()),
+        ];
+        let req = serde_json::json!({
+            "selectList": [{"type": "literal_exactnumeric", "value": 1}],
+            "filter": null,
+            "having": null,
+        });
+        let (proj, types) = referenced_column_projection(&req, &all_cols);
+        assert_eq!(
+            proj,
+            vec![ProjectionItem::Column("A".to_string())],
+            "no referenced source column ⇒ exactly one column, the first of all_cols"
+        );
+        assert_eq!(types, vec!["DECIMAL(18,0)".to_string()]);
     }
 
     // -----------------------------------------------------------------------
