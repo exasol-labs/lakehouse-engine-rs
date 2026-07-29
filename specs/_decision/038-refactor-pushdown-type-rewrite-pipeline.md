@@ -17,8 +17,8 @@ extracted into shared pipeline functions.
 
 ### Decision
 
-After rewiring every caller onto the two new pipeline functions
-(`apply_filter_type_rewrites`, `apply_select_item_type_rewrites`), narrow
+After rewiring every caller onto the one surviving pipeline function
+(`apply_type_rewrites`), narrow
 `like_subject_type_guard`, `string_function_arg_type_guard`, and
 `rewrite_decimal_stringifications` from `pub(super)` to private.
 
@@ -39,7 +39,7 @@ directly. The narrowing is a deletion of surface, not an addition of machinery.
 
 **ID:** two-fixed-pass-list-functions-not-a-pass-selection-parameter
 **Plan:** refactor-pushdown-type-rewrite-pipeline
-**Status:** Accepted
+**Status:** Superseded by one-type-rewrite-pipeline-function-for-both-render-surfaces
 
 ### Context
 
