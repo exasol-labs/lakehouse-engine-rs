@@ -58,32 +58,25 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
             let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
             Value::Int32(arr.value(row))
         }
-        DataType::Int64 | DataType::UInt32 | DataType::UInt64 => {
-            // All map to DECIMAL(20,0); use Int64 or the appropriate cast.
-            match dt {
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                    Value::Int64(arr.value(row))
-                }
-                DataType::UInt32 => {
-                    let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
-                    Value::Int64(arr.value(row) as i64)
-                }
-                DataType::UInt64 => {
-                    let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    // UInt64 may overflow i64 — serialize large values via Numeric
-                    let v = arr.value(row);
-                    // Safe as i64 when ≤ i64::MAX; else use Numeric
-                    if v <= i64::MAX as u64 {
-                        Value::Int64(v as i64)
-                    } else {
-                        Value::Numeric(Decimal {
-                            unscaled: v as i128,
-                            scale: 0,
-                        })
-                    }
-                }
-                _ => unreachable!(),
+        DataType::Int64 => {
+            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            Value::Int64(arr.value(row))
+        }
+        DataType::UInt32 => {
+            let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
+            Value::Int64(arr.value(row) as i64)
+        }
+        DataType::UInt64 => {
+            let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
+            // UInt64 may overflow i64 — serialize large values via Numeric.
+            let v = arr.value(row);
+            if v <= i64::MAX as u64 {
+                Value::Int64(v as i64)
+            } else {
+                Value::Numeric(Decimal {
+                    unscaled: v as i128,
+                    scale: 0,
+                })
             }
         }
         DataType::UInt8 => {
@@ -238,6 +231,7 @@ mod tests {
         BinaryArray, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
         Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder,
         ListBuilder, StringBuilder, StructArray, UInt8Builder, UInt16Builder, UInt32Builder,
+        UInt64Builder,
     };
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
@@ -345,6 +339,43 @@ mod tests {
             Value::Numeric(d) => {
                 assert_eq!(d.scale, 4);
                 assert_eq!(d.unscaled, 1_234_567_890_000_i128);
+            }
+            other => panic!("expected Numeric, got {other:?}"),
+        }
+    }
+
+    /// Scenario: the Arrow-to-Value converter dispatches on one flat arm per Arrow type.
+    /// `Int64` and in-range `UInt32`/`UInt64` all produce `Value::Int64`; `UInt64` above
+    /// `i64::MAX` produces `Value::Numeric` of scale 0.
+    #[test]
+    fn int64_uint32_uint64_convert_identically_through_flat_arms() {
+        // Int64 → Value::Int64
+        let mut i64b = Int64Builder::new();
+        i64b.append_value(42);
+        let rows = batch_to_rows(&single_col_batch("x", Arc::new(i64b.finish())));
+        assert_eq!(rows[0][0], Value::Int64(42));
+
+        // UInt32 → Value::Int64
+        let mut u32b = UInt32Builder::new();
+        u32b.append_value(u32::MAX);
+        let rows = batch_to_rows(&single_col_batch("x", Arc::new(u32b.finish())));
+        assert_eq!(rows[0][0], Value::Int64(u32::MAX as i64));
+
+        // UInt64 at i64::MAX → Value::Int64
+        let mut u64b = UInt64Builder::new();
+        u64b.append_value(i64::MAX as u64);
+        let rows = batch_to_rows(&single_col_batch("x", Arc::new(u64b.finish())));
+        assert_eq!(rows[0][0], Value::Int64(i64::MAX));
+
+        // UInt64 above i64::MAX → Value::Numeric of scale 0
+        let mut u64b_over = UInt64Builder::new();
+        let over = i64::MAX as u64 + 1;
+        u64b_over.append_value(over);
+        let rows = batch_to_rows(&single_col_batch("x", Arc::new(u64b_over.finish())));
+        match &rows[0][0] {
+            Value::Numeric(d) => {
+                assert_eq!(d.scale, 0);
+                assert_eq!(d.unscaled, over as i128);
             }
             other => panic!("expected Numeric, got {other:?}"),
         }
