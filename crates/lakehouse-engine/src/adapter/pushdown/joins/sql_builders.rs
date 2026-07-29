@@ -711,7 +711,7 @@ fn qualified_join_order_by(
 /// 2/3), replacing the old whole-table `full_row_projection` (issue #160).
 ///
 /// Walks the FULL expression tree of every clause the wrapper renders — the clause set
-/// [`referenced_clause_values`] owns — collecting through [`collect_all_column_names`]'
+/// [`referenced_clause_values`] owns — collecting through [`collect_all_column_names`]'s
 /// Unicode fold, so every column the rendered SQL names is projected and none is
 /// missing at runtime. Column order and Exasol types are preserved from `all_cols`.
 /// Always returns at least one column (an empty EMITS clause is invalid in Exasol):
