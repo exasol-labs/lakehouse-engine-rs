@@ -14,7 +14,7 @@ use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
 };
-use crate::types::mapping::exasol_type_from_json;
+use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::render_expression_safe;
@@ -432,24 +432,47 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     )
 }
 
-/// Extract all columns and their Exasol types from the first involved table.
-pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
+/// The `(folded name, Exasol type)` columns of ONE involved table of `request`.
+///
+/// The ONE `col_types` builder: it owns the `involvedTables` walk, the `name`/`dataType`
+/// read, and the [`exasol_type_from_json`] mapping. An absent `involvedTables`, a table
+/// `select_table` does not select, and absent `columns` each yield an empty vec; a column
+/// missing either `name` or `dataType` is skipped.
+///
+/// Table selection and case fold are TWO parameters rather than one mode flag because the
+/// two callers' choices correlate by accident, not by design: [`extract_all_column_types`]
+/// takes the first table and folds full-Unicode, while `involved_table_columns` (joins
+/// planning) finds a table by name and folds ASCII-only. Deriving one from the other would
+/// record that unreconciled divergence as intended behavior. `fold_case` preserves nothing
+/// observable — `resolve_table_schema` Unicode-uppercases every column name before either
+/// caller sees it — so it is tracked for removal, collapsing this builder to one fold
+/// (#270).
+pub(super) fn column_types(
+    request: &Json,
+    select_table: impl FnOnce(&[Json]) -> Option<&Json>,
+    fold_case: impl Fn(&str) -> String,
+) -> Vec<(String, String)> {
     request
         .get("involvedTables")
         .and_then(|v| v.as_array())
-        .and_then(|tables| tables.first())
+        .and_then(|tables| select_table(tables))
         .and_then(|t| t.get("columns"))
         .and_then(|c| c.as_array())
         .map(|cols| {
             cols.iter()
                 .filter_map(|c| {
-                    let name = c.get("name")?.as_str()?.to_uppercase();
+                    let name = fold_case(c.get("name")?.as_str()?);
                     let dt_json = c.get("dataType")?;
                     Some((name, exasol_type_from_json(dt_json)))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Extract all columns and their Exasol types from the first involved table.
+pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
+    column_types(request, |tables: &[Json]| tables.first(), str::to_uppercase)
 }
 
 /// Deep-clone `expr` with every `tableAlias` key removed, so the reused
@@ -589,8 +612,7 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// slower, never wrong.
 ///
 /// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
-/// is a bare `column` node, the subject name is uppercased (mirroring
-/// [`extract_all_column_types`]'s uppercasing convention) and looked up in
+/// is a bare `column` node, the subject name is uppercased and looked up in
 /// `col_types`, then dispatched:
 ///
 /// | Exasol type | Action |
@@ -642,6 +664,29 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
     )
 }
 
+/// The Exasol type `node`'s column name resolves to in `col_types`, if any.
+///
+/// The ONE `col_types` lookup for the type-rewrite guards: read `name`, fold it with the
+/// full-Unicode `to_uppercase` to match the keys `extract_all_column_types` builds, then
+/// scan. `involved_table_columns`' ASCII-folded keys agree for every column name the
+/// adapter can declare — `resolve_table_schema` Unicode-uppercases names before declaring
+/// them, so no declarable name can differ between the two folds. `None` means the type is
+/// not resolvable — the node carries no `name`, or its folded name is absent from the list
+/// — two cases every caller already treats identically.
+///
+/// Deliberately does NOT test `node`'s `type` tag. A non-`column` node is a PASS-THROUGH
+/// for [`guard_like_subject`] and [`coerce_string_position_arg`] but an unresolvable type
+/// is a DECLINE, so absorbing the tag test here would turn every literal and computed
+/// argument into a decline. Each caller keeps its own tag test and its own meaning for a
+/// `None`.
+fn column_exa_type<'t>(node: &Json, col_types: &'t [(String, String)]) -> Option<&'t str> {
+    let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
+    col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t.as_str())
+}
+
 /// Type-check and, if needed, rewrite a single `predicate_like` /
 /// `predicate_like_regexp` node. See [`like_subject_type_guard`] for the dispatch
 /// table; returns `None` to decline the whole filter.
@@ -657,33 +702,21 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
     }
     let subject = subject.expect("is_bare_column implies expression is present");
 
-    // Uppercase the subject name before lookup, matching `extract_all_column_types`'s
-    // uppercasing (`support.rs:411`). A nameless column is unresolvable → fail-safe
-    // decline.
-    let name = subject
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_uppercase())?;
-    let exa_type = col_types
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, t)| t.as_str());
-
-    match exa_type {
+    match column_exa_type(subject, col_types).map(classify_exa_type) {
         // String subject: DataFusion coerces it natively — leave unchanged.
-        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(like_node.clone()),
+        Some(ExaTypeClass::Character) => Some(like_node.clone()),
         // DATE: rewrap the subject as CAST(<col> AS VARCHAR); DataFusion's Date32→Utf8
         // cast is `YYYY-MM-DD`.
-        Some("DATE") => {
+        Some(ExaTypeClass::Date) => {
             let mut out = like_node.clone();
             out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
         // Every other non-string type (DECIMAL incl. integer DECIMAL(p,0), DOUBLE,
-        // BOOLEAN, TIMESTAMP, …) and a lookup miss decline the WHOLE filter: DataFusion's
+        // BOOLEAN, TIMESTAMP, …) and an unresolvable type decline the WHOLE filter: DataFusion's
         // formatting of these to string diverges from Exasol's, so a native-eval
         // fallback is safer than a silently-wrong or hard-failing cast (decision-log [2]).
-        _ => None,
+        Some(ExaTypeClass::Decimal | ExaTypeClass::Other) | None => None,
     }
 }
 
@@ -807,25 +840,17 @@ fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)])
 }
 
 /// Whether `node` is a bare `column` node whose (uppercased) name resolves in
-/// `col_types` to an Exasol DECIMAL type. Integer columns are wire-encoded as
-/// `DECIMAL(p,0)`, so `.starts_with("DECIMAL")` also matches them (harmless: the
-/// trim is a no-op on a scale-0 value). Mirrors [`guard_like_subject`]'s uppercase
-/// + `col_types` lookup.
+/// `col_types` to [`ExaTypeClass::Decimal`]. Integer columns are wire-encoded as
+/// `DECIMAL(p,0)`, which also classifies as `Decimal` (harmless: the trim is a
+/// no-op on a scale-0 value).
 fn is_bare_decimal_column(node: &Json, col_types: &[(String, String)]) -> bool {
     if node.get("type").and_then(|t| t.as_str()) != Some("column") {
         return false;
     }
-    let Some(name) = node
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_uppercase())
-    else {
-        return false;
-    };
-    col_types
-        .iter()
-        .find(|(n, _)| *n == name)
-        .is_some_and(|(_, t)| t.starts_with("DECIMAL"))
+    matches!(
+        column_exa_type(node, col_types).map(classify_exa_type),
+        Some(ExaTypeClass::Decimal)
+    )
 }
 
 /// Wrap a (bare-column) node in the adapter-synthesized `decimal_to_varchar_exasol`
@@ -881,10 +906,8 @@ enum StringPositionArgs {
 /// | `INSTR`, `LOCATE` | `[0, 1]`, clamped to the arity, at two or fewer arguments; [`StringPositionArgs::Decline`] beyond two |
 /// | `CHR`, `UNICODECHR`, anything else | [`StringPositionArgs::NotGoverned`] |
 ///
-/// `fn_name` is uppercased before matching, mirroring the uppercase-then-look-up
-/// convention of [`guard_like_subject`] / [`extract_all_column_types`]. Every returned
-/// index is filtered to `< arg_count`, so a caller may index `arguments` with it
-/// directly.
+/// `fn_name` is uppercased before matching. Every returned index is filtered to
+/// `< arg_count`, so a caller may index `arguments` with it directly.
 ///
 /// `INSTR` / `LOCATE` beyond two arguments DECLINE unconditionally on argument type,
 /// and that branch must not be "simplified" into a `Coerce(vec![0, 1])`:
@@ -982,8 +1005,7 @@ fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -
     })
 }
 
-/// Type-dispatch ONE string-position argument, mirroring [`guard_like_subject`]'s
-/// uppercase-then-look-up convention:
+/// Type-dispatch ONE string-position argument:
 ///
 /// | Exasol type | Action |
 /// |-------------|--------|
@@ -999,24 +1021,14 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
     if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
         return Some(arg.clone());
     }
-    // A nameless column is unresolvable → fail-safe decline.
-    let name = arg
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_uppercase())?;
-    let exa_type = col_types
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, t)| t.as_str());
-
-    match exa_type {
-        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(arg.clone()),
-        Some("DATE") => Some(wrap_cast_to_varchar(arg)),
-        Some(t) if t.starts_with("DECIMAL") => Some(wrap_decimal_to_varchar(arg)),
-        // BOOLEAN, DOUBLE PRECISION, TIMESTAMP, … and a lookup miss all decline: their
+    match column_exa_type(arg, col_types).map(classify_exa_type) {
+        Some(ExaTypeClass::Character) => Some(arg.clone()),
+        Some(ExaTypeClass::Date) => Some(wrap_cast_to_varchar(arg)),
+        Some(ExaTypeClass::Decimal) => Some(wrap_decimal_to_varchar(arg)),
+        // BOOLEAN, DOUBLE PRECISION, TIMESTAMP, … and an unresolvable type all decline: their
         // text forms diverge between the two engines, so a cast would convert a crash
         // into a wrong answer (same reasoning as `guard_like_subject`).
-        _ => None,
+        Some(ExaTypeClass::Other) | None => None,
     }
 }
 
@@ -1304,8 +1316,9 @@ pub(super) fn project_columns(
 /// Unicode `to_uppercase`, while `collect_column_tables` and `collect_side_column_names`
 /// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
 /// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
-/// under ASCII — and no test in this crate uses a non-ASCII column name, so unifying them
-/// would silently change behavior while the whole suite still passed.
+/// under ASCII — and no test exercises `collect_all_column_names`, `collect_column_tables`,
+/// or `collect_side_column_names` with a non-ASCII column name, so unifying their folds
+/// would still pass the whole suite.
 pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
     match expr {
         Json::Object(map) => {
@@ -5584,7 +5597,7 @@ mod tests {
     }
 
     /// The name is uppercased before matching, so a lowercase `fn_name` resolves
-    /// identically (mirrors `guard_like_subject`'s uppercase-then-look-up convention).
+    /// identically.
     #[test]
     fn string_position_args_matches_lowercase_function_name() {
         assert_eq!(
@@ -6071,8 +6084,8 @@ mod tests {
         );
     }
 
-    /// A column name in any letter case resolves — the name is uppercased before the
-    /// `col_types` lookup, mirroring `extract_all_column_types`.
+    /// A column name in any letter case resolves — [`column_exa_type`] uppercases the
+    /// name before the `col_types` lookup.
     #[test]
     fn string_fn_guard_resolves_case_mismatched_column_name() {
         let col_types = decimal_rewrite_col_types();
@@ -6081,6 +6094,36 @@ mod tests {
             string_function_arg_type_guard(&node, &col_types),
             Some(string_fn("UPPER", vec![trimmed_decimal("C_DeCiMaL_a")])),
             "a mixed-case column name must resolve against the uppercase map"
+        );
+    }
+
+    /// The one `col_types` lookup folds the node's name with the full-Unicode
+    /// `to_uppercase`, so it resolves against the Unicode-folded list
+    /// [`extract_all_column_types`] builds and MISSES the ASCII-folded list
+    /// `involved_table_columns` builds.
+    ///
+    /// `STRAßE` is a CONSTRUCTED literal, not a name Exasol delivers: this crate
+    /// uppercases every Iceberg field name itself before declaring it
+    /// (`resolve_table_schema`, `file_resolution.rs:640`) and the full-Unicode fold maps
+    /// `ß` to `SS`, so a real `straße` column reaches this lookup as `STRASSE` and no
+    /// reachable name distinguishes the two folds. The literal is used here solely
+    /// because Rust's two folds disagree on it, which is what makes the miss assertion
+    /// falsifiable.
+    #[test]
+    fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
+        let node = column("STRAßE");
+        let unicode_folded = [("STRASSE".to_string(), "VARCHAR(2000000)".to_string())];
+        let ascii_folded = [("STRAßE".to_string(), "VARCHAR(2000000)".to_string())];
+
+        assert_eq!(
+            column_exa_type(&node, &unicode_folded),
+            Some("VARCHAR(2000000)"),
+            "`STRAßE`.to_uppercase() is `STRASSE`, the key `extract_all_column_types` builds"
+        );
+        assert_eq!(
+            column_exa_type(&node, &ascii_folded),
+            None,
+            "`to_ascii_uppercase` leaves `STRAßE`, which the Unicode fold cannot match"
         );
     }
 
