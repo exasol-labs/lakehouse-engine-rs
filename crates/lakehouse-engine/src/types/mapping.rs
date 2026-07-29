@@ -22,17 +22,28 @@ use serde_json::{Value as Json, json};
 /// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than
 /// erroring — incompatible values are serialized to JSON strings in the scan.
 pub fn arrow_to_exasol_type(dt: &DataType) -> String {
-    compatible_exasol_type(dt).unwrap_or_else(|| "VARCHAR(2000000)".to_string())
+    match compatible_exasol_type(dt) {
+        Some(CompatibleExaType::Fixed(s)) => s.to_string(),
+        Some(CompatibleExaType::Decimal(p, s)) => format!("DECIMAL({p},{s})"),
+        None => "VARCHAR(2000000)".to_string(),
+    }
 }
 
-/// The Exasol type string for an Arrow type Exasol represents directly, or `None`
-/// for one that has to cross the boundary as a JSON string.
+/// A compatible Exasol type, deferring string formatting until the caller needs
+/// it — `needs_json_fallback` only needs the `Option`'s discriminant, not the
+/// rendered string.
+enum CompatibleExaType {
+    Fixed(&'static str),
+    Decimal(u8, i8),
+}
+
+/// The Exasol type for an Arrow type Exasol represents directly, or `None` for
+/// one that has to cross the boundary as a JSON string.
 ///
-/// `None` IS the JSON-fallback flag, carried in the `Option` rather than derived
-/// from the returned string: `Utf8` and an out-of-range `Decimal128` both surface
-/// as `VARCHAR(2000000)`, so the string cannot separate the type that crosses
-/// unchanged from the one that must be serialized first.
-fn compatible_exasol_type(dt: &DataType) -> Option<String> {
+/// `None` IS the JSON-fallback flag: `Utf8` and an out-of-range `Decimal128` both
+/// surface as `VARCHAR(2000000)`, so the rendered string cannot separate the type
+/// that crosses unchanged from the one that must be serialized first.
+fn compatible_exasol_type(dt: &DataType) -> Option<CompatibleExaType> {
     let exasol_type = match dt {
         DataType::Boolean => "BOOLEAN",
 
@@ -56,14 +67,14 @@ fn compatible_exasol_type(dt: &DataType) -> Option<String> {
         DataType::Timestamp(_, _) => "TIMESTAMP",
 
         DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
-            return Some(format!("DECIMAL({p},{s})"));
+            return Some(CompatibleExaType::Decimal(*p, *s));
         }
 
         // Every incompatible type (List, Struct, Map, Binary, ...): VARCHAR via
         // the JSON fallback.
         _ => return None,
     };
-    Some(exasol_type.to_string())
+    Some(CompatibleExaType::Fixed(exasol_type))
 }
 
 /// The canonical Arrow `DataType` that the engine's `emit_batch` IPC feed accepts
