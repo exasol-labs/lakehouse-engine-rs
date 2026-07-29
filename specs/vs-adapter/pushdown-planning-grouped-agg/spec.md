@@ -35,6 +35,26 @@ grouped request cannot be decomposed into this partial/merge shape at all.
   decomposition as the single-group path.
 * LIMIT is never pushed into the per-shard grouped scan; the grouped common spec carries
   no LIMIT, so no shard observes one — it appears only in the outer wrapper.
+* **The merge wrapper owns the request's full final window, offset included (issue #191).**
+  The grouped path already withholds the LIMIT from every per-shard scan (see "LIMIT is NOT
+  pushed into per-shard scan for a grouped query") and renders it on the outer merge SELECT
+  instead, because a per-shard bound would drop groups before the merge re-groups them. An
+  OFFSET obeys the same rule for a stronger reason — a per-shard OFFSET skips a different
+  group set on every shard — so the offset belongs on the same merge SELECT, rendered through
+  the one shared limit-and-offset seam.
+* **A grouped request carrying an offset always has a merge `ORDER BY` rendered beside it.**
+  Exasol's grammar admits an OFFSET only alongside an ORDER BY, and a grouped ORDER BY that
+  cannot resolve over the merge's `GK_*`/`PARTIAL_*` columns routes the whole request to the
+  qualified single-table wrapper instead (`vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback`).
+  So the merge SELECT can render an OFFSET without producing the `sqlCode 42000`
+  "OFFSET not allowed in LIMIT without ORDER BY" that a bare OFFSET would. Confirmed live on
+  three grouped shapes, each pushing a non-empty `orderBy` alongside the offset: an ordinal on
+  the group key, an ordinal on the aggregate, and a group key absent from the select list.
+* **A GROUP BY select is the ONLY aggregate shape that can carry an offset.** Exasol rejects an
+  `OFFSET` in an UNGROUPED aggregated select outright (`sqlCode 42000`, "OFFSET not allowed in
+  aggregated selects", verified live), so the grouped merge and the qualified wrapper are the
+  only aggregate-side sites the offset reaches — never the single-group aggregate merge or the
+  lone-`COUNT(DISTINCT)` wrapper.
 * Exasol validates the outer wrapper SELECT's column types positionally against
   `selectListDataTypes`, so the wrapper SELECT must list its items in the user's
   `selectList` order.
@@ -138,3 +158,12 @@ grouped request cannot be decomposed into this partial/merge shape at all.
 * *AND* a group-key sort key SHALL still render as its positional output ordinal, unchanged by this delta, including in an `orderBy` that mixes a group-key key with an aggregate key
 * *AND* the per-shard partial scan SHALL still carry no `LIMIT` and no sort keys, so the anti-wrong-truncation invariant holds unchanged
 * *AND* the merged result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
+
+### Scenario: The grouped merge wrapper renders the request's OFFSET alongside its LIMIT
+
+* *GIVEN* a `GROUP BY` aggregate `pushdown` request that decomposes into the partial/merge shape, carrying a merge-resolvable `orderBy`, a `limit` with `numElements` = `n`, and a non-zero `limit.offset` = `m` — for example `SELECT MOD(id,4) AS k, COUNT(*) FROM t GROUP BY MOD(id,4) ORDER BY k LIMIT 2 OFFSET 1`
+* *WHEN* the adapter builds the grouped scan-driving SQL
+* *THEN* the outer merge SELECT SHALL render `GROUP BY <keys> [HAVING …] ORDER BY <keys> LIMIT n OFFSET m`, in that clause order, with the offset rendered through the SAME shared limit-and-offset seam every other wrapper uses
+* *AND* the per-shard grouped scan spec SHALL carry NEITHER the row limit NOR any offset, so no shard drops a group before the merge re-groups the partials
+* *AND* a request whose `limit.offset` is zero or absent SHALL produce byte-identical SQL to the pre-change output, so no already-correct grouped plan changes
+* *AND* the returned groups SHALL equal the same `GROUP BY … ORDER BY … LIMIT n OFFSET m` evaluated over all rows on a single node — for the seeded 20-row `events` fixture the example query SHALL return the groups ranked 2-3, NOT the groups ranked 1-2

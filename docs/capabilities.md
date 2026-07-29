@@ -26,6 +26,7 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 | Comparison | `FN_PRED_EQUAL`, `FN_PRED_NOTEQUAL`, `FN_PRED_LESS`, `FN_PRED_LESSEQUAL`, `FN_PRED_BETWEEN`, `FN_PRED_IN_CONSTLIST`, `FN_PRED_IS_NULL`, `FN_PRED_IS_NOT_NULL`, `FN_PRED_LIKE`, `FN_PRED_LIKE_ESCAPE`, `FN_PRED_REGEXP_LIKE` | `WHERE qty BETWEEN 1 AND 10` |
 | Literals | `LITERAL_BOOL`, `LITERAL_DATE`, `LITERAL_DOUBLE`, `LITERAL_EXACTNUMERIC`, `LITERAL_NULL`, `LITERAL_STRING`, `LITERAL_TIMESTAMP`, `LITERAL_TIMESTAMP_UTC` | `WHERE d = DATE '2024-01-01'` |
 | Limit | `LIMIT` | `... LIMIT 100` |
+| Limit with offset | `LIMIT_WITH_OFFSET` | `... LIMIT 20 OFFSET 40` |
 | Ordered top-N | `ORDER_BY_COLUMN` | `... ORDER BY price DESC LIMIT 20` |
 | Ordered by expression | `ORDER_BY_EXPRESSION` | `... ORDER BY price * discount DESC` |
 
@@ -34,8 +35,10 @@ Translated predicates prune whole data files with Iceberg manifest stats. The pr
 `ORDER BY ... LIMIT n` pushes down as a per-shard bounded top-N. This pushdown needs a single table
 (no join, no `GROUP BY`), and every sort key must be a bare projected column. DataFusion runs a
 `TopK`, not a full sort. Each shard emits only its own local top-`n` rows. Exasol then merges the
-`shard_count × n` rows with a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` remains
-unadvertised.
+`shard_count × n` rows with a final `ORDER BY ... LIMIT n`. `LIMIT_WITH_OFFSET` is now advertised
+(issue #191). The per-shard bounded top-N never carries an offset. A non-zero offset always
+declines to the row-scan wrapper. That wrapper renders the full `ORDER BY ... LIMIT n OFFSET m`
+window itself.
 
 The adapter also advertises `ORDER_BY_EXPRESSION` (issue #198). A sort key that is an expression,
 not a bare column, does not qualify for the bounded top-N above. Three paths still render the
@@ -74,7 +77,7 @@ The scan computes these functions and passes the results through.
 | Arithmetic | `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV` | `SELECT price * discount` |
 | Math | `FN_ABS`, `FN_ACOS`, `FN_ASIN`, `FN_ATAN`, `FN_ATAN2`, `FN_CEIL`, `FN_COS`, `FN_COSH`, `FN_COT`, `FN_DEGREES`, `FN_EXP`, `FN_FLOOR`, `FN_LN`, `FN_LOG`, `FN_MOD`, `FN_POWER`, `FN_RADIANS`, `FN_ROUND`, `FN_SIGN`, `FN_SIN`, `FN_SINH`, `FN_SQRT`, `FN_TAN`, `FN_TANH`, `FN_TRUNC` | `SELECT ROUND(amt, 2)` |
 | String | `FN_ASCII`, `FN_CHR`, `FN_CONCAT`, `FN_INITCAP`, `FN_INSTR`, `FN_LEFT`, `FN_LENGTH`, `FN_LOCATE`, `FN_LOWER`, `FN_LPAD`, `FN_LTRIM`, `FN_OCTET_LENGTH`, `FN_REPEAT`, `FN_REPLACE`, `FN_REVERSE`, `FN_RIGHT`, `FN_RPAD`, `FN_RTRIM`, `FN_SUBSTR`, `FN_TRANSLATE`, `FN_TRIM`, `FN_UNICODE`, `FN_UNICODECHR`, `FN_UPPER` | `WHERE UPPER(code) = 'AB'` |
-| Date / time | `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_DATE_TRUNC`, `FN_DAY`, `FN_EXTRACT`, `FN_HOUR`, `FN_MINUTE`, `FN_MONTH`, `FN_SECOND`, `FN_SYSDATE`, `FN_SYSTIMESTAMP`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
+| Date / time | `FN_DATE_TRUNC`, `FN_DAY`, `FN_EXTRACT`, `FN_HOUR`, `FN_MINUTE`, `FN_MONTH`, `FN_SECOND`, `FN_TO_DATE`, `FN_TO_TIMESTAMP`, `FN_YEAR` | `WHERE YEAR(ts) = 2024` |
 | Conditional | `FN_CASE`, `FN_GREATEST`, `FN_LEAST`, `FN_NULLIFZERO`, `FN_ZEROIFNULL` | `SELECT CASE WHEN x > 0 THEN 'p' END` |
 
 ## Aggregation
@@ -104,7 +107,7 @@ Exasol combines these partial values into the final result.
 
 ## Handled by Exasol
 
-The adapter does not push these capabilities to the scan. Exasol computes them on the returned partial results. The results are correct and fast. These capabilities are not decomposable into a partial/merge plan.
+The adapter does not push these capabilities to the scan. Exasol computes them on the returned partial results, or evaluates them itself post-scan. The results are always correct; not always fast — a capability lives in this section for one of two reasons: (a) it is not decomposable into a partial/merge plan (results are correct and fast), or (b) the scan cannot evaluate it at all, because the scan holds no clock, time zone, or statement context (correct, but the predicate prunes no files).
 
 | Capability | Example | Where it runs |
 |---|---|---|
@@ -112,4 +115,5 @@ The adapter does not push these capabilities to the scan. Exasol computes them o
 | `ORDER BY` over a join, `GROUP BY`, or an unprojected/JSON-fallback sort key | `SELECT a.x FROM a JOIN b ... ORDER BY a.x` | Not eligible for the ordered top-N pushdown. The adapter generates a correct final `ORDER BY`/`LIMIT` itself |
 | Grouped `COUNT(DISTINCT)`, `MEDIAN`, `APPROX_COUNT_DISTINCT` | `SELECT k, COUNT(DISTINCT u) FROM t GROUP BY k` | Not decomposable into partial/merge. Exasol computes on the returned rows |
 | `LISTAGG` / `GROUP_CONCAT` | `LISTAGG(name)` | Exasol-side |
+| `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` | `WHERE created_at < CURRENT_TIMESTAMP` | The scan receives neither `SESSIONTIMEZONE` nor `DBTIMEZONE` and holds no statement anchor, so Exasol evaluates the clock itself, once per statement, in its own zones. Results are correct; a predicate over one of these names prunes no files |
 | Geospatial, session functions | — | Exasol-side / unsupported |

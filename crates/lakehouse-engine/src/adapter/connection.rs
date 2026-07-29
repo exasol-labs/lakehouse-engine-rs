@@ -7,6 +7,8 @@ use crate::scan::spec::{CatalogProps, StorageProps};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
+use super::nonempty_str;
+
 /// The only unconditionally-required field in the CONNECTION password JSON.
 ///
 /// The four S3 fields (`endpoint`, `region`, `access_key`, `secret_key`) are
@@ -202,20 +204,14 @@ fn validate_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     Ok(())
 }
 
-fn str_field<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    obj.get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-}
-
 fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
     ConnectionCreds {
-        warehouse: str_field(json, "warehouse").unwrap_or("").to_string(),
-        endpoint: str_field(json, "endpoint").unwrap_or("").to_string(),
-        region: str_field(json, "region").unwrap_or("").to_string(),
-        access_key: str_field(json, "access_key").unwrap_or("").to_string(),
-        secret_key: str_field(json, "secret_key").unwrap_or("").to_string(),
-        session_token: str_field(json, "session_token").map(|s| s.to_string()),
+        warehouse: nonempty_str(json, "warehouse").unwrap_or("").to_string(),
+        endpoint: nonempty_str(json, "endpoint").unwrap_or("").to_string(),
+        region: nonempty_str(json, "region").unwrap_or("").to_string(),
+        access_key: nonempty_str(json, "access_key").unwrap_or("").to_string(),
+        secret_key: nonempty_str(json, "secret_key").unwrap_or("").to_string(),
+        session_token: nonempty_str(json, "session_token").map(|s| s.to_string()),
         path_style: json
             .get("path_style")
             .and_then(|v| v.as_bool())
@@ -228,11 +224,11 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
             .get("use_vended_credentials")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        token: str_field(json, "token").map(|s| s.to_string()),
-        client_id: str_field(json, "client_id").map(|s| s.to_string()),
-        client_secret: str_field(json, "client_secret").map(|s| s.to_string()),
-        oauth2_server_uri: str_field(json, "oauth2_server_uri").map(|s| s.to_string()),
-        scope: str_field(json, "scope").map(|s| s.to_string()),
+        token: nonempty_str(json, "token").map(|s| s.to_string()),
+        client_id: nonempty_str(json, "client_id").map(|s| s.to_string()),
+        client_secret: nonempty_str(json, "client_secret").map(|s| s.to_string()),
+        oauth2_server_uri: nonempty_str(json, "oauth2_server_uri").map(|s| s.to_string()),
+        scope: nonempty_str(json, "scope").map(|s| s.to_string()),
     }
 }
 

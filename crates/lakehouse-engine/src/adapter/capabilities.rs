@@ -44,9 +44,12 @@ pub const CAPABILITIES: &[&str] = &[
     // ORDER BY pushdown: bare-column sort keys (add-topn-pushdown) and expression
     // sort keys (issue #198), backed by the declined row-scan wrapper, the grouped
     // merge, and the qualified wrapper — see docs/capabilities.md for the full
-    // explanation. LIMIT_WITH_OFFSET stays unadvertised — no backing path.
+    // explanation. LIMIT_WITH_OFFSET is now backed by the same three wrappers
+    // (issue #191); the per-shard bounded top-N never carries an offset — a
+    // non-zero offset always declines that path to the row-scan wrapper instead.
     "ORDER_BY_COLUMN",
     "ORDER_BY_EXPRESSION",
+    "LIMIT_WITH_OFFSET",
     // Arithmetic binary-operator functions (issue #59, task 1.2)
     "FN_ADD",
     "FN_SUB",
@@ -109,9 +112,22 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_UNICODE",
     "FN_UNICODECHR",
     "FN_UPPER",
-    // Date/time scalar functions
-    "FN_CURRENT_DATE",
-    "FN_CURRENT_TIMESTAMP",
+    // Date/time scalar functions. FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/
+    // FN_SYSTIMESTAMP (the now-family) are NOT advertised: rendering Exasol's three
+    // distinct now-family semantics (session-zone CURRENT_TIMESTAMP, database-zone
+    // SYSTIMESTAMP, and their TO_DATE forms) needs SESSIONTIMEZONE/DBTIMEZONE, but
+    // neither reaches the scan UDF — the pushdown request carries no zone,
+    // CommonScanSpec carries no temporal field, the scan opens no connect-back
+    // session, and the SDK's UdfContext exposes no clock or zone. The scan can only
+    // read its own container clock in UTC, once per shard (a fresh SessionContext
+    // per invocation), so a pushed clock call would be evaluated G times with no
+    // statement anchor while Exasol's now-family is statement-constant. Measured
+    // live against Exasol 2025.2.1: a pushed SYSTIMESTAMP returned a value ~2 hours
+    // off native (UTC container clock vs EUROPE/BERLIN DBTIMEZONE/SESSIONTIMEZONE),
+    // and GROUP BY SYSTIMESTAMP over a two-file table returned two distinct
+    // timestamps against one statement-constant native value. Withdrawn so Exasol
+    // evaluates its own clock instead — see
+    // vs-adapter/pushdown-planning-capability-extensions.
     "FN_DATE_TRUNC",
     "FN_DAY",
     "FN_EXTRACT",
@@ -119,8 +135,6 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_MINUTE",
     "FN_MONTH",
     "FN_SECOND",
-    "FN_SYSDATE",
-    "FN_SYSTIMESTAMP",
     "FN_TO_DATE",
     "FN_TO_TIMESTAMP",
     "FN_YEAR",
@@ -337,6 +351,11 @@ mod tests {
         // FN_ADD_HOURS/FN_ADD_MINUTES were withdrawn after E2E parity (task 3.1):
         // the microsecond round-trip diverges on a DATE argument (Exasol infers
         // TIMESTAMP(0), the rendering yields TIMESTAMP(3), pushdown rejected).
+        // FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/FN_SYSTIMESTAMP (the
+        // now-family) were withdrawn: no time zone, clock, or statement anchor
+        // reaches the scan UDF, so no rendering matches Exasol's statement-constant,
+        // zone-aware now-family — see the CAPABILITIES const above and
+        // vs-adapter/pushdown-planning-capability-extensions.
         for name in &[
             "FN_DIV",
             "FN_TO_CHAR",
@@ -358,6 +377,10 @@ mod tests {
             "FN_DAYOFWEEK",
             "FN_LAST_DAY",
             "FN_CONVERT_TZ",
+            "FN_CURRENT_DATE",
+            "FN_CURRENT_TIMESTAMP",
+            "FN_SYSDATE",
+            "FN_SYSTIMESTAMP",
         ] {
             assert!(
                 !cap_strs.contains(name),
@@ -480,8 +503,6 @@ mod tests {
 
         // --- task 1.3: date/time scalar functions ---
         for name in &[
-            "FN_CURRENT_DATE",
-            "FN_CURRENT_TIMESTAMP",
             "FN_DATE_TRUNC",
             "FN_DAY",
             "FN_EXTRACT",
@@ -489,8 +510,6 @@ mod tests {
             "FN_MINUTE",
             "FN_MONTH",
             "FN_SECOND",
-            "FN_SYSDATE",
-            "FN_SYSTIMESTAMP",
             "FN_TO_DATE",
             "FN_TO_TIMESTAMP",
             "FN_YEAR",
@@ -558,15 +577,15 @@ mod tests {
         // ORDER_BY_COLUMN backs the per-shard bounded top-N + Exasol-side merge.
         // Backing-path detail (incl. ORDER_BY_EXPRESSION, issue #198) is documented
         // once on the `CAPABILITIES` const above; its advertisement is covered by
-        // `advertises_order_by_column_and_expression`. OFFSET remains unadvertised —
-        // no backing path exists for it.
+        // `advertises_order_by_column_and_expression`. LIMIT_WITH_OFFSET (issue #191)
+        // is now backed by the same three wrappers — see docs/capabilities.md.
         assert!(
             cap_strs.contains(&"ORDER_BY_COLUMN"),
             "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
         );
         assert!(
-            !cap_strs.contains(&"LIMIT_WITH_OFFSET"),
-            "LIMIT_WITH_OFFSET must NOT be advertised: {cap_strs:?}"
+            cap_strs.contains(&"LIMIT_WITH_OFFSET"),
+            "LIMIT_WITH_OFFSET must be advertised: {cap_strs:?}"
         );
         // Inner equi-join pushdown is advertised (add-join-pushdown-broadcast);
         // outer joins, non-equi ("all condition") joins, and any Cartesian product

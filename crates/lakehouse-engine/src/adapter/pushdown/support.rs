@@ -254,7 +254,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 /// "emitting function in expression").
 ///
 /// LIMIT/OFFSET/ORDER BY are NEVER pushed into the distinct fan-out (leaking one would
-/// truncate the per-shard distinct set → a wrong count); the caller-guarded `limit` is
+/// truncate the per-shard distinct set → a wrong count); the request's raw `limit` is
 /// applied only to the outer wrapper. The native `COUNT(DISTINCT "V")` yields exactly
 /// the type Exasol declares for a `COUNT(DISTINCT)`, so the count needs no output cast.
 ///
@@ -485,6 +485,74 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
     }
 }
 
+/// The expression-grammar fields whose value is an ARRAY of child expressions.
+/// Curated deliberately — see [`rewrite_expr_tree`].
+const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
+
+/// The expression-grammar fields whose value is a SINGLE child expression.
+/// Curated deliberately — see [`rewrite_expr_tree`].
+const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
+
+/// Rewrite an Exasol pushdown expression tree bottom-up: at every node each curated
+/// child is rewritten FIRST, then `f` is applied to that node with its
+/// already-rewritten children in place.
+///
+/// The single owner of the traversal the type-aware guards share; each of them
+/// supplies only its per-node decision as `f`.
+///
+/// ## Post-order is load-bearing
+///
+/// A guard's own check sees rewritten children, which is what makes a NESTED
+/// occurrence reachable: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`, so a
+/// check inspecting only the outer node's direct arguments would never reach the
+/// inner ones. It is also what stops a double rewrite at the outer level — an inner
+/// argument already coerced is no longer a bare column when the outer check runs.
+///
+/// ## A decline propagates to the root
+///
+/// `f` returning `None` declines the WHOLE tree, not just the declining subtree: the
+/// `None` travels out through every enclosing level via `?`. That mirrors the
+/// all-or-nothing untranslatable-predicate backstop — the whole filter is dropped so
+/// Exasol evaluates it natively, or the whole select-list item falls back to the base
+/// row. An INFALLIBLE rewriter composes as the never-declining case: with a
+/// statically always-`Some` `f` the result is always `Some`, so such a caller keeps
+/// its `-> Json` signature by unwrapping with a fallback rather than a panic.
+///
+/// ## Why the field list is curated
+///
+/// [`EXPR_ARRAY_FIELDS`] and [`EXPR_SINGLE_FIELDS`] enumerate this grammar's
+/// child-bearing fields by hand instead of walking every map value. A blind walk
+/// would descend into a node's object-valued `dataType` sub-object (e.g.
+/// `{"type":"VARCHAR"}`) and hand it to `f` as if it were an expression, letting a
+/// guard rewrite a declared type. `name` is excluded too, though for a different
+/// reason: it always carries a bare identifier string in this grammar, never an
+/// object, so keeping it off the curated list keeps identifiers unrewritable.
+/// Widening the reach therefore means adding a field to one of the two consts, which
+/// all callers inherit.
+///
+/// Child shapes are matched as the grammar sends them: an array field is descended
+/// into only when it really is a `Json::Array`, a single-child field only when the
+/// child is an object. A leaf — a literal, a `column`, any non-object node — has no
+/// curated children and is handed straight to `f`.
+fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<Json> {
+    let mut out = node.clone();
+    for field in EXPR_ARRAY_FIELDS {
+        if let Some(Json::Array(children)) = node.get(field) {
+            let rewritten: Option<Vec<Json>> =
+                children.iter().map(|c| rewrite_expr_tree(c, f)).collect();
+            out[field] = Json::Array(rewritten?);
+        }
+    }
+    for field in EXPR_SINGLE_FIELDS {
+        if let Some(child) = node.get(field)
+            && child.is_object()
+        {
+            out[field] = rewrite_expr_tree(child, f)?;
+        }
+    }
+    f(&out)
+}
+
 /// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
 /// scan, using the column-type map from [`extract_all_column_types`].
 ///
@@ -497,14 +565,27 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
 /// decision belongs in the adapter, not in the stateless (and sibling-shared)
 /// `vs-expression` translator (decision-log [1]).
 ///
-/// Walks the filter tree through the only node types that can nest a
-/// `predicate_like`/`predicate_like_regexp` in this codebase's expression grammar —
-/// `predicate_and` / `predicate_or` (children under `expressions`) and
-/// `predicate_not` (child under `expression`). A `LIKE` reachable only through some
-/// other node (e.g. buried in a `function_scalar_case` inside the filter) is out of
-/// scope, matching the single-table scope of this fix; it renders as before and is
-/// the pre-existing risk. Any node that is neither a junction nor a `LIKE` is
-/// returned unchanged — this guard only inspects `LIKE` subjects.
+/// Walks the filter tree through [`rewrite_expr_tree`], the same post-order primitive
+/// [`string_function_arg_type_guard`] and [`rewrite_decimal_stringifications`] run on:
+/// every curated child under [`EXPR_ARRAY_FIELDS`]/[`EXPR_SINGLE_FIELDS`] is visited,
+/// not only the `predicate_and`/`predicate_or`/`predicate_not` junctions a narrower,
+/// pre-migration traversal used to stop at. A `predicate_like` buried inside a
+/// `function_scalar_case`, under a comparison predicate's `left`/`right`, or inside a
+/// scalar function's `arguments` is now reached the same as one sitting directly
+/// under a junction — the #207 blind spot that narrower traversal left open is
+/// closed. Any node that is not itself a `predicate_like`/`predicate_like_regexp` is
+/// returned unchanged by the closure below; this guard only inspects `LIKE` subjects.
+///
+/// Widening the reach widens the decline trade [`guard_like_subject`] already made,
+/// in two different directions depending on why it declines. Where the subject's
+/// Exasol type RESOLVES to a non-string type, a `LIKE` newly reached by this wider
+/// traversal used to hard-fail the DataFusion scan outright (`There isn't a common
+/// type to coerce <Type> and Utf8 in LIKE expression`) and now declines to native
+/// Exasol evaluation instead — strictly a fix, never a cost. Where the subject's
+/// column NAME does not resolve in `col_types` (a lookup miss, fail-safe decline), a
+/// `LIKE` that previously rendered unguarded — because the narrower traversal never
+/// reached it — may now decline a filter that would have pushed down and worked:
+/// slower, never wrong.
 ///
 /// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
 /// is a bare `column` node, the subject name is uppercased (mirroring
@@ -526,6 +607,23 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
 /// Exasol's default; an altered session format is an accepted tracked exception
 /// (#216, decision-log [8]).
 ///
+/// ## Descending into a `LIKE` node's own children is inert
+///
+/// [`rewrite_expr_tree`] is post-order, so a `LIKE` node's `expression` (subject) and
+/// `pattern` are rewritten BEFORE the node itself is dispatched to
+/// [`guard_like_subject`]. That descent cannot disturb the dispatch: the per-node
+/// closure acts on the two `LIKE` node types and clones everything else, so a bare
+/// `column` subject (and a literal pattern) comes back as the same value and
+/// [`guard_like_subject`] sees exactly the node it would have seen without the
+/// descent. The `function_scalar_cast` the DATE arm wraps the subject in is
+/// synthesized by the closure itself, after the descent is finished, so the traversal
+/// never revisits it and cannot double-wrap it.
+///
+/// Skipping a NON-object child (which [`rewrite_expr_tree`] does, descending only into
+/// an object) is inert for the same reason: a non-object node has no curated child
+/// field of its own and falls to the closure's clone-everything-else arm, so
+/// descending into one would only put back the value that is already in place.
+///
 /// Returns:
 /// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
 /// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
@@ -533,37 +631,14 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
 ///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
 ///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
 ///   predicate natively (decision-log [3]).
-pub(super) fn like_subject_type_guard(
-    filter: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
-    let node_type = filter.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    match node_type {
-        // Junctions: recurse into every child; a single declined child (`None`)
-        // short-circuits the whole tree via `?`.
-        "predicate_and" | "predicate_or" => {
-            let mut out = filter.clone();
-            if let Some(Json::Array(children)) = filter.get("expressions") {
-                let mut rewritten = Vec::with_capacity(children.len());
-                for child in children {
-                    rewritten.push(like_subject_type_guard(child, col_types)?);
-                }
-                out["expressions"] = Json::Array(rewritten);
-            }
-            Some(out)
-        }
-        "predicate_not" => {
-            let mut out = filter.clone();
-            if let Some(child) = filter.get("expression") {
-                out["expression"] = like_subject_type_guard(child, col_types)?;
-            }
-            Some(out)
-        }
-        "predicate_like" | "predicate_like_regexp" => guard_like_subject(filter, col_types),
-        // Any other node (predicate_equal, column, literals, …) is not a LIKE and
-        // cannot nest one in this grammar — returned unchanged.
-        _ => Some(filter.clone()),
-    }
+fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    rewrite_expr_tree(
+        filter,
+        &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
+            Some("predicate_like" | "predicate_like_regexp") => guard_like_subject(out, col_types),
+            _ => Some(out.clone()),
+        },
+    )
 }
 
 /// Type-check and, if needed, rewrite a single `predicate_like` /
@@ -645,106 +720,90 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 ///
 /// ## Post-order recursion is load-bearing
 ///
-/// Children are rewritten FIRST (post-order), then the node's own stringifier check
-/// runs. This is what makes NESTED occurrences reachable: Exasol encodes `a||b||c`
+/// The traversal is [`rewrite_expr_tree`]: children are rewritten FIRST (post-order),
+/// then the node's own stringifier check runs as that primitive's per-node closure.
+/// Post-order is what makes NESTED occurrences reachable: Exasol encodes `a||b||c`
 /// as NESTED `CONCAT(a, CONCAT(b, c))` (confirmed live for
 /// `id||'-'||c_decimal_a`), so a rewriter inspecting only the OUTER `CONCAT`'s direct
 /// arguments would never reach `c_decimal_a` (a direct argument only of the INNER
-/// `CONCAT`). The generic child-recursion walks every child-bearing field of this
-/// codebase's expression grammar — the array fields `expressions` / `arguments` /
-/// `results` and the single-child fields `expression` / `pattern` / `left` / `right`
-/// / `basis` — so a stringifier buried arbitrarily deep (inside a `CASE` branch,
-/// inside a logical connective, inside another `CONCAT`) is still found and rewritten.
+/// `CONCAT`). [`rewrite_expr_tree`] walks every field in [`EXPR_ARRAY_FIELDS`] and
+/// [`EXPR_SINGLE_FIELDS`] — this codebase's curated child-bearing fields — so a
+/// stringifier buried arbitrarily deep (inside a `CASE` branch, inside a logical
+/// connective, inside another `CONCAT`) is still found and rewritten.
 ///
-/// Wired into `project_columns`'s select-list handling and the WHERE-clause
-/// filter chain.
-pub(super) fn rewrite_decimal_stringifications(
-    node: &Json,
-    col_types: &[(String, String)],
-) -> Json {
-    // A leaf (`column`, literal) or any non-object node has no recursable children
-    // and is not itself a stringifier — pass it through unchanged.
-    if !node.is_object() {
-        return node.clone();
-    }
-
-    // --- Step 1: post-order — rewrite every known child-bearing field FIRST, so a
-    // nested stringifier (e.g. CONCAT-in-CONCAT) is already resolved before this
-    // node's own check runs. Clone-and-replace, mirroring `like_subject_type_guard`.
-    let mut out = node.clone();
-    for field in ["expressions", "arguments", "results"] {
-        if let Some(Json::Array(children)) = node.get(field) {
-            let rewritten: Vec<Json> = children
-                .iter()
-                .map(|c| rewrite_decimal_stringifications(c, col_types))
-                .collect();
-            out[field] = Json::Array(rewritten);
-        }
-    }
-    for field in ["expression", "pattern", "left", "right", "basis"] {
-        match node.get(field) {
-            Some(child) if child.is_object() => {
-                out[field] = rewrite_decimal_stringifications(child, col_types);
+/// Reached via [`apply_filter_type_rewrites`] (the WHERE-clause filter chain) and
+/// [`apply_select_item_type_rewrites`] (`project_columns`'s select-list handling) —
+/// those two pipeline functions are this pass's only PRODUCTION callers (the pass
+/// corpus in `mod tests` calls it directly).
+///
+/// The closure passed to [`rewrite_expr_tree`] is statically always-`Some` — it has
+/// no decline path, only unconditional per-node-type rewrites — so `rewrite_expr_tree`
+/// can never actually return `None` here. The `.unwrap_or_else` below is therefore an
+/// unreachable-in-practice fallback kept only to compose with `rewrite_expr_tree`'s
+/// `Option`-returning signature, not a real decline path; it deliberately falls back
+/// to a clone rather than panicking, so a change that somehow broke the invariant
+/// would degrade to a no-op rewrite instead of taking down query planning.
+fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)]) -> Json {
+    rewrite_expr_tree(node, &|out: &Json| {
+        // With children already rewritten (by `rewrite_expr_tree`'s post-order
+        // traversal), check whether THIS node is one of the three stringifier shapes
+        // over a (still-)bare DECIMAL column argument.
+        let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        Some(match node_type {
+            "function_scalar_cast" => {
+                let target_is_string = out
+                    .get("dataType")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.to_uppercase())
+                    .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
+                if target_is_string
+                    && let Some(Json::Array(args)) = out.get("arguments")
+                    && let [arg] = args.as_slice()
+                    && is_bare_decimal_column(arg, col_types)
+                {
+                    // Replace the WHOLE cast node — `decimal_to_varchar_exasol` already
+                    // yields the correct VARCHAR-typed trimmed string; do not re-nest it
+                    // inside the original CAST.
+                    return Some(wrap_decimal_to_varchar(arg));
+                }
+                out.clone()
             }
-            _ => {}
-        }
-    }
-
-    // --- Step 2: with children already rewritten, check whether THIS node is one of
-    // the three stringifier shapes over a (still-)bare DECIMAL column argument.
-    let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    match node_type {
-        "function_scalar_cast" => {
-            let target_is_string = out
-                .get("dataType")
-                .and_then(|d| d.get("type"))
-                .and_then(|t| t.as_str())
-                .map(|t| t.to_uppercase())
-                .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
-            if target_is_string
-                && let Some(Json::Array(args)) = out.get("arguments")
-                && let [arg] = args.as_slice()
-                && is_bare_decimal_column(arg, col_types)
-            {
-                // Replace the WHOLE cast node — `decimal_to_varchar_exasol` already
-                // yields the correct VARCHAR-typed trimmed string; do not re-nest it
-                // inside the original CAST.
-                return wrap_decimal_to_varchar(arg);
+            "function_scalar" => {
+                let fn_name = out
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+                let mut out = out.clone();
+                // CONCAT and LENGTH both implicitly stringify each DECIMAL argument.
+                // Per-argument replacement: wrap only the bare DECIMAL columns, leave
+                // literals, non-DECIMAL columns, and already-recursed nested nodes as-is.
+                if (fn_name == "CONCAT" || fn_name == "LENGTH")
+                    && let Some(Json::Array(args)) = out.get("arguments")
+                {
+                    let rewritten: Vec<Json> = args
+                        .iter()
+                        .map(|a| {
+                            if is_bare_decimal_column(a, col_types) {
+                                wrap_decimal_to_varchar(a)
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    out["arguments"] = Json::Array(rewritten);
+                }
+                out
             }
-            out
-        }
-        "function_scalar" => {
-            let fn_name = out
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or("")
-                .to_uppercase();
-            // CONCAT and LENGTH both implicitly stringify each DECIMAL argument.
-            // Per-argument replacement: wrap only the bare DECIMAL columns, leave
-            // literals, non-DECIMAL columns, and already-recursed nested nodes as-is.
-            if (fn_name == "CONCAT" || fn_name == "LENGTH")
-                && let Some(Json::Array(args)) = out.get("arguments")
-            {
-                let rewritten: Vec<Json> = args
-                    .iter()
-                    .map(|a| {
-                        if is_bare_decimal_column(a, col_types) {
-                            wrap_decimal_to_varchar(a)
-                        } else {
-                            a.clone()
-                        }
-                    })
-                    .collect();
-                out["arguments"] = Json::Array(rewritten);
-            }
-            out
-        }
-        // Any other node type (comparison predicate, arithmetic function, CAST to a
-        // non-string target, …): return the children-recursed node unchanged. A bare
-        // DECIMAL column that is a direct argument here is NOT wrapped — this is what
-        // keeps `c_decimal_a > 5` and `CAST(c_decimal_a AS DOUBLE)` untouched.
-        _ => out,
-    }
+            // Any other node type (comparison predicate, arithmetic function, CAST to a
+            // non-string target, …): return the children-rewritten node unchanged. A bare
+            // DECIMAL column that is a direct argument here is NOT wrapped — this is what
+            // keeps `c_decimal_a > 5` and `CAST(c_decimal_a AS DOUBLE)` untouched.
+            _ => out.clone(),
+        })
+    })
+    .unwrap_or_else(|| node.clone())
 }
 
 /// Whether `node` is a bare `column` node whose (uppercased) name resolves in
@@ -866,13 +925,14 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 /// string-position argument ([`string_position_args`] decides which those are) is
 /// dispatched on its Exasol type by [`coerce_string_position_arg`] before rendering.
 ///
-/// Recursion is POST-ORDER over the same child-bearing fields as
-/// [`rewrite_decimal_stringifications`]. Both halves earn their keep: post-order is
-/// what coerces the INNER call of a nested `UPPER(TRIM(<decimal column>))` before the
-/// outer check runs (which then sees a non-column argument and cannot re-wrap it), and
-/// the broad field list is what reaches a string function under a COMPARISON predicate
-/// (`UPPER(c) = 'X'` is a `predicate_equal` with the function under `left`) — a node
-/// [`like_subject_type_guard`]'s junction-only recursion never descends into.
+/// The traversal is the same [`rewrite_expr_tree`] primitive
+/// [`rewrite_decimal_stringifications`] runs on, so both share one owner for the
+/// post-order-plus-curated-field-list traversal. Both halves earn their keep:
+/// post-order is what coerces the INNER call of a nested `UPPER(TRIM(<decimal
+/// column>))` before the outer check runs (which then sees a non-column argument and
+/// cannot re-wrap it), and the broad field list is what reaches a string function
+/// under a COMPARISON predicate — `UPPER(c) = 'X'` is a `predicate_equal` with the
+/// function under `left`, the shape issue #210's WHERE-clause repro takes.
 ///
 /// Returns:
 /// - `Some(tree)` — render this (possibly coerced) tree.
@@ -881,71 +941,45 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 ///   Exasol evaluates it natively, or the WHOLE select-list item falls back to the base
 ///   row. A `NotGoverned` node never declines, whatever its arguments' types.
 ///
-/// Runs BEFORE [`rewrite_decimal_stringifications`] at both wired surfaces: a coerced
-/// argument is no longer a bare column, so the decimal rewriter no-ops on it instead of
-/// double-wrapping.
-pub(super) fn string_function_arg_type_guard(
-    node: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
-    // A leaf (literal, `column`) or any non-object node has no recursable children and
-    // no function dispatch — pass it through unchanged.
-    if !node.is_object() {
-        return Some(node.clone());
-    }
-
-    // --- Step 1: post-order — guard every known child-bearing field FIRST, so a nested
-    // string function is already coerced before this node's own check runs. A declined
-    // child short-circuits the whole tree via `?`.
-    let mut out = node.clone();
-    for field in ["expressions", "arguments", "results"] {
-        if let Some(Json::Array(children)) = node.get(field) {
-            let rewritten: Option<Vec<Json>> = children
-                .iter()
-                .map(|c| string_function_arg_type_guard(c, col_types))
-                .collect();
-            out[field] = Json::Array(rewritten?);
+/// Runs BEFORE [`rewrite_decimal_stringifications`] in both pipeline functions that
+/// chain the two — [`apply_filter_type_rewrites`] and [`apply_select_item_type_rewrites`]
+/// — which are the sole enforcers of that ordering: a coerced argument is no longer a
+/// bare column, so the decimal rewriter no-ops on it instead of double-wrapping.
+fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    rewrite_expr_tree(node, &|out: &Json| {
+        // With children already guarded (by `rewrite_expr_tree`'s post-order
+        // traversal), dispatch THIS node's own string-position arguments. Only a
+        // `function_scalar` can be a string function; every other node type passes
+        // through unchanged.
+        if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
+            return Some(out.clone());
         }
-    }
-    for field in ["expression", "pattern", "left", "right", "basis"] {
-        match node.get(field) {
-            Some(child) if child.is_object() => {
-                out[field] = string_function_arg_type_guard(child, col_types)?;
+        // `fn_name` is passed un-uppercased: `string_position_args` uppercases it itself.
+        let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let arg_count = out
+            .get("arguments")
+            .and_then(|a| a.as_array())
+            .map_or(0, |a| a.len());
+        match string_position_args(fn_name, arg_count) {
+            // Not a governed string function: leave it alone WITHOUT declining, even over a
+            // non-coercible argument — `CHR`/`UNICODECHR` take a genuine integer codepoint.
+            StringPositionArgs::NotGoverned => Some(out.clone()),
+            // An arity `vs-expression` renders incompletely (#228) — decline it rather than
+            // push a truncated rendering.
+            StringPositionArgs::Decline => None,
+            StringPositionArgs::Coerce(indices) => {
+                // Every index is clamped to `arg_count` by `string_position_args`, so a
+                // non-empty `indices` implies `out["arguments"]` exists as an array —
+                // indexing it here can never synthesize a missing field.
+                let mut out = out.clone();
+                for i in indices {
+                    let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
+                    out["arguments"][i] = coerced;
+                }
+                Some(out)
             }
-            _ => {}
         }
-    }
-
-    // --- Step 2: with children already guarded, dispatch THIS node's own
-    // string-position arguments. Only a `function_scalar` can be a string function;
-    // every other node type is already fully handled by the recursion above.
-    if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
-        return Some(out);
-    }
-    // `fn_name` is passed un-uppercased: `string_position_args` uppercases it itself.
-    let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let arg_count = out
-        .get("arguments")
-        .and_then(|a| a.as_array())
-        .map_or(0, |a| a.len());
-    match string_position_args(fn_name, arg_count) {
-        // Not a governed string function: leave it alone WITHOUT declining, even over a
-        // non-coercible argument — `CHR`/`UNICODECHR` take a genuine integer codepoint.
-        StringPositionArgs::NotGoverned => Some(out),
-        // An arity `vs-expression` renders incompletely (#228) — decline it rather than
-        // push a truncated rendering.
-        StringPositionArgs::Decline => None,
-        StringPositionArgs::Coerce(indices) => {
-            // Every index is clamped to `arg_count` by `string_position_args`, so a
-            // non-empty `indices` implies `out["arguments"]` exists as an array —
-            // indexing it here can never synthesize a missing field.
-            for i in indices {
-                let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
-                out["arguments"][i] = coerced;
-            }
-            Some(out)
-        }
-    }
+    })
 }
 
 /// Type-dispatch ONE string-position argument, mirroring [`guard_like_subject`]'s
@@ -984,6 +1018,66 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
         // into a wrong answer (same reasoning as `guard_like_subject`).
         _ => None,
     }
+}
+
+/// Run the ordered type-rewrite pass sequence over a WHERE-clause filter tree, before
+/// it is rendered for the DataFusion scan: [`like_subject_type_guard`] →
+/// [`string_function_arg_type_guard`] → [`rewrite_decimal_stringifications`].
+///
+/// - [`like_subject_type_guard`] (issue #207): may decline the whole filter, or
+///   rewrap a DATE subject.
+/// - [`string_function_arg_type_guard`] (issue #210): coerces string-position
+///   arguments, or declines.
+/// - [`rewrite_decimal_stringifications`] (issue #211): runs last, never declines.
+///
+/// The string-function guard MUST run BEFORE the decimal rewrite, not after: a
+/// coerced argument is no longer a bare column, so the decimal rewriter no-ops on it
+/// instead of double-wrapping it into two trim wrappers — see
+/// [`string_function_arg_type_guard`]'s doc for the full argument.
+///
+/// The three passes disagree on fallibility — the first two decline via `Option`,
+/// the decimal rewrite never declines — so this function is also the fallibility
+/// bridge: `?` propagates either guard's decline, and the infallible decimal pass's
+/// plain `Json` return is wrapped in `Some`, sparing every caller from re-deriving
+/// that bridge itself.
+///
+/// Returns:
+/// - `Some(tree)` — this (possibly rewritten) tree is safe to render.
+/// - `None` — a guard declined somewhere in the tree; the whole filter is dropped.
+pub(super) fn apply_filter_type_rewrites(
+    filter: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let filter = like_subject_type_guard(filter, col_types)?;
+    let filter = string_function_arg_type_guard(&filter, col_types)?;
+    Some(rewrite_decimal_stringifications(&filter, col_types))
+}
+
+/// Run the ordered type-rewrite pass sequence over one select-list item, before it is
+/// projected for the DataFusion scan: [`string_function_arg_type_guard`] →
+/// [`rewrite_decimal_stringifications`].
+///
+/// [`string_function_arg_type_guard`] guards the item's string-function arguments
+/// against a non-coercible column type (issue #210) FIRST; [`rewrite_decimal_stringifications`]
+/// then rewrites any directly-stringified bare DECIMAL column into a
+/// `decimal_to_varchar_exasol` node (issue #211). The guard must run first — see
+/// [`string_function_arg_type_guard`]'s doc for why the order is load-bearing — and the
+/// decimal rewrite is a no-op passthrough for anything it does not recognize, so it is
+/// safe to run unconditionally on every item that survives the guard.
+///
+/// Unlike [`apply_filter_type_rewrites`], this pipeline runs no LIKE-subject guard: a
+/// select-list item is not yet wired to [`like_subject_type_guard`]. This is a TRACKED
+/// GAP (issue #219), NOT an invariant that a select-list item can never be a LIKE
+/// subject — issue #219 documents `SELECT c_date LIKE '2024%' FROM …` hitting the same
+/// DataFusion coercion failure the filter-side guard exists to prevent, and a
+/// `function_scalar_case`-nested LIKE reaches it too.
+///
+/// Returns:
+/// - `Some(tree)` — this (possibly rewritten) item is safe to project.
+/// - `None` — the string-function guard declined; the caller must fall back.
+fn apply_select_item_type_rewrites(item: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let item = string_function_arg_type_guard(item, col_types)?;
+    Some(rewrite_decimal_stringifications(&item, col_types))
 }
 
 /// Extract the projected columns and their Exasol types from the pushdown request.
@@ -1098,31 +1192,18 @@ pub(super) fn project_columns(
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
                     .map(exasol_type_from_json);
-                // Guard every select-list item's string-function arguments against a
-                // non-coercible column type (issue #210) BEFORE the decimal-stringification
-                // rewrite below — guard first, decimal rewriter second, same as the
-                // WHERE-clause chain; see `string_function_arg_type_guard`'s doc for why the
-                // order is load-bearing. `project_columns` has THREE callers —
-                // `extract_projection` (single-table), `extract_join_projection`
-                // (`joins/rendering.rs`, whose `col_types` is the UNION of both joined
-                // tables' columns), and `joins/mod.rs`'s empty-side path — so this guard
-                // (and its ability to decline) reaches the broadcast-join SELECT list too,
-                // not just the single-table path. On `None` the item can't be safely pushed
-                // down at all; fall back to the full base row for the whole select list,
-                // like every other "untranslatable item" arm below.
-                let Some(e) = string_function_arg_type_guard(e, &all_cols) else {
+                // On `None` the item can't be
+                // safely pushed down at all; fall back to the full base row for the
+                // whole select list, like every other "untranslatable item" arm below.
+                // `project_columns` has THREE callers — `extract_projection`
+                // (single-table), `extract_join_projection` (`joins/rendering.rs`,
+                // whose `col_types` is the UNION of both joined tables' columns), and
+                // `joins/mod.rs`'s empty-side path — so this decline reaches the
+                // broadcast-join SELECT list too, not just the single-table path.
+                let Some(e) = apply_select_item_type_rewrites(e, &all_cols) else {
                     needs_full_fallback = true;
                     continue;
                 };
-                // Rewrite directly-stringified bare-DECIMAL columns into
-                // `decimal_to_varchar_exasol` so the rendered SQL reproduces Exasol's
-                // trimmed DECIMAL→string form (issue #211). The rewriter is a no-op
-                // passthrough for anything it does not recognize (bare columns, literals,
-                // other node types), so it is safe and correct to run unconditionally on
-                // every item before the dispatch below. Shadowing `e` with the owned
-                // rewritten node, then re-borrowing, keeps the rest of the loop body
-                // unchanged.
-                let e = rewrite_decimal_stringifications(&e, &all_cols);
                 let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
@@ -1232,6 +1313,45 @@ pub(super) fn project_columns(
     Ok((proj_names, proj_types, needs_full_fallback))
 }
 
+/// Walk every `column` node reachable from `expr`, invoking `f` once per node found.
+///
+/// Owns both the recursion and the `type == "column"` test because every current
+/// caller acts only on `column` nodes — pushing that test back into each caller's
+/// closure would just relocate one duplication into three smaller ones. Traversal
+/// is blind (every object field, every array element) rather than schema-aware,
+/// because a collect rebuilds nothing: blind descent is what reaches a column
+/// buried inside a `CASE` or a function call, and it is safe precisely because
+/// nothing here reconstructs the tree. This MUST NOT be merged with issue #257's
+/// curated post-order rewrite primitive — that primitive edits the tree in place
+/// and so cannot blindly descend into a node's own `dataType`/`name` sub-objects,
+/// which a rewrite must leave untouched but a collect may safely enter.
+///
+/// Case folding is deliberately NOT owned here — each callback applies its own, and the
+/// current callers deliberately disagree: `collect_all_column_names` below folds with
+/// Unicode `to_uppercase`, while `collect_column_tables` and `collect_side_column_names`
+/// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
+/// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
+/// under ASCII — and no test in this crate uses a non-ASCII column name, so unifying them
+/// would silently change behavior while the whole suite still passed.
+pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
+                f(map);
+            }
+            for v in map.values() {
+                walk_column_nodes(v, &mut *f);
+            }
+        }
+        Json::Array(items) => {
+            for item in items {
+                walk_column_nodes(item, &mut *f);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Recursively collect every bare-column reference's UPPERCASE name found anywhere
 /// within `value` into `names` — walking arrays, objects, and nested `expression`
 /// wrappers alike, so it works uniformly over a `selectList`, a `filter`/`having`
@@ -1245,24 +1365,11 @@ pub(super) fn collect_all_column_names(
     value: &Json,
     names: &mut std::collections::HashSet<String>,
 ) {
-    match value {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column")
-                && let Some(name) = map.get("name").and_then(|n| n.as_str())
-            {
-                names.insert(name.to_uppercase());
-            }
-            for v in map.values() {
-                collect_all_column_names(v, names);
-            }
+    walk_column_nodes(value, &mut |map| {
+        if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
+            names.insert(name.to_uppercase());
         }
-        Json::Array(items) => {
-            for item in items {
-                collect_all_column_names(item, names);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -1271,6 +1378,38 @@ pub(super) fn extract_limit(pushdown_req: &Json) -> Option<u64> {
         .get("limit")
         .and_then(|l| l.get("numElements"))
         .and_then(|n| n.as_u64())
+}
+
+/// Extract the OFFSET from the pushdown request; 0 when absent.
+///
+/// Exasol sends `limit.offset` only once `LIMIT_WITH_OFFSET` is advertised, and
+/// normalises an explicit `OFFSET 0` away entirely — so an absent key and a zero
+/// offset are the same request (verified live). Sibling of [`extract_limit`]
+/// rather than a widened return type: most call sites need the limit alone.
+pub(super) fn extract_offset(pushdown_req: &Json) -> u64 {
+    pushdown_req
+        .get("limit")
+        .and_then(|l| l.get("offset"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0)
+}
+
+/// Render the trailing window clause for a wrapper SELECT: the single seam every
+/// site that renders a final `LIMIT` shares.
+///
+/// A zero offset renders the pre-offset ` LIMIT {n}` string byte-for-byte, so an
+/// already-correct plan cannot change shape. Callers must render their own
+/// `ORDER BY` ahead of this: Exasol's grammar rejects an `OFFSET` without one.
+///
+/// The `(None, _)` arm silently drops a non-zero offset with no limit; this is
+/// unreachable in production — Exasol's grammar ties `OFFSET` to a `LIMIT` (fact 4),
+/// so a bare offset without one is rejected before it ever reaches this function.
+pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {
+    match (limit, offset) {
+        (None, _) => String::new(),
+        (Some(n), 0) => format!(" LIMIT {n}"),
+        (Some(n), m) => format!(" LIMIT {n} OFFSET {m}"),
+    }
 }
 
 /// Whether the pushdown request carries a non-empty `orderBy` array.
@@ -1385,6 +1524,79 @@ mod tests {
     use super::*;
     use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
     use vs_expression::render_df_filter_safe;
+
+    /// `walk_column_nodes` fires its callback exactly once per `column` node
+    /// wherever one is nested — inside a function's `arguments` array, a `CASE`'s
+    /// `results`, a comparison predicate's `left`/`right`, and even a `column`
+    /// node's own child object — and never for a non-`column` object, a scalar,
+    /// or an array node itself.
+    #[test]
+    fn walk_column_nodes_visits_every_nested_column_node_once() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "PLUS",
+            "arguments": [
+                {"type": "column", "name": "A", "tableName": "T"},
+                {"type": "literal_exactnumeric", "value": 1}
+            ],
+            "case": {
+                "type": "case",
+                "results": [
+                    {"type": "column", "name": "B"},
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            },
+            "predicate": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C"},
+                "right": {
+                    "type": "column",
+                    "name": "D",
+                    "nested": {"type": "column", "name": "E"}
+                }
+            }
+        });
+
+        let mut visited = Vec::new();
+        walk_column_nodes(&expr, &mut |map| {
+            visited.push(
+                map.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        });
+        visited.sort();
+
+        assert_eq!(
+            visited,
+            vec!["A", "B", "C", "D", "E"],
+            "every column node must fire exactly once, including one nested inside another column node"
+        );
+    }
+
+    /// `walk_column_nodes` never invokes its callback for a non-container root —
+    /// `Json::Null`, a scalar string, or a scalar number fall through the `_ => {}`
+    /// arm untouched, and an empty object matches `Json::Object` but has no `type`
+    /// key and no values to recurse into, so it is a no-op too. Production hands
+    /// the primitive exactly such roots unguarded: `referenced_column_projection`
+    /// (`joins/sql_builders.rs`) and `referenced_side_columns` (`rendering.rs`)
+    /// pass `pushdown_req.get("groupBy")` / `get("orderBy")` / `get("selectList")`
+    /// straight through with no `is_null()` guard.
+    #[test]
+    fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
+        let mut invocations: usize = 0;
+
+        walk_column_nodes(&serde_json::Value::Null, &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!("REGION"), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!(7), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!({}), &mut |_| invocations += 1);
+
+        assert_eq!(
+            invocations, 0,
+            "a null, scalar, or empty-object root must be a no-op: groupBy/orderBy/selectList reach walk_column_nodes unguarded"
+        );
+    }
 
     /// `strip_table_alias` removes every `tableAlias` key at any nesting depth
     /// (issue #193) while preserving `tableName` and `name`, recursing through
@@ -2055,6 +2267,39 @@ mod tests {
 
         let req2 = serde_json::json!({"limit": {"numElements": 42}});
         assert_eq!(extract_limit(&req2), Some(42));
+    }
+
+    /// `extract_offset` is a sibling accessor of `extract_limit`: 0 when the
+    /// `offset` key is absent (the shape Exasol sends for a bare `LIMIT n` and,
+    /// verified live, also for an explicit `OFFSET 0`), the value otherwise.
+    #[test]
+    fn offset_extracted_from_pushdown_request() {
+        assert_eq!(extract_offset(&serde_json::json!({})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 42}})),
+            0
+        );
+        assert_eq!(extract_offset(&serde_json::json!({"offset": 3})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 12, "offset": 3}})),
+            3
+        );
+    }
+
+    /// The one rendering seam every reachable wrapper SELECT routes through.
+    /// The `offset == 0` arm MUST stay byte-identical to the pre-change
+    /// ` LIMIT {n}` splice — every existing SQL-shape assertion depends on it.
+    #[test]
+    fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
+        assert_eq!(render_limit_offset(None, 0), "");
+        assert_eq!(render_limit_offset(None, 3), "");
+
+        for n in [0_u64, 1, 12, u64::MAX] {
+            assert_eq!(render_limit_offset(Some(n), 0), format!(" LIMIT {n}"));
+        }
+
+        assert_eq!(render_limit_offset(Some(12), 3), " LIMIT 12 OFFSET 3");
+        assert_eq!(render_limit_offset(Some(0), 3), " LIMIT 0 OFFSET 3");
     }
 
     #[test]
@@ -3963,6 +4208,35 @@ mod tests {
         );
     }
 
+    /// Scenario: a `predicate_like` over a DECIMAL-typed column pins the two pipelines'
+    /// pass-list difference. `apply_filter_type_rewrites` runs `like_subject_type_guard`
+    /// and declines (`None`), matching `like_guard_decimal_subject_declines` above.
+    /// `apply_select_item_type_rewrites` runs no LIKE-subject guard at all — a TRACKED
+    /// GAP (issue #219), NOT desired behavior — so it returns `Some` with the node
+    /// unchanged. Closing #219 is expected to flip the `Some` half of this assertion to
+    /// `None`; until then this test fails if the two pass lists are ever silently
+    /// unified.
+    #[test]
+    fn select_list_pipeline_omits_like_pass_pending_219() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "amount"},
+            "pattern": {"type": "literal_string", "value": "9%"}
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        assert_eq!(
+            apply_filter_type_rewrites(&filter, &col_types),
+            None,
+            "filter pipeline's LIKE-subject guard must decline a DECIMAL subject"
+        );
+        assert_eq!(
+            apply_select_item_type_rewrites(&filter, &col_types),
+            Some(filter.clone()),
+            "select-list pipeline runs no LIKE-subject guard (#219 tracked gap): the node must pass through unchanged"
+        );
+    }
+
     /// Scenario: LIKE on an integer column declines the whole filter. Exasol has no
     /// separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
     /// (confirmed via live payload capture this session).
@@ -4113,6 +4387,243 @@ mod tests {
         );
     }
 
+    /// Regression (#207 blind spot): a DECIMAL-typed LIKE buried inside a
+    /// `function_scalar_case`'s `arguments` (a WHEN condition) must decline the whole
+    /// filter, same as a LIKE nested under `predicate_and`/`predicate_or`/`predicate_not` —
+    /// a `LIKE` at this non-junction position is type-guarded like any other.
+    #[test]
+    fn like_guard_decimal_inside_case_declines() {
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "amount"},
+                    "pattern": {"type": "literal_string", "value": "9%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a DECIMAL LIKE buried in a function_scalar_case's arguments must decline \
+             the whole filter: {result:?}"
+        );
+    }
+
+    /// Regression (#207 blind spot): a DATE-typed LIKE buried inside a
+    /// `function_scalar_case`'s `arguments` (a WHEN condition) is rewritten in place as
+    /// `CAST(<col> AS VARCHAR)`, with the enclosing CASE structure (its `results`
+    /// THEN/ELSE branches) preserved unchanged — a `LIKE` at this non-junction position
+    /// is type-guarded like any other.
+    #[test]
+    fn like_guard_date_inside_case_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let then_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+        let else_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 0});
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": column.clone(),
+                    "pattern": {"type": "literal_string", "value": "2024%"}
+                }
+            ],
+            "results": [then_branch.clone(), else_branch.clone()]
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {
+                        "type": "function_scalar_cast",
+                        "name": "CAST",
+                        "dataType": {"type": "VARCHAR"},
+                        "arguments": [column]
+                    },
+                    "pattern": {"type": "literal_string", "value": "2024%"}
+                }
+            ],
+            "results": [then_branch, else_branch]
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "a DATE LIKE buried in a function_scalar_case's arguments must be rewrapped \
+             in CAST(<col> AS VARCHAR) in place, with the CASE's results preserved: {result:?}"
+        );
+    }
+
+    /// The widened traversal must not cost a working pushdown: a VARCHAR-typed LIKE
+    /// buried inside a `function_scalar_case`'s `arguments` is now reached (it was not,
+    /// pre-migration), but since VARCHAR needs no rewrap the returned tree must equal
+    /// the input tree exactly, byte for byte.
+    #[test]
+    fn like_guard_varchar_inside_case_unchanged() {
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "name"},
+                    "pattern": {"type": "literal_string", "value": "A%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        let col_types = vec![("NAME".to_string(), "VARCHAR(20)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "a VARCHAR LIKE buried in a function_scalar_case's arguments must be \
+             returned unchanged: {result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // rewrite_expr_tree — the shared post-order traversal primitive
+    // ---------------------------------------------------------------------------
+
+    /// Post-order: when `f` runs on a node, that node's curated children are
+    /// already their rewritten selves. Proven without interior mutability — the
+    /// closure copies the child's (rewritten) type onto the parent, so the
+    /// assertion can only hold if the child was rewritten first.
+    #[test]
+    fn expr_tree_applies_f_to_children_before_their_parent() {
+        let tree = serde_json::json!({
+            "type": "outer",
+            "expression": {"type": "inner"},
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            let mut out = node.clone();
+            if node.get("type").and_then(|t| t.as_str()) == Some("inner") {
+                out["type"] = Json::from("inner_rewritten");
+            } else {
+                out["child_type_seen"] = node["expression"]["type"].clone();
+            }
+            Some(out)
+        })
+        .expect("an always-Some closure must never decline");
+
+        assert_eq!(
+            out["child_type_seen"],
+            Json::from("inner_rewritten"),
+            "the parent must see its already-rewritten child: {out}"
+        );
+    }
+
+    /// A `None` from `f` at any depth declines the WHOLE tree — it propagates out
+    /// through every enclosing level instead of dropping only the declining
+    /// subtree.
+    #[test]
+    fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
+        let tree = serde_json::json!({
+            "type": "root",
+            "expressions": [
+                {"type": "keep"},
+                {"type": "branch", "left": {"type": "decline_here"}},
+            ],
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            if node.get("type").and_then(|t| t.as_str()) == Some("decline_here") {
+                return None;
+            }
+            Some(node.clone())
+        });
+
+        assert_eq!(
+            out, None,
+            "a declined descendant must decline the whole tree"
+        );
+    }
+
+    /// Only the curated fields are descended into, and only in the shapes the
+    /// grammar sends: an array field must be a `Json::Array`, a single-child field
+    /// must be an object. A node's object-valued `dataType` sub-object is never
+    /// handed to `f`, so no guard can rewrite a declared type; `name` is excluded
+    /// too, since it always carries a bare identifier string, never an object.
+    #[test]
+    fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
+        let tree = serde_json::json!({
+            "type": "root",
+            "dataType": {"type": "VARCHAR"},
+            "arguments": {"type": "not_an_array"},
+            "pattern": "not_an_object",
+            "expression": {"type": "curated_single"},
+            "results": [{"type": "curated_array"}],
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            let mut out = node.clone();
+            out["visited"] = Json::Bool(true);
+            Some(out)
+        })
+        .expect("an always-Some closure must never decline");
+
+        assert_eq!(
+            out["expression"]["visited"],
+            Json::Bool(true),
+            "curated field `expression` must be descended into: {out}"
+        );
+        assert_eq!(
+            out["results"][0]["visited"],
+            Json::Bool(true),
+            "curated field `results` must be descended into: {out}"
+        );
+        for skipped in ["dataType", "arguments"] {
+            assert_eq!(
+                out[skipped]["visited"],
+                Json::Null,
+                "`{skipped}` must not be descended into: {out}"
+            );
+        }
+        assert_eq!(
+            out["pattern"],
+            Json::from("not_an_object"),
+            "a non-object single-child field must be left untouched: {out}"
+        );
+    }
+
+    /// A non-object node reaches `f` too: the primitive has no leaf early-return,
+    /// which is what lets the migrated walkers drop theirs.
+    #[test]
+    fn expr_tree_applies_f_to_a_non_object_node() {
+        for leaf in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                rewrite_expr_tree(&leaf, &|_| Some(Json::from("touched"))),
+                Some(Json::from("touched")),
+                "a non-object node must be handed to `f`: {leaf}"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // rewrite_decimal_stringifications — issue #211 decimal-trim JSON rewrite
     // ---------------------------------------------------------------------------
@@ -4146,6 +4657,25 @@ mod tests {
             "dataType": {"type": target},
             "arguments": [arg],
         })
+    }
+
+    /// A non-object node is returned unchanged: `rewrite_expr_tree` finds no curated
+    /// child on it, so the always-`Some` closure's catch-all arm clones it.
+    #[test]
+    fn decimal_rewrite_passes_through_non_object_node() {
+        let col_types = decimal_rewrite_col_types();
+        for node in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                rewrite_decimal_stringifications(&node, &col_types),
+                node.clone(),
+                "a non-object node must be passed through: {node}"
+            );
+        }
     }
 
     /// `CAST(<decimal column> AS VARCHAR)` → the WHOLE cast node is replaced by a
@@ -5294,8 +5824,7 @@ mod tests {
     }
 
     /// The guard reaches a string function nested under a COMPARISON predicate (under
-    /// `left`) — the reach `like_subject_type_guard`'s junction-only recursion does not
-    /// have, and the shape issue #210's WHERE-clause repro takes.
+    /// `left`) — the shape issue #210's WHERE-clause repro takes.
     #[test]
     fn string_fn_guard_reaches_function_under_comparison_predicate() {
         let col_types = decimal_rewrite_col_types();
