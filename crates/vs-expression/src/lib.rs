@@ -35,10 +35,9 @@ use serde_json::Value as Json;
 ///   arity check.
 /// - `Shaped` — falls through to the per-name arm, which owns both dialects.
 ///
-/// Six constructs have an Exasol form the gate's `<NAME>(<rendered args>)`
-/// rule cannot derive — either because it is not a call at all, or because
-/// the DataFusion side is not — and are `Shaped`, each for a different
-/// reason:
+/// Ten names have an Exasol form the gate's `<NAME>(<rendered args>)` rule
+/// cannot derive — either because it is not a call at all, or because the
+/// DataFusion side is not — and are `Shaped`. They fall into six groups:
 /// - the five operator wire names `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` —
 ///   SQL operators, not calls;
 /// - `MOD` — Exasol requires the `MOD(a, b)` form, DataFusion the `%`

@@ -107,7 +107,7 @@ Exasol combines these partial values into the final result.
 
 ## Handled by Exasol
 
-The adapter does not push these capabilities to the scan. Exasol computes them on the returned partial results. The results are correct and fast. A capability lives in this section for one of two reasons: (a) it is not decomposable into a partial/merge plan, or (b) the scan cannot evaluate it at all, because the scan holds no clock, time zone, or statement context.
+The adapter does not push these capabilities to the scan. Exasol computes them on the returned partial results, or evaluates them itself post-scan. The results are always correct; not always fast — a capability lives in this section for one of two reasons: (a) it is not decomposable into a partial/merge plan (results are correct and fast), or (b) the scan cannot evaluate it at all, because the scan holds no clock, time zone, or statement context (correct, but the predicate prunes no files).
 
 | Capability | Example | Where it runs |
 |---|---|---|
