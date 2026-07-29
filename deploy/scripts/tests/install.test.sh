@@ -385,15 +385,28 @@ test_missing_prereq_fails_fast() {
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
 }
 
-test_missing_github_token_fails_fast() {
-  echo "== test_missing_github_token_fails_fast =="
+test_github_token_is_optional() {
+  echo "== test_github_token_is_optional =="
+
+  # Both source repos are public: a run with no token at all must still succeed, and must never
+  # send a malformed empty Authorization header to GitHub (GitHub 401s on that, worse than
+  # sending none). SaaS mode also sends its OWN unrelated "Authorization: Bearer <PAT>" to the
+  # SaaS REST API, so scope the check to lines that actually hit api.github.com.
   reset_env
   unset GITHUB_TOKEN
   run_file --account-id ACC1 --database-id DB1 --profile staging
-  assert_rc_nonzero "missing github token: nonzero exit" "$LAST_RC"
-  assert_contains "missing github token: names GITHUB_TOKEN" "$LAST_OUT" "GITHUB_TOKEN"
-  assert_contains "missing github token: names --github-token" "$LAST_OUT" "--github-token"
-  assert_eq "missing github token: no network/SQL call made before failing" "" "$(log_content)"
+  assert_eq "no token: succeeds" "0" "$LAST_RC"
+  local gh_lines
+  gh_lines="$(printf '%s\n' "$(log_content)" | grep 'api.github.com' || true)"
+  assert_not_contains "no token: no Authorization header sent to GitHub" "$gh_lines" "Authorization"
+
+  # An explicit token IS still honored, e.g. to raise the unauthenticated rate limit.
+  reset_env
+  unset GITHUB_TOKEN
+  run_file --account-id ACC1 --database-id DB1 --profile staging --github-token EXPLICITGHTOKEN789
+  assert_eq "explicit token: succeeds" "0" "$LAST_RC"
+  gh_lines="$(printf '%s\n' "$(log_content)" | grep 'api.github.com' || true)"
+  assert_contains "explicit token: sent on the GitHub calls" "$gh_lines" "Authorization: Bearer EXPLICITGHTOKEN789"
 }
 
 test_connectivity_mode_either_or() {
@@ -1601,7 +1614,7 @@ test_usage_is_mode_aware() {
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
-  test_missing_github_token_fails_fast
+  test_github_token_is_optional
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials

@@ -389,3 +389,40 @@ It never derives, and never reads the value of, the BucketFS write password. See
   it — the hand-driven local verification ran against a container that already had a matching SLC
   registered, so it drove the engine path and the DDL, not `register_slc`.
 - **Promotes to ADR:** yes
+
+### [13] `GITHUB_TOKEN` reversed from required to optional — both repos went public
+
+- **Context:** Decision [3] made `GITHUB_TOKEN`/`--github-token` required in both targets, because
+  at the time `lakehouse-engine-rs` was private and no unauthenticated GitHub call worked for the
+  script fetch, `releases/latest` resolution, or the asset download. Both `lakehouse-engine-rs` and
+  `language-container-rs` have since been made public repositories. The requirement outlived its
+  reason: it also had a sharper bug than "required" implied — every GitHub `curl` call sent
+  `Authorization: Bearer $ARG_GITHUB_TOKEN` unconditionally, so even bypassing the `validate_required`
+  check by exporting an empty `GITHUB_TOKEN` would still send a malformed empty bearer header, which
+  GitHub rejects with 401 rather than treating as anonymous.
+- **Decision:** Drop the `validate_required` hard-required check entirely (it had no other
+  content). `--github-token`/`GITHUB_TOKEN` is now optional everywhere: a new `set_github_auth_args`
+  populates a `GITHUB_AUTH_ARGS` array with the `-H "Authorization: Bearer <token>"` pair only when
+  a token was actually given, and every GitHub `curl` call (`resolve_versions`,
+  `download_release_asset`) splices in `"${GITHUB_AUTH_ARGS[@]}"` instead of the header literal. An
+  unset/empty token now means "send no `Authorization` header," never "send an empty one." A token
+  is still accepted and still useful — it raises the unauthenticated 60-requests/hour GitHub REST
+  API rate limit.
+- **Options Considered:**
+
+  | Option | Verdict |
+  |--------|---------|
+  | Token optional, header omitted when absent | ✓ Chosen — matches the repos' actual (public) visibility, fixes the empty-bearer-header 401 bug, and keeps the rate-limit escape hatch for heavy/CI use |
+  | Remove `--github-token`/`GITHUB_TOKEN` entirely | ✗ Rejected — a shared-egress-IP CI runner can still hit the 60/hour unauthenticated cap; the flag is cheap to keep and removes a real escape hatch if dropped |
+  | Leave the requirement in place | ✗ Rejected — asks every operator for a token a public repo does not need, and still carries the empty-bearer-header bug for anyone who worked around the check |
+
+- **Consequences:** The one-liners in `docs/install.md` and the header comment in `install.sh` no
+  longer `export GITHUB_TOKEN=<token>` before the `curl | bash`. The "manual install on a restricted
+  network" appendix's release-tarball step now uses the plain, unauthenticated
+  `releases/download/<tag>/<asset>` URL instead of the two-step authenticated release-by-tag +
+  asset-by-id API dance, which was only ever needed for a private repo. `install.sh`'s own
+  `download_release_asset` (used by the one-line installer, not the manual appendix) keeps the
+  asset-by-id API mechanism unchanged, now called unauthenticated by default, since rewriting it to
+  the plain download URL is a separate, larger change not required to fix the token requirement.
+- **Promotes to ADR:** no — a narrow reversal of [3] tracked here is sufficient; nothing here
+  changes the architecture [3] and [4] established.

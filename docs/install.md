@@ -26,21 +26,20 @@ example is a network with no path to GitHub.
   or `exapump profile init`). This is true for BucketFS targets even when you connect with
   `--dsn` or `--host`. The reason: `exapump bucketfs cp` always reads its connection from a
   profile, plus any `--bfs-*` overrides you give.
-- A GitHub token with read access to this repo (private) and to
-  [`language-container-rs`](https://github.com/exasol-labs/language-container-rs) (public). The
-  install script uses one token for both.
+- A GitHub token is optional. Both this repo and
+  [`language-container-rs`](https://github.com/exasol-labs/language-container-rs) are public;
+  pass `--github-token`/`GITHUB_TOKEN` only to raise the unauthenticated GitHub API rate limit
+  (60 requests/hour per IP) if you hit it.
 
 ## Install with one command
 
-Because this repo is private, download the script through the authenticated GitHub contents
-API. Do not use a plain `releases/download/...` URL: that URL does not work on a private repo.
+Download the script through the GitHub contents API — no authentication needed, since the repo
+is public.
 
 ### Exasol SaaS
 
 ```bash
-export GITHUB_TOKEN=<your-token>
-
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
+curl -fsSL -H "Accept: application/vnd.github.raw" \
   https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 | bash -s -- --account-id <ACCOUNT_ID> --database-id <DATABASE_ID> --profile <PROFILE>
 ```
@@ -56,9 +55,7 @@ covers the [bundled Docker stack](#local-dev-stack) too.
 With a profile that already has `bfs_host` and `bfs_write_password` set:
 
 ```bash
-export GITHUB_TOKEN=<your-token>
-
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
+curl -fsSL -H "Accept: application/vnd.github.raw" \
   https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 | bash -s -- --profile <PROFILE>
 ```
@@ -67,9 +64,7 @@ With direct connection flags instead of a profile's connection fields, give the 
 explicitly:
 
 ```bash
-export GITHUB_TOKEN=<your-token>
-
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
+curl -fsSL -H "Accept: application/vnd.github.raw" \
   https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 | bash -s -- --host <host:port> --user <user> --password <password> \
     --bfs-host <bfs-host> --bfs-write-password <bfs-write-password>
@@ -103,7 +98,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--profile <name>` | An `exapump` named profile. One of three connectivity flags. Give exactly one. |
 | `--dsn <dsn>` | A direct `exapump` DSN. You can set `EXAPUMP_DSN` instead. |
 | `--host <host:port> --user <u> --password <p>` | A direct connection. `--host` must include the port. There is no separate `--port` flag. |
-| `--github-token <token>` | Required in both targets. You can set `GITHUB_TOKEN` instead. |
+| `--github-token <token>` | Optional, both targets. Raises the unauthenticated GitHub API rate limit. You can set `GITHUB_TOKEN` instead. |
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
@@ -128,7 +123,7 @@ Run `bash deploy/scripts/install.sh --help` to see the same reference from the s
 Pin the engine and the SLC to matching versions with `--lakehouse-version` and `--slc-version`:
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
+curl -fsSL -H "Accept: application/vnd.github.raw" \
   "https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh?ref=v0.9.0" \
 | bash -s -- --profile <PROFILE> --lakehouse-version 0.9.0 --slc-version <slc-version>
 ```
@@ -260,26 +255,16 @@ This path needs no Docker, no Rust toolchain, and no local build.
 ### 1. Download the release tarball
 
 Every [GitHub Release](https://github.com/exasol-labs/lakehouse-engine-rs/releases) includes a
-prebuilt `lakehouse-engine.tar.gz`. This repo is private, so a plain `releases/download/...` URL
-does not work. Download the asset through the authenticated GitHub API instead, in two steps.
-
-First, look up the release and find the asset ID for `lakehouse-engine.tar.gz`:
+prebuilt `lakehouse-engine.tar.gz`. The repo is public, so the plain release-download URL works,
+with no GitHub API call and no token:
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-  "https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/releases/tags/v<VERSION>"
+curl -fsSL -o lakehouse-engine.tar.gz \
+  "https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine.tar.gz"
 ```
 
-Pin `<VERSION>` to the release you install. Find the `id` field of the asset named
-`lakehouse-engine.tar.gz` in the response. Then download that asset by ID:
-
-```bash
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/octet-stream" \
-  "https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/releases/assets/<ASSET_ID>" \
-  -o lakehouse-engine.tar.gz
-```
-
-The archive contains the file at `udf/liblakehouse_engine.so`.
+Pin `<VERSION>` to the release you install. The archive contains the file at
+`udf/liblakehouse_engine.so`.
 
 ### 2. Upload the tarball to BucketFS
 

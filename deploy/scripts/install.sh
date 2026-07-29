@@ -5,9 +5,10 @@
 # product install and prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does
 # NOT create catalog objects.
 #
-# Distributed one-liner (piped into bash over stdin):
-#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-#     -H "Accept: application/vnd.github.raw" \
+# Distributed one-liner (piped into bash over stdin). Both source repos are public, so no
+# token is required; pass --github-token/GITHUB_TOKEN only to raise the unauthenticated
+# 60-requests/hour GitHub API rate limit:
+#   curl -fsSL -H "Accept: application/vnd.github.raw" \
 #     https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 #   | bash -s -- --account-id $ACC --database-id $DB --profile staging
 #
@@ -340,9 +341,9 @@ Connectivity (both modes; exactly one of the three):
                             direct connection assembled into a DSN; --host MUST include the port
                             (e.g. myhost:8563) - there is no --port flag
 
-Required in both modes:
-  --github-token <token>    GitHub token with read access to the private lakehouse-engine-rs
-                            repo (or set GITHUB_TOKEN)
+Optional in both modes (both repos are public; a token only raises the unauthenticated
+60-requests/hour GitHub API rate limit):
+  --github-token <token>    GitHub token (or set GITHUB_TOKEN)
 
 SaaS target only:
   --account-id <id>         SaaS account id (from the SaaS web console)
@@ -441,18 +442,6 @@ parse_args() {
   return 0
 }
 
-# Mode-independent required fields. The SaaS-specific requirement (BOTH --account-id and
-# --database-id) is enforced by resolve_target_mode itself -- having both IS what selects the SaaS
-# target -- so main() must resolve the target mode BEFORE calling this. The BucketFS-specific
-# requirements live in validate_bucketfs_required.
-validate_required() {
-  local missing=0
-  if [[ -z "$ARG_GITHUB_TOKEN" ]]; then
-    err "missing GitHub token: pass --github-token or set GITHUB_TOKEN (a token with read access to the private $ENGINE_REPO repository)"
-    missing=1
-  fi
-  [[ "$missing" -eq 0 ]]
-}
 
 # Prints the resolved connectivity mode (profile|dsn|host) on stdout, or errors and returns 1.
 # Reads the ARG_* globals directly (consistent with the rest of the file).
@@ -636,6 +625,21 @@ resolve_saas_base() {
   fi
 }
 
+# --- GitHub auth --------------------------------------------------------------
+# Populates GITHUB_AUTH_ARGS with the -H Authorization header args for a GitHub REST call, or
+# leaves it empty. Both lakehouse-engine-rs and language-container-rs are public repos, so a
+# token is optional -- it only raises the unauthenticated 60-requests/hour rate limit. An empty
+# token must never be sent: GitHub rejects a malformed `Authorization: Bearer` (no value) with
+# 401, which is worse than sending no Authorization header at all.
+GITHUB_AUTH_ARGS=()
+set_github_auth_args() {
+  GITHUB_AUTH_ARGS=()
+  if [[ -n "$ARG_GITHUB_TOKEN" ]]; then
+    GITHUB_AUTH_ARGS=(-H "Authorization: Bearer $ARG_GITHUB_TOKEN")
+  fi
+  return 0
+}
+
 # --- Version resolution ------------------------------------------------------
 normalize_version() {
   local v="$1"
@@ -651,12 +655,13 @@ version_to_tag() {
 }
 
 resolve_versions() {
+  set_github_auth_args
   if [[ -n "$ARG_LAKEHOUSE_VERSION" ]]; then
     RESOLVED_ENGINE_TAG="$(version_to_tag "$ARG_LAKEHOUSE_VERSION")"
   else
     local ej
-    if ! ej="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
-      err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API. Ensure GITHUB_TOKEN/--github-token has read access to the private repo."
+    if ! ej="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
+      err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API. If this is a rate limit, pass --github-token/GITHUB_TOKEN."
       return 1
     fi
     if ! RESOLVED_ENGINE_TAG="$(extract_json_string_field "$ej" "tag_name")"; then
@@ -670,7 +675,7 @@ resolve_versions() {
     RESOLVED_SLC_TAG="$(version_to_tag "$ARG_SLC_VERSION")"
   else
     local sj
-    if ! sj="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
+    if ! sj="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
       err "could not resolve the latest $SLC_REPO release via the GitHub REST API."
       return 1
     fi
@@ -1000,8 +1005,9 @@ smoke_test_sql() {
 download_release_asset() {
   local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
   local release_json asset_id dl_err
+  set_github_auth_args
 
-  if ! release_json="$(curl -fsS -H "Authorization: Bearer $ARG_GITHUB_TOKEN" \
+  if ! release_json="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" \
       "https://api.github.com/repos/$repo/releases/tags/$tag" </dev/null 2>&1)"; then
     err "could not fetch release '$tag' from $repo via the GitHub REST API."
     return 1
@@ -1012,7 +1018,7 @@ download_release_asset() {
     return 1
   fi
 
-  if ! dl_err="$(curl -fsSL -H "Authorization: Bearer $ARG_GITHUB_TOKEN" \
+  if ! dl_err="$(curl -fsSL "${GITHUB_AUTH_ARGS[@]}" \
       -H "Accept: application/octet-stream" \
       -o "$dest_path" \
       "https://api.github.com/repos/$repo/releases/assets/$asset_id" </dev/null 2>&1)"; then
@@ -1170,7 +1176,6 @@ main() {
   if ! TARGET_MODE="$(resolve_target_mode)"; then
     exit 1
   fi
-  validate_required || exit 1
   if ! CONNECTIVITY_MODE="$(validate_connectivity)"; then
     exit 1
   fi

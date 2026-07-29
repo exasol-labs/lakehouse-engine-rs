@@ -4,7 +4,7 @@ Everything `deploy/scripts/install.sh` decides **before it touches the network**
 
 This feature also owns the installer's own **distribution contract**: how the script reaches the operator's shell, and how a run is pinned for reproducibility.
 
-Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereqs`, `resolve_target_mode`, `resolve_bfs_bucket_from_profile`, `resolve_target_layout`, `validate_bucketfs_required`, `resolve_saas_pat`, `resolve_saas_base`, `resolve_versions`, and `usage`, plus the documented one-liner in `docs/install.md`. The SLC step is `packaging/install-script-slc-registration`; the engine artifact, the DDL and the smoke test are `packaging/install-script-deploy`.
+Scope: `parse_args`, `validate_connectivity`, `check_prereqs`, `resolve_target_mode`, `resolve_bfs_bucket_from_profile`, `resolve_target_layout`, `validate_bucketfs_required`, `set_github_auth_args`, `resolve_saas_pat`, `resolve_saas_base`, `resolve_versions`, and `usage`, plus the documented one-liner in `docs/install.md`. The SLC step is `packaging/install-script-slc-registration`; the engine artifact, the DDL and the smoke test are `packaging/install-script-deploy`.
 
 ## Background
 
@@ -14,7 +14,7 @@ Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereq
 * `exapump bucketfs` is **not** `exapump sql`: it accepts no `--dsn`, `--user` or `--password`, only a named profile plus `--bfs-*` overrides. It also requires at least one profile to exist in the exapump config **even when every `--bfs-*` flag is supplied explicitly** — verified live against an empty `~/.exapump/config.toml`, where `exapump bucketfs ls` fails with `Error: No profiles found in config`.
 * BucketFS paths given to `exapump` are **bucket-relative**: no leading slash and no bucket segment (`udf/liblakehouse_engine.so`), because `exapump` builds its URL as `<scheme>://<bfs-host>:<bfs-port>/<bucket>/<path>` and takes the bucket from `--bfs-bucket` or the profile. The bucket name DOES appear in `%udf_object` and in the RUST alias, because those strings are read by the Exasol engine, not by `exapump`.
 * On Exasol SaaS the personal access token IS the SQL password, so the REST bearer credential is derived from whichever connectivity mode was chosen rather than asked for a second time. This reasoning is SaaS-specific and does not generalize — see `packaging/install-script-slc-registration` and `packaging/install-script-deploy` for the BucketFS write password, which is only ever checked for presence.
-* The repository is private, so no unauthenticated URL works for the script or for a release asset. One bearer token (`--github-token` / `GITHUB_TOKEN`) authenticates every GitHub access, including the fetch of the installer itself; the same token is sent to the public `language-container-rs`, keeping exactly one authenticated code path.
+* Both `lakehouse-engine-rs` and `language-container-rs` are public repositories, so every GitHub access (the installer fetch, `releases/latest` resolution, and asset download) works unauthenticated. A bearer token (`--github-token` / `GITHUB_TOKEN`) is optional and adds an `Authorization` header when given, purely to raise the unauthenticated 60-requests/hour GitHub REST API rate limit; `set_github_auth_args` builds that header (or leaves it empty) once per call site, and an empty/unset token must never be sent as a malformed `Authorization: Bearer` header, since GitHub 401s on that rather than treating it as anonymous.
 * The RUST `SCRIPT_LANGUAGES` alias carries no SLC version — the version lives in the uploaded tarball's content — so `TARGET_RUST_LANG_SEGMENT` varies by target only, never by version.
 
 ## Scenarios
@@ -38,12 +38,12 @@ Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereq
 * *AND* this SHALL hold even in `--dsn` or `--host` connectivity mode with `--bfs-host`, `--bfs-port`, `--bfs-bucket` and `--bfs-write-password` all supplied explicitly — the requirement belongs to `exapump bucketfs`, which accepts no DSN or user/password flags of its own
 * *AND* the documented prerequisites SHALL state this as a requirement of the BucketFS target rather than as an edge case
 
-### Scenario: A missing GitHub token stops the run before the first network call
+### Scenario: A GitHub token is optional and never sent malformed
 
 * *GIVEN* an invocation with neither `--github-token` nor `GITHUB_TOKEN` set
-* *WHEN* the installer validates its required inputs
-* *THEN* it SHALL exit non-zero naming both `--github-token` and `GITHUB_TOKEN`, and SHALL state that the token needs read access to the private `exasol-labs/lakehouse-engine-rs` repository
-* *AND* it SHALL make no network call before failing, because a token is required by both targets and by every subsequent GitHub access
+* *WHEN* the installer makes any GitHub REST API call (version resolution, release-by-tag lookup, asset download)
+* *THEN* the run SHALL still succeed, and no `Authorization` header SHALL be sent on that call, because both `exasol-labs/lakehouse-engine-rs` and `exasol-labs/language-container-rs` are public repositories
+* *AND* GIVEN `--github-token` or `GITHUB_TOKEN` IS set, every GitHub REST API call SHALL send `Authorization: Bearer <token>`, to raise the unauthenticated 60-requests/hour rate limit
 
 ### Scenario: Exactly one connectivity mode is required
 
@@ -144,13 +144,12 @@ Scope: `parse_args`, `validate_required`, `validate_connectivity`, `check_prereq
 * *AND* `--staging` SHALL select `https://cloud-staging.exasol.com`
 * *AND* a default run SHALL never contact the staging host
 
-### Scenario: The installer is distributed through the authenticated GitHub contents API on `main`
+### Scenario: The installer is distributed through the GitHub contents API on `main`
 
 * *GIVEN* an operator installing with the documented one-liner
 * *WHEN* they fetch the script
-* *THEN* the documented URL SHALL be the authenticated GitHub **contents API** for `deploy/scripts/install.sh` on `main`, sent with `Authorization: Bearer $GITHUB_TOKEN` and `Accept: application/vnd.github.raw`, and piped into `bash -s -- <flags>`
+* *THEN* the documented URL SHALL be the GitHub **contents API** for `deploy/scripts/install.sh` on `main`, sent with `Accept: application/vnd.github.raw` and no `Authorization` header, and piped into `bash -s -- <flags>`
 * *AND* the installer SHALL NOT be published as a release asset, because a release asset would freeze the installer at its release-time state and ship an installer bug forever inside every past release
-* *AND* a plain `raw.githubusercontent.com` or `releases/download/...` URL SHALL NOT be documented, because neither works against a private repository
 * *AND* a run SHALL be pinnable in two independent dimensions: `?ref=<tag>` appended to the same contents-API URL pins the SCRIPT, while `--lakehouse-version` and `--slc-version` pin the ARTIFACTS; the documentation SHALL present them together, because pinning only one gives a mismatched pair
 * *AND* because `main` is therefore a live distribution channel with no release gate before a user's next fetch, the install-script CI jobs SHALL be required checks AND SHALL block the `release` job
 
