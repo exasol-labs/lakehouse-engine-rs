@@ -16,6 +16,7 @@ use super::stack::{
     lakehouse_engine_so_path, local_stack_connection_password, minio_url, upload_to_bucketfs,
 };
 
+use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageProps};
@@ -347,7 +348,6 @@ pub fn local_stack_storage() -> StorageProps {
 /// `CatalogProps` for the host-visible local Docker stack, for `table`.
 pub fn local_stack_catalog(table: &str) -> CatalogProps {
     CatalogProps {
-        uri: iceberg_catalog_url(),
         warehouse: "s3://warehouse/".to_string(),
         table: table.to_string(),
     }
@@ -366,8 +366,11 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
     let catalog_props = local_stack_catalog(&format!("{namespace}.{table}"));
     let storage = local_stack_storage();
     let creds = local_stack_creds();
+    let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds)
+        .await
+        .unwrap_or_else(|e| panic!("CatalogSession::resolve({table}) must succeed: {e}"));
 
-    let (files, ..) = resolve_file_list(&catalog_uri, &catalog_props, &storage, &creds, None)
+    let (files, ..) = resolve_file_list(&session, &catalog_props, &storage, &creds, None)
         .await
         .unwrap_or_else(|e| panic!("resolve_file_list({table}) must succeed: {e}"));
     files

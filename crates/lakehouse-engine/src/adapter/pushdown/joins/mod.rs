@@ -3,9 +3,9 @@ use crate::scan::spec::{CatalogProps, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::credentials::CatalogSession;
 use super::file_resolution::empty_result_sql;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
+use lakehouse_catalog::CatalogSession;
 
 mod planning;
 mod rendering;

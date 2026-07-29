@@ -9,19 +9,19 @@ pub mod pushdown;
 #[cfg(test)]
 mod pushdown_surface_probe;
 pub mod sharding;
-pub mod sigv4;
 pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
-use crate::adapter::pushdown::{handle_pushdown, list_namespace_tables, resolve_table_schema};
+use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageProps;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
+use lakehouse_catalog::{CatalogSession, list_namespace_tables};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 
@@ -247,22 +247,9 @@ fn handle_create_virtual_schema(
         })
         .map_err(|e| redact_error(&storage, e))?;
 
-    // `build_virtual_tables` is pure (no `ctx`, no `storage`) so it cannot redact
-    // its own propagated abort-path errors — the caller applies the same
-    // `redact_error` the old inline loop applied per-table, now applied once over
-    // the whole enumeration result, preserving the no-credential-leak guarantee.
-    let (tables_json, table_map, skipped_idents) = build_virtual_tables(
-        &configured_ns,
-        &table_idents,
-        |ident: &iceberg::TableIdent| {
-            let iceberg_id = iceberg_identifier_string(ident);
-            let per_table_catalog = catalog_block(&creds, &catalog_uri, &iceberg_id);
-            rt.block_on(async {
-                resolve_table_schema(&catalog_uri, &per_table_catalog, &creds).await
-            })
-        },
-    )
-    .map_err(|e| redact_error(&storage, e))?;
+    let (tables_json, table_map, skipped_idents) =
+        resolve_namespace_virtual_tables(&rt, &catalog_uri, &creds, &configured_ns, &table_idents)
+            .map_err(|e| redact_error(&storage, e))?;
 
     for ident in &skipped_idents {
         udf_log!(
@@ -296,6 +283,54 @@ fn handle_create_virtual_schema(
     });
 
     Ok(build_schema_response(request, schema_metadata))
+}
+
+/// Resolve every enumerated table's schema into its `createVirtualSchema` entry.
+///
+/// Owns the catalog session for the whole enumeration, so the schema loop's OAuth2
+/// grant and `/v1/config` lookup each run once for the namespace instead of once per
+/// table — sound because a session is scoped to one `(catalog_uri, warehouse)` tuple
+/// and every table here shares both, varying only `CatalogProps.table`.
+///
+/// An EMPTY namespace builds NO session and therefore makes no catalog contact at
+/// all. That input is reachable (a namespace with no tables) and it is what the
+/// pre-hoist per-table loop cost for it: hoisting the build unconditionally would
+/// charge an empty enumeration an OAuth2 grant it never needed and would fail a
+/// request that used to succeed with an empty table list. With at least one table the
+/// build happens before the loop, so a grant failure surfaces once for the whole
+/// request rather than at whichever table happened to be resolved first.
+///
+/// `list_namespace_tables` keeps its own independent auth path and is deliberately
+/// NOT folded onto this session, so on the OAuth2 client-credentials mode its
+/// `RestCatalog` grant remains and such a request still performs two grants in total,
+/// not one.
+///
+/// Errors propagate unredacted — no `ctx` and no `StorageProps` reach here, so the
+/// caller applies the same `redact_error` the old inline loop applied per-table, once
+/// over the whole enumeration result, preserving the no-credential-leak guarantee.
+fn resolve_namespace_virtual_tables(
+    rt: &tokio::runtime::Runtime,
+    catalog_uri: &str,
+    creds: &ConnectionCreds,
+    configured_ns: &[String],
+    table_idents: &[iceberg::TableIdent],
+) -> Result<VirtualTables, UdfError> {
+    if table_idents.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let session =
+        rt.block_on(async { CatalogSession::resolve(catalog_uri, &creds.warehouse, creds).await })?;
+
+    build_virtual_tables(
+        configured_ns,
+        table_idents,
+        |ident: &iceberg::TableIdent| {
+            let iceberg_id = iceberg_identifier_string(ident);
+            let per_table_catalog = catalog_block(creds, &iceberg_id);
+            rt.block_on(async { resolve_table_schema(&session, &per_table_catalog, creds).await })
+        },
+    )
 }
 
 /// Assemble the createVirtualSchema / refresh / setProperties response.
@@ -372,7 +407,7 @@ async fn handle_pushdown_request(
 
     // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
-    let catalog = catalog_block(creds, catalog_uri, &iceberg_identifier);
+    let catalog = catalog_block(creds, &iceberg_identifier);
 
     handle_pushdown(
         request,
@@ -992,7 +1027,8 @@ fn exasol_type_to_json(exasol_type: &str) -> Json {
 
 /// Returns `true` iff `err` is the catalog's "table not found" (HTTP 404)
 /// signal — the deterministic prefix the single catalog error site
-/// (`authed_get_json`'s non-success branch in `pushdown::credentials`) emits as
+/// (`authed_get_json`'s non-success branch in `lakehouse_catalog`'s
+/// `iceberg_io`) emits as
 /// `format!("catalog returned HTTP {}: {}", status.as_u16(), redact(&body))`.
 ///
 /// A 404 marks a namespace entry that is absent or not an Iceberg table (AWS
@@ -2863,6 +2899,56 @@ mod tests {
         assert!(tables_json.is_empty(), "no Iceberg table → empty tables");
         assert!(table_map.is_empty(), "no survivor → empty TABLE_MAP");
         assert_eq!(skipped.len(), 2, "every non-Iceberg table is skipped");
+    }
+
+    /// A namespace the catalog reports as holding NO table costs zero catalog
+    /// contact: there is nothing to resolve, so no session is built.
+    ///
+    /// Driven against an unreachable `catalog_uri` with OAuth2 client-credentials —
+    /// the mode whose session build issues a token grant — so an unguarded build
+    /// could only fail. The call must still succeed with an empty table list, which
+    /// is the boundary an unconditionally hoisted session build silently changed:
+    /// one grant instead of none, and a request that used to return an empty schema
+    /// now failing on the grant.
+    #[test]
+    fn create_virtual_schema_over_empty_namespace_contacts_no_catalog_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let creds = ConnectionCreds {
+            warehouse: "warehouse".into(),
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            session_token: None,
+            path_style: true,
+            use_sigv4: false,
+            use_vended_credentials: false,
+            token: None,
+            client_id: Some("oauth-client-id-sentinel".into()),
+            client_secret: Some("oauth-client-secret-sentinel".into()),
+            oauth2_server_uri: None,
+            scope: None,
+        };
+        let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+
+        let (tables_json, table_map, skipped) = resolve_namespace_virtual_tables(
+            &rt,
+            "http://127.0.0.1:1",
+            &creds,
+            &configured_ns,
+            &[],
+        )
+        .expect("an empty namespace must resolve without contacting the catalog");
+
+        assert!(
+            tables_json.is_empty(),
+            "an empty namespace advertises no virtual table"
+        );
+        assert!(table_map.is_empty(), "no table → empty TABLE_MAP");
+        assert!(skipped.is_empty(), "no table → nothing skipped");
     }
 
     /// A non-404 per-table failure (transport / non-404 HTTP) aborts the whole

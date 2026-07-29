@@ -18,40 +18,6 @@ pub(super) fn sample_storage() -> StorageProps {
     }
 }
 
-/// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
-/// Individual tests set only the auth fields under test.
-pub(super) fn base_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "warehouse".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-    }
-}
-
-/// Static storage with the sentinel keys `STATIC_AK_SENTINEL` / `STATIC_SK_SENTINEL`
-/// (matching the credentials-cluster test sentinels in `credentials::tests`).
-pub(super) fn static_storage() -> StorageProps {
-    StorageProps {
-        endpoint: "https://s3.amazonaws.com".into(),
-        region: "us-east-1".into(),
-        access_key: "STATIC_AK_SENTINEL".into(),
-        secret_key: "STATIC_SK_SENTINEL".into(),
-        path_style: false,
-        ..Default::default()
-    }
-}
-
 /// Assemble the scan-driving SQL from a known file list + spec — the same
 /// logic `handle_pushdown` runs after `resolve_file_list`.
 /// Uses `cluster_nodes=1` (single-shard / legacy shape).

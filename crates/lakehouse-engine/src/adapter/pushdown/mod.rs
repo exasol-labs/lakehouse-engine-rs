@@ -27,13 +27,7 @@ use support::{
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
-mod credentials;
-use credentials::CatalogSession;
-pub use credentials::{extract_vended_keys, merge_vended_into_storage};
-
-mod namespace;
-pub use namespace::list_namespace_tables;
-use namespace::parse_table_ident;
+use lakehouse_catalog::{CatalogSession, parse_table_ident};
 
 mod file_resolution;
 use file_resolution::{empty_result_sql, encode_initial_default, relativize_shards_to_root};
@@ -201,13 +195,17 @@ pub async fn handle_pushdown(
     // never emitted ahead of an ordering the adapter did not itself render.
     let has_order_by = order_by_present(&pushdown_req);
 
-    // Resolve file list exactly once. The returned `effective_storage` carries
-    // vended STS creds when use_vended_credentials is true; otherwise it equals
-    // the static `storage` passed in. Every per-shard ScanSpec uses this storage.
-    // filter_json_raw is forwarded for Iceberg-level file pruning; ScanSpec.filter
-    // (DataFusion SQL string) is set separately above and left completely unchanged.
+    parse_table_ident(&catalog.table)?;
+
+    // Resolve the file list exactly once, on one session built once for this request.
+    // The returned `effective_storage` carries vended STS creds when
+    // use_vended_credentials is true; otherwise it equals the static `storage` passed
+    // in. Every per-shard ScanSpec uses this storage. filter_json_raw is forwarded for
+    // Iceberg-level file pruning; ScanSpec.filter (DataFusion SQL string) is set
+    // separately above and left completely unchanged.
+    let session = CatalogSession::resolve(catalog_uri, &catalog.warehouse, creds).await?;
     let (files, effective_storage, logical_schema, table_root, name_mapping) =
-        resolve_file_list(catalog_uri, catalog, storage, creds, filter_json_raw).await?;
+        resolve_file_list(&session, catalog, storage, creds, filter_json_raw).await?;
     let storage = &effective_storage;
 
     if files.is_empty() {
@@ -769,6 +767,87 @@ pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<Logica
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
+
+    // ---------------------------------------------------------------------------
+    // Task 4.4 — catalog-auth secrets never in ScanSpec
+    //
+    // Relocated from the former `pushdown/credentials.rs` when that module moved
+    // into `lakehouse-catalog`: the assertion is about the ENGINE's scan-spec
+    // serialization, and the catalog crate must not name `ScanSpec`,
+    // `CommonScanSpec`, or `FileEntry`. The four vended sentinels it reads are
+    // re-declared here with the same literal values the crate's own
+    // `test_support` uses, so both sides' assertions stay comparable.
+    // ---------------------------------------------------------------------------
+
+    const VENDED_AK: &str = "VENDED_AK_SENTINEL";
+    const VENDED_SK: &str = "VENDED_SK_SENTINEL";
+    const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
+    const VENDED_REGION: &str = "eu-west-2";
+
+    /// Scenario: Catalog auth props are never placed in any scan spec, even when
+    /// `use_vended_credentials` is enabled and vended creds are in the storage.
+    ///
+    /// The ScanSpec must carry ONLY S3 storage credentials (vended or static).
+    /// Auth fields (`token`, `client_secret`, etc.) must never appear in the JSON.
+    #[test]
+    fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
+        // Build a spec with VENDED storage credentials (simulating what
+        // resolve_file_list returns after vended extraction).
+        let vended_storage = StorageProps {
+            endpoint: "https://s3.amazonaws.com".into(),
+            region: VENDED_REGION.into(),
+            access_key: VENDED_AK.into(),
+            secret_key: VENDED_SK.into(),
+            session_token: Some(VENDED_TOK.into()),
+            path_style: false,
+            ..Default::default()
+        };
+
+        let spec = ScanSpec {
+            common: CommonScanSpec {
+                projection: vec!["ID".into()],
+                emit_exa_types: vec!["DECIMAL(20,0)".into()],
+                storage: vended_storage,
+                ..Default::default()
+            },
+            files: vec![FileEntry::new(
+                "s3://warehouse/db/events/part-00000.parquet",
+                1,
+            )],
+        };
+
+        let json = spec.to_json();
+
+        // Auth field NAMES must never appear as JSON keys in the serialized spec.
+        // Check for the exact key pattern `"<field>":` to avoid false-positives
+        // from legitimate substrings (e.g. `"session_token"` contains `"token"`).
+        for field in [
+            "\"token\":",
+            "\"credential\":",
+            "\"client_id\":",
+            "\"client_secret\":",
+            "\"oauth2_server_uri\":",
+            "\"oauth2-server-uri\":",
+            // scope is too short and appears in storage endpoint strings, so it
+            // is checked by key name only, above, not by a sentinel value.
+        ] {
+            assert!(
+                !json.contains(field),
+                "ScanSpec JSON must not carry auth field key '{field}': {json}"
+            );
+        }
+
+        // Vended credentials MUST be present in the storage block.
+        assert!(
+            json.contains(VENDED_AK),
+            "vended access_key must be in storage: {json}"
+        );
+        assert!(
+            json.contains(VENDED_TOK),
+            "vended session_token must be in storage: {json}"
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // ScanSpec GROUP BY — group-key fragments propagated to the scan spec
@@ -2251,6 +2330,86 @@ mod tests {
         assert!(
             sql.contains(r#"SELECT "REGION", "NAME", "AMOUNT", "ID" FROM ("#),
             "the scan path must emit the derived projection unqualified: {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Parse-before-config ordering — regression coverage
+    // ---------------------------------------------------------------------------
+
+    /// A malformed `catalog.table` identifier against an unreachable `catalog_uri`
+    /// must fail with `parse_table_ident`'s own error, not a transport error from
+    /// the unreachable host.
+    ///
+    /// Proves `handle_pushdown` validates the identifier BEFORE
+    /// `CatalogSession::resolve` runs the OAuth2 client-credentials grant (the
+    /// only branch of `resolve_catalog_auth` that makes network contact — the
+    /// no-auth and static-token branches never touch the network at all, so this
+    /// test would pass vacuously against a broken build-then-validate ordering
+    /// unless creds force the OAuth2 branch). `catalog_uri` is a closed local
+    /// port (`127.0.0.1:1`, connection refused) so a wrongly-ordered
+    /// implementation fails fast with a transport error instead of hanging.
+    #[tokio::test]
+    async fn malformed_table_ident_fails_before_any_catalog_contact() {
+        let creds = ConnectionCreds {
+            warehouse: "warehouse".into(),
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            session_token: None,
+            path_style: true,
+            use_sigv4: false,
+            use_vended_credentials: false,
+            token: None,
+            client_id: Some("oauth-client-id-sentinel".into()),
+            client_secret: Some("oauth-client-secret-sentinel".into()),
+            oauth2_server_uri: None,
+            scope: None,
+        };
+
+        let catalog = CatalogProps {
+            warehouse: "warehouse".into(),
+            // No '.' separator: fails `parse_table_ident`'s validation before any
+            // catalog HTTP is issued.
+            table: "malformed_identifier_with_no_namespace_separator".into(),
+        };
+
+        // Two-column universe (non-empty): an empty `columns` array fails in
+        // `project_columns` before the code path under test even runs, which
+        // would mask the ordering this test proves.
+        let request = nq4_request();
+
+        let result = handle_pushdown(
+            &request,
+            "http://127.0.0.1:1",
+            &sample_storage(),
+            &catalog,
+            None,
+            1,
+            1,
+            1,
+            1024,
+            1,
+            0.6,
+            200,
+            4,
+            1024,
+            &creds,
+        )
+        .await;
+
+        let err = result.expect_err("a malformed table identifier must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("namespace.table"),
+            "error must be parse_table_ident's own error, got: {message}"
+        );
+        assert!(
+            !message.contains("OAuth2"),
+            "error must not be the OAuth2 token request/transport error \
+             (would mean the session was built before the identifier was \
+             validated): {message}"
         );
     }
 }

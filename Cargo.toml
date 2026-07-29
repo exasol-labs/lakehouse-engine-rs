@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-engine", "crates/vs-expression"]
+members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression"]
 # The UDF crate is a cdylib that MUST be compiled inside rust:1.94-bookworm
 # (glibc 2.36) via `make cross-musl-udf-build`. A bare host `cargo build
 # --release` must never emit the .so — it would write a host-glibc binary that
@@ -74,3 +74,17 @@ anyhow     = { version = "1" }
 chrono  = { version = "0.4" }
 futures = { version = "0.3" }
 url     = { version = "2" }
+
+# AWS SigV4 signing for the Glue REST catalog: lakehouse-catalog signs every
+# catalog request it issues on that path.
+# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
+aws-sigv4              = { version = "1.4", default-features = true }
+aws-credential-types   = { version = "1.2" }
+# A direct dependency of aws-sigv4 (for Identity), declared explicitly so the
+# `use aws_smithy_runtime_api::client::identity::Identity` import resolves without
+# relying on a transitive re-export.
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+
+# Async HTTP client for the catalog's self-issued signed `loadTable` GET. The
+# engine's test harness adds `features = ["blocking"]` on top for its own use.
+reqwest = { version = "0.12" }

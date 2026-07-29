@@ -205,8 +205,12 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 - Build the UDF `.so` only inside `rust:1.94-bookworm` (glibc 2.36, matches the SLC) via
   `make cross-musl-udf-build`. **Never `cargo build --release` on the host** — it writes a
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
-- One crate / one `.so` exports **both** entry points (VS adapter + DataFusion scan SET UDF) —
-  `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
+- Two library crates, one `.so`: `crates/lakehouse-engine` (Iceberg file planning, scan-spec wire
+  format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
+  `crates/lakehouse-catalog` (Iceberg REST catalog access — `CatalogSession`, auth, namespace
+  enumeration, vended-storage resolution, SigV4 signing). The catalog crate compiles into the
+  engine's cdylib, so one `.so` still exports **both** entry points (VS adapter + DataFusion scan
+  SET UDF) — `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
 - SDK: `exasol-udf-sdk` **0.20.3** + `exasol-udf-macros` **0.20.3** (built with rustc 1.94 to match
   the v0.20.3 SLC fingerprint). Since 0.18.0, `connect-back`
   is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.

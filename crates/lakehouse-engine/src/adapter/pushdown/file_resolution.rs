@@ -8,18 +8,15 @@ use futures::TryStreamExt;
 use iceberg::TableIdent;
 use serde_json::Value as Json;
 
-use super::credentials::{
-    CatalogSession, build_s3_file_io, extract_vended_endpoint, extract_vended_keys,
-    extract_vended_path_style, extract_vended_region, load_table_any_auth,
-    merge_vended_into_storage,
+use lakehouse_catalog::{
+    CatalogSession, build_s3_file_io, load_table_any_auth, parse_table_ident, redact_credentials,
+    resolve_vended_storage,
 };
+
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
-use super::namespace::parse_table_ident;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{
-    aggregate_exasol_types, emits_ident, exasol_type_from_json, redact_catalog_error,
-};
+use super::support::{aggregate_exasol_types, emits_ident, exasol_type_from_json};
 use super::{GroupedSelectItem, build_logical_schema};
 
 /// Emit a file path relative to `table_root` when the file lives under it,
@@ -176,48 +173,26 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// Resolve the data-file list from the Iceberg REST catalog for a single table.
+/// Resolve the data-file list from the Iceberg REST catalog for one table, on a
+/// [`CatalogSession`] the caller already built.
 ///
-/// This is the resolve-once seam: called exactly once per single-table pushdown in
-/// the adapter; the file list is passed explicitly to the scan UDF. The table
-/// identifier is validated BEFORE any catalog HTTP (parse-before-config: a malformed
-/// identifier issues zero `/v1/config` traffic and returns the same parse error),
-/// then a single-use [`CatalogSession`] is built and the work delegated to
-/// [`resolve_file_list_with_session`] — the shared-session core join legs reuse.
+/// This is the resolve-once seam AND the only file-resolution entry point: the
+/// single-table pushdown path, every join leg, and the external E2E callers all come
+/// through here; the resolved file list is passed explicitly to the scan UDF. Taking
+/// the session rather than a `catalog_uri` is what makes a per-table session rebuild
+/// inexpressible — the catalog-auth strategy, `/v1/config` prefix, and pooled HTTP
+/// client are resolved once per query into the passed session and reused across every
+/// table's `loadTable` GET (e.g. each leg of a join). A `catalog_uri` parameter
+/// alongside the session would be a second copy of a value the session already
+/// carries, free to disagree with it.
 ///
-/// `filter_json` is the raw pushdown filter JSON forwarded for Iceberg-level file
-/// pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
-pub async fn resolve_file_list(
-    catalog_uri: &str,
-    catalog_props: &CatalogProps,
-    storage: &StorageProps,
-    creds: &ConnectionCreds,
-    filter_json: Option<&Json>,
-) -> Result<
-    (
-        Vec<FileEntry>,
-        StorageProps,
-        Vec<LogicalField>,
-        String,
-        Vec<NameMappingEntry>,
-    ),
-    UdfError,
-> {
-    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
-    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
-    // identifier issues zero catalog HTTP and returns the same parse error.
-    parse_table_ident(&catalog_props.table)?;
-    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
-    resolve_file_list_with_session(&session, catalog_props, storage, creds, filter_json).await
-}
-
-/// Resolve the data-file list from the Iceberg REST catalog, reusing an existing
-/// per-query [`CatalogSession`].
-///
-/// This is the shared-session core of [`resolve_file_list`]: the catalog-auth
-/// strategy, `/v1/config` prefix, and pooled HTTP client are resolved once per query
-/// into the passed [`CatalogSession`] and reused across every table's `loadTable`
-/// GET (e.g. each leg of a join), never rebuilt per table.
+/// The parse-before-config guarantee therefore belongs to the CALLER: because the
+/// session is built outside this function, the involved-table identifier must be
+/// validated at the `handle_pushdown` seam BEFORE `CatalogSession::resolve`, so a
+/// malformed identifier issues zero catalog HTTP and surfaces a parse error rather
+/// than a transport error from an unreachable catalog. This function parses the
+/// identifier again below to build the `TableIdent`, so skipping the caller-side
+/// check costs the guarantee, never correctness.
 ///
 /// The catalog load_table request is self-issued via `load_table_any_auth`, which
 /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
@@ -231,7 +206,7 @@ pub async fn resolve_file_list(
 ///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
-pub(crate) async fn resolve_file_list_with_session(
+pub async fn resolve_file_list(
     session: &CatalogSession,
     catalog_props: &CatalogProps,
     storage: &StorageProps,
@@ -270,25 +245,7 @@ pub(crate) async fn resolve_file_list_with_session(
         &catalog_props.warehouse
     };
     let effective_storage = if creds.use_vended_credentials {
-        let (ak, sk, st) = extract_vended_keys(&result, anchor);
-        let mut merged = merge_vended_into_storage(storage, &ak, &sk, st.as_deref());
-        // Adopt the vended region only when the response advertises one; otherwise
-        // preserve the static region.
-        if let Some(region) = extract_vended_region(&result, anchor) {
-            merged.region = region;
-        }
-        // Adopt the vended S3 endpoint and path-style flag when advertised. An
-        // S3-compatible store (e.g. MinIO behind Lakekeeper) vends the concrete
-        // `s3.endpoint`/`s3.path-style-access`, and a vended CONNECTION carries no
-        // static endpoint; AWS S3 omits them, so absence preserves the static
-        // values and the Glue vended path is unchanged.
-        if let Some(endpoint) = extract_vended_endpoint(&result, anchor) {
-            merged.endpoint = endpoint;
-        }
-        if let Some(path_style) = extract_vended_path_style(&result, anchor) {
-            merged.path_style = path_style;
-        }
-        merged
+        resolve_vended_storage(&result, storage, anchor)
     } else {
         storage.clone()
     };
@@ -300,7 +257,7 @@ pub(crate) async fn resolve_file_list_with_session(
     let runtime = iceberg::Runtime::try_current().map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
     let table_builder = iceberg::table::Table::builder()
@@ -316,7 +273,7 @@ pub(crate) async fn resolve_file_list_with_session(
     .map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
@@ -432,7 +389,7 @@ fn classify_manifest_file(
 ///
 /// The message names ONLY the mechanism (never a file path, which could in
 /// principle embed a presigned credential) and is defensively passed through
-/// [`redact_catalog_error`] so no secret can survive into surfaced SQL/error text.
+/// [`redact_credentials`] so no secret can survive into surfaced SQL/error text.
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
@@ -441,7 +398,7 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
         table_name,
         mechanism.describe(),
     );
-    UdfError::User(redact_catalog_error(&msg))
+    UdfError::User(redact_credentials(&msg))
 }
 
 /// Fail loud at plan time if the table's current snapshot uses ANY delete/data
@@ -472,7 +429,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to open Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_credentials(&e.to_string())
             ))
         })?
         .read()
@@ -481,7 +438,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to read Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_credentials(&e.to_string())
             ))
         })?;
 
@@ -493,7 +450,7 @@ async fn ensure_supported_delete_mechanisms(
         UdfError::User(format!(
             "failed to parse Iceberg manifest list for '{}': {}",
             table_name,
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
@@ -502,7 +459,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to load Iceberg manifest for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_credentials(&e.to_string())
             ))
         })?;
         for entry in manifest.entries() {
@@ -565,14 +522,14 @@ async fn plan_files_from_table(
         UdfError::User(format!(
             "failed to plan Iceberg files for '{}': {}",
             table_name,
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
     let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
         UdfError::User(format!(
             "failed to collect Iceberg file tasks: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
@@ -602,30 +559,31 @@ async fn plan_files_from_table(
         .collect())
 }
 
-/// Resolve the Iceberg table schema for `createVirtualSchema`.
+/// Resolve one Iceberg table's schema for `createVirtualSchema` on the
+/// [`CatalogSession`] the caller already built.
 ///
 /// Returns (field_name, exasol_type_string) pairs. The table metadata is loaded
 /// via the unified `load_table_any_auth` (SigV4 | bearer | OAuth2-bearer | none).
 /// Schema resolution only reads `table.metadata().current_schema()` — no S3
 /// manifest access is needed, so vended credentials do not affect this path.
+///
+/// Takes the session by shared reference and holds no means to build one, so a
+/// per-table OAuth2 grant is structurally inexpressible: `adapter/mod.rs` builds
+/// ONE session ahead of the table-enumeration loop and every table's schema
+/// resolves on it, and a grant failure surfaces there — once, before the loop —
+/// rather than at whichever table happened to be resolved first. There is no
+/// `catalog_uri` parameter because the session already carries it and a second
+/// copy could disagree with it.
+///
+/// `catalog_props.table` names the table; `load_table_any_auth` parses that
+/// identifier before it issues any HTTP, so a malformed identifier still returns
+/// the parse error without a `loadTable` GET.
 pub async fn resolve_table_schema(
-    catalog_uri: &str,
+    session: &CatalogSession,
     catalog_props: &CatalogProps,
     creds: &ConnectionCreds,
 ) -> Result<Vec<(String, String)>, UdfError> {
-    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
-    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
-    // identifier issues zero catalog HTTP and returns the same parse error —
-    // mirroring the guard at the single-table pushdown seam in `mod.rs`.
-    parse_table_ident(&catalog_props.table)?;
-
-    // Build a single-use session inline (one OAuth grant, one `/v1/config` lookup)
-    // and load the table metadata on it via the unified auth-mode-agnostic loader.
-    // Schema resolution reads only `current_schema()`; vended credentials never
-    // affect it. Cost is unchanged from the pre-refactor path: one grant, one
-    // config lookup, one `loadTable` GET.
-    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
-    let result = load_table_any_auth(&session, catalog_props, creds).await?;
+    let result = load_table_any_auth(session, catalog_props, creds).await?;
     let table_metadata = result.metadata;
 
     let schema = table_metadata.current_schema();

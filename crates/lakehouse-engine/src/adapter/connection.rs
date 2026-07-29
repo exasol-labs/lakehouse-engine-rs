@@ -17,80 +17,18 @@ use super::nonempty_str;
 /// when `use_sigv4` is enabled (see `read_connection`).
 pub const REQUIRED_KEY: &str = "warehouse";
 
-/// Parsed credential fields from a CONNECTION password JSON object.
+/// Parsed credential fields from a CONNECTION password JSON object, declared once
+/// in the `lakehouse-catalog` crate and re-exported here at its pre-move path.
 ///
-/// Carries all optional flags so later work (SigV4 signing, credential vending,
-/// catalog token/OAuth2 auth) can read them without touching the module again.
-///
-/// Secret-bearing fields (`secret_key`, `client_secret`, `token`) are excluded
-/// from the derived `Debug` output via a manual impl to prevent accidental leaks.
-#[derive(Clone)]
-pub struct ConnectionCreds {
-    pub warehouse: String,
-    pub endpoint: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-    /// Optional STS session token. Absent when not supplied.
-    pub session_token: Option<String>,
-    /// Use path-style S3 access. Defaults to `true` to preserve MinIO behaviour.
-    pub path_style: bool,
-    /// Sign catalog REST requests with AWS SigV4. Defaults to `false` so
-    /// existing MinIO/REST stacks behave exactly as before.
-    pub use_sigv4: bool,
-    /// Request short-lived vended S3 credentials via `load_table`. Defaults to
-    /// `false` so existing stacks behave exactly as before.
-    pub use_vended_credentials: bool,
-    /// Static bearer token for catalog authentication. Absent when not supplied.
-    pub token: Option<String>,
-    /// OAuth2 client ID for catalog client-credentials flow. Absent when not supplied.
-    pub client_id: Option<String>,
-    /// OAuth2 client secret for catalog client-credentials flow. Absent when not supplied.
-    pub client_secret: Option<String>,
-    /// Optional OAuth2 token endpoint URI. Absent when not supplied.
-    pub oauth2_server_uri: Option<String>,
-    /// Optional OAuth2 scope. Absent when not supplied.
-    pub scope: Option<String>,
-}
-
-impl std::fmt::Debug for ConnectionCreds {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectionCreds")
-            .field("warehouse", &self.warehouse)
-            .field("endpoint", &self.endpoint)
-            .field("region", &self.region)
-            .field("access_key", &self.access_key)
-            .field("secret_key", &"[redacted]")
-            .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "[redacted]"),
-            )
-            .field("path_style", &self.path_style)
-            .field("use_sigv4", &self.use_sigv4)
-            .field("use_vended_credentials", &self.use_vended_credentials)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
-            .field("client_id", &self.client_id)
-            .field(
-                "client_secret",
-                &self.client_secret.as_ref().map(|_| "[redacted]"),
-            )
-            .field("oauth2_server_uri", &self.oauth2_server_uri)
-            .field("scope", &self.scope)
-            .finish()
-    }
-}
-
-impl ConnectionCreds {
-    /// Returns `true` when catalog authentication credentials are present:
-    /// either a static bearer `token` OR any OAuth2 client-credential field
-    /// (`client_id` and/or `client_secret`). Partial OAuth still signals
-    /// catalog-auth intent, so the SigV4 guard rejects it.
-    ///
-    /// Used exclusively for the SigV4 mutual-exclusivity check.
-    pub fn has_catalog_auth(&self) -> bool {
-        self.token.is_some() || self.client_id.is_some() || self.client_secret.is_some()
-    }
-}
+/// The type lives in the catalog crate because that crate is what consumes it —
+/// catalog authentication, prefix resolution, and credential vending all read
+/// these fields — and the dependency edge points engine → catalog, so a type both
+/// crates name must be declared on the catalog side. What stays in this module is
+/// everything that interprets the Exasol CONNECTION delivery mechanism:
+/// [`read_connection`], `parse_creds`, `validate_creds`, [`storage_block`],
+/// [`catalog_block`], and [`REQUIRED_KEY`]. The catalog crate must not name that
+/// mechanism.
+pub use lakehouse_catalog::ConnectionCreds;
 
 /// Resolved CONNECTION: catalog URI plus parsed credentials.
 #[derive(Debug)]
@@ -245,10 +183,12 @@ pub fn storage_block(creds: &ConnectionCreds) -> StorageProps {
     }
 }
 
-/// Build `CatalogProps` from resolved credentials, catalog URI, and table name.
-pub fn catalog_block(creds: &ConnectionCreds, uri: &str, table: &str) -> CatalogProps {
+/// Build `CatalogProps` from resolved credentials and table name.
+///
+/// Takes no catalog URI: `CatalogProps` does not carry one, because every consumer
+/// of it already receives the URI as its own explicit parameter.
+pub fn catalog_block(creds: &ConnectionCreds, table: &str) -> CatalogProps {
     CatalogProps {
-        uri: uri.to_string(),
         warehouse: creds.warehouse.clone(),
         table: table.to_string(),
     }
@@ -550,9 +490,9 @@ mod tests {
     fn catalog_block_maps_creds_to_catalog_props() {
         let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
         let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
-        let catalog = catalog_block(&resolved.creds, &resolved.uri, "db.my_table");
+        let catalog = catalog_block(&resolved.creds, "db.my_table");
 
-        assert_eq!(catalog.uri, "http://catalog.example.com");
+        assert_eq!(resolved.uri, "http://catalog.example.com");
         assert_eq!(catalog.warehouse, "wh");
         assert_eq!(catalog.table, "db.my_table");
     }
