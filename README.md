@@ -56,7 +56,7 @@ Start at the [documentation index](docs/index.md), or go straight to a guide:
 
 | Guide | What it covers |
 |-------|----------------|
-| [Install](docs/install.md) | Three install paths: one command for Exasol SaaS, an automated two-command path for self-managed Exasol, and a manual curl/SQL fallback for restricted networks. The steps deploy the `.so`, register the Rust SLC, create the scripts, and point a Virtual Schema at your data. |
+| [Install](docs/install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
 | [Catalogs](docs/catalogs.md) | How to connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs. Covers CONNECTION objects, credentials, and object-storage access. |
 | [Benchmark](docs/benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](docs/architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
