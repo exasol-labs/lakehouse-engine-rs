@@ -731,10 +731,9 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 /// stringifier buried arbitrarily deep (inside a `CASE` branch, inside a logical
 /// connective, inside another `CONCAT`) is still found and rewritten.
 ///
-/// Reached via [`apply_filter_type_rewrites`] (the WHERE-clause filter chain) and
-/// [`apply_select_item_type_rewrites`] (`project_columns`'s select-list handling) —
-/// those two pipeline functions are this pass's only PRODUCTION callers (the pass
-/// corpus in `mod tests` calls it directly).
+/// Reached via [`apply_type_rewrites`] — the one pipeline function that runs this
+/// pass as the third step of its three-pass order for every caller — and is this
+/// pass's only PRODUCTION caller (the pass corpus in `mod tests` calls it directly).
 ///
 /// The closure passed to [`rewrite_expr_tree`] is statically always-`Some` — it has
 /// no decline path, only unconditional per-node-type rewrites — so `rewrite_expr_tree`
@@ -941,10 +940,10 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 ///   Exasol evaluates it natively, or the WHOLE select-list item falls back to the base
 ///   row. A `NotGoverned` node never declines, whatever its arguments' types.
 ///
-/// Runs BEFORE [`rewrite_decimal_stringifications`] in both pipeline functions that
-/// chain the two — [`apply_filter_type_rewrites`] and [`apply_select_item_type_rewrites`]
-/// — which are the sole enforcers of that ordering: a coerced argument is no longer a
-/// bare column, so the decimal rewriter no-ops on it instead of double-wrapping.
+/// Runs BEFORE [`rewrite_decimal_stringifications`] in [`apply_type_rewrites`], the
+/// one pipeline function that chains the two and is the sole enforcer of that
+/// ordering: a coerced argument is no longer a bare column, so the decimal rewriter
+/// no-ops on it instead of double-wrapping.
 fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
     rewrite_expr_tree(node, &|out: &Json| {
         // With children already guarded (by `rewrite_expr_tree`'s post-order
@@ -1020,12 +1019,14 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
     }
 }
 
-/// Run the ordered type-rewrite pass sequence over a WHERE-clause filter tree, before
-/// it is rendered for the DataFusion scan: [`like_subject_type_guard`] →
-/// [`string_function_arg_type_guard`] → [`rewrite_decimal_stringifications`].
+/// Run the ordered type-rewrite pass sequence over a JSON expression tree, before it
+/// is rendered or projected for the DataFusion scan: [`like_subject_type_guard`] →
+/// [`string_function_arg_type_guard`] → [`rewrite_decimal_stringifications`]. One
+/// ordered pass list serves every caller, whether the tree is a whole filter or a
+/// single select-list item.
 ///
-/// - [`like_subject_type_guard`] (issue #207): may decline the whole filter, or
-///   rewrap a DATE subject.
+/// - [`like_subject_type_guard`] (issue #207): may decline the whole tree, or rewrap
+///   a DATE subject.
 /// - [`string_function_arg_type_guard`] (issue #210): coerces string-position
 ///   arguments, or declines.
 /// - [`rewrite_decimal_stringifications`] (issue #211): runs last, never declines.
@@ -1042,42 +1043,13 @@ fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Opt
 /// that bridge itself.
 ///
 /// Returns:
-/// - `Some(tree)` — this (possibly rewritten) tree is safe to render.
-/// - `None` — a guard declined somewhere in the tree; the whole filter is dropped.
-pub(super) fn apply_filter_type_rewrites(
-    filter: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
-    let filter = like_subject_type_guard(filter, col_types)?;
-    let filter = string_function_arg_type_guard(&filter, col_types)?;
-    Some(rewrite_decimal_stringifications(&filter, col_types))
-}
-
-/// Run the ordered type-rewrite pass sequence over one select-list item, before it is
-/// projected for the DataFusion scan: [`string_function_arg_type_guard`] →
-/// [`rewrite_decimal_stringifications`].
-///
-/// [`string_function_arg_type_guard`] guards the item's string-function arguments
-/// against a non-coercible column type (issue #210) FIRST; [`rewrite_decimal_stringifications`]
-/// then rewrites any directly-stringified bare DECIMAL column into a
-/// `decimal_to_varchar_exasol` node (issue #211). The guard must run first — see
-/// [`string_function_arg_type_guard`]'s doc for why the order is load-bearing — and the
-/// decimal rewrite is a no-op passthrough for anything it does not recognize, so it is
-/// safe to run unconditionally on every item that survives the guard.
-///
-/// Unlike [`apply_filter_type_rewrites`], this pipeline runs no LIKE-subject guard: a
-/// select-list item is not yet wired to [`like_subject_type_guard`]. This is a TRACKED
-/// GAP (issue #219), NOT an invariant that a select-list item can never be a LIKE
-/// subject — issue #219 documents `SELECT c_date LIKE '2024%' FROM …` hitting the same
-/// DataFusion coercion failure the filter-side guard exists to prevent, and a
-/// `function_scalar_case`-nested LIKE reaches it too.
-///
-/// Returns:
-/// - `Some(tree)` — this (possibly rewritten) item is safe to project.
-/// - `None` — the string-function guard declined; the caller must fall back.
-fn apply_select_item_type_rewrites(item: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    let item = string_function_arg_type_guard(item, col_types)?;
-    Some(rewrite_decimal_stringifications(&item, col_types))
+/// - `Some(tree)` — this (possibly rewritten) tree is safe to render or project.
+/// - `None` — a guard declined somewhere in the tree; the caller decides what a
+///   decline means for its own render surface.
+pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let expr = like_subject_type_guard(expr, col_types)?;
+    let expr = string_function_arg_type_guard(&expr, col_types)?;
+    Some(rewrite_decimal_stringifications(&expr, col_types))
 }
 
 /// Extract the projected columns and their Exasol types from the pushdown request.
@@ -1200,7 +1172,7 @@ pub(super) fn project_columns(
                 // whose `col_types` is the UNION of both joined tables' columns), and
                 // `joins/mod.rs`'s empty-side path — so this decline reaches the
                 // broadcast-join SELECT list too, not just the single-table path.
-                let Some(e) = apply_select_item_type_rewrites(e, &all_cols) else {
+                let Some(e) = apply_type_rewrites(e, &all_cols) else {
                     needs_full_fallback = true;
                     continue;
                 };
@@ -4208,16 +4180,13 @@ mod tests {
         );
     }
 
-    /// Scenario: a `predicate_like` over a DECIMAL-typed column pins the two pipelines'
-    /// pass-list difference. `apply_filter_type_rewrites` runs `like_subject_type_guard`
-    /// and declines (`None`), matching `like_guard_decimal_subject_declines` above.
-    /// `apply_select_item_type_rewrites` runs no LIKE-subject guard at all — a TRACKED
-    /// GAP (issue #219), NOT desired behavior — so it returns `Some` with the node
-    /// unchanged. Closing #219 is expected to flip the `Some` half of this assertion to
-    /// `None`; until then this test fails if the two pass lists are ever silently
-    /// unified.
+    /// Scenario: a `predicate_like` over a DECIMAL-typed column pins that
+    /// [`apply_type_rewrites`] declines it — matching
+    /// `like_guard_decimal_subject_declines` above, which calls the guard directly
+    /// rather than through the pipeline. This test fails if the LIKE pass is ever
+    /// dropped from the pipeline; one pipeline now serves both render surfaces.
     #[test]
-    fn select_list_pipeline_omits_like_pass_pending_219() {
+    fn type_rewrite_pipeline_runs_like_guard() {
         let filter = serde_json::json!({
             "type": "predicate_like",
             "expression": {"type": "column", "name": "amount"},
@@ -4226,14 +4195,9 @@ mod tests {
         let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
 
         assert_eq!(
-            apply_filter_type_rewrites(&filter, &col_types),
+            apply_type_rewrites(&filter, &col_types),
             None,
-            "filter pipeline's LIKE-subject guard must decline a DECIMAL subject"
-        );
-        assert_eq!(
-            apply_select_item_type_rewrites(&filter, &col_types),
-            Some(filter.clone()),
-            "select-list pipeline runs no LIKE-subject guard (#219 tracked gap): the node must pass through unchanged"
+            "the type-rewrite pipeline's LIKE-subject guard must decline a DECIMAL subject"
         );
     }
 
@@ -5441,6 +5405,196 @@ mod tests {
             items.len(),
             col_types.len(),
             "function_aggregate must widen to the full base row, not project as an Expr: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
+    }
+
+    // ---------------------------------------------------------------------------
+    // like_subject_type_guard wired into apply_type_rewrites — issue #219
+    // select-list LIKE type coercion
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `predicate_like` over `d` (`DATE`) projects a SINGLE expression that
+    /// rewraps the subject as `CAST("D" AS VARCHAR)`, mirroring the filter pipeline's
+    /// DATE arm — not the full base row.
+    #[test]
+    fn selectlist_like_over_date_projects_cast_expr() {
+        let item = serde_json::json!({
+            "type": "predicate_like",
+            "expression": column("d"),
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "boolean"} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert!(
+            !widened,
+            "a DATE LIKE subject rewraps, it must not widen to the full base row"
+        );
+        assert_eq!(
+            items.len(),
+            1,
+            "the DATE LIKE item must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"CAST("D" AS VARCHAR)"#) && expr.contains("LIKE"),
+            "the DATE subject must be rewrapped in CAST(<col> AS VARCHAR) before the LIKE: {expr}"
+        );
+        assert_eq!(types, vec!["BOOLEAN".to_string()]);
+    }
+
+    /// Scenario: a `predicate_like`/`predicate_like_regexp` over a subject that
+    /// resolves to a non-string Exasol type (DECIMAL, integer DECIMAL(p,0), DOUBLE,
+    /// BOOLEAN, TIMESTAMP) or does not resolve at all widens the WHOLE select list to
+    /// the full base row — `Ok`, never `Err`. Mirrors
+    /// `like_guard_decimal_subject_declines`'s dispatch table, now proven wired through
+    /// `project_columns`.
+    #[test]
+    fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let cases: Vec<(&str, Json)> = vec![
+            (
+                "c_decimal_a (DECIMAL(10,2))",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "id (DECIMAL(20,0), integer)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("id"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_double_a (DOUBLE PRECISION)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_double_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_bool_a (BOOLEAN)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_bool_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_ts_a (TIMESTAMP)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_ts_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "unresolvable column name",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("not_a_column"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "predicate_like_regexp over c_decimal_a",
+                serde_json::json!({
+                    "type": "predicate_like_regexp",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "^1.*"}
+                }),
+            ),
+        ];
+
+        for (label, item) in cases {
+            let pushdown_req = serde_json::json!({
+                "selectList": [ item ],
+                "selectListDataTypes": [ {"type": "boolean"} ],
+            });
+            let (items, types, widened) = project_columns(&pushdown_req, col_types.clone())
+                .unwrap_or_else(|e| panic!("[{label}] must project (Ok), not error: {e}"));
+
+            assert!(
+                widened,
+                "[{label}] a non-string LIKE subject must widen to the full base row"
+            );
+            assert_eq!(
+                items.len(),
+                col_types.len(),
+                "[{label}] must fall back to the full base row, not a truncated projection: {items:?}"
+            );
+            let expected_names: Vec<ProjectionItem> = col_types
+                .iter()
+                .map(|(n, _)| ProjectionItem::Column(n.clone()))
+                .collect();
+            assert_eq!(
+                items, expected_names,
+                "[{label}] the full-row fallback must project every base column unchanged"
+            );
+            let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+            assert_eq!(types, expected_types, "[{label}] EMITS types mismatch");
+        }
+    }
+
+    /// Scenario: a `predicate_like` over `c_decimal_a` nested inside a
+    /// `function_scalar_case` still widens to the full base row — pinning that the
+    /// guard's [`rewrite_expr_tree`] reach (a LIKE buried under a CASE, not only a
+    /// bare top-level select-list item) is wired all the way through
+    /// `project_columns`, not just the isolated `like_subject_type_guard` call.
+    #[test]
+    fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let case_expr = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_string", "value": "yes"},
+                {"type": "literal_string", "value": "no"}
+            ]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ case_expr ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project (Ok)");
+
+        assert!(
+            widened,
+            "a LIKE nested inside a CASE over a DECIMAL subject must widen the whole select list"
+        );
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "must fall back to the full base row, not a truncated projection: {items:?}"
         );
         let expected_names: Vec<ProjectionItem> = col_types
             .iter()
