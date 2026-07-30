@@ -65,7 +65,7 @@ No live interview was run. This plan was authored headless via `/speq:plan-pr`, 
 
 - **Decision:** Add "Pushdown reads the cluster node count from the UDF handshake" and "Pushdown node count falls back to one when the handshake reports none" to `vs-adapter/pushdown-planning`. Change `parallelism/work-unit-sharding` only where it names the node count's source.
 - **Alternatives:** Put both scenarios in `parallelism/work-unit-sharding`, since the node count exists only to size `G`.
-- **Rationale:** `pushdown-planning` is the feature that owns what the adapter reads while serving a `pushdown` request, and it already carries the sibling scenario for the other synchronous handshake read, "Scan-driving UDF invocations are schema-qualified from the running adapter script's schema" (`ctx.script_schema()`). Putting the node-count read next to it keeps one feature owning the handshake-read seam. `work-unit-sharding` owns the arithmetic that consumes the value, which is unchanged, so it needs only a corrected source attribution.
+- **Rationale:** `pushdown-planning` is the feature that owns what the adapter reads while serving a `pushdown` request, and it already carries the sibling scenario for the other synchronous handshake read, "Scan-driving UDF invocations are schema-qualified from the running adapter script's schema" (`ctx.script_schema()`). Putting the node-count read next to it keeps one feature owning the handshake-read seam. `work-unit-sharding` owns the arithmetic that consumes the value, which is unchanged, so it needs only a corrected source attribution. This takes `vs-adapter/pushdown-planning` to 11 scenarios, crossing `/speq:spec-merge`'s >10 signal. Keep the feature intact rather than splitting it: `datafusion-scan/scan-execution` and `datafusion-scan/scan-execution-positional-deletes` already sit at 11, and the handshake-read seam belongs with `ctx.script_schema()`.
 - **Promotes to ADR:** no
 
 ### [9] Prove the mechanism with unit tests and the regression with E2E; gate the multi-node value manually
@@ -86,7 +86,7 @@ No live interview was run. This plan was authored headless via `/speq:plan-pr`, 
 ### [plan-review] Two recorded specs still mandate preserving CLUSTER_NODES
 
 - **Finding:** `[REQUIREMENT_CONFLICT]` BLOCKER (round 1, § Requirement Quality). `specs/vs-adapter/create-virtual-schema/spec.md:111` and `specs/vs-adapter/refresh-and-set-properties/spec.md:33` both enumerate `CLUSTER_NODES` among the notes the adapter preserves, and neither feature appeared in `plan.md` § Features. After `/speq:record` the library would both mandate and forbid the key on a `refresh` response.
-- **Direction change:** Added both features to § Features and created both spec deltas — `vs-adapter/create-virtual-schema/spec.md` (`DELTA:CHANGED` on "Create virtual schema records the Exasol-name to Iceberg-identifier map in adapterNotes") and `vs-adapter/refresh-and-set-properties/spec.md` (`DELTA:CHANGED` on "Refresh rebuilds the table map and preserves other adapter notes"). Both go one clause beyond the reviewer's narrow-deletion instruction, and deliberately so: deleting the token alone would leave "preserve every other pre-existing entry" mandating preservation of the very key branch (a) removes, so each scenario now names `CLUSTER_NODES` as the single exception to preservation. The `create-virtual-schema` Feature description also drops the node count from its recorded-values list, logged in § Record Notes. Both scenarios map to existing tests whose `CLUSTER_NODES` assertions task 1.3 inverts (`create_vs_records_table_map_in_adapter_notes`, `table_map_merges_with_existing_notes`, `refresh_rebuilds_table_map_preserves_notes`) — the reviewer's finding surfaced these two assertions, which the old task list never mentioned.
+- **Direction change:** Added both features to § Features and created both spec deltas — `vs-adapter/create-virtual-schema/spec.md` (`DELTA:CHANGED` on "Create virtual schema records the Exasol-name to Iceberg-identifier map in adapterNotes") and `vs-adapter/refresh-and-set-properties/spec.md` (`DELTA:CHANGED` on "Refresh rebuilds the table map and preserves other adapter notes"). Both go one clause beyond the reviewer's narrow-deletion instruction, and deliberately so: deleting the token alone would leave "preserve every other pre-existing entry" mandating preservation of the very key branch (a) removes, so each scenario now names `CLUSTER_NODES` as the single exception to preservation. The `create-virtual-schema` Feature description also drops the node count from its recorded-values list, logged in § Record Notes. Both scenarios map to existing tests whose `CLUSTER_NODES` assertions task 1.3 inverts (`create_vs_records_table_map_in_adapter_notes`, `table_map_merges_with_existing_notes`) — the reviewer's finding surfaced these two assertions, which the old task list never mentioned.
 - **Promotes to ADR:** no
 
 ### [plan-review] Mission glossary still says the node count is captured at createVirtualSchema
@@ -135,4 +135,76 @@ No live interview was run. This plan was authored headless via `/speq:plan-pr`, 
 
 - **Finding:** `[PROSE_BLOAT]` ADVISORY (round 1, § Prose Quality). Three sentences against `/speq:writing-guardrails`' two-sentence § Summary cap, the third carrying only the issue link, which § Interview already cites.
 - **Direction change:** Deleted the third sentence and appended the issue link to the second, which the branch (a) rewrite also reworded to name the active removal.
+- **Promotes to ADR:** no
+
+### [plan-review] Rollback after a REFRESH silently degrades the shard fan-out
+
+- **Finding:** `[NFR_IGNORED]` ADVISORY (round 2, § Feasibility). Branch (a)'s active note removal is one-way: after a `REFRESH` on the new adapter, `CLUSTER_NODES` is gone. If an operator then rolls the `.so` back to a pre-refactor build, that build reads the now-absent note and falls to `unwrap_or(1)`, so `G` silently collapses to `1 × PARALLELISM_FACTOR` until another `REFRESH` rewrites the note. No artifact stated this consequence, and § Impact item 3's "no breaking change" heading overstated the change against its own body.
+- **Direction change:** Added a § Migration row documenting the rollback-after-`REFRESH` degradation: results stay correct, fan-out shrinks silently, resolved only by another `REFRESH`. Removed "no breaking change" from § Impact item 3's heading, which now reads "No migration."
+- **Promotes to ADR:** no
+
+### [plan-review] Decision log named no superseded ADR for the reversed CLUSTER_NODES rule
+
+- **Finding:** `[REQUIREMENT_CONFLICT]` BLOCKER (round 2, § Requirement Quality). No decision entry named the ADR this plan overrides. The live ADR `source-cluster-node-count-from-udfcontext-node-count-not-a-connect-back-select-nproc-supersedes-adr-006` (`specs/_decision/001-migrate-legacy-decision-log.md:1304-1331`, Status Accepted) mandates recording the node count as `CLUSTER_NODES`; decisions [2] and [6] directly reverse that with no pointer between them, so `/speq:record` would publish two Accepted ADRs in direct contradiction with no way to repair the older one later.
+- **Direction change:** Added a closing Rationale sentence to decision [2] naming the superseded ADR by slug, stating that this rule reverses recording the count as `CLUSTER_NODES` while retaining the `UdfContext::node_count()` source and the `0 => 1` floor that ADR established. Decision [6] deliberately carries no supersede reference, so `recorder-agent` sets `**Supersedes:**` on exactly one new ADR.
+- **Promotes to ADR:** no
+
+### [plan-review] Task 1.3's retarget instruction still targeted the wrong test
+
+- **Finding:** `[TASK_GRANULARITY]` BLOCKER (round 2, § Task Breakdown). Task 1.3's retarget clause still named `build_adapter_notes_merges_existing` for a key-rename to `NOTE_PARALLELISM_FACTOR`, but that test has no `adapter_note` call to retarget — its probe is a `CLUSTER_NODES` survival assertion (`adapter/mod.rs:1502-1506`) that round 1's fix should have inverted instead. Left as written, retargeting the key while keeping the `"3"` expectation fails immediately, and the test that hid round 1's original defect keeps asserting the wrong thing.
+- **Direction change:** Removed `build_adapter_notes_merges_existing` from the retarget clause, leaving only `adapter_note_absent_or_unparseable_yields_none` retargeted to `NOTE_PARALLELISM_FACTOR`. Added a separate instruction: keep the fixture's inherited `CLUSTER_NODES` entry, replace the `"3"` survival assertion with an assertion that the key is absent, and update the doc comment to state merge-not-clobber for every key except `CLUSTER_NODES`. Added `build_adapter_notes_merges_existing` to § Scenario Coverage under "createVirtualSchema adapterNotes omit the cluster node count".
+- **Promotes to ADR:** no
+
+### [plan-review] No test could fail on a re-introduced adapterNotes read
+
+- **Finding:** `[AMBIGUOUS_REQUIREMENT]` ADVISORY (round 2, § Requirement Quality). The "MUST NOT read the node count from `adapterNotes`" clauses had no discriminating test: `cluster_nodes_passes_through_reported_node_count` never sees a request, the E2E test's schema simply lacks a `CLUSTER_NODES` note at all, and `adapter_notes_carry_parallelism_factor` never enters the pushdown path. A note read could be re-introduced and every mapped test would still pass.
+- **Direction change:** Added task 1.3 unit test `pushdown_ignores_persisted_cluster_nodes_note` — a `pushdown` request whose `adapterNotes` carry `CLUSTER_NODES = "9"`, called with `cluster_nodes = 1`, asserting the derived shard count is `1 × PARALLELISM_FACTOR`. Mapped it in § Scenario Coverage against both "Pushdown reads the cluster node count from the UDF handshake" and "Recorded parallelism factor drives later work-unit sharding".
+- **Promotes to ADR:** no
+
+### [plan-review] Fallback scenario compared against a reference implementation this plan deletes
+
+- **Finding:** `[AMBIGUOUS_REQUIREMENT]` ADVISORY (round 2, § Requirement Quality). The fallback scenario's AND clause required the new shard count to match "the shard count the pre-refactor path produced from an absent or unparseable `CLUSTER_NODES` adapterNote" — once `adapter/mod.rs:373-376` is deleted, no reader or test can evaluate that comparison. It is migration rationale stated as a requirement, not a requirement.
+- **Direction change:** Replaced the clause in `vs-adapter/pushdown-planning/spec.md` with the absolute statement it stands for: `G` SHALL be `min(1 × PARALLELISM_FACTOR, 300, file_count)` per `parallelism/work-unit-sharding`. The pre-refactor-equivalence argument already lives in decision [5]'s Rationale.
+- **Promotes to ADR:** no
+
+### [plan-review] Record Notes row 2 misdescribed its own edit
+
+- **Finding:** `[COMPLETENESS_GAP]` ADVISORY (round 2, § Requirement Quality). § Record Notes row 2 named the wrong anchor (recorded bullets 1-6, when the marker spans only 1-5) and claimed the other four carried-through bullets were "unchanged," when two are reworded (the connect-back bullet drops the node count from its subject; the parallelism-factor bullet drops `CLUSTER_NODES` from its sibling list). A recorder honoring "unchanged" over the delta text would re-merge `CLUSTER_NODES` as a recorded sibling key — the exact contradiction round 1 blocked. § Features line 84 also undercounted the edit, saying both features "carry a single scenario edit" when `create-virtual-schema` also revises its Feature description.
+- **Direction change:** Rewrote § Record Notes row 2's anchor to "bullets 1-5 (recorded numbering)" and its Edit column to state the marker's six bullets replace all five verbatim, naming which two change subject. Reworded § Features line 84 to note `create-virtual-schema` also revises its Feature description (see § Record Notes).
+- **Promotes to ADR:** no
+
+### [plan-review] Task 1.3 undercounted resolve_cluster_nodes's test call sites
+
+- **Finding:** `[EFFORT_MISESTIMATION]` ADVISORY (round 2, § Task Breakdown). Task 1.3 named only one of three `resolve_cluster_nodes` test call sites (`nr_of_cores_from_available_parallelism_when_unavailable`); the other two (`nr_of_cores_property_overrides_auto_detect`, `nr_of_cores_property_falls_back_to_auto_detect`) also assert on the discarded node-count half of the old tuple and need those assertions deleted, not just a signature update. Task 1.2 also left the comment block above the deleted note-read (`adapter/mod.rs:370-372`) naming `CLUSTER_NODES` as note-carried, which the change makes false.
+- **Direction change:** Task 1.3 now lists all three call sites by name and line, including the `assert_eq!(nodes, ...)` deletions each needs. Task 1.2 now also rewrites the `adapter/mod.rs:370-372` comment block to name only `PARALLELISM_FACTOR` and the other note-carried values.
+- **Promotes to ADR:** no
+
+### [plan-review] Task 1.1 and task 1.3 both claimed the same two tests under different names
+
+- **Finding:** `[TRACEABILITY_GAP]` ADVISORY (round 2, § Task Breakdown). Task 1.1's "write its two unit tests first" and task 1.3's "retarget `cluster_nodes_defaults_to_one_when_node_count_zero` and `cluster_nodes_passes_through_reported_node_count` onto `cluster_nodes_from_context`" pointed at the same two behaviors. The existing tests already pass against `resolve_cluster_nodes`, so they cannot serve as task 1.1's TDD red step, forcing either duplicate coverage under new names or a naming collision.
+- **Direction change:** Task 1.1 now names its two new tests explicitly (`cluster_nodes_from_context_defaults_to_one_when_node_count_zero`, `cluster_nodes_from_context_passes_through_reported_node_count`) and § Scenario Coverage rows 1 and 3 point to those names. Task 1.3 now deletes the two old tests, superseded by task 1.1's tests, instead of retargeting them, and both are added to § Dead Code Removal.
+- **Promotes to ADR:** no
+
+### [plan-review] Refresh scenario's changed clause had no test mapped, and the decision log claimed one that doesn't assert it
+
+- **Finding:** `[TRACEABILITY_GAP]` ADVISORY (round 2, § Task Breakdown). § Scenario Coverage's last row mapped "Refresh rebuilds the table map and preserves other adapter notes" only to `refresh_rebuilds_table_map_preserves_notes`, which contains no `CLUSTER_NODES` assertion at all. The clause the delta actually changed — the inherited-key removal — is proven only by `refresh_notes_drop_inherited_cluster_nodes`, which was mapped to a different scenario. Compounding it, this decision log's own "[plan-review] Two recorded specs still mandate preserving CLUSTER_NODES" entry listed `refresh_rebuilds_table_map_preserves_notes` among the tests task 1.3 inverts, which is false.
+- **Direction change:** Removed `refresh_rebuilds_table_map_preserves_notes` from that earlier Review Finding's list of inverted tests. Added `refresh_notes_drop_inherited_cluster_nodes` to § Scenario Coverage's "Refresh rebuilds the table map and preserves other adapter notes" row, alongside the existing test.
+- **Promotes to ADR:** no
+
+### [plan-review] Homing both new scenarios in pushdown-planning crosses the spec-merge split threshold
+
+- **Finding:** `[HIDDEN_DEPENDENCY]` ADVISORY (round 2, § Task Breakdown). Adding both new scenarios to `vs-adapter/pushdown-planning` takes it from 9 to 11 recorded scenarios, crossing `/speq:spec-merge`'s "> 10 scenarios per spec" organization-review signal, which stops `speq record` before archiving to demand an unplanned split decision. Decision [8] weighed only where the seam belongs and never mentioned the count.
+- **Direction change:** Added a closing sentence to decision [8] recording the threshold crossing and the precedent for keeping the feature intact: `datafusion-scan/scan-execution` and `datafusion-scan/scan-execution-positional-deletes` already sit at 11 scenarios each, and the handshake-read seam belongs with `ctx.script_schema()`.
+- **Promotes to ADR:** no
+
+### [plan-review] The NOTE_CLUSTER_NODES tombstone had no sunset condition
+
+- **Finding:** `[TACTICAL_SHORTCUT]` ADVISORY (round 2, § Design Depth). Branch (a) leaves `NOTE_CLUSTER_NODES` and its `remove` call in `build_adapter_notes` permanently, with no condition recorded anywhere for when they can be deleted — an unexplained legacy eviction inside a builder whose stated job is recording current values.
+- **Direction change:** Extended task 1.3's channel-rationale-comment instruction to state the removal condition in the comment itself: the constant and the `remove` call exist solely to evict a key persisted by pre-refactor adapter versions, and both can be deleted once every deployed virtual schema has refreshed on this version or later. Filed [#287](https://github.com/exasol-labs/lakehouse-engine-rs/issues/287) as the tombstone's tracked owner and named it in a new § Consequences sentence.
+- **Promotes to ADR:** no
+
+### [plan-review] Three governed sentences broke the 25-word cap
+
+- **Finding:** `[PROSE_BLOAT]` ADVISORY (round 2, § Prose Quality). plan.md § Features line 84's second sentence ran 38 words and hung a bare "it" four clauses from its antecedent. The `create-virtual-schema-adapter-notes` Feature description closed with a separate 38-word sentence and, in doing so, narrowed its recorded subject from "cluster configuration" to just the core count, silently dropping the parallelism-factor, threading, and memory-budget entries the feature still records.
+- **Direction change:** Split plan.md line 84's second sentence into two. Restored the `create-virtual-schema-adapter-notes` Feature description's opening subject to "the per-node core count, the resource budgets, and the Exasol-name to Iceberg-identifier map" and split its closing sentence at the semicolon.
 - **Promotes to ADR:** no

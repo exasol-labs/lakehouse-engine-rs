@@ -73,6 +73,6 @@ sum/count decomposition) is covered separately in
 * *GIVEN* a `pushdown` request whose context reports `UdfContext::node_count()` as `0` (no live handshake node count)
 * *WHEN* the adapter resolves the node count for that request
 * *THEN* the adapter SHALL use a node count of `1`
-* *AND* the resulting shard count MUST be identical to the shard count the pre-refactor path produced from an absent or unparseable `CLUSTER_NODES` adapterNote
+* *AND* the resulting shard count `G` SHALL be `min(1 × PARALLELISM_FACTOR, 300, file_count)` per `parallelism/work-unit-sharding`
 * *AND* the adapter SHALL still return a successful `pushdown` response
 <!-- /DELTA:NEW -->

@@ -1,6 +1,6 @@
 # Feature: Create Virtual Schema — AdapterNotes
 
-Records the per-node core count and the Exasol-name to Iceberg-identifier map in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read these back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute; the cluster node count is excluded, because every pushdown reads it from its own UDF handshake, and a `CLUSTER_NODES` entry inherited from a pre-refactor schema is removed rather than preserved.
+Records the per-node core count, the resource budgets, and the Exasol-name to Iceberg-identifier map in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read these back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute. The cluster node count is excluded, because every pushdown reads it from its own UDF handshake, and a `CLUSTER_NODES` entry inherited from a pre-refactor schema is removed rather than preserved.
 
 ## Background
 
