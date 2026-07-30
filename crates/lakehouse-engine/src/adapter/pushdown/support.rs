@@ -1313,7 +1313,7 @@ pub(super) fn project_columns(
 ///
 /// Case folding is deliberately NOT owned here — each callback applies its own, and the
 /// current callers deliberately disagree: `collect_all_column_names` below folds with
-/// Unicode `to_uppercase`, while `collect_column_tables` and `collect_side_column_names`
+/// Unicode `to_uppercase`, while `column_tables` and `collect_side_column_names`
 /// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
 /// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
 /// under ASCII — and no test exercises `collect_all_column_names`, `collect_column_tables`,
