@@ -3,9 +3,9 @@ use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry,
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::credentials::CatalogSession;
-use super::super::file_resolution::resolve_file_list_with_session;
+use super::super::file_resolution::resolve_file_list;
 use super::super::support::{column_types, extract_limit, order_by_present};
+use lakehouse_catalog::CatalogSession;
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///
@@ -337,7 +337,7 @@ pub(super) async fn resolve_one_join_side(
         ..catalog.clone()
     };
     let (files, effective_storage, logical_schema, table_root, name_mapping) =
-        resolve_file_list_with_session(session, &side_catalog, storage, creds, filter_json).await?;
+        resolve_file_list(session, &side_catalog, storage, creds, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         iceberg_ident.to_string(),

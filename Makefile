@@ -21,9 +21,11 @@ UDF_BUILDER_IMAGE ?= rust:1.94-bookworm
 # workspace lock change (mtime check). E2E targets depend on it so tests never
 # run against a stale binary — and an unchanged crate is a sub-second no-op.
 VS_SO   := target/release/liblakehouse_engine.so
-VS_SRCS := $(shell find crates/lakehouse-engine/src crates/vs-expression/src -name '*.rs') \
+VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src crates/vs-expression/src -name '*.rs') \
            crates/lakehouse-engine/Cargo.toml \
+           crates/lakehouse-catalog/Cargo.toml \
            crates/vs-expression/Cargo.toml \
+           Cargo.toml \
            .cargo/config.toml \
            Cargo.lock
 

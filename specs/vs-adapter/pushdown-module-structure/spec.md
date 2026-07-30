@@ -77,17 +77,35 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 * The case-folding clause of the "One blind traversal primitive backs every column-collecting walk" scenario is UNCHANGED and still binding, and so is the §Background bullet recording that `str::to_uppercase` and `str::to_ascii_uppercase` are NOT interchangeable. Issue #181 is gated on PRESERVING that divergence, not on relaxing it: it adds the non-ASCII characterisation test this feature's scenario left unwritten, so the forbidden reconciliation would now fail a test rather than pass the whole suite silently.
 * No visibility changes on either side. The renamed walk keeps `pub(super)` in `joins/rendering.rs` and `collect_side_column_names` keeps its private visibility, so no item's visibility widens. The restated clause's "no join-module `use` path changes" consequence scopes to declaring the primitive in `support`; issue #181 does edit the `use super::rendering::{…}` list inside `joins` (tasks 3.2, 4.4, 6.4), which widens no path and adds no cross-module reach.
 * The generated-SQL gate of the amended scenario is unchanged and is the proof for this delta too: the four join golden-SQL full-string assertions, the two `dispatch_golden` decline-wrapper assertions, and the declined-`ORDER BY` hidden-column assertions MUST all pass with no edit to any assertion or expected value, because the collected table set drives side-local versus cross-side conjunct partitioning and is therefore visible in the generated SQL.
+* The frozen `crate::adapter::pushdown::<name>` façade is redrawn ONCE, deliberately, when the catalog access layer leaves the crate (issue #204). No `vs-adapter/pushdown-planning*` scenario changes, because the redraw removes items rather than altering any decision or any generated SQL.
+* The façade stays FROZEN after the redraw. This delta changes what the baseline IS, not whether there is one: the two probe files still fail the build on any unplanned narrowing, and a further change to the item set still needs its own spec delta.
+* The baseline the two probes cite, `specs/_plans/refactor-adapter-pushdown-modules/public-surface-baseline.txt`, no longer exists. `/speq:record` archived it with plan `refactor-adapter-pushdown-modules` into `specs/_recorded/`, which this project gitignores, so both probes point at a path that cannot be read. The probes' own `use` lists are the only surviving baseline and are promoted to being it.
+* The `credentials` submodule named in this feature's second Background bullet is dissolved by the extraction, not merely renamed: its catalog HTTP, auth, session, and vended code becomes the `lakehouse-catalog` crate. `vs-adapter/catalog-crate-structure` owns the new boundary. The submodule list stays "a design decision recorded in the plan, not a normative contract", exactly as that bullet already says.
+* `resolve_vended_storage` is deliberately NOT added to the pushdown façade as a replacement for the two items it retires. Adding it would re-create the coupling the redraw removes: a probe test in `lakehouse-engine` asserting a `lakehouse-catalog` concept through a re-export. The new crate carries its own probe instead.
+* This feature's `pub(super)` visibility rule is unaffected. `redact_catalog_error` narrows out of `pushdown/support.rs` entirely — it is deleted and its callers repointed at the catalog crate's `redact_credentials` — which the rule permits — it caps how far a cross-submodule helper may WIDEN and does not forbid a helper leaving once its callers move.
 
 ## Scenarios
 
 ### Scenario: Public pushdown façade resolves at every pre-refactor path
 
-* *GIVEN* a `name → visibility` snapshot of every symbol reachable via `crate::adapter::pushdown::<name>`, captured from the pre-refactor module before any code moves
+* *GIVEN* a `name → visibility` snapshot of every symbol reachable via `crate::adapter::pushdown::<name>`, captured from the pre-refactor module before any code moves, as amended once by the catalog extraction's planned three-item release
 * *WHEN* the same extraction re-runs against the refactored `pushdown/mod.rs` façade and all in-repo consumers compile
-* *THEN* the re-extracted `name → visibility` set MUST diff empty against the captured baseline — no reachable item added, removed, narrowed, or widened
-* *AND* every pre-refactor path `crate::adapter::pushdown::<name>` MUST still resolve to the same item at the same external visibility (`pub` or `pub(crate)`)
-* *AND* the `adapter`, `scan`, and `capabilities` consumers MUST compile without editing any `use crate::adapter::pushdown::...` path
-* *AND* a `#[cfg(test)]` reachability probe naming every pre-refactor `pub` and `pub(crate)` item from outside the `pushdown` module MUST compile, so an effective narrowing masked by a re-export is a compile error
+* *THEN* the re-extracted `name → visibility` set MUST diff empty against the CURRENT baseline — the 22-item in-crate probe `use` list and the 12-item external probe `use` list — so no reachable item is added, removed, narrowed, or widened outside a scenario that plans it
+* *AND* every path `crate::adapter::pushdown::<name>` that survives the catalog extraction MUST still resolve to the same item at the same external visibility (`pub` or `pub(crate)`), the three released items being `extract_vended_keys`, `merge_vended_into_storage`, and `list_namespace_tables`
+* *AND* the `adapter`, `scan`, and `capabilities` consumers MUST compile without editing any surviving `use crate::adapter::pushdown::...` path
+* *AND* a `#[cfg(test)]` reachability probe naming every remaining `pub` and `pub(crate)` item from outside the `pushdown` module MUST compile, so an effective narrowing masked by a re-export is a compile error
+
+### Scenario: The pushdown façade releases exactly the three items the catalog extraction relocates
+
+* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes — `src/adapter/pushdown_surface_probe.rs` naming 25 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 15 externally-`pub` items — both citing a baseline file that `/speq:record` archived into the gitignored `specs/_recorded/` tree and that therefore no longer exists
+* *WHEN* the catalog access layer moves into the `lakehouse-catalog` crate and the vended mechanism functions are demoted
+* *THEN* EXACTLY THREE items SHALL leave the façade and no other item SHALL be added, removed, narrowed, or widened: `extract_vended_keys` and `merge_vended_into_storage` leave because they become crate-private in `lakehouse-catalog`, and `list_namespace_tables` leaves because it relocates to `lakehouse_catalog::list_namespace_tables`
+* *AND* the in-crate probe SHALL name 22 items and the external probe SHALL name 12, and both MUST compile, so any further narrowing is a build failure rather than a silent gap
+* *AND* `resolve_file_list` and `resolve_table_schema` SHALL KEEP their names and their `pub` visibility on the façade while their first parameter becomes `&lakehouse_catalog::CatalogSession`, because a signature change is not a surface change and `vs-adapter/pushdown-catalog-session` owns it
+* *AND* `resolve_vended_storage` MUST NOT be added to the pushdown façade; it SHALL be reachable only as `lakehouse_catalog::resolve_vended_storage`
+* *AND* `CatalogSession` MUST NOT be re-exported at `crate::adapter::pushdown::CatalogSession`, because external callers name it on the crate that declares it and a second path would be a redundant alias
+* *AND* both probe doc comments SHALL state that the probe's own `use` list IS the baseline, and NEITHER SHALL cite `specs/_plans/refactor-adapter-pushdown-modules/public-surface-baseline.txt`, so the surface contract stops depending on a file that cannot be read
+* *AND* the `lakehouse-catalog` crate SHALL carry its own external-vantage probe, so the boundary the three departing items move to is guarded the same way the one they left is — `vs-adapter/catalog-crate-structure` owns that probe's contents
 
 ### Scenario: Behavior is unchanged across the refactor
 

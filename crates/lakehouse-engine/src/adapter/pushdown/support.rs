@@ -1442,11 +1442,6 @@ pub(super) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Redact credential-shaped values from a catalog error message.
-pub(super) fn redact_catalog_error(msg: &str) -> String {
-    crate::scan::emit::redact_credentials(msg)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
@@ -3971,25 +3966,6 @@ mod tests {
         assert!(
             common.contains("\"filter\"") && common.contains("42"),
             "filter must be pushed into the common arg: {common}"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Task 4.3 — No credential in error text
-    // ---------------------------------------------------------------------------
-
-    /// Scenario: redact_catalog_error removes credential-shaped values from messages.
-    #[test]
-    fn redact_catalog_error_strips_credentials() {
-        let msg = "GET failed: access_key=AKID_SECRET_VALUE region=us-east-1";
-        let safe = redact_catalog_error(msg);
-        assert!(
-            !safe.contains("AKID_SECRET_VALUE"),
-            "credential value must be redacted: {safe}"
-        );
-        assert!(
-            safe.contains("access_key"),
-            "label must be preserved: {safe}"
         );
     }
 
