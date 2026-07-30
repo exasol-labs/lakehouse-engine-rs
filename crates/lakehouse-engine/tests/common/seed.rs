@@ -2841,6 +2841,75 @@ pub async fn rest_replace_current_schema(
     Ok(())
 }
 
+/// Namespace and table for the non-ASCII (`ß`) identifier E2E coverage
+/// (`refactor-col-types-guard-dedup` task 7). Its OWN namespace, so this table
+/// never enters any other suite's `createVirtualSchema` table enumeration —
+/// every other E2E virtual schema is created over [`E2E_NAMESPACE`].
+pub const E2E_NONASCII_NAMESPACE: &str = "e2e_nonascii";
+/// Both the TABLE name and the COLUMN name under test are this same
+/// non-ASCII identifier, so the table and the seeder cannot drift apart.
+pub const E2E_NONASCII_TABLE: &str = "straße";
+pub const NONASCII_COL: &str = E2E_NONASCII_TABLE;
+
+/// Seeded values for the `straße` column, prefixed so a `LIKE` predicate
+/// selects a proper subset ([`NONASCII_LIKE_PATTERN`] matches the first two).
+pub const NONASCII_VALUES: [&str; 4] = ["alpha-1", "alpha-2", "beta-1", "beta-2"];
+pub const NONASCII_TOTAL_ROWS: i64 = NONASCII_VALUES.len() as i64;
+pub const NONASCII_LIKE_PATTERN: &str = "alpha%";
+pub const NONASCII_LIKE_MATCH_COUNT: i64 = 2;
+
+/// Seed the `straße` table (`id`, `straße`) into its own `e2e_nonascii`
+/// namespace. Idempotent.
+pub async fn seed_non_ascii_identifier(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-nonascii").await?;
+    let ns = NamespaceIdent::new(E2E_NONASCII_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for straße table")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, NONASCII_COL, Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build straße Iceberg schema")?;
+
+    create_and_append(
+        &catalog,
+        E2E_NONASCII_NAMESPACE,
+        E2E_NONASCII_TABLE,
+        iceberg_schema,
+        vec![make_non_ascii_identifier_batch()],
+    )
+    .await
+    .context("seed straße table")?;
+    Ok(())
+}
+
+fn make_non_ascii_identifier_batch() -> RecordBatch {
+    let ids: Vec<i64> = (1..=NONASCII_VALUES.len() as i64).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(NONASCII_COL, DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(NONASCII_VALUES.to_vec())),
+        ],
+    )
+    .expect("straße RecordBatch construction is infallible")
+}
+
 #[cfg(test)]
 mod seed_catalog_props_tests {
     use super::*;

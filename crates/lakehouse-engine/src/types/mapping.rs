@@ -368,9 +368,8 @@ pub enum ExaTypeClass {
 }
 
 /// Classify an Exasol SQL type string into the family the three pushdown guards in
-/// `adapter/pushdown/support.rs` branch on, reproducing their predicates exactly (each
-/// guard still runs its own `starts_with`/`==` checks independently; this is not yet
-/// wired into them — issue #265 is the intended first consumer).
+/// `adapter/pushdown/support.rs` — `guard_like_subject`, `is_bare_decimal_column`,
+/// and `coerce_string_position_arg` — branch on.
 ///
 /// - [`ExaTypeClass::Character`] iff the string starts with `"VARCHAR"` or `"CHAR"`.
 /// - [`ExaTypeClass::Decimal`] iff the string starts with `"DECIMAL"` — deliberately
