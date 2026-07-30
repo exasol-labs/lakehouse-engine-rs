@@ -368,7 +368,10 @@ pub(super) async fn resolve_one_join_side(
 /// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
 /// column-collecting walk" scenario. The two sides agree not by construction but by
 /// premise — `resolve_table_schema` Unicode-uppercases every name it declares, so no
-/// lowercase or non-ASCII name reaches either side. The E2E test
+/// LOWERCASE name reaches either side. Non-ASCII letters can still reach both sides
+/// (e.g. `über` uppercases to `ÜBER`, not to an ASCII form); the folds still agree
+/// there because `to_ascii_uppercase` only touches ASCII `a`-`z`, none of which
+/// remain once a name is already Unicode-uppercased. The E2E test
 /// `non_ascii_table_and_column_stay_queryable` guards that premise.
 pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
     column_types(request, |tables: &[Json]| {

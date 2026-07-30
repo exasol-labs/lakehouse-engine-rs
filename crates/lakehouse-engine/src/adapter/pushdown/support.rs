@@ -661,11 +661,13 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
 /// scan. `involved_table_columns` applies that same Unicode fold to its own keys, so this
 /// lookup's fold matches both builders' output for any column name — not a claim that the
 /// two builders' lists are the same vector, which they are not (they differ by table
-/// selection). Separately, `resolve_table_schema` Unicode-uppercases names before declaring them, so no lowercase
-/// non-ASCII name ever reaches this lookup at all — a premise guarded by
-/// `non_ascii_table_and_column_stay_queryable`. `None` means the type is not resolvable — the node carries no
-/// `name`, or its folded name is absent from the list — two cases every caller already
-/// treats identically.
+/// selection). Separately, `resolve_table_schema` Unicode-uppercases names before declaring
+/// them, so no LOWERCASE name ever reaches this lookup — a premise guarded by
+/// `non_ascii_table_and_column_stay_queryable`. Non-ASCII letters can still reach it (e.g.
+/// `über` uppercases to `ÜBER`, not to an ASCII form); `to_uppercase` is idempotent, so the
+/// name is already a fixed point regardless of whether it happens to be ASCII. `None` means
+/// the type is not resolvable — the node carries no `name`, or its folded name is absent
+/// from the list — two cases every caller already treats identically.
 ///
 /// Deliberately does NOT test `node`'s `type` tag. A non-`column` node is a PASS-THROUGH
 /// for [`guard_like_subject`] and [`coerce_string_position_arg`] but an unresolvable type

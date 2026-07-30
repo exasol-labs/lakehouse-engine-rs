@@ -303,16 +303,19 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// arrives from [`involved_table_columns`] folded by `support::column_types`' Unicode
 /// `to_uppercase`, while `names` is folded by `collect_side_column_names`' ASCII-only
 /// `to_ascii_uppercase`. The two agree only by premise — `resolve_table_schema`
-/// Unicode-uppercases every name it declares, so nothing lowercase or non-ASCII reaches
-/// either side (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`).
-/// Repair any divergence at that premise, never by unifying the two folds. If the
-/// premise ever weakens, `full_cols` would hold `STRASSE` where `names` holds `STRAßE`;
-/// this filter would then drop a column the outer wrapper still references, and the
-/// empty-result fallback named above rescues only a *fully* empty narrowing — a partial
-/// mismatch narrows a referenced column away instead. That is a dropped column, not
-/// necessarily a silent one: if the outer wrapper's rendered SQL still references it
-/// elsewhere, Exasol surfaces a column-not-found error rather than a silently wrong
-/// result.
+/// Unicode-uppercases every name it declares, so no LOWERCASE name reaches either side
+/// (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`). Non-ASCII
+/// letters can still reach both sides (e.g. `über` uppercases to `ÜBER`, not to an
+/// ASCII form) — the two folds still agree there because `to_ascii_uppercase` only
+/// touches ASCII `a`-`z`, none of which remain once a name is already
+/// Unicode-uppercased. Repair any divergence at that premise, never by unifying the
+/// two folds. If the premise ever weakens, `full_cols` would hold `STRASSE` where
+/// `names` holds `STRAßE`; this filter would then drop a column the outer wrapper
+/// still references, and the empty-result fallback named above rescues only a
+/// *fully* empty narrowing — a partial mismatch narrows a referenced column away
+/// instead. That is a dropped column, not necessarily a silent one: if the outer
+/// wrapper's rendered SQL still references it elsewhere, Exasol surfaces a
+/// column-not-found error rather than a silently wrong result.
 pub(super) fn referenced_side_columns(
     pushdown_req: &Json,
     condition: &Json,
