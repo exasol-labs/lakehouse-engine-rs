@@ -2,22 +2,10 @@ use crate::scan::spec::ProjectionItem;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{
-    render_df_filter_exasol_safe, render_expression_exasol_safe, render_expression_safe,
-};
+use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
 use super::super::support::{project_columns, quote_ident, walk_column_nodes};
 use super::planning::{DetectedJoin, involved_table_columns};
-
-/// Render a join's equi-condition node to a DataFusion SQL boolean expression via
-/// the `vs-expression` translator (bare column names). `None` when the node cannot
-/// be rendered — a defensive decline, since [`plan_join`] only reaches the broadcast
-/// path for a `predicate_equal` condition. Uses `render_expression` (not the filter
-/// renderer) so the boolean expression is returned verbatim, never suppressed as
-/// trivially true.
-pub(super) fn render_join_condition(condition: &Json) -> Option<String> {
-    render_expression_safe(condition)
-}
 
 /// The cross-table projection and Exasol EMITS types for a broadcast join.
 ///
@@ -91,11 +79,24 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
 /// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
 /// node cannot be rendered.
 ///
+/// One recursive translator covers every node shape the qualified N-scan wrapper's
+/// select list needs — columns, literals, scalar expressions, a top-level
+/// `function_aggregate`, AND a `function_aggregate` nested inside a scalar function
+/// — with no separate select-list-specific renderer. The translator splices an
+/// Exasol aggregate `name` verbatim (Exasol pushed it, so it is a valid Exasol
+/// aggregate — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, the STDDEV/VARIANCE family),
+/// renders each argument by recursion (table-qualifying any column argument via its
+/// `tableAlias`), handles `COUNT(*)`, and honors `DISTINCT`. This is byte-compatible
+/// with the former top-level `render_aggregate_qualified` (single-arg aggregate →
+/// `NAME(<arg>)`, `COUNT(*)` → `COUNT(*)`), and additionally renders a scalar
+/// expression that wraps aggregates (e.g. `ROUND(100.0 * SUM(CASE …) / COUNT(*),
+/// 2)`) instead of declining.
+///
 /// This whole module builds outer-wrapper SQL that Exasol's own core engine
 /// parses directly, so CAST targets must use Exasol syntax (length-qualified
-/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in this
-/// file (`render_join_condition`, `render_broadcast_join`) which stay on the
-/// bare-`VARCHAR` DataFusion dialect.
+/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in the
+/// join-rendering path (`render_broadcast_join`'s `render_expression_safe` call)
+/// which stay on the bare-`VARCHAR` DataFusion dialect.
 pub(super) fn render_expression_qualified(
     expr: &Json,
     alias_of: &HashMap<String, String>,
@@ -116,28 +117,27 @@ pub(super) fn render_df_filter_qualified(
     render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
-/// Walk an expression tree, recording every `column` node's owning side: its
-/// UPPERCASE `tableName` into `tables`, or `has_untagged` when a `column` carries
-/// no `tableName`. `any_column` becomes true on the first `column` node seen.
+/// Walk an expression tree, returning every `column` node's owning side: the set of
+/// UPPERCASE `tableName`s seen, whether any `column` carried no `tableName`
+/// (`has_untagged`), and whether any `column` node was seen at all (`any_column`).
 ///
 /// `tableName` is the SAME attribution signal [`annotate_columns_with_alias`] uses,
 /// so conjunct-to-side attribution is by table identity — never by column name,
 /// which keeps the shared-column-name case (both tables carry an `ID`) correct.
-pub(super) fn collect_column_tables(
-    expr: &Json,
-    tables: &mut std::collections::HashSet<String>,
-    has_untagged: &mut bool,
-    any_column: &mut bool,
-) {
+pub(super) fn column_tables(expr: &Json) -> (std::collections::HashSet<String>, bool, bool) {
+    let mut tables = std::collections::HashSet::new();
+    let mut has_untagged = false;
+    let mut any_column = false;
     walk_column_nodes(expr, &mut |map| {
-        *any_column = true;
+        any_column = true;
         match map.get("tableName").and_then(|t| t.as_str()) {
             Some(tn) => {
                 tables.insert(tn.to_ascii_uppercase());
             }
-            None => *has_untagged = true,
+            None => has_untagged = true,
         }
     });
+    (tables, has_untagged, any_column)
 }
 
 /// The single side a conjunct is local to — `Some(UPPERCASE table name)` iff every
@@ -150,10 +150,7 @@ pub(super) fn collect_column_tables(
 /// condition for that side's rows to survive the join, so using it to prune that
 /// side can never drop a row the join would have kept.
 fn conjunct_single_side(conjunct: &Json) -> Option<String> {
-    let mut tables = std::collections::HashSet::new();
-    let mut has_untagged = false;
-    let mut any_column = false;
-    collect_column_tables(conjunct, &mut tables, &mut has_untagged, &mut any_column);
+    let (tables, has_untagged, any_column) = column_tables(conjunct);
     if has_untagged || !any_column || tables.len() != 1 {
         return None;
     }
@@ -247,6 +244,45 @@ fn collect_side_column_names(
     });
 }
 
+/// Visit every clause of `pushdown_req` whose rendered SQL can name a source column:
+/// `selectList`, a non-null `filter`, `groupBy`, `orderBy`, then a non-null `having`.
+///
+/// The single owner of *which* clauses those are, so adding or removing one is a
+/// one-function edit rather than a two-function edit kept in sync by hand. It owns the
+/// clause set and nothing else: the per-node collector is a parameter because the two
+/// callers must stay divergent in ways this walk has no business reconciling. They
+/// fold case differently — [`referenced_side_columns`] collects through
+/// `collect_side_column_names`' ASCII-only `to_ascii_uppercase`,
+/// `referenced_column_projection` through `collect_all_column_names`' Unicode
+/// `to_uppercase`, a disagreement `walk_column_nodes`' doc comment and
+/// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
+/// column-collecting walk" scenario both forbid unifying — and they fall back
+/// differently when the narrowing selects nothing.
+///
+/// [`referenced_side_columns`] deliberately keeps its own absent/empty-`selectList`
+/// short-circuit BEFORE calling this, so `selectList` is named twice by design. That
+/// guard MUST NOT be folded in here: it is a fallback policy, not part of the clause
+/// set, and folding it in would hand `referenced_column_projection` a short-circuit
+/// that `vs-adapter/pushdown-joins-module-structure`'s "One clause walk feeds both
+/// wrapper column-narrowing routines" scenario forbids it — that path must keep
+/// narrowing through the remaining clauses when the select list is absent or empty.
+pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {
+    if let Some(list) = pushdown_req.get("selectList") {
+        visit(list);
+    }
+    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+        visit(f);
+    }
+    for key in ["groupBy", "orderBy"] {
+        if let Some(v) = pushdown_req.get(key) {
+            visit(v);
+        }
+    }
+    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
+        visit(h);
+    }
+}
+
 /// The subset of `full_cols` this side actually contributes to the outer two-scan
 /// wrapper — dropping columns the wrapper never references, so each fan-out leg
 /// ships narrow rows instead of the table's full column set.
@@ -254,7 +290,9 @@ fn collect_side_column_names(
 /// The kept set is every column of this side referenced by any clause the wrapper
 /// renders: the SELECT list, the join condition, the WHERE (the FULL predicate —
 /// the outer wrapper renders all of it, so a side-local *or* cross-table filter
-/// column must survive), GROUP BY, HAVING, and ORDER BY. Order and Exasol types are
+/// column must survive), GROUP BY, HAVING, and ORDER BY. The request's share of that
+/// set comes from [`referenced_clause_values`]; the join condition is collected
+/// separately because it is not a clause of the request. Order and Exasol types are
 /// preserved from `full_cols`.
 ///
 /// Two total-safety fallbacks keep the wrapper buildable: an absent/empty SELECT
@@ -266,28 +304,15 @@ pub(super) fn referenced_side_columns(
     table_name: &str,
     full_cols: &[(String, String)],
 ) -> Vec<(String, String)> {
+    // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
+    if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
+        return full_cols.to_vec();
+    }
     let mut names = std::collections::HashSet::new();
-    match pushdown_req.get("selectList") {
-        Some(Json::Array(list)) if !list.is_empty() => {
-            for item in list {
-                collect_side_column_names(item, table_name, &mut names);
-            }
-        }
-        // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
-        _ => return full_cols.to_vec(),
-    }
     collect_side_column_names(condition, table_name, &mut names);
-    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
-        collect_side_column_names(f, table_name, &mut names);
-    }
-    for key in ["groupBy", "orderBy"] {
-        if let Some(v) = pushdown_req.get(key) {
-            collect_side_column_names(v, table_name, &mut names);
-        }
-    }
-    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
-        collect_side_column_names(h, table_name, &mut names);
-    }
+    referenced_clause_values(pushdown_req, |v| {
+        collect_side_column_names(v, table_name, &mut names)
+    });
     let narrowed: Vec<(String, String)> = full_cols
         .iter()
         .filter(|(name, _)| names.contains(name))
@@ -300,29 +325,9 @@ pub(super) fn referenced_side_columns(
     }
 }
 
-/// Render one select-list item to a table-qualified outer-SELECT expression through
-/// the SINGLE `vs-expression` path — columns, literals, scalar expressions, a
-/// top-level `function_aggregate`, AND a `function_aggregate` nested inside a scalar
-/// function all render through the same recursive translator.
-///
-/// The translator splices an Exasol aggregate `name` verbatim (Exasol pushed it, so
-/// it is a valid Exasol aggregate — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, the
-/// STDDEV/VARIANCE family), renders each argument by recursion (table-qualifying any
-/// column argument via its `tableAlias`), handles `COUNT(*)`, and honors `DISTINCT`.
-/// This is byte-compatible with the former top-level `render_aggregate_qualified`
-/// (single-arg aggregate → `NAME(<arg>)`, `COUNT(*)` → `COUNT(*)`), and additionally
-/// renders a scalar expression that wraps aggregates (e.g.
-/// `ROUND(100.0 * SUM(CASE …) / COUNT(*), 2)`) instead of declining. `None` only when
-/// the node genuinely cannot be rendered.
-pub(super) fn render_selectlist_item_qualified(
-    item: &Json,
-    alias_of: &HashMap<String, String>,
-) -> Option<String> {
-    render_expression_qualified(item, alias_of)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::super::support::collect_all_column_names;
     use super::super::planning::{JoinSides, disjoint_schema_guard};
     use super::super::sql_builders::{
         JoinScanTuning, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
@@ -333,7 +338,7 @@ mod tests {
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
-    use vs_expression::render_df_filter_safe;
+    use vs_expression::{render_df_filter_safe, render_expression_safe};
 
     // ---------------------------------------------------------------------------
     // Join rendering: disjoint-column guard + condition/filter/projection
@@ -393,7 +398,7 @@ mod tests {
     #[test]
     fn join_condition_renders_via_translator() {
         assert_eq!(
-            render_join_condition(&equi_condition()).as_deref(),
+            render_expression_safe(&equi_condition()).as_deref(),
             Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
             "the equi-condition must render to a bare-name DataFusion boolean expr"
         );
@@ -868,6 +873,63 @@ mod tests {
         assert_eq!(
             narrowed, full,
             "an absent select list ⇒ SELECT *, keep every column"
+        );
+    }
+
+    /// A narrowing that selects no column of this side keeps the FULL column set —
+    /// `referenced_side_columns` never emits a zero-column fan-out leg. That full-set
+    /// fallback is its own policy; `referenced_column_projection` falls back to only
+    /// the first column instead, and the two MUST stay divergent.
+    #[test]
+    fn referenced_side_columns_keeps_all_when_narrowing_empty() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        });
+        let condition = equi_condition();
+        let full = vec![
+            ("L_ORDERKEY".to_string(), "DECIMAL(20,0)".to_string()),
+            ("L_QUANTITY".to_string(), "DECIMAL(18,2)".to_string()),
+        ];
+        let narrowed = referenced_side_columns(&pushdown_req, &condition, "LINEITEM", &full);
+        assert_eq!(
+            narrowed, full,
+            "no clause references a LINEITEM column ⇒ keep every column rather than \
+             emit a zero-column leg"
+        );
+    }
+
+    /// The two column collectors MUST keep their divergent case folding:
+    /// `collect_all_column_names` folds with Unicode `to_uppercase`,
+    /// `collect_side_column_names` with ASCII-only `to_ascii_uppercase`. `ß` is the
+    /// witness — Unicode folds it to `SS`, ASCII leaves it untouched. No other test in
+    /// this crate uses a non-ASCII identifier, so without this test reconciling the two
+    /// folds (which sharing one clause walk invites) would change behavior while the
+    /// whole suite still passed.
+    #[test]
+    fn column_collectors_keep_divergent_case_folding() {
+        let expr = serde_json::json!({
+            "type": "column", "name": "straße", "tableName": "CUSTOMER",
+        });
+
+        let mut unicode_folded = std::collections::HashSet::new();
+        collect_all_column_names(&expr, &mut unicode_folded);
+        assert_eq!(
+            unicode_folded,
+            std::collections::HashSet::from(["STRASSE".to_string()]),
+            "collect_all_column_names folds ß to SS via Unicode to_uppercase"
+        );
+
+        let mut ascii_folded = std::collections::HashSet::new();
+        collect_side_column_names(&expr, "CUSTOMER", &mut ascii_folded);
+        assert_eq!(
+            ascii_folded,
+            std::collections::HashSet::from(["STRAßE".to_string()]),
+            "collect_side_column_names leaves ß untouched via to_ascii_uppercase"
+        );
+
+        assert_ne!(
+            unicode_folded, ascii_folded,
+            "the two folds are NOT interchangeable and MUST NOT be unified"
         );
     }
 

@@ -55,6 +55,12 @@ pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
 /// a `User` error — surfaced by the FFI shim as a hard `F-UDF-CL-RUST-9001` client
 /// error with no native re-plan (`vs-adapter/pushdown-planning-join` "declined
 /// safely", last resort).
+///
+/// Not merged with `sql_builders::join_render_decline`: that one covers the six
+/// separate qualified-N-scan render-decline sites (an unrenderable select-list
+/// item, join condition, GROUP BY key, HAVING, ORDER BY key, or missing column
+/// metadata), each a plain `{clause}; this is a hard error, not a native re-plan`
+/// sentence with no extra clause inserted.
 pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError {
     let detail = match reason {
         IneligibleJoinReason::NotInnerJoinType => "the join is not an inner join",
