@@ -306,11 +306,13 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// Unicode-uppercases every name it declares, so nothing lowercase or non-ASCII reaches
 /// either side (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`).
 /// Repair any divergence at that premise, never by unifying the two folds. If the
-/// premise ever weakens the failure is silent, not an error: `full_cols` would hold
-/// `STRASSE` where `names` holds `STRAßE`, this filter would drop a column the outer
-/// wrapper still references, and the empty-result fallback named above rescues only a
-/// *fully* empty narrowing — a partial mismatch narrows a referenced column away with
-/// no error at all.
+/// premise ever weakens, `full_cols` would hold `STRASSE` where `names` holds `STRAßE`;
+/// this filter would then drop a column the outer wrapper still references, and the
+/// empty-result fallback named above rescues only a *fully* empty narrowing — a partial
+/// mismatch narrows a referenced column away instead. That is a dropped column, not
+/// necessarily a silent one: if the outer wrapper's rendered SQL still references it
+/// elsewhere, Exasol surfaces a column-not-found error rather than a silently wrong
+/// result.
 pub(super) fn referenced_side_columns(
     pushdown_req: &Json,
     condition: &Json,

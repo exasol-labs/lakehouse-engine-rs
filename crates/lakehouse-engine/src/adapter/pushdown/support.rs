@@ -658,9 +658,10 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
 ///
 /// The ONE `col_types` lookup for the type-rewrite guards: read `name`, fold it with the
 /// full-Unicode `to_uppercase` to match the keys `extract_all_column_types` builds, then
-/// scan. `involved_table_columns` builds its keys with the same fold, so the two builders'
-/// lists agree for every column name, not only ones the adapter can declare. Separately,
-/// `resolve_table_schema` Unicode-uppercases names before declaring them, so no lowercase
+/// scan. `involved_table_columns` applies that same Unicode fold to its own keys, so this
+/// lookup's fold matches both builders' output for any column name — not a claim that the
+/// two builders' lists are the same vector, which they are not (they differ by table
+/// selection). Separately, `resolve_table_schema` Unicode-uppercases names before declaring them, so no lowercase
 /// non-ASCII name ever reaches this lookup at all — a premise guarded by
 /// `non_ascii_table_and_column_stay_queryable`. `None` means the type is not resolvable — the node carries no
 /// `name`, or its folded name is absent from the list — two cases every caller already
