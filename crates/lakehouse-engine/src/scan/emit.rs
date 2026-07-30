@@ -231,7 +231,7 @@ pub fn redact_storage_error(msg: String, secrets: &[&str]) -> UdfError {
     ))
 }
 
-pub(crate) use lakehouse_catalog::{redact_credentials, redact_secret_values};
+pub use lakehouse_catalog::{redact_credentials, redact_secret_values};
 
 #[cfg(test)]
 mod tests {

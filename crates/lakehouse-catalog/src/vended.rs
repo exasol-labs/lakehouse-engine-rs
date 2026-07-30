@@ -188,11 +188,7 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(
-            &result,
-            &static_storage(),
-            "s3://bucket/db/t/metadata/v1.json",
-        );
+        let merged = resolve_vended_storage(&result, &static_storage(), result.metadata.location());
 
         assert_eq!(
             merged.access_key, "VENDED_AK",
