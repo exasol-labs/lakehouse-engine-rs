@@ -30,10 +30,10 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 
 ### Scenario: Refresh rebuilds the table map and preserves other adapter notes
 
-* *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`CLUSTER_NODES`, `NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`)
+* *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`), and that MAY additionally carry a `CLUSTER_NODES` entry when the schema was created by an adapter version that still recorded the node count
 * *WHEN* the adapter builds the `refresh` response
 * *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables — a full rebuild, never a diff or patch of the prior map
-* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`
+* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`, with an inherited `CLUSTER_NODES` entry as the ONE exception — it is REMOVED, so the stale node count disappears from the persisted notes on the first `refresh` after the upgrade (see `vs-adapter/create-virtual-schema-adapter-notes`)
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `schemaMetadata.adapterNotes`
 
 ### Scenario: Refresh echoes requestedTables when present
