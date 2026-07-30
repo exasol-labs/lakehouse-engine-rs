@@ -32,9 +32,7 @@ arrow      = { workspace = true }
 parquet    = { workspace = true }
 datafusion = { workspace = true }
 
-# `azure`: ADLS Gen2 (`abfss://`) object store. Declared here rather than in
-# `[workspace.dependencies]` so the feature edit doesn't invalidate CI's rust-cache
-# key; Cargo unions features across references, so the workspace `aws` stays on.
+# `azure`: ADLS Gen2 (`abfss://`) object store; unions with the workspace `aws`.
 object_store = { workspace = true, features = ["azure"] }
 # Required to implement object_store's `#[async_trait]` `ObjectStore` trait for the
 # spec-size HEAD wrapper. Already resolved transitively via object_store/datafusion.
