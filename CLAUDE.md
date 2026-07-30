@@ -10,6 +10,19 @@ Project mission in: @specs/mission.md
   work, in addition to speq spec deltas. Reference the issue in the implementing commit
   (`Closes #<n>`) so the work and its tracking stay linked.
 
+## Code navigation & editing
+
+- **Prefer Serena's MCP symbolic tools over `grep`/`Read`/`Edit` for any code file.**
+  Use `get_symbols_overview` / `find_symbol` for discovery and `find_referencing_symbols`
+  for usages; use `replace_symbol_body`, `insert_after_symbol`, `insert_before_symbol`,
+  `rename_symbol`, or `safe_delete_symbol` for edits — never a raw `Edit` on a symbol
+  you reached via Serena. `grep`/`Glob` remain fine for discovery only; `Read`/`Edit`
+  remain fine for non-code files (docs, specs, config) or a file already fully read
+  into context this session.
+- If Serena's tools are not yet loaded this session, load them and call
+  `initial_instructions` before the first code read/grep/edit — don't default to
+  built-in tools out of habit.
+
 ## PR title convention
 
 PR titles MUST follow Conventional Commits format: `<type>(<scope>): <description>` (scope is

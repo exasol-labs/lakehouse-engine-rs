@@ -3,13 +3,12 @@
 //! Extracted verbatim from the former flat `pushdown.rs`.
 
 use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec, render_ordered};
+use crate::types::mapping::{exasol_type_from_json, parse_decimal_args};
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
-use super::support::{
-    build_fan_out_inner, exasol_type_from_json, quote_ident, render_limit_offset,
-};
+use super::support::{build_fan_out_inner, quote_ident, render_limit_offset};
 use super::topn::parse_sort_flags;
 
 /// Classification of one `selectList` item in a grouped-aggregate pushdown.
@@ -818,21 +817,19 @@ pub(super) fn col_type_for(
 /// Map a column's Exasol type to the appropriate SUM partial EMITS type.
 ///
 /// DOUBLE PRECISION => DOUBLE PRECISION (no change).
-/// DECIMAL(p,s) => DECIMAL(36,s) (widened to max Exasol precision, preserving scale).
-/// Any other type (DATE, TIMESTAMP, VARCHAR, BOOLEAN) => DOUBLE PRECISION as an
-/// emergency fallback (callers should have validated before reaching here).
+/// DECIMAL(p,s) => DECIMAL(36,s) (widened to max Exasol precision, preserving scale);
+/// an absent scale defaults to 0, per the shared `parse_decimal_args` contract.
+/// Any other type (DATE, TIMESTAMP, VARCHAR, BOOLEAN) — and any DECIMAL declaration
+/// `parse_decimal_args` rejects — => DOUBLE PRECISION as an emergency fallback
+/// (callers should have validated before reaching here).
 fn sum_emit_type(col_ty: &str) -> String {
     if col_ty == "DOUBLE PRECISION" {
         return "DOUBLE PRECISION".to_string();
     }
-    if let Some(inner) = col_ty
-        .strip_prefix("DECIMAL(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        // inner is "p,s"
-        if let Some((_p, s)) = inner.split_once(',') {
-            return format!("DECIMAL(36,{s})");
-        }
+    // No uppercasing step: every producer of `col_ty` already emits uppercase, and
+    // adding one would change the answer for a lowercase input.
+    if let Some((_p, s)) = parse_decimal_args(col_ty) {
+        return format!("DECIMAL(36,{s})");
     }
     // Non-numeric type: validation should have caught this, but fall back gracefully.
     "DOUBLE PRECISION".to_string()
@@ -1139,6 +1136,88 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::scan::spec::CommonScanSpec;
+
+    // NOTE on the `sum_emit_type` tests below: routing `sum_emit_type` through the
+    // canonical `parse_decimal_args` makes it GAIN a whitespace-trimming step it did
+    // not have before, because `parse_decimal_args` trims each argument before
+    // parsing. `DECIMAL(10, 2)` therefore yields `DECIMAL(36,2)` where it used to
+    // yield `DECIMAL(36, 2)` — the raw scale slice echoed verbatim. That is an
+    // INTENDED consequence of consolidation, not an incidental one, and it is
+    // unreachable from every producer of `col_ty` in this repo (each emits a
+    // canonical, already-trimmed `DECIMAL(p,s)` under a `p,s <= 36` guard).
+
+    /// The one representative neither invariant generates: with no comma there is no
+    /// scale text to diverge. The move comes solely from `parse_decimal_args`
+    /// defaulting an absent scale to `0`, where `sum_emit_type` used to require a
+    /// comma and decline the input entirely.
+    #[test]
+    fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
+        assert_eq!(sum_emit_type("DECIMAL(10)"), "DECIMAL(36,0)");
+    }
+
+    /// Invariant (a) as a property over an OPEN input set: for every scale text that
+    /// is not already the canonical `i8` rendering, the answer is never the raw echo
+    /// the pre-consolidation parser produced. Only a canonical rendering — or the
+    /// numeric fallback — can emerge from a parsed `i8`. An open set is the right
+    /// shape here because the pre-consolidation parser echoed the raw scale text
+    /// without reading it, so the diverging input set has no closed enumeration.
+    ///
+    /// The rows cover one divergence class each: untrimmed whitespace (the gained
+    /// trimming step); a leading `+` or a leading zero, which `i8` parsing accepts
+    /// and which therefore can only re-emerge canonically; a non-numeric scale, which
+    /// used to be interpolated verbatim into an EMITS type Exasol cannot parse and now
+    /// declines to the numeric fallback; a scale outside `i8`; and a further comma,
+    /// where the old `split_once(',')` kept `2,3` as the scale text while
+    /// `parse_decimal_args` rejects a third argument outright.
+    #[test]
+    fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
+        // (raw scale text, canonical answer once parsed) — `None` = the parser
+        // rejects the text, so the answer is the numeric fallback.
+        let non_canonical: &[(&str, Option<&str>)] = &[
+            (" 2", Some("DECIMAL(36,2)")),
+            ("2 ", Some("DECIMAL(36,2)")),
+            ("+2", Some("DECIMAL(36,2)")),
+            ("02", Some("DECIMAL(36,2)")),
+            ("-02", Some("DECIMAL(36,-2)")),
+            ("X", None),
+            ("2,3", None),
+            ("200", None),
+            ("", None),
+        ];
+        for (raw_scale, canonical) in non_canonical {
+            let answer = sum_emit_type(&format!("DECIMAL(10,{raw_scale})"));
+            assert_ne!(
+                answer,
+                format!("DECIMAL(36,{raw_scale})"),
+                "a non-canonical scale text must never be echoed verbatim"
+            );
+            assert_eq!(
+                answer,
+                canonical.unwrap_or("DOUBLE PRECISION"),
+                "wrong answer for scale text {raw_scale:?}"
+            );
+        }
+    }
+
+    /// Invariant (b) as a property over an OPEN input set: every precision
+    /// `parse_decimal_args` rejects now declines to the numeric fallback, where it
+    /// used to yield `DECIMAL(36,2)` regardless — the pre-consolidation parser bound
+    /// the precision as `_p` and never read it, so even an unrepresentable precision
+    /// borrowed a `DECIMAL(36,…)` width. That non-reading is also why the diverging
+    /// set is open rather than a closed enumeration. The rows cover one rejection
+    /// class each: a precision outside `u8`, a negative one, a non-numeric one, and
+    /// an empty or whitespace-only one.
+    #[test]
+    fn sum_emit_type_declines_every_precision_the_parser_rejects() {
+        for rejected_precision in ["300", "256", "-1", "X", "", " "] {
+            assert_eq!(
+                sum_emit_type(&format!("DECIMAL({rejected_precision},2)")),
+                "DOUBLE PRECISION",
+                "precision {rejected_precision:?} is rejected by the parser, so the \
+                 aggregate must fall back rather than borrow a DECIMAL(36,…) width"
+            );
+        }
+    }
 
     /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
     /// CHAR/VARCHAR target must render the CAST target LENGTH-QUALIFIED

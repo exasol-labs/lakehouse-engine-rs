@@ -18,6 +18,7 @@ use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageProps;
+use crate::types::mapping::exasol_type_to_json;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
@@ -976,55 +977,6 @@ fn available_parallelism_or_0() -> u32 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// JSON type serialization helpers
-// ---------------------------------------------------------------------------
-
-/// Convert an Exasol type string to the VS column dataType JSON object.
-/// Minimal implementation covering the types produced by our mapping.
-fn exasol_type_to_json(exasol_type: &str) -> Json {
-    let upper = exasol_type.to_uppercase();
-    if upper == "BOOLEAN" {
-        return json!({"type": "boolean"});
-    }
-    if upper == "DOUBLE PRECISION" {
-        return json!({"type": "double"});
-    }
-    if upper == "DATE" {
-        return json!({"type": "date"});
-    }
-    if upper == "TIMESTAMP" {
-        return json!({"type": "timestamp"});
-    }
-    if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
-        return json!({"type": "timestamp", "withLocalTimeZone": true});
-    }
-    if let Some(inner) = upper
-        .strip_prefix("DECIMAL(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.splitn(2, ',').collect();
-        if parts.len() == 2
-            && let (Ok(p), Ok(s)) = (
-                parts[0].trim().parse::<u64>(),
-                parts[1].trim().parse::<u64>(),
-            )
-        {
-            return json!({"type": "decimal", "precision": p, "scale": s});
-        }
-    }
-    // Default: VARCHAR(size)
-    let size = if let Some(inner) = upper
-        .strip_prefix("VARCHAR(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        inner.trim().parse::<u64>().unwrap_or(2000000)
-    } else {
-        2000000
-    };
-    json!({"type": "varchar", "size": size})
-}
-
 /// Returns `true` iff `err` is the catalog's "table not found" (HTTP 404)
 /// signal — the deterministic prefix the single catalog error site
 /// (`authed_get_json`'s non-success branch in `lakehouse_catalog`'s
@@ -1333,39 +1285,6 @@ mod tests {
             err.to_string().contains("is required"),
             "expected handle_create_virtual_schema's normal required-property error, got: {err}"
         );
-    }
-
-    #[test]
-    fn exasol_type_to_json_roundtrip() {
-        let cases = [
-            ("BOOLEAN", "boolean"),
-            ("DOUBLE PRECISION", "double"),
-            ("DATE", "date"),
-            ("TIMESTAMP", "timestamp"),
-        ];
-        for (ty, expected_type) in cases {
-            let j = exasol_type_to_json(ty);
-            assert_eq!(
-                j["type"].as_str().unwrap().to_lowercase(),
-                expected_type,
-                "type mismatch for {ty}"
-            );
-        }
-        let dec = exasol_type_to_json("DECIMAL(18,4)");
-        assert_eq!(dec["precision"].as_u64().unwrap(), 18);
-        assert_eq!(dec["scale"].as_u64().unwrap(), 4);
-    }
-
-    #[test]
-    fn exasol_type_to_json_timestamp_with_local_time_zone() {
-        let tstz = exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE");
-        assert_eq!(
-            tstz,
-            serde_json::json!({"type": "timestamp", "withLocalTimeZone": true})
-        );
-
-        let ts = exasol_type_to_json("TIMESTAMP");
-        assert_eq!(ts, serde_json::json!({"type": "timestamp"}));
     }
 
     // Minimal UdfContext for dispatch tests that need no I/O. Its `node_count()`

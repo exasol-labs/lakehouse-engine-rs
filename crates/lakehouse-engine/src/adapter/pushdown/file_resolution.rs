@@ -3,6 +3,7 @@ use crate::scan::spec::{
     AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
     NameMappingEntry, ProjectionItem, StorageProps,
 };
+use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::TableIdent;
@@ -16,7 +17,7 @@ use lakehouse_catalog::{
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{aggregate_exasol_types, emits_ident, exasol_type_from_json};
+use super::support::{aggregate_exasol_types, emits_ident};
 use super::{GroupedSelectItem, build_logical_schema};
 
 /// Emit a file path relative to `table_root` when the file lives under it,
