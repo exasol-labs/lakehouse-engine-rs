@@ -352,22 +352,33 @@ pub(super) async fn resolve_one_join_side(
 /// The (folded name, Exasol type) columns of the named involved table.
 ///
 /// Locates the `involvedTables[]` entry whose `name` equals `table_name` (the
-/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns
-/// with the ASCII-only `to_ascii_uppercase` fold, Exasol types from `dataType`.
+/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns to
+/// `support::column_types`' folded names plus Exasol types from `dataType`.
 /// Returns an empty vec when the table or its columns are absent.
 ///
 /// A partial application of `support::column_types`, supplying the find-by-name
-/// selection and the ASCII-only fold this side has always applied.
+/// selection.
+///
+/// CROSS-FOLD SEAM: this output travels into `referenced_side_columns`
+/// (`joins/rendering.rs`) as `full_cols`, where it is string-matched against the name
+/// set `collect_side_column_names` builds with the ASCII-only `to_ascii_uppercase`.
+/// The two folds are different BY DESIGN and MUST NOT be reconciled by changing
+/// either one: `column_types` owns this side's fold, and unifying the collect walks'
+/// is forbidden by `walk_column_nodes`' doc comment and by
+/// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
+/// column-collecting walk" scenario. The two sides agree not by construction but by
+/// premise — `resolve_table_schema` Unicode-uppercases every name it declares, so no
+/// LOWERCASE name reaches either side. Non-ASCII letters can still reach both sides
+/// (e.g. `über` uppercases to `ÜBER`, not to an ASCII form); the folds still agree
+/// there because `to_ascii_uppercase` only touches ASCII `a`-`z`, none of which
+/// remain once a name is already Unicode-uppercased. The E2E test
+/// `non_ascii_table_and_column_stay_queryable` guards that premise.
 pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
-    column_types(
-        request,
-        |tables: &[Json]| {
-            tables
-                .iter()
-                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
-        },
-        str::to_ascii_uppercase,
-    )
+    column_types(request, |tables: &[Json]| {
+        tables
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
+    })
 }
 
 /// The disjoint-column-name guard for reusing the `vs-expression` translator
@@ -769,52 +780,5 @@ mod tests {
         assert_eq!(sides.dimension.table_name, "SELF_A");
         assert_eq!(sides.fact.table_name, "SELF_B");
         assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
-    }
-
-    // ---------------------------------------------------------------------------
-    // Case-fold characterization: `extract_all_column_types` vs `involved_table_columns`.
-    // ---------------------------------------------------------------------------
-
-    /// `extract_all_column_types` and `involved_table_columns` apply DIFFERENT case
-    /// folds to a column name — Unicode `to_uppercase` and ASCII-only
-    /// `to_ascii_uppercase`, respectively — and this is the ONLY assertion in the
-    /// repository that distinguishes the two.
-    ///
-    /// `STRAßE` is a CONSTRUCTED literal, chosen because Rust's two folds disagree on
-    /// it (`to_uppercase` → `STRASSE`, `to_ascii_uppercase` → `STRAßE`), NOT a name
-    /// Exasol ever delivers: `resolve_table_schema` (`file_resolution.rs:600`)
-    /// Unicode-uppercases every column name before either builder ever sees it, so no
-    /// reachable input can exercise this divergence — confirmed live against a local
-    /// Docker Exasol container, which served an Iceberg `straße` column as `STRASSE`.
-    /// The test survives that finding anyway: every name reaching either builder in
-    /// production is already Unicode-uppercased, so a merge that silently unified the
-    /// two folds would still pass the rest of this suite. Tracked as a low-priority
-    /// simplification (not a correctness fix) to remove `column_types`'s `fold_case`
-    /// parameter, at which point this test is deleted (#270).
-    #[test]
-    fn each_builder_keeps_its_own_case_fold_on_a_constructed_non_ascii_literal() {
-        use crate::adapter::pushdown::support::extract_all_column_types;
-
-        let request = serde_json::json!({
-            "involvedTables": [
-                {
-                    "name": "STREETS",
-                    "columns": [
-                        {"name": "STRAßE", "dataType": {"type": "varchar", "size": 100}},
-                    ],
-                },
-            ],
-        });
-
-        assert_eq!(
-            extract_all_column_types(&request),
-            vec![("STRASSE".to_string(), "VARCHAR(100)".to_string())],
-            "extract_all_column_types must apply the Unicode fold"
-        );
-        assert_eq!(
-            involved_table_columns(&request, "STREETS"),
-            vec![("STRAßE".to_string(), "VARCHAR(100)".to_string())],
-            "involved_table_columns must apply the ASCII fold"
-        );
     }
 }
