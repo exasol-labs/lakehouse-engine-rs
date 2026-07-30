@@ -660,7 +660,7 @@ resolve_versions() {
     RESOLVED_ENGINE_TAG="$(version_to_tag "$ARG_LAKEHOUSE_VERSION")"
   else
     local ej
-    if ! ej="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
+    if ! ej="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
       err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API. If this is a rate limit, pass --github-token/GITHUB_TOKEN."
       return 1
     fi
@@ -675,7 +675,7 @@ resolve_versions() {
     RESOLVED_SLC_TAG="$(version_to_tag "$ARG_SLC_VERSION")"
   else
     local sj
-    if ! sj="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
+    if ! sj="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
       err "could not resolve the latest $SLC_REPO release via the GitHub REST API."
       return 1
     fi
@@ -1007,7 +1007,7 @@ download_release_asset() {
   local release_json asset_id dl_err
   set_github_auth_args
 
-  if ! release_json="$(curl -fsS "${GITHUB_AUTH_ARGS[@]}" \
+  if ! release_json="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
       "https://api.github.com/repos/$repo/releases/tags/$tag" </dev/null 2>&1)"; then
     err "could not fetch release '$tag' from $repo via the GitHub REST API."
     return 1
@@ -1018,7 +1018,7 @@ download_release_asset() {
     return 1
   fi
 
-  if ! dl_err="$(curl -fsSL "${GITHUB_AUTH_ARGS[@]}" \
+  if ! dl_err="$(curl -fsSL "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
       -H "Accept: application/octet-stream" \
       -o "$dest_path" \
       "https://api.github.com/repos/$repo/releases/assets/$asset_id" </dev/null 2>&1)"; then
