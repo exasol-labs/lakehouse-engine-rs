@@ -476,13 +476,13 @@ pub(super) fn wrap_declined_order_by(
 mod tests {
     use super::super::support::{
         DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, build_scan_driving_sql,
-        extract_all_column_types, extract_projection, order_by_present, shard_count,
+        classify_where_filter, extract_all_column_types, extract_projection, order_by_present,
+        shard_count,
     };
     use super::super::test_support::*;
     use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
     use super::*;
     use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
-    use vs_expression::render_df_filter_safe;
 
     // -----------------------------------------------------------------------
     // Ordered top-N pushdown (B3)
@@ -499,13 +499,22 @@ mod tests {
             .unwrap_or(Json::Null);
         let (mut proj_cols, mut proj_types, widened) =
             extract_projection(request, &pushdown_req).unwrap();
-        let filter = pushdown_req
-            .get("filter")
-            .filter(|f| !f.is_null())
-            .and_then(render_df_filter_safe);
         let limit = extract_limit(&pushdown_req);
         let has_order_by = order_by_present(&pushdown_req);
         let col_types = extract_all_column_types(request);
+        // Production classifies the WHERE filter ONCE through `classify_where_filter`
+        // and routes a DECLINED one to the qualified single-table wrapper AHEAD of the
+        // routing classifier. This mirror reproduces the classification but covers only
+        // the no-decline half of it — the shape whose scan spec carries the filter — so
+        // a declining fixture belongs on `build_dispatch_sql`, which owns that route.
+        let (filter, declined_filter) = classify_where_filter(
+            pushdown_req.get("filter").filter(|f| !f.is_null()),
+            &col_types,
+        );
+        assert!(
+            declined_filter.is_none(),
+            "plan_scan_sql mirrors only the no-decline dispatch path; a declined-filter fixture needs build_dispatch_sql, not this helper"
+        );
 
         let items = detect_aggregates(&pushdown_req)
             .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
