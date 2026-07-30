@@ -438,19 +438,9 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
 /// read, and the [`exasol_type_from_json`] mapping. An absent `involvedTables`, a table
 /// `select_table` does not select, and absent `columns` each yield an empty vec; a column
 /// missing either `name` or `dataType` is skipped.
-///
-/// Table selection and case fold are TWO parameters rather than one mode flag because the
-/// two callers' choices correlate by accident, not by design: [`extract_all_column_types`]
-/// takes the first table and folds full-Unicode, while `involved_table_columns` (joins
-/// planning) finds a table by name and folds ASCII-only. Deriving one from the other would
-/// record that unreconciled divergence as intended behavior. `fold_case` preserves nothing
-/// observable — `resolve_table_schema` Unicode-uppercases every column name before either
-/// caller sees it — so it is tracked for removal, collapsing this builder to one fold
-/// (#270).
 pub(super) fn column_types(
     request: &Json,
     select_table: impl FnOnce(&[Json]) -> Option<&Json>,
-    fold_case: impl Fn(&str) -> String,
 ) -> Vec<(String, String)> {
     request
         .get("involvedTables")
@@ -461,7 +451,7 @@ pub(super) fn column_types(
         .map(|cols| {
             cols.iter()
                 .filter_map(|c| {
-                    let name = fold_case(c.get("name")?.as_str()?);
+                    let name = c.get("name")?.as_str()?.to_uppercase();
                     let dt_json = c.get("dataType")?;
                     Some((name, exasol_type_from_json(dt_json)))
                 })
@@ -472,7 +462,7 @@ pub(super) fn column_types(
 
 /// Extract all columns and their Exasol types from the first involved table.
 pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
-    column_types(request, |tables: &[Json]| tables.first(), str::to_uppercase)
+    column_types(request, |tables: &[Json]| tables.first())
 }
 
 /// Deep-clone `expr` with every `tableAlias` key removed, so the reused
@@ -668,11 +658,13 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
 ///
 /// The ONE `col_types` lookup for the type-rewrite guards: read `name`, fold it with the
 /// full-Unicode `to_uppercase` to match the keys `extract_all_column_types` builds, then
-/// scan. `involved_table_columns`' ASCII-folded keys agree for every column name the
-/// adapter can declare — `resolve_table_schema` Unicode-uppercases names before declaring
-/// them, so no declarable name can differ between the two folds. `None` means the type is
-/// not resolvable — the node carries no `name`, or its folded name is absent from the list
-/// — two cases every caller already treats identically.
+/// scan. `involved_table_columns` builds its keys with the same fold, so the two builders'
+/// lists agree for every column name, not only ones the adapter can declare. Separately,
+/// `resolve_table_schema` Unicode-uppercases names before declaring them, so no lowercase
+/// non-ASCII name ever reaches this lookup at all — a premise guarded by
+/// `non_ascii_table_and_column_stay_queryable`. `None` means the type is not resolvable — the node carries no
+/// `name`, or its folded name is absent from the list — two cases every caller already
+/// treats identically.
 ///
 /// Deliberately does NOT test `node`'s `type` tag. A non-`column` node is a PASS-THROUGH
 /// for [`guard_like_subject`] and [`coerce_string_position_arg`] but an unresolvable type
@@ -1316,9 +1308,9 @@ pub(super) fn project_columns(
 /// Unicode `to_uppercase`, while `column_tables` and `collect_side_column_names`
 /// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
 /// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
-/// under ASCII — and no test exercises `collect_all_column_names`, `collect_column_tables`,
-/// or `collect_side_column_names` with a non-ASCII column name, so unifying their folds
-/// would still pass the whole suite.
+/// under ASCII — and that divergence is pinned by `column_collectors_keep_divergent_case_folding`
+/// in `joins/rendering.rs`, which feeds `straße` through `collect_all_column_names` and
+/// `collect_side_column_names` and asserts they diverge (`STRASSE` vs `STRAßE`).
 pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
     match expr {
         Json::Object(map) => {
@@ -6099,16 +6091,15 @@ mod tests {
 
     /// The one `col_types` lookup folds the node's name with the full-Unicode
     /// `to_uppercase`, so it resolves against the Unicode-folded list
-    /// [`extract_all_column_types`] builds and MISSES the ASCII-folded list
-    /// `involved_table_columns` builds.
+    /// [`extract_all_column_types`] builds and MISSES a constructed ASCII-folded list
+    /// that no builder in this codebase produces.
     ///
     /// `STRAßE` is a CONSTRUCTED literal, not a name Exasol delivers: this crate
     /// uppercases every Iceberg field name itself before declaring it
     /// (`resolve_table_schema`, `file_resolution.rs:640`) and the full-Unicode fold maps
-    /// `ß` to `SS`, so a real `straße` column reaches this lookup as `STRASSE` and no
-    /// reachable name distinguishes the two folds. The literal is used here solely
-    /// because Rust's two folds disagree on it, which is what makes the miss assertion
-    /// falsifiable.
+    /// `ß` to `SS`, so a real `straße` column reaches this lookup as `STRASSE`. The
+    /// `ascii_folded` list below is likewise constructed, used here solely because Rust's
+    /// two folds disagree on `STRAßE`, which is what makes the miss assertion falsifiable.
     #[test]
     fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
         let node = column("STRAßE");

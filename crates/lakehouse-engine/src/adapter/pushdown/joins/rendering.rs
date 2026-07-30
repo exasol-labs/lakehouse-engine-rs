@@ -298,6 +298,19 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// Two total-safety fallbacks keep the wrapper buildable: an absent/empty SELECT
 /// list means `SELECT *` over both fan-outs, so every column is kept; and an
 /// (unreachable) empty result keeps `full_cols` rather than emit a zero-column leg.
+///
+/// The `names.contains(name)` narrowing below is a CROSS-FOLD string match: `full_cols`
+/// arrives from [`involved_table_columns`] folded by `support::column_types`' Unicode
+/// `to_uppercase`, while `names` is folded by `collect_side_column_names`' ASCII-only
+/// `to_ascii_uppercase`. The two agree only by premise — `resolve_table_schema`
+/// Unicode-uppercases every name it declares, so nothing lowercase or non-ASCII reaches
+/// either side (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`).
+/// Repair any divergence at that premise, never by unifying the two folds. If the
+/// premise ever weakens the failure is silent, not an error: `full_cols` would hold
+/// `STRASSE` where `names` holds `STRAßE`, this filter would drop a column the outer
+/// wrapper still references, and the empty-result fallback named above rescues only a
+/// *fully* empty narrowing — a partial mismatch narrows a referenced column away with
+/// no error at all.
 pub(super) fn referenced_side_columns(
     pushdown_req: &Json,
     condition: &Json,
