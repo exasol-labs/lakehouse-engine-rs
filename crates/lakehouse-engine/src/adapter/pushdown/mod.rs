@@ -75,8 +75,8 @@ mod dispatch_golden;
 
 /// Resolve the Iceberg snapshot + file list and build pushdown SQL.
 ///
-/// `cluster_nodes` — the number of Exasol nodes read from the `CLUSTER_NODES`
-/// adapterNotes entry (default 1 when absent or unparseable).
+/// `cluster_nodes` — the number of Exasol nodes, captured from `ctx.node_count()`
+/// in `dispatch`'s pushdown arm (default 1 when the handshake reports 0).
 ///
 /// `parallelism_factor` — the oversubscription multiplier read from the
 /// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
