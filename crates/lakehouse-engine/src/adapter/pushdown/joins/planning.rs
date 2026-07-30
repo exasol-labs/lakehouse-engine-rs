@@ -1,5 +1,5 @@
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageProps};
+use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -205,7 +205,7 @@ pub(crate) struct ResolvedJoinSide {
     /// query on the same `resolve_file_list` path as `logical_schema`.
     pub name_mapping: Vec<NameMappingEntry>,
     /// Effective storage for this side (vended STS creds when applicable).
-    pub effective_storage: StorageProps,
+    pub effective_storage: StorageBackend,
     /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
     pub total_bytes: u64,
 }
@@ -221,7 +221,7 @@ impl ResolvedJoinSide {
         files: Vec<FileEntry>,
         logical_schema: Vec<LogicalField>,
         name_mapping: Vec<NameMappingEntry>,
-        effective_storage: StorageProps,
+        effective_storage: StorageBackend,
     ) -> Self {
         let total_bytes = files
             .iter()
@@ -327,7 +327,7 @@ pub(super) async fn resolve_one_join_side(
     table_name: &str,
     iceberg_ident: &str,
     session: &CatalogSession,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,

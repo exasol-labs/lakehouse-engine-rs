@@ -227,7 +227,11 @@ pub fn render_order_by_clause(keys: &[SortKey]) -> String {
 /// no serialized [`ScanSpec`] carries a catalog block. It is re-exported here only
 /// so the adapter planning layer and the E2E harness keep the `use` path they were
 /// written against.
-pub use lakehouse_catalog::{CatalogProps, StorageProps};
+///
+/// [`StorageBackend`] is the backend selector wrapping [`StorageProps`], declared in
+/// that same producing crate and re-exported here so the scan, adapter, and catalog
+/// layers all name the storage backend at one path.
+pub use lakehouse_catalog::{CatalogProps, StorageBackend, StorageProps};
 
 /// One field in the logical schema carried by `ScanSpec::logical_schema`.
 ///
@@ -604,7 +608,7 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<JoinSpec>,
 
-    pub storage: StorageProps,
+    pub storage: StorageBackend,
 
     /// DataFusion `target_partitions` for this scan instance.
     #[serde(default = "default_one_usize")]
@@ -661,7 +665,7 @@ impl CommonScanSpec {
 
 impl Default for CommonScanSpec {
     /// The shard-invariant baseline: no pushdown (empty projection/filter/order-by,
-    /// no aggregate/group/join), a placeholder [`StorageProps`], and every tuning
+    /// no aggregate/group/join), a placeholder S3 [`StorageBackend`], and every tuning
     /// knob at its shared test-fixture value. Its purpose is construction ergonomics
     /// for tests, which spread `..Default::default()` and override ONLY the fields a
     /// given scenario exercises, rather than respelling all shard-invariant fields.
@@ -686,7 +690,7 @@ impl Default for CommonScanSpec {
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
             join: None,
-            storage: StorageProps::default(),
+            storage: StorageBackend::S3(StorageProps::default()),
             df_target_partitions: default_one_usize(),
             df_batch_size: default_batch_size(),
             df_threads_per_udf: default_one_usize(),
@@ -850,14 +854,14 @@ mod tests {
                 projection: vec!["id".into(), "name".into()],
                 filter: Some("(\"ID\" > 10)".into()),
                 limit: Some(100),
-                storage: StorageProps {
+                storage: StorageBackend::S3(StorageProps {
                     endpoint: "http://minio:9000".into(),
                     region: "us-east-1".into(),
                     access_key: "minioadmin".into(),
                     secret_key: "minioadmin".into(),
                     allow_http: true,
                     ..Default::default()
-                },
+                }),
                 ..Default::default()
             },
             files: vec![
@@ -865,6 +869,13 @@ mod tests {
                 FileEntry::new("data/part-00001.parquet", 2048),
             ],
         }
+    }
+
+    /// Unwraps the S3 payload from a [`StorageBackend`] for field-level assertions
+    /// in tests that predate the backend wrapper and only ever exercised S3.
+    fn s3_props(storage: &StorageBackend) -> &StorageProps {
+        let StorageBackend::S3(props) = storage;
+        props
     }
 
     /// `CommonScanSpec::default()` — the shared test-construction baseline that
@@ -878,7 +889,7 @@ mod tests {
     fn default_matches_serde_absent_except_s3_max_connections() {
         // A common blob whose every optional/tuning field is absent from JSON
         // (only the two non-defaulted fields, `projection` and `storage`, present).
-        let minimal = r#"{"projection":[],"storage":{"endpoint":"","region":"","access_key":"","secret_key":""}}"#;
+        let minimal = r#"{"projection":[],"storage":{"s3":{"endpoint":"","region":"","access_key":"","secret_key":""}}}"#;
         let from_absent = CommonScanSpec::from_json(minimal).unwrap();
         let d = CommonScanSpec::default();
 
@@ -889,8 +900,11 @@ mod tests {
         assert_eq!(d.df_threads_per_udf, from_absent.df_threads_per_udf);
         assert_eq!(d.memory_pool_fraction, from_absent.memory_pool_fraction);
         assert_eq!(d.instance_overhead_mb, from_absent.instance_overhead_mb);
-        assert_eq!(d.storage.path_style, from_absent.storage.path_style);
-        assert!(!d.storage.allow_http && !from_absent.storage.allow_http);
+        assert_eq!(
+            s3_props(&d.storage).path_style,
+            s3_props(&from_absent.storage).path_style
+        );
+        assert!(!s3_props(&d.storage).allow_http && !s3_props(&from_absent.storage).allow_http);
 
         // The one deliberate divergence: Default is the fixture value, serde's
         // field-absent fallback is the conservative wire default.
@@ -934,11 +948,11 @@ mod tests {
         assert_eq!(back.common.limit, Some(100));
 
         // Credentials survive the round-trip (they must reach the scan UDF).
-        assert_eq!(back.common.storage.endpoint, "http://minio:9000");
-        assert_eq!(back.common.storage.access_key, "minioadmin");
-        assert_eq!(back.common.storage.secret_key, "minioadmin");
-        assert!(back.common.storage.path_style);
-        assert!(back.common.storage.allow_http);
+        assert_eq!(s3_props(&back.common.storage).endpoint, "http://minio:9000");
+        assert_eq!(s3_props(&back.common.storage).access_key, "minioadmin");
+        assert_eq!(s3_props(&back.common.storage).secret_key, "minioadmin");
+        assert!(s3_props(&back.common.storage).path_style);
+        assert!(s3_props(&back.common.storage).allow_http);
     }
 
     #[test]
@@ -946,7 +960,8 @@ mod tests {
         let mut spec = sample_spec();
         spec.common.filter = None;
         spec.common.limit = None;
-        spec.common.storage.session_token = None;
+        let StorageBackend::S3(props) = &mut spec.common.storage;
+        props.session_token = None;
         spec.common.aggregates = None;
         spec.common.group_keys = None;
         let json = spec.to_json();
@@ -1002,12 +1017,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
@@ -1142,12 +1152,7 @@ mod tests {
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
             "aggregates": [{"kind": "sum", "column": "AMOUNT"}],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         let legacy_plans = legacy
@@ -1266,12 +1271,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
@@ -1282,12 +1282,7 @@ mod tests {
         // Same for the common blob in isolation.
         let legacy_common_json = r#"{
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
         assert!(
@@ -1422,12 +1417,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
@@ -1482,12 +1472,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
@@ -1534,12 +1519,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
@@ -1579,12 +1559,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
@@ -1619,12 +1594,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
@@ -1667,12 +1637,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 123]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
@@ -1688,12 +1653,7 @@ mod tests {
         // 4. The default also applies to CommonScanSpec (shard-invariant blob).
         let legacy_common_json = r#"{
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
         assert_eq!(
@@ -1843,12 +1803,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(
@@ -1860,12 +1815,7 @@ mod tests {
         // Same for the common blob in isolation.
         let legacy_common_json = r#"{
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
         assert_eq!(
@@ -1921,12 +1871,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert!(
@@ -1937,12 +1882,7 @@ mod tests {
         // Same for the common blob in isolation.
         let legacy_common_json = r#"{
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
         assert!(
@@ -1963,12 +1903,7 @@ mod tests {
         let legacy_json = r#"{
             "files": [["s3://w/f0.parquet", 100], ["s3://w/f1.parquet", 200]],
             "projection": [],
-            "storage": {
-                "endpoint": "http://minio:9000",
-                "region": "us-east-1",
-                "access_key": "k",
-                "secret_key": "s"
-            }
+            "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
         }"#;
         let legacy = ScanSpec::from_json(legacy_json).unwrap();
         assert_eq!(legacy.files.len(), 2);
@@ -2137,7 +2072,7 @@ mod tests {
     fn common_blob_wire_is_byte_stable() {
         let spec = sample_spec();
 
-        let common_wire = r#"{"table_root":"s3://warehouse/db/table","projection":["id","name"],"filter":"(\"ID\" > 10)","limit":100,"storage":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}"#;
+        let common_wire = r#"{"table_root":"s3://warehouse/db/table","projection":["id","name"],"filter":"(\"ID\" > 10)","limit":100,"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}"#;
         assert_eq!(spec.to_common_json(), common_wire);
 
         let files_wire = r#"[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#;

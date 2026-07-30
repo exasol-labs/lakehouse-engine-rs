@@ -89,3 +89,31 @@ fn storage_props_wire_encoding_unchanged() {
 
     assert_eq!(serde_json::to_string(&storage).unwrap(), golden);
 }
+
+/// Companion pin to [`storage_props_wire_encoding_unchanged`]: `StorageBackend`
+/// wraps [`StorageProps`] in an externally-tagged, lowercase-keyed `s3` variant,
+/// so the exact same field values now round-trip under `{"s3": {...}}` rather
+/// than the bare object above. This is the one deliberate byte-level wire
+/// change the storage-backend-enum refactor makes.
+#[test]
+fn storage_backend_wire_encoding_tags_the_s3_payload() {
+    use lakehouse_engine::scan::spec::StorageBackend;
+
+    let backend = StorageBackend::S3(StorageProps {
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        allow_http: true,
+        ..Default::default()
+    });
+
+    let golden = r#"{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}"#;
+
+    let encoded = serde_json::to_string(&backend).unwrap();
+    assert_eq!(encoded, golden);
+    assert_eq!(
+        serde_json::from_str::<StorageBackend>(&encoded).unwrap(),
+        backend
+    );
+}

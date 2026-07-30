@@ -12,13 +12,9 @@ use crate::auth::{
 };
 use crate::iceberg_io::authed_get_json;
 use crate::namespace::parse_table_ident;
-use crate::{CatalogProps, ConnectionCreds, StorageProps};
+use crate::{CatalogProps, ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::CatalogBuilder;
-use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
-    S3_SESSION_TOKEN,
-};
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
@@ -30,14 +26,15 @@ use std::sync::Arc;
 /// (MinIO) storage factory.
 ///
 /// iceberg 0.10.0 requires an explicit `StorageFactory`; the S3 config keys are
-/// supplied in the same props map passed to `load`. Credentials live only in
-/// this map and never appear in returned SQL or error strings.
+/// supplied in the same props map passed to `load`, via `storage`'s
+/// [`StorageBackend::catalog_storage_props`]. Credentials live only in this map
+/// and never appear in returned SQL or error strings.
 ///
 /// Crate-private: `namespace`'s unsigned enumeration path is the only caller.
 pub(crate) async fn build_rest_catalog(
     catalog_uri: &str,
     catalog: &CatalogProps,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<RestCatalog, UdfError> {
     let mut props = HashMap::new();
@@ -46,25 +43,7 @@ pub(crate) async fn build_rest_catalog(
         REST_CATALOG_PROP_WAREHOUSE.to_string(),
         catalog.warehouse.clone(),
     );
-    if !storage.endpoint.is_empty() {
-        props.insert(S3_ENDPOINT.to_string(), storage.endpoint.clone());
-    }
-    if !storage.region.is_empty() {
-        props.insert(S3_REGION.to_string(), storage.region.clone());
-    }
-    if !storage.access_key.is_empty() {
-        props.insert(S3_ACCESS_KEY_ID.to_string(), storage.access_key.clone());
-    }
-    if !storage.secret_key.is_empty() {
-        props.insert(S3_SECRET_ACCESS_KEY.to_string(), storage.secret_key.clone());
-    }
-    if let Some(token) = &storage.session_token {
-        props.insert(S3_SESSION_TOKEN.to_string(), token.clone());
-    }
-    props.insert(
-        S3_PATH_STYLE_ACCESS.to_string(),
-        storage.path_style.to_string(),
-    );
+    props.extend(storage.catalog_storage_props());
 
     inject_catalog_auth_props(&mut props, creds);
 
