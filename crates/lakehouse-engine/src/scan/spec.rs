@@ -213,77 +213,21 @@ pub fn render_order_by_clause(keys: &[SortKey]) -> String {
         .join(", ")
 }
 
-/// Storage connection properties (S3-compatible / MinIO).
-/// Fields are plain Strings so serde handles them uniformly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageProps {
-    pub endpoint: String,
-    pub region: String,
-    pub access_key: String,
-    pub secret_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_token: Option<String>,
-    /// Enable HTTP (MinIO local dev typically uses HTTP, not HTTPS).
-    #[serde(default)]
-    pub allow_http: bool,
-    /// Use path-style access (required for MinIO).
-    #[serde(default = "default_true")]
-    pub path_style: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for StorageProps {
-    /// Mirrors serde's field-absent defaults: empty connection fields, no session
-    /// token, HTTPS (`allow_http` false), and path-style access ON (`default_true`).
-    /// So `StorageProps::default()` equals deserializing a `StorageProps` whose
-    /// optional fields are all absent — the single source of truth is the same
-    /// `default_true` seam serde uses. A placeholder for tests, which override the
-    /// connection fields that matter to a given scenario.
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            region: String::new(),
-            access_key: String::new(),
-            secret_key: String::new(),
-            session_token: None,
-            allow_http: false,
-            path_style: default_true(),
-        }
-    }
-}
-
-impl StorageProps {
-    /// The non-empty secret values (access key, secret key, session token).
-    ///
-    /// Used for value-based error redaction: any error string containing one of
-    /// these literal values has it stripped before the error is surfaced.
-    pub fn secret_values(&self) -> Vec<&str> {
-        let mut secrets = Vec::new();
-        for candidate in [self.access_key.as_str(), self.secret_key.as_str()] {
-            if !candidate.is_empty() {
-                secrets.push(candidate);
-            }
-        }
-        if let Some(token) = self.session_token.as_deref()
-            && !token.is_empty()
-        {
-            secrets.push(token);
-        }
-        secrets
-    }
-}
-
-/// Iceberg REST catalog connection properties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CatalogProps {
-    pub uri: String,
-    pub warehouse: String,
-    /// Fully-qualified table identifier: "<namespace>.<table>".
-    pub table: String,
-}
+/// Storage and catalog connection properties, both declared once in the
+/// `lakehouse-catalog` crate and re-exported here at the path their consumers
+/// already import.
+///
+/// [`StorageProps`] belongs to the crate that PRODUCES it — a `loadTable` response
+/// vends the S3 credentials, region, endpoint, and path-style — while the scan
+/// layer that CONSUMES it as a [`CommonScanSpec`] field keeps this path. One
+/// definition therefore backs one serde wire contract, pinned by this module's
+/// `common_blob_wire_is_byte_stable` test.
+///
+/// [`CatalogProps`] is not a scan-spec type at all: no `scan` module names it and
+/// no serialized [`ScanSpec`] carries a catalog block. It is re-exported here only
+/// so the adapter planning layer and the E2E harness keep the `use` path they were
+/// written against.
+pub use lakehouse_catalog::{CatalogProps, StorageProps};
 
 /// One field in the logical schema carried by `ScanSpec::logical_schema`.
 ///

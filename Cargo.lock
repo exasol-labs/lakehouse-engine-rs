@@ -2957,15 +2957,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lakehouse-catalog"
+version = "0.1.0"
+dependencies = [
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "exasol-udf-sdk",
+ "iceberg",
+ "iceberg-catalog-rest",
+ "iceberg-storage-opendal",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "lakehouse-engine"
-version = "0.30.14"
+version = "0.30.15"
 dependencies = [
  "anyhow",
  "arrow",
  "async-trait",
- "aws-credential-types",
- "aws-sigv4",
- "aws-smithy-runtime-api",
  "base64",
  "bytes",
  "chrono",
@@ -2976,6 +2991,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "lakehouse-catalog",
  "native-tls",
  "object_store",
  "parquet",

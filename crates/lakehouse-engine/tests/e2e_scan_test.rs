@@ -35,6 +35,7 @@ use common::stack::{
     wait_for_minio,
 };
 
+use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
 
 use std::sync::OnceLock;
@@ -3084,10 +3085,18 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .build()
         .expect("tokio runtime for file-count pruning test");
 
+    // One `CatalogSession` built once and reused across all three pruning calls
+    // below, mirroring the single-session-per-query contract `resolve_file_list`
+    // now requires (see `adapter/mod.rs`'s hoisted enumeration session and
+    // `pushdown/mod.rs`'s `handle_pushdown`).
+    let session = rt
+        .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
+        .expect("CatalogSession::resolve must succeed");
+
     // --- baseline: no filter → 3 data files (one per partition) ---
     let all_files = rt
         .block_on(async {
-            resolve_file_list(&catalog_uri, &catalog_props, &storage, &creds, None).await
+            resolve_file_list(&session, &catalog_props, &storage, &creds, None).await
         })
         .expect("resolve_file_list (no filter) must succeed");
     let all_files = all_files.0;
@@ -3109,7 +3118,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let pruned_partition = rt
         .block_on(async {
             resolve_file_list(
-                &catalog_uri,
+                &session,
                 &catalog_props,
                 &storage,
                 &creds,
@@ -3146,7 +3155,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let pruned_range = rt
         .block_on(async {
             resolve_file_list(
-                &catalog_uri,
+                &session,
                 &catalog_props,
                 &storage,
                 &creds,

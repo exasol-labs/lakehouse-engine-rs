@@ -3,9 +3,9 @@ use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry,
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::credentials::CatalogSession;
-use super::super::file_resolution::resolve_file_list_with_session;
+use super::super::file_resolution::resolve_file_list;
 use super::super::support::{column_types, extract_limit, order_by_present};
+use lakehouse_catalog::CatalogSession;
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///
@@ -337,7 +337,7 @@ pub(super) async fn resolve_one_join_side(
         ..catalog.clone()
     };
     let (files, effective_storage, logical_schema, table_root, name_mapping) =
-        resolve_file_list_with_session(session, &side_catalog, storage, creds, filter_json).await?;
+        resolve_file_list(session, &side_catalog, storage, creds, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         iceberg_ident.to_string(),
@@ -782,7 +782,7 @@ mod tests {
     ///
     /// `STRAßE` is a CONSTRUCTED literal, chosen because Rust's two folds disagree on
     /// it (`to_uppercase` → `STRASSE`, `to_ascii_uppercase` → `STRAßE`), NOT a name
-    /// Exasol ever delivers: `resolve_table_schema` (`file_resolution.rs:640`)
+    /// Exasol ever delivers: `resolve_table_schema` (`file_resolution.rs:600`)
     /// Unicode-uppercases every column name before either builder ever sees it, so no
     /// reachable input can exercise this divergence — confirmed live against a local
     /// Docker Exasol container, which served an Iceberg `straße` column as `STRASSE`.

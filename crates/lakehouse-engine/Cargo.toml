@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.30.14"
+version = "0.30.15"
 edition = "2024"
 license.workspace = true
 
@@ -25,7 +25,8 @@ lakekeeper-e2e = []
 exasol-udf-sdk    = { version = "0.21.0", features = ["emit-arrow"] }
 exasol-udf-macros = { version = "0.21.0" }
 
-vs-expression = { path = "../vs-expression" }
+vs-expression     = { path = "../vs-expression" }
+lakehouse-catalog = { path = "../lakehouse-catalog" }
 
 arrow      = { workspace = true }
 parquet    = { workspace = true }
@@ -63,21 +64,6 @@ url     = { workspace = true }
 # subscriber machinery crosses into the `.so`.
 tracing = { version = "0.1", default-features = false }
 
-# SigV4 signing for Glue REST catalog requests (engine-only: not used by vs-expression).
-# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
-aws-sigv4             = { version = "1.4", default-features = true }
-aws-credential-types  = { version = "1.2" }
-# aws-smithy-runtime-api is a direct dependency of aws-sigv4 (for Identity); we declare
-# it explicitly so the `use aws_smithy_runtime_api::client::identity::Identity` import
-# in sigv4.rs resolves without relying on transitive re-export.
-aws-smithy-runtime-api = { version = "1", features = ["client"] }
-
-# Async reqwest client for the self-issued signed load_table GET (task 4.1).
-# Intentionally async (no "blocking" feature): the adapter's handle_pushdown_request runs
-# inside rt.block_on(async { ... }), so a blocking reqwest call would panic at runtime.
-# The dev-dependency reqwest uses "blocking" only for the test harness; that is independent.
-reqwest = { version = "0.12" }
-
 [dev-dependencies]
 # time: tokio::time::sleep, used by the concurrency-bound integration tests to force
 # deterministic overlap in fake delete-file reads.
@@ -95,7 +81,7 @@ parquet             = { workspace = true }
 tpchgen             = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-reqwest             = { version = "0.12", features = ["blocking"] }
+reqwest             = { workspace = true, features = ["blocking"] }
 # Seed harness only: name reqsign-core's `Context`/`Result` to implement a
 # `ProvideCredential` that forces static MinIO admin S3 credentials for the seed
 # write path, overriding Lakekeeper's vended STS session token (see seed.rs
