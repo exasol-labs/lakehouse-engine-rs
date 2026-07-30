@@ -3002,7 +3002,6 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tpchgen",
  "tracing",
