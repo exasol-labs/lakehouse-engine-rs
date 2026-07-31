@@ -109,9 +109,9 @@ pub(super) fn render_expression_qualified(
 /// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
 /// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
 /// or unrenderable — mirroring the single-table `render_df_filter_safe` contract.
-/// A `None` here is never Exasol's problem to catch: Exasol never independently
-/// re-checks or re-applies an advertised capability, so the caller must itself
-/// self-apply a declined filter (e.g. as an outer WHERE) rather than omit it. Uses
+/// A `None` here is never Exasol's problem to catch: the caller must itself
+/// self-apply a declined filter (e.g. as an outer WHERE) rather than omit it
+/// (`pushdown`'s module header). Uses
 /// the Exasol-dialect entry point because the wrapper WHERE is parsed by Exasol's
 /// core engine (length-qualified CAST targets).
 pub(super) fn render_df_filter_qualified(

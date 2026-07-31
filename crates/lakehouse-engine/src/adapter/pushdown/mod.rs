@@ -4,12 +4,10 @@
 //! Architecture invariants:
 //! - File list resolved exactly ONCE here, in the planning layer.
 //! - The scan SCALAR EMIT UDF receives the explicit file list; it NEVER discovers files.
-//! - Once the adapter's capabilities response advertises a predicate or function
-//!   shape, Exasol delegates it fully to the adapter and never independently
-//!   re-checks or re-applies it — there is no Exasol-side fallback. A predicate the
-//!   adapter cannot faithfully translate into the DataFusion scan is therefore
-//!   self-applied by the adapter itself (e.g. as an outer WHERE), never OMITTED
-//!   from the spec — omitting it would return wrong rows, not defer to a safe check.
+//! - A predicate the adapter cannot faithfully translate into the DataFusion scan is
+//!   self-applied by the adapter itself (e.g. as an outer WHERE), never OMITTED from
+//!   the spec. There is no Exasol-side fallback to defer to — see CLAUDE.md
+//!   § "Virtual Schema pushdown delegation" and `specs/_decision/045`.
 //! - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
 //! - Catalog/connection auth credentials (OAuth token, bearer, etc.) NEVER appear
 //!   in any returned SQL string or error message. Storage (S3) credentials are a
@@ -346,8 +344,8 @@ pub(crate) fn build_dispatch_sql(
 
     // Declined-WHERE-filter route, taken AHEAD of the routing classifier so ONE route
     // serves all five request shapes (row scan, top-N, single-group aggregate, grouped
-    // aggregate, `COUNT(DISTINCT)`). Exasol re-applies nothing it delegated, so a
-    // predicate the scan spec cannot carry is the adapter's own to render — and the
+    // aggregate, `COUNT(DISTINCT)`). A predicate the scan spec cannot carry is the
+    // adapter's own to render (see this module's header) — and the
     // qualified wrapper is the one shape that positions that `WHERE` between the raw
     // fan-out (aggregate-free, sort-free, LIMIT-free by construction) and every other
     // clause, so it filters BEFORE aggregating, grouping, and truncating. Wrapping the

@@ -62,7 +62,7 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * *AND* a WHERE filter over columns of either side SHALL be rendered via the same `crates/vs-expression` translator path used for single-table filters and carried in the common spec
 * *AND* a filter that is PRESENT and non-trivial but that the translator DECLINES SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition already does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
 * *AND* the adapter SHALL distinguish an ABSENT or trivially-true filter, which leaves the broadcast plan eligible and emits no scan-spec filter, from a DECLINED one, which forfeits the broadcast plan
-* *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because Exasol re-applies nothing it delegated and the result would carry extra rows
+* *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because the result would carry extra rows — see `vs-adapter/pushdown-declined-filter-self-apply`
 
 ### Scenario: Join condition is rendered via the vs-expression translator
 

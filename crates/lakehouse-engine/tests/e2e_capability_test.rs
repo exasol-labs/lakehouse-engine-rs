@@ -3719,12 +3719,10 @@ fn e2e_now_family_matches_native_oracle() {
 // Declined-filter self-apply (#279, `fix-declined-filter-self-apply`): a WHERE
 // predicate the adapter cannot push into the DataFusion scan must still be
 // applied — in the adapter's OWN Exasol-dialect SQL — rather than silently
-// dropped. Exasol's Virtual Schema protocol is all-or-nothing per advertised
-// capability: once a capability (e.g. `FN_CAST`, `FN_SECOND`) is advertised,
-// Exasol delegates the whole predicate and never independently re-checks or
-// re-applies it. Before this fix, all three render sites read a declined
-// render as "safe to omit", so every query below returned all 12 seeded rows
-// instead of the filtered subset.
+// dropped (see CLAUDE.md § "Virtual Schema pushdown delegation"). Before this
+// fix, all three render sites read a declined render as "safe to omit", so
+// every query below returned all 12 seeded rows instead of the filtered
+// subset.
 //
 // Every predicate here is one of the three DECLINE sources the plan verified
 // live against this Docker Exasol stack: `SECOND(ts, 3)` (DataFusion-dialect

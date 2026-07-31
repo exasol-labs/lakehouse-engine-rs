@@ -512,12 +512,10 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
 /// Answers whether the DataFusion dialect can express `expr` as a scan-spec
 /// filter.
 ///
-/// WHY this exists: once the adapter's capabilities response advertises a
-/// predicate or function shape, Exasol delegates it fully and never
-/// independently re-checks or re-applies it — there is no Exasol-side
-/// fallback. A predicate this returns `false` for therefore cannot be pushed
-/// into the DataFusion-in-UDF scan spec; the caller MUST self-apply it in the
-/// adapter's own returned SQL instead, never omit it. A trivially-true
+/// A predicate this returns `false` for cannot be pushed into the
+/// DataFusion-in-UDF scan spec; the caller MUST self-apply it in the adapter's
+/// own returned SQL instead, never omit it (no Exasol-side fallback — see
+/// CLAUDE.md § "Virtual Schema pushdown delegation"). A trivially-true
 /// predicate (renders to `TRUE`/`NULL`) answers `true`: omitting a no-op
 /// predicate is correct, not a decline.
 pub(super) fn datafusion_renderable(expr: &Json) -> bool {
@@ -552,8 +550,7 @@ const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right",
 /// `f` returning `None` declines the WHOLE tree, not just the declining subtree: the
 /// `None` travels out through every enclosing level via `?`. That mirrors the
 /// all-or-nothing untranslatable-predicate backstop — the whole filter or the whole
-/// select-list item is declined. Exasol never independently re-checks or re-applies
-/// an advertised capability, so this is NOT a case where Exasol safely evaluates the
+/// select-list item is declined. This is NOT a case where Exasol safely evaluates the
 /// decline natively — the caller must itself self-apply the declined filter (or fall
 /// back to the base row for a select-list item). An INFALLIBLE rewriter composes as
 /// the never-declining case: with a statically always-`Some` `f` the result is always
@@ -669,9 +666,8 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
 /// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
 ///   tree propagates to the outer call, mirroring the all-or-nothing
-///   untranslatable-predicate backstop (`mod.rs:14-15`). Exasol never independently
-///   re-checks or re-applies an advertised capability, so a decline here is NOT
-///   safely deferred to Exasol — the caller must itself self-apply the declined
+///   untranslatable-predicate backstop (`super`'s module header). A decline here is
+///   NOT safely deferred to Exasol — the caller must itself self-apply the declined
 ///   filter (e.g. as an outer WHERE) rather than omit it (decision-log [3]).
 fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
     rewrite_expr_tree(
@@ -980,8 +976,7 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 /// - `Some(tree)` — render this (possibly coerced) tree.
 /// - `None` — decline. A decline anywhere in the tree propagates to the outer call
 ///   through `?`, mirroring [`like_subject_type_guard`]: the WHOLE filter or the
-///   WHOLE select-list item is declined. Exasol never independently re-checks or
-///   re-applies an advertised capability, so this decline is NOT safely deferred to
+///   WHOLE select-list item is declined. This decline is NOT safely deferred to
 ///   Exasol — the caller must itself self-apply the declined filter (or fall back to
 ///   the base row for a select-list item) rather than omit it. A `NotGoverned` node
 ///   never declines, whatever its arguments' types.
@@ -1096,12 +1091,10 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
 ///
 /// The single owner of that classification, so `build_dispatch_sql` never re-derives
 /// renderability and the trivially-true rule keeps its one owner in
-/// `crates/vs-expression`. Splitting matters because there is no Exasol-side
-/// fallback: once the capabilities response advertises a predicate shape Exasol
-/// delegates it fully and never re-applies it, so a predicate this hands back as
+/// `crates/vs-expression`. Splitting matters because a predicate this hands back as
 /// `declined` MUST be self-applied in the adapter's own returned SQL — the pre-#279
 /// code collapsed both outcomes into one `None` and silently returned unfiltered
-/// rows.
+/// rows (`super`'s module header states the invariant and cites the reason).
 ///
 /// `declined` is the ORIGINAL, un-rewritten tree: the type rewrites target the
 /// DataFusion dialect, whereas the self-apply site renders Exasol. A guard declining
@@ -4367,8 +4360,7 @@ mod tests {
     /// through to its consequence: a nested non-string LIKE declines the ENTIRE
     /// enclosing filter, and that whole filter — the renderable `STATUS = 'OPEN'`
     /// conjunct included — is then applied by the adapter in the wrapper's `WHERE`, not
-    /// omitted. Exasol re-applies nothing it delegated, so omitting either conjunct
-    /// would return rows the query excludes.
+    /// omitted — omitting either conjunct would return rows the query excludes.
     #[test]
     fn nested_like_decline_routes_to_wrapper_where() {
         let filter = serde_json::json!({

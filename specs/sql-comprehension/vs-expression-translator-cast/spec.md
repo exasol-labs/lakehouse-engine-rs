@@ -7,8 +7,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 * This delta corrects what a refused CAST target MEANS for the caller. The refusal itself is
   unchanged — an error in raising mode, `None` in the safe variants, for exactly the targets whose
   DataFusion result would diverge. What is corrected is the claim that the adapter can therefore
-  omit the CAST and let Exasol evaluate it: `FN_CAST` IS advertised, so Exasol delegates the CAST and
-  re-applies nothing. See `vs-adapter/pushdown-declined-filter-self-apply`.
+  omit the CAST and let Exasol evaluate it: `FN_CAST` IS advertised, so nothing else evaluates it.
+  See `vs-adapter/pushdown-declined-filter-self-apply` and ADR `specs/_decision/045`.
 * These five targets are refused in BOTH dialects, so a WHERE predicate carrying one cannot be
   self-applied either. That predicate is the terminal case: a clean client-facing error, never a
   result computed without it.

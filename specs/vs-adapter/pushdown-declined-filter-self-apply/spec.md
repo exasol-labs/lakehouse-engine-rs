@@ -5,12 +5,10 @@ own returned SQL any predicate it cannot push to DataFusion.
 
 ## Background
 
-* Exasol's pushdown response envelope carries exactly two fields, `type` and `sql`. There is no
-  residual, partial-pushdown, or "I did not handle this" field, and capability negotiation is
-  whole-capability and whole-schema, fixed at DDL time. The adapter cannot hand a predicate back.
-* Exasol splits the query BEFORE sending the pushdown request, using the capabilities response
-  alone: it post-processes only what the adapter did NOT advertise. A predicate whose capability
-  the adapter advertised is removed from Exasol's own plan and never re-checked.
+* The protocol fact this feature rests on — there is no Exasol-side fallback for a predicate whose
+  capability the adapter advertised, and no envelope field with which to hand one back — is recorded
+  once, in ADR `specs/_decision/045` and CLAUDE.md § "Virtual Schema pushdown delegation". This spec
+  states only what the adapter must therefore DO, and does not restate the fact.
 * Three sites render the DataFusion-bound WHERE filter and each returns `Option<String>`: the
   single-table path (`handle_pushdown`), the broadcast-join path (`render_broadcast_join`), and the
   N-scan per-leg path (`build_side_fan_out_sql`). `None` conflates three outcomes — no filter in the
@@ -66,7 +64,7 @@ own returned SQL any predicate it cannot push to DataFusion.
 * *THEN* the adapter SHALL route the request to the qualified single-table wrapper and render the ORIGINAL request filter tree as that wrapper's own `WHERE`, table-qualified against the wrapper's single subquery alias
 * *AND* the per-shard scan spec SHALL carry NO `filter`, so the predicate is applied exactly once
 * *AND* the returned SQL SHALL evaluate the predicate, so the result SHALL equal native Exasol evaluation of the same query rather than the unfiltered row set the omission returned
-* *AND* the adapter MUST NOT return SQL that omits the predicate, because Exasol removed it from its own plan when it delegated it and re-applies nothing
+* *AND* the adapter MUST NOT return SQL that omits the predicate, because nothing else would apply it
 
 ### Scenario: A declined filter is applied before aggregation, grouping, and truncation
 

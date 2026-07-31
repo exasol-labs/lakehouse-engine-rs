@@ -60,8 +60,8 @@ pub const CAPABILITIES: &[&str] = &[
     // Type conversion (issue #104): CAST is advertised over its faithful
     // target-type set (VARCHAR/CHAR/DECIMAL(p,s)/DOUBLE/BOOLEAN/DATE/TIMESTAMP).
     // A CAST target renderable under neither dialect (INTERVAL/GEOMETRY/HASHTYPE/
-    // TIMESTAMP WITH LOCAL TIME ZONE) fails the query, because an advertised
-    // capability is never re-applied by Exasol.
+    // TIMESTAMP WITH LOCAL TIME ZONE) fails the query — it can be applied nowhere
+    // (see `pushdown`'s module header).
     "FN_CAST",
     // Math scalar functions
     "FN_ABS",

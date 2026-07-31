@@ -114,7 +114,7 @@ fourth route rather than a new shape.
 
 Plan-review round 1 found that the original design added the DataFusion-renderability condition
 inside `side_local_filter`, which has a second production consumer the plan never named:
-`plan_join` (`joins/mod.rs:122`) passes its result to `resolve_one_join_side` as that side's Iceberg
+`plan_join` (`joins/mod.rs`) passes its result to `resolve_one_join_side` as that side's Iceberg
 manifest-pruning predicate. The condition would have stripped declined conjuncts from pruning too —
 more files opened, correct rows, no failing test — contradicting the plan's own non-goals and the
 `pushdown-file-pruning` and `pushdown-declined-filter-self-apply` specs.
@@ -173,9 +173,9 @@ absent, trivially true, unrenderable — and error only on the third.
 A renderer that suppresses a no-op result must never decide unrenderability; that decision needs
 the non-suppressing entry point. This rule applies identically to both wrappers in this plan.
 
-## ADR: The decline route carries a projection override for absent- or empty-`selectList` shapes
+## ADR: The decline route projects the full base row instead of the referenced-column narrowing
 
-**ID:** decline-route-carries-a-projection-override-for-select-star-shapes
+**ID:** decline-route-projects-the-full-base-row
 **Plan:** fix-declined-filter-self-apply
 **Status:** Accepted
 
@@ -190,24 +190,30 @@ turned "wrong rows" into a hard `04000` error or a silently truncated single-col
 
 ### Decision
 
-Give `qualified_single_table_fallback_pushdown` a second new parameter, a pre-computed projection
-override. The decline route passes the full base row (every `col_types` entry, in order, with its
-Exasol type) when `selectList` is absent, JSON-null, or an empty array, and `None` everywhere else.
-The guard lives at the decline route, not inside `referenced_column_projection`, which stays the
-one shared column-narrowing walk for both the wrapper and the join-projection narrowing.
+Key the projection off the decline route itself, inside
+`qualified_single_table_fallback_pushdown`: when `declined_filter` is `Some`, project the full base
+row (every `col_types` entry, in order, with its Exasol type); otherwise call
+`referenced_column_projection` as before. This applies to EVERY request the decline route carries,
+not only the select-star shapes the finding named — the narrowing is what is unsafe here, so
+forfeiting it wholesale is simpler than a per-shape `selectList` test and strictly no less correct.
+`referenced_column_projection` itself stays an unconditional narrowing walk, shared unchanged with
+the join-projection narrowing.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Add a projection override parameter at the decline route only | ✓ Chosen — keeps the one shared narrowing walk intact for its other callers |
+| Gate on `declined_filter` inside the wrapper dispatch, projecting the full base row | ✓ Chosen — one branch, no new parameter, and no `selectList`-shape test to keep in sync with Exasol's positional validation |
+| Pass a pre-computed projection override in as a new parameter, set only for absent/JSON-null/empty-array `selectList` | ✗ Rejected — a parameter plus a shape test to express what the route already knows from `declined_filter` |
 | Fold the guard into `referenced_column_projection` | ✗ Rejected — that function is shared with the join wrapper's narrowing, which must keep its existing behavior |
 
 ### Consequences
 
 Widening the set of request shapes a wrapper serves widens its column-shape contract: a route added
 ahead of a classifier inherits every shape the classifier used to divert. The empty-array arity was
-confirmed against the live Docker Exasol container rather than assumed from code.
+confirmed against the live Docker Exasol container rather than assumed from code. The decline route
+forfeits referenced-column narrowing (#160) for all its requests — the same trade the wrapper's
+other routes already make, on a path that is already the slower one.
 
 ## ADR: A native partial-pushdown acknowledgment mechanism is ruled out, not assumed absent
 

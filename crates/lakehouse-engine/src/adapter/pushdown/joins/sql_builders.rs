@@ -28,9 +28,9 @@ use super::rendering::{
 pub(crate) struct RenderedJoinPushdown {
     /// The rendered DataFusion SQL boolean join condition (→ [`JoinSpec::condition`]).
     pub condition: String,
-    /// The rendered cross-table WHERE filter. `Some` only when the request's
-    /// filter is absent or trivially true — NEVER when it is declined: a declined
-    /// filter forfeits the broadcast plan entirely and falls through to the N-scan
+    /// The rendered cross-table WHERE filter, or `None` when the request carries
+    /// none or it renders trivially true. NEVER a declined filter: a decline
+    /// forfeits the broadcast plan entirely and falls through to the N-scan
     /// wrapper instead, so this field carries no decline case to self-apply.
     pub filter: Option<String>,
     /// The cross-table projection, spanning columns from both tables, in order.
@@ -382,8 +382,8 @@ fn outer_wrapper_clauses(
 /// DataFusion dialect can render; cross-table / OR-spanning / untagged residual
 /// conjuncts, every DataFusion-DECLINED conjunct, and any untaggable join condition
 /// remain in the outer WHERE, each parenthesized so a top-level `OR` cannot bind
-/// across the ANDs. Nothing is ever omitted: Exasol re-applies nothing it delegated,
-/// so a predicate no leg can apply is the wrapper's own to render. For an inner join
+/// across the ANDs. Nothing is ever omitted — a predicate no leg can apply is the
+/// wrapper's own to render (`pushdown`'s module header). For an inner join
 /// this is result-equivalent to single-node evaluation, independent of join order and
 /// of shared column names.
 ///

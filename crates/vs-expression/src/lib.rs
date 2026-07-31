@@ -4990,9 +4990,8 @@ mod tests {
         // no-op to omit from the scan spec — but that is one of two
         // distinguishable causes of a `None` return, regardless of which
         // dialect rendered the fragment. The other cause, a genuine decline,
-        // must be self-applied by the caller: Exasol never re-applies an
-        // advertised capability, so a declined predicate omitted here would
-        // be silently lost, not backstopped.
+        // must be self-applied by the caller — a declined predicate omitted
+        // here would be silently lost, not backstopped.
         let true_filter = json!({"type": "literal_bool", "value": true});
         assert!(render_df_filter_exasol_safe(&true_filter).is_none());
 
