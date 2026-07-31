@@ -5,29 +5,33 @@ use std::collections::HashMap;
 use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
 use super::super::support::{
-    datafusion_renderable, project_columns, quote_ident, walk_column_nodes,
+    datafusion_renderable, project_columns, quote_ident, type_accepted_rewrite, walk_column_nodes,
 };
 use super::planning::{DetectedJoin, involved_table_columns};
 
-/// The cross-table projection and Exasol EMITS types for a broadcast join.
+/// The SOLE producer of a join's column-type union: `join.tables[0]`'s
+/// [`involved_table_columns`] extended with `join.tables[1]`'s. Broadcast is a
+/// two-table optimization, so `join.tables[0]`/`[1]` are the two involved tables.
 ///
-/// Reuses [`project_columns`] against the disjoint union of both involved tables'
-/// columns, so a projected column spanning either side is typed from whichever
-/// side owns it. The caller must have already passed the [`disjoint_schema_guard`]
-/// so the union carries no name collision. Broadcast is a two-table optimization,
-/// so `join.tables[0]`/`[1]` are the two involved tables.
-///
-/// The third element is [`project_columns`]'s widening signal, forwarded verbatim:
-/// `true` means the derived projection is the full two-table base row, not one item
-/// per select-list item (#196).
+/// Every consumer that needs "the type universe a broadcast-join filter or
+/// projection may be screened against" MUST call this rather than re-deriving the
+/// union itself — [`extract_join_projection`] and `render_broadcast_join`'s
+/// `classify_where_filter` call both do. The caller must have already passed the
+/// [`disjoint_schema_guard`](super::planning::disjoint_schema_guard) so the union
+/// carries no name collision — a bare column name resolves to exactly one Exasol
+/// type only once that guard has passed.
+pub(super) fn join_col_types(request: &Json, join: &DetectedJoin) -> Vec<(String, String)> {
+    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
+    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
+    combined
+}
+
 pub(super) fn extract_join_projection(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
-    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
-    project_columns(pushdown_req, combined)
+    project_columns(pushdown_req, join_col_types(request, join))
 }
 
 /// Render one projection item as an outer-query SELECT expression: a bare column is
@@ -209,15 +213,21 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 /// this makes NO renderability decision, and each consumer screens (or does not
 /// screen) its own input before calling.
 ///
-/// The two consumers therefore receive DIFFERENT trees, deliberately:
+/// THREE consumers receive DIFFERENT trees built from this function's output,
+/// deliberately:
 /// (a) that side's `resolve_file_list` for Iceberg manifest pruning is given the
-/// RAW filter, so every side-local conjunct prunes manifests even when the
-/// DataFusion dialect cannot render it — screening here would silently open more
-/// files while still returning correct rows; and (b) that side's fan-out
-/// `ScanSpec.filter` is given a tree already screened by [`renderable_only`], so
-/// the conjuncts it yields are all renderable and the leg's own render cannot
-/// decline. Cross-table conjuncts and OR-spanning conjuncts are withheld from both
-/// and applied only by the outer wrapper's WHERE.
+/// RAW filter, unscreened, so every side-local conjunct prunes manifests even when
+/// the DataFusion dialect cannot render it — screening here would silently open
+/// more files while still returning correct rows;
+/// (b) that side's fan-out `ScanSpec.filter` is given a tree first screened by
+/// [`renderable_only`], then screened AND REWRITTEN per side by
+/// [`type_screened_leg_filter`], so the leg receives only conjuncts that are both
+/// syntactically renderable and type-correct for that side's own columns; and
+/// (c) the outer wrapper's residual `WHERE` receives the RAW conjuncts
+/// [`type_screened_leg_filter`] hands back declined, because the wrapper renders in
+/// the Exasol dialect and a DataFusion-rewritten tree is the wrong input there.
+/// Cross-table conjuncts and OR-spanning conjuncts are withheld from (a) and (b)
+/// and applied only by the outer wrapper's WHERE, alongside the type-declined half.
 pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
     let target = table_name.to_ascii_uppercase();
     partition_conjuncts(filter, |c| {
@@ -263,6 +273,63 @@ pub(super) fn renderable_only(filter: &Json) -> Option<Json> {
 /// carry because no leg can apply it.
 pub(super) fn declined_only(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, |c| !datafusion_renderable(c))
+}
+
+/// Split ONE side's side-local conjuncts into the REWRITTEN set its fan-out leg may
+/// render and the RAW set the outer wrapper must apply: returns
+/// `(leg_filter, type_declined)`, a partition of `side_local`'s top-level conjuncts
+/// that is total (every conjunct lands in exactly one half) and type-correct for that
+/// one side.
+///
+/// The N-scan analog of the broadcast surface's
+/// [`classify_where_filter`](super::super::support::classify_where_filter), and
+/// deliberately NOT a call to it: that function owns a WHOLE-filter classification
+/// against ONE type universe, which neither half of this surface's situation matches.
+/// Both surfaces do share the acceptance predicate underneath, and ask
+/// [`type_accepted_rewrite`] for it rather than each encoding it.
+///
+/// PER-SIDE, POST-ATTRIBUTION. The N-scan path has no disjoint-column-name
+/// precondition (the broadcast path's `disjoint_schema_guard` is what earns the
+/// broadcast surface its single union universe), so a bare column name here can
+/// resolve to a DIFFERENT Exasol type on each side. The only universe that answers
+/// "will DataFusion accept this conjunct in THIS leg" is the owning side's own
+/// `col_types` — knowable only after [`side_local_filter`] has attributed the
+/// conjunct, hence a screen that runs after attribution rather than over the request's
+/// whole filter.
+///
+/// PER-CONJUNCT, NOT PER-TREE. One type-declining conjunct must not forfeit its
+/// side's other pushable conjuncts; the outer wrapper's WHERE absorbs exactly the
+/// rejected ones. The single-table WHERE surface declines whole-filter only because it
+/// has no partition to absorb one conjunct into.
+///
+/// SCREENED ON THE REWRITTEN TREE. The leg renders what this function returns — the
+/// REWRITTEN tree — so renderability must be established on that tree, not on the raw
+/// one. [`type_accepted_rewrite`] is what establishes it, for the per-conjunct screen
+/// and the re-formed tree alike, and the broadcast site inherits the same guarantee
+/// from the same call.
+///
+/// FAILS CLOSED TOWARDS THE RESIDUAL. Should the re-formed accepted tree not itself
+/// survive [`type_accepted_rewrite`], the WHOLE side-local set becomes residual. A
+/// conjunct applied nowhere returns wrong rows; a conjunct applied in the outer
+/// wrapper instead of a leg is merely slower.
+///
+/// The declined half is returned RAW because the outer wrapper renders it in the
+/// EXASOL dialect: the rewrites synthesize DataFusion-dialect nodes, so a rewritten
+/// tree is the wrong input there — the same reason `classify_where_filter` returns its
+/// declined half un-rewritten.
+pub(super) fn type_screened_leg_filter(
+    side_local: &Json,
+    col_types: &[(String, String)],
+) -> (Option<Json>, Option<Json>) {
+    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
+    let declined = partition_conjuncts(side_local, |c| !accepts(c));
+    match partition_conjuncts(side_local, accepts) {
+        None => (None, declined),
+        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
+            Some(rewritten) => (Some(rewritten), declined),
+            None => (None, Some(side_local.clone())),
+        },
+    }
 }
 
 /// AND two optional sub-predicates into one: the `predicate_and` of both when
@@ -410,6 +477,7 @@ mod tests {
         detected_join, equi_condition, join_request, resolved_side, two_scan_tuning,
     };
     use super::*;
+    use crate::adapter::pushdown::support::apply_type_rewrites;
     use crate::adapter::pushdown::test_support::*;
     use vs_expression::{render_df_filter_safe, render_expression_safe};
 
@@ -1025,6 +1093,251 @@ mod tests {
         assert!(
             leg_conjuncts.iter().all(|c| datafusion_renderable(c)),
             "the screened leg filter must omit the declined conjunct: {leg}"
+        );
+    }
+
+    /// CUSTOMER's `(name, Exasol type)` universe from the standard two-table join
+    /// request: `C_CUSTKEY DECIMAL(20,0)`, `C_NAME VARCHAR(100)`.
+    fn customer_col_types() -> Vec<(String, String)> {
+        involved_table_columns(&join_request(Json::Null, equi_condition()), "CUSTOMER")
+    }
+
+    /// ORDERS' `(name, Exasol type)` universe: `O_CUSTKEY DECIMAL(20,0)`,
+    /// `O_ORDERDATE DATE` — one type the LIKE guard declines and one it rewrites.
+    fn orders_col_types() -> Vec<(String, String)> {
+        involved_table_columns(&join_request(Json::Null, equi_condition()), "ORDERS")
+    }
+
+    fn like_over(column: &str, table: &str, pattern: &str) -> Json {
+        serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": column, "tableName": table},
+            "pattern": {"type": "literal_string", "value": pattern}
+        })
+    }
+
+    fn and_of(conjuncts: Vec<Json>) -> Json {
+        serde_json::json!({"type": "predicate_and", "expressions": conjuncts})
+    }
+
+    fn conjunct_count(filter: Option<&Json>) -> usize {
+        filter.map_or(0, |f| {
+            let mut out = Vec::new();
+            flatten_conjuncts(f, &mut out);
+            out.len()
+        })
+    }
+
+    /// Every conjunct the type pipeline accepts reaches the leg half REWRITTEN and the
+    /// declined half stays empty — so an all-accepted side keeps its full pushdown, and
+    /// the leg receives the rewritten tree (`CAST("O_ORDERDATE" AS VARCHAR) LIKE …`),
+    /// not the raw one DataFusion would refuse to coerce.
+    #[test]
+    fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
+        let filter = and_of(vec![
+            like_over("O_ORDERDATE", "ORDERS", "1995%"),
+            orders_local_rendering_conjunct(),
+        ]);
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+
+        assert!(
+            declined.is_none(),
+            "no conjunct declines, so nothing may be handed to the outer wrapper: {declined:?}"
+        );
+        let leg = leg.expect("an all-accepted side-local set must reach its leg");
+        assert_eq!(
+            conjunct_count(Some(&leg)),
+            2,
+            "both accepted conjuncts must reach the leg: {leg}"
+        );
+        let rendered = render_df_filter_safe(&leg).expect("the rewritten set must render");
+        assert!(
+            rendered.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && rendered.contains("LIKE"),
+            "the DATE LIKE subject must reach the leg CAST to VARCHAR, not bare: {rendered}"
+        );
+    }
+
+    /// When no conjunct survives the screen the leg half is `None` and the outer
+    /// wrapper receives the WHOLE side-local set in RAW form — the DECIMAL LIKE
+    /// unwrapped, because the Exasol dialect must render what the DataFusion dialect
+    /// declined, and the rewrites target the DataFusion dialect only.
+    #[test]
+    fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
+        let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
+        let filter = and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]);
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+
+        assert!(
+            leg.is_none(),
+            "no conjunct may be pushed when every one of them declines: {leg:?}"
+        );
+        let declined = declined.expect("a fully declined side-local set must go residual");
+        let mut conjuncts = Vec::new();
+        flatten_conjuncts(&declined, &mut conjuncts);
+        assert_eq!(
+            conjuncts.len(),
+            2,
+            "both declined conjuncts must reach the outer wrapper: {declined}"
+        );
+        assert!(
+            conjuncts.contains(&&decimal_like),
+            "the DECIMAL LIKE must be carried RAW so the Exasol dialect can render it: \
+             {declined}"
+        );
+    }
+
+    /// The partition is TOTAL and DISJOINT over the side-local conjuncts in every
+    /// shape — all accepted, all declined, mixed — and it FAILS CLOSED: whenever the
+    /// leg half is absent the declined half carries every conjunct, so a predicate is
+    /// never dropped from both halves (that would return wrong rows, where a residual
+    /// conjunct is merely slower).
+    #[test]
+    fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
+        let date_like = like_over("O_ORDERDATE", "ORDERS", "1995%");
+        let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
+        let mixed = and_of(vec![
+            date_like.clone(),
+            decimal_like.clone(),
+            orders_local_rendering_conjunct(),
+        ]);
+        let cases = [
+            (
+                "all accepted",
+                and_of(vec![date_like, orders_local_rendering_conjunct()]),
+            ),
+            (
+                "all declined",
+                and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]),
+            ),
+            ("mixed", mixed.clone()),
+        ];
+
+        for (label, filter) in cases {
+            let input = conjunct_count(Some(&filter));
+            let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+            assert_eq!(
+                conjunct_count(leg.as_ref()) + conjunct_count(declined.as_ref()),
+                input,
+                "{label}: every conjunct must land in exactly one half — none dropped, \
+                 none double-applied"
+            );
+            if leg.is_none() {
+                assert_eq!(
+                    conjunct_count(declined.as_ref()),
+                    input,
+                    "{label}: fail closed — with no leg half the declined half must carry \
+                     the WHOLE side-local set"
+                );
+            }
+        }
+
+        let (leg, declined) = type_screened_leg_filter(&mixed, &orders_col_types());
+        let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
+            .expect("the rewritten accepted set must render for DataFusion");
+        assert!(
+            leg_sql.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && !leg_sql.contains("O_CUSTKEY"),
+            "one type-declining conjunct must not forfeit its side's other pushable \
+             conjuncts: {leg_sql}"
+        );
+        assert_eq!(
+            declined,
+            Some(decimal_like),
+            "the declined half must be exactly the type-declined conjunct, RAW"
+        );
+    }
+
+    /// A conjunct the type pipeline ACCEPTS but the DataFusion dialect cannot render
+    /// lands in the DECLINED half in RAW form, never dropped from both: the leg renders
+    /// the REWRITTEN tree, so that is the tree whose renderability decides the
+    /// partition. `SECOND(CAST(<DECIMAL col> AS VARCHAR), 3)` is exactly that shape —
+    /// the decimal pass rewrites the cast, and the two-argument `SECOND` arity is one
+    /// the DataFusion dialect refuses.
+    #[test]
+    fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
+        let col_types = customer_col_types();
+        let filter = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
+                {"type": "function_scalar_cast", "name": "CAST",
+                 "dataType": {"type": "VARCHAR", "size": 40},
+                 "arguments": [
+                     {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]},
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        });
+
+        let rewritten = apply_type_rewrites(&filter, &col_types)
+            .expect("precondition: the type pipeline ACCEPTS this tree");
+        assert!(
+            rewritten.to_string().contains("decimal_to_varchar_exasol"),
+            "precondition: the pipeline REWRITES the DECIMAL stringification: {rewritten}"
+        );
+        assert!(
+            !datafusion_renderable(&rewritten),
+            "precondition: the REWRITTEN tree still does not render for DataFusion"
+        );
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &col_types);
+
+        assert!(
+            leg.is_none(),
+            "a rewrite the DataFusion dialect cannot render must not reach the leg: {leg:?}"
+        );
+        assert_eq!(
+            declined,
+            Some(filter),
+            "it must reach the outer wrapper RAW — with the plain CAST, not the \
+             DataFusion-only rewrite the Exasol dialect has no node for"
+        );
+    }
+
+    /// The N-scan path has NO disjoint-column-name precondition, so each side is
+    /// screened against ITS OWN `col_types`: the same bare `SHARED_KEY` LIKE is
+    /// accepted (and CAST) on the side declaring it `DATE` and declined on the side
+    /// declaring it `DECIMAL`. A shared union would resolve one name to two types and
+    /// screen at least one side against the wrong one.
+    #[test]
+    fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "DATED", "columns": [
+                    {"name": "SHARED_KEY", "dataType": {"type": "date"}}]},
+                {"name": "NUMBERED", "columns": [
+                    {"name": "SHARED_KEY",
+                     "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            ]
+        });
+        let filter = like_over("SHARED_KEY", "DATED", "1995%");
+
+        let (date_leg, date_declined) =
+            type_screened_leg_filter(&filter, &involved_table_columns(&request, "DATED"));
+        let date_sql = render_df_filter_safe(
+            &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
+        )
+        .expect("the CAST-rewrapped LIKE renders for DataFusion");
+        assert!(
+            date_sql.contains(r#"CAST("SHARED_KEY" AS VARCHAR)"#),
+            "the DATE side must push the CAST-rewritten LIKE into its leg: {date_sql}"
+        );
+        assert!(
+            date_declined.is_none(),
+            "the DATE side declines nothing: {date_declined:?}"
+        );
+
+        let (numeric_leg, numeric_declined) =
+            type_screened_leg_filter(&filter, &involved_table_columns(&request, "NUMBERED"));
+        assert!(
+            numeric_leg.is_none(),
+            "the DECIMAL side has no safe rewrite, so nothing may reach its leg: \
+             {numeric_leg:?}"
+        );
+        assert_eq!(
+            numeric_declined,
+            Some(filter),
+            "the DECIMAL side must hand the SAME conjunct to the outer wrapper RAW"
         );
     }
 
