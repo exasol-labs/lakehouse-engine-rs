@@ -4,7 +4,9 @@ use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
-use super::super::support::{project_columns, quote_ident, walk_column_nodes};
+use super::super::support::{
+    datafusion_renderable, project_columns, quote_ident, walk_column_nodes,
+};
 use super::planning::{DetectedJoin, involved_table_columns};
 
 /// The cross-table projection and Exasol EMITS types for a broadcast join.
@@ -106,10 +108,12 @@ pub(super) fn render_expression_qualified(
 
 /// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
 /// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
-/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract,
-/// so a dropped predicate is Exasol's own backstop responsibility exactly as
-/// elsewhere. Uses the Exasol-dialect entry point because the wrapper WHERE is
-/// parsed by Exasol's core engine (length-qualified CAST targets).
+/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract.
+/// A `None` here is never Exasol's problem to catch: the caller must itself
+/// self-apply a declined filter (e.g. as an outer WHERE) rather than omit it
+/// (`pushdown`'s module header). Uses
+/// the Exasol-dialect entry point because the wrapper WHERE is parsed by Exasol's
+/// core engine (length-qualified CAST targets).
 pub(super) fn render_df_filter_qualified(
     filter: &Json,
     alias_of: &HashMap<String, String>,
@@ -177,9 +181,10 @@ fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
 /// into one sub-predicate: `None` when none are kept, the bare conjunct when exactly
 /// one is, else a `predicate_and` over all kept conjuncts.
 ///
-/// The shared shape of [`side_local_filter`] (keep conjuncts local to one side) and
-/// [`cross_side_residual_filter`] (keep the cross-side complement) — only the `keep`
-/// predicate differs, so the two are the exact set-partition halves of one filter.
+/// The shared shape of the two complementary screen pairs over one filter — only
+/// the `keep` predicate differs: [`side_local_filter`] (conjuncts local to one
+/// side) against [`cross_side_residual_filter`] (the cross-side complement), and
+/// [`renderable_only`] against [`declined_only`].
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(filter, &mut conjuncts);
@@ -200,12 +205,19 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 
 /// The side-local sub-predicate of `filter` for `table_name`: the AND of exactly
 /// those top-level conjuncts every column of which is attributed to `table_name`.
-/// `None` when no conjunct is side-local to it.
+/// `None` when no conjunct is side-local to it. Attribution by `tableName` alone —
+/// this makes NO renderability decision, and each consumer screens (or does not
+/// screen) its own input before calling.
 ///
-/// This is what is threaded into (a) that side's `resolve_file_list` for Iceberg
-/// manifest pruning and (b) that side's fan-out `ScanSpec.filter` for DataFusion
-/// row-group pruning + row filtering. Cross-table conjuncts and OR-spanning
-/// conjuncts are withheld here and applied only by the outer wrapper's WHERE.
+/// The two consumers therefore receive DIFFERENT trees, deliberately:
+/// (a) that side's `resolve_file_list` for Iceberg manifest pruning is given the
+/// RAW filter, so every side-local conjunct prunes manifests even when the
+/// DataFusion dialect cannot render it — screening here would silently open more
+/// files while still returning correct rows; and (b) that side's fan-out
+/// `ScanSpec.filter` is given a tree already screened by [`renderable_only`], so
+/// the conjuncts it yields are all renderable and the leg's own render cannot
+/// decline. Cross-table conjuncts and OR-spanning conjuncts are withheld from both
+/// and applied only by the outer wrapper's WHERE.
 pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
     let target = table_name.to_ascii_uppercase();
     partition_conjuncts(filter, |c| {
@@ -218,12 +230,55 @@ pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json>
 /// OR-spanning, untagged, or column-free conjuncts (`conjunct_single_side` is
 /// `None`). `None` when every conjunct is side-local.
 ///
-/// This is the exact set-complement of the per-side [`side_local_filter`] slices:
-/// every conjunct is either side-local to exactly one table (pushed into that side's
-/// fan-out leg) or cross-side residual (kept here, in the outer wrapper's WHERE), so
-/// the partition is total and disjoint — no conjunct is dropped or double-applied.
+/// The complement it forms is over WHATEVER TREE IT IS GIVEN, not over the request's
+/// raw filter: it is the exact set-complement of the per-side [`side_local_filter`]
+/// slices of that same tree, and nothing more. On the render path it is given the
+/// [`renderable_only`] half, so the outer wrapper's WHERE additionally carries
+/// [`declined_only`] — the total partition of the request's filter is therefore
+/// `renderable_only`/`declined_only` composed with these two, and it is that
+/// composition, not this function alone, that leaves no conjunct dropped or
+/// double-applied.
 pub(super) fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, |c| conjunct_single_side(c).is_none())
+}
+
+/// The DataFusion-RENDERABLE half of `filter`'s top-level conjuncts, and
+/// [`declined_only`] its exact complement — the sole renderability screen on the
+/// N-scan render path, applied at [`super::sql_builders::build_n_scan_join_sql`]'s
+/// two render sites and NOWHERE else.
+///
+/// It sits at the render sites rather than inside [`side_local_filter`] because
+/// that function has a second consumer that must NOT be screened: `plan_join`
+/// passes its result to Iceberg manifest pruning, where dropping a declined
+/// conjunct would silently open more files while still returning correct rows —
+/// a regression no test could catch. Only the leg's `ScanSpec.filter` is
+/// rendered, so only it needs screening; a conjunct this rejects is carried by
+/// the outer wrapper's WHERE in the Exasol dialect instead of being omitted.
+pub(super) fn renderable_only(filter: &Json) -> Option<Json> {
+    partition_conjuncts(filter, datafusion_renderable)
+}
+
+/// The DataFusion-DECLINED half of `filter`'s top-level conjuncts — the exact
+/// complement of [`renderable_only`], and the set the outer wrapper's WHERE must
+/// carry because no leg can apply it.
+pub(super) fn declined_only(filter: &Json) -> Option<Json> {
+    partition_conjuncts(filter, |c| !datafusion_renderable(c))
+}
+
+/// AND two optional sub-predicates into one: the `predicate_and` of both when
+/// both are present, the present one alone when only one is, `None` when neither
+/// is.
+///
+/// Callers must pass DISJOINT conjunct sets — this de-duplicates nothing, so
+/// overlapping inputs would double-apply a predicate.
+pub(super) fn conjoin_filters(left: Option<Json>, right: Option<Json>) -> Option<Json> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [l, r],
+        })),
+        (l, r) => l.or(r),
+    }
 }
 
 /// Record the UPPERCASE name of every `column` node in `expr` attributed (by
@@ -834,6 +889,142 @@ mod tests {
         assert!(
             labels.contains("LABEL") && !labels.contains('5'),
             "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name: {labels}"
+        );
+    }
+
+    /// The ORDERS-side-local conjunct the DataFusion dialect CAN express.
+    fn orders_local_rendering_conjunct() -> Json {
+        serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+            "right": {"type": "literal_string", "value": "1995-01-01"}
+        })
+    }
+
+    /// The ORDERS-side-local conjunct the DataFusion dialect REFUSES (its `SECOND`
+    /// field shortcut permits exactly one argument) while Exasol renders it — the
+    /// dialect asymmetry the render-site screen exists to route.
+    fn orders_local_declined_conjunct() -> Json {
+        serde_json::json!({
+            "type": "predicate_greater",
+            "left": {
+                "type": "function_scalar",
+                "name": "SECOND",
+                "arguments": [
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                    {"type": "literal_exactnumeric", "value": 3}
+                ]
+            },
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        })
+    }
+
+    /// Both ORDERS-side-local conjuncts under one AND: one renders for DataFusion,
+    /// one declines.
+    fn orders_local_rendering_and_declined_filter() -> Json {
+        serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                orders_local_rendering_conjunct(),
+                orders_local_declined_conjunct(),
+            ],
+        })
+    }
+
+    /// A side-local conjunct whose DataFusion render DECLINES is reclassified as
+    /// residual: `declined_only` keeps exactly it, `renderable_only` keeps exactly
+    /// the complement, and it still renders in the Exasol dialect — so the outer
+    /// wrapper's WHERE can apply what no leg can.
+    #[test]
+    fn declined_side_local_conjunct_partitions_to_residual() {
+        let filter = orders_local_rendering_and_declined_filter();
+        let rendering = orders_local_rendering_conjunct();
+        let declined = orders_local_declined_conjunct();
+        assert!(
+            !datafusion_renderable(&declined) && datafusion_renderable(&rendering),
+            "precondition: exactly one of the two conjuncts declines for DataFusion"
+        );
+
+        assert_eq!(
+            declined_only(&filter),
+            Some(declined.clone()),
+            "declined_only must keep exactly the conjunct DataFusion cannot express"
+        );
+        assert_eq!(
+            renderable_only(&filter),
+            Some(rendering),
+            "renderable_only must keep exactly its complement — the two are exact halves"
+        );
+        assert!(
+            render_expression_exasol_safe(&declined).is_some(),
+            "the residual conjunct must render in the Exasol dialect, or the outer \
+             WHERE could not apply it either"
+        );
+        assert_eq!(
+            conjunct_single_side(&declined).as_deref(),
+            Some("ORDERS"),
+            "attribution is unchanged — only the RENDER declines, so the screen is \
+             the sole reason this conjunct becomes residual"
+        );
+    }
+
+    /// The complement: a side-local conjunct the DataFusion dialect CAN express
+    /// still reaches its own leg through the screened tree, so the screen costs the
+    /// rendering case nothing.
+    #[test]
+    fn rendering_side_local_conjunct_still_reaches_its_leg() {
+        let filter = orders_local_rendering_and_declined_filter();
+        let leg_eligible = renderable_only(&filter).expect("the rendering conjunct survives");
+
+        let leg = render_df_filter_safe(
+            &side_local_filter(&leg_eligible, "ORDERS").expect("still ORDERS-side-local"),
+        )
+        .expect("a DataFusion-renderable leg filter renders");
+
+        assert!(
+            leg.contains("'1995-01-01'") && !leg.contains("SECOND"),
+            "the rendering conjunct must reach the leg and the declined one must not: {leg}"
+        );
+    }
+
+    /// The Iceberg manifest-pruning input is NOT screened: `plan_join` passes the
+    /// RAW filter to `side_local_filter`, so a conjunct whose DataFusion render
+    /// declines still prunes that side's manifests. Only the leg's `ScanSpec.filter`
+    /// sees the screened tree — screening inside `side_local_filter` would silently
+    /// open more files with no failing test.
+    #[test]
+    fn join_side_pruning_input_unchanged_when_df_render_declines() {
+        let filter = orders_local_rendering_and_declined_filter();
+
+        let pruning =
+            side_local_filter(&filter, "ORDERS").expect("both conjuncts are ORDERS-side-local");
+        let mut pruning_conjuncts = Vec::new();
+        flatten_conjuncts(&pruning, &mut pruning_conjuncts);
+        assert_eq!(
+            pruning_conjuncts.len(),
+            2,
+            "pruning must still receive BOTH side-local conjuncts: {pruning}"
+        );
+        assert!(
+            pruning_conjuncts.iter().any(|c| !datafusion_renderable(c)),
+            "the declined conjunct must still be in the pruning input: {pruning}"
+        );
+
+        let leg = side_local_filter(
+            &renderable_only(&filter).expect("the rendering conjunct survives"),
+            "ORDERS",
+        )
+        .expect("the rendering conjunct is still ORDERS-side-local");
+        let mut leg_conjuncts = Vec::new();
+        flatten_conjuncts(&leg, &mut leg_conjuncts);
+        assert_eq!(
+            leg_conjuncts.len(),
+            1,
+            "the screened leg filter must carry only the rendering conjunct: {leg}"
+        );
+        assert!(
+            leg_conjuncts.iter().all(|c| datafusion_renderable(c)),
+            "the screened leg filter must omit the declined conjunct: {leg}"
         );
     }
 

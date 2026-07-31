@@ -30,7 +30,12 @@ use planning::{
     select_broadcast_sides,
 };
 use rendering::side_local_filter;
-use sql_builders::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
+// Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
+// (a sibling of `joins` under `pushdown`, gated `#[cfg(test)]`) can drive both
+// join SQL builders directly to pin cross-site golden-SQL fixtures — the same
+// reachability pattern already used for `qualified_single_table_fallback_pushdown`
+// above.
+pub(super) use sql_builders::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
 
 /// Schema-qualify a UDF/script name for a pushdown-driving query.
 ///

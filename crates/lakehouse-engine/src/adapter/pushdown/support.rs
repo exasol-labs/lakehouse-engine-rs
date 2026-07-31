@@ -17,7 +17,7 @@ use crate::scan::spec::{
 use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::render_expression_safe;
+use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// The registered SQL name of the scan SCALAR EMIT UDF entry point.
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
@@ -499,6 +499,19 @@ pub(super) fn strip_table_alias(expr: &Json) -> Json {
     }
 }
 
+/// Answers whether the DataFusion dialect can express `expr` as a scan-spec
+/// filter.
+///
+/// A predicate this returns `false` for cannot be pushed into the
+/// DataFusion-in-UDF scan spec; the caller MUST self-apply it in the adapter's
+/// own returned SQL instead, never omit it (no Exasol-side fallback — see
+/// CLAUDE.md § "Virtual Schema pushdown delegation"). A trivially-true
+/// predicate (renders to `TRUE`/`NULL`) answers `true`: omitting a no-op
+/// predicate is correct, not a decline.
+pub(super) fn datafusion_renderable(expr: &Json) -> bool {
+    render_expression_safe(expr).is_some()
+}
+
 /// The expression-grammar fields whose value is an ARRAY of child expressions.
 /// Curated deliberately — see [`rewrite_expr_tree`].
 const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
@@ -526,11 +539,13 @@ const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right",
 ///
 /// `f` returning `None` declines the WHOLE tree, not just the declining subtree: the
 /// `None` travels out through every enclosing level via `?`. That mirrors the
-/// all-or-nothing untranslatable-predicate backstop — the whole filter is dropped so
-/// Exasol evaluates it natively, or the whole select-list item falls back to the base
-/// row. An INFALLIBLE rewriter composes as the never-declining case: with a
-/// statically always-`Some` `f` the result is always `Some`, so such a caller keeps
-/// its `-> Json` signature by unwrapping with a fallback rather than a panic.
+/// all-or-nothing untranslatable-predicate backstop — the whole filter or the whole
+/// select-list item is declined. This is NOT a case where Exasol safely evaluates the
+/// decline natively — the caller must itself self-apply the declined filter (or fall
+/// back to the base row for a select-list item). An INFALLIBLE rewriter composes as
+/// the never-declining case: with a statically always-`Some` `f` the result is always
+/// `Some`, so such a caller keeps its `-> Json` signature by unwrapping with a
+/// fallback rather than a panic.
 ///
 /// ## Why the field list is curated
 ///
@@ -641,9 +656,9 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
 /// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
 ///   tree propagates to the outer call, mirroring the all-or-nothing
-///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
-///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
-///   predicate natively (decision-log [3]).
+///   untranslatable-predicate backstop (`super`'s module header). A decline here is
+///   NOT safely deferred to Exasol — the caller must itself self-apply the declined
+///   filter (e.g. as an outer WHERE) rather than omit it (decision-log [3]).
 fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
     rewrite_expr_tree(
         filter,
@@ -955,9 +970,11 @@ fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
 /// Returns:
 /// - `Some(tree)` — render this (possibly coerced) tree.
 /// - `None` — decline. A decline anywhere in the tree propagates to the outer call
-///   through `?`, mirroring [`like_subject_type_guard`]: the WHOLE filter is dropped so
-///   Exasol evaluates it natively, or the WHOLE select-list item falls back to the base
-///   row. A `NotGoverned` node never declines, whatever its arguments' types.
+///   through `?`, mirroring [`like_subject_type_guard`]: the WHOLE filter or the
+///   WHOLE select-list item is declined. This decline is NOT safely deferred to
+///   Exasol — the caller must itself self-apply the declined filter (or fall back to
+///   the base row for a select-list item) rather than omit it. A `NotGoverned` node
+///   never declines, whatever its arguments' types.
 ///
 /// Runs BEFORE [`rewrite_decimal_stringifications`] in [`apply_type_rewrites`], the
 /// one pipeline function that chains the two and is the sole enforcer of that
@@ -1058,6 +1075,23 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
     let expr = like_subject_type_guard(expr, col_types)?;
     let expr = string_function_arg_type_guard(&expr, col_types)?;
     Some(rewrite_decimal_stringifications(&expr, col_types))
+}
+
+/// Splits a request's raw WHERE filter into the predicate the scan spec carries and
+/// the predicate the adapter must self-apply. Returns `(scan_filter, declined)`,
+/// mutually exclusive; both `None` for no filter or a trivially-true one. Sole owner
+/// of this classification (see `_decision/045`). `declined` is the original,
+/// un-rewritten tree — the type rewrites target the DataFusion dialect only.
+pub(super) fn classify_where_filter<'a>(
+    filter_json_raw: Option<&'a Json>,
+    col_types: &[(String, String)],
+) -> (Option<String>, Option<&'a Json>) {
+    let rewritten = filter_json_raw.and_then(|f| apply_type_rewrites(f, col_types));
+    match (filter_json_raw, &rewritten) {
+        (Some(raw), None) => (None, Some(raw)),
+        (Some(raw), Some(tree)) if !datafusion_renderable(tree) => (None, Some(raw)),
+        _ => (rewritten.as_ref().and_then(render_df_filter_safe), None),
+    }
 }
 
 /// Extract the projected columns and their Exasol types from the pushdown request.
@@ -1555,6 +1589,95 @@ mod tests {
         );
     }
 
+    /// A predicate the DataFusion dialect can express answers `true`.
+    #[test]
+    fn datafusion_renderable_true_for_a_rendering_predicate() {
+        let expr = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "AGE"},
+            "right": {"type": "literal_exactnumeric", "value": 18}
+        });
+
+        assert!(datafusion_renderable(&expr));
+    }
+
+    /// `SECOND(ts, 3)` is a DataFusion field-shortcut arity refusal (exactly 1
+    /// argument permitted) — the dialect-asymmetric decline this plan's fix
+    /// exists to self-apply rather than silently omit.
+    #[test]
+    fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "arguments": [
+                {"type": "column", "name": "TS"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+
+        assert!(!datafusion_renderable(&expr));
+    }
+
+    /// A trivially-true `TRUE` literal answers `true`: `render_expression_safe`
+    /// does not suppress it, so omitting it from the scan spec is a correct
+    /// no-op, not a decline.
+    #[test]
+    fn datafusion_renderable_true_for_trivially_true_literal() {
+        let expr = serde_json::json!({"type": "literal_bool", "value": true});
+
+        assert!(datafusion_renderable(&expr));
+    }
+
+    /// `strip_table_alias` must not change the decline/accept answer:
+    /// `handle_pushdown` screens the un-stripped tree while the N-scan leg
+    /// renders the `tableAlias`-stripped one, and both must agree. Covers both
+    /// directions: a predicate that declines under both dialects (below), and
+    /// one that RENDERS under both (below) — the safety-critical direction,
+    /// since `build_side_fan_out_sql` strips the alias and re-renders AFTER
+    /// `renderable_only` screened the un-stripped tree, so a conjunct whose
+    /// answer flipped `true` -> `false` under stripping would be silently
+    /// dropped from the leg.
+    #[test]
+    fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
+        let with_alias = serde_json::json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "tableAlias": "O",
+            "arguments": [
+                {"type": "column", "name": "TS", "tableName": "T", "tableAlias": "O"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        let stripped = strip_table_alias(&with_alias);
+
+        assert_eq!(
+            datafusion_renderable(&with_alias),
+            datafusion_renderable(&stripped),
+            "stripping tableAlias must not change whether the DataFusion dialect accepts the predicate"
+        );
+        assert!(
+            !datafusion_renderable(&stripped),
+            "SECOND(ts, 3) must still decline once table-alias-stripped"
+        );
+
+        let renders_with_alias = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "TS", "tableName": "T", "tableAlias": "O"},
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        });
+        let renders_stripped = strip_table_alias(&renders_with_alias);
+
+        assert_eq!(
+            datafusion_renderable(&renders_with_alias),
+            datafusion_renderable(&renders_stripped),
+            "stripping tableAlias must not change whether a RENDERING predicate is still accepted"
+        );
+        assert!(
+            datafusion_renderable(&renders_stripped),
+            "TS > 1 must still render once table-alias-stripped"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
     // ---------------------------------------------------------------------------
@@ -2024,7 +2147,8 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Scenario: Filter predicate is pushed into the scan spec (translatable) or
-    // omitted (untranslatable) — never mistranslated.
+    // kept out of it (untranslatable) — never mistranslated, never omitted from
+    // the query.
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -2051,7 +2175,9 @@ mod tests {
         );
 
         // Untranslatable predicate (e.g., an aggregate or unknown function):
-        // render_df_filter_safe returns None → omitted from spec.
+        // render_df_filter_safe returning None keeps it out of the SCAN SPEC
+        // only — the adapter must still self-apply it elsewhere (see
+        // declined_filter_routes_every_dispatch_shape_to_qualified_wrapper).
         let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
         let omitted = render_df_filter_safe(&untranslatable);
         assert!(
@@ -2059,7 +2185,10 @@ mod tests {
             "untranslatable predicate must be omitted (None), not mistranslated"
         );
 
-        // Confirm omitting the filter still produces valid SQL (correctness backstop).
+        // Confirm the scan SQL stays valid without a scan-spec filter — the
+        // adapter applies the predicate itself elsewhere rather than relying
+        // on any re-check by Exasol (see
+        // declined_filter_routes_every_dispatch_shape_to_qualified_wrapper).
         let sql_no_filter = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["AGE".into()],
@@ -3011,6 +3140,7 @@ mod tests {
             &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
+            None,
         )
         .expect("Case 2/3 qualified wrapper must build");
 
@@ -4163,6 +4293,136 @@ mod tests {
         assert_eq!(
             result, None,
             "a nested non-string LIKE must decline the whole top-level filter"
+        );
+    }
+
+    /// Route `filter` through the production classification and then through the
+    /// qualified single-table wrapper, returning the emitted SQL.
+    ///
+    /// Asserts the fixture genuinely declines before rendering: these tests are about
+    /// WHERE a declined predicate ends up, so a fixture that quietly renders would
+    /// assert nothing. The inner scan projects the whole `col_types` universe, which is
+    /// what the production decline route passes as its projection override.
+    fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) -> String {
+        let (scan_filter, declined) = classify_where_filter(Some(filter), col_types);
+        assert!(
+            scan_filter.is_none(),
+            "fixture precondition: a declining filter must never reach the scan spec: \
+             {scan_filter:?}"
+        );
+        let declined = declined.expect(
+            "fixture precondition: a declining filter must be handed back for self-applying",
+        );
+        let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
+        let pushdown_req = serde_json::json!({"filter": filter.clone()});
+        let fan_out_spec = ScanSpec {
+            common: CommonScanSpec {
+                projection: col_types
+                    .iter()
+                    .map(|(name, _)| ProjectionItem::Column(name.clone()))
+                    .collect(),
+                emit_exa_types: col_types.iter().map(|(_, ty)| ty.clone()).collect(),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        super::super::joins::build_qualified_single_table_fallback_sql(
+            &request,
+            &pushdown_req,
+            &fan_out_spec,
+            &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            Some(declined),
+        )
+        .expect("the wrapper must render the declined predicate")
+    }
+
+    /// The declined half of `like_guard_nested_decimal_declines_whole_filter`, carried
+    /// through to its consequence: a nested non-string LIKE declines the ENTIRE
+    /// enclosing filter, and that whole filter — the renderable `STATUS = 'OPEN'`
+    /// conjunct included — is then applied by the adapter in the wrapper's `WHERE`, not
+    /// omitted — omitting either conjunct would return rows the query excludes.
+    #[test]
+    fn nested_like_decline_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "STATUS", "tableName": "T"},
+                    "right": {"type": "literal_string", "value": "OPEN"},
+                },
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "AMOUNT", "tableName": "T"},
+                    "pattern": {"type": "literal_string", "value": "9%"},
+                },
+            ],
+        });
+        let col_types = vec![
+            ("STATUS".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(9,2)".to_string()),
+        ];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        let where_at = sql
+            .find(r#"AS "LHS_T0" WHERE "#)
+            .unwrap_or_else(|| panic!("the declined filter must reach the wrapper: {sql}"));
+        assert!(
+            sql[where_at..].contains(r#""LHS_T0"."AMOUNT" LIKE '9%'"#)
+                && sql[where_at..].contains(r#""LHS_T0"."STATUS" = 'OPEN'"#),
+            "the wrapper WHERE must carry the WHOLE declined filter, both conjuncts: {sql}"
+        );
+    }
+
+    /// The declined half of `like_guard_integer_subject_declines`, carried through to
+    /// its consequence: an integer column arrives as `DECIMAL(20,0)`, the LIKE declines
+    /// the filter for the scan, and the adapter applies it itself in the wrapper.
+    #[test]
+    fn declined_like_on_integer_column_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "QUANTITY", "tableName": "T"},
+            "pattern": {"type": "literal_string", "value": "1%"},
+        });
+        let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."QUANTITY" LIKE '1%')"#),
+            "the integer-column LIKE must be applied in the wrapper WHERE: {sql}"
+        );
+    }
+
+    /// The declined half of `like_guard_unresolvable_column_declines`, carried through
+    /// to its consequence: an unresolvable subject type is a FAIL-SAFE decline, and a
+    /// fail-safe decline must still self-apply. It cannot omit the predicate on the
+    /// grounds that it could not type it — that reasoning is what returned unfiltered
+    /// rows.
+    ///
+    /// The fixture is deliberately unreachable from Exasol, which only sends columns of
+    /// the request's own `involvedTables`, so the assertion is about the routing
+    /// decision alone: the emitted SQL names a column this artificial `col_types`
+    /// universe does not project.
+    #[test]
+    fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "MYSTERY", "tableName": "T"},
+            "pattern": {"type": "literal_string", "value": "A%"},
+        });
+        let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
+            "an unresolvable-subject decline must still be applied by the adapter, \
+             never omitted: {sql}"
         );
     }
 
