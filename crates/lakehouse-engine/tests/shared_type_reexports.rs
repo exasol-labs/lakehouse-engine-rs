@@ -15,7 +15,7 @@
 //! involved anywhere below; the proof is that this file compiles at all.
 
 use lakehouse_engine::adapter::connection::ConnectionCreds;
-use lakehouse_engine::scan::spec::{CatalogProps, StorageProps};
+use lakehouse_engine::scan::spec::{AdlsCred, CatalogProps, StorageProps};
 
 /// Accepts only the catalog crate's own `StorageProps` — never a re-export.
 fn accepts_catalog_crate_storage_props(_props: lakehouse_catalog::StorageProps) {}
@@ -25,6 +25,9 @@ fn accepts_catalog_crate_catalog_props(_props: lakehouse_catalog::CatalogProps) 
 
 /// Accepts only the catalog crate's own `ConnectionCreds` — never a re-export.
 fn accepts_catalog_crate_connection_creds(_creds: lakehouse_catalog::ConnectionCreds) {}
+
+/// Accepts only the catalog crate's own `AdlsCred` — never a re-export.
+fn accepts_catalog_crate_adls_cred(_cred: lakehouse_catalog::AdlsCred) {}
 
 #[test]
 fn reexported_paths_resolve_to_the_catalog_crate_types() {
@@ -62,8 +65,15 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
         client_secret: None,
         oauth2_server_uri: None,
         scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
     };
     accepts_catalog_crate_connection_creds(creds);
+
+    // Built via the engine's re-exported `scan::spec` path.
+    let adls_cred = AdlsCred::AccountKey("k".into());
+    accepts_catalog_crate_adls_cred(adls_cred);
 }
 
 /// Independent, integration-level pin on `StorageProps`' serde encoding,

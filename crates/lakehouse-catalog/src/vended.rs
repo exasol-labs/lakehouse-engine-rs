@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 /// Resolve the effective scan storage for a table from its `loadTable` response.
 ///
-/// Selects the vended credential source ONCE for `anchor` and overlays every
-/// value it advertises onto `base`'s wrapped `StorageProps`, returning a fresh
-/// [`StorageBackend`] of the same variant. A value the response does not
+/// For an `S3` backend, selects the vended credential source ONCE for `anchor`
+/// and overlays every value it advertises onto `base`'s wrapped `StorageProps`,
+/// returning a fresh [`StorageBackend::S3`]. A value the response does not
 /// advertise keeps `base`'s, so a response carrying no vended credentials at
 /// all resolves to `base` unchanged.
 ///
@@ -23,6 +23,11 @@ use std::collections::HashMap;
 /// `storage_credentials[*].prefix` matches against. An HTTPS catalog URI can
 /// never prefix-match an S3 prefix and would silently select the flat `config`
 /// map instead.
+///
+/// For an `Adls` backend, `base` passes through unchanged: vended Azure SAS
+/// credentials are a tracked exception (#276), so the effective backend is
+/// already selected once at `parse_creds`/`storage_block` time and this
+/// function does no Azure-specific extraction.
 ///
 /// Whether vending applies at all is the caller's decision, not this function's:
 /// `use_vended_credentials` gates the call rather than being a parameter,
@@ -38,6 +43,7 @@ pub fn resolve_vended_storage(
             let vended = select_credential_source(result, anchor);
             StorageBackend::S3(merge_vended_into_storage(props, vended))
         }
+        StorageBackend::Adls { .. } => base.clone(),
     }
 }
 
@@ -93,6 +99,7 @@ fn vended_config_value(vended: &HashMap<String, String>, key: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::AdlsCred;
     use crate::test_support::*;
 
     const VENDED_AK: &str = "VENDED_AK_SENTINEL";
@@ -1186,6 +1193,29 @@ mod tests {
         assert!(
             !merged.path_style,
             "path_style absent from the matched entry must preserve static, not read config"
+        );
+    }
+
+    /// Scenario: an `Adls` backend is returned unchanged, byte-for-byte, from a
+    /// `LoadTableResult` that carries vended S3 credentials. The effective
+    /// backend is already selected once at `parse_creds`/`storage_block` time;
+    /// vended Azure SAS credentials are a tracked exception (#276), so this
+    /// function must not attempt any Azure-specific extraction or scheme
+    /// switching — it must simply pass the `Adls` variant through.
+    #[test]
+    fn resolve_vended_storage_returns_an_adls_backend_unchanged() {
+        let base = StorageBackend::Adls {
+            account_name: "myaccount".into(),
+            cred: AdlsCred::AccountKey("static-account-key".into()),
+        };
+        let result = vended_result_flat_config();
+        let anchor = result.metadata.location().to_string();
+
+        let resolved = resolve_vended_storage(&result, &base, &anchor);
+
+        assert_eq!(
+            resolved, base,
+            "an Adls backend must pass through unchanged"
         );
     }
 }

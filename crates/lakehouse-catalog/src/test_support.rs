@@ -26,6 +26,9 @@ pub(crate) fn base_creds() -> ConnectionCreds {
         client_secret: None,
         oauth2_server_uri: None,
         scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
     }
 }
 
@@ -62,6 +65,7 @@ pub(crate) fn static_backend() -> StorageBackend {
 pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     match backend {
         StorageBackend::S3(props) => props,
+        StorageBackend::Adls { .. } => panic!("s3_payload is S3-only"),
     }
 }
 
@@ -96,5 +100,8 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
         client_secret: None,
         oauth2_server_uri: None,
         scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
     }
 }

@@ -2850,6 +2850,9 @@ mod tests {
             client_secret: Some("oauth-client-secret-sentinel".into()),
             oauth2_server_uri: None,
             scope: None,
+            account_name: None,
+            account_key: None,
+            sas_token: None,
         };
         let configured_ns = vec!["prod".to_string(), "finance".to_string()];
 

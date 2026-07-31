@@ -231,7 +231,7 @@ pub fn render_order_by_clause(keys: &[SortKey]) -> String {
 /// [`StorageBackend`] is the backend selector wrapping [`StorageProps`], declared in
 /// that same producing crate and re-exported here so the scan, adapter, and catalog
 /// layers all name the storage backend at one path.
-pub use lakehouse_catalog::{CatalogProps, StorageBackend, StorageProps};
+pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps};
 
 /// One field in the logical schema carried by `ScanSpec::logical_schema`.
 ///
@@ -874,7 +874,9 @@ mod tests {
     /// Unwraps the S3 payload from a [`StorageBackend`] for field-level assertions
     /// in tests that predate the backend wrapper and only ever exercised S3.
     fn s3_props(storage: &StorageBackend) -> &StorageProps {
-        let StorageBackend::S3(props) = storage;
+        let StorageBackend::S3(props) = storage else {
+            panic!("s3_props is S3-only")
+        };
         props
     }
 
@@ -960,7 +962,9 @@ mod tests {
         let mut spec = sample_spec();
         spec.common.filter = None;
         spec.common.limit = None;
-        let StorageBackend::S3(props) = &mut spec.common.storage;
+        let StorageBackend::S3(props) = &mut spec.common.storage else {
+            panic!("fixture is S3-only")
+        };
         props.session_token = None;
         spec.common.aggregates = None;
         spec.common.group_keys = None;
