@@ -76,13 +76,13 @@ pub enum StorageBackend {
     /// Azure Data Lake Storage Gen2, reached via `abfss://`.
     Adls {
         /// Configures the iceberg `FileIO` manifest-read path via
-        /// [`Self::catalog_storage_props`]. The DataFusion scan path does NOT
-        /// read this field — it derives the account from the host of the
-        /// side's own file URIs via `MicrosoftAzureBuilder::with_url`
-        /// (`crates/lakehouse-engine/src/scan/object_store.rs`). So an
-        /// `account_name` that disagrees with the table location's actual
-        /// account surfaces as an object-store auth failure at scan time,
-        /// not as a plan-time error.
+        /// [`Self::catalog_storage_props`] — an `account_name` that disagrees
+        /// with the credential's actual account surfaces as an auth failure
+        /// there, at plan time (manifest read), before any scan runs. The
+        /// DataFusion scan path does NOT read this field — it derives the
+        /// account from the host of the side's own file URIs via
+        /// `MicrosoftAzureBuilder::with_url`
+        /// (`crates/lakehouse-engine/src/scan/object_store.rs`) instead.
         account_name: String,
         /// Exactly one Azure credential for that account.
         cred: AdlsCred,
@@ -314,6 +314,7 @@ mod tests {
             r#"{"azure":{"endpoint":"","region":"","access_key":"","secret_key":""}}"#,
             r#"{"Adls":{"account_name":"","cred":{"AccountKey":""}}}"#,
             r#"{"azure":{"account_name":"","cred":{"AccountKey":""}}}"#,
+            r#"{"adls":{"endpoint":"","region":"","access_key":"","secret_key":""}}"#,
             r#"{"adls":{"account_name":"","cred":{"AccountKey":""}}}"#,
         ] {
             assert!(
