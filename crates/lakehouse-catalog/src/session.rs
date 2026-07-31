@@ -18,19 +18,13 @@ use iceberg::CatalogBuilder;
 use iceberg_catalog_rest::{
     REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
-use iceberg_storage_opendal::OpenDalStorageFactory;
 use std::collections::HashMap;
-use std::sync::Arc;
 
-/// Build a RestCatalog configured to read/write data files through the S3
-/// (MinIO) storage factory.
+/// Build a RestCatalog for the unsigned namespace-enumeration path.
 ///
-/// iceberg 0.10.0 requires an explicit `StorageFactory`; the S3 config keys are
-/// supplied in the same props map passed to `load`, via `storage`'s
-/// [`StorageBackend::catalog_storage_props`]. Credentials live only in this map
-/// and never appear in returned SQL or error strings.
-///
-/// Crate-private: `namespace`'s unsigned enumeration path is the only caller.
+/// No `StorageFactory` is set: the only caller lists tables/namespaces (pure
+/// REST), which never builds a `FileIO`. Credentials flow through `props` via
+/// [`StorageBackend::catalog_storage_props`] and never appear in SQL or errors.
 pub(crate) async fn build_rest_catalog(
     catalog_uri: &str,
     catalog: &CatalogProps,
@@ -48,9 +42,6 @@ pub(crate) async fn build_rest_catalog(
     inject_catalog_auth_props(&mut props, creds);
 
     RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }))
         .load("lakehouse", props)
         .await
         .map_err(|e: iceberg::Error| {

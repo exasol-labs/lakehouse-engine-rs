@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 /// Carries all optional flags so later work (SigV4 signing, credential vending,
 /// catalog token/OAuth2 auth) can read them without touching the module again.
 ///
-/// Secret-bearing fields (`secret_key`, `client_secret`, `token`) are excluded
-/// from the derived `Debug` output via a manual impl to prevent accidental leaks.
+/// Secret-bearing fields (`secret_key`, `client_secret`, `token`, `account_key`,
+/// `sas_token`) are excluded from the derived `Debug` output via a manual impl to
+/// prevent accidental leaks.
 #[derive(Clone)]
 pub struct ConnectionCreds {
     pub warehouse: String,
@@ -49,6 +50,12 @@ pub struct ConnectionCreds {
     pub oauth2_server_uri: Option<String>,
     /// Optional OAuth2 scope. Absent when not supplied.
     pub scope: Option<String>,
+    /// Azure storage account name. Absent when not supplied.
+    pub account_name: Option<String>,
+    /// Azure shared storage-account key. Absent when not supplied.
+    pub account_key: Option<String>,
+    /// Azure inline shared-access-signature token. Absent when not supplied.
+    pub sas_token: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectionCreds {
@@ -74,6 +81,12 @@ impl std::fmt::Debug for ConnectionCreds {
             )
             .field("oauth2_server_uri", &self.oauth2_server_uri)
             .field("scope", &self.scope)
+            .field("account_name", &self.account_name)
+            .field(
+                "account_key",
+                &self.account_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("sas_token", &self.sas_token.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -250,6 +263,9 @@ mod tests {
             client_secret: Some("oauth-client-secret".into()),
             oauth2_server_uri: Some("https://auth.example.com/token".into()),
             scope: Some("catalog:read".into()),
+            account_name: Some("acct".into()),
+            account_key: Some("static-account-key".into()),
+            sas_token: Some("sv=…&sig=static-sas-signature".into()),
         };
 
         let debug = format!("{creds:?}");
@@ -259,6 +275,8 @@ mod tests {
             "sts-session-token",
             "static-bearer-token",
             "oauth-client-secret",
+            "static-account-key",
+            "sv=…&sig=static-sas-signature",
         ] {
             assert!(
                 !debug.contains(secret),

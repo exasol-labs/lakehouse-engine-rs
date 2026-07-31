@@ -10,8 +10,10 @@ use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use lakehouse_catalog::redact_error_text;
 use object_store::ClientOptions;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
@@ -19,11 +21,11 @@ use object_store::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use url::Url;
+use url::{Position, Url};
 
 use super::session_config_for_spec;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
-use crate::scan::spec::{FileEntry, ScanSpec, StorageBackend};
+use crate::scan::spec::{AdlsCred, FileEntry, ScanSpec, StorageBackend};
 
 /// Build a DataFusion `SessionContext` with an object store registered per scan side.
 ///
@@ -34,6 +36,8 @@ pub(super) fn build_session_context(
     spec: &ScanSpec,
     memory_limit_bytes: u64,
 ) -> Result<SessionContext, UdfError> {
+    validate_sides_share_one_store(spec)?;
+
     let config = session_config_for_spec(spec);
 
     // Memory pool + spill config.
@@ -113,10 +117,10 @@ struct StoreRegistration<'a> {
 /// registration was new: `Some(url)` = registered under `url`, `None` = the
 /// registry already held that key and nothing was (re-)registered.
 ///
-/// Dispatches on the storage backend because deriving a store key is a
-/// backend-specific decision, not a shared one — an S3 bucket is the URI host,
-/// which is not what identifies a store on every backend — so each backend owns
-/// both its key derivation and its store construction.
+/// Dispatches on the storage backend because CONSTRUCTING the store is a
+/// backend-specific decision. The store URL is not: [`side_store_url`] derives it
+/// once for every backend, and each arm only reads out of it the part its builder
+/// needs — the host as an S3 bucket name, the whole URL for Azure.
 ///
 /// The `None` case is what makes a broadcast join's two sides safe to register
 /// unconditionally: sides sharing one bucket collapse onto one store as an
@@ -132,9 +136,11 @@ fn register_side_store(
 ) -> Result<Option<Url>, UdfError> {
     match registration.backend {
         StorageBackend::S3(storage) => {
-            let bucket = extract_bucket_from_files(side.files, side.table_root)?;
-            let store_url = Url::parse(&format!("s3://{bucket}"))
-                .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
+            let store_url = side_store_url(side.files, side.table_root)?;
+            let bucket = store_url
+                .host_str()
+                .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {store_url}")))?
+                .to_string();
             if ctx
                 .runtime_env()
                 .object_store_registry
@@ -174,14 +180,46 @@ fn register_side_store(
             let secrets = storage.secret_values();
             let s3 = builder.build().map_err(|e| {
                 // Do not echo the error directly — it might contain credential fragments.
-                let stripped = crate::scan::emit::redact_secret_values(&e.to_string(), &secrets);
                 UdfError::User(format!(
                     "failed to configure S3 object store: {}",
-                    crate::scan::emit::redact_credentials(&stripped)
+                    redact_error_text(&e.to_string(), &secrets)
                 ))
             })?;
 
             let sized_store = SpecSizedObjectStore::new(Arc::new(s3), registration.sizes.clone());
+            ctx.runtime_env()
+                .register_object_store(&store_url, Arc::new(sized_store));
+            Ok(Some(store_url))
+        }
+        StorageBackend::Adls { cred, .. } => {
+            let store_url = side_store_url(side.files, side.table_root)?;
+            if ctx
+                .runtime_env()
+                .object_store_registry
+                .get_store(&store_url)
+                .is_ok()
+            {
+                return Ok(None);
+            }
+
+            let builder = MicrosoftAzureBuilder::new()
+                .with_url(store_url.as_str())
+                .with_client_options(client_options_for(registration.connection_budget));
+            let builder = match cred {
+                AdlsCred::AccountKey(key) => builder.with_access_key(key),
+                AdlsCred::Sas(sas) => builder.with_config(AzureConfigKey::SasKey, sas),
+            };
+
+            let secrets = registration.backend.secret_values();
+            let azure = builder.build().map_err(|e| {
+                UdfError::User(format!(
+                    "failed to configure Azure object store: {}",
+                    redact_error_text(&e.to_string(), &secrets)
+                ))
+            })?;
+
+            let sized_store =
+                SpecSizedObjectStore::new(Arc::new(azure), registration.sizes.clone());
             ctx.runtime_env()
                 .register_object_store(&store_url, Arc::new(sized_store));
             Ok(Some(store_url))
@@ -360,20 +398,80 @@ impl ObjectStore for SpecSizedObjectStore {
     }
 }
 
-/// Extract the S3 bucket (host) from the first entry of an explicit file list,
-/// reconstructing a relative first entry against `table_root`.
+/// The object-store URL one scan side reads its files through: the
+/// `scheme://userinfo@host:port` slice of the side's first reconstructed file
+/// URI, with a relative first entry resolved against `table_root`.
 ///
-/// The S3 arm's own store-key derivation, private to it: the bucket is the URI
-/// host, which is an S3-specific reading of a file URI rather than a shared one.
-fn extract_bucket_from_files(files: &[FileEntry], table_root: &str) -> Result<String, UdfError> {
+/// The single derivation every backend and [`validate_sides_share_one_store`]
+/// read, so the key a store is registered under and the key DataFusion looks it
+/// up with agree by construction rather than by inspection. The slice is exactly
+/// the one `ListingTableUrl::object_store()` takes, and it deliberately KEEPS the
+/// userinfo — which is where an `abfss://` URI carries its container — unlike
+/// DataFusion's coarser registry key, which drops it.
+fn side_store_url(files: &[FileEntry], table_root: &str) -> Result<Url, UdfError> {
     let first = files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
     let abs = reconstruct_abs_uri(&first.path, table_root);
     let url = Url::parse(&abs).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
-    url.host_str()
-        .map(|h| h.to_string())
-        .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {abs}")))
+    let store = &url[Position::BeforeScheme..Position::BeforePath];
+    Url::parse(store)
+        .map_err(|e| UdfError::User(format!("invalid object-store root '{store}': {e}")))
+}
+
+/// Reject a scan spec whose sides would collapse onto ONE registered object store
+/// while needing DIFFERENT ones.
+///
+/// DataFusion keys its object-store registry by scheme, host and port only
+/// (`get_url_key`, `datafusion-execution-54.1.0/src/object_store.rs:268-274`),
+/// dropping the userinfo [`side_store_url`] keeps. On `abfss://` that userinfo IS
+/// the container, and the container is the scope of the store actually built, so
+/// two sides in different containers of one storage account share a registry key
+/// but need two stores: whichever registered first would serve both, silently
+/// reading one side's files out of the other side's container.
+///
+/// The key formula is DataFusion's and cannot be changed here, so the only safe
+/// reading of such a spec is to refuse it. Stated over the two derived URLs and
+/// not over any backend, so it also holds for a future backend whose store scope
+/// is finer than its registry key — and it can never fire for S3, whose URIs
+/// carry no userinfo.
+///
+/// Only an empty DIMENSION side is ignored: `build_session_context` skips it
+/// before registration (`!join.files.is_empty()`), so it can neither collide nor
+/// be derived from. An empty FACT side is NOT ignored — it still reaches
+/// [`side_store_url`] and fails there with "scan spec has no files", exactly as it
+/// would without this check.
+fn validate_sides_share_one_store(spec: &ScanSpec) -> Result<(), UdfError> {
+    let fact = (spec.files.as_slice(), spec.common.table_root.as_str());
+    let dimension = spec
+        .common
+        .join
+        .as_ref()
+        .map(|join| (join.files.as_slice(), join.table_root.as_str()));
+
+    let sides = std::iter::once(fact)
+        .chain(dimension)
+        .filter(|(files, _)| !files.is_empty());
+
+    let mut by_registry_key: HashMap<String, Url> = HashMap::new();
+    for (files, table_root) in sides {
+        let store_url = side_store_url(files, table_root)?;
+        let registry_key = format!(
+            "{}://{}",
+            store_url.scheme(),
+            &store_url[Position::BeforeHost..Position::AfterPort]
+        );
+        if let Some(other) = by_registry_key.insert(registry_key, store_url.clone())
+            && other != store_url
+        {
+            return Err(UdfError::User(format!(
+                "scan spec sides need different object stores ('{other}' and '{store_url}') but \
+                 DataFusion registers a store by scheme, host and port only, so both sides would \
+                 be read through whichever of the two registered first"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Verify every data file and associated delete file in `files` resolves to the
@@ -465,6 +563,15 @@ mod tests {
             },
             ScanSide { files, table_root },
         )
+    }
+
+    /// A two-sided spec rooted at the given `abfss://` locations, one relative
+    /// file per side — the shape the container-collision precondition rules on.
+    fn abfss_spec(fact_root: &str, dim_root: &str) -> ScanSpec {
+        let mut spec = spec_with_join(dim_root, vec![FileEntry::new("data/dim-0.parquet", 64)]);
+        spec.common.table_root = fact_root.into();
+        spec.files = vec![FileEntry::new("data/fact-0.parquet", 128)];
+        spec
     }
 
     /// `minimal_spec` (fact side in `test-bucket`) plus a broadcast-join dimension
@@ -632,6 +739,159 @@ mod tests {
         );
     }
 
+    /// A syntactically valid (base64) account key: `MicrosoftAzureBuilder::build`
+    /// decodes the access key with `AzureAccessKey::try_new`, which rejects any
+    /// non-base64 fixture before the store ever gets far enough to register.
+    const VALID_ACCOUNT_KEY: &str = "c3RhdGljLWFjY291bnQta2V5";
+
+    /// An Azure backend with the given credential, for a fixed test account.
+    fn adls_backend(cred: AdlsCred) -> StorageBackend {
+        StorageBackend::Adls {
+            account_name: "acct".into(),
+            cred,
+        }
+    }
+
+    /// A one-sided Adls spec rooted at `table_root`, under the given credential.
+    fn adls_spec(table_root: &str, cred: AdlsCred) -> ScanSpec {
+        let mut spec = minimal_spec();
+        spec.common.storage = adls_backend(cred);
+        spec.common.table_root = table_root.into();
+        spec.files = vec![FileEntry::new("data/part-0.parquet", 1)];
+        spec
+    }
+
+    /// A two-sided Adls spec: fact side at `fact_root`, dimension side at
+    /// `dim_root`, both read under the same credential.
+    fn adls_spec_with_join(fact_root: &str, dim_root: &str, cred: AdlsCred) -> ScanSpec {
+        let mut spec = adls_spec(fact_root, cred);
+        spec.common.join = Some(JoinSpec {
+            table_root: dim_root.into(),
+            files: vec![FileEntry::new("data/dim-0.parquet", 64)],
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join_type: JoinType::Inner,
+            condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        });
+        spec
+    }
+
+    /// [`side_store_url`]'s own return value carries the container (userinfo),
+    /// but DataFusion's registry key does not: `get_url_key`
+    /// (`datafusion-execution-54.1.0/src/object_store.rs:268-274`) keys only on
+    /// scheme, host and port, dropping userinfo. So `get_store` succeeds for ANY
+    /// container of the same account host, not just the one registered — this
+    /// asymmetry is exactly the collision `validate_sides_share_one_store` exists
+    /// to reject.
+    #[test]
+    fn register_side_store_returns_the_container_qualified_url_but_the_registry_key_drops_the_container()
+     {
+        let spec = adls_spec(
+            "abfss://container@acct.dfs.core.windows.net/db/table",
+            AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
+        );
+        let ctx = SessionContext::new();
+        let expected =
+            Url::parse("abfss://container@acct.dfs.core.windows.net").expect("URL must parse");
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("an Azure side must register"),
+            Some(expected.clone())
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(&expected)
+                .is_ok(),
+            "the container-qualified store must be resolvable"
+        );
+
+        let other_container_same_account =
+            Url::parse("abfss://other@acct.dfs.core.windows.net").expect("URL must parse");
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(&other_container_same_account)
+                .is_ok(),
+            "the registry key drops the container, so a DIFFERENT container of the same \
+             account resolves to the SAME store — exactly the collision \
+             validate_sides_share_one_store exists to reject"
+        );
+    }
+
+    /// A second side rooted in the SAME container of the same account shares the
+    /// first side's registry key: the registration is skipped and reports `None`,
+    /// exactly the S3 shared-bucket contract.
+    #[test]
+    fn register_side_store_skips_a_second_side_in_the_same_container() {
+        let spec = adls_spec_with_join(
+            "abfss://container@acct.dfs.core.windows.net/db/fact",
+            "abfss://container@acct.dfs.core.windows.net/db/dim",
+            AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
+        );
+        let ctx = SessionContext::new();
+        register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+            .expect("fact side must register");
+
+        let join = spec.common.join.as_ref().expect("spec carries a join");
+        assert_eq!(
+            register_side(&ctx, &spec, &join.files, &join.table_root)
+                .expect("a same-container dimension side must not fail"),
+            None,
+            "a dimension side in the same container must not be registered twice"
+        );
+    }
+
+    /// Two sides in different storage ACCOUNTS differ at the registry-key level
+    /// (the host), so both register their own store under their own URL.
+    #[test]
+    fn register_side_store_registers_both_sides_in_different_accounts() {
+        let spec = adls_spec_with_join(
+            "abfss://facts@acct1.dfs.core.windows.net/db/fact",
+            "abfss://dims@acct2.dfs.core.windows.net/db/dim",
+            AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()),
+        );
+        let ctx = SessionContext::new();
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("fact side must register"),
+            Some(Url::parse("abfss://facts@acct1.dfs.core.windows.net").expect("URL must parse"))
+        );
+        let join = spec.common.join.as_ref().expect("spec carries a join");
+        assert_eq!(
+            register_side(&ctx, &spec, &join.files, &join.table_root)
+                .expect("dimension side in a different account must register"),
+            Some(Url::parse("abfss://dims@acct2.dfs.core.windows.net").expect("URL must parse"))
+        );
+    }
+
+    /// `MicrosoftAzureBuilder` accepts only four host suffixes
+    /// (`dfs`/`blob`.`core.windows.net`/`fabric.microsoft.com`). A host outside
+    /// that set must fail loud at `build()` with `UrlNotRecognised` — not collapse
+    /// silently to some other account — and the surfaced error must carry no
+    /// credential value, redacted by the same value-then-label pass as the S3 arm.
+    #[test]
+    fn register_side_store_surfaces_an_unrecognised_azure_host_redacted() {
+        let secret = "static-account-key";
+        let spec = adls_spec(
+            "abfss://container@sovereign.example.com/db/table",
+            AdlsCred::AccountKey(secret.into()),
+        );
+        let ctx = SessionContext::new();
+
+        let err = register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+            .expect_err("an unrecognised Azure host suffix must be rejected");
+        let UdfError::User(msg) = err else {
+            panic!("an unrecognised host is caller input, not an internal fault");
+        };
+        assert!(
+            !msg.contains(secret),
+            "the error must not leak the account key: {msg}"
+        );
+    }
+
     /// The dimension-side guard: an empty dimension file list registers only the
     /// fact side. Without the guard, deriving a store key from no files fails the
     /// whole session build — even though such a spec has no dimension store to
@@ -759,24 +1019,146 @@ mod tests {
         assert_eq!(rel_url.prefix(), &rel_key);
     }
 
-    /// 4.3: the bucket is derived from the reconstructed absolute URI of the
-    /// first file — for a relative first entry it comes via the table root, for
-    /// an absolute-only spec (empty root) behavior is unchanged.
+    /// 4.2: an Adls-backed spec's size-index key excludes the container.
+    /// `object_store::path::Path` is relative to the store root `side_store_url`
+    /// derives (an Azure side registers scoped to one container), so the
+    /// size-index key for a file inside that store must key as
+    /// `path/to/file.parquet` — never re-including the container/account
+    /// authority — exactly mirroring `size_index_keys_by_listing_url_prefix`
+    /// above, just with an `abfss://` root instead of `s3://`.
     #[test]
-    fn extract_bucket_handles_relative_and_absolute_first_entry() {
+    fn spec_size_index_keys_an_abfss_file_without_its_container() {
+        let mut spec = adls_spec(
+            "abfss://container@account.dfs.core.windows.net/path/to",
+            AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
+        );
+        spec.files = vec![FileEntry::new("file.parquet", 999)];
+        let index = build_spec_size_index(&spec).expect("index must build");
+
+        let key = ObjectStorePath::from("path/to/file.parquet");
+        assert_eq!(
+            index.get(&key),
+            Some(&999),
+            "index must key the file relative to the store root, excluding the container"
+        );
+
+        let url = ListingTableUrl::parse(
+            "abfss://container@account.dfs.core.windows.net/path/to/file.parquet",
+        )
+        .unwrap();
+        assert_eq!(url.prefix(), &key);
+    }
+
+    /// The store URL is derived from the reconstructed absolute URI of the first
+    /// file — for a relative first entry via the table root, for an absolute-only
+    /// spec (empty root) from the entry itself — and for every `s3://` input it is
+    /// the very URL the deleted bucket derivation was formatted back into, so the
+    /// registered key is unchanged.
+    #[test]
+    fn side_store_url_returns_the_same_url_for_s3_as_the_deleted_bucket_derivation() {
         // Relative first entry: bucket comes from the table root.
         let rel = vec![FileEntry::new("data/part-0.parquet", 1)];
         assert_eq!(
-            extract_bucket_from_files(&rel, "s3://warehouse/db/table").unwrap(),
-            "warehouse"
+            side_store_url(&rel, "s3://warehouse/db/table").unwrap(),
+            bucket_url("warehouse")
         );
 
         // Absolute first entry, empty root (legacy): unchanged behavior.
         let abs = vec![FileEntry::new("s3://legacy-bucket/data/part-0.parquet", 1)];
         assert_eq!(
-            extract_bucket_from_files(&abs, "").unwrap(),
-            "legacy-bucket"
+            side_store_url(&abs, "").unwrap(),
+            bucket_url("legacy-bucket")
         );
+    }
+
+    /// The derivation keeps the file list's own scheme instead of rewriting it to
+    /// `s3://`, so a store registered under it is found by the lookup DataFusion
+    /// actually performs — `ListingTableUrl::object_store()` on the file URI, which
+    /// preserves `s3a`. The deleted derivation registered `s3://<bucket>`, a key
+    /// that lookup never asks for.
+    #[test]
+    fn side_store_url_preserves_the_s3a_scheme_so_the_key_matches_the_lookup() {
+        let files = vec![FileEntry::new("data/part-0.parquet", 1)];
+        let derived = side_store_url(&files, "s3a://warehouse/db/table")
+            .expect("an s3a file list must yield a store URL");
+        assert_eq!(derived.as_str(), "s3a://warehouse");
+
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&derived, Arc::new(::object_store::memory::InMemory::new()));
+        let lookup = ListingTableUrl::parse("s3a://warehouse/db/table/data/part-0.parquet")
+            .expect("the file URI must parse")
+            .object_store();
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(lookup.as_ref())
+                .is_ok(),
+            "the store must be resolvable under the key the scan looks up"
+        );
+    }
+
+    /// The container-collision precondition. DataFusion keys the object-store
+    /// registry by scheme, host and port only, so two `abfss://` sides in
+    /// different containers of ONE storage account share a key while needing two
+    /// different stores — the dimension side would be read out of the fact side's
+    /// container with no error. The spec is rejected instead.
+    ///
+    /// Two accepting controls keep the rule from degenerating into "any spec with
+    /// two sides is rejected": the rule keys on the store URL, so two sides in ONE
+    /// container need one store and are accepted, and two different accounts
+    /// differ in the registry key too, so they get their own stores and cannot
+    /// collide.
+    #[test]
+    fn validate_sides_share_one_store_rejects_two_containers_in_one_account() {
+        let colliding = abfss_spec(
+            "abfss://facts@acct.dfs.core.windows.net/db/fact",
+            "abfss://dims@acct.dfs.core.windows.net/db/dim",
+        );
+        let err = validate_sides_share_one_store(&colliding)
+            .expect_err("two containers of one storage account must be rejected");
+        assert!(
+            matches!(err, UdfError::User(_)),
+            "a colliding spec is caller input, not an internal fault; got {err:?}"
+        );
+
+        validate_sides_share_one_store(&abfss_spec(
+            "abfss://facts@acct.dfs.core.windows.net/db/fact",
+            "abfss://facts@acct.dfs.core.windows.net/db/dim",
+        ))
+        .expect("two sides in one container need one store and must be accepted");
+
+        validate_sides_share_one_store(&abfss_spec(
+            "abfss://facts@acct.dfs.core.windows.net/db/fact",
+            "abfss://dims@other.dfs.core.windows.net/db/dim",
+        ))
+        .expect("sides in different storage accounts must be accepted");
+    }
+
+    /// The precondition can never fire on S3: an `s3://` URI carries no userinfo,
+    /// so a side's store URL and its registry key hold the same authority. Every
+    /// S3 spec shape the scan builds passes it unchanged.
+    #[test]
+    fn validate_sides_share_one_store_accepts_every_s3_spec_shape() {
+        let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
+        for (shape, spec) in [
+            ("no join", minimal_spec()),
+            (
+                "join in the fact bucket",
+                spec_with_join("s3://test-bucket/db/dim", dim_files.clone()),
+            ),
+            (
+                "join in another bucket",
+                spec_with_join("s3://dim-bucket/db/dim", dim_files),
+            ),
+            (
+                "join with an empty file list",
+                spec_with_join("s3://dim-bucket/db/dim", Vec::new()),
+            ),
+        ] {
+            validate_sides_share_one_store(&spec)
+                .unwrap_or_else(|e| panic!("the '{shape}' S3 shape must be accepted, got {e:?}"));
+        }
     }
 
     /// 4.2: the wrapper answers a HEAD (`get_opts` with `head`) from the size

@@ -2765,6 +2765,9 @@ mod tests {
             client_secret: Some("oauth-client-secret-sentinel".into()),
             oauth2_server_uri: None,
             scope: None,
+            account_name: None,
+            account_key: None,
+            sas_token: None,
         };
 
         let catalog = CatalogProps {
