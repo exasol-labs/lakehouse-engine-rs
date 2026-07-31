@@ -63,9 +63,9 @@ pub fn redact_credentials(s: &str) -> String {
         // 2nd+ occurrence if we stopped after the first match. The cursor
         // advances past each redaction so the re-emitted label is never
         // re-matched (which would loop forever).
-        let pat_lower = pat.to_lowercase();
+        let pat_lower = pat.to_ascii_lowercase();
         let mut from = 0;
-        while let Some(rel) = result[from..].to_lowercase().find(&pat_lower) {
+        while let Some(rel) = result[from..].to_ascii_lowercase().find(&pat_lower) {
             let idx = from + rel;
             let after = idx + pat.len();
             // Find the end of the value (next quote, whitespace, comma, or ampersand).
@@ -312,6 +312,21 @@ mod tests {
         assert!(
             safe.contains("access_key"),
             "label must be preserved: {safe}"
+        );
+    }
+
+    /// A Unicode character whose full case-folding grows its byte length (e.g.
+    /// Turkish dotted İ → "i̇") must not desync the byte offsets computed from
+    /// the lowercased search string against the original — `to_lowercase()`
+    /// once did, and `result[..idx]` panicked on a non-ASCII multi-byte
+    /// continuation byte. `to_ascii_lowercase()` preserves length exactly.
+    #[test]
+    fn redact_credentials_does_not_panic_on_length_changing_unicode_casefold() {
+        let msg = "İİİİİsig=ütoken";
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("sig=ü"),
+            "sig= value must be redacted: {safe}"
         );
     }
 }
