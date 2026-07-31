@@ -4,6 +4,16 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 
 ## Background
 
+* The broadcast contract already requires "a condition/filter/projection the `crates/vs-expression`
+  translator can render; any deviation is served by the unified unaccelerated fallback". This delta
+  does not change that contract — it makes the FILTER half of it actually enforced. The broadcast
+  renderer previously conflated an absent filter with a filter present but unrenderable, so a
+  declined filter produced a broadcast plan carrying no filter at all, which no clause then applied.
+  See `vs-adapter/pushdown-declined-filter-self-apply`.
+* Broadcast SQL has no outer `WHERE`. Its projection is narrowed to the select-list items, so a
+  filter-only column is not even in scope for one. Declining to the N-scan fallback — which owns a
+  qualified outer `WHERE` — is therefore the only place the predicate can be applied without
+  widening the projection, and widening already triggers the recorded projection-widened decline.
 * The adapter advertises exactly `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI`; `JOIN_TYPE_LEFT_OUTER`, `JOIN_TYPE_RIGHT_OUTER`, `JOIN_TYPE_FULL_OUTER`, `JOIN_CONDITION_ALL`, and any Cartesian-product capability stay unadvertised.
 * Both sides' Iceberg snapshot, data-file list, and per-file byte size are resolved exactly once per pushdown, in the planning layer; no scan UDF invocation discovers files itself.
 * The broadcast threshold is read from a VS adapter note (`JOIN_BROADCAST_MAX_BYTES`, default 134217728) and compared against each side's Iceberg-metadata byte size — computed from manifest `file_size_in_bytes`, with NO Parquet data read.
@@ -43,13 +53,16 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * *AND* when the smaller side's byte size exceeds `JOIN_BROADCAST_MAX_BYTES` the adapter SHALL take the unified unaccelerated fallback instead
 * *AND* the threshold SHALL be read from the persisted adapter note `JOIN_BROADCAST_MAX_BYTES`, defaulting to 134217728 when absent or unparseable
 
-### Scenario: Join projection and EMITS span both involved tables
+### Scenario: Broadcast join projection and filter are rendered per involved table
 
-* *GIVEN* a broadcast-eligible inner equi-join whose select list projects columns from both involved tables
-* *WHEN* the adapter builds the scan spec
+* *GIVEN* a broadcast-eligible inner equi-join `pushdown` request over two involved tables
+* *WHEN* the adapter resolves the projection and renders the WHERE filter
 * *THEN* the adapter SHALL resolve each projected column's Exasol output type from the involved table it belongs to, matching the column against that table's involved-table column metadata
 * *AND* the scan-driving SQL's declared EMITS column list SHALL match the projected join output columns in order and type
 * *AND* a WHERE filter over columns of either side SHALL be rendered via the same `crates/vs-expression` translator path used for single-table filters and carried in the common spec
+* *AND* a filter that is PRESENT and non-trivial but that the translator DECLINES SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition already does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
+* *AND* the adapter SHALL distinguish an ABSENT or trivially-true filter, which leaves the broadcast plan eligible and emits no scan-spec filter, from a DECLINED one, which forfeits the broadcast plan
+* *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because the result would carry extra rows — see `vs-adapter/pushdown-declined-filter-self-apply`
 
 ### Scenario: Join condition is rendered via the vs-expression translator
 

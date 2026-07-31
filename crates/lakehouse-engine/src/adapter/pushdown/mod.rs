@@ -1,3 +1,18 @@
+//! Pushdown planning: resolve the Iceberg file list ONCE and build the
+//! scan-driving SQL that invokes the LAKEHOUSE_SCAN SCALAR EMIT UDF.
+//!
+//! Architecture invariants:
+//! - File list resolved exactly ONCE here, in the planning layer.
+//! - The scan SCALAR EMIT UDF receives the explicit file list; it NEVER discovers files.
+//! - A predicate the adapter cannot faithfully translate into the DataFusion scan is
+//!   self-applied by the adapter itself (e.g. as an outer WHERE), never OMITTED from
+//!   the spec. There is no Exasol-side fallback to defer to — see CLAUDE.md
+//!   § "Virtual Schema pushdown delegation" and `specs/_decision/045`.
+//! - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
+//! - Catalog/connection auth credentials (OAuth token, bearer, etc.) NEVER appear
+//!   in any returned SQL string or error message. Storage (S3) credentials are a
+//!   documented exception — see `handle_pushdown`'s doc comment.
+
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
@@ -5,23 +20,10 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-/// Pushdown planning: resolve the Iceberg file list ONCE and build the
-/// scan-driving SQL that invokes the LAKEHOUSE_SCAN SCALAR EMIT UDF.
-///
-/// Architecture invariants:
-/// - File list resolved exactly ONCE here, in the planning layer.
-/// - The scan SCALAR EMIT UDF receives the explicit file list; it NEVER discovers files.
-/// - A predicate the adapter cannot translate is OMITTED from the spec
-///   (correctness backstop: Exasol keeps the predicate at its own level).
-/// - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-/// - Catalog/connection auth credentials (OAuth token, bearer, etc.) NEVER appear
-///   in any returned SQL string or error message. Storage (S3) credentials are a
-///   documented exception — see `handle_pushdown`'s doc comment.
-use vs_expression::render_df_filter_safe;
 
 mod support;
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, apply_type_rewrites,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, classify_where_filter,
     extract_all_column_types, extract_limit, extract_projection, order_by_present,
     strip_table_alias,
 };
@@ -66,6 +68,12 @@ use joins::{
 
 #[cfg(test)]
 use crate::scan::spec::{AggKind, AggregatePlan};
+// The filter pipeline's two halves, imported for the test mirrors that pin their
+// composition; production reaches them through `classify_where_filter`.
+#[cfg(test)]
+use support::apply_type_rewrites;
+#[cfg(test)]
+use vs_expression::render_df_filter_safe;
 
 #[cfg(test)]
 mod test_support;
@@ -75,8 +83,8 @@ mod dispatch_golden;
 
 /// Resolve the Iceberg snapshot + file list and build pushdown SQL.
 ///
-/// `cluster_nodes` — the number of Exasol nodes read from the `CLUSTER_NODES`
-/// adapterNotes entry (default 1 when absent or unparseable).
+/// `cluster_nodes` — the number of Exasol nodes, captured from `ctx.node_count()`
+/// in `dispatch`'s pushdown arm (default 1 when the handshake reports 0).
 ///
 /// `parallelism_factor` — the oversubscription multiplier read from the
 /// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
@@ -179,13 +187,14 @@ pub async fn handle_pushdown(
 
     let col_types = extract_all_column_types(request);
 
-    // The rewritten filter feeds ONLY the DataFusion-bound scan filter;
-    // `filter_json_raw` itself is left completely unmodified for the later
-    // `resolve_file_list` Iceberg-level pruning call below, which must see the
-    // original, un-rewritten predicate tree.
-    let filter = filter_json_raw
-        .and_then(|f| apply_type_rewrites(f, &col_types))
-        .and_then(|f| render_df_filter_safe(&f));
+    // ONE classification of the request's WHERE filter, owned by
+    // `classify_where_filter`: `filter` is the DataFusion-bound scan-spec predicate,
+    // `declined_filter` the original tree the adapter must self-apply because the
+    // scan cannot carry it. At most one is `Some`. `filter_json_raw` itself is left
+    // completely unmodified for the later `resolve_file_list` Iceberg-level pruning
+    // call below, which must see the original, un-rewritten predicate tree — a
+    // decline changes what the ADAPTER renders, never what pruning sees.
+    let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
 
     let limit = extract_limit(&pushdown_req);
 
@@ -242,6 +251,7 @@ pub async fn handle_pushdown(
         projection_widened,
         col_types,
         filter,
+        declined_filter,
         limit,
         has_order_by,
         &shards,
@@ -272,6 +282,12 @@ pub async fn handle_pushdown(
 /// `projection_widened` is `extract_projection`'s widening signal for the
 /// `proj_cols`/`proj_types` pair passed alongside it: `true` means they are the full
 /// base row rather than one item per select-list item (#196).
+///
+/// `filter` and `declined_filter` are the two halves of `classify_where_filter`'s
+/// single classification and are never both `Some`: `filter` is the predicate the
+/// scan spec carries, `declined_filter` the ORIGINAL tree the adapter must self-apply
+/// because the scan cannot carry it. This dispatcher does not re-derive
+/// renderability — that classification has exactly one owner.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dispatch_sql(
     request: &Json,
@@ -281,6 +297,7 @@ pub(crate) fn build_dispatch_sql(
     projection_widened: bool,
     col_types: Vec<(String, String)>,
     filter: Option<String>,
+    declined_filter: Option<&Json>,
     limit: Option<u64>,
     has_order_by: bool,
     shards: &[Vec<FileEntry>],
@@ -324,6 +341,22 @@ pub(crate) fn build_dispatch_sql(
         instance_overhead_mb,
         s3_max_connections,
     };
+
+    // Declined WHERE route, ahead of shape routing so it applies before aggregating,
+    // grouping, and truncating (see `_decision/045`).
+    if let Some(declined) = declined_filter {
+        return qualified_single_table_fallback_pushdown(
+            request,
+            pushdown_req,
+            &base,
+            None,
+            shards,
+            &col_types,
+            udf_name,
+            distribute_udf_name,
+            Some(declined),
+        );
+    }
 
     // One shared classifier decides the routing shape for BOTH this dispatcher and
     // the empty-result path (`file_resolution::empty_result_sql`), so their output
@@ -422,9 +455,11 @@ pub(crate) fn build_dispatch_sql(
             //
             // Per-shard scan stays LIMIT-free and sort-free (no aggregates, no group
             // keys); the group keys, HAVING, ORDER BY, and LIMIT go in the outer
-            // wrapper only. The WHERE filter is pushed into the scan (advertised
-            // filter capabilities carry only translatable predicates), exactly as the
-            // grouped push-down path does — no outer WHERE needed.
+            // wrapper only. The WHERE filter is pushed into the scan, exactly as the
+            // grouped push-down path does, and needs no outer WHERE — not because an
+            // advertised capability guarantees a translatable predicate (it does not),
+            // but because a predicate the scan cannot carry never reaches this arm: the
+            // declined-filter route above intercepts it and self-applies it.
             return qualified_single_table_fallback_pushdown(
                 request,
                 pushdown_req,
@@ -434,6 +469,7 @@ pub(crate) fn build_dispatch_sql(
                 &col_types,
                 udf_name,
                 distribute_udf_name,
+                None,
             );
         }
         RequestShape::SingleGroupAgg { items } => {
@@ -504,6 +540,7 @@ pub(crate) fn build_dispatch_sql(
                     &col_types,
                     udf_name,
                     distribute_udf_name,
+                    None,
                 );
             }
             // No distinct item: the ordinary single-group aggregate plans drive the
@@ -547,6 +584,7 @@ pub(crate) fn build_dispatch_sql(
                     &col_types,
                     udf_name,
                     distribute_udf_name,
+                    None,
                 );
             }
             None
@@ -933,6 +971,11 @@ mod tests {
     /// Calls the same pipeline function `handle_pushdown` calls
     /// (`apply_type_rewrites`, then `render_df_filter_safe`) on the
     /// DataFusion-bound filter tree.
+    ///
+    /// Mirrors only the NO-DECLINE half of production's filter pipeline:
+    /// `handle_pushdown` classifies through `classify_where_filter`, which routes a
+    /// DECLINED filter to the qualified single-table wrapper rather than into the scan
+    /// spec. This fixture renders, so the mirror and production agree.
     #[test]
     fn where_filter_decimal_stringification_rewritten_to_trim() {
         let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -973,6 +1016,11 @@ mod tests {
     /// over-wrap a non-stringifying context. `predicate_greater` is not a
     /// `function_scalar`, so `string_function_arg_type_guard` has nothing to dispatch on
     /// here and the rendering is byte-identical to before this guard was wired in.
+    ///
+    /// Mirrors only the NO-DECLINE half of production's filter pipeline:
+    /// `handle_pushdown` classifies through `classify_where_filter`, which routes a
+    /// DECLINED filter to the qualified single-table wrapper rather than into the scan
+    /// spec. This fixture renders, so the mirror and production agree.
     #[test]
     fn filter_decimal_comparison_not_rewritten() {
         let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -1003,6 +1051,11 @@ mod tests {
     /// — reaches it there, coercing the DECIMAL argument into the trimmed
     /// `decimal_to_varchar_exasol` form through the same pipeline function
     /// `handle_pushdown` calls (issue #210).
+    ///
+    /// Mirrors only the NO-DECLINE half of production's filter pipeline:
+    /// `handle_pushdown` classifies through `classify_where_filter`, which routes a
+    /// DECLINED filter to the qualified single-table wrapper rather than into the scan
+    /// spec. This fixture renders, so the mirror and production agree.
     #[test]
     fn where_filter_string_fn_under_comparison_predicate_coerced() {
         let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -1032,8 +1085,14 @@ mod tests {
     /// `handle_pushdown` calls: DOUBLE PRECISION has no safe cast-to-text form that
     /// matches Exasol's own conversion (same reasoning as `guard_like_subject`'s
     /// BOOLEAN/DOUBLE/TIMESTAMP declines), so the whole filter is omitted rather than
-    /// pushed with a possibly-wrong text comparison — Exasol evaluates the predicate
-    /// natively instead (issue #210).
+    /// pushed with a possibly-wrong text comparison (issue #210).
+    ///
+    /// Mirrors only the SCAN-SPEC half of production's filter pipeline. The decline
+    /// keeps the predicate out of the scan spec — still true — but production no longer
+    /// OMITS it: there is no Exasol-side backstop, so `classify_where_filter` hands the
+    /// original tree to the qualified single-table wrapper, which applies it in its own
+    /// `WHERE`. That half is pinned by
+    /// `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`.
     #[test]
     fn where_filter_string_fn_over_double_declines() {
         let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
@@ -1064,6 +1123,11 @@ mod tests {
     /// a bare `column`, so `guard_like_subject`'s bare-column dispatch has nothing to do
     /// and passes the node through unchanged. `string_function_arg_type_guard` then
     /// coerces the DECIMAL argument nested inside that same `UPPER` call (issue #210).
+    ///
+    /// Mirrors only the NO-DECLINE half of production's filter pipeline:
+    /// `handle_pushdown` classifies through `classify_where_filter`, which routes a
+    /// DECLINED filter to the qualified single-table wrapper rather than into the scan
+    /// spec. This fixture renders, so the mirror and production agree.
     #[test]
     fn where_filter_upper_decimal_inside_like_subject_coerced() {
         let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -1095,6 +1159,13 @@ mod tests {
     /// `function_scalar_case`'s `arguments`, itself nested under `predicate_equal`'s
     /// `left`, must decline the whole filter — a `LIKE` at this non-junction position
     /// is type-guarded like any other.
+    ///
+    /// Mirrors only the SCAN-SPEC half of production's filter pipeline. The decline
+    /// keeps the predicate out of the scan spec — still true — but production no longer
+    /// OMITS it: there is no Exasol-side backstop, so `classify_where_filter` hands the
+    /// original tree to the qualified single-table wrapper, which applies it in its own
+    /// `WHERE`. That half is pinned by
+    /// `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`.
     #[test]
     fn where_filter_like_decimal_inside_case_declines_whole_filter() {
         let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
@@ -1638,6 +1709,7 @@ mod tests {
             projection_widened,
             guard_col_types(),
             None,
+            None,
             limit,
             has_order_by,
             &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
@@ -1654,6 +1726,333 @@ mod tests {
             200,
             8,
         )
+    }
+
+    // ---------------------------------------------------------------------------
+    // Declined WHERE filter self-applied in the adapter's own SQL (issue #279)
+    // ---------------------------------------------------------------------------
+
+    /// `AMOUNT LIKE '1%'` over the guard fixture's DECIMAL column — the live-verified
+    /// shape `like_subject_type_guard` declines, so `apply_type_rewrites` yields `None`
+    /// and the scan spec can carry no filter at all, while Exasol renders it fine.
+    fn declined_like_on_decimal() -> Json {
+        serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "AMOUNT", "tableName": "EVENTS"},
+            "pattern": {"type": "literal_string", "value": "1%"},
+        })
+    }
+
+    /// Drive the real `build_dispatch_sql` over the fixed `EVENTS` fixture for a
+    /// `pushdownRequest` body, deriving EVERY dispatch input through the same
+    /// production helpers `handle_pushdown` uses — `extract_projection`,
+    /// `classify_where_filter`, `extract_limit`, `order_by_present` — so this harness
+    /// cannot drift from the pipeline it exercises. The logical schema is empty, which
+    /// declines the bounded top-N unconditionally: the decline route is asserted to win
+    /// over the shapes the classifier would otherwise pick, not to depend on them.
+    fn declined_dispatch_sql(pushdown_req_body: Json) -> String {
+        let request = guard_events_request(pushdown_req_body);
+        let pushdown_req = pd(&request);
+        let col_types = guard_col_types();
+        let (proj_cols, proj_types, projection_widened) =
+            extract_projection(&request, &pushdown_req).expect("the fixture must project");
+        let (filter, declined_filter) = classify_where_filter(
+            pushdown_req.get("filter").filter(|f| !f.is_null()),
+            &col_types,
+        );
+        let result = build_dispatch_sql(
+            &request,
+            &pushdown_req,
+            proj_cols,
+            proj_types,
+            projection_widened,
+            col_types,
+            filter,
+            declined_filter,
+            extract_limit(&pushdown_req),
+            order_by_present(&pushdown_req),
+            &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+            "s3://warehouse/db/events".to_string(),
+            Vec::new(),
+            Vec::new(),
+            &sample_storage(),
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            4,
+            8192,
+            2,
+            0.6,
+            200,
+            8,
+        )
+        .expect("build_dispatch_sql must succeed for this fixture");
+        result["sql"]
+            .as_str()
+            .expect("pushdown response must carry a sql field")
+            .to_string()
+    }
+
+    /// Scenario (pushdown-declined-filter-self-apply): a declined WHERE filter routes
+    /// EVERY single-table dispatch shape to the qualified wrapper, which applies the
+    /// predicate itself. Asserted over the three shapes whose renderings otherwise
+    /// diverge most — the bare row scan, the grouped partial/merge aggregate, and the
+    /// ordered top-N — because the decline route sits AHEAD of the routing classifier,
+    /// which is exactly what makes ONE route serve all five shapes.
+    ///
+    /// Each shape asserts both halves of the guarantee: the predicate appears in the
+    /// wrapper's `WHERE`, and the fan-out scan spec carries no `"filter"` — applied
+    /// exactly once, never twice and never nowhere.
+    #[test]
+    fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
+        let declined = declined_like_on_decimal();
+        let id_col = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS"});
+        let region_col =
+            serde_json::json!({"type": "column", "name": "REGION", "tableName": "EVENTS"});
+        let shapes = [
+            (
+                "row scan",
+                serde_json::json!({
+                    "selectList": [id_col.clone()],
+                    "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+                    "filter": declined.clone(),
+                }),
+            ),
+            (
+                "grouped aggregate",
+                serde_json::json!({
+                    "aggregationType": "group_by",
+                    "groupBy": [region_col.clone()],
+                    "selectList": [region_col, agg_item("COUNT", None, false)],
+                    "selectListDataTypes": [
+                        {"type": "varchar", "size": 2000000},
+                        {"type": "decimal", "precision": 18, "scale": 0},
+                    ],
+                    "filter": declined.clone(),
+                }),
+            ),
+            (
+                "ordered top-N",
+                serde_json::json!({
+                    "selectList": [id_col.clone()],
+                    "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+                    "orderBy": [{
+                        "type": "order_by_element",
+                        "expression": id_col,
+                        "isAscending": true,
+                        "nullsLast": true,
+                    }],
+                    "limit": {"numElements": 5},
+                    "filter": declined.clone(),
+                }),
+            ),
+        ];
+
+        for (shape, body) in shapes {
+            let sql = declined_dispatch_sql(body);
+            let where_at = sql.find(r#"AS "LHS_T0" WHERE "#).unwrap_or_else(|| {
+                panic!("the {shape} shape must route to the qualified wrapper: {sql}")
+            });
+            assert!(
+                sql[where_at..].contains("LIKE")
+                    && sql[where_at..].contains(r#""LHS_T0"."AMOUNT""#),
+                "the {shape} shape's wrapper WHERE must carry the declined predicate, \
+                 table-qualified: {sql}"
+            );
+            assert!(
+                !sql.contains(r#""filter""#),
+                "the {shape} shape's fan-out scan spec must carry no filter — the \
+                 declined predicate is applied exactly once: {sql}"
+            );
+        }
+    }
+
+    /// A filter that renders trivially true is still OMITTED, with no wrapper: the
+    /// three outcomes `None` used to collapse are absent, trivially true, and declined,
+    /// and only the third needs self-applying. `classify_where_filter` hands back
+    /// neither a scan filter nor a declined tree here, so the request keeps the
+    /// wrapper-free fast scan.
+    #[test]
+    fn trivially_true_filter_omitted_without_wrapper() {
+        let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
+        let (filter, declined) = classify_where_filter(Some(&trivially_true), &guard_col_types());
+        assert!(
+            filter.is_none() && declined.is_none(),
+            "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
+        );
+
+        let sql = declined_dispatch_sql(serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+            "filter": trivially_true,
+        }));
+
+        assert!(
+            !sql.contains("LHS_T0"),
+            "a trivially-true filter must keep the wrapper-free fast scan: {sql}"
+        );
+        assert!(
+            !sql.contains(r#""filter""#),
+            "a trivially-true filter must not reach the scan spec: {sql}"
+        );
+    }
+
+    /// A `SELECT *` request with a declined filter projects the FULL base row, not just
+    /// the filter's columns. This shape reaches the qualified wrapper ONLY through the
+    /// decline route, and narrowing collects only the columns the rendered clauses NAME —
+    /// for a request with no `selectList` that is `AMOUNT` alone, which Exasol rejects
+    /// positionally (`04000` "Expected number of columns is 4 but pushdown query has 1").
+    /// `referenced_column_projection`'s no-select-list arm is what keeps both the inner
+    /// scan and the outer select list at the full base row, in `col_types` order.
+    ///
+    /// Live-verified wire form: Exasol OMITS the `selectList` key for `SELECT *` (and
+    /// still sends a full-row `selectListDataTypes` beside it). The sibling test
+    /// `no_select_list_wire_forms_all_keep_the_full_base_row` pins the tolerated
+    /// variants, so a future Exasol that sends `[]` or `null` instead lands on the same
+    /// arm.
+    #[test]
+    fn declined_filter_with_absent_select_list_projects_full_row() {
+        let sql = declined_dispatch_sql(serde_json::json!({
+            "filter": declined_like_on_decimal(),
+        }));
+
+        assert!(
+            sql.contains(r#""projection":["REGION","NAME","AMOUNT","ID"]"#),
+            "the inner scan must emit every base-row column in col_types order, not \
+             only the filter's: {sql}"
+        );
+        assert!(
+            sql.starts_with(
+                r#"SELECT "LHS_T0"."REGION", "LHS_T0"."NAME", "LHS_T0"."AMOUNT", "LHS_T0"."ID" FROM ("#
+            ),
+            "the wrapper's outer select list must be the full base row, in order: {sql}"
+        );
+    }
+
+    /// The counterpart: a declined filter beside a REAL select list KEEPS the
+    /// referenced-column narrowing (#160). The full-row projection is owed to the
+    /// `SELECT *` shape alone, not to the decline — so a request that names its columns
+    /// ships only the select list's and the filter's, never the whole row.
+    ///
+    /// This is the route where narrowing matters most: the fan-out carries no filter (the
+    /// predicate is applied in the outer wrapper), so every row of the table crosses the
+    /// UDF boundary and column width is the only remaining lever.
+    #[test]
+    fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
+        let sql = declined_dispatch_sql(serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+            "filter": declined_like_on_decimal(),
+        }));
+
+        assert!(
+            sql.contains(r#""projection":["AMOUNT","ID"]"#),
+            "the inner scan must narrow to the select list's and the declined filter's \
+             columns, in col_types order — not the full base row: {sql}"
+        );
+        assert!(
+            sql.starts_with(r#"SELECT "LHS_T0"."ID" FROM ("#),
+            "the wrapper's outer select list must stay the request's own single item: {sql}"
+        );
+        let where_at = sql
+            .find(r#"AS "LHS_T0" WHERE "#)
+            .unwrap_or_else(|| panic!("must route to the qualified wrapper: {sql}"));
+        assert!(
+            sql[where_at..].contains(r#""LHS_T0"."AMOUNT""#),
+            "the declined predicate's column must be projected AND qualified in the \
+             wrapper's WHERE: {sql}"
+        );
+    }
+
+    /// A DataFusion render decline changes what the ADAPTER renders, never what Iceberg
+    /// manifest pruning sees. `classify_where_filter` hands back the ORIGINAL,
+    /// un-rewritten tree — the very tree `handle_pushdown` forwards to
+    /// `resolve_file_list` — so a still-prunable conjunct sitting beside the declined
+    /// one keeps pruning exactly as many files as before.
+    #[test]
+    fn iceberg_pruning_input_unchanged_when_df_render_declines() {
+        use crate::adapter::iceberg_predicate::to_iceberg_predicate;
+        use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        use std::sync::Arc;
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "ts",
+                    Type::Primitive(PrimitiveType::Timestamp),
+                )),
+            ])
+            .build()
+            .unwrap();
+        // Three conjuncts, each carrying its own load. `id > 5` is prunable and must
+        // survive. `SECOND(ts, 3)` is refused by the DataFusion dialect on arity while
+        // Exasol renders it — the render-decline cause, distinct from the type-guard
+        // decline the LIKE fixtures above exercise. `LENGTH(amount) > 5` is REWRITTEN
+        // by `rewrite_decimal_stringifications` into the Exasol trim form, so the
+        // rewritten tree differs from this one by value and the equality assertion
+        // below genuinely discriminates the original from the rewritten tree.
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {
+                    "type": "predicate_greater",
+                    "left": {"type": "column", "name": "id"},
+                    "right": {"type": "literal_exactnumeric", "value": 5},
+                },
+                {
+                    "type": "predicate_greater",
+                    "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
+                        {"type": "column", "name": "ts"},
+                        {"type": "literal_exactnumeric", "value": 3},
+                    ]},
+                    "right": {"type": "literal_exactnumeric", "value": 1},
+                },
+                {
+                    "type": "predicate_greater",
+                    "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
+                        {"type": "column", "name": "amount"},
+                    ]},
+                    "right": {"type": "literal_exactnumeric", "value": 5},
+                },
+            ],
+        });
+        let col_types = vec![
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("TS".to_string(), "TIMESTAMP".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
+        ];
+        assert_ne!(
+            apply_type_rewrites(&filter, &col_types).as_ref(),
+            Some(&filter),
+            "fixture precondition: the type rewrites must CHANGE this tree, so the \
+             assertion below can tell the original from the rewritten one"
+        );
+
+        let (scan_filter, declined) = classify_where_filter(Some(&filter), &col_types);
+
+        assert!(
+            scan_filter.is_none(),
+            "the DataFusion render must decline this filter: {scan_filter:?}"
+        );
+        assert_eq!(
+            declined,
+            Some(&filter),
+            "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
+             tree resolve_file_list prunes with"
+        );
+        let pred = to_iceberg_predicate(&filter, &schema)
+            .expect("the prunable conjunct must still yield an Iceberg predicate");
+        assert!(
+            format!("{pred}").contains("id"),
+            "pruning must keep the prunable conjunct even though the sibling conjunct \
+             declined: {pred}"
+        );
     }
 
     /// Scenario (pushdown-planning-capability-extensions, issues #225 / #189): a

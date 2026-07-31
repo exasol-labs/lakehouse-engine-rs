@@ -198,6 +198,7 @@ fn dispatch_sql_with_pushdown_req(
         false,
         base_col_types(),
         filter,
+        None,
         limit,
         false,
         &fixed_shards(),
@@ -524,5 +525,255 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
             && sql_with_alias.contains(r#""LHS_T0"."NAME""#),
         "the wrapper must qualify every column reference to its own subquery alias \
          LHS_T0, whether or not the request carried a tableAlias: {sql_with_alias}"
+    );
+}
+
+// --- Cross-site fixtures (plan `fix-declined-filter-self-apply`, task 2.6) ---
+//
+// The ten fixtures above pin the single-table dispatch seam alone. The two
+// fixtures below additionally drive the broadcast-join and N-scan-join render
+// sites (`render_broadcast_join` + `build_broadcast_join_sql`, and
+// `build_n_scan_join_sql`) so a single pair of tests proves ALL THREE sites
+// named in the plan's Design > Context table stay byte-identical for a
+// filterless request and for a request whose filter renders cleanly — the
+// only two cases the fix is required to leave unchanged.
+
+use super::joins::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
+
+/// A minimal CUSTOMER ⋈ ORDERS inner equi-join pushdown request (disjoint
+/// column names, a broadcast-eligible shape), with an optional WHERE filter —
+/// the join-side counterpart of `row_scan_request`.
+fn two_table_join_request(filter: Option<Json>) -> Json {
+    let mut pushdown_req = serde_json::json!({
+        "type": "select",
+        "from": {
+            "type": "join",
+            "join_type": "inner",
+            "left": {"name": "CUSTOMER", "type": "table"},
+            "right": {"name": "ORDERS", "type": "table"},
+            "condition": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+            },
+        },
+        "selectList": [
+            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        ],
+    });
+    if let Some(f) = filter {
+        pushdown_req["filter"] = f;
+    }
+    serde_json::json!({
+        "involvedTables": [
+            {"name": "CUSTOMER", "columns": [
+                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+            ]},
+            {"name": "ORDERS", "columns": [
+                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "O_ORDERDATE", "dataType": {"type": "date"}},
+            ]},
+        ],
+        "pushdownRequest": pushdown_req,
+        "schemaMetadataInfo": {
+            "properties": {},
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"CUSTOMER": "lh.customer", "ORDERS": "lh.orders"}
+            }).to_string(),
+        },
+    })
+}
+
+/// The detected join shape for [`two_table_join_request`], resolved through
+/// the production [`detect_join`] seam rather than hand-built.
+fn two_table_detected_join(request: &Json) -> DetectedJoin {
+    match detect_join(request, &pd(request)).expect("two-table join must be detected") {
+        JoinShape::Join(join) => join,
+        other => panic!("expected a detected join, got {other:?}"),
+    }
+}
+
+/// CUSTOMER's resolved join side: one small file, columns disjoint from ORDERS.
+fn resolved_customer_side() -> ResolvedJoinSide {
+    ResolvedJoinSide {
+        table_name: "CUSTOMER".to_string(),
+        iceberg_ident: "lh.customer".to_string(),
+        table_root: "s3://warehouse/lh/customer".to_string(),
+        files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
+        logical_schema: vec![LogicalField {
+            field_id: 1,
+            name: "CUSTOMER_KEY".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+        }],
+        name_mapping: Vec::new(),
+        effective_storage: sample_storage(),
+        total_bytes: 10,
+    }
+}
+
+/// ORDERS' resolved join side: one larger file, columns disjoint from CUSTOMER.
+fn resolved_orders_side() -> ResolvedJoinSide {
+    ResolvedJoinSide {
+        table_name: "ORDERS".to_string(),
+        iceberg_ident: "lh.orders".to_string(),
+        table_root: "s3://warehouse/lh/orders".to_string(),
+        files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
+        logical_schema: vec![LogicalField {
+            field_id: 1,
+            name: "ORDERS_KEY".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+        }],
+        name_mapping: Vec::new(),
+        effective_storage: sample_storage(),
+        total_bytes: 100,
+    }
+}
+
+/// The fixed join tuning knobs both join-site goldens dispatch over.
+fn join_scan_tuning() -> JoinScanTuning {
+    JoinScanTuning {
+        cluster_nodes: 1,
+        parallelism_factor: 1,
+        df_target_partitions: 1,
+        df_batch_size: 8192,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 0,
+        s3_max_connections: 1,
+    }
+}
+
+/// A filterless request — single-table row scan, and CUSTOMER ⋈ ORDERS at the
+/// broadcast and N-scan join sites — must emit byte-identical SQL at all
+/// three pushdown render sites named in the plan's Design > Context table:
+/// `handle_pushdown`'s `build_dispatch_sql` seam, `render_broadcast_join` +
+/// `build_broadcast_join_sql`, and `build_n_scan_join_sql`. Proves tasks
+/// 2.1-2.5 changed nothing for the "no filter in the request" case, which was
+/// always correct to omit.
+#[test]
+fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
+    // Site 1: single-table WHERE (`handle_pushdown` / `build_dispatch_sql`).
+    let (proj_cols, proj_types) = row_scan_projection();
+    let single_table_sql = dispatch_sql(&row_scan_request(), proj_cols, proj_types, None, None);
+    assert_eq!(
+        single_table_sql,
+        include_str!("testdata/dispatch_golden/filterless_single_table.sql")
+    );
+
+    // Site 2: broadcast join (`render_broadcast_join` + `build_broadcast_join_sql`).
+    let request = two_table_join_request(None);
+    let pushdown_req = pd(&request);
+    let join = two_table_detected_join(&request);
+    let rendered = render_broadcast_join(&request, &pushdown_req, &join)
+        .expect("render_broadcast_join must not error for a well-formed request")
+        .expect("a disjoint-column, filterless equi-join must stay broadcast-eligible");
+    let sides = JoinSides {
+        fact: resolved_orders_side(),
+        dimension: resolved_customer_side(),
+        broadcast_eligible: true,
+    };
+    let broadcast_sql = build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        &join_scan_tuning(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    );
+    assert_eq!(
+        broadcast_sql,
+        include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
+    );
+
+    // Site 3: N-scan per-leg fallback (`build_n_scan_join_sql`).
+    let sides = vec![resolved_customer_side(), resolved_orders_side()];
+    let n_scan_sql = build_n_scan_join_sql(
+        &request,
+        &pushdown_req,
+        &join,
+        &sides,
+        &join_scan_tuning(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("build_n_scan_join_sql must succeed for this fixture");
+    assert_eq!(
+        n_scan_sql,
+        include_str!("testdata/dispatch_golden/filterless_n_scan_join.sql")
+    );
+}
+
+/// A filter that RENDERS cleanly in DataFusion dialect must ALSO emit
+/// byte-identical SQL at all three sites — the fix changes behavior only for
+/// a DECLINED filter, never a rendering one. Proves the single-table path
+/// stays on its wrapper-free fast scan (no `LHS_T0` qualified fallback), the
+/// broadcast join keeps its accelerated shape, and the N-scan fallback keeps
+/// pushing the rendering conjunct into its owning leg rather than the outer
+/// WHERE.
+#[test]
+fn rendering_filter_emits_unchanged_wrapper_free_scan() {
+    // Site 1: single-table WHERE.
+    let (proj_cols, proj_types) = row_scan_projection();
+    let single_table_sql = dispatch_sql(
+        &row_scan_request(),
+        proj_cols,
+        proj_types,
+        Some(r#"("REGION" = 'EU')"#.to_string()),
+        None,
+    );
+    assert_eq!(
+        single_table_sql,
+        include_str!("testdata/dispatch_golden/rendering_single_table.sql")
+    );
+
+    // Site 2: broadcast join.
+    let renderable_filter = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "right": {"type": "literal_string", "value": "ACME"},
+    });
+    let request = two_table_join_request(Some(renderable_filter));
+    let pushdown_req = pd(&request);
+    let join = two_table_detected_join(&request);
+    let rendered = render_broadcast_join(&request, &pushdown_req, &join)
+        .expect("render_broadcast_join must not error for a well-formed request")
+        .expect("a disjoint-column equi-join with a rendering filter must stay broadcast-eligible");
+    let sides = JoinSides {
+        fact: resolved_orders_side(),
+        dimension: resolved_customer_side(),
+        broadcast_eligible: true,
+    };
+    let broadcast_sql = build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        &join_scan_tuning(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    );
+    assert_eq!(
+        broadcast_sql,
+        include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")
+    );
+
+    // Site 3: N-scan per-leg fallback.
+    let sides = vec![resolved_customer_side(), resolved_orders_side()];
+    let n_scan_sql = build_n_scan_join_sql(
+        &request,
+        &pushdown_req,
+        &join,
+        &sides,
+        &join_scan_tuning(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("build_n_scan_join_sql must succeed for this fixture");
+    assert_eq!(
+        n_scan_sql,
+        include_str!("testdata/dispatch_golden/rendering_n_scan_join.sql")
     );
 }

@@ -52,6 +52,14 @@ gap — but it must still be named as a deliberate trade-off in the spec, not le
 - Use `exapump` for all Exasol/BucketFS interaction.
 - DSNs must include `validateservercertificate=0` (self-signed Docker cert).
 
+## Virtual Schema pushdown delegation
+
+Once the adapter's capabilities response advertises a predicate or function shape, Exasol delegates
+it fully to the adapter and never independently re-checks or re-applies it. There is no Exasol-side
+fallback once a capability is advertised. The adapter therefore owns generating the equivalent SQL
+itself for anything within an advertised capability that it cannot faithfully push into the
+DataFusion scan — omitting it returns wrong rows, not a safely-deferred check.
+
 ## Verification discipline
 
 - A reported bug MUST be reproduced locally against the Docker Exasol container before it is

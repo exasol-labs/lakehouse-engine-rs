@@ -13,6 +13,24 @@ fallback has exactly one implementation for all N ≥ 2 involved tables.
 
 ## Background
 
+* This delta corrects which conjuncts reach a fan-out leg. A conjunct reaches a leg only if the leg
+  can actually apply it, so a side-local conjunct the DataFusion dialect cannot render is residual
+  and lands in the outer wrapper's `WHERE` rather than being pushed into a leg that then drops it.
+  The set the legs receive and the set the outer wrapper renders stay exact complements, so the
+  partition remains total and disjoint. See `vs-adapter/pushdown-declined-filter-self-apply`.
+* The renderability screen governs the RENDER path only. Each side's Iceberg manifest-pruning
+  predicate keeps EVERY side-local conjunct, renderable or not, because pruning only ever removes
+  files that provably cannot match; narrowing that input would silently open more files and buy no
+  correctness.
+* The stale claim that the outer Exasol query "still applies the FULL `WHERE`" is corrected in the
+  same change: it applies exactly the residual set, and the residual set is now defined so that
+  every conjunct no leg applies is in it.
+* The outer wrapper's `WHERE` is rendered from ONE renderer over ONE combined residual tree, and that
+  render has THREE outcomes, not two. An ABSENT residual set emits no clause. A residual set that
+  renders TRIVIALLY TRUE emits no clause and is not an error — the trivially-true-suppressing
+  renderer returns nothing for it exactly as it does for an unrenderable one, so that renderer alone
+  cannot decide the error. A residual set the NON-SUPPRESSING qualified render also cannot express is
+  UNRENDERABLE and returns the wrapper's existing client-facing error. Only the third outcome errors.
 * The adapter advertises exactly `JOIN`, `JOIN_TYPE_INNER`, and `JOIN_CONDITION_EQUI` (`vs-adapter/pushdown-planning-join`); there is no per-query opt-out, so Exasol pushes every inner equi-join of any arity and expects this fallback (or the broadcast path) to serve it.
 * Each involved table's Iceberg snapshot, data-file list, and logical schema are resolved exactly once per pushdown, in the planning layer, recovering each table's original-cased Iceberg identifier from `TABLE_MAP` by its involved-table name; no scan UDF invocation discovers files itself.
 * The unaccelerated fallback is a SINGLE unified renderer for every inner join with N ≥ 2 involved tables: the two-involved-table case is exactly N = 2, and there is only one implementation. Each involved table is scanned through its own nested-distributor + scalar-scan fan-out subquery, and all N subquery results are reconstructed into the original inner join by Exasol's core engine. Broadcast (strictly two-table, node-local in the scan UDF, `vs-adapter/pushdown-planning-join`) is an optimization SELECTED WITHIN the one join path, not a second rendering implementation; when broadcast is unavailable for a two-table join it takes the same N = 2 unified fallback.
@@ -79,8 +97,13 @@ fallback has exactly one implementation for all N ≥ 2 involved tables.
 * *WHEN* the adapter renders the `INNER JOIN … ON` chain
 * *THEN* the adapter SHALL attach each join condition to the earliest join point in the left-to-right chain at which every table the condition references is in scope, deciding scope by the SET of `tableName`s the condition touches — NEVER by column name, so shared column names across sides stay correctly qualified
 * *AND* a join point at which no not-yet-attached condition becomes resolvable SHALL be rendered with `ON 1=1`
-* *AND* each side's SIDE-LOCAL WHERE conjuncts (referencing only that one table) SHALL be pushed INTO that side's fan-out leg as a DataFusion filter, so DataFusion performs row-group pruning and row filtering per leg
-* *AND* only the RESIDUAL WHERE conjuncts — cross-table, OR-spanning, or untagged — SHALL remain in the outer wrapper's `WHERE`
+* *AND* a top-level WHERE conjunct SHALL be pushed INTO a side's fan-out leg as a DataFusion filter if and only if it references only that ONE table AND the DataFusion dialect can render it, so DataFusion performs row-group pruning and row filtering per leg for every conjunct the leg can actually apply
+* *AND* every OTHER conjunct SHALL be RESIDUAL and remain in the outer wrapper's `WHERE`: cross-table, OR-spanning, untagged, column-free, or side-local-but-unrenderable — REPLACING the recorded "only the RESIDUAL WHERE conjuncts — cross-table, OR-spanning, or untagged — SHALL remain in the outer wrapper's `WHERE`", under which a side-local conjunct that failed to render was applied nowhere
+* *AND* the partition SHALL stay total and disjoint, so no conjunct is dropped and none is applied twice
+* *AND* the filter each leg receives SHALL already be screened as DataFusion-renderable, so the leg's own render cannot decline and no second renderability decision exists to drift from the first
+* *AND* each side's Iceberg manifest-pruning predicate SHALL keep every side-local conjunct, renderable or not, so a render decline SHALL NOT change which files are opened
+* *AND* a non-empty residual set that the NON-SUPPRESSING qualified Exasol render also cannot express SHALL return the wrapper's existing client-facing error, because the predicate can be applied nowhere and returning rows without it would be wrong
+* *AND* a non-empty residual set that renders trivially true SHALL emit no outer `WHERE` and SHALL NOT error, so the error decision MUST NOT be taken from the trivially-true-suppressing render's empty result
 * *AND* the returned result SHALL equal the result of the same inner join evaluated on a single node, for any assignment of conditions to join points
 
 ### Scenario: Shared-column-name join uses qualified rendering, not bare-name broadcast rendering

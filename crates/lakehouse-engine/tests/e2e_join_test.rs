@@ -29,7 +29,7 @@ use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
-    LINEITEM_ROWS, seed_events,
+    FACT_ORDERS_ROWS, LINEITEM_ROWS, seed_events,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -891,6 +891,299 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
         actual, expected,
         "scalar-over-aggregate grouped three-table join result must equal the \
          same select list evaluated over the un-joined fact_lineitem table.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Declined-filter self-apply at the join render sites (plan
+// fix-declined-filter-self-apply, tasks 2.8/2.9, #279). A side-local WHERE
+// conjunct DataFusion's dialect cannot render — `SECOND(<col>, 3)`, the same
+// 2-argument arity refusal `vs-expression`'s
+// second_with_precision_declines_for_datafusion_renders_for_exasol pins —
+// must still be applied: at the broadcast site by declining the broadcast
+// plan altogether (task 2.3), and at the N-scan site as a residual
+// outer-WHERE conjunct alongside a rendering conjunct that still reaches its
+// own leg's scan-spec filter (task 2.4). `O_ORDERDATE` is a plain DATE column
+// (no time component), so `SECOND(O_ORDERDATE, 3)` is always `0` — verified
+// live against the Docker Exasol container (`SELECT SECOND(DATE
+// '2024-01-05', 3)` = `0`) — making the declined predicate always-true over
+// the seeded data. The correctness assertion is therefore that the declined
+// filter costs no rows, not that it narrows them.
+// ---------------------------------------------------------------------------
+
+/// A below-threshold two-table inner equi-join with a single declined
+/// side-local conjunct (`SECOND(O_ORDERDATE, 3) = 0`, always true for the
+/// seeded DATE column) and no postprocessing.
+fn broadcast_declined_filter_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE SECOND(o.O_ORDERDATE, 3) = 0",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
+/// The full (unfiltered) `fact_orders ⋈ dim_customer` join, computed
+/// independently of the join pushdown — the ground truth
+/// [`broadcast_declined_filter_join_query`] must match, since its sole filter
+/// is always true over the seeded data. Same shape as [`expected_join_rows`]
+/// with the `O_ORDERDATE` WHERE bound dropped.
+fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    let dim_cols = conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    ));
+    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
+    let custkey_to_name: HashMap<String, String> = dim_cols[0]
+        .iter()
+        .zip(dim_cols[1].iter())
+        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
+        .collect();
+
+    let fact_cols = conn.query_columns(&format!(
+        "SELECT O_CUSTKEY, O_ORDERDATE FROM {}",
+        vs_fact_table(vs_name)
+    ));
+    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
+
+    let mut rows: Vec<(String, String)> = fact_cols[0]
+        .iter()
+        .zip(fact_cols[1].iter())
+        .map(|(custkey, date)| {
+            let key = value_to_string(custkey);
+            let name = custkey_to_name
+                .get(&key)
+                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
+                .clone();
+            (name, value_to_string(date))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A below-threshold two-table inner equi-join carrying a declined side-local
+/// WHERE conjunct (`SECOND(O_ORDERDATE, 3)`, a 2-argument arity refusal under
+/// the DataFusion dialect) declines the broadcast plan altogether (task 2.3)
+/// rather than silently dropping the predicate and riding the broadcast
+/// in-UDF join unfiltered: the pushed plan is the N-scan wrapper, never a
+/// broadcast common-blob join block, and the result is correct.
+#[test]
+fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = broadcast_declined_filter_join_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a declined side-local filter must decline the broadcast plan and fall \
+         back to the N-scan wrapper (LHS_T0/LHS_T1), not omit the predicate:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a declined filter must NOT ride the broadcast in-UDF join unfiltered \
+         (no common-blob join block may appear):\n{pushed}"
+    );
+    assert!(
+        pushed.contains("SECOND("),
+        "the fallback wrapper must self-apply the declined conjunct in its own \
+         outer WHERE, not just fall back and drop it:\n{pushed}"
+    );
+
+    let cols = conn.query_columns(&query);
+    let actual = columns_to_sorted_pairs(&cols);
+    let expected = expected_full_join_rows(&mut conn, VS_NAME);
+
+    assert_eq!(
+        actual.len(),
+        FACT_ORDERS_ROWS,
+        "SECOND(O_ORDERDATE, 3) is always 0 for the seeded DATE column, so the \
+         declined filter must cost no rows: expected {FACT_ORDERS_ROWS}, got {}: {actual:?}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "the N-scan fallback result must equal the independently computed \
+         unfiltered join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A below-threshold two-table inner equi-join carrying a declined side-local
+/// WHERE conjunct that is FALSE for every seeded row (`SECOND(O_ORDERDATE, 3)
+/// = 1`, since `O_ORDERDATE` is a plain DATE with no time component so
+/// `SECOND(..., 3)` is always `0`). Unlike
+/// [`e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters`], whose
+/// always-true conjunct cannot distinguish "self-applied" from "silently
+/// dropped", this always-false conjunct can: a build that dropped the
+/// declined predicate instead of self-applying it would return every row,
+/// while the correct self-apply excludes them all.
+#[test]
+fn e2e_broadcast_declined_filter_excludes_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE SECOND(o.O_ORDERDATE, 3) = 1",
+        vs_fact_table(VS_NAME),
+        vs_dim_table(VS_NAME)
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a declined side-local filter must decline the broadcast plan and fall \
+         back to the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+    );
+
+    let row_count = conn.query_row_count(&query);
+    assert_eq!(
+        row_count, 0,
+        "SECOND(O_ORDERDATE, 3) = 1 is false for every seeded DATE row, so a \
+         correctly self-applied declined conjunct must exclude every row \
+         (a build that silently dropped it instead would return all \
+         {FACT_ORDERS_ROWS}): got {row_count}"
+    );
+}
+
+/// A three-table inner equi-join carrying BOTH a rendering side-local
+/// conjunct (`O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'`, unchanged from
+/// [`join_query`]) and a declined side-local conjunct (`SECOND(O_ORDERDATE,
+/// 3) = 0`, always true), both local to the `fact_orders` side.
+fn three_table_join_with_mixed_filters_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {} c \
+         JOIN {} o ON c.C_CUSTKEY = o.O_CUSTKEY \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
+         WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
+         AND SECOND(o.O_ORDERDATE, 3) = 0",
+        vs_dim_table(vs_name),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name)
+    )
+}
+
+/// The expected result of [`three_table_join_with_mixed_filters_query`],
+/// computed independently of the join pushdown: the same
+/// `O_ORDERDATE >= {ORDERDATE_LOWER_BOUND}` bound narrows `fact_orders`
+/// before joining against `dim_customer` and `fact_lineitem`; the declined
+/// `SECOND(...) = 0` conjunct contributes no additional narrowing (always
+/// true for the seeded DATE column), so it is not applied here.
+fn expected_three_table_join_rows_with_orderdate_filter(
+    conn: &mut ExaConn,
+    vs_name: &str,
+) -> Vec<Vec<String>> {
+    let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    )));
+    let orderkey_to_custkey = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT O_ORDERKEY, O_CUSTKEY FROM {} WHERE O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'",
+        vs_fact_table(vs_name)
+    )));
+
+    let line_cols = conn.query_columns(&format!(
+        "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY FROM {}",
+        vs_lineitem_table(vs_name)
+    ));
+    assert_eq!(line_cols.len(), 3, "lineitem query must return 3 columns");
+
+    let mut rows: Vec<Vec<String>> = (0..line_cols[0].len())
+        .filter_map(|i| {
+            let order_key = value_to_string(&line_cols[0][i]);
+            let cust_key = orderkey_to_custkey.get(&order_key)?;
+            let name = custkey_to_name
+                .get(cust_key)
+                .unwrap_or_else(|| panic!("O_CUSTKEY {cust_key} has no matching customer"))
+                .clone();
+            let line_number = value_to_string(&line_cols[1][i]);
+            let quantity = value_to_string(&line_cols[2][i]);
+            Some(vec![name, line_number, quantity])
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A three-table inner-join whose WHERE carries both a rendering side-local
+/// conjunct and a declined side-local conjunct — both local to the
+/// `fact_orders` side — is served by the N-scan wrapper with the two
+/// conjuncts partitioned correctly (task 2.4): the declined conjunct
+/// (`SECOND(..., 3)`) is carried by the outer wrapper's `WHERE` in Exasol
+/// dialect (it can only appear there — DataFusion never renders it, so it
+/// cannot reach any leg's `ScanSpec.filter`), while the rendering conjunct
+/// (`O_ORDERDATE >= DATE '...'`) still reaches its own leg's DataFusion
+/// `ScanSpec.filter`, unchanged from the single-conjunct case. The result is
+/// correct.
+///
+/// Exasol canonicalizes the rendering conjunct before the adapter ever sees
+/// it — the pushdown request carries `predicate_lessequal(literal_date,
+/// column)`, i.e. `DATE '...' <= O_ORDERDATE`, not the `>=` form as written —
+/// so the leg's rendered filter is asserted in that canonical (flipped)
+/// shape, confirmed against the live EXPLAIN VIRTUAL output.
+#[test]
+fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = three_table_join_with_mixed_filters_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 3),
+        "a three-table join must emit the N-scan wrapper with three distinct \
+         LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a three-table join must NOT carry a broadcast common-blob join \
+         block:\n{pushed}"
+    );
+
+    // The declined conjunct is rendered as a verbatim Exasol function call
+    // (`SECOND(...)`) — it can appear ONLY in the outer wrapper's WHERE,
+    // never inside a leg's DataFusion-rendered `ScanSpec.filter` (that
+    // dialect refuses the 2-argument form), so this substring alone proves
+    // the declined conjunct was self-applied rather than silently dropped.
+    assert!(
+        pushed.contains("SECOND("),
+        "the declined SECOND(..., 3) conjunct must be rendered as a verbatim \
+         Exasol call in the outer wrapper's WHERE:\n{pushed}"
+    );
+    // The rendering conjunct is rendered under the DataFusion dialect
+    // (bare/unqualified, `render_df_filter_safe`) into its leg's
+    // `ScanSpec.filter` as a SQL string, itself embedded in the outer JSON
+    // scan-spec blob — hence the doubled single-quote (SQL string-literal
+    // escaping) around the DATE literal. This exact form cannot appear in
+    // Exasol's own echoed pushdown-request JSON, which encodes the DATE
+    // literal as a plain `"value" : "2024-01-05"` field, never wrapped in
+    // `DATE ''...''`.
+    assert!(
+        pushed.contains(&format!("DATE ''{ORDERDATE_LOWER_BOUND}''")),
+        "the rendering O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' conjunct \
+         must still reach its leg's scan-spec filter:\n{pushed}"
+    );
+
+    let cols = conn.query_columns(&query);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 result columns, got {}",
+        cols.len()
+    );
+    let actual = fetch_rows_as_vecs(&cols);
+    let expected = expected_three_table_join_rows_with_orderdate_filter(&mut conn, VS_NAME);
+
+    assert!(
+        !actual.is_empty(),
+        "expected at least one row (orders on/after {ORDERDATE_LOWER_BOUND}), got none"
+    );
+    assert_eq!(
+        actual, expected,
+        "the mixed rendering/declined-filter three-table join result must \
+         equal the independently computed join.\n\
          actual:   {actual:?}\nexpected: {expected:?}"
     );
 }
