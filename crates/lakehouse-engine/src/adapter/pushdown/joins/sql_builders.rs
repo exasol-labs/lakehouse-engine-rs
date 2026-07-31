@@ -772,6 +772,19 @@ fn qualified_join_order_by(
 /// inner-scan projection for BOTH decline wrappers (grouped and single-group Case
 /// 2/3), replacing the old whole-table `full_row_projection` (issue #160).
 ///
+/// A request carrying NO select list is the one shape that must NOT narrow: it is a
+/// genuine `SELECT *`, the wrapper's own select-list renderer enumerates every
+/// projected column ([`n_scan_join_select_items`]'s fallback arm), and Exasol
+/// validates that row positionally against the FULL base row — so a narrowed
+/// projection would emit a short row it rejects with `04000` "Expected number of
+/// columns". Both arms therefore share ONE test, and it is deliberately permissive
+/// (Postel's law): the live wire form is an ABSENT `selectList` key — captured from
+/// the Docker container via `EXPLAIN VIRTUAL`, with `selectListDataTypes` still
+/// carrying the full row beside it — while the protocol documents the same intent as
+/// an EMPTY select list, so absent, JSON `null`, `[]`, and a non-array are all
+/// accepted as "no select list" and a future Exasol that switches wire form needs no
+/// change here.
+///
 /// Walks the FULL expression tree of every clause the wrapper renders — the clause set
 /// [`referenced_clause_values`] owns — collecting through [`collect_all_column_names`]'s
 /// Unicode fold, so every column the rendered SQL names is projected and none is
@@ -784,6 +797,19 @@ pub(in super::super) fn referenced_column_projection(
     pushdown_req: &Json,
     all_cols: &[(String, String)],
 ) -> (Vec<ProjectionItem>, Vec<String>) {
+    // No select list ⇒ `SELECT *` ⇒ the full base row, never a narrowing (see doc).
+    // Accepts every "no select list" wire form Exasol might use, not only the absent
+    // key it sends today.
+    if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
+        return (
+            all_cols
+                .iter()
+                .map(|(name, _)| ProjectionItem::Column(name.clone()))
+                .collect(),
+            all_cols.iter().map(|(_, ty)| ty.clone()).collect(),
+        );
+    }
+
     let mut names = std::collections::HashSet::new();
     referenced_clause_values(pushdown_req, |v| collect_all_column_names(v, &mut names));
 
@@ -929,18 +955,14 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 ///
 /// `declined_filter` is the predicate the wrapper must self-apply as its own `WHERE`
 /// (see [`build_qualified_single_table_fallback_sql`]); `filter` MUST be `None`
-/// alongside it so the predicate is applied exactly once. That route also projects
-/// the FULL base row instead of the default [`referenced_column_projection`]
-/// narrowing, which collects only the columns the rendered clauses NAME: for a
-/// genuine `SELECT *` — a shape ONLY this route reaches — that is the filter's
-/// columns alone, and the wrapper's absent-`selectList` arm would then enumerate a
-/// one-column base row where Exasol validates the full row positionally (`04000`
-/// "Expected number of columns"). The full row is the same `(names, types)` pair
-/// every widened row scan already emits, so it adds no EMITS-type risk; its only
-/// cost is forfeiting the referenced-column narrowing (#160) on the decline route,
-/// the same trade the other wrapper routes already make. Narrowing stays
-/// unconditional inside `referenced_column_projection` itself, which the join
-/// wrapper shares and which must keep narrowing.
+/// alongside it so the predicate is applied exactly once. It does NOT decide the
+/// projection. The decline route does reach the one shape that must project the FULL
+/// base row — a genuine `SELECT *`, whose request carries no select list — but the
+/// reason is the select list, not the decline, so that arm lives inside
+/// [`referenced_column_projection`] and is keyed off what Exasol sent. A declined
+/// filter over a REAL select list therefore keeps the referenced-column narrowing
+/// (#160), which matters most on exactly this route: the fan-out carries no filter
+/// here, so every row ships and column width is the only lever left.
 #[allow(clippy::too_many_arguments)]
 pub(in super::super) fn qualified_single_table_fallback_pushdown(
     request: &Json,
@@ -953,17 +975,7 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<Json, UdfError> {
-    let (fb_proj_cols, fb_proj_types) = if declined_filter.is_some() {
-        (
-            col_types
-                .iter()
-                .map(|(name, _)| ProjectionItem::Column(name.clone()))
-                .collect(),
-            col_types.iter().map(|(_, ty)| ty.clone()).collect(),
-        )
-    } else {
-        referenced_column_projection(pushdown_req, col_types)
-    };
+    let (fb_proj_cols, fb_proj_types) = referenced_column_projection(pushdown_req, col_types);
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
             projection: fb_proj_cols,
@@ -2527,14 +2539,23 @@ mod tests {
         );
     }
 
-    /// `referenced_column_projection` keeps narrowing through the remaining clauses
-    /// when the SELECT list is absent or empty — it MUST NOT acquire
-    /// `referenced_side_columns`' absent/empty-`selectList` short-circuit, which
-    /// returns every column without inspecting another clause. The two routines share
-    /// one clause walk but keep divergent fallback policies, and this is the
-    /// divergence a naive merge would silently erase.
+    /// `referenced_column_projection` returns the FULL base row — never a narrowing —
+    /// for every "no select list" wire form, because that request is a `SELECT *` whose
+    /// result Exasol validates positionally against the whole row (`04000` otherwise).
+    ///
+    /// The tolerated set is deliberately wider than what Exasol sends today (Postel's
+    /// law): the live capture shows the `selectList` KEY OMITTED for `SELECT *`, while
+    /// the protocol documents the same intent as an empty select list — so JSON `null`,
+    /// `[]`, and a non-array value are accepted as the same shape, and a future Exasol
+    /// that switches wire form lands on this arm with no code change.
+    ///
+    /// This arm is shared with [`n_scan_join_select_items`]'s own no-select-list arm, so
+    /// the projection and the outer SELECT list cannot disagree on the row's arity. It
+    /// does NOT merge the OTHER divergence from [`referenced_side_columns`]: a request
+    /// that HAS a select list but names no source column still falls back to the first
+    /// column alone, pinned by `referenced_column_projection_falls_back_to_first_column`.
     #[test]
-    fn referenced_column_projection_narrows_without_select_list() {
+    fn no_select_list_wire_forms_all_keep_the_full_base_row() {
         let all_cols = vec![
             ("GK".to_string(), "VARCHAR(10)".to_string()),
             ("FCOL".to_string(), "DECIMAL(18,0)".to_string()),
@@ -2545,24 +2566,66 @@ mod tests {
             "left": {"type": "column", "name": "FCOL", "tableName": "T"},
             "right": {"type": "literal_exactnumeric", "value": 5},
         });
+        let full_row: Vec<ProjectionItem> = all_cols
+            .iter()
+            .map(|(name, _)| ProjectionItem::Column(name.clone()))
+            .collect();
+        let full_types: Vec<String> = all_cols.iter().map(|(_, ty)| ty.clone()).collect();
 
         for req in [
+            // Absent key — the form live-captured from Exasol for `SELECT *`.
             serde_json::json!({"filter": filter.clone()}),
+            // Forms Exasol does not send today but might; all mean `SELECT *`.
             serde_json::json!({"selectList": [], "filter": filter.clone()}),
+            serde_json::json!({"selectList": null, "filter": filter.clone()}),
+            serde_json::json!({"selectList": "*", "filter": filter.clone()}),
         ] {
             let (proj, types) = referenced_column_projection(&req, &all_cols);
             assert_eq!(
-                proj,
-                vec![ProjectionItem::Column("FCOL".to_string())],
-                "an absent/empty select list must still narrow through the filter to \
-                 ONLY the filter's column, never short-circuit to every column: {req}"
+                proj, full_row,
+                "no select list ⇒ `SELECT *` ⇒ the full base row, so the wrapper's own \
+                 no-select-list SELECT arm and this projection agree on the arity \
+                 Exasol validates: {req}"
             );
             assert_eq!(
-                types,
-                vec!["DECIMAL(18,0)".to_string()],
-                "types stay positionally aligned with the narrowed column"
+                types, full_types,
+                "types stay positionally aligned with the full base row: {req}"
             );
         }
+    }
+
+    /// A REAL select list beside a filter still narrows: only the columns the rendered
+    /// clauses NAME reach the inner scan, the filter's included. This is the half of
+    /// #160 the decline route used to forfeit wholesale.
+    #[test]
+    fn referenced_column_projection_narrows_with_a_real_select_list() {
+        let all_cols = vec![
+            ("GK".to_string(), "VARCHAR(10)".to_string()),
+            ("FCOL".to_string(), "DECIMAL(18,0)".to_string()),
+            ("IRRELEVANT_COL".to_string(), "VARCHAR(10)".to_string()),
+        ];
+        let req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "GK", "tableName": "T"}],
+            "filter": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "FCOL", "tableName": "T"},
+                "right": {"type": "literal_exactnumeric", "value": 5},
+            },
+        });
+
+        let (proj, types) = referenced_column_projection(&req, &all_cols);
+        assert_eq!(
+            proj,
+            vec![
+                ProjectionItem::Column("GK".to_string()),
+                ProjectionItem::Column("FCOL".to_string()),
+            ],
+            "select-list ∪ filter columns only — the unreferenced column stays out"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(10)".to_string(), "DECIMAL(18,0)".to_string()]
+        );
     }
 
     /// A request naming no source column at all still yields exactly one projected

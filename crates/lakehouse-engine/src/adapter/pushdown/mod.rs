@@ -1909,12 +1909,17 @@ mod tests {
 
     /// A `SELECT *` request with a declined filter projects the FULL base row, not just
     /// the filter's columns. This shape reaches the qualified wrapper ONLY through the
-    /// new decline route, and the wrapper's default narrowing collects only the columns
-    /// the rendered clauses NAME — for an absent `selectList` that is `AMOUNT` alone,
-    /// which Exasol rejects positionally (`04000` "Expected number of columns is 4 but
-    /// pushdown query has 1"). The projection override the decline route passes is what
-    /// keeps both the inner scan and the outer select list at the full base row, in
-    /// `col_types` order.
+    /// decline route, and narrowing collects only the columns the rendered clauses NAME —
+    /// for a request with no `selectList` that is `AMOUNT` alone, which Exasol rejects
+    /// positionally (`04000` "Expected number of columns is 4 but pushdown query has 1").
+    /// `referenced_column_projection`'s no-select-list arm is what keeps both the inner
+    /// scan and the outer select list at the full base row, in `col_types` order.
+    ///
+    /// Live-verified wire form: Exasol OMITS the `selectList` key for `SELECT *` (and
+    /// still sends a full-row `selectListDataTypes` beside it). The sibling test
+    /// `no_select_list_wire_forms_all_keep_the_full_base_row` pins the tolerated
+    /// variants, so a future Exasol that sends `[]` or `null` instead lands on the same
+    /// arm.
     #[test]
     fn declined_filter_with_absent_select_list_projects_full_row() {
         let sql = declined_dispatch_sql(serde_json::json!({
@@ -1931,6 +1936,41 @@ mod tests {
                 r#"SELECT "LHS_T0"."REGION", "LHS_T0"."NAME", "LHS_T0"."AMOUNT", "LHS_T0"."ID" FROM ("#
             ),
             "the wrapper's outer select list must be the full base row, in order: {sql}"
+        );
+    }
+
+    /// The counterpart: a declined filter beside a REAL select list KEEPS the
+    /// referenced-column narrowing (#160). The full-row projection is owed to the
+    /// `SELECT *` shape alone, not to the decline — so a request that names its columns
+    /// ships only the select list's and the filter's, never the whole row.
+    ///
+    /// This is the route where narrowing matters most: the fan-out carries no filter (the
+    /// predicate is applied in the outer wrapper), so every row of the table crosses the
+    /// UDF boundary and column width is the only remaining lever.
+    #[test]
+    fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
+        let sql = declined_dispatch_sql(serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+            "filter": declined_like_on_decimal(),
+        }));
+
+        assert!(
+            sql.contains(r#""projection":["AMOUNT","ID"]"#),
+            "the inner scan must narrow to the select list's and the declined filter's \
+             columns, in col_types order — not the full base row: {sql}"
+        );
+        assert!(
+            sql.starts_with(r#"SELECT "LHS_T0"."ID" FROM ("#),
+            "the wrapper's outer select list must stay the request's own single item: {sql}"
+        );
+        let where_at = sql
+            .find(r#"AS "LHS_T0" WHERE "#)
+            .unwrap_or_else(|| panic!("must route to the qualified wrapper: {sql}"));
+        assert!(
+            sql[where_at..].contains(r#""LHS_T0"."AMOUNT""#),
+            "the declined predicate's column must be projected AND qualified in the \
+             wrapper's WHERE: {sql}"
         );
     }
 

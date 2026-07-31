@@ -45,6 +45,11 @@ own returned SQL any predicate it cannot push to DataFusion.
   single-table wrapper, whose raw fan-out is aggregate-free, sort-free, and LIMIT-free.
 * The wrapper-free single-table fast path is unchanged for every request whose filter renders. A
   materialization boundary appears only on the decline path, which is rare and already slower.
+* On the decline path the fan-out carries NO filter — the predicate is self-applied above it — so
+  every row of the table crosses the UDF boundary and projection width is the only remaining lever.
+  That is why the wrapper's referenced-column narrowing must survive the decline rather than be
+  traded away with it; the one shape that cannot narrow is a `SELECT *`, whose result Exasol
+  validates positionally against the full base row.
 * Iceberg-level file pruning is unaffected and stays sound at BOTH pruning inputs — the single-table
   `resolve_file_list` tree and each join side's side-local predicate. Both keep every conjunct,
   renderable or not: pruning only ever removes files that provably cannot match, and the predicate is
@@ -90,6 +95,15 @@ own returned SQL any predicate it cannot push to DataFusion.
 * *THEN* the adapter SHALL omit the filter from the scan spec and SHALL NOT route the request to the wrapper, because a no-op predicate restricts nothing and omitting it cannot change a result
 * *AND* the emitted SQL SHALL be byte-identical to its pre-change output
 * *AND* the trivially-true rule SHALL stay owned by `crates/vs-expression`, so no adapter site SHALL test a rendered fragment against the literal strings `TRUE` or `NULL`
+
+### Scenario: A declined filter does not widen the wrapper's projection
+
+* *GIVEN* a single-table `pushdown` request whose filter declines
+* *WHEN* the adapter derives the wrapper's inner-scan projection
+* *THEN* the projection SHALL be decided by the request's `selectList` alone, never by the fact that a filter declined
+* *AND* a request carrying a non-empty `selectList` SHALL keep the referenced-column narrowing, projecting only the columns the wrapper's rendered clauses name — its select list's and the self-applied predicate's
+* *AND* a request carrying NO select list — a `SELECT *`, which Exasol sends as an omitted `selectList` key — SHALL project the FULL base row in table-column order at BOTH the inner scan and the wrapper's outer select list, because Exasol validates the pushdown result positionally against the whole row
+* *AND* the "no select list" test SHALL treat an absent key, JSON null, an empty array, and a non-array value alike, so a later change in Exasol's wire form cannot reintroduce a positional mismatch
 
 ### Scenario: A broadcast-eligible join whose filter declines takes the N-scan fallback
 

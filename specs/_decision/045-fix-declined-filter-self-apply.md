@@ -173,7 +173,7 @@ absent, trivially true, unrenderable — and error only on the third.
 A renderer that suppresses a no-op result must never decide unrenderability; that decision needs
 the non-suppressing entry point. This rule applies identically to both wrappers in this plan.
 
-## ADR: The decline route projects the full base row instead of the referenced-column narrowing
+## ADR: The full-base-row projection is keyed off the absent select list, not off the decline
 
 **ID:** decline-route-projects-the-full-base-row
 **Plan:** fix-declined-filter-self-apply
@@ -182,38 +182,61 @@ the non-suppressing entry point. This rule applies identically to both wrappers 
 ### Context
 
 Plan-review round 2 found that routing every dispatch shape to
-`qualified_single_table_fallback_pushdown` on a decline sent a genuine `SELECT *` request (absent,
-JSON-null, or empty-array `selectList` — a shape only the new route can reach) to
+`qualified_single_table_fallback_pushdown` on a decline sent a genuine `SELECT *` request to
 `referenced_column_projection`, which narrows the projection to the columns the rendered clauses
 NAME. Exasol validates the pushdown result positionally, so the narrowed projection would have
-turned "wrong rows" into a hard `04000` error or a silently truncated single-column result.
+turned "wrong rows" into a hard `04000` error or a silently truncated single-column result. The
+first fix keyed the full-base-row projection off `declined_filter.is_some()`, which also disabled
+narrowing for every declined request that DOES carry a select list.
+
+PR review challenged that breadth, and the wire form was then captured live rather than argued.
+`EXPLAIN VIRTUAL` echoes the pushdown request Exasol sends, and for `SELECT * FROM t WHERE …` it
+OMITS the `selectList` key entirely while still sending a full-row `selectListDataTypes` — 10
+entries for the 10-column probe table. Eight further shapes — `1`, `1+1`, `NULL`, `COUNT(*)`,
+`COUNT(NULL)`, `COUNT(1)`, `col + 1`, and an explicit column list — all carry a present, non-empty
+`selectList`. So the shape that must not narrow is exactly "no select list", and it is the only one.
 
 ### Decision
 
-Key the projection off the decline route itself, inside
-`qualified_single_table_fallback_pushdown`: when `declined_filter` is `Some`, project the full base
-row (every `col_types` entry, in order, with its Exasol type); otherwise call
-`referenced_column_projection` as before. This applies to EVERY request the decline route carries,
-not only the select-star shapes the finding named — the narrowing is what is unsafe here, so
-forfeiting it wholesale is simpler than a per-shape `selectList` test and strictly no less correct.
-`referenced_column_projection` itself stays an unconditional narrowing walk, shared unchanged with
-the join-projection narrowing.
+Key the full-base-row projection off the select list Exasol sent, inside
+`referenced_column_projection`: no select list ⇒ every `all_cols` entry in order with its Exasol
+type; otherwise narrow as before. `qualified_single_table_fallback_pushdown` carries no projection
+branch — `declined_filter` decides the wrapper's `WHERE` and nothing else.
+
+The test is deliberately wider than the observed wire form (Postel's law): an absent key, JSON
+`null`, `[]`, and a non-array value are all read as "no select list". Exasol omits the key today
+while the protocol documents the same intent as an EMPTY select list, so a future version could
+switch forms; accepting every form costs one `matches!` and makes that change a no-op here.
+
+This also places the arm beside the identical test in `n_scan_join_select_items`, which decides the
+wrapper's own outer SELECT list. The two must agree on the row's arity Exasol validates, and now
+they agree by construction rather than through a caller-side override.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Gate on `declined_filter` inside the wrapper dispatch, projecting the full base row | ✓ Chosen — one branch, no new parameter, and no `selectList`-shape test to keep in sync with Exasol's positional validation |
-| Pass a pre-computed projection override in as a new parameter, set only for absent/JSON-null/empty-array `selectList` | ✗ Rejected — a parameter plus a shape test to express what the route already knows from `declined_filter` |
-| Fold the guard into `referenced_column_projection` | ✗ Rejected — that function is shared with the join wrapper's narrowing, which must keep its existing behavior |
+| Fold a permissive no-select-list arm into `referenced_column_projection` | ✓ Chosen — pairs the projection with the select-list renderer's own test, keeps #160 narrowing for every declined request that names its columns, and absorbs a future wire-form change |
+| Gate on `declined_filter` inside the wrapper dispatch, projecting the full base row | ✗ Rejected (chosen first, then corrected) — forfeits narrowing for every declined request including those that name their columns, on the one route where the fan-out carries no filter and therefore ships every row |
+| Pass a pre-computed projection override in as a new parameter, set only for the no-select-list shapes | ✗ Rejected — a parameter to express what the request itself already states |
+| Test only for the absent key Exasol sends today | ✗ Rejected — a wire-form change would silently reintroduce the `04000`, and the permissive test costs nothing |
 
 ### Consequences
 
 Widening the set of request shapes a wrapper serves widens its column-shape contract: a route added
-ahead of a classifier inherits every shape the classifier used to divert. The empty-array arity was
-confirmed against the live Docker Exasol container rather than assumed from code. The decline route
-forfeits referenced-column narrowing (#160) for all its requests — the same trade the wrapper's
-other routes already make, on a path that is already the slower one.
+ahead of a classifier inherits every shape the classifier used to divert. Keying the answer off the
+request's own shape, rather than off which guard routed there, keeps that contract inside one
+function instead of spreading it across callers.
+
+The absent-key wire form is verified against the live Docker Exasol container, via the
+`EXPLAIN VIRTUAL` echo of the request JSON — not assumed from documentation or from code. An earlier
+revision of this ADR described the shape as "absent, JSON-null, or empty-array"; the live form is
+the omitted key alone, and the other forms are tolerated by choice rather than observed.
+
+Referenced-column narrowing (#160) is retained on the decline route for every request that carries a
+select list. That is the route where it matters most: the fan-out carries no filter there (the
+predicate is self-applied in the outer wrapper), so every row of the table crosses the UDF boundary
+and column width is the only remaining lever.
 
 ## ADR: A native partial-pushdown acknowledgment mechanism is ruled out, not assumed absent
 
@@ -233,7 +256,8 @@ Close the question as a negative finding. The documented pushdown response has e
 member and `ResponseJsonConverter` serializes those two keys only. The word "residual" and any
 partial-pushdown equivalent appear nowhere in the adapter API reference or the Exasol Virtual
 Schema documentation. The only incomplete-pushdown concept in the protocol runs the other direction,
-Exasol to adapter, as an empty `selectList`.
+Exasol to adapter, as a `SELECT *` request with no select list — documented as an empty
+`selectList`, sent live as an omitted key.
 
 ### Options Considered
 
