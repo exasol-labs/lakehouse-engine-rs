@@ -342,19 +342,8 @@ pub(crate) fn build_dispatch_sql(
         s3_max_connections,
     };
 
-    // Declined-WHERE-filter route, taken AHEAD of the routing classifier so ONE route
-    // serves all five request shapes (row scan, top-N, single-group aggregate, grouped
-    // aggregate, `COUNT(DISTINCT)`). A predicate the scan spec cannot carry is the
-    // adapter's own to render (see this module's header) — and the
-    // qualified wrapper is the one shape that positions that `WHERE` between the raw
-    // fan-out (aggregate-free, sort-free, LIMIT-free by construction) and every other
-    // clause, so it filters BEFORE aggregating, grouping, and truncating. Wrapping the
-    // emitted SQL in `SELECT * FROM (…) WHERE …` instead would filter after all three,
-    // which is wrong for four of the five shapes.
-    //
-    // `filter` is passed as `None` — the two halves of the classification are mutually
-    // exclusive, so it is already `None` here, and naming it keeps the
-    // applied-exactly-once invariant local rather than inferred.
+    // Declined WHERE route, ahead of shape routing so it applies before aggregating,
+    // grouping, and truncating (see `_decision/045`).
     if let Some(declined) = declined_filter {
         return qualified_single_table_fallback_pushdown(
             request,

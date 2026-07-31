@@ -238,21 +238,8 @@ fn join_render_decline(clause: &str) -> UdfError {
     ))
 }
 
-/// Render a filter tree the wrapper must SELF-APPLY as its own `WHERE`, with THREE
-/// outcomes rather than two: `Ok(Some(sql))` when the Exasol dialect renders it,
-/// `Ok(None)` when it is trivially true and correctly needs no clause at all, and
-/// `Err` (a hard error, no native re-plan) when NEITHER dialect renders it, because
-/// a predicate applicable NOWHERE must fail the query rather than silently return
-/// unfiltered rows. Owns that one rule for both self-apply sites — the N-scan
-/// wrapper's residual WHERE and the single-table wrapper's declined WHERE — which
-/// pass only their own `subject` for the decline message.
-///
-/// The error is keyed on the NON-suppressing [`render_expression_qualified`], not on
-/// [`render_df_filter_qualified`] alone: the latter suppresses a trivially-true
-/// render to `None` exactly as its DataFusion twin does, so its `None` alone cannot
-/// tell the two causes apart. Both ways of getting that wrong are correctness bugs —
-/// gating on the suppressing renderer alone hard-fails a correct no-op predicate,
-/// while treating both `None`s as "no clause" returns unfiltered rows.
+/// `Ok(Some(sql))` rendered, `Ok(None)` trivially true, `Err` when neither dialect
+/// renders it (see `_decision/045`).
 fn render_self_applied_where(
     tree: &Json,
     alias_of: &HashMap<String, String>,
@@ -430,18 +417,9 @@ pub(in super::super) fn build_n_scan_join_sql(
         conditions.push(rendered);
     }
 
-    // ONE renderability screen for the whole render path, applied HERE and never
-    // inside `side_local_filter` — whose OTHER consumer, `plan_join`'s Iceberg
-    // manifest pruning, must keep every side-local conjunct, declined or not.
     let where_filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     let leg_eligible = where_filter.and_then(renderable_only);
 
-    // The outer WHERE carries exactly what no leg applies: the cross-side residual
-    // of the leg-eligible conjuncts (cross-table, OR-spanning, untagged, or
-    // column-free) PLUS every conjunct DataFusion declined. The two sets are
-    // disjoint by construction — `leg_eligible` holds only renderable conjuncts —
-    // so the AND duplicates nothing, and together with the per-side slices below the
-    // partition stays exact and total.
     let residual = conjoin_filters(
         leg_eligible.as_ref().and_then(cross_side_residual_filter),
         where_filter.and_then(declined_only),

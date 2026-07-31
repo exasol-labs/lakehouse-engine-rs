@@ -1077,23 +1077,11 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
     Some(rewrite_decimal_stringifications(&expr, col_types))
 }
 
-/// Split a request's raw WHERE filter into the predicate the DataFusion scan spec
-/// carries and the predicate the adapter must render itself.
-///
-/// Returns `(scan_filter, declined)`. The two are mutually exclusive, and BOTH are
-/// `None` for a request that carries no filter or one that renders trivially true —
-/// omitting a no-op predicate is correct, not a decline.
-///
-/// The single owner of that classification, so `build_dispatch_sql` never re-derives
-/// renderability and the trivially-true rule keeps its one owner in
-/// `crates/vs-expression`. Splitting matters because a predicate this hands back as
-/// `declined` MUST be self-applied in the adapter's own returned SQL — the pre-#279
-/// code collapsed both outcomes into one `None` and silently returned unfiltered
-/// rows (`super`'s module header states the invariant and cites the reason).
-///
-/// `declined` is the ORIGINAL, un-rewritten tree: the type rewrites target the
-/// DataFusion dialect, whereas the self-apply site renders Exasol. A guard declining
-/// the rewrite is itself a decline — the scan cannot carry the predicate either way.
+/// Splits a request's raw WHERE filter into the predicate the scan spec carries and
+/// the predicate the adapter must self-apply. Returns `(scan_filter, declined)`,
+/// mutually exclusive; both `None` for no filter or a trivially-true one. Sole owner
+/// of this classification (see `_decision/045`). `declined` is the original,
+/// un-rewritten tree — the type rewrites target the DataFusion dialect only.
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
     col_types: &[(String, String)],
