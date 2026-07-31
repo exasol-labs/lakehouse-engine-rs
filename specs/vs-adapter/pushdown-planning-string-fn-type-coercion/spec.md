@@ -7,7 +7,6 @@ Scope: the two render surfaces that issue #211 already covers — the select-lis
 Out of scope, each an accurately-scoped tracked exception rather than a silent gap:
 
 * A string-position argument that is a literal or a computed expression rather than a bare `column` node — its Exasol type is not resolvable from `involvedTables[0].columns` (issue #223's existing scope, same convention as `vs-adapter/pushdown-planning-decimal-string-format`).
-* The broadcast-join PER-LEG WHERE-clause filter path (`pushdown/joins/sql_builders.rs`), a render surface distinct from the join SELECT list (issue #223). The join SELECT list is NOT out of scope — `project_columns` reaches it.
 * The ENTIRE grouped-aggregate render path — every `groupBy` element AND every non-aggregate select-list item. `detect_group_by_aggregates` renders both with bare `render_expression` and matches them by rendered-SQL string equality, and `handle_pushdown` consumes that grouped SQL directly; the grouped arm's `projection` is inert, so `project_columns` never runs against it. `SELECT UPPER(c_custkey), COUNT(*) … GROUP BY UPPER(c_custkey)` therefore still hard-fails, whether or not the key also appears in the select list (issue #227).
 * The aggregate-argument render path — `parse_agg_item`'s `arg_column_or_expr` renders an aggregate's argument expression with no type guard, so `MAX(UPPER(c_custkey))` and `COUNT(UPPER(c_custkey))` still hard-fail (issue #227).
 * `CHR`/`UNICODECHR` over a non-numeric argument, the mirror-image type-blindness of an integer-position argument.
@@ -46,6 +45,24 @@ Out of scope, each an accurately-scoped tracked exception rather than a silent g
 * `vs-adapter/pushdown-module-structure` owns `column_exa_type`'s contract — its `Option<&str>` return, its Unicode `to_uppercase` fold, and its exclusion of the node's `type` tag test. The two `col_types` builders' fold divergence produces no join-path miss for any column name the adapter can declare; `vs-adapter/pushdown-module-structure` records the live capture that established this. This feature consumes that contract and SHALL NOT restate it: it records only that the normalization its decline depends on now has one owner, named rather than mirrored.
 * Background bullet "An expression argument's `column` node carries no `dataType` on the wire; column Exasol types are read from `involvedTables[0].columns` via `extract_all_column_types`, which uppercases every column name" stays accurate and is NOT amended. `extract_all_column_types` still produces the list and still uppercases; what moves is the CONSUMING lookup's fold, into `column_exa_type`.
 * Apache Iceberg spec check: NOT implicated. This delta changes no type mapping, no schema handling, no scan, and no pushdown decision — it renames the owner of a case-normalization step inside the adapter's own column-name lookup. The Iceberg determination this feature already records for its DATE, DECIMAL, and decline dispatch is unaffected and stands unedited.
+* This feature's recorded out-of-scope bullet "The broadcast-join PER-LEG WHERE-clause filter path
+  (`pushdown/joins/sql_builders.rs`), a render surface distinct from the join SELECT list (issue
+  #223)" is REPLACED: that surface is now IN scope. Both join WHERE-filter render surfaces — the
+  broadcast join's combined filter and the N-scan fallback's per-leg filter — run the guard through
+  the shared type-rewrite pipeline, so the guard's decline and coercion reach them exactly as they
+  reach the single-table WHERE filter. See `vs-adapter/pushdown-planning-join-filter-type-coercion`
+  (issue #215). Issue #223's slice 2 closes with it; #223's slices 1 (computed-expression arguments)
+  and 3 (GROUP-BY-only keys) remain open and out of scope here.
+* The guard itself is untouched — no dispatch-table, arity-table, or traversal change. Only its
+  reachable surface set grows, and it grows by wiring, not by new guard code.
+* Issue #228's exposure NARROWS as a direct consequence: the `INSTR`/`LOCATE`-beyond-two-arguments
+  decline now also covers the two join WHERE surfaces, so those surfaces return Exasol's native
+  result instead of a position computed from a rendering that silently drops the third and fourth
+  arguments. #228 is NOT closed — its root cause is the rendering defect in
+  `crates/vs-expression`, untouched here, and any render surface still unwired to the guard remains
+  exposed. Nothing in this delta should be read as having adjudicated #228.
+* The grouped-aggregate render path, the aggregate-argument render path, `CHR`/`UNICODECHR`, and a
+  non-bare-column string-position argument all remain out of scope, unchanged by this delta.
 
 ## Scenarios
 
@@ -120,6 +137,8 @@ Out of scope, each an accurately-scoped tracked exception rather than a silent g
 * *AND* the index assignment SHALL be independent of the translator's render-time argument reorder, because `vs-expression` renders Exasol `INSTR(string, substring)` as `strpos(arg0, arg1)` and Exasol `LOCATE(substring, string)` as `strpos(arg1, arg0)` — the reorder swaps which rendered slot each argument fills, never which arguments are string-position
 * *AND* the previously hard-failing `Function 'strpos' requires String, but received Int64` planning error SHALL no longer occur for this shape
 * *AND* an `INSTR` or `LOCATE` call carrying MORE than two arguments — `INSTR(a, b, start)`, `INSTR(a, b, start, occurrence)`, or `LOCATE(a, b, start)` — SHALL instead make the guard return `None`, declining the whole tree for EVERY argument type including all-VARCHAR, because `vs-expression` reads only `args[0]` and `args[1]` and drops the rest (issue #228): coercing index 0 would let an incompletely rendered call plan successfully, converting today's loud DataFusion type error into a silently wrong position, and it SHALL therefore also correct the pre-existing wrong result for an all-string `INSTR(c_varchar, 'b', 3)`, which pushed down as `strpos("C_VARCHAR", 'b')` and ignored the start position
+* *AND* that beyond-two decline SHALL be reached at the broadcast join's combined WHERE filter and at the N-scan fallback's per-leg WHERE filter as well as at the single-table WHERE filter and the select-list projection, each routing the decline through its OWN already-existing self-application outcome — REPLACING this feature's recorded out-of-scope bullet naming the join per-leg WHERE-filter path as a deferred surface (issue #223 slice 2, wired by issue #215)
+* *AND* narrowing #228's exposure this way SHALL NOT be recorded as closing #228, whose root cause is the `crates/vs-expression` rendering defect this delta does not touch
 
 ### Scenario: CHR and UNICODECHR are excluded from the guard
 

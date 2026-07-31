@@ -1,8 +1,9 @@
 # Feature: Pushdown Planning — LIKE Type Coercion
 
-Makes pushed-down `LIKE` and `REGEXP_LIKE` predicates type-aware on both render surfaces that
-carry a pushed expression tree: the single-table WHERE-clause filter and the select-list
-projection (`project_columns`, shared with the broadcast join). A LIKE predicate's `column`
+Makes pushed-down `LIKE` and `REGEXP_LIKE` predicates type-aware on the render surfaces that
+carry a pushed expression tree: the single-table WHERE-clause filter, the select-list
+projection (`project_columns`, shared with the broadcast join), the broadcast join's combined
+WHERE filter, and the N-scan fallback's per-leg WHERE filter (`vs-adapter/pushdown-planning-join-filter-type-coercion`, issue #215). A LIKE predicate's `column`
 subject never carries a `dataType` on the wire, and DataFusion performs no implicit
 non-string-to-VARCHAR coercion the way Exasol does — so a pushed-down LIKE over a non-string
 column hard-failed the DataFusion scan at execution time. This feature dispatches on the column's
@@ -44,6 +45,17 @@ projection to the full base row so Exasol post-processes the item itself.
 * `vs-adapter/pushdown-module-structure` owns `column_exa_type`'s contract — its `Option<&str>` return, its Unicode `to_uppercase` fold, and its exclusion of the node's `type` tag test. This feature consumes that contract and SHALL NOT restate it: it records only that the normalization its decline depends on now has one owner, named rather than mirrored.
 * The Unicode-versus-ASCII fold divergence between the two `col_types` builders is NOT a change to this feature, and it produces no join-path miss for any column name the adapter can declare. This scenario reads `involvedTables[0].columns` through `extract_all_column_types`, the Unicode-folding path, exactly as before. `vs-adapter/pushdown-module-structure` records the divergence, the live capture showing it unreachable, and the issue tracking removal of the `fold_case` parameter that preserves it.
 * Apache Iceberg spec check: NOT implicated. This delta changes no type mapping, no schema handling, no scan, and no pushdown decision — it renames the owner of a case-normalization step inside the adapter's own column-name lookup. The Iceberg determination this feature already records for its DATE and DECIMAL dispatch is unaffected and stands unedited.
+* This feature's opening enumeration of "both render surfaces that carry a pushed expression tree:
+  the single-table WHERE-clause filter and the select-list projection" is REPLACED by FOUR surfaces.
+  `vs-adapter/pushdown-planning-join-filter-type-coercion` adds the broadcast join's combined WHERE
+  filter and the N-scan fallback's per-leg WHERE filter (issue #215). This feature keeps ownership of
+  the subject TYPE DISPATCH itself — pass through a string subject, rewrap a DATE subject as
+  CAST-to-VARCHAR, decline everything else — unchanged and shared verbatim by all four surfaces; the
+  join feature owns only which column-type universe each join surface screens against and what a
+  decline means there.
+* The subject dispatch, its traversal, and every clause of every scenario below are unchanged by that
+  extension. A reader looking for what a decline MEANS at a join surface is directed to the join
+  feature; a reader looking for what triggers one stays here.
 
 ## Scenarios
 
@@ -54,6 +66,7 @@ projection to the full base row so Exasol post-processes the item itself.
 * *WHEN* the adapter builds the DataFusion scan-spec filter
 * *THEN* the adapter SHALL leave the predicate subject unchanged, rendering `(<column> LIKE <pattern>)` exactly as before this change
 * *AND* the rendered filter SHALL be carried in the common spec, because a string subject needs no coercion
+* *AND* this pass-through SHALL hold identically at all FOUR surfaces that now run the dispatch — the single-table WHERE filter, the select-list projection, the broadcast join's combined WHERE filter, and the N-scan fallback's per-leg WHERE filter — REPLACING this feature's recorded enumeration of "both render surfaces", which named only the first two (see `vs-adapter/pushdown-planning-join-filter-type-coercion`, issue #215)
 
 ### Scenario: LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR
 
