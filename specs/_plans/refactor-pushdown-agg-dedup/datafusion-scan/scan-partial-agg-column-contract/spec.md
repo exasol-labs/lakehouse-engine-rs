@@ -37,7 +37,7 @@ Gives the partial-aggregate COLUMN CONTRACT — how many columns each `AggKind` 
 
 ### Scenario: The statistical-aggregate partial argument routes through the shared argument renderer
 
-* *GIVEN* the stat-family branch of `partial_select_items` (`partial_agg.rs:395-403`), which bypasses `agg_arg_sql` and instead reads `plan.column.as_deref().unwrap_or("")` — falling back to an EMPTY identifier that DataFusion rejects with an opaque `column "" not found` rather than to `agg_arg_sql`'s self-describing `__MISSING_AGG_ARGUMENT__` sentinel
+* *GIVEN* the stat-family branch of `partial_select_items` (`partial_agg.rs:395-403`), which bypasses `agg_arg_sql` and instead reads `plan.column.as_deref().unwrap_or("")` — falling back to an EMPTY identifier that DataFusion rejects with an opaque `Schema error: No field named .` (captured live, plan `refactor-pushdown-agg-dedup` task 1.2) rather than to `agg_arg_sql`'s self-describing `__MISSING_AGG_ARGUMENT__` sentinel
 * *WHEN* the scan renders the `COUNT`, `SUM`, and `SUM(col*col)` sufficient statistics for a statistical aggregate
 * *THEN* all three SHALL take their argument from `agg_arg_sql(plan)`, the same helper every other kind uses, and the branch SHALL retain NO `plan.column` read and NO local `quote_ident` call of its own
 * *AND* the rendered SQL for a bare-column statistical aggregate MUST be byte-identical to the pre-refactor output, because `agg_arg_sql` returns `quote_ident(column)` for a plan with no `arg_expr` — which is exactly what the branch computes today
