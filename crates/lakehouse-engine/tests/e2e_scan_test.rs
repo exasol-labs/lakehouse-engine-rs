@@ -1193,22 +1193,21 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// After createVirtualSchema the CLUSTER_NODES count is recorded in the schema's
-/// adapterNotes and is >= 1.
+/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR
+/// and NR_OF_CORES, but no CLUSTER_NODES key — the node count is no longer
+/// persisted in adapterNotes at all; `pushdown` now reads it live from
+/// `UdfContext::node_count()` on every request instead.
 ///
 /// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
 /// column for adapter-controlled schema state. Exasol does NOT persist
 /// adapter-returned schemaMetadata.properties (they are silently dropped and
-/// never appear in any catalog view), so the adapter carries CLUSTER_NODES in
-/// adapterNotes (a JSON string), which Exasol DOES persist and surface here.
+/// never appear in any catalog view), so the adapter carries its persisted
+/// properties in adapterNotes (a JSON string), which Exasol DOES persist and
+/// surface here.
 ///
 /// (The view is keyed by SCHEMA_NAME, confirmed against the live DB.)
-///
-/// CLUSTER_NODES is sourced from `ctx.node_count()` (the live UDF handshake
-/// metadata), defaulting to 1 when the count is 0 — so asserting >= 1 (not
-/// == cluster size) is correct and robust across single- and multi-node runs.
 #[test]
-fn create_vs_records_cluster_nodes_property() {
+fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -1234,16 +1233,64 @@ fn create_vs_records_cluster_nodes_property() {
         "ADAPTER_NOTES must be non-empty (Exasol must have persisted it): {notes:?}"
     );
 
-    // adapterNotes is a JSON string carrying {"CLUSTER_NODES":"<n>"}.
     let parsed: serde_json::Value = serde_json::from_str(notes)
         .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
-    let raw = parsed["CLUSTER_NODES"]
-        .as_str()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry CLUSTER_NODES as a string: {notes:?}"));
-    let n: i64 = raw
-        .parse()
-        .unwrap_or_else(|_| panic!("CLUSTER_NODES value '{raw}' is not an integer"));
-    assert!(n >= 1, "CLUSTER_NODES must be >= 1, got {n}");
+    assert!(
+        parsed.get("PARALLELISM_FACTOR").is_some(),
+        "ADAPTER_NOTES must carry PARALLELISM_FACTOR: {notes:?}"
+    );
+    assert!(
+        parsed.get("NR_OF_CORES").is_some(),
+        "ADAPTER_NOTES must carry NR_OF_CORES: {notes:?}"
+    );
+    assert!(
+        parsed.get("CLUSTER_NODES").is_none(),
+        "ADAPTER_NOTES must NOT carry CLUSTER_NODES (node count is read live \
+         from UdfContext::node_count() per pushdown request, never persisted): \
+         {notes:?}"
+    );
+}
+
+/// Even with CLUSTER_NODES no longer persisted in adapterNotes,
+/// `EXPLAIN VIRTUAL` over a multi-file scan against the (now note-free)
+/// virtual schema still produces the `LAKEHOUSE_DISTRIBUTE_FILES` shard
+/// fan-out — i.e. dropping the persisted note did not break shard-fan-out
+/// emission: `pushdown` still plans the fan-out with no adapterNotes node
+/// count available.
+///
+/// This test cannot distinguish the handshake node-count source
+/// (`UdfContext::node_count()`, captured in `dispatch` and threaded through
+/// as `cluster_nodes`) from the pre-refactor absent-note default: the
+/// `events` fixture commits exactly two data files, which clamps
+/// `shard_count` to 2 for every node count >= 1, so the fan-out markers below
+/// are insensitive to the node count by construction on this single-node
+/// suite. The plan's `parallelism/work-unit-sharding (GATE: four-node
+/// staging)` manual check is the only one that distinguishes a correctly
+/// read four-node count from the `0 => 1` floor.
+///
+/// Uses the same fan-out marker style as
+/// `ordered_topn_pushes_down_matches_single_node`: the literal
+/// `AS shards(shard_key, files) GROUP BY shard_key)` string is the adapter's
+/// own emitted fan-out SQL, not an echo of Exasol's pushdown request, so it
+/// is a precise, non-false-positive marker.
+#[test]
+fn pushdown_shards_from_handshake_node_count_without_note() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT id, name, score FROM {}", vs_table());
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LAKEHOUSE_DISTRIBUTE_FILES"),
+        "multi-file scan must push down as a LAKEHOUSE_DISTRIBUTE_FILES shard \
+         fan-out, got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+        "shard fan-out must carry the shards(shard_key, files) VALUES table \
+         grouped by shard_key, got:\n{pushed_sql}"
+    );
 }
 
 /// COUNT(col) aggregate pushdown returns the correct non-null row count.
