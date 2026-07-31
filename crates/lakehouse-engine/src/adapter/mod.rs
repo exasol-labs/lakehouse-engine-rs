@@ -34,18 +34,6 @@ const PROP_ICEBERG_NAMESPACE: &str = "ICEBERG_NAMESPACE";
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 // Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-// Removal key, not a write channel. Adapter versions before this change wrote
-// the live node count under this key in the createVirtualSchema response's
-// adapterNotes (a stringified JSON object persisted by Exasol) so pushdown
-// could read it back from schemaMetadataInfo.adapterNotes. The node count is
-// now read directly from the UDF handshake on every pushdown request (see
-// `cluster_nodes_from_context`), so nothing writes this key anymore —
-// `build_adapter_notes` instead calls `notes.remove(NOTE_CLUSTER_NODES)` to
-// actively evict any value a pre-refactor adapter version persisted, since
-// the notes merge otherwise preserves an inherited key forever. Both the
-// constant and that `remove` call can be deleted once every deployed virtual
-// schema has refreshed at least once on this version or later.
-const NOTE_CLUSTER_NODES: &str = "CLUSTER_NODES";
 // adapterNotes key for the per-node CPU core count captured at createVirtualSchema time.
 const NOTE_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property name for the parallelism factor (oversubscription multiplier).
@@ -666,8 +654,7 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
 /// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
 /// table names to original-cased Iceberg identifiers). Any pre-existing notes on
-/// the request are preserved (merge, not clobber) — except CLUSTER_NODES,
-/// which is actively evicted; see [`NOTE_CLUSTER_NODES`].
+/// the request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
@@ -686,7 +673,6 @@ fn build_adapter_notes(
     table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
-    notes.remove(NOTE_CLUSTER_NODES);
     notes.insert(
         NOTE_NR_OF_CORES.to_string(),
         Json::String(nr_of_cores.to_string()),
@@ -1381,8 +1367,7 @@ mod tests {
     }
 
     /// Verifies merge-not-clobber: a pre-existing adapterNotes key survives
-    /// `build_adapter_notes` for every key except CLUSTER_NODES, which is
-    /// actively removed (see [`NOTE_CLUSTER_NODES`]).
+    /// `build_adapter_notes`.
     #[test]
     fn build_adapter_notes_merges_existing() {
         let req = serde_json::json!({
@@ -1412,15 +1397,15 @@ mod tests {
             Some("keep-me"),
             "pre-existing adapterNotes keys must be preserved"
         );
-        assert!(
-            parsed.get(NOTE_CLUSTER_NODES).is_none(),
-            "CLUSTER_NODES must be removed from adapterNotes"
+        assert_eq!(
+            parsed["CLUSTER_NODES"].as_str(),
+            Some("1"),
+            "pre-existing adapterNotes keys must be preserved, including foreign ones"
         );
     }
 
     /// Verifies that the createVirtualSchema response's adapterNotes carry no
-    /// CLUSTER_NODES key at all — the note is no longer written, only ever
-    /// removed if inherited from a pre-refactor persisted value.
+    /// CLUSTER_NODES key at all — the note is no longer written.
     #[test]
     fn adapter_notes_omit_cluster_nodes() {
         let request = serde_json::json!({"type": "createVirtualSchema"});
@@ -1441,56 +1426,13 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
         assert!(
-            parsed.get(NOTE_CLUSTER_NODES).is_none(),
+            parsed.get("CLUSTER_NODES").is_none(),
             "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
         );
         assert_eq!(
             parsed[NOTE_PARALLELISM_FACTOR].as_str(),
             Some(DEFAULT_PARALLELISM_FACTOR.to_string().as_str()),
             "other notes must still be recorded"
-        );
-    }
-
-    /// A `refresh` request whose incoming adapterNotes carry CLUSTER_NODES
-    /// (inherited from a pre-refactor adapter version) yields notes with that
-    /// key removed, while every other inherited key survives the rewrite.
-    #[test]
-    fn refresh_notes_drop_inherited_cluster_nodes() {
-        let req = serde_json::json!({
-            "type": "refresh",
-            "schemaMetadataInfo": {
-                "adapterNotes": "{\"CLUSTER_NODES\":\"9\",\"OTHER_A\":\"keep-a\",\"OTHER_B\":\"keep-b\"}"
-            },
-        });
-        let notes = build_adapter_notes(
-            &req,
-            0,
-            DEFAULT_PARALLELISM_FACTOR,
-            ThreadingMode::Auto,
-            DEFAULT_DF_TARGET_PARTITIONS,
-            DEFAULT_DF_THREADS_PER_UDF,
-            DEFAULT_DF_BATCH_SIZE,
-            DEFAULT_MEMORY_POOL_FRACTION,
-            DEFAULT_INSTANCE_OVERHEAD_MB,
-            DEFAULT_S3_MAX_CONNECTIONS,
-            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-            &[],
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
-        assert!(
-            parsed.get(NOTE_CLUSTER_NODES).is_none(),
-            "an inherited CLUSTER_NODES note must be dropped on refresh"
-        );
-        assert_eq!(
-            parsed["OTHER_A"].as_str(),
-            Some("keep-a"),
-            "every other inherited key must survive the rewrite"
-        );
-        assert_eq!(
-            parsed["OTHER_B"].as_str(),
-            Some("keep-b"),
-            "every other inherited key must survive the rewrite"
         );
     }
 
@@ -2535,9 +2477,10 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
         assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
-        assert!(
-            parsed.get(NOTE_CLUSTER_NODES).is_none(),
-            "CLUSTER_NODES must be removed from adapterNotes"
+        assert_eq!(
+            parsed["CLUSTER_NODES"].as_str(),
+            Some("5"),
+            "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
         );
         assert!(parsed[NOTE_TABLE_MAP].is_object());
     }
@@ -2909,8 +2852,7 @@ mod tests {
         ];
         let table_map = build_table_map(&configured_ns, &idents).unwrap();
 
-        // Simulate a request with a pre-existing CLUSTER_NODES note, inherited
-        // from a pre-refactor adapter version.
+        // Simulate a request with a pre-existing, foreign adapterNotes key.
         let request = serde_json::json!({
             "type": "createVirtualSchema",
             "schemaMetadataInfo": {
@@ -2950,10 +2892,11 @@ mod tests {
             "TABLE_MAP must map EU__ORDERS → prod.finance.eu.orders"
         );
 
-        // Pre-existing CLUSTER_NODES must be actively evicted, not preserved.
-        assert!(
-            parsed.get(NOTE_CLUSTER_NODES).is_none(),
-            "CLUSTER_NODES must be removed by build_adapter_notes"
+        // A pre-existing, foreign adapterNotes key must survive the merge.
+        assert_eq!(
+            parsed["CLUSTER_NODES"].as_str(),
+            Some("3"),
+            "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
         );
     }
 

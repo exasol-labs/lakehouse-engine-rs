@@ -40,19 +40,19 @@ The plan ships without a live multi-node cluster available in the implementation
 
 ### Decision
 
-Adopt as a standing rule: `schemaMetadata.adapterNotes` carries a value only when the value is derived at create time and a pushdown cannot recompute it. `TABLE_MAP` qualifies (recomputing it costs a catalog namespace enumeration per query); handshake metadata never qualifies. `CLUSTER_NODES` is deleted as a write and actively removed from any notes inherited from a pre-refactor schema, rather than left to persist unread.
+Adopt as a standing rule: `schemaMetadata.adapterNotes` carries a value only when the value is derived at create time and a pushdown cannot recompute it. `TABLE_MAP` qualifies (recomputing it costs a catalog namespace enumeration per query); handshake metadata never qualifies. `CLUSTER_NODES` is deleted as a write. No in-place migration mechanism is added for a note persisted by a pre-refactor adapter version — an operator upgrading past this change drops and recreates the virtual schema, per architect review (PR #282) — so an inherited `CLUSTER_NODES` entry simply survives the merge like any other foreign key, unread and inert.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Stop writing `CLUSTER_NODES`; actively remove any inherited key on every response | ✓ Chosen — a written-never-read note is state the mission forbids, and `build_adapter_notes` merges into round-tripped notes, so only an active `notes.remove` guarantees the key disappears |
+| Drop only the write and let an inherited key persist unread on pre-refactor schemas | ✓ Chosen — an operator upgrading past this change drops and recreates the virtual schema rather than upgrading in place, so no code needs to reach into and rewrite a schema's persisted state; a merge that leaves a stale, unread foreign key is no different from any other stale metadata the drop-and-recreate step discards |
+| Stop writing `CLUSTER_NODES`; actively remove any inherited key on every response | ✗ Rejected (reversed after initial acceptance, on architect review) — builds and maintains removal machinery, a tracked follow-up issue, and a dedicated manual test gate to solve a problem the operational upgrade path already solves without any code |
 | Treat `adapterNotes` as a general-purpose cache for anything convenient at pushdown time | ✗ Rejected — the de facto status quo that produced `CLUSTER_NODES`, and the next convenient value would follow it in |
-| Drop only the write and let the key persist unread on pre-refactor schemas | ✗ Rejected — `build_adapter_notes` merges into the notes Exasol round-trips, so the key would survive on every pre-existing schema forever |
 
 ### Consequences
 
-This rule reverses the superseded ADR's decision to record the node count as `CLUSTER_NODES`, while retaining that ADR's `UdfContext::node_count()` source and its `0 => 1` floor. The `NOTE_CLUSTER_NODES` constant survives solely as the removal key until every deployed virtual schema has refreshed on this version or later ([#287](https://github.com/exasol-labs/lakehouse-engine-rs/issues/287) tracks its eventual deletion). Rolling back to a pre-refactor `.so` after a `REFRESH` on the new adapter silently collapses `G` to `1 × PARALLELISM_FACTOR` until another `REFRESH` rewrites the note.
+This rule reverses the superseded ADR's decision to record the node count as `CLUSTER_NODES`, while retaining that ADR's `UdfContext::node_count()` source and its `0 => 1` floor. No tombstone constant, no active-removal code path, and no tracked cleanup issue exist for this — a virtual schema created before this change keeps a stale `CLUSTER_NODES` key in its persisted notes indefinitely, unread and harmless, until the schema is dropped and recreated on the new adapter version.
 
 ## ADR: Capture the Handshake Read in `dispatch`; Pass a Value, Never `ctx`, into Async Planning
 

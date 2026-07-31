@@ -1,6 +1,6 @@
 # Feature: Create Virtual Schema — AdapterNotes
 
-Records the per-node core count, the resource budgets, and the Exasol-name to Iceberg-identifier map in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read these back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute. The cluster node count is excluded, because every pushdown reads it from its own UDF handshake, and a `CLUSTER_NODES` entry inherited from a pre-refactor schema is removed rather than preserved.
+Records the per-node core count, the resource budgets, and the Exasol-name to Iceberg-identifier map in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read these back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute. The cluster node count is excluded, because every pushdown reads it from its own UDF handshake.
 
 ## Background
 
@@ -9,12 +9,11 @@ Records the per-node core count, the resource budgets, and the Exasol-name to Ic
   from `UdfContext::node_count()` instead of from a persisted note (see
   `vs-adapter/pushdown-planning`). `adapterNotes` is reserved for values derived at
   create time that a pushdown cannot recompute, such as `TABLE_MAP`.
-* Not recording the node count is not the same as not removing it. The adapter builds
-  its response notes by merging into the notes Exasol round-trips back, so a
-  `CLUSTER_NODES` entry persisted by an earlier adapter version would otherwise survive
-  every `refresh` and `setProperties` indefinitely. The adapter therefore removes that
-  key explicitly while building the notes; the merge preserves every OTHER pre-existing
-  entry, and `CLUSTER_NODES` is its one exception.
+* No migration mechanism exists, or is needed, for a schema created before this
+  change: a `CLUSTER_NODES` entry persisted by an earlier adapter version simply
+  survives the merge like any other foreign key, unread and inert. An operator
+  upgrading past this change drops and recreates the virtual schema rather than
+  relying on an in-place migration path.
 * The per-node core count is read directly on the executing node via
   `std::thread::available_parallelism()` and recorded as `NR_OF_CORES`; this is the
   same host-core-count source the scan UDF already trusts for DataFusion
@@ -58,11 +57,9 @@ Records the per-node core count, the resource budgets, and the Exasol-name to Ic
 ### Scenario: createVirtualSchema adapterNotes omit the cluster node count
 
 * *GIVEN* an Exasol session that has installed the VS adapter script, with the catalog and storage connection properties supplied
-* *AND* the request's `schemaMetadataInfo.adapterNotes` either carry no notes at all or carry a `CLUSTER_NODES` entry persisted by an earlier adapter version
 * *WHEN* Exasol sends a `createVirtualSchema`, `refresh`, or `setProperties` request naming an Iceberg table
 * *THEN* the `adapterNotes` of the returned response MUST NOT carry a `CLUSTER_NODES` entry
-* *AND* the adapter SHALL remove an inherited `CLUSTER_NODES` entry while building those notes, rather than letting the merge preserve it, so the entry disappears from the persisted notes on the first `refresh` or `setProperties` after the upgrade
-* *AND* the `adapterNotes` SHALL still carry `NR_OF_CORES`, `PARALLELISM_FACTOR`, and `TABLE_MAP`, so removing the node count does not disturb any other recorded entry
+* *AND* the `adapterNotes` SHALL still carry `NR_OF_CORES`, `PARALLELISM_FACTOR`, and `TABLE_MAP`, so omitting the node count does not disturb any other recorded entry
 
 ### Scenario: Adapter records the per-node core count in the virtual-schema adapterNotes
 
