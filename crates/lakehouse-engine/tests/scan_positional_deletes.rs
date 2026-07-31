@@ -28,7 +28,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ScanSpec,
-    StorageProps,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     run_join_scan_with_session, run_raw_scan_with_session, session_config_for_spec,
@@ -105,15 +105,15 @@ impl UdfContext for FakeCtx {
 
 /// Storage props are never dialed for a local `file://` scan; a placeholder
 /// keeps the spec well-formed.
-fn dummy_storage() -> StorageProps {
-    StorageProps {
+fn dummy_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
         region: "us-east-1".into(),
         access_key: "k".into(),
         secret_key: "s".into(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Byte size of a local file, given its `file://` URL — robust to

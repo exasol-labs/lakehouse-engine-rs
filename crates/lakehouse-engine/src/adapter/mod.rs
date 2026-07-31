@@ -17,7 +17,7 @@ use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
-use crate::scan::spec::StorageProps;
+use crate::scan::spec::StorageBackend;
 use crate::types::mapping::exasol_type_to_json;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
@@ -184,12 +184,12 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageProps, ConnectionCreds), UdfError> {
+) -> Result<(String, StorageBackend, ConnectionCreds), UdfError> {
     let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION))?;
-    let mut storage = storage_block(&resolved.creds);
-    storage.allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
+    let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let storage = storage_block(&resolved.creds, allow_http);
     Ok((resolved.uri, storage, resolved.creds))
 }
 
@@ -306,7 +306,7 @@ fn handle_create_virtual_schema(
 /// `RestCatalog` grant remains and such a request still performs two grants in total,
 /// not one.
 ///
-/// Errors propagate unredacted — no `ctx` and no `StorageProps` reach here, so the
+/// Errors propagate unredacted — no `ctx` and no `StorageBackend` reach here, so the
 /// caller applies the same `redact_error` the old inline loop applied per-table, once
 /// over the whole enumeration result, preserving the no-credential-leak guarantee.
 fn resolve_namespace_virtual_tables(
@@ -363,7 +363,7 @@ fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
 async fn handle_pushdown_request(
     request: &Json,
     catalog_uri: &str,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
     script_schema: &str,
 ) -> Result<Json, UdfError> {
@@ -1009,7 +1009,7 @@ fn is_table_not_found(err: &UdfError) -> bool {
 /// Strips the literal secret values held in `storage` (value-based) and then
 /// applies the label-based heuristic, so credentials cannot leak through error
 /// shapes the label heuristic misses.
-fn redact_error(storage: &StorageProps, e: UdfError) -> UdfError {
+fn redact_error(storage: &StorageBackend, e: UdfError) -> UdfError {
     match e {
         UdfError::User(msg) => {
             let stripped = crate::scan::emit::redact_secret_values(&msg, &storage.secret_values());

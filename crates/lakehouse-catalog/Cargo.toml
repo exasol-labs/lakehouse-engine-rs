@@ -12,7 +12,9 @@ exasol-udf-sdk = { workspace = true }
 
 iceberg                 = { workspace = true }
 iceberg-catalog-rest    = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
+# `opendal-azdls`: ADLS Gen2 backend for the `OpenDalStorageFactory` FileIO
+# registration in `storage.rs`/`session.rs`; unions with the workspace `opendal-s3`.
+iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
 serde      = { workspace = true }
 serde_json = { workspace = true }

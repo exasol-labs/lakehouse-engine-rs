@@ -32,7 +32,8 @@ arrow      = { workspace = true }
 parquet    = { workspace = true }
 datafusion = { workspace = true }
 
-object_store = { workspace = true }
+# `azure`: ADLS Gen2 (`abfss://`) object store; unions with the workspace `aws`.
+object_store = { workspace = true, features = ["azure"] }
 # Required to implement object_store's `#[async_trait]` `ObjectStore` trait for the
 # spec-size HEAD wrapper. Already resolved transitively via object_store/datafusion.
 async-trait = "0.1"
@@ -41,9 +42,7 @@ async-trait = "0.1"
 # `RoaringTreemap` and feeds the vendored `build_deletes_row_selection`.
 roaring = { workspace = true }
 
-iceberg              = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
+iceberg = { workspace = true }
 
 # rt-multi-thread: scan UDF builds a multi-thread runtime when DATAFUSION_THREADS_PER_UDF > 1.
 # sync: tokio::sync::Semaphore (the shared delete-read limiter) declared directly rather
@@ -51,8 +50,6 @@ iceberg-storage-opendal = { workspace = true }
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-thiserror  = { workspace = true }
-anyhow     = { workspace = true }
 
 chrono  = { workspace = true }
 futures = { workspace = true }
@@ -81,6 +78,9 @@ parquet             = { workspace = true }
 tpchgen             = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+# Seed harness only (tests/common/seed.rs) builds its own FileIO via
+# `OpenDalStorageFactory`; the production path uses lakehouse-catalog's.
+iceberg-storage-opendal = { workspace = true }
 reqwest             = { workspace = true, features = ["blocking"] }
 # Seed harness only: name reqsign-core's `Context`/`Result` to implement a
 # `ProvideCredential` that forces static MinIO admin S3 credentials for the seed

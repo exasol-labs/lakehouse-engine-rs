@@ -19,7 +19,7 @@ use super::stack::{
 use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
-use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageProps};
+use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
 
 use std::time::Duration;
 
@@ -333,16 +333,16 @@ pub fn local_stack_creds() -> ConnectionCreds {
     }
 }
 
-/// `StorageProps` for the host-visible local Docker stack.
-pub fn local_stack_storage() -> StorageProps {
-    StorageProps {
+/// `StorageBackend` for the host-visible local Docker stack.
+pub fn local_stack_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: minio_url(),
         region: "us-east-1".to_string(),
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// `CatalogProps` for the host-visible local Docker stack, for `table`.

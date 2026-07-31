@@ -7,7 +7,7 @@
 
 use crate::redaction::redact_credentials;
 use crate::session::{build_rest_catalog, glue_catalog_prefix};
-use crate::{CatalogProps, ConnectionCreds, StorageProps};
+use crate::{CatalogProps, ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
@@ -48,7 +48,7 @@ pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), Ud
 pub async fn list_namespace_tables(
     catalog_uri: &str,
     configured_ns: &[String],
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
     let ns_ident = NamespaceIdent::from_vec(configured_ns.to_vec()).map_err(|e| {
@@ -76,7 +76,7 @@ async fn list_namespace_tables_unsigned(
     catalog_uri: &str,
     parent: &NamespaceIdent,
     warehouse: &str,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
     // Build a temporary CatalogProps with an empty table to construct the RestCatalog.
@@ -376,7 +376,7 @@ mod tests {
         });
 
         let catalog_uri = format!("http://127.0.0.1:{port}");
-        let storage = static_storage();
+        let storage = static_backend();
         let mut creds = base_creds();
         creds.use_sigv4 = true;
         creds.warehouse = "123456789012".into();
