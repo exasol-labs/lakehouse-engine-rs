@@ -26,7 +26,7 @@ use exasol_udf_sdk::error::UdfError;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::{resolve_file_list, resolve_table_schema};
 use lakehouse_engine::scan::spec::{
-    CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageProps,
+    CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageBackend,
 };
 use serde_json::Value as Json;
 
@@ -38,13 +38,13 @@ use serde_json::Value as Json;
 async fn accepts_shared_session_for_file_resolution(
     session: &lakehouse_catalog::CatalogSession,
     catalog_props: &CatalogProps,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
 ) -> Result<
     (
         Vec<FileEntry>,
-        StorageProps,
+        StorageBackend,
         Vec<LogicalField>,
         String,
         Vec<NameMappingEntry>,

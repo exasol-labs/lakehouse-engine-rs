@@ -8,15 +8,16 @@
 //! sources applies, which six config keys carry the vended values, or how each
 //! spells absence.
 
-use crate::StorageProps;
+use crate::{StorageBackend, StorageProps};
 use std::collections::HashMap;
 
 /// Resolve the effective scan storage for a table from its `loadTable` response.
 ///
 /// Selects the vended credential source ONCE for `anchor` and overlays every
-/// value it advertises onto `base`, returning a fresh [`StorageProps`]. A value
-/// the response does not advertise keeps `base`'s, so a response carrying no
-/// vended credentials at all resolves to `base` unchanged.
+/// value it advertises onto `base`'s wrapped `StorageProps`, returning a fresh
+/// [`StorageBackend`] of the same variant. A value the response does not
+/// advertise keeps `base`'s, so a response carrying no vended credentials at
+/// all resolves to `base` unchanged.
 ///
 /// `anchor` must be the table's own S3 location — that is what
 /// `storage_credentials[*].prefix` matches against. An HTTPS catalog URI can
@@ -29,11 +30,15 @@ use std::collections::HashMap;
 /// its input is a decision the function declined to make.
 pub fn resolve_vended_storage(
     result: &iceberg_catalog_rest::LoadTableResult,
-    base: &StorageProps,
+    base: &StorageBackend,
     anchor: &str,
-) -> StorageProps {
-    let vended = select_credential_source(result, anchor);
-    merge_vended_into_storage(base, vended)
+) -> StorageBackend {
+    match base {
+        StorageBackend::S3(props) => {
+            let vended = select_credential_source(result, anchor);
+            StorageBackend::S3(merge_vended_into_storage(props, vended))
+        }
+    }
 }
 
 /// The one credential source that applies to `location`, per the Iceberg REST
@@ -188,7 +193,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(&result, &static_storage(), result.metadata.location());
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &static_backend(),
+            result.metadata.location(),
+        ));
 
         assert_eq!(
             merged.access_key, "VENDED_AK",
@@ -228,11 +237,11 @@ mod tests {
             vec![],
         );
 
-        let merged = resolve_vended_storage(
+        let merged = s3_payload(resolve_vended_storage(
             &result,
-            &static_storage(),
+            &static_backend(),
             "s3://bucket/db/t/metadata/v1.json",
-        );
+        ));
 
         assert_eq!(
             merged.access_key, "LONG_AK",
@@ -255,11 +264,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(
+        let merged = s3_payload(resolve_vended_storage(
             &result,
-            &static_storage(),
+            &static_backend(),
             "s3://bucket/db/t/metadata/v1.json",
-        );
+        ));
 
         assert_eq!(
             merged.access_key, "CONFIG_AK",
@@ -280,11 +289,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(
+        let merged = s3_payload(resolve_vended_storage(
             &result,
-            &static_storage(),
+            &static_backend(),
             "s3://bucket/db/t/metadata/v1.json",
-        );
+        ));
 
         assert_eq!(merged.access_key, "CONFIG_AK");
         assert_eq!(merged.secret_key, "CONFIG_SK");
@@ -320,7 +329,7 @@ mod tests {
             ],
         );
 
-        let base = static_storage();
+        let base = static_backend();
 
         // The S3 table location ("s3://bucket/db/t") matches the prefix "s3://bucket/db".
         // Verify vended creds are returned when the anchor is the S3 table location.
@@ -329,7 +338,7 @@ mod tests {
             s3_anchor.starts_with("s3://"),
             "metadata.location() must be an S3 URI, got: {s3_anchor}"
         );
-        let merged_s3 = resolve_vended_storage(&result, &base, &s3_anchor);
+        let merged_s3 = s3_payload(resolve_vended_storage(&result, &base, &s3_anchor));
         assert_eq!(
             merged_s3.access_key, "VENDED_AK",
             "S3 table location anchor must match the storage_credentials prefix"
@@ -338,7 +347,7 @@ mod tests {
         // If we mistakenly used the HTTPS catalog URI as the anchor, no prefix matches
         // and we fall back to the flat config — pin that failure mode here.
         let https_anchor = "https://glue.us-east-1.amazonaws.com/v1/catalog";
-        let merged_https = resolve_vended_storage(&result, &base, https_anchor);
+        let merged_https = s3_payload(resolve_vended_storage(&result, &base, https_anchor));
         assert_eq!(
             merged_https.access_key, "CONFIG_AK",
             "HTTPS URI must not match any S3 prefix, must fall back to flat config"
@@ -375,7 +384,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(&result, &base, result.metadata.location());
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base.clone()),
+            result.metadata.location(),
+        ));
 
         assert_eq!(
             merged.access_key, "VENDED_AK",
@@ -431,7 +444,11 @@ mod tests {
             None,
             vec![("s3.access-key-id", ""), ("s3.secret-access-key", "")],
         );
-        let merged = resolve_vended_storage(&result, &base, result.metadata.location());
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base.clone()),
+            result.metadata.location(),
+        ));
 
         assert_eq!(
             merged.access_key, "STATIC_AK",
@@ -473,7 +490,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(&result, &base, result.metadata.location());
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base),
+            result.metadata.location(),
+        ));
 
         assert_eq!(
             merged.session_token.as_deref(),
@@ -503,11 +524,11 @@ mod tests {
             ],
         );
 
-        let merged = resolve_vended_storage(
+        let merged = s3_payload(resolve_vended_storage(
             &result,
-            &static_storage(),
+            &static_backend(),
             "s3://bucket/db/t/metadata/v1.json",
-        );
+        ));
 
         assert_eq!(merged.endpoint, "http://minio:9000/");
         assert!(merged.path_style);
@@ -528,11 +549,11 @@ mod tests {
             vec![("s3.endpoint", "http://wrong:1/")],
         );
 
-        let merged = resolve_vended_storage(
+        let merged = s3_payload(resolve_vended_storage(
             &result,
-            &static_storage(),
+            &static_backend(),
             "s3://bucket/db/t/metadata/v1.json",
-        );
+        ));
 
         assert_eq!(
             merged.endpoint, "http://minio:9000/",
@@ -554,7 +575,11 @@ mod tests {
         );
         let base = static_storage();
 
-        let merged = resolve_vended_storage(&result, &base, "s3://bucket/db/t/metadata/v1.json");
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base.clone()),
+            "s3://bucket/db/t/metadata/v1.json",
+        ));
 
         assert_eq!(merged.endpoint, base.endpoint);
         assert_eq!(merged.path_style, base.path_style);
@@ -592,7 +617,11 @@ mod tests {
         // Also confirm that a loadTable result carrying vended creds does NOT
         // affect the storage when we skip vended extraction.
         let result = vended_result_flat_config();
-        let if_applied = resolve_vended_storage(&result, &storage, "s3://bucket/db/t");
+        let if_applied = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(storage.clone()),
+            "s3://bucket/db/t",
+        ));
         // The keys are present in the result but we never apply them.
         assert_eq!(
             if_applied.access_key, VENDED_AK,
@@ -625,7 +654,11 @@ mod tests {
         // The vended extraction logic is auth-mode-independent: run it for each
         // logical auth mode and confirm identical output.
         for mode_label in ["no-auth", "bearer", "oauth2"] {
-            let merged = resolve_vended_storage(&result, &storage, &anchor);
+            let merged = s3_payload(resolve_vended_storage(
+                &result,
+                &StorageBackend::S3(storage.clone()),
+                &anchor,
+            ));
 
             assert_eq!(
                 merged.access_key, VENDED_AK,
@@ -666,7 +699,11 @@ mod tests {
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &storage, &anchor);
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(storage.clone()),
+            &anchor,
+        ));
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -695,11 +732,11 @@ mod tests {
     /// config shape. Extraction is auth-mode-independent.
     #[test]
     fn oauth2_path_extracts_vended_credentials() {
-        let storage = static_storage();
+        let storage = static_backend();
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &storage, &anchor);
+        let merged = s3_payload(resolve_vended_storage(&result, &storage, &anchor));
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -749,7 +786,11 @@ mod tests {
                 "{mode_label}: no vended session_token"
             );
             // Confirm the result has vended keys (but we ignored them).
-            let if_applied = resolve_vended_storage(&result, &storage, &anchor);
+            let if_applied = s3_payload(resolve_vended_storage(
+                &result,
+                &StorageBackend::S3(storage.clone()),
+                &anchor,
+            ));
             assert_eq!(
                 if_applied.access_key, VENDED_AK,
                 "{mode_label}: result has vended keys (not applied)"
@@ -783,7 +824,11 @@ mod tests {
         );
         let anchor = result_with_region.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result_with_region, &storage, &anchor);
+        let merged = s3_payload(resolve_vended_storage(
+            &result_with_region,
+            &StorageBackend::S3(storage.clone()),
+            &anchor,
+        ));
         assert_eq!(
             merged.region, VENDED_REGION,
             "vended region must override static region"
@@ -799,7 +844,11 @@ mod tests {
             ],
         );
         let anchor2 = result_no_region.metadata.location().to_string();
-        let merged2 = resolve_vended_storage(&result_no_region, &storage, &anchor2);
+        let merged2 = s3_payload(resolve_vended_storage(
+            &result_no_region,
+            &StorageBackend::S3(storage.clone()),
+            &anchor2,
+        ));
         assert_eq!(
             merged2.region, "us-east-1",
             "static region must be preserved when client.region absent"
@@ -882,7 +931,7 @@ mod tests {
     /// whole vended source.
     #[test]
     fn resolve_vended_storage_empty_access_key_preserves_static() {
-        let base = static_storage();
+        let base = static_backend();
         let result = make_load_table_result(
             None,
             vec![
@@ -893,7 +942,7 @@ mod tests {
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &base, &anchor);
+        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
 
         assert_eq!(
             merged.access_key, STATIC_AK,
@@ -910,7 +959,7 @@ mod tests {
     /// convention, so the static `base` secret_key is preserved.
     #[test]
     fn resolve_vended_storage_empty_secret_key_preserves_static() {
-        let base = static_storage();
+        let base = static_backend();
         let result = make_load_table_result(
             None,
             vec![
@@ -921,7 +970,7 @@ mod tests {
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &base, &anchor);
+        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
 
         assert_eq!(
             merged.secret_key, STATIC_SK,
@@ -949,7 +998,11 @@ mod tests {
             ],
         );
         let anchor_absent = result_absent.metadata.location().to_string();
-        let merged_absent = resolve_vended_storage(&result_absent, &base, &anchor_absent);
+        let merged_absent = s3_payload(resolve_vended_storage(
+            &result_absent,
+            &StorageBackend::S3(base.clone()),
+            &anchor_absent,
+        ));
         assert_eq!(
             merged_absent.session_token.as_deref(),
             Some("STATIC_TOKEN_SENTINEL"),
@@ -966,7 +1019,11 @@ mod tests {
             ],
         );
         let anchor_empty = result_empty.metadata.location().to_string();
-        let merged_empty = resolve_vended_storage(&result_empty, &base, &anchor_empty);
+        let merged_empty = s3_payload(resolve_vended_storage(
+            &result_empty,
+            &StorageBackend::S3(base.clone()),
+            &anchor_empty,
+        ));
         assert_eq!(
             merged_empty.session_token.as_deref(),
             Some("STATIC_TOKEN_SENTINEL"),
@@ -986,7 +1043,11 @@ mod tests {
         let result = make_load_table_result(None, vec![("s3.path-style-access", "TRUE")]);
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &base, &anchor);
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base),
+            &anchor,
+        ));
 
         assert!(
             !merged.path_style,
@@ -1001,7 +1062,7 @@ mod tests {
     /// value never leaks into the result.
     #[test]
     fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config() {
-        let base = static_storage();
+        let base = static_backend();
         let result = make_load_table_result(
             Some(vec![(
                 "s3://bucket/db",
@@ -1011,7 +1072,7 @@ mod tests {
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &base, &anchor);
+        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -1035,7 +1096,11 @@ mod tests {
 
         let mut base_http = static_storage();
         base_http.allow_http = true;
-        let merged_http = resolve_vended_storage(&result, &base_http, &anchor);
+        let merged_http = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base_http),
+            &anchor,
+        ));
         assert!(
             merged_http.allow_http,
             "allow_http=true on base must carry through"
@@ -1043,7 +1108,11 @@ mod tests {
 
         let mut base_https = static_storage();
         base_https.allow_http = false;
-        let merged_https = resolve_vended_storage(&result, &base_https, &anchor);
+        let merged_https = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base_https),
+            &anchor,
+        ));
         assert!(
             !merged_https.allow_http,
             "allow_http=false on base must carry through, unaffected by the same vended result"
@@ -1090,7 +1159,11 @@ mod tests {
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = resolve_vended_storage(&result, &base, &anchor);
+        let merged = s3_payload(resolve_vended_storage(
+            &result,
+            &StorageBackend::S3(base),
+            &anchor,
+        ));
 
         assert_eq!(
             merged.access_key, VENDED_AK,

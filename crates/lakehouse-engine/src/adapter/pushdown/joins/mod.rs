@@ -1,5 +1,5 @@
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, StorageProps};
+use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -99,7 +99,7 @@ pub(super) async fn plan_join(
     pushdown_req: &Json,
     join: &DetectedJoin,
     session: &CatalogSession,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
     scan_schema: Option<&str>,

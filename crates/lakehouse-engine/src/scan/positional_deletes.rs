@@ -26,7 +26,7 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageProps};
+use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageBackend};
 use crate::scan::{
     FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
 };
@@ -539,7 +539,7 @@ impl PositionalDeleteScanTable {
         field_id_resolution: FieldIdResolution,
         files: Vec<FileEntry>,
         table_root: String,
-        storage: &StorageProps,
+        storage: &StorageBackend,
         delete_read_limiter: Arc<Semaphore>,
     ) -> Self {
         let secrets = storage
