@@ -30,7 +30,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, StorageProps,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
@@ -163,15 +163,15 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
-fn storage() -> StorageProps {
-    StorageProps {
+fn storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
         region: "us-east-1".into(),
         access_key: "test-access-key".into(),
         secret_key: "TOPSECRETVALUE".into(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// A join `ScanSpec`: `fact_files` is the sharded fact side (`files`); `dim_files`

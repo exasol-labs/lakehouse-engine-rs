@@ -5,17 +5,17 @@
 //! these through `super::test_support`.
 
 use super::*;
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef};
+use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, StorageProps};
 
-pub(super) fn sample_storage() -> StorageProps {
-    StorageProps {
+pub(super) fn sample_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".into(),
         region: "us-east-1".into(),
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Assemble the scan-driving SQL from a known file list + spec — the same

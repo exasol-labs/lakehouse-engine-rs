@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
-    ScanSpec, StorageProps,
+    ScanSpec, StorageBackend,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -102,7 +102,7 @@ mod dispatch_golden;
 pub async fn handle_pushdown(
     request: &Json,
     catalog_uri: &str,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     catalog: &CatalogProps,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
@@ -287,7 +287,7 @@ pub(crate) fn build_dispatch_sql(
     table_root: String,
     logical_schema: Vec<LogicalField>,
     name_mapping: Vec<NameMappingEntry>,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     udf_name: &str,
     distribute_udf_name: &str,
     df_target_partitions: usize,
@@ -767,7 +767,7 @@ pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<Logica
 mod tests {
     use super::test_support::*;
     use super::*;
-    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
+    use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
 
     // ---------------------------------------------------------------------------
     // Task 4.4 — catalog-auth secrets never in ScanSpec
@@ -794,7 +794,7 @@ mod tests {
     fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         // Build a spec with VENDED storage credentials (simulating what
         // resolve_file_list returns after vended extraction).
-        let vended_storage = StorageProps {
+        let vended_storage = StorageBackend::S3(StorageProps {
             endpoint: "https://s3.amazonaws.com".into(),
             region: VENDED_REGION.into(),
             access_key: VENDED_AK.into(),
@@ -802,7 +802,7 @@ mod tests {
             session_token: Some(VENDED_TOK.into()),
             path_style: false,
             ..Default::default()
-        };
+        });
 
         let spec = ScanSpec {
             common: CommonScanSpec {

@@ -3,7 +3,7 @@
 /// The CONNECTION's `address` is the Iceberg REST catalog URI; the `password`
 /// is a JSON object carrying credential and behavioural fields. Credential
 /// values NEVER appear in any error message produced by this module.
-use crate::scan::spec::{CatalogProps, StorageProps};
+use crate::scan::spec::{CatalogProps, StorageBackend, StorageProps};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
@@ -170,17 +170,23 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
     }
 }
 
-/// Build `StorageProps` from resolved credentials.
-pub fn storage_block(creds: &ConnectionCreds) -> StorageProps {
-    StorageProps {
+/// Build a `StorageBackend` from resolved credentials. `allow_http` arrives as
+/// a parameter rather than a `ConnectionCreds` field because it originates
+/// from the adapter's `PROP_ALLOW_HTTP` property, read in
+/// `resolve_connection_config`, not from the connection creds themselves;
+/// taking it here lets this function finish building the `StorageBackend`
+/// payload in one step, so no caller has to mutate the constructed payload
+/// afterwards to apply it.
+pub fn storage_block(creds: &ConnectionCreds, allow_http: bool) -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: creds.endpoint.clone(),
         region: creds.region.clone(),
         access_key: creds.access_key.clone(),
         secret_key: creds.secret_key.clone(),
         session_token: creds.session_token.clone(),
-        allow_http: false,
+        allow_http,
         path_style: creds.path_style,
-    }
+    })
 }
 
 /// Build `CatalogProps` from resolved credentials and table name.
@@ -476,7 +482,7 @@ mod tests {
     fn storage_block_maps_creds_to_storage_props() {
         let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
         let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
-        let storage = storage_block(&resolved.creds);
+        let StorageBackend::S3(storage) = storage_block(&resolved.creds, false);
 
         assert_eq!(storage.endpoint, "http://s3.example.com");
         assert_eq!(storage.region, "us-east-1");

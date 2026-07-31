@@ -1,6 +1,7 @@
-//! Object-store construction and DataFusion session-context wiring: builds the
-//! S3/MinIO object store (size-indexed HEAD wrapper), registers it on the
-//! session runtime, and constructs the memory-pool-sized `SessionContext`.
+//! Object-store construction and DataFusion session-context wiring: registers the
+//! object store each scan side reads its files through — dispatching on the scan
+//! spec's `StorageBackend` and wrapping each store in the spec-sized HEAD
+//! decorator — and constructs the memory-pool-sized `SessionContext`.
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -22,9 +23,9 @@ use url::Url;
 
 use super::session_config_for_spec;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
-use crate::scan::spec::{FileEntry, ScanSpec};
+use crate::scan::spec::{FileEntry, ScanSpec, StorageBackend};
 
-/// Build a DataFusion SessionContext with the MinIO object store registered.
+/// Build a DataFusion `SessionContext` with an object store registered per scan side.
 ///
 /// Sizes the DataFusion memory pool from `memory_limit_bytes` (UDF per-instance
 /// limit in bytes; `0` = unknown sentinel → conservative 1024 MB default) and
@@ -47,59 +48,145 @@ pub(super) fn build_session_context(
 
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
-    // Register the MinIO object store for the S3 URL scheme, wrapped so that
+    // Register the object store for the sharded fact side, wrapped so that
     // per-file HEAD requests are answered from the caller-supplied sizes in the
     // spec instead of issuing an object-store HEAD over the network.
+    //
+    // ONE whole-spec size index covering `spec.files` AND `join.files` is built
+    // here and handed to BOTH registrations below, because a store registered for
+    // one side answers the HEADs of every side that resolves to it. Narrowing it
+    // to the side being registered would leave the dimension files unindexed in
+    // the shared-bucket case, where only the fact store is ever registered.
     let sizes = build_spec_size_index(spec)?;
-    let bucket = extract_bucket(spec)?;
-    register_bucket_store(
+    let registration = StoreRegistration {
+        backend: &spec.common.storage,
+        connection_budget: spec.common.s3_max_connections,
+        sizes: &sizes,
+    };
+    register_side_store(
         &ctx,
-        &spec.common.storage,
-        &bucket,
-        spec.common.s3_max_connections,
-        &sizes,
+        &registration,
+        ScanSide {
+            files: &spec.files,
+            table_root: &spec.common.table_root,
+        },
     )?;
 
     // A broadcast join's dimension side may live in a different bucket than the
     // sharded fact side. Register a store for it too (same credentials, same size
-    // index) so DataFusion can resolve its object store; skip when it coincides
-    // with the fact bucket — the common same-warehouse case, where the fact store
-    // already serves both sides.
+    // index) so DataFusion can resolve its object store; when it coincides with
+    // the fact side — the common same-warehouse case — the registry already holds
+    // that store key, so the registration is skipped and the fact store serves
+    // both sides.
     if let Some(join) = &spec.common.join
         && !join.files.is_empty()
     {
-        let dim_bucket = extract_bucket_from_files(&join.files, &join.table_root)?;
-        if dim_bucket != bucket {
-            register_bucket_store(
-                &ctx,
-                &spec.common.storage,
-                &dim_bucket,
-                spec.common.s3_max_connections,
-                &sizes,
-            )?;
-        }
+        register_side_store(
+            &ctx,
+            &registration,
+            ScanSide {
+                files: &join.files,
+                table_root: &join.table_root,
+            },
+        )?;
     }
 
     Ok(ctx)
 }
 
-/// Build an S3 store for `bucket` (sized-HEAD wrapped) and register it on `ctx`
-/// under the `s3://{bucket}` URL. Shared by the single-table scan and the two
-/// sides of a broadcast join (which may span two buckets under one credential).
-fn register_bucket_store(
+/// One side of a scan (the fact side or a join's dimension side): its own file
+/// list and table root.
+struct ScanSide<'a> {
+    files: &'a [FileEntry],
+    table_root: &'a str,
+}
+
+/// Whole-spec values shared identically by every side's registration call.
+struct StoreRegistration<'a> {
+    backend: &'a StorageBackend,
+    connection_budget: usize,
+    sizes: &'a HashMap<ObjectStorePath, u64>,
+}
+
+/// Register the object store one side of a scan reads its files through, keyed by
+/// the store URL that side's own file list resolves to, and answer whether that
+/// registration was new: `Some(url)` = registered under `url`, `None` = the
+/// registry already held that key and nothing was (re-)registered.
+///
+/// Dispatches on the storage backend because deriving a store key is a
+/// backend-specific decision, not a shared one — an S3 bucket is the URI host,
+/// which is not what identifies a store on every backend — so each backend owns
+/// both its key derivation and its store construction.
+///
+/// The `None` case is what makes a broadcast join's two sides safe to register
+/// unconditionally: sides sharing one bucket collapse onto one store as an
+/// artifact of the registry key, with no bucket comparison at the call site.
+/// `StoreRegistration::sizes` is therefore the WHOLE spec's size index and not
+/// the side's — the one store that survives that collapse must answer the sized
+/// HEADs of both sides — which is why it sits with the whole-spec values rather
+/// than beside the per-side file list in [`ScanSide`].
+fn register_side_store(
     ctx: &SessionContext,
-    storage: &crate::scan::spec::StorageProps,
-    bucket: &str,
-    s3_max_connections: usize,
-    sizes: &HashMap<ObjectStorePath, u64>,
-) -> Result<(), UdfError> {
-    let s3 = build_s3_store(storage, bucket, s3_max_connections)?;
-    let sized_store = SpecSizedObjectStore::new(Arc::new(s3), sizes.clone());
-    let store_url = Url::parse(&format!("s3://{bucket}"))
-        .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
-    ctx.runtime_env()
-        .register_object_store(&store_url, Arc::new(sized_store));
-    Ok(())
+    registration: &StoreRegistration<'_>,
+    side: ScanSide<'_>,
+) -> Result<Option<Url>, UdfError> {
+    match registration.backend {
+        StorageBackend::S3(storage) => {
+            let bucket = extract_bucket_from_files(side.files, side.table_root)?;
+            let store_url = Url::parse(&format!("s3://{bucket}"))
+                .map_err(|e| UdfError::User(format!("invalid bucket URL: {e}")))?;
+            if ctx
+                .runtime_env()
+                .object_store_registry
+                .get_store(&store_url)
+                .is_ok()
+            {
+                return Ok(None);
+            }
+
+            // `with_client_options` REPLACES the builder's whole `ClientOptions` (it does
+            // not merge), so it must run before `with_allow_http`, which layers onto
+            // whatever `ClientOptions` is already set. Reversing this order silently
+            // drops `allow_http`, breaking plain-HTTP endpoints like MinIO.
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(&bucket)
+                .with_region(&storage.region)
+                .with_access_key_id(&storage.access_key)
+                .with_secret_access_key(&storage.secret_key)
+                .with_client_options(client_options_for(registration.connection_budget))
+                .with_allow_http(storage.allow_http);
+
+            // Path-style stores (MinIO and other S3-compatibles) need the explicit endpoint
+            // and path-style addressing. For real AWS S3 (virtual-hosted) we must NOT set an
+            // endpoint: object_store derives https://<bucket>.s3.<region>.amazonaws.com from
+            // the region. Setting a regional endpoint without the bucket sends requests to
+            // the account root -> S3 returns 403 (s3:ListAllMyBuckets).
+            if storage.path_style {
+                builder = builder
+                    .with_endpoint(&storage.endpoint)
+                    .with_virtual_hosted_style_request(false);
+            }
+
+            if let Some(token) = &storage.session_token {
+                builder = builder.with_token(token);
+            }
+
+            let secrets = storage.secret_values();
+            let s3 = builder.build().map_err(|e| {
+                // Do not echo the error directly — it might contain credential fragments.
+                let stripped = crate::scan::emit::redact_secret_values(&e.to_string(), &secrets);
+                UdfError::User(format!(
+                    "failed to configure S3 object store: {}",
+                    crate::scan::emit::redact_credentials(&stripped)
+                ))
+            })?;
+
+            let sized_store = SpecSizedObjectStore::new(Arc::new(s3), registration.sizes.clone());
+            ctx.runtime_env()
+                .register_object_store(&store_url, Arc::new(sized_store));
+            Ok(Some(store_url))
+        }
+    }
 }
 
 /// HTTP client options that bound the object store's warm connection pool to the
@@ -273,64 +360,11 @@ impl ObjectStore for SpecSizedObjectStore {
     }
 }
 
-/// Build an AmazonS3 (MinIO-compatible) object store from StorageProps, sizing the
-/// HTTP connection pool to the resolved `s3_max_connections` budget.
-fn build_s3_store(
-    storage: &crate::scan::spec::StorageProps,
-    bucket: &str,
-    s3_max_connections: usize,
-) -> Result<impl ObjectStore, UdfError> {
-    // `with_client_options` REPLACES the builder's whole `ClientOptions` (it does
-    // not merge), so it must run before `with_allow_http`, which layers onto
-    // whatever `ClientOptions` is already set. Reversing this order silently
-    // drops `allow_http`, breaking plain-HTTP endpoints like MinIO.
-    let mut builder = AmazonS3Builder::new()
-        .with_bucket_name(bucket)
-        .with_region(&storage.region)
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key)
-        .with_client_options(client_options_for(s3_max_connections))
-        .with_allow_http(storage.allow_http);
-
-    // Path-style stores (MinIO and other S3-compatibles) need the explicit endpoint
-    // and path-style addressing. For real AWS S3 (virtual-hosted) we must NOT set an
-    // endpoint: object_store derives https://<bucket>.s3.<region>.amazonaws.com from
-    // the region. Setting a regional endpoint without the bucket sends requests to
-    // the account root -> S3 returns 403 (s3:ListAllMyBuckets).
-    if storage.path_style {
-        builder = builder
-            .with_endpoint(&storage.endpoint)
-            .with_virtual_hosted_style_request(false);
-    }
-
-    if let Some(token) = &storage.session_token {
-        builder = builder.with_token(token);
-    }
-
-    let secrets = storage.secret_values();
-    builder.build().map_err(|e| {
-        // Do not echo the error directly — it might contain credential fragments.
-        let stripped = crate::scan::emit::redact_secret_values(&e.to_string(), &secrets);
-        UdfError::User(format!(
-            "failed to configure S3 object store: {}",
-            crate::scan::emit::redact_credentials(&stripped)
-        ))
-    })
-}
-
-/// Extract the S3 bucket name from the first file in the spec.
-///
-/// The first entry may now be relative to `table_root`, so it is reconstructed
-/// into its absolute URI first (a `://`-bearing entry passes through unchanged);
-/// the bucket is then the host of that absolute URI. For the all-absolute case
-/// (empty `table_root`) reconstruction is a no-op, so behavior is unchanged.
-fn extract_bucket(spec: &ScanSpec) -> Result<String, UdfError> {
-    extract_bucket_from_files(&spec.files, &spec.common.table_root)
-}
-
 /// Extract the S3 bucket (host) from the first entry of an explicit file list,
-/// reconstructing a relative first entry against `table_root`. Shared by the fact
-/// side (`extract_bucket`) and a join's dimension side.
+/// reconstructing a relative first entry against `table_root`.
+///
+/// The S3 arm's own store-key derivation, private to it: the bucket is the URI
+/// host, which is an S3-specific reading of a file URI rather than a shared one.
 fn extract_bucket_from_files(files: &[FileEntry], table_root: &str) -> Result<String, UdfError> {
     let first = files
         .first()
@@ -395,9 +429,58 @@ pub(super) fn validate_uniform_object_store_files(
 mod tests {
     use super::*;
     use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
+    use crate::scan::spec::{JoinSpec, JoinType};
     use crate::scan::test_support::minimal_spec;
     use ::object_store::ClientConfigKey;
     use datafusion::execution::memory_pool::MemoryLimit;
+
+    /// The store key an S3 bucket is registered under.
+    fn bucket_url(bucket: &str) -> Url {
+        Url::parse(&format!("s3://{bucket}")).expect("bucket URL must parse")
+    }
+
+    /// Whether the session's registry holds a store under `bucket`'s key.
+    fn store_registered(ctx: &SessionContext, bucket: &str) -> bool {
+        ctx.runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url(bucket))
+            .is_ok()
+    }
+
+    /// Register one side through the seam under test, always with the WHOLE-spec
+    /// size index — the same thing `build_session_context` passes to every call.
+    fn register_side(
+        ctx: &SessionContext,
+        spec: &ScanSpec,
+        files: &[FileEntry],
+        table_root: &str,
+    ) -> Result<Option<Url>, UdfError> {
+        let sizes = build_spec_size_index(spec).expect("size index must build");
+        register_side_store(
+            ctx,
+            &StoreRegistration {
+                backend: &spec.common.storage,
+                connection_budget: spec.common.s3_max_connections,
+                sizes: &sizes,
+            },
+            ScanSide { files, table_root },
+        )
+    }
+
+    /// `minimal_spec` (fact side in `test-bucket`) plus a broadcast-join dimension
+    /// side rooted at `dim_root` — the shape driving the second registration.
+    fn spec_with_join(dim_root: &str, dim_files: Vec<FileEntry>) -> ScanSpec {
+        let mut spec = minimal_spec();
+        spec.common.join = Some(JoinSpec {
+            table_root: dim_root.into(),
+            files: dim_files,
+            logical_schema: Vec::new(),
+            name_mapping: Vec::new(),
+            join_type: JoinType::Inner,
+            condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        });
+        spec
+    }
 
     /// A positive memory limit causes the DataFusion pool to be sized at fraction × (limit − overhead).
     /// Uses minimal_spec defaults: fraction=0.6, overhead=200 MiB.
@@ -483,22 +566,128 @@ mod tests {
         );
     }
 
-    /// The store built from a spec inherits the spec's connection budget, and the
-    /// build succeeds without leaking any credential value into an error. Exercised
-    /// as a unit test against the private `build_s3_store` seam directly (rather
-    /// than an integration test) so this function does not need to be `pub` — it
-    /// is otherwise only ever called internally from `build_session_context`.
+    /// The store built for a side inherits the spec's connection budget, and the
+    /// build succeeds without leaking any credential value into an error.
+    /// Exercised as a unit test against the private `register_side_store` seam
+    /// directly (rather than an integration test) so that function does not need
+    /// to be `pub` — it is otherwise only ever called from `build_session_context`.
     #[test]
     fn build_s3_store_applies_spec_connection_budget() {
         let mut spec = minimal_spec();
         spec.common.s3_max_connections = 16;
-        let bucket = extract_bucket(&spec).expect("bucket must parse");
-        build_s3_store(
-            &spec.common.storage,
-            &bucket,
-            spec.common.s3_max_connections,
+        let ctx = SessionContext::new();
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("store must build with a connection budget"),
+            Some(bucket_url("test-bucket")),
+            "a non-default connection budget must still register the side's store"
+        );
+    }
+
+    /// Two sides resolving to distinct buckets each get their own store, reported
+    /// by the URL each was registered under and both resolvable from the registry.
+    #[test]
+    fn register_side_store_registers_one_store_per_distinct_side() {
+        let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
+        let spec = spec_with_join("s3://dim-bucket/db/dim", dim_files.clone());
+        let ctx = SessionContext::new();
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("fact side must register"),
+            Some(bucket_url("test-bucket"))
+        );
+        assert_eq!(
+            register_side(&ctx, &spec, &dim_files, "s3://dim-bucket/db/dim")
+                .expect("dimension side must register"),
+            Some(bucket_url("dim-bucket"))
+        );
+
+        for bucket in ["test-bucket", "dim-bucket"] {
+            assert!(
+                store_registered(&ctx, bucket),
+                "a store must be resolvable for {bucket}"
+            );
+        }
+    }
+
+    /// A dimension side resolving to the fact side's bucket registers no second
+    /// store: the registry already holds that key, so the call reports `None` and
+    /// the already-registered fact store serves both sides. The skip is an
+    /// artifact of the key, never a bucket comparison at the call site.
+    #[test]
+    fn join_dimension_side_sharing_the_fact_bucket_is_not_registered_twice() {
+        let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
+        let spec = spec_with_join("s3://test-bucket/db/dim", dim_files.clone());
+        let ctx = SessionContext::new();
+        register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+            .expect("fact side must register");
+
+        assert_eq!(
+            register_side(&ctx, &spec, &dim_files, "s3://test-bucket/db/dim")
+                .expect("a shared-bucket dimension side must not fail"),
+            None,
+            "a dimension side in the fact bucket must not be registered twice"
+        );
+    }
+
+    /// The dimension-side guard: an empty dimension file list registers only the
+    /// fact side. Without the guard, deriving a store key from no files fails the
+    /// whole session build — even though such a spec has no dimension store to
+    /// register, whatever root the join block names.
+    #[test]
+    fn join_with_empty_dimension_file_list_registers_only_the_fact_side() {
+        let spec = spec_with_join("s3://dim-bucket/db/dim", Vec::new());
+
+        let ctx = build_session_context(&spec, 0)
+            .expect("an empty dimension file list must not fail the session build");
+
+        assert!(
+            store_registered(&ctx, "test-bucket"),
+            "the fact side must still be registered"
+        );
+        assert!(
+            !store_registered(&ctx, "dim-bucket"),
+            "an empty dimension file list must register no dimension store"
+        );
+    }
+
+    /// The size index handed to every registration is the WHOLE spec's. In the
+    /// shared-bucket case only the fact store is registered, and that ONE store
+    /// must answer a DIMENSION file's HEAD from the spec — a per-side size map
+    /// would silently push those HEADs onto the network.
+    #[tokio::test]
+    async fn shared_bucket_join_store_answers_both_sides_sizes_from_the_spec() {
+        use ::object_store::ObjectStoreExt;
+        const DIM_SIZE: u64 = 4242;
+
+        let spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", DIM_SIZE)],
+        );
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+        let store = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url("test-bucket"))
+            .expect("the shared-bucket store must be registered");
+
+        // Bounded so a fall-through to the (unreachable) endpoint fails fast and
+        // legibly instead of exhausting the object-store retry budget; a HEAD
+        // served from the index does no I/O and never waits.
+        let meta = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.head(&ObjectStorePath::from("db/dim/data/dim-0.parquet")),
         )
-        .expect("store must build with a connection budget");
+        .await
+        .expect("the dimension HEAD must be answered from the spec, not over the network")
+        .expect("head of an indexed dimension file must succeed");
+
+        assert_eq!(
+            meta.size, DIM_SIZE,
+            "the fact-side store must answer the dimension file's size from the whole-spec index"
+        );
     }
 
     /// 4.1: a `://`-bearing entry is absolute and passes through unchanged.
@@ -576,16 +765,18 @@ mod tests {
     #[test]
     fn extract_bucket_handles_relative_and_absolute_first_entry() {
         // Relative first entry: bucket comes from the table root.
-        let mut rel = minimal_spec();
-        rel.common.table_root = "s3://warehouse/db/table".into();
-        rel.files = vec![FileEntry::new("data/part-0.parquet", 1)];
-        assert_eq!(extract_bucket(&rel).unwrap(), "warehouse");
+        let rel = vec![FileEntry::new("data/part-0.parquet", 1)];
+        assert_eq!(
+            extract_bucket_from_files(&rel, "s3://warehouse/db/table").unwrap(),
+            "warehouse"
+        );
 
         // Absolute first entry, empty root (legacy): unchanged behavior.
-        let mut abs = minimal_spec();
-        abs.common.table_root = String::new();
-        abs.files = vec![FileEntry::new("s3://legacy-bucket/data/part-0.parquet", 1)];
-        assert_eq!(extract_bucket(&abs).unwrap(), "legacy-bucket");
+        let abs = vec![FileEntry::new("s3://legacy-bucket/data/part-0.parquet", 1)];
+        assert_eq!(
+            extract_bucket_from_files(&abs, "").unwrap(),
+            "legacy-bucket"
+        );
     }
 
     /// 4.2: the wrapper answers a HEAD (`get_opts` with `head`) from the size

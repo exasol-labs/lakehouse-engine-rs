@@ -4,7 +4,7 @@
 //! comment names its consumers; a fixture reached by only one module lives
 //! in that module's own `mod tests` instead.
 
-use crate::{ConnectionCreds, StorageProps};
+use crate::{ConnectionCreds, StorageBackend, StorageProps};
 
 /// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
 /// Individual tests set only the auth fields under test.
@@ -32,7 +32,7 @@ pub(crate) fn base_creds() -> ConnectionCreds {
 /// Static storage with the sentinel keys `STATIC_AK_SENTINEL` / `STATIC_SK_SENTINEL`
 /// (matching the credentials-cluster test sentinels below).
 ///
-/// Consumers: `namespace`, `vended`.
+/// Consumers: `vended`, and [`static_backend`] below.
 pub(crate) fn static_storage() -> StorageProps {
     StorageProps {
         endpoint: "https://s3.amazonaws.com".into(),
@@ -41,6 +41,27 @@ pub(crate) fn static_storage() -> StorageProps {
         secret_key: "STATIC_SK_SENTINEL".into(),
         path_style: false,
         ..Default::default()
+    }
+}
+
+/// [`static_storage`] wrapped in the `S3` backend variant — the fixture for every
+/// call site that now takes `&StorageBackend` (`list_namespace_tables`,
+/// `resolve_vended_storage`) rather than `&StorageProps`.
+///
+/// Consumers: `namespace`, `vended`.
+pub(crate) fn static_backend() -> StorageBackend {
+    StorageBackend::S3(static_storage())
+}
+
+/// Unwrap a `StorageBackend`'s `S3` payload — the test-only inverse of
+/// `StorageBackend::S3(..)`, so a test asserting directly on `StorageProps`
+/// fields against a `resolve_vended_storage` return value can stay unchanged
+/// below the unwrap.
+///
+/// Consumers: `vended`.
+pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
+    match backend {
+        StorageBackend::S3(props) => props,
     }
 }
 

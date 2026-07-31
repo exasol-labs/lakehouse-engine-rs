@@ -1,48 +1,15 @@
-//! The two I/O primitives the catalog layer is built on: an authenticated
-//! catalog `GET` that deserializes its JSON body, and the S3 `FileIO` the scan
-//! reads manifest files through.
+//! The authenticated catalog `GET` the catalog layer's REST access is built on:
+//! it applies the resolved auth strategy to the request and deserializes the JSON
+//! body.
 //!
 //! Moved verbatim from the engine's `adapter/pushdown/credentials.rs`.
 //! Credential values NEVER appear in any returned error — every error site
 //! routes through a redaction closure.
 
+use crate::ConnectionCreds;
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
 use crate::redaction::redact_secret_values;
-use crate::{ConnectionCreds, StorageProps};
 use exasol_udf_sdk::error::UdfError;
-use iceberg::io::{
-    FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION,
-    S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
-};
-use iceberg_storage_opendal::OpenDalStorageFactory;
-use std::sync::Arc;
-
-/// Build an S3 `FileIO` from storage props.
-///
-/// Used by the signed path to give the iceberg `Table` a way to read manifest
-/// files from S3 after we have fetched and deserialized the `LoadTableResult`.
-pub fn build_s3_file_io(storage: &StorageProps) -> iceberg::io::FileIO {
-    let mut builder = FileIOBuilder::new(Arc::new(OpenDalStorageFactory::S3 {
-        customized_credential_load: None,
-    }));
-    if !storage.endpoint.is_empty() {
-        builder = builder.with_prop(S3_ENDPOINT, &storage.endpoint);
-    }
-    if !storage.region.is_empty() {
-        builder = builder.with_prop(S3_REGION, &storage.region);
-    }
-    if !storage.access_key.is_empty() {
-        builder = builder.with_prop(S3_ACCESS_KEY_ID, &storage.access_key);
-    }
-    if !storage.secret_key.is_empty() {
-        builder = builder.with_prop(S3_SECRET_ACCESS_KEY, &storage.secret_key);
-    }
-    if let Some(token) = &storage.session_token {
-        builder = builder.with_prop(S3_SESSION_TOKEN, token);
-    }
-    builder = builder.with_prop(S3_PATH_STYLE_ACCESS, storage.path_style.to_string());
-    builder.build()
-}
 
 /// Build and authenticate a `GET` request against `url`, applying the resolved
 /// catalog-auth strategy and (when vending) the access-delegation header, then

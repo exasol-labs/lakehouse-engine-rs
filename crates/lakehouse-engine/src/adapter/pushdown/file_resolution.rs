@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
-    NameMappingEntry, ProjectionItem, StorageProps,
+    NameMappingEntry, ProjectionItem, StorageBackend,
 };
 use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
@@ -10,7 +10,7 @@ use iceberg::TableIdent;
 use serde_json::Value as Json;
 
 use lakehouse_catalog::{
-    CatalogSession, build_s3_file_io, load_table_any_auth, parse_table_ident, redact_credentials,
+    CatalogSession, load_table_any_auth, parse_table_ident, redact_credentials,
     resolve_vended_storage,
 };
 
@@ -199,7 +199,7 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
 /// none). Vended-credential extraction is gated SOLELY on
 /// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it
-/// is true the returned `StorageProps` carries the vended STS keys (merged over
+/// is true the returned `StorageBackend` carries the vended STS keys (merged over
 /// the static `storage` props, and the vended `client.region` when present) so
 /// every per-shard `ScanSpec.storage` uses the vended creds. When it is false,
 /// returns `(files, storage.clone())` — byte-identical to the no-vending behaviour
@@ -210,13 +210,13 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 pub async fn resolve_file_list(
     session: &CatalogSession,
     catalog_props: &CatalogProps,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
 ) -> Result<
     (
         Vec<FileEntry>,
-        StorageProps,
+        StorageBackend,
         Vec<LogicalField>,
         String,
         Vec<NameMappingEntry>,
@@ -254,7 +254,7 @@ pub async fn resolve_file_list(
     // Build the iceberg Table so plan_files() can read manifests from S3.
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
     let table_ident = TableIdent::new(namespace, table_name);
-    let file_io = build_s3_file_io(&effective_storage);
+    let file_io = effective_storage.file_io();
     let runtime = iceberg::Runtime::try_current().map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
