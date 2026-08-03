@@ -3714,3 +3714,255 @@ fn e2e_now_family_matches_native_oracle() {
          delta={delta}s"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declined-filter self-apply (#279, `fix-declined-filter-self-apply`): a WHERE
+// predicate the adapter cannot push into the DataFusion scan must still be
+// applied — in the adapter's OWN Exasol-dialect SQL — rather than silently
+// dropped (see CLAUDE.md § "Virtual Schema pushdown delegation"). Before this
+// fix, all three render sites read a declined render as "safe to omit", so
+// every query below returned all 12 seeded rows instead of the filtered
+// subset.
+//
+// Every predicate here is one of the three DECLINE sources the plan verified
+// live against this Docker Exasol stack: `SECOND(ts, 3)` (DataFusion-dialect
+// arity refusal), `LIKE` against a DECIMAL column (`like_subject_type_guard`),
+// and `INSTR` with a 3rd argument (`string_function_arg_type_guard`'s >2-arg
+// decline).
+// ---------------------------------------------------------------------------
+
+/// `SECOND(c_ts, 3)` — the 3-argument form with an explicit fractional-seconds
+/// precision — is advertised (`FN_SECOND`) but declines DataFusion rendering
+/// (only the 1-argument form renders; see this plan's
+/// `second_with_precision_declines_for_datafusion_renders_for_exasol` in
+/// `crates/vs-expression`). Every seeded `c_ts` shares the same whole second
+/// (fraction 0), so `SECOND(c_ts, 3) > 1` is false for every row: the correct
+/// answer is 0 rows. Before the fix the whole filter was dropped and all 12
+/// rows came back.
+///
+/// Also asserts the emitted `EXPLAIN VIRTUAL` SQL carries the wrapper's own
+/// `WHERE` (qualified single-table fallback, alias `LHS_T0`) rather than a
+/// scan-spec `"filter"` field — proof the declined predicate is applied in the
+/// adapter's own SQL, not pushed into the DataFusion scan.
+#[test]
+fn e2e_declined_filter_second_arity_returns_filtered_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ID FROM {} WHERE SECOND(C_TS, 3) > 1",
+        vs_typed_table()
+    );
+    let row_count = conn.query_row_count(&sql);
+    assert_eq!(
+        row_count, 0,
+        "WHERE SECOND(c_ts, 3) > 1 must return 0 rows (declined filter \
+         self-applied by the adapter), not all 12 seeded rows"
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LHS_T0"),
+        "a declined single-table WHERE filter must route through the qualified \
+         wrapper (alias LHS_T0), got:\n{pushed_sql}"
+    );
+    assert!(
+        !pushed_sql.contains("\"filter\":\""),
+        "a declined WHERE filter must NOT appear as a scan-spec \"filter\" — \
+         it is applied only in the wrapper's own WHERE, got:\n{pushed_sql}"
+    );
+}
+
+/// `LIKE` against a `DECIMAL` column declines (`like_subject_type_guard`)
+/// rather than being pushed into the DataFusion scan. Per `common/seed.rs`'s
+/// `typed_probe()`, `c_decimal_a`'s unscaled value is `1050` (-> `"10.50"`)
+/// for ids 1, 5, and 7 only; every other row's `c_decimal_a` renders with a
+/// different leading digit or is NULL. Before the fix all 12 rows came back.
+#[test]
+fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ID FROM {} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![1, 5, 7],
+        "WHERE c_decimal_a LIKE '1%' must return exactly ids 1, 5, 7 \
+         (unscaled value 1050 -> \"10.50\"), got {ids:?}"
+    );
+}
+
+/// `INSTR` with a 3rd (start-position) argument declines
+/// (`string_function_arg_type_guard`'s >2-arg refusal) rather than being
+/// coerced down to a 2-argument DataFusion `strpos`, which would silently
+/// ignore the start position.
+///
+/// Per `common/seed.rs`'s `typed_probe()`, `c_varchar` values are: id1="aa",
+/// id2="AA", id3=NULL, id4="bb", id5="aa", id6="cc", id7="Aa", id8="dd",
+/// id9="BB", id10=NULL, id11="ee", id12="cc". `INSTR` is case-sensitive, so
+/// `INSTR(c_varchar, 'a', 2)` is nonzero only for ids 1, 5, 7 (each has a
+/// lowercase `'a'` at or after position 2) and NULL for ids 3, 10 (excluded
+/// by `= 0`); every other id is exactly 0. Confirmed against Exasol's own
+/// `INSTR` evaluation via the already-correct SELECT-list expression pushdown
+/// (unrelated to this plan's WHERE-clause fix). Before the fix all 12 rows
+/// came back for the WHERE-clause shape below.
+#[test]
+fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ID FROM {} WHERE INSTR(C_VARCHAR, 'a', 2) = 0 ORDER BY ID",
+        vs_typed_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![2, 4, 6, 8, 9, 11, 12],
+        "WHERE INSTR(c_varchar, 'a', 2) = 0 must return exactly ids \
+         2, 4, 6, 8, 9, 11, 12, got {ids:?}"
+    );
+}
+
+/// A declined filter is applied BEFORE aggregation, not after — `COUNT(*)`
+/// over the LIKE-decline predicate (ids 1, 5, 7) must be 3, not 12. If the
+/// self-applied `WHERE` were instead wrapped AROUND an unfiltered aggregate
+/// (or omitted entirely), this would count all 12 rows.
+#[test]
+fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let count = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE C_DECIMAL_A LIKE '1%'",
+        vs_typed_table()
+    ));
+    assert_eq!(
+        count, 3,
+        "COUNT(*) under a declined WHERE filter must be 3 (ids 1, 5, 7), \
+         not 12 — the filter must be applied before aggregating"
+    );
+}
+
+/// A declined filter is applied BEFORE `ORDER BY … LIMIT` truncation, not
+/// after. The LIKE-decline predicate matches ids 1, 5, 7 (in ascending
+/// order); `LIMIT 2` must return `[1, 5]`. A build that truncated the
+/// UNFILTERED 12-row set first would instead return `[1, 2]` — the first two
+/// ids overall, not the first two MATCHING ids.
+#[test]
+fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ID FROM {} WHERE C_DECIMAL_A LIKE '1%' ORDER BY ID LIMIT 2",
+        vs_typed_table()
+    ));
+    assert_eq!(cols.len(), 1, "expected 1 column (ID): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![1, 5],
+        "ORDER BY id LIMIT 2 under a declined WHERE filter must return \
+         [1, 5] (the first two of the FILTERED set 1, 5, 7), not [1, 2] \
+         (the first two of the unfiltered 12-row set), got {ids:?}"
+    );
+}
+
+/// `SELECT * … WHERE SECOND(C_TS, 3) > 1` — a genuine `SELECT *` (absent
+/// `selectList`) over a declined filter — must return the FULL base row
+/// (every one of the 10 `typed_distinct_probe` columns, in order) and the
+/// correct 0 rows, with NO `04000` "Expected number of columns" positional
+/// error. The qualified wrapper's inner projection is normally narrowed to
+/// only the columns the rendered clauses NAME (`referenced_column_projection`);
+/// for a genuine `SELECT *` that narrowed set would be the filter's columns
+/// alone (`C_TS`), which Exasol would reject positionally against the base
+/// row's 10 real columns. The projection-override fix (task 2.5) must instead
+/// project every `col_types` column, in order, for this shape.
+///
+/// Uses the raw `resultSet` metadata (`numColumns`/`numRows`), not
+/// `query_columns`, which returns an empty vec for any zero-row result and so
+/// cannot observe the column count of zero rows (see
+/// `e2e_all_files_pruned_literal_projection_empty_shape` above).
+#[test]
+fn e2e_declined_filter_select_star_returns_full_row_shape() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT * FROM {} WHERE SECOND(C_TS, 3) > 1",
+        vs_typed_table()
+    );
+    // `execute` panics on a rejected pushdown (e.g. a `04000` column-count
+    // mismatch), so reaching the assertions below already proves Exasol
+    // accepted the full-base-row shape.
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let num_columns = result_set["numColumns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numColumns in resultSet: {resp}"));
+    assert_eq!(
+        num_columns, 10,
+        "SELECT * with a declined filter must project the FULL 10-column \
+         base row (id, c_decimal_a, c_decimal_b, c_double, c_varchar, \
+         c_date, c_ts, c_bool, c_price, c_qty), got {num_columns}: {resp}"
+    );
+    let num_rows = result_set["numRows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numRows in resultSet: {resp}"));
+    assert_eq!(
+        num_rows, 0,
+        "SELECT * WHERE SECOND(c_ts, 3) > 1 must return 0 rows: {resp}"
+    );
+}
+
+/// A WHERE predicate carrying an advertised `FN_CAST` to a target refused in
+/// BOTH dialects (`HASHTYPE` — see `render_cast_target` in
+/// `crates/vs-expression/src/lib.rs`, which has no HASHTYPE/INTERVAL/GEOMETRY
+/// arm in either the Exasol or DataFusion branch) reaches the adapter — the
+/// RHS is a valid `HASHTYPE` literal so Exasol's own parser accepts and does
+/// not constant-fold away the predicate before pushdown (confirmed live via
+/// `EXPLAIN VIRTUAL`: the pushdown request carries a `predicate_equal` node
+/// whose left side is `CAST(C_VARCHAR AS HASHTYPE)`). Neither dialect can
+/// render that CAST, so the adapter must return a clean error naming the
+/// unrenderable predicate — not the wrong-rows defect this plan fixes, and
+/// not a query that runs to completion.
+///
+/// The error must also carry no credential leakage: the storage credentials
+/// (`minioadmin`/`minioadmin`, the seeded MinIO access/secret key) must never
+/// appear in the adapter's error text.
+#[test]
+fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ID FROM {} WHERE CAST(C_VARCHAR AS HASHTYPE) = \
+         CAST('00000000000000000000000000000000' AS HASHTYPE)",
+        vs_typed_table()
+    );
+    let resp = conn.try_execute(&sql);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a WHERE predicate unrenderable under BOTH dialects (CAST to \
+         HASHTYPE) must return a clean adapter error, not rows: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        !msg.contains("minioadmin"),
+        "adapter error message must not leak storage credentials: {msg}"
+    );
+    assert!(
+        msg.to_ascii_lowercase().contains("neither dialect"),
+        "adapter error must name the both-dialects-declined reason, got: {msg}"
+    );
+}

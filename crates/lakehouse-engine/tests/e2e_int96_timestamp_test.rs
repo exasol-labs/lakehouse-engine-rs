@@ -133,7 +133,9 @@ async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
         .split_once('/')
         .unwrap_or_else(|| panic!("data file URI must have a <bucket>/<key> form, got: {uri}"));
 
-    let StorageBackend::S3(storage) = local_stack_storage();
+    let StorageBackend::S3(storage) = local_stack_storage() else {
+        panic!("LocalStack fixture is S3-only")
+    };
     let store = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region(&storage.region)

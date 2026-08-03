@@ -3133,6 +3133,7 @@ mod tests {
             &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
+            None,
         )
         .expect("qualified fallback must build");
 

@@ -38,7 +38,9 @@ sum/count decomposition) is covered separately in
 * `node_count()` returns `0` only on a context carrying no live handshake metadata (a stub, a test double, or a broken handshake), so `0` maps to a node count of `1` and any live cluster (single-node included) reports `≥ 1`.
 * The common spec's `projection` field carries the pushed-down projected columns ONLY for the row-scan and join dispatch paths. An aggregate or GROUP BY request leaves `projection` empty, because the aggregate scan-dispatch path derives its physical projection from the `aggregates`/`group_keys` fields rather than from `projection` (see `vs-adapter/pushdown-planning-single-group-agg` and `vs-adapter/pushdown-planning-grouped-agg`).
 * See `vs-adapter/pushdown-planning-single-group-agg` for single-group aggregate pushdown (capability advertisement, partial-aggregate translation, wrapper merge SQL, and AVG decomposition).
-* A predicate node the adapter cannot faithfully translate is OMITTED from the scan spec; Exasol keeps and evaluates the predicate itself as a correctness backstop.
+* This delta SUPERSEDES the preceding Background bullet "A predicate node the adapter cannot faithfully translate is OMITTED from the scan spec; Exasol keeps and evaluates the predicate itself as a correctness backstop." That claim is FALSE and is corrected, not merely superseded: a predicate the adapter cannot faithfully translate MUST be applied by the adapter's own returned SQL — see `vs-adapter/pushdown-declined-filter-self-apply` and ADR `specs/_decision/045` for why nothing else applies it. Omitting it returns extra unfiltered rows, verified live.
+* The single-table path distinguishes an ABSENT filter from a DECLINED one. An absent or trivially-true filter is omitted and the wrapper-free fast scan is unchanged; a declined filter routes the request to the qualified single-table wrapper, which applies the predicate in its own `WHERE`.
+* The wrapper-free outer scalar scan select remains the shape for every request whose filter renders. The `SELECT * FROM (…)` boundary the wrapper introduces exists only on the decline path.
 * See `vs-adapter/pushdown-planning-like-type-coercion` for the type-aware LIKE/REGEXP_LIKE rule that dispatches on the subject column's Exasol type before rendering the filter.
 * When a query aliases a table in its `FROM` clause (`FROM customer c`), Exasol stamps a `tableAlias` on every `column` node in the pushdown request — including nodes the user wrote unqualified. The single scan relation exposes only bare column names, so an alias-qualified reference does not resolve; the single-table push therefore strips the alias before rendering (see `vs-adapter/pushdown-planning-alias-stripping`). The `crates/vs-expression` translator itself always honors a present `tableAlias` (`sql-comprehension/vs-expression-translator`); stripping is the single-table caller's responsibility.
 
@@ -76,10 +78,20 @@ sum/count decomposition) is covered separately in
 
 * *GIVEN* a query with a WHERE predicate over a supported column and operator
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, omitting (never mistranslating) any node it cannot render
+* *THEN* the adapter SHALL translate the predicate into the shard-invariant common spec passed to the UDF, and the translation SHALL be ALL-OR-NOTHING over the whole top-level filter — REPLACING the recorded "omitting (never mistranslating) any node it cannot render", which sanctioned dropping one node while keeping the rest of the tree
+* *AND* a filter the adapter cannot render for DataFusion SHALL be self-applied in the qualified wrapper's `WHERE` rather than omitted, per `vs-adapter/pushdown-declined-filter-self-apply`
 * *AND* before translating a `predicate_like` or `predicate_like_regexp` whose subject is a bare `column` node, the adapter SHALL apply the type-aware LIKE rule (see `vs-adapter/pushdown-planning-like-type-coercion`), because DataFusion performs no implicit non-string-to-VARCHAR coercion and would hard-fail the scan on a LIKE over a non-string column
 * *AND* the adapter SHALL ALSO translate the soundly-translatable conjuncts into an `iceberg::expr::Predicate` applied to the Iceberg table scan as a file-pruning filter, dropping any node it cannot translate soundly rather than skipping a file that could match
 * *AND* the DataFusion scan SHALL always apply the full common-spec filter, so the Iceberg pruning filter only narrows which files are opened and never changes the result set
+
+### Scenario: A declined WHERE filter routes the single-table request to the qualified wrapper
+
+* *GIVEN* a single-table `pushdown` request carrying a non-null `filter` that the DataFusion-bound render declines, of any dispatch shape — row scan, top-N, single-group aggregate, grouped aggregate, or `COUNT(DISTINCT)`
+* *WHEN* the pushdown dispatcher selects the SQL shape
+* *THEN* the dispatcher SHALL route the request to the qualified single-table wrapper BEFORE the routing classifier runs, so one route serves every dispatch shape
+* *AND* the request's ORIGINAL filter tree SHALL still be forwarded to Iceberg-level file pruning unchanged, because pruning reads the un-rewritten tree and only ever removes files that provably cannot match
+* *AND* the wrapper's returned column count, order, and declared types SHALL equal what the request's `selectList` declares, and an absent, JSON-null, or empty `selectList` SHALL return the FULL base row rather than only the columns the declined predicate references, so the route never trips Exasol's positional `04000` validation
+* *AND* a request whose filter renders, or which carries no filter, SHALL take its existing dispatch shape with the emitted SQL byte-identical to its pre-change output
 
 ### Scenario: LIMIT is pushed into the scan spec
 

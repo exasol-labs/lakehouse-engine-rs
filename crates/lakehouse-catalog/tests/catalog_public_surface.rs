@@ -18,7 +18,7 @@
 #![allow(unused_imports)]
 
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, ConnectionCreds, StorageBackend, StorageProps,
+    AdlsCred, CatalogProps, CatalogSession, ConnectionCreds, StorageBackend, StorageProps,
     list_namespace_tables, load_table_any_auth, parse_table_ident, redact_credentials,
     redact_secret_values, resolve_vended_storage,
 };

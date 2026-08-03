@@ -1504,8 +1504,14 @@ pub fn render_expression_safe(expr: &Json) -> Option<String> {
 ///
 /// Returns `None` when:
 /// - rendering fails (unsupported node types, malformed input), or
-/// - the filter is trivially true (`TRUE` or `NULL`) — the adapter omits
-///   it from the scan spec and lets Exasol keep it as a correctness backstop.
+/// - the filter is trivially true (`TRUE` or `NULL`).
+///
+/// These two causes are NOT distinguishable from this function's `None` alone, and
+/// this function does not decide what a `None` means for the request as a whole —
+/// that is the caller's responsibility (see `datafusion_renderable` in the adapter's
+/// `pushdown/support.rs`), which is the only place that knows whether the filter was
+/// absent, trivially true, or actually declined and therefore needs self-applying
+/// rather than omitting.
 ///
 /// DataFusion dialect — see [`render_expression`]; the Exasol-dialect twin is
 /// [`render_df_filter_exasol_safe`].
@@ -1545,7 +1551,9 @@ pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
 /// Render a VS filter expression to an **Exasol** SQL WHERE fragment.
 ///
 /// Returns `None` when rendering fails or the filter is trivially true
-/// (`TRUE`/`NULL`), mirroring [`render_df_filter_safe`] exactly. Exasol
+/// (`TRUE`/`NULL`), mirroring [`render_df_filter_safe`] exactly — including that
+/// those two causes are not distinguishable here, and what a `None` means for the
+/// request as a whole is the caller's responsibility, not this function's. Exasol
 /// dialect — see [`render_expression_exasol`]; the DataFusion-dialect twin is
 /// [`render_df_filter_safe`].
 pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
@@ -2232,12 +2240,15 @@ mod tests {
     }
 
     #[test]
-    fn cast_to_unsupported_target_falls_back() {
+    fn cast_to_unsupported_target_declines() {
         // Exasol CAST targets with no faithful DataFusion 54 equivalent. Each is
         // sent with the dataType descriptor shape shown (verified against the
-        // Exasol virtual-schema data-types API). The translator must decline
-        // (Err in raising mode, None in safe mode) so the adapter omits the CAST
-        // and Exasol evaluates it as a correctness backstop.
+        // Exasol virtual-schema data-types API). The translator declines these
+        // targets (Err in raising mode, None in safe mode); there is no
+        // Exasol-side re-check of an advertised capability, so it is the
+        // caller's job to decide what to do with that `None`/`Err` — the
+        // adapter's declined-predicate route errors rather than omitting the
+        // CAST.
         //
         // TIMESTAMP WITH LOCAL TIME ZONE is the trap: Exasol serialises it as
         // type "TIMESTAMP" with `withLocalTimeZone: true` — NOT a distinct type
@@ -3420,6 +3431,33 @@ mod tests {
                 "{name} 3-arg must be None in safe mode"
             );
         }
+    }
+
+    /// Pins the dialect asymmetry `fix-declined-filter-self-apply` relies on:
+    /// `SECOND` is a DataFusion field-shortcut (exactly 1 argument) but an Exasol
+    /// `VerbatimCall` (any arity, rendered as written). A 2-argument `SECOND(ts, 3)`
+    /// therefore declines under the DataFusion dialect while still rendering under
+    /// the Exasol dialect — the asymmetry a declined filter must be self-applied
+    /// through, in Exasol's own dialect, rather than omitted.
+    #[test]
+    fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "arguments": [
+                {"type": "column", "name": "ts"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "SECOND(ts, 3) must decline under the DataFusion dialect"
+        );
+        assert!(
+            render_expression_exasol_safe(&expr).is_some(),
+            "SECOND(ts, 3) must still render under the Exasol dialect"
+        );
     }
 
     // --- Integer division DIV is deliberately not translated ---
@@ -4948,9 +4986,12 @@ mod tests {
         // Exasol-dialect twin of `true_filter_returns_none_in_safe_mode` /
         // `null_filter_returns_none_in_safe_mode` above: `render_df_filter_exasol_safe`
         // suppresses a trivially-true (`TRUE` or `NULL`) filter exactly like
-        // `render_df_filter_safe` does, so the adapter omits it from the scan
-        // spec and leaves Exasol to apply it as a correctness backstop,
-        // regardless of which dialect rendered the fragment.
+        // `render_df_filter_safe` does. A trivially-true filter is a correct
+        // no-op to omit from the scan spec — but that is one of two
+        // distinguishable causes of a `None` return, regardless of which
+        // dialect rendered the fragment. The other cause, a genuine decline,
+        // must be self-applied by the caller — a declined predicate omitted
+        // here would be silently lost, not backstopped.
         let true_filter = json!({"type": "literal_bool", "value": true});
         assert!(render_df_filter_exasol_safe(&true_filter).is_none());
 

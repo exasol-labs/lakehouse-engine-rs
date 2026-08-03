@@ -3,7 +3,7 @@
 /// The CONNECTION's `address` is the Iceberg REST catalog URI; the `password`
 /// is a JSON object carrying credential and behavioural fields. Credential
 /// values NEVER appear in any error message produced by this module.
-use crate::scan::spec::{CatalogProps, StorageBackend, StorageProps};
+use crate::scan::spec::{AdlsCred, CatalogProps, StorageBackend, StorageProps};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
@@ -83,17 +83,68 @@ pub fn read_connection(ctx: &dyn UdfContext, name: Option<&str>) -> Result<Resol
 ///
 /// Rules, in precedence order:
 /// 1. `warehouse` is the only unconditionally-required field.
-/// 2. SigV4 and catalog token/OAuth authentication are mutually exclusive.
-/// 3. When `use_sigv4` is enabled, `access_key`, `secret_key`, and `region` are
+/// 2. Azure and static S3 storage credentials cannot both be supplied. An
+///    undeclared precedence between two credential sets would resolve an
+///    ambiguous credentials input silently, which is the misconfiguration the
+///    rest of these rules exist to prevent.
+/// 3. A CONNECTION supplying ANY Azure field is an Azure CONNECTION, and an
+///    Azure CONNECTION requires `account_name` plus EXACTLY ONE of `account_key`
+///    and `sas_token`. Keying on any-of-three rather than on `account_name`
+///    alone is what turns a CONNECTION that supplies a credential and forgets
+///    the account name into a named-field error instead of a silent fall back to
+///    S3 with the credential ignored.
+/// 4. SigV4 and catalog token/OAuth authentication are mutually exclusive.
+/// 5. When `use_sigv4` is enabled, `access_key`, `secret_key`, and `region` are
 ///    required (they sign the catalog `load_table` request ahead of any vended
 ///    credentials); this holds regardless of `use_vended_credentials`. `endpoint`
 ///    stays optional.
-/// 4. OAuth2 client credentials require both `client_id` and `client_secret`.
+/// 6. OAuth2 client credentials require both `client_id` and `client_secret`.
+///
+/// Rules 2 and 3 sit ahead of 4-6 because they decide WHICH storage backend the
+/// credential set describes; reporting a catalog-authentication defect first
+/// would leave a malformed storage-credential set unreported until the operator
+/// fixed an unrelated field. Rule 2 sits ahead of rule 3 because a CONNECTION
+/// carrying both credential sets has no single well-formed shape for rule 3 to
+/// check it against. `use_sigv4` together with Azure fields needs no rule of its
+/// own: rule 2 rejects it when the SigV4 fields are supplied, and rule 5 rejects
+/// it when they are not.
 fn validate_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     if creds.warehouse.is_empty() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' password is missing required field: {REQUIRED_KEY}"
         )));
+    }
+
+    let azure_fields = supplied_azure_fields(creds);
+    if !azure_fields.is_empty() {
+        let s3_fields = supplied_s3_fields(creds);
+        if !s3_fields.is_empty() {
+            return Err(UdfError::User(format!(
+                "CONNECTION '{name}' supplies Azure storage credential field(s) {} together \
+                 with S3 storage credential field(s) {}; Azure and S3 storage credentials \
+                 cannot both be supplied on one CONNECTION",
+                azure_fields.join(", "),
+                s3_fields.join(", ")
+            )));
+        }
+
+        let mut defects: Vec<&str> = Vec::new();
+        if creds.account_name.is_none() {
+            defects.push("account_name is missing");
+        }
+        match (creds.account_key.is_some(), creds.sas_token.is_some()) {
+            (true, true) => defects.push("account_key and sas_token are both present"),
+            (false, false) => defects.push("neither account_key nor sas_token is present"),
+            (true, false) | (false, true) => {}
+        }
+        if !defects.is_empty() {
+            return Err(UdfError::User(format!(
+                "CONNECTION '{name}' supplies Azure storage credential field(s) {}; an Azure \
+                 CONNECTION requires account_name and exactly one of account_key and sas_token: {}",
+                azure_fields.join(", "),
+                defects.join("; ")
+            )));
+        }
     }
 
     if creds.use_sigv4 && creds.has_catalog_auth() {
@@ -142,6 +193,38 @@ fn validate_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     Ok(())
 }
 
+/// The Azure storage-credential field names this CONNECTION supplies. An empty
+/// result is what makes a CONNECTION an S3 one: naming no Azure field describes
+/// no Azure backend.
+fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
+    [
+        ("account_name", creds.account_name.is_some()),
+        ("account_key", creds.account_key.is_some()),
+        ("sas_token", creds.sas_token.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, supplied)| supplied.then_some(field))
+    .collect()
+}
+
+/// The static S3 storage-credential field names this CONNECTION supplies.
+///
+/// The four string fields use the empty string as "absent", the convention
+/// `parse_creds` applies to every field it reads through `nonempty_str`;
+/// `session_token` uses `None`.
+fn supplied_s3_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
+    [
+        ("endpoint", !creds.endpoint.is_empty()),
+        ("region", !creds.region.is_empty()),
+        ("access_key", !creds.access_key.is_empty()),
+        ("secret_key", !creds.secret_key.is_empty()),
+        ("session_token", creds.session_token.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, supplied)| supplied.then_some(field))
+    .collect()
+}
+
 fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
     ConnectionCreds {
         warehouse: nonempty_str(json, "warehouse").unwrap_or("").to_string(),
@@ -167,6 +250,9 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
         client_secret: nonempty_str(json, "client_secret").map(|s| s.to_string()),
         oauth2_server_uri: nonempty_str(json, "oauth2_server_uri").map(|s| s.to_string()),
         scope: nonempty_str(json, "scope").map(|s| s.to_string()),
+        account_name: nonempty_str(json, "account_name").map(|s| s.to_string()),
+        account_key: nonempty_str(json, "account_key").map(|s| s.to_string()),
+        sas_token: nonempty_str(json, "sas_token").map(|s| s.to_string()),
     }
 }
 
@@ -176,8 +262,32 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
 /// `resolve_connection_config`, not from the connection creds themselves;
 /// taking it here lets this function finish building the `StorageBackend`
 /// payload in one step, so no caller has to mutate the constructed payload
-/// afterwards to apply it.
+/// afterwards to apply it. It is an S3-only knob: the Azure backend carries no
+/// HTTP-scheme field, so an Azure CONNECTION ignores it.
+///
+/// This is the ONE site that selects a storage backend from input, and it is
+/// TOTAL by construction. The Azure branch needs an account name AND a
+/// resolvable [`AdlsCred`] — exactly one of `account_key` and `sas_token` —
+/// and falls through to S3 when either is absent. `read_connection` always runs
+/// `validate_creds` first, so that fall-through is unreachable in production;
+/// it is a deterministic answer rather than a panic because a panic inside a
+/// UDF is an abnormal VM exit, and the engine responds by SIGKILLing every
+/// sibling VM of the statement part — turning a defensive assertion into a
+/// cluster-wide failure. Returning `Result` instead would push a new error path
+/// through the caller for a state that cannot occur.
 pub fn storage_block(creds: &ConnectionCreds, allow_http: bool) -> StorageBackend {
+    let azure_cred = match (creds.account_key.as_deref(), creds.sas_token.as_deref()) {
+        (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),
+        (None, Some(sas_token)) => Some(AdlsCred::Sas(sas_token.to_string())),
+        (Some(_), Some(_)) | (None, None) => None,
+    };
+    if let (Some(account_name), Some(cred)) = (creds.account_name.as_deref(), azure_cred) {
+        return StorageBackend::Adls {
+            account_name: account_name.to_string(),
+            cred,
+        };
+    }
+
     StorageBackend::S3(StorageProps {
         endpoint: creds.endpoint.clone(),
         region: creds.region.clone(),
@@ -482,7 +592,9 @@ mod tests {
     fn storage_block_maps_creds_to_storage_props() {
         let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
         let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
-        let StorageBackend::S3(storage) = storage_block(&resolved.creds, false);
+        let StorageBackend::S3(storage) = storage_block(&resolved.creds, false) else {
+            panic!("S3 creds must select the S3 backend")
+        };
 
         assert_eq!(storage.endpoint, "http://s3.example.com");
         assert_eq!(storage.region, "us-east-1");
@@ -490,6 +602,191 @@ mod tests {
         assert_eq!(storage.secret_key, "SECRET");
         assert_eq!(storage.session_token, None);
         assert!(storage.path_style);
+    }
+
+    /// Distinctive so a "this value never reaches an error" assertion cannot pass
+    /// by accident: no substring of these appears in any field name or fixed
+    /// message text.
+    const AZURE_ACCOUNT_KEY: &str = "azure-shared-key-must-never-leak";
+    const AZURE_SAS: &str = "sv=2024-01-01&sig=azure-sas-signature-must-never-leak";
+    const S3_SECRET: &str = "s3-secret-must-never-leak";
+
+    /// The account-key shape resolves to `AdlsCred::AccountKey` and leaves
+    /// `sas_token` absent — the two Azure credential fields are never both
+    /// populated on a well-formed CONNECTION.
+    #[test]
+    fn account_key_creds_select_the_adls_backend() {
+        let password = serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "account_key": AZURE_ACCOUNT_KEY,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
+
+        let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+
+        assert_eq!(resolved.creds.account_name.as_deref(), Some("myaccount"));
+        assert_eq!(
+            resolved.creds.account_key.as_deref(),
+            Some(AZURE_ACCOUNT_KEY)
+        );
+        assert_eq!(resolved.creds.sas_token, None);
+        assert_eq!(
+            storage_block(&resolved.creds, false),
+            StorageBackend::Adls {
+                account_name: "myaccount".to_string(),
+                cred: AdlsCred::AccountKey(AZURE_ACCOUNT_KEY.to_string()),
+            }
+        );
+    }
+
+    /// `allow_http` is an S3-only knob, so passing it enabled must leave the Azure
+    /// payload identical — the variant carries no HTTP-scheme field at all.
+    #[test]
+    fn sas_token_creds_select_the_adls_backend() {
+        let password = serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "sas_token": AZURE_SAS,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
+
+        let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+
+        assert_eq!(resolved.creds.sas_token.as_deref(), Some(AZURE_SAS));
+        assert_eq!(resolved.creds.account_key, None);
+        assert_eq!(
+            storage_block(&resolved.creds, true),
+            StorageBackend::Adls {
+                account_name: "myaccount".to_string(),
+                cred: AdlsCred::Sas(AZURE_SAS.to_string()),
+            }
+        );
+    }
+
+    /// The three malformed Azure shapes: no account name, both credentials, and
+    /// neither credential. Each names its own defect and no supplied value.
+    #[test]
+    fn azure_creds_require_account_name_and_exactly_one_credential() {
+        let shapes = [
+            (
+                serde_json::json!({ "warehouse": "wh", "account_key": AZURE_ACCOUNT_KEY }),
+                "account_name is missing",
+            ),
+            (
+                serde_json::json!({
+                    "warehouse": "wh",
+                    "account_name": "myaccount",
+                    "account_key": AZURE_ACCOUNT_KEY,
+                    "sas_token": AZURE_SAS,
+                }),
+                "account_key and sas_token are both present",
+            ),
+            (
+                serde_json::json!({ "warehouse": "wh", "account_name": "myaccount" }),
+                "neither account_key nor sas_token is present",
+            ),
+        ];
+
+        for (password, expected_defect) in shapes {
+            let ctx = StubCtx::with_conn("http://catalog.example.com", &password.to_string());
+
+            let err = read_connection(&ctx, Some("MY_CONN"))
+                .expect_err("a malformed Azure credential set must be rejected")
+                .to_string();
+
+            assert!(
+                err.contains("account_name and exactly one of account_key and sas_token"),
+                "{err}"
+            );
+            assert!(err.contains(expected_defect), "{err}");
+            assert!(!err.contains(AZURE_ACCOUNT_KEY), "{err}");
+            assert!(!err.contains(AZURE_SAS), "{err}");
+        }
+    }
+
+    /// The rejection names every supplied field so the operator can see which
+    /// two credential sets collided, while echoing none of their values.
+    #[test]
+    fn mixed_azure_and_s3_credential_fields_are_rejected() {
+        let password = serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "account_key": AZURE_ACCOUNT_KEY,
+            "region": "us-east-1",
+            "secret_key": S3_SECRET,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
+
+        let err = read_connection(&ctx, Some("MY_CONN"))
+            .expect_err("a CONNECTION mixing Azure and S3 credential fields must be rejected")
+            .to_string();
+
+        assert!(
+            err.contains("Azure and S3 storage credentials cannot both be supplied"),
+            "{err}"
+        );
+        for supplied_field in ["account_name", "account_key", "region", "secret_key"] {
+            assert!(
+                err.contains(supplied_field),
+                "{supplied_field} missing: {err}"
+            );
+        }
+        assert!(!err.contains(AZURE_ACCOUNT_KEY), "{err}");
+        assert!(!err.contains(S3_SECRET), "{err}");
+    }
+
+    /// A CONNECTION naming no Azure field is still an S3 CONNECTION, whether or
+    /// not it requests vended credentials.
+    #[test]
+    fn absent_optional_fields_default_and_still_select_s3() {
+        for use_vended_credentials in [false, true] {
+            let password = serde_json::json!({
+                "warehouse": "wh",
+                "use_vended_credentials": use_vended_credentials,
+            })
+            .to_string();
+            let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
+
+            let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+
+            assert_eq!(resolved.creds.account_name, None);
+            assert_eq!(resolved.creds.account_key, None);
+            assert_eq!(resolved.creds.sas_token, None);
+            assert_eq!(
+                storage_block(&resolved.creds, false),
+                StorageBackend::S3(StorageProps::default())
+            );
+        }
+    }
+
+    /// `storage_block` is total. A credential set that never passed
+    /// `validate_creds` — two Azure credentials at once, or a credential with no
+    /// account name — resolves deterministically to S3 instead of panicking,
+    /// because a panic inside a UDF is an abnormal VM exit and the engine
+    /// SIGKILLs every sibling VM of the statement part when one dies that way.
+    #[test]
+    fn storage_block_falls_through_to_s3_for_an_unvalidated_azure_shape() {
+        let both_credentials = parse_creds(&serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "account_key": AZURE_ACCOUNT_KEY,
+            "sas_token": AZURE_SAS,
+        }));
+        let no_account_name = parse_creds(&serde_json::json!({
+            "warehouse": "wh",
+            "account_key": AZURE_ACCOUNT_KEY,
+        }));
+
+        for creds in [both_credentials, no_account_name] {
+            assert_eq!(
+                storage_block(&creds, false),
+                StorageBackend::S3(StorageProps::default())
+            );
+        }
     }
 
     #[test]

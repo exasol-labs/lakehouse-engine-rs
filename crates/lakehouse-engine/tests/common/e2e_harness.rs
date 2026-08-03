@@ -330,6 +330,9 @@ pub fn local_stack_creds() -> ConnectionCreds {
         client_secret: None,
         oauth2_server_uri: None,
         scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
     }
 }
 

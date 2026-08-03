@@ -22,8 +22,9 @@ pub fn redact_secret_values(s: &str, secrets: &[&str]) -> String {
 
 /// Replace credential-shaped substrings with "[REDACTED]".
 ///
-/// Catches common S3 credential patterns, SigV4 Authorization headers, and
-/// vended STS keys without pulling in a regex crate.
+/// Catches common S3 credential patterns, SigV4 Authorization headers, vended
+/// STS keys, and Azure ADLS static-credential patterns, without pulling in a
+/// regex crate.
 pub fn redact_credentials(s: &str) -> String {
     // Heuristic: anything that looks like an AWS key (long alphanum after
     // known key names) is replaced. We keep this simple and conservative.
@@ -45,6 +46,13 @@ pub fn redact_credentials(s: &str) -> String {
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
+        "account_key",
+        "sas_token",
+        "adls.account-key",
+        "adls.sas-token",
+        "azure_storage_access_key",
+        "azure_storage_sas_key",
+        "sig=",
     ];
     const REDACTED: &str = "[REDACTED]";
     let mut result = s.to_string();
@@ -55,9 +63,9 @@ pub fn redact_credentials(s: &str) -> String {
         // 2nd+ occurrence if we stopped after the first match. The cursor
         // advances past each redaction so the re-emitted label is never
         // re-matched (which would loop forever).
-        let pat_lower = pat.to_lowercase();
+        let pat_lower = pat.to_ascii_lowercase();
         let mut from = 0;
-        while let Some(rel) = result[from..].to_lowercase().find(&pat_lower) {
+        while let Some(rel) = result[from..].to_ascii_lowercase().find(&pat_lower) {
             let idx = from + rel;
             let after = idx + pat.len();
             // Find the end of the value (next quote, whitespace, comma, or ampersand).
@@ -73,6 +81,19 @@ pub fn redact_credentials(s: &str) -> String {
         }
     }
     result
+}
+
+/// Strip credentials from an external error string before it is surfaced.
+///
+/// The single owner of the two-pass composition: [`redact_secret_values`] FIRST,
+/// [`redact_credentials`] SECOND. The order is load-bearing, not stylistic — an
+/// Azure SAS token carries its own `sig=` label, so a label-first pass rewrites
+/// the middle of the token and leaves the value pass unable to match the literal,
+/// surfacing the token's permission and expiry fields verbatim. Value-first
+/// removes the whole token, and the label pass then still catches credential
+/// shapes whose literal value the caller never held.
+pub fn redact_error_text(msg: &str, secrets: &[&str]) -> String {
+    redact_credentials(&redact_secret_values(msg, secrets))
 }
 
 #[cfg(test)]
@@ -175,6 +196,71 @@ mod tests {
         );
     }
 
+    /// Scenario: Azure ADLS static-credential labels (field names, iceberg
+    /// storage config keys, and the SAS-URL signature query parameter) are
+    /// redacted, mirroring the AWS-label coverage above.
+    #[test]
+    fn redact_credentials_strips_azure_account_key_and_sas_labels() {
+        let msg = concat!(
+            "account_key=STATIC_ACCOUNT_KEY_VALUE ",
+            "sas_token=STATIC_SAS_TOKEN_VALUE ",
+            "adls.account-key=CONFIG_ACCOUNT_KEY_VALUE ",
+            "adls.sas-token=CONFIG_SAS_TOKEN_VALUE ",
+            "azure_storage_access_key=ENV_ACCOUNT_KEY_VALUE ",
+            "azure_storage_sas_key=ENV_SAS_KEY_VALUE ",
+            "https://acct.blob.core.windows.net/c/f?sv=2023&sig=SAS_SIGNATURE_VALUE"
+        );
+        let safe = redact_credentials(msg);
+        for secret in [
+            "STATIC_ACCOUNT_KEY_VALUE",
+            "STATIC_SAS_TOKEN_VALUE",
+            "CONFIG_ACCOUNT_KEY_VALUE",
+            "CONFIG_SAS_TOKEN_VALUE",
+            "ENV_ACCOUNT_KEY_VALUE",
+            "ENV_SAS_KEY_VALUE",
+            "SAS_SIGNATURE_VALUE",
+        ] {
+            assert!(!safe.contains(secret), "secret must be redacted: {safe}");
+        }
+        for label in [
+            "account_key",
+            "sas_token",
+            "adls.account-key",
+            "adls.sas-token",
+        ] {
+            assert!(safe.contains(label), "label must be preserved: {safe}");
+        }
+    }
+
+    /// Scenario: `redact_error_text` runs the value pass BEFORE the label pass, so a
+    /// SAS token — which carries its own `sig=` label — is removed whole.
+    ///
+    /// Pins the ORDER, not just the outcome: the inverted composition is asserted to
+    /// still leak the token's `sp=` permission field, so swapping the two calls inside
+    /// `redact_error_text` fails here instead of silently passing.
+    #[test]
+    fn redact_error_text_removes_a_sas_token_whole_unlike_the_inverted_order() {
+        let sas = "sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=SIG_VALUE";
+        let raw = format!("failed to open https://acct.blob.core.windows.net/c/f?{sas}");
+
+        let safe = redact_error_text(&raw, &[sas]);
+        assert!(!safe.contains(sas), "SAS literal must be gone: {safe}");
+        assert!(
+            !safe.contains("sp=rwdlacx"),
+            "permission field must not survive: {safe}"
+        );
+        assert!(
+            !safe.contains("SIG_VALUE"),
+            "signature must not survive: {safe}"
+        );
+
+        let inverted = redact_secret_values(&redact_credentials(&raw), &[sas]);
+        assert!(
+            inverted.contains("sp=rwdlacx"),
+            "inverted order is expected to leak the permission field: {inverted}"
+        );
+    }
+
     /// Scenario: A label that appears MORE than once in the same error string is
     /// fully redacted on every occurrence — not just the first.
     ///
@@ -226,6 +312,21 @@ mod tests {
         assert!(
             safe.contains("access_key"),
             "label must be preserved: {safe}"
+        );
+    }
+
+    /// A Unicode character whose full case-folding grows its byte length (e.g.
+    /// Turkish dotted İ → "i̇") must not desync the byte offsets computed from
+    /// the lowercased search string against the original — `to_lowercase()`
+    /// once did, and `result[..idx]` panicked on a non-ASCII multi-byte
+    /// continuation byte. `to_ascii_lowercase()` preserves length exactly.
+    #[test]
+    fn redact_credentials_does_not_panic_on_length_changing_unicode_casefold() {
+        let msg = "İİİİİsig=ütoken";
+        let safe = redact_credentials(msg);
+        assert!(
+            !safe.contains("sig=ü"),
+            "sig= value must be redacted: {safe}"
         );
     }
 }
