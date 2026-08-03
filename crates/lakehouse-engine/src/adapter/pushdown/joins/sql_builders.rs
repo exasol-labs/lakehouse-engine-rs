@@ -1708,15 +1708,18 @@ mod tests {
     }
 
     /// The exact failing-E2E shape: `COUNT(DISTINCT CAST(col AS CHAR(20)))`
-    /// routed to the qualified wrapper must render the CAST target
-    /// LENGTH-QUALIFIED (`VARCHAR(20)`), never bare `VARCHAR`. The qualified
-    /// wrapper SQL is parsed by Exasol's own engine, whose VARCHAR type REQUIRES
-    /// a length — a bare `VARCHAR` is the "unexpected ')', expecting '('" parse
-    /// error (`count_distinct_expression_arg_via_wrapper_matches_single_node`).
-    /// This guards the join/qualified-wrapper half of the Exasol-dialect CAST
-    /// split under plain `cargo test`, without Docker/Exasol.
+    /// routed to the qualified wrapper must render the CAST target as the
+    /// declared, LENGTH-QUALIFIED `CHAR(20) ASCII`, never bare `VARCHAR` and
+    /// never a collapsed `VARCHAR(20)`. The qualified wrapper SQL is parsed and
+    /// type-checked by Exasol's own engine: a bare `VARCHAR` is the "unexpected
+    /// ')', expecting '('" parse error
+    /// (`count_distinct_expression_arg_via_wrapper_matches_single_node`), and a
+    /// `VARCHAR(20)` where Exasol declared `CHAR(20) ASCII` is the "Data type
+    /// mismatch" pushdown rejection of #192. This guards the
+    /// join/qualified-wrapper one of the three Exasol-dialect CAST consumers
+    /// under plain `cargo test`, without Docker/Exasol.
     #[test]
-    fn qualified_count_distinct_cast_char_renders_length_qualified_exasol_varchar() {
+    fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
         let alias_of = seam_alias_of();
         let item = serde_json::json!({
             "type": "function_aggregate", "name": "COUNT", "distinct": true,
@@ -1729,16 +1732,69 @@ mod tests {
         let sql = render_selectlist_item_qualified(&item, &alias_of)
             .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
         assert!(
-            sql.contains("VARCHAR(20)"),
-            "Exasol-parsed qualified wrapper needs a length-qualified CAST target: {sql}"
+            sql.contains("CHAR(20) ASCII"),
+            "Exasol-parsed qualified wrapper needs the declared length-qualified \
+             CHAR CAST target: {sql}"
         );
         assert!(
             !sql.contains("AS VARCHAR)"),
             "must NOT emit a bare length-less VARCHAR (Exasol rejects it): {sql}"
         );
         assert!(
-            sql.contains(r#"COUNT(DISTINCT CAST("LHS_T0"."C_VARCHAR" AS VARCHAR(20)))"#),
+            !sql.contains("VARCHAR(20)"),
+            "must NOT collapse the declared CHAR target to VARCHAR(20) (#192): {sql}"
+        );
+        assert!(
+            sql.contains(r#"COUNT(DISTINCT CAST("LHS_T0"."C_VARCHAR" AS CHAR(20) ASCII))"#),
             "full qualified COUNT(DISTINCT CAST(...)) shape must match: {sql}"
+        );
+    }
+
+    /// The N-scan unaccelerated join wrapper — the second of the three
+    /// Exasol-dialect CAST consumers — carries the same CAST-to-CHAR select item
+    /// through `n_scan_join_select_items`, so its outer SELECT list must declare
+    /// the target as `CHAR(20) ASCII` too. The wrapper's SELECT is validated
+    /// positionally against Exasol's `selectListDataTypes`, so a collapsed
+    /// `VARCHAR(20)` here is the same #192 "Data type mismatch" rejection.
+    #[test]
+    fn n_scan_join_select_list_renders_exasol_char_target() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {"type": "function_scalar_cast", "name": "CAST",
+             "arguments": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+             "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}},
+            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+        ]);
+        request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10});
+
+        assert!(
+            join_requires_exasol_postprocessing(&pd(&request)),
+            "a LIMIT must force the Exasol-executed N-scan wrapper path"
+        );
+
+        let detected = detected_join(&request);
+        let sides = vec![
+            resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+            resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected,
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        )
+        .expect("a CAST-to-CHAR select item must build the unified wrapper");
+
+        assert!(
+            sql.contains(r#"CAST("LHS_T0"."C_NAME" AS CHAR(20) ASCII)"#),
+            "the N-scan wrapper's SELECT list must declare the CHAR target: {sql}"
+        );
+        assert!(
+            !sql.contains("VARCHAR(20)") && !sql.contains("AS VARCHAR)"),
+            "must neither collapse to VARCHAR(20) nor emit a bare VARCHAR: {sql}"
         );
     }
 

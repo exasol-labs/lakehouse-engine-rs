@@ -51,7 +51,8 @@ pub use grouped_agg::{
     detect_group_by_aggregates, validate_agg_col_types,
 };
 use grouped_agg::{
-    GroupedOrderBy, build_grouped_order_by_clause, group_key_exasol_types, render_having_over_merge,
+    GroupedOrderBy, blank_pad_char_group_keys, build_grouped_order_by_clause,
+    group_key_exasol_types, render_having_over_merge,
 };
 
 mod request_shape;
@@ -376,6 +377,13 @@ pub(crate) fn build_dispatch_sql(
             // rebuilt with `limit = None`), preserving the anti-wrong-truncation
             // invariant (decision [4]).
             let grouped_limit = limit;
+            // Resolved BEFORE the spec: the DataFusion-side group keys are derived
+            // from these declared types, because a CHAR(n)-declared key must be
+            // blank-padded to n to reproduce Exasol's own CHAR grouping (#192).
+            // ONLY the spec copy is padded — `build_grouped_order_by_clause` above
+            // and `build_grouped_aggregate_scan_sql` below keep the unpadded
+            // fragments, which are what a pushed ORDER BY is matched against.
+            let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
             // This branch is ALWAYS an aggregate dispatch — see `ScanSpec::projection`
             // doc for why an empty `projection` is inert here, not "all columns"
             // (#145). Aggregate scans also emit via the freely-coercing Value path,
@@ -387,12 +395,11 @@ pub(crate) fn build_dispatch_sql(
                     filter,
                     limit: grouped_limit,
                     aggregates: Some(grouped_agg_plans.clone()),
-                    group_keys: Some(group_keys.clone()),
+                    group_keys: Some(blank_pad_char_group_keys(&group_keys, &group_key_types)),
                     ..base.clone()
                 },
                 files: vec![],
             };
-            let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
             // Per-plan declared types, aligned 1:1 with `grouped_agg_plans` (which
             // now includes aggregates nested inside a scalar-over-aggregate item).
             // `aggregate_exasol_types` keyed off top-level select items only and
@@ -1329,6 +1336,263 @@ mod tests {
         assert!(
             sql.contains(r#"ORDER BY "NAME""#) && sql.contains("LIMIT 5"),
             "a matched top-N must still form (sort key already projected, native type): {sql}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CHAR-declared group-key blank padding through the real dispatcher (#192)
+    // ---------------------------------------------------------------------------
+
+    /// A `CAST(NAME AS CHAR(size))` select-list/`groupBy` node, declared with
+    /// `character_set` so both the plain and the ` ASCII`-suffixed declared type
+    /// can be driven through the dispatcher.
+    fn char_cast_key(size: u64, character_set: &str) -> Json {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
+            "arguments": [{"type": "column", "name": "NAME"}]
+        })
+    }
+
+    /// Wrap a single group key + `COUNT(*)` into the grouped request shape, with
+    /// the key's declared type at its own `selectListDataTypes` ordinal.
+    fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Json {
+        let mut body = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [key.clone()],
+            "selectList": [key, agg_item("COUNT", None, false)],
+            "selectListDataTypes": [key_type, {"type": "decimal", "precision": 18, "scale": 0}],
+        });
+        if let Some(elements) = order_by {
+            body["orderBy"] = elements;
+        }
+        guard_events_request(body)
+    }
+
+    /// Wrap a single group key + `COUNT(*)` into the grouped request shape with the
+    /// key ABSENT from `selectList` (`SELECT COUNT(*) … GROUP BY <key>`), so its
+    /// declared type is reachable only through its own `groupBy` node.
+    fn unprojected_char_grouped_request(key: Json) -> Json {
+        guard_events_request(serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [key],
+            "selectList": [agg_item("COUNT", None, false)],
+            "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+        }))
+    }
+
+    /// The `group_keys` entry the emitted scan spec must carry, escaped exactly as
+    /// the dispatcher embeds it: JSON-encoded into the spec blob, then wrapped in a
+    /// SQL string literal (single quotes doubled).
+    fn embedded_group_keys(fragments: &[String]) -> String {
+        let encoded: Vec<String> = fragments
+            .iter()
+            .map(|f| serde_json::to_string(f).expect("a group-key fragment is JSON-encodable"))
+            .collect();
+        format!(r#""group_keys":[{}]"#, encoded.join(",")).replace('\'', "''")
+    }
+
+    /// The dispatcher's grouped arm must hand the DataFusion side a BLANK-PADDED
+    /// copy of a `CHAR(20)`-declared group key, while the outer merge wrapper keeps
+    /// casting the staging column back to `CHAR(20)`. Without the pad, `'ab'` and
+    /// `'ab   '` reach the merge as two distinct `GK_0` values and the query returns
+    /// two rows where Exasol's own `CAST(x AS CHAR(20))` returns one (issue #192).
+    #[test]
+    fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
+        let request = char_grouped_request(
+            char_cast_key(20, "UTF8"),
+            serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
+            None,
+        );
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+        let padded = format!(
+            "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
+             ELSE {fragment} END"
+        );
+        assert!(
+            sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
+            "the scan spec must carry the blank-padded group key {padded}: {sql}"
+        );
+        assert!(
+            sql.contains(r#"CAST("GK_0" AS CHAR(20))"#),
+            "the outer merge wrapper must still cast the staging column to CHAR(20): {sql}"
+        );
+    }
+
+    /// The same pad must reach the scan spec when the CHAR-declared key is NOT in
+    /// the select list (`SELECT COUNT(*) … GROUP BY CAST(NAME AS CHAR(20))`). This
+    /// shape is strictly more dangerous than the projected one: the outer wrapper
+    /// has no `CAST("GK_0" AS CHAR(20))` output column, so an unpadded key raises
+    /// no type mismatch — it just returns a row per trailing-blank variant where
+    /// Exasol returns one merged row (#192 review finding).
+    #[test]
+    fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
+        let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+        let padded = format!(
+            "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
+             ELSE {fragment} END"
+        );
+        assert!(
+            sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
+            "an unprojected CHAR(20) group key must still reach the scan padded: {sql}"
+        );
+    }
+
+    /// CONTROL for the unprojected path: a VARCHAR-declared `groupBy` node must
+    /// reach the scan spec unpadded. The `groupBy` fallback fires here (the node
+    /// carries a `dataType`), so this proves it resolves the declared type rather
+    /// than padding every unprojected group key.
+    #[test]
+    fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
+        let request = unprojected_char_grouped_request(serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "VARCHAR", "size": 10},
+            "arguments": [{"type": "column", "name": "NAME"}]
+        }));
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            sql.contains(&embedded_group_keys(&[
+                r#"CAST("NAME" AS VARCHAR)"#.to_string()
+            ])),
+            "an unprojected VARCHAR-declared group key must reach the scan unpadded: {sql}"
+        );
+        assert!(
+            !sql.contains("rpad("),
+            "no pad may be emitted for an unprojected VARCHAR-declared group key: {sql}"
+        );
+    }
+
+    /// The pad width must survive the ` ASCII` character-set suffix Exasol appends
+    /// to an ASCII-declared CHAR — the #192 primary shape. A parse that trims a
+    /// trailing `)` off the declared type would find no width here and ship the key
+    /// unpadded, reintroducing the wrong-row-count bug for every ASCII CHAR key.
+    #[test]
+    fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
+        let request = char_grouped_request(
+            char_cast_key(3, "ASCII"),
+            serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"}),
+            None,
+        );
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+        let padded = format!(
+            "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
+             ELSE {fragment} END"
+        );
+        assert!(
+            sql.contains(&embedded_group_keys(std::slice::from_ref(&padded))),
+            "a `CHAR(3) ASCII` group key must reach the scan padded to 3: {sql}"
+        );
+        assert!(
+            sql.contains(r#"CAST("GK_0" AS CHAR(3) ASCII)"#),
+            "the outer merge wrapper must still cast the staging column to CHAR(3) ASCII: {sql}"
+        );
+    }
+
+    /// CONTROL: a VARCHAR-declared group key must reach the scan spec byte-identical
+    /// to the pre-fix rendering — VARCHAR carries no blank padding, so wrapping it
+    /// would change grouping semantics for every ordinary string GROUP BY.
+    #[test]
+    fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
+        let request = char_grouped_request(
+            serde_json::json!({"type": "column", "name": "REGION"}),
+            serde_json::json!({"type": "varchar", "size": 10}),
+            None,
+        );
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("REGION".to_string())],
+            vec!["VARCHAR(10)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            sql.contains(&embedded_group_keys(&[r#""REGION""#.to_string()])),
+            "a VARCHAR-declared group key must reach the scan unpadded: {sql}"
+        );
+        assert!(
+            !sql.contains("rpad("),
+            "no pad may be emitted for a VARCHAR-declared group key: {sql}"
+        );
+    }
+
+    /// The padded copy goes ONLY to the DataFusion side: `build_grouped_order_by_clause`
+    /// matches a pushed `orderBy` against the UNPADDED rendered group keys, so a sort
+    /// on a CHAR-declared group key must still resolve to its output ordinal. Matching
+    /// against the padded copy instead would make it `Unresolvable` and turn every
+    /// `ORDER BY` over a CHAR group key into a hard pushdown decline.
+    ///
+    /// The key is a bare column because `parse_sort_key_element` accepts only bare
+    /// columns as sort keys — an expression sort key declines for its own, unrelated
+    /// reason and would not exercise the padded/unpadded split at all.
+    #[test]
+    fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
+        let request = char_grouped_request(
+            serde_json::json!({"type": "column", "name": "NAME"}),
+            serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"}),
+            Some(serde_json::json!([{
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "NAME"},
+                "isAscending": true,
+                "nullsLast": true
+            }])),
+        );
+
+        let sql = guard_dispatch_sql(
+            &request,
+            vec![ProjectionItem::Column("NAME".to_string())],
+            vec!["VARCHAR(2000000)".to_string()],
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            sql.contains("ORDER BY 1"),
+            "the sort on the CHAR-declared group key must resolve to output ordinal 1: {sql}"
+        );
+        assert!(
+            sql.contains("rpad("),
+            "the DataFusion-side copy must still be padded alongside the resolved \
+             ORDER BY: {sql}"
         );
     }
 }

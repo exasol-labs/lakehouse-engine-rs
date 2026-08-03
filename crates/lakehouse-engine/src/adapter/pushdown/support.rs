@@ -774,6 +774,29 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
+/// Exasol's maximum CHAR width. A wider declaration is rejected outright:
+/// `CAST('a' AS CHAR(2001))` fails live with "specified length too long for char
+/// type - maximum is 2000". So a CHAR `size` is capped here rather than reusing
+/// VARCHAR's 2,000,000 ceiling.
+const EXASOL_CHAR_MAX_SIZE: u64 = 2000;
+
+/// Exasol's maximum VARCHAR width.
+const EXASOL_VARCHAR_MAX_SIZE: u64 = 2000000;
+
+/// The character-set suffix a CHAR/VARCHAR declaration needs, `" ASCII"` or `""`.
+///
+/// Exasol treats an unsuffixed character declaration as UTF8, so a column it
+/// declared `ASCII` must carry the suffix back or its type check reports a "Data
+/// type mismatch" (issue #136 follow-up). Shared by the CHAR and VARCHAR arms:
+/// the rule must be identical for both, and a second copy would drift (issue #52).
+fn character_set_suffix(dt: &Json) -> &'static str {
+    let is_ascii = dt
+        .get("characterSet")
+        .and_then(|v| v.as_str())
+        .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
+    if is_ascii { " ASCII" } else { "" }
+}
+
 /// Derive an Exasol type string from the VS column dataType JSON.
 pub(super) fn exasol_type_from_json(dt: &Json) -> String {
     let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
@@ -801,19 +824,35 @@ pub(super) fn exasol_type_from_json(dt: &Json) -> String {
                 "TIMESTAMP".to_string()
             }
         }
-        _ => {
-            // VARCHAR, CHAR, and all others.
-            let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
-            let capped = size.min(2000000);
-            let is_ascii = dt
-                .get("characterSet")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-            if is_ascii {
-                format!("VARCHAR({capped}) ASCII")
-            } else {
-                format!("VARCHAR({capped})")
+        "char" => {
+            // A genuine CHAR must stay CHAR: Exasol validates the pushdown output
+            // column type positionally, and it declares an equal-length CASE, a bare
+            // string literal, and an explicit CAST-to-CHAR as CHAR(n) — rendering
+            // those VARCHAR(n) is rejected with "Data type mismatch" (issue #192).
+            //
+            // An absent `size` is unreachable from a real Exasol `dataType` — but if
+            // it occurred, it must NOT default to the maximum width: `CHAR(2000)`
+            // would blank-pad every value of that column to 2,000 characters, the
+            // most damaging default available. Instead fall back to the project's
+            // "unknown width" convention (`VARCHAR(2000000)`), matching
+            // `vs-expression`'s `render_cast_target` Exasol CHAR arm. The
+            // `EXASOL_CHAR_MAX_SIZE` cap applies only to a PRESENT `size`.
+            match dt.get("size").and_then(|v| v.as_u64()) {
+                Some(size) => {
+                    let capped = size.min(EXASOL_CHAR_MAX_SIZE);
+                    format!("CHAR({capped}){}", character_set_suffix(dt))
+                }
+                None => format!("VARCHAR({EXASOL_VARCHAR_MAX_SIZE})"),
             }
+        }
+        _ => {
+            // VARCHAR and all others.
+            let size = dt
+                .get("size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(EXASOL_VARCHAR_MAX_SIZE);
+            let capped = size.min(EXASOL_VARCHAR_MAX_SIZE);
+            format!("VARCHAR({capped}){}", character_set_suffix(dt))
         }
     }
 }
@@ -887,7 +926,7 @@ mod tests {
     /// `exasol_type_from_json` must read the `characterSet` field back off a
     /// `{"type":"varchar", ...}` dataType JSON (Exasol's wire format for CHAR/VARCHAR
     /// select-list items, e.g. `{"type":"CHAR","size":3,"characterSet":"ASCII"}` as
-    /// confirmed by `vs-expression`'s `renders_cast_char_as_varchar` test) and append
+    /// confirmed by `vs-expression`'s `renders_cast_char_as_datafusion_varchar` test) and append
     /// `" ASCII"` when it is `"ASCII"` (case-insensitively) — otherwise a CASE/literal
     /// expression Exasol declares as `VARCHAR(n) ASCII` round-trips back through our
     /// EMITS clause as bare `VARCHAR(n)`, which Exasol's type checker treats as
@@ -900,6 +939,54 @@ mod tests {
 
         let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
         assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
+    }
+
+    /// `exasol_type_from_json` must render a genuine `{"type":"CHAR", ...}` dataType
+    /// JSON as `CHAR(n)` — not fall through to the catch-all's `VARCHAR(n)` the way
+    /// current code does. An equal-length CASE expression (e.g. `CASE WHEN ... THEN
+    /// 'NEG' ELSE 'POS' END`) round-trips back through this function as `CHAR(3)
+    /// ASCII`; rendering it `VARCHAR(3) ASCII` instead causes Exasol's type checker
+    /// to reject the pushdown with "Data type mismatch" (issue #192).
+    #[test]
+    fn exasol_type_from_json_renders_char_type() {
+        let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
+        assert_eq!(exasol_type_from_json(&ascii), "CHAR(3) ASCII");
+    }
+
+    /// The CHAR arm must mirror VARCHAR's `characterSet` handling exactly: append
+    /// `" ASCII"` only when `characterSet` is `"ASCII"` (case-insensitively), and
+    /// render a bare `CHAR(n)` (no suffix) for `"UTF8"` or when `characterSet` is
+    /// absent — e.g. `CAST(c_phone AS CHAR(20))`, which Exasol declares `CHAR(20)
+    /// UTF8` (live-verified), must round-trip as bare `CHAR(20)`.
+    #[test]
+    fn exasol_type_from_json_propagates_char_ascii_character_set() {
+        let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
+        assert_eq!(exasol_type_from_json(&utf8), "CHAR(20)");
+
+        let no_charset = serde_json::json!({"type": "CHAR", "size": 20});
+        assert_eq!(exasol_type_from_json(&no_charset), "CHAR(20)");
+    }
+
+    /// Exasol rejects a CHAR declaration above 2,000 characters
+    /// (`CAST('a' AS CHAR(2001))` fails live with "specified length too long for
+    /// char type - maximum is 2000"), so the CHAR arm must cap `size` at 2,000 —
+    /// unlike VARCHAR's 2,000,000 cap.
+    #[test]
+    fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
+        let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
+        assert_eq!(exasol_type_from_json(&oversized), "CHAR(2000)");
+    }
+
+    /// An absent `size` on a CHAR `dataType` is unreachable from a real Exasol
+    /// request, but if it occurred the CHAR arm must not silently default to
+    /// the *maximum* width (`CHAR(2000)`, which blank-pads every value to
+    /// 2,000 characters) — it must fall back to the project's "unknown width"
+    /// convention, matching `vs-expression`'s `render_cast_target` Exasol CHAR
+    /// arm.
+    #[test]
+    fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
+        let no_size = serde_json::json!({"type": "CHAR"});
+        assert_eq!(exasol_type_from_json(&no_size), "VARCHAR(2000000)");
     }
 
     // ---------------------------------------------------------------------------
@@ -3132,6 +3219,60 @@ mod tests {
         assert_eq!(proj_types[0], "TIMESTAMP");
     }
 
+    /// A `CAST(<col> AS CHAR(20))` select-list item (`function_scalar_cast`) must
+    /// project with a `CHAR(20)` EMITS type — through the real `project_columns`
+    /// entry point (`extract_projection`), not the bare `exasol_type_from_json`
+    /// function. The declared type comes from `selectListDataTypes`, not from the
+    /// item's own rendered CAST target (which stays a bare, length-less `VARCHAR`
+    /// on the DataFusion dialect — a separate, unaffected non-goal of this fix).
+    /// The item must stay a rendered expression, never falling back to the full
+    /// base row (issue #192, facet B).
+    #[test]
+    fn project_columns_emits_char_type_for_cast_to_char_item() {
+        let cast_item = serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
+            "arguments": [{"type": "column", "name": "c_varchar"}]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "id", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "c_varchar", "dataType": {"type": "varchar", "size": 2000000}},
+                ],
+            }],
+            "pushdownRequest": {
+                "selectList": [
+                    {"type": "column", "name": "id"},
+                    cast_item,
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 20, "scale": 0},
+                    {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
+                ],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+
+        assert_eq!(
+            proj_cols.len(),
+            2,
+            "must project exactly the two select-list items, no full-row fallback: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[1], ProjectionItem::Expr { .. }),
+            "the CAST-to-CHAR item must stay a rendered expression, not fall back to the \
+             full base row: {proj_cols:?}"
+        );
+        assert_eq!(
+            proj_types,
+            vec!["DECIMAL(20,0)".to_string(), "CHAR(20)".to_string()],
+            "the CAST-to-CHAR item must be declared CHAR(20), not VARCHAR(20): {proj_types:?}"
+        );
+    }
+
     /// An untranslatable select-list item falls back to the bare column.
     #[test]
     fn selectlist_untranslatable_item_falls_back_to_column() {
@@ -3266,6 +3407,28 @@ mod tests {
             result,
             Some(filter),
             "VARCHAR subject must be returned unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a genuine CHAR column pushes down unchanged.
+    /// `like_subject_type_guard` already classifies any `CHAR`-prefixed Exasol type
+    /// as a string subject alongside VARCHAR (`support.rs:546`), so this is a
+    /// non-regression CONTROL for the CHAR-type-declaration fix (issue #192): it
+    /// must pass unchanged both before and after that fix.
+    #[test]
+    fn like_guard_char_subject_unchanged() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "code"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("CODE".to_string(), "CHAR(3) ASCII".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "CHAR subject must be returned unchanged"
         );
     }
 
