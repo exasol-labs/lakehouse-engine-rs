@@ -2,13 +2,14 @@
 //!
 //! Extracted verbatim from the former flat `pushdown.rs`.
 
-use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec};
+use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec, render_ordered};
+use crate::types::mapping::{exasol_type_from_json, parse_decimal_args};
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
-use super::support::{build_fan_out_inner, exasol_type_from_json, quote_ident};
-use super::topn::parse_sort_key_element;
+use super::support::{build_fan_out_inner, quote_ident, render_limit_offset};
+use super::topn::parse_sort_flags;
 
 /// Classification of one `selectList` item in a grouped-aggregate pushdown.
 ///
@@ -492,10 +493,12 @@ pub(super) fn group_key_exasol_types(
 /// only (after `GROUP BY`). Never pushed into the shard scan — a per-shard HAVING would
 /// incorrectly discard groups that only clear the threshold after merging across shards.
 ///
-/// ## LIMIT
+/// ## LIMIT / OFFSET
 ///
-/// LIMIT is never pushed into a shard spec for grouped queries (shard emits all
-/// partial groups; the outer wrapper applies the final LIMIT when needed).
+/// LIMIT and OFFSET are never pushed into a shard spec for grouped queries (shard
+/// emits all partial groups; the outer wrapper applies the final `LIMIT n OFFSET m`
+/// when needed, through the shared [`render_limit_offset`] seam — a zero offset
+/// renders the pre-offset ` LIMIT {n}` string byte-for-byte, fix-191-order-by-offset).
 /// Build the explicit final `ORDER BY` element list for a grouped-aggregate merge.
 ///
 /// Once `ORDER_BY_COLUMN` is advertised Exasol delegates the ORDER BY and no longer
@@ -508,17 +511,27 @@ pub(super) fn group_key_exasol_types(
 /// lexicographic VARCHAR `GK_*` staging column (a plain `ORDER BY "GK_0"` would sort
 /// `1,10,11,2,…`, corrupting a numeric order).
 ///
-/// Each bare-column sort key must map to a group key (a bare-column `ORDER BY` in a
-/// GROUP BY query is only legal on a grouped column). It is matched to its group-key
-/// slot exactly as `detect_group_by_aggregates` matches select items (rendered-SQL
-/// equality), then to that group key's `selectList` ordinal (its output position,
-/// since the outer SELECT is assembled in `selectList` order with no gaps). Returns
-/// `None` when there is no `orderBy`, and the caller declines the pushdown when a key
-/// is present but cannot be resolved to a grouped output column — a shape SQL forbids.
+/// A sort key that IS a group key is matched to its group-key slot exactly as
+/// `detect_group_by_aggregates` matches select items (rendered-SQL equality), then to
+/// that group key's `selectList` ordinal (its output position, since the outer SELECT
+/// is assembled in `selectList` order with no gaps).
+///
+/// A sort key that is an AGGREGATE among the detected plans is rewritten to that
+/// aggregate's MERGED expression over the `PARTIAL_*` columns by
+/// [`render_having_over_merge`] — the same rewriter and the same `AggregatePlan`
+/// equality match the merged HAVING uses. The merge wrapper is a GROUP BY query, so
+/// its `ORDER BY` may reference an aggregate expression directly; no hidden output
+/// column is added, so Exasol's positional `selectListDataTypes` validation of the
+/// visible SELECT list is unaffected.
+///
+/// Returns `None` when there is no `orderBy`. Anything else — an aggregate absent from
+/// the plans (no `PARTIAL_*` column exists and the adapter will not fabricate one), a
+/// bare column that is no group key, a node the merge rewriter does not express — is
+/// [`GroupedOrderBy::Unresolvable`], which routes the request to the qualified
+/// single-table wrapper (issue #198).
 pub(super) fn build_grouped_order_by_clause(
     pushdown_req: &Json,
-    group_keys: &[String],
-    select_items: &[GroupedSelectItem],
+    detection: &GroupedAggregateDetection,
 ) -> Option<GroupedOrderBy> {
     let elements = pushdown_req.get("orderBy").and_then(|v| v.as_array())?;
     if elements.is_empty() {
@@ -526,41 +539,48 @@ pub(super) fn build_grouped_order_by_clause(
     }
     let mut parts = Vec::with_capacity(elements.len());
     for element in elements {
-        let key = match parse_sort_key_element(element) {
-            Some(k) => k,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        // Flags only: an aggregate sort key is no bare `column` node, so
+        // `parse_sort_key_element` would yield no `SortKey` to render through. A
+        // missing flag is never defaulted — a wrong guess is a wrong order.
+        let Some((ascending, nulls_last)) = parse_sort_flags(element) else {
+            return Some(GroupedOrderBy::Unresolvable);
         };
-        let rendered = match element
-            .get("expression")
-            .and_then(|e| render_expression(e).ok())
-        {
-            Some(r) => r,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        let Some(expr) = element.get("expression") else {
+            return Some(GroupedOrderBy::Unresolvable);
         };
-        let slot = match group_keys.iter().position(|gk| *gk == rendered) {
-            Some(s) => s,
-            None => return Some(GroupedOrderBy::Unresolvable),
+        let ordering = match group_key_output_ordinal(expr, detection) {
+            Some(ordinal) => ordinal.to_string(),
+            None => match render_having_over_merge(expr, &detection.plans) {
+                Some(merged) => merged,
+                None => return Some(GroupedOrderBy::Unresolvable),
+            },
         };
-        // Output position of this group key = its selectList ordinal (1-based for SQL).
-        let select_index = select_items.iter().find_map(|it| match it {
-            GroupedSelectItem::GroupKey {
-                group_key_slot,
-                select_index,
-            } if *group_key_slot == slot => Some(*select_index),
-            _ => None,
-        });
-        match select_index {
-            Some(idx) => parts.push(key.render_ordered(&(idx + 1).to_string())),
-            None => return Some(GroupedOrderBy::Unresolvable),
-        }
+        parts.push(render_ordered(&ordering, ascending, nulls_last));
     }
     Some(GroupedOrderBy::Clause(parts.join(", ")))
 }
 
+/// The 1-based merge-output ordinal of a sort-key expression that IS one of the
+/// group keys, or `None` when it is not a group key (or its group key has no
+/// `selectList` ordinal of its own).
+fn group_key_output_ordinal(expr: &Json, detection: &GroupedAggregateDetection) -> Option<usize> {
+    let rendered = render_expression(expr).ok()?;
+    let slot = detection.group_keys.iter().position(|gk| *gk == rendered)?;
+    detection.select_items.iter().find_map(|it| match it {
+        GroupedSelectItem::GroupKey {
+            group_key_slot,
+            select_index,
+        } if *group_key_slot == slot => Some(select_index + 1),
+        _ => None,
+    })
+}
+
 /// Outcome of resolving a grouped-aggregate merge `ORDER BY` (see
-/// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key that
-/// cannot be mapped to a grouped output column — the caller declines the pushdown
-/// as a hard error rather than emitting a merge that silently drops the ordering.
+/// [`build_grouped_order_by_clause`]). `Unresolvable` marks a pushed sort key the
+/// merge decomposition cannot express; `classify_request_shape` routes such a
+/// request to the qualified single-table wrapper, which renders the ordering
+/// natively over materialized rows, rather than emitting a merge that would silently
+/// drop it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GroupedOrderBy {
     Clause(String),
@@ -580,6 +600,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregate_types: &[String],
     select_items: &[GroupedSelectItem],
     limit: Option<u64>,
+    offset: u64,
     col_types: &[(String, String)],
     udf_name: &str,
     distribute_udf_name: &str,
@@ -687,9 +708,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         sql.push_str(ob);
     }
 
-    if let Some(n) = limit {
-        sql.push_str(&format!(" LIMIT {n}"));
-    }
+    sql.push_str(&render_limit_offset(limit, offset));
     sql
 }
 
@@ -798,21 +817,19 @@ pub(super) fn col_type_for(
 /// Map a column's Exasol type to the appropriate SUM partial EMITS type.
 ///
 /// DOUBLE PRECISION => DOUBLE PRECISION (no change).
-/// DECIMAL(p,s) => DECIMAL(36,s) (widened to max Exasol precision, preserving scale).
-/// Any other type (DATE, TIMESTAMP, VARCHAR, BOOLEAN) => DOUBLE PRECISION as an
-/// emergency fallback (callers should have validated before reaching here).
+/// DECIMAL(p,s) => DECIMAL(36,s) (widened to max Exasol precision, preserving scale);
+/// an absent scale defaults to 0, per the shared `parse_decimal_args` contract.
+/// Any other type (DATE, TIMESTAMP, VARCHAR, BOOLEAN) — and any DECIMAL declaration
+/// `parse_decimal_args` rejects — => DOUBLE PRECISION as an emergency fallback
+/// (callers should have validated before reaching here).
 fn sum_emit_type(col_ty: &str) -> String {
     if col_ty == "DOUBLE PRECISION" {
         return "DOUBLE PRECISION".to_string();
     }
-    if let Some(inner) = col_ty
-        .strip_prefix("DECIMAL(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        // inner is "p,s"
-        if let Some((_p, s)) = inner.split_once(',') {
-            return format!("DECIMAL(36,{s})");
-        }
+    // No uppercasing step: every producer of `col_ty` already emits uppercase, and
+    // adding one would change the answer for a lowercase input.
+    if let Some((_p, s)) = parse_decimal_args(col_ty) {
+        return format!("DECIMAL(36,{s})");
     }
     // Non-numeric type: validation should have caught this, but fall back gracefully.
     "DOUBLE PRECISION".to_string()
@@ -1119,7 +1136,88 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::scan::spec::CommonScanSpec;
-    use vs_expression::render_expression_safe;
+
+    // NOTE on the `sum_emit_type` tests below: routing `sum_emit_type` through the
+    // canonical `parse_decimal_args` makes it GAIN a whitespace-trimming step it did
+    // not have before, because `parse_decimal_args` trims each argument before
+    // parsing. `DECIMAL(10, 2)` therefore yields `DECIMAL(36,2)` where it used to
+    // yield `DECIMAL(36, 2)` — the raw scale slice echoed verbatim. That is an
+    // INTENDED consequence of consolidation, not an incidental one, and it is
+    // unreachable from every producer of `col_ty` in this repo (each emits a
+    // canonical, already-trimmed `DECIMAL(p,s)` under a `p,s <= 36` guard).
+
+    /// The one representative neither invariant generates: with no comma there is no
+    /// scale text to diverge. The move comes solely from `parse_decimal_args`
+    /// defaulting an absent scale to `0`, where `sum_emit_type` used to require a
+    /// comma and decline the input entirely.
+    #[test]
+    fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
+        assert_eq!(sum_emit_type("DECIMAL(10)"), "DECIMAL(36,0)");
+    }
+
+    /// Invariant (a) as a property over an OPEN input set: for every scale text that
+    /// is not already the canonical `i8` rendering, the answer is never the raw echo
+    /// the pre-consolidation parser produced. Only a canonical rendering — or the
+    /// numeric fallback — can emerge from a parsed `i8`. An open set is the right
+    /// shape here because the pre-consolidation parser echoed the raw scale text
+    /// without reading it, so the diverging input set has no closed enumeration.
+    ///
+    /// The rows cover one divergence class each: untrimmed whitespace (the gained
+    /// trimming step); a leading `+` or a leading zero, which `i8` parsing accepts
+    /// and which therefore can only re-emerge canonically; a non-numeric scale, which
+    /// used to be interpolated verbatim into an EMITS type Exasol cannot parse and now
+    /// declines to the numeric fallback; a scale outside `i8`; and a further comma,
+    /// where the old `split_once(',')` kept `2,3` as the scale text while
+    /// `parse_decimal_args` rejects a third argument outright.
+    #[test]
+    fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
+        // (raw scale text, canonical answer once parsed) — `None` = the parser
+        // rejects the text, so the answer is the numeric fallback.
+        let non_canonical: &[(&str, Option<&str>)] = &[
+            (" 2", Some("DECIMAL(36,2)")),
+            ("2 ", Some("DECIMAL(36,2)")),
+            ("+2", Some("DECIMAL(36,2)")),
+            ("02", Some("DECIMAL(36,2)")),
+            ("-02", Some("DECIMAL(36,-2)")),
+            ("X", None),
+            ("2,3", None),
+            ("200", None),
+            ("", None),
+        ];
+        for (raw_scale, canonical) in non_canonical {
+            let answer = sum_emit_type(&format!("DECIMAL(10,{raw_scale})"));
+            assert_ne!(
+                answer,
+                format!("DECIMAL(36,{raw_scale})"),
+                "a non-canonical scale text must never be echoed verbatim"
+            );
+            assert_eq!(
+                answer,
+                canonical.unwrap_or("DOUBLE PRECISION"),
+                "wrong answer for scale text {raw_scale:?}"
+            );
+        }
+    }
+
+    /// Invariant (b) as a property over an OPEN input set: every precision
+    /// `parse_decimal_args` rejects now declines to the numeric fallback, where it
+    /// used to yield `DECIMAL(36,2)` regardless — the pre-consolidation parser bound
+    /// the precision as `_p` and never read it, so even an unrepresentable precision
+    /// borrowed a `DECIMAL(36,…)` width. That non-reading is also why the diverging
+    /// set is open rather than a closed enumeration. The rows cover one rejection
+    /// class each: a precision outside `u8`, a negative one, a non-numeric one, and
+    /// an empty or whitespace-only one.
+    #[test]
+    fn sum_emit_type_declines_every_precision_the_parser_rejects() {
+        for rejected_precision in ["300", "256", "-1", "X", "", " "] {
+            assert_eq!(
+                sum_emit_type(&format!("DECIMAL({rejected_precision},2)")),
+                "DOUBLE PRECISION",
+                "precision {rejected_precision:?} is rejected by the parser, so the \
+                 aggregate must fall back rather than borrow a DECIMAL(36,…) width"
+            );
+        }
+    }
 
     /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
     /// CHAR/VARCHAR target must render the CAST target LENGTH-QUALIFIED
@@ -1456,7 +1554,7 @@ mod tests {
         let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
         // The group key ID is output column 1 → positional ordinal, explicit dir+nulls.
         assert_eq!(
-            build_grouped_order_by_clause(&req, &result.group_keys, &result.select_items),
+            build_grouped_order_by_clause(&req, &result),
             Some(GroupedOrderBy::Clause("1 ASC NULLS LAST".to_string())),
             "grouped ORDER BY must map the sort key to its 1-based output ordinal"
         );
@@ -1472,6 +1570,7 @@ mod tests {
             &[],
             &result.select_items,
             None,
+            0,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -1484,6 +1583,75 @@ mod tests {
         );
         // No LIMIT was requested, so none is rendered.
         assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
+    }
+
+    /// An `ORDER BY` on an aggregate that IS among the detected select-list plans
+    /// resolves to that aggregate's MERGED expression over the `PARTIAL_*` columns —
+    /// the same rewrite, by the same `AggregatePlan`-equality match, the merged
+    /// HAVING uses (issue #198). A group-key element mixed into the same `orderBy`
+    /// still renders as its positional output ordinal, unchanged.
+    #[test]
+    fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("SUM", Some("AMOUNT"), false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(36, 2)]),
+        );
+        req["orderBy"] = serde_json::json!([
+            {
+                "type": "order_by_element",
+                "expression": agg_item("SUM", Some("AMOUNT"), false),
+                "isAscending": false,
+                "nullsLast": true,
+            },
+            {
+                "type": "order_by_element",
+                "expression": {"type": "column", "name": "ID"},
+                "isAscending": true,
+                "nullsLast": false,
+            },
+        ]);
+
+        let detection = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        assert_eq!(
+            build_grouped_order_by_clause(&req, &detection),
+            Some(GroupedOrderBy::Clause(
+                r#"SUM("PARTIAL_sum_0") DESC NULLS LAST, 1 ASC NULLS FIRST"#.to_string()
+            )),
+            "an aggregate sort key must render as its merged partial, a group key as its ordinal"
+        );
+    }
+
+    /// An `ORDER BY` on an aggregate ABSENT from the detected plans has no
+    /// `PARTIAL_*` column to merge over, and the adapter does not fabricate one:
+    /// the resolution reports `Unresolvable`, which `classify_request_shape` turns
+    /// into a `GroupByWrapper` route (issue #198).
+    #[test]
+    fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
+        );
+        req["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": agg_item("SUM", Some("AMOUNT"), false),
+            "isAscending": false,
+            "nullsLast": true,
+        }]);
+
+        let detection = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        assert_eq!(
+            build_grouped_order_by_clause(&req, &detection),
+            Some(GroupedOrderBy::Unresolvable),
+            "an aggregate with no matching plan must not resolve to a fabricated partial"
+        );
     }
 
     /// Scalar expression in GROUP BY (e.g., function_scalar YEAR) renders via render_expression.
@@ -1615,6 +1783,7 @@ mod tests {
             &[],
             &result.select_items,
             None,
+            0,
             &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -1885,6 +2054,7 @@ mod tests {
             &aggregate_types,
             &result.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -1970,6 +2140,7 @@ mod tests {
             &[],
             &select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2143,6 +2314,7 @@ mod tests {
             &[],
             &keys_first_select_items(1, 1),
             Some(100),
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2160,6 +2332,171 @@ mod tests {
         assert!(
             sql.contains("LIMIT 100"),
             "outer wrapper should still apply the final LIMIT: {sql}"
+        );
+    }
+
+    /// A nonzero offset must never reach the per-shard fan-out spec: the common
+    /// blob shared by every shard carries neither "limit" nor an "offset" key —
+    /// there is no offset field on `CommonScanSpec` at all (design invariant: no
+    /// `ScanSpec`/UDF wire change), so this also pins that no such field leaks into
+    /// the shared JSON. The outer wrapper is the only place the offset renders
+    /// (fix-191-order-by-offset).
+    #[test]
+    fn grouped_merge_offset_never_reaches_per_shard_spec() {
+        let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
+        let g = shard_count(1, 1, files.len());
+        let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                limit: Some(100),
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec!["\"REGION\"".into()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &["\"REGION\"".to_string()],
+            &[],
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[],
+            &keys_first_select_items(1, 1),
+            Some(100),
+            3,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            Some("1 ASC NULLS LAST"),
+        );
+        let common = common_arg_literal(&sql);
+        assert!(
+            !common.contains("\"limit\"") && !common.contains("\"offset\""),
+            "grouped common blob must NOT carry limit or offset: {common}"
+        );
+        assert!(
+            sql.contains("ORDER BY 1 ASC NULLS LAST LIMIT 100 OFFSET 3"),
+            "outer wrapper applies the final ORDER BY ... LIMIT ... OFFSET: {sql}"
+        );
+    }
+
+    /// Byte-identical requirement (fix-191-order-by-offset): a zero offset renders
+    /// the exact pre-change ` LIMIT {n}` string with no OFFSET token, so every
+    /// already-correct SQL-shape assertion for the grouped-agg path keeps passing
+    /// unchanged.
+    #[test]
+    fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
+        let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
+        let g = shard_count(1, 1, files.len());
+        let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                limit: Some(100),
+                aggregates: Some(vec![AggregatePlan {
+                    kind: AggKind::Count,
+                    column: None,
+                    arg_expr: None,
+                }]),
+                group_keys: Some(vec!["\"REGION\"".into()]),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
+        let sql = build_grouped_aggregate_scan_sql(
+            &spec_template,
+            &shards,
+            &["\"REGION\"".to_string()],
+            &[],
+            &[AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }],
+            &[],
+            &keys_first_select_items(1, 1),
+            Some(100),
+            0,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            None,
+        );
+        assert!(
+            sql.ends_with(" LIMIT 100"),
+            "zero offset must render the bare pre-offset LIMIT clause: {sql}"
+        );
+        assert!(
+            !sql.contains("OFFSET"),
+            "zero offset must never render an OFFSET token: {sql}"
+        );
+    }
+
+    /// The grouped merge renders `GROUP BY … ORDER BY … LIMIT n OFFSET m` in that
+    /// exact clause order (fix-191-order-by-offset, capture rows 5-8):
+    /// `render_limit_offset` is the shared seam every reachable wrapper calls, and
+    /// this pins the grouped merge's wiring into it.
+    #[test]
+    fn grouped_merge_renders_limit_offset_in_clause_order() {
+        let mut req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "ID"}]),
+            serde_json::json!([
+                {"type": "column", "name": "ID"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
+        );
+        req["orderBy"] = serde_json::json!([{
+            "type": "order_by_element",
+            "expression": {"type": "column", "name": "ID"},
+            "isAscending": true,
+            "nullsLast": true,
+        }]);
+
+        let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
+        let group_key_types =
+            group_key_exasol_types(&req, &result.group_keys, &result.select_items);
+        let sql = build_grouped_aggregate_scan_sql(
+            &grouped_spec(&result),
+            &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
+            &result.group_keys,
+            &group_key_types,
+            &result.plans,
+            &[],
+            &result.select_items,
+            Some(2),
+            1,
+            &[("ID".to_string(), "DECIMAL(20,0)".to_string())],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+            Some("1 ASC NULLS LAST"),
+        );
+        assert!(
+            sql.ends_with(" ORDER BY 1 ASC NULLS LAST LIMIT 2 OFFSET 1"),
+            "merge SQL must render GROUP BY … ORDER BY … LIMIT n OFFSET m in that order: {sql}"
+        );
+        let group_by_pos = sql.find("GROUP BY").expect("must contain GROUP BY");
+        let order_by_pos = sql.find(" ORDER BY").expect("must contain ORDER BY");
+        let limit_pos = sql.find(" LIMIT").expect("must contain LIMIT");
+        let offset_pos = sql.find(" OFFSET").expect("must contain OFFSET");
+        assert!(
+            group_by_pos < order_by_pos && order_by_pos < limit_pos && limit_pos < offset_pos,
+            "clauses must appear in GROUP BY, ORDER BY, LIMIT, OFFSET order: {sql}"
         );
     }
 
@@ -2292,6 +2629,7 @@ mod tests {
             &aggregate_types,
             &select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2551,6 +2889,7 @@ mod tests {
             &d.plan_types,
             &d.select_items,
             None,
+            0,
             &soa_col_types(),
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2672,7 +3011,7 @@ mod tests {
             "wrapper item must be over merged partials: {soa}"
         );
         assert!(
-            soa.contains("SUM(\"PARTIAL_") && soa.contains("round("),
+            soa.contains("SUM(\"PARTIAL_") && soa.contains("ROUND("),
             "wrapper must render ROUND over merged SUM(PARTIAL_*) partials: {soa}"
         );
         assert!(
@@ -2719,7 +3058,7 @@ mod tests {
         );
         assert!(
             items[0].starts_with("CAST(")
-                && items[0].contains("round(")
+                && items[0].contains("ROUND(")
                 && items[0].contains("DECIMAL(5,2)"),
             "position 0 must be the scalar-over-aggregate, cast to its own type: {items:?}"
         );
@@ -2794,6 +3133,7 @@ mod tests {
             &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
+            None,
         )
         .expect("qualified fallback must build");
 
@@ -2900,6 +3240,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -2921,7 +3262,8 @@ mod tests {
     /// A HAVING referencing an aggregate that is NOT present among the plans
     /// (e.g. `COUNT(*)` when only `SUM(score)` was projected) cannot be merged,
     /// so `render_having_over_merge` returns None — the signal for
-    /// `handle_pushdown` to DECLINE the pushdown rather than drop the HAVING.
+    /// `classify_request_shape` to route the request to `RequestShape::GroupByWrapper`
+    /// rather than drop the HAVING.
     #[test]
     fn render_having_over_merge_declines_unknown_aggregate() {
         let having = serde_json::json!({
@@ -2981,6 +3323,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -3063,6 +3406,7 @@ mod tests {
             &aggregate_types,
             &detection.select_items,
             Some(2),
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
@@ -3387,86 +3731,6 @@ mod tests {
         );
     }
 
-    /// Regression: HAVING is present + grouped-path type-validation fails.
-    ///
-    /// Before the fix, `handle_pushdown` would fall through to the row-scan path
-    /// and silently discard the HAVING predicate — yielding wrong results because
-    /// the adapter advertised `AGGREGATE_HAVING` so Exasol does not re-apply it.
-    ///
-    /// This test proves the two components that the guard in `handle_pushdown`
-    /// relies on: (a) HAVING renders to `Some` for this request, and (b) type
-    /// validation fails for SUM over a non-numeric column. Together they mean the
-    /// guard `if having.is_some() && !validate_agg_col_types(...)` triggers and
-    /// the function returns an error instead of falling through.
-    #[test]
-    fn having_present_and_grouped_type_validation_fails_conditions_hold() {
-        // Pushdown request: GROUP BY aggregate with SUM over VARCHAR (non-numeric)
-        // and a simple HAVING predicate (column > literal — translatable by render_expression_safe).
-        //
-        // A HAVING with `function_aggregate` is NOT translatable by vs_expression, so we use a
-        // plain column comparison to exercise the "having renders to Some" side of the invariant.
-        let request = serde_json::json!({
-            "involvedTables": [{
-                "columns": [
-                    {"name": "REGION", "dataType": {"type": "VARCHAR", "size": 100}},
-                    {"name": "LABEL",  "dataType": {"type": "VARCHAR", "size": 50}},
-                    {"name": "SCORE",  "dataType": {"type": "DOUBLE"}},
-                ]
-            }],
-            "pushdownRequest": {
-                "aggregationType": "group_by",
-                "groupBy": [{"type": "column", "name": "REGION"}],
-                "selectList": [
-                    {"type": "column", "name": "REGION"},
-                    {
-                        "type": "function_aggregate",
-                        "name": "SUM",
-                        "arguments": [{"type": "column", "name": "LABEL"}]
-                    }
-                ],
-                "having": {
-                    "type": "predicate_greater",
-                    "left":  {"type": "column", "name": "SCORE"},
-                    "right": {"type": "literal_exactnumeric", "value": "100"}
-                }
-            }
-        });
-        let pushdown_req = request["pushdownRequest"].clone();
-        let col_types = extract_all_column_types(&request);
-
-        // (a) detect_group_by_aggregates must find a grouped path.
-        let detected = detect_group_by_aggregates(&pushdown_req);
-        assert!(
-            detected.is_some(),
-            "test setup: must detect grouped aggregates"
-        );
-        let grouped_plans = detected.unwrap().plans;
-
-        // (b) validate_agg_col_types must fail (SUM over VARCHAR is invalid).
-        assert!(
-            !validate_agg_col_types(&grouped_plans, &col_types),
-            "type validation must fail for SUM(VARCHAR)"
-        );
-
-        // (c) HAVING must render to Some — confirming it would be dropped without the guard.
-        let having = pushdown_req
-            .get("having")
-            .filter(|h| !h.is_null())
-            .and_then(render_expression_safe);
-        assert!(
-            having.is_some(),
-            "HAVING must render to Some — without the guard it would be silently dropped"
-        );
-
-        // Both conditions simultaneously: this is exactly the state that triggers the
-        // guard `if having.is_some() && !validate_agg_col_types(...)` in handle_pushdown.
-        // When both hold, handle_pushdown returns Err (not Ok with dropped HAVING).
-        assert!(
-            having.is_some() && !validate_agg_col_types(&grouped_plans, &col_types),
-            "guard condition must hold: having present AND type validation failed"
-        );
-    }
-
     /// HAVING is rendered and appears in the outer GROUP BY wrapper SQL.
     #[test]
     fn having_clause_appears_in_outer_wrapper_only() {
@@ -3504,6 +3768,7 @@ mod tests {
             &[],
             &keys_first_select_items(1, 1),
             None,
+            0,
             &col_types,
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,

@@ -1,17 +1,17 @@
 <div align="center">
 
-<img src="docs/assets/logo.svg" width="96" height="96" alt="lakehouse-engine-rs logo">
+<img src="docs/assets/logo.svg" width="128" height="128" alt="lakehouse-engine-rs logo">
 
 # lakehouse-engine-rs
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml)
-[![spec|driven](https://img.shields.io/badge/spec%7Cdriven-grey.svg)](specs/)
-[![Exasol|database](https://img.shields.io/badge/Exasol%7Cdatabase-grey.svg)](https://www.exasol.com)
+[![spec|driven](https://img.shields.io/badge/spec-driven-blueviolet.svg)](specs/)
+[![Exasol|database](https://img.shields.io/badge/Exasol-database-blue.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-**In-place lakehouse query engine for Exasol — DataFusion in Rust UDFs, querying Iceberg and
-Databricks tables straight from SQL.**
+**In-place lakehouse query engine for Exasol. DataFusion runs in Rust UDFs and queries Iceberg
+and Databricks tables straight from SQL.**
 
 </div>
 
@@ -19,7 +19,8 @@ Databricks tables straight from SQL.**
 
 ## Quick start
 
-Once deployed (see [Install](docs/install.md)), create a Virtual Schema and query it:
+After you deploy the engine (see [Install](docs/install.md)), create a Virtual Schema. Then query
+the schema:
 
 ```sql
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
@@ -34,29 +35,43 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 
 ## What this is
 
-`lakehouse-engine-rs` is an Exasol **Virtual Schema** that does more than translate and plan: it
-runs the [DataFusion](https://datafusion.apache.org/) engine on the node, in place. The VS stays
-thin — query translation, pushdown analysis, parallelization planning, result-schema mapping —
-while all execution happens in disposable, node-local DataFusion runtimes inside Rust UDFs. Files
-are sharded across nodes, scanned in parallel, then merged in Exasol.
+`lakehouse-engine-rs` is a query engine for lakehouses. The engine is an Exasol Virtual Schema.
+
+- **Execution model.** [Apache DataFusion](https://datafusion.apache.org/) runs inside stateless
+  Rust UDFs. Each invocation creates one session, and the engine discards that session on
+  completion.
+- **Sharding.** The engine resolves the Iceberg file list once per query and splits it into
+  sharded work units. Exasol distributes the work units across the nodes and multiplexes them onto
+  the cores of each node. Cluster parallelism and the vectorized execution of DataFusion therefore
+  compound. No node scans the files of another node.
+- **Pushdown.** Pushed-down projection, filter, LIMIT, Top-N, aggregation, and broadcast-eligible
+  inner equi-joins keep each scan lean. The same path reaches Apache Iceberg and
+  Databricks-managed Iceberg.
+- **No materialization.** Every query starts from source metadata. The engine materializes nothing
+  and copies nothing out.
 
 ## Documentation
 
-- [**docs/**](docs/index.md) — documentation index
-- [Install & deploy](docs/install.md) — build the `.so`, register the SLC, create scripts + CONNECTION + VS. If `exapump`/curl can't reach BucketFS directly (e.g. Exasol SaaS), see [Install](docs/install.md) for a fully manual path — curl/UI upload plus hand-run SQL, no Docker required
-- [Capabilities](docs/capabilities.md) — projection / filter / LIMIT / aggregation pushdown matrix
-- [`specs/`](specs/) — design source of truth (spec-driven development via the `speq` skill)
+Start at the [documentation index](docs/index.md), or go straight to a guide:
+
+| Guide | What it covers |
+|-------|----------------|
+| [Install](docs/install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
+| [Catalogs](docs/catalogs.md) | How to connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs. Covers CONNECTION objects, credentials, and object-storage access. |
+| [Benchmark](docs/benchmark.md) | The benchmark query set and how to run it yourself. |
+| [Architecture](docs/architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
+| [Capabilities](docs/capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
+| [Tuning](docs/tuning.md) | Configuration parameters reference and runtime telemetry. |
+| [Debugging pushdown](docs/debugging-pushdown.md) | How to see exactly what the adapter pushes down for a query, with `EXPLAIN VIRTUAL`. |
 
 ## License
 
-Community-supported. Licensed under [MIT](LICENSE).
+Free and open-source. Community-supported. Licensed under [MIT](LICENSE).
 
 ---
 
 <div align="center">
 
-Built with Rust 🦀 for Exasol.
-
-Community-supported, maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
+Built with Rust 🦀 and made with ❤️. Maintained by [Exasol Labs 🧪](https://github.com/exasol-labs/).
 
 </div>

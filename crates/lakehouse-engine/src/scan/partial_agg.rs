@@ -165,7 +165,7 @@ async fn run_grouped_partial_aggregate(
             let mut row_values: Vec<Value> = Vec::with_capacity(batch.num_columns());
 
             for col_idx in 0..n_group_keys {
-                let raw = arrow_value_at(batch.column(col_idx), row_idx);
+                let raw = arrow_value_at(batch.column(col_idx), row_idx)?;
                 // Stringify for GK_i VARCHAR(2000000) column.
                 // Value has no Display; format each variant explicitly.
                 let gk_str = value_to_gk_string(raw);
@@ -174,7 +174,7 @@ async fn run_grouped_partial_aggregate(
 
             // Partial aggregate columns follow.
             for col_idx in n_group_keys..batch.num_columns() {
-                row_values.push(arrow_value_at(batch.column(col_idx), row_idx));
+                row_values.push(arrow_value_at(batch.column(col_idx), row_idx)?);
             }
 
             ctx.emit(&row_values)?;
@@ -419,18 +419,18 @@ fn partial_row_from_batch(
     for plan in aggregates {
         match plan.kind {
             AggKind::Avg => {
-                row.push(arrow_value_at(batch.column(col), 0));
-                row.push(arrow_value_at(batch.column(col + 1), 0));
+                row.push(arrow_value_at(batch.column(col), 0)?);
+                row.push(arrow_value_at(batch.column(col + 1), 0)?);
                 col += 2;
             }
             AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
-                row.push(arrow_value_at(batch.column(col), 0));
-                row.push(arrow_value_at(batch.column(col + 1), 0));
-                row.push(arrow_value_at(batch.column(col + 2), 0));
+                row.push(arrow_value_at(batch.column(col), 0)?);
+                row.push(arrow_value_at(batch.column(col + 1), 0)?);
+                row.push(arrow_value_at(batch.column(col + 2), 0)?);
                 col += 3;
             }
             _ => {
-                row.push(arrow_value_at(batch.column(col), 0));
+                row.push(arrow_value_at(batch.column(col), 0)?);
                 col += 1;
             }
         }

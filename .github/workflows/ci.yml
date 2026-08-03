@@ -4,11 +4,14 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore: ["specs/**"]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, edited]
-    paths-ignore: ["specs/**"]
+    # ready_for_review so CI fires when a draft is marked ready (the draft
+    # guard on the root jobs skips draft-PR runs).
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Merge queue: required checks MUST run on merge_group or queued PRs hang
+  # forever waiting for a status that never reports.
+  merge_group:
   workflow_dispatch:
 
 # Cancel a superseded run when a PR branch gets a new push (saves CI minutes,
@@ -21,83 +24,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "4"
-  CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # ── build early ──────────────────────────────────────────────────────────
-  # Warms the shared host cargo cache that lint/unit-tests/e2e's test-binary
-  # compile reuse. Independent of build-so (different toolchain: host vs the
-  # rust:1.94-bookworm container) — runs in parallel with it.
-  build:
-    name: Build (warm cache)
-    runs-on: ubuntu-latest
-    # A PR base-retarget (e.g. a stacked PR's base branch merging) fires `edited`
-    # with no code change. Only an `edited` event that actually changed `base`
-    # should re-run CI — a plain title/body/label edit should not. Skipping this
-    # job cascades a skip through everything that (transitively) `needs` it.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
-    steps:
-      # ubuntu-latest ships only ~21 GB free on /; a cached target/ restore plus
-      # a full debug `--all-targets` build of the DataFusion/Arrow/AWS/Iceberg
-      # tree can fill it, and ld then dies with SIGBUS (signal 7) when it can't
-      # extend an mmap'd object/output file. Reclaim ~12 GB of preinstalled SDKs
-      # we never use before building.
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
-      - uses: actions/checkout@v7
-
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
-        with:
-          components: clippy, rustfmt
-
-      # rust-cache keys on every installed toolchain's `rustc -vV`, including
-      # the runner image's preinstalled stable Rust — which drifts across the
-      # heterogeneous hosted-runner image pool and has nothing to do with this
-      # repo's pinned 1.94 (rust-toolchain.toml). A writer/reader landing on
-      # different preinstalled versions silently diverges the cache key and
-      # forces a full cold recompile in every reader job (#133). Drop
-      # everything but 1.94 so the key only reflects the toolchain actually
-      # used to compile.
-      - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
-
-      # Swatinem/rust-cache (not raw actions/cache) because it PRUNES target/
-      # before saving: it strips this workspace's own crate artifacts +
-      # incremental data and keeps only dependency builds, so the cache stays
-      # small instead of ballooning with the full DataFusion/Arrow/Iceberg
-      # --all-targets debug tree (the bloat that filled the runner disk and
-      # ENOSPC-killed lint/unit-tests). It also keys on rustc + Cargo.lock
-      # automatically. This job is the SOLE writer of the shared cache; the
-      # fan-out jobs restore it read-only (save-if: false) so they don't each
-      # race to save a copy.
-      #
-      # `cargo build` produces full .rlib codegen — a SUPERSET of what clippy
-      # (.rmeta only) and `cargo test` (.rlib, to link the test binary) each
-      # need — so this writer's cache serves every reader. The `-rlib` suffix
-      # deliberately BUSTS an earlier immutable cache written under `workspace`:
-      # in the brief window when lint was also a writer, clippy won the save
-      # race and stored a .rmeta-only cache. GitHub cache keys are immutable, so
-      # this warm build kept restoring that check-only cache as a "full match"
-      # and skipped its own save — leaving unit-tests to recompile the entire
-      # dep tree (~17 min) for the .rlib it couldn't find. Bumping the key
-      # forces a fresh save of the real .rlib cache. Bump again if it recurs.
-      - name: Cache cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: workspace-rlib
-
-      # The workspace has no default-members (see Cargo.toml) so `cargo build`
-      # alone is a no-op by design; --workspace is required to actually
-      # compile both crates + their test binaries and warm the cache below.
-      - name: Build workspace (debug, warm cache)
-        run: cargo build --workspace --all-targets
-
   # ── the real release artifact ─────────────────────────────────────────────
   # Built the same way a developer does: inside rust:1.94-bookworm (glibc
   # 2.36), matching the SLC. Never `cargo build --release` on the runner
@@ -105,15 +34,13 @@ jobs:
   build-so:
     name: Build release .so (Docker)
     runs-on: ubuntu-latest
+    # Skip draft PRs; still run on push/merge_group (where pull_request is null).
+    # e2e/e2e-lakekeeper cascade-skip via `needs: [build-so]`.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
     # release build). 60 min is a safety backstop against a genuine hang, not
     # a tight budget.
     timeout-minutes: 60
-    # See the `build` job's `if` — same base-retarget-vs-plain-edit guard.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
@@ -142,13 +69,25 @@ jobs:
       # ~33-min cold build: on a lockfile change the exact key misses, but the
       # `docker-cargo-` prefix restores the most recent prior cache, so cargo
       # recompiles only the changed crates instead of the whole dep graph.
-      - name: Cache Docker-side cargo registry and target/
-        uses: actions/cache@v6
+      #
+      # Split restore/save so only main writes. Caches are branch-scoped, so PR
+      # branches were each minting an exact-key copy — 12 of them, 7.5 GB
+      # against a 10 GB quota — even though the `docker-cargo-` prefix fallback
+      # already makes main's entry usable from any branch.
+      - name: Restore Docker-side cargo registry and target/
+        id: docker-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo-docker-registry
             target/
-          key: docker-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # .cargo/config.toml is in the key for the same reason rust-cache
+          # hashes it (see that file): a future [profile.release] edit there
+          # would change every release fingerprint without moving Cargo.lock —
+          # exact hit, save skipped, permanently poisoned. The prefix fallback
+          # keeps unrelated (e.g. dev-profile) edits warm; cost is one
+          # redundant re-save on main per config edit.
+          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
             docker-cargo-
 
@@ -163,19 +102,31 @@ jobs:
       - name: Fix Docker-side build output ownership
         run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
 
+      # Main only (see the restore step), and only on an exact-key miss — keys
+      # are immutable, so re-saving a hit is a wasted multi-GB upload.
+      - name: Save Docker-side cargo registry and target/
+        if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo-docker-registry
+            target/
+          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v7
         with:
           name: lakehouse-engine-so
           path: target/release/liblakehouse_engine.so
 
-  # ── fan-out: lint / unit-tests / licenses all need only `build`'s cache ──
+  # ── fan-out: lint / unit-tests / licenses, all at t=0 ────────────────────
+  # Nothing here waits on build-so (different toolchain: host vs the
+  # rust:1.94-bookworm container); `unit-tests` doubles as the cache writer.
   lint:
     name: Check & Lint
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
-      # Same rationale as the build job: reclaim ~12 GB before restoring the
+      # Same rationale as build-so: reclaim ~12 GB before restoring the
       # shared cache and compiling on top of it, so clippy's --all-targets pass
       # doesn't ENOSPC on the ~21 GB default runner disk.
       - name: Free disk space
@@ -195,14 +146,21 @@ jobs:
       - name: Ensure rustfmt/clippy available on 1.94
         run: rustup component add rustfmt clippy --toolchain 1.94
 
-      # Stabilizes the rust-cache key against the runner image's preinstalled
-      # Rust drifting between writer/reader jobs — see the `build` job's
-      # matching step for the full rationale (#133).
+      # rust-cache keys on every installed toolchain's `rustc -vV`, including
+      # the runner image's preinstalled stable Rust — which drifts across the
+      # heterogeneous hosted-runner image pool and has nothing to do with this
+      # repo's pinned 1.94 (rust-toolchain.toml). A writer/reader landing on
+      # different preinstalled versions silently diverges the cache key and
+      # forces a full cold recompile in every reader job (#133). Drop
+      # everything but 1.94 so the key only reflects the toolchain actually
+      # used to compile.
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # Restore the pruned cache the build job saved (same shared-key); read
-      # only — save-if:false so this job never writes its own copy.
+      # Read-only restore of the cache `unit-tests` writes; save-if:false so
+      # readers never race to save their own copy. Keep the inputs identical
+      # across all four rust-cache steps — a divergence leaves readers
+      # permanently cold (#133).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -218,10 +176,9 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       # Reclaim disk before restoring the shared cache + compiling the test
-      # binaries, matching build/lint/e2e (avoids the ENOSPC that killed this
+      # binaries, matching build-so/lint/e2e (avoids the ENOSPC that killed this
       # job).
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
@@ -232,16 +189,28 @@ jobs:
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       # Stabilizes the rust-cache key against the runner image's preinstalled
-      # Rust drifting between writer/reader jobs — see the `build` job's
+      # Rust drifting between writer/reader jobs — see the `lint` job's
       # matching step for the full rationale (#133).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      - name: Restore cargo & build artifacts
+      # SOLE WRITER of the shared cache. rust-cache (not raw actions/cache)
+      # because it PRUNES target/ before saving — only dependency builds are
+      # kept, so the cache doesn't balloon with the full DataFusion/Arrow/
+      # Iceberg debug tree. `cargo test` emits .rlib, a superset of what clippy
+      # (.rmeta) and the E2E jobs need, so this writer serves every reader.
+      #
+      # What keys this cache against profile edits is .cargo/config.toml, NOT
+      # anything here — see the comment in that file. The old manual "bump the
+      # -rlib suffix" workaround is gone with it.
+      #
+      # save-if gates writes to main: PR branches would otherwise each mint a
+      # branch-scoped duplicate against the repo's 10 GB cache quota.
+      - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: workspace-rlib
-          save-if: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
       # never touches a live stack.
@@ -251,27 +220,17 @@ jobs:
   licenses:
     name: License Check
     runs-on: ubuntu-latest
-    # See the `build` job's `if` — same base-retarget-vs-plain-edit guard.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.action != 'edited' ||
-      github.event.changes.base != null
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
-      - name: Cache cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
+      # Deliberately NOT caching ~/.cargo/registry: it saved ~9s on a sub-minute
+      # job while holding 2 GB of the repo's 10 GB quota and evicting caches
+      # that matter. Without it `cargo deny`'s `cargo metadata` re-downloads the
+      # index and this job grows to ~2–3 min — off the critical path, so leave
+      # it. Don't "fix" this back.
       - name: Install cargo-deny
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
@@ -280,17 +239,113 @@ jobs:
       # MIT-compliance gate: every third-party dependency must carry a license
       # from deny.toml's allow-list; keep that list in sync with about.toml's
       # `accepted` list (both files cross-reference each other).
-      - name: Check licenses
-        run: cargo deny check licenses
+      - name: Check licenses and advisories
+        run: cargo deny check licenses advisories
 
-      - name: Check advisories
-        run: cargo deny check advisories
+  # ── install script: static checks + stubbed unit tests, no network ──────
+  # deploy/scripts/install.sh is fetched straight off `main` by every user's
+  # `curl | bash` one-liner (see docs/install.md) — there is no release gate
+  # between a merge and that fetch, so this job (and install-script-e2e below)
+  # must both be required checks AND block `release` (see release.needs).
+  install-script:
+    name: Install Script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: ShellCheck
+        run: shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh
+
+      - name: Unit tests (stubbed exapump/curl, no network)
+        run: make test-install
+
+  # ── install script: real end-to-end run against a live BucketFS Exasol ──
+  # Proves the BucketFS target (Exasol AsApp/Docker/on-premise all speak the same
+  # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior
+  # release fetched through the authenticated GitHub API — exactly what a
+  # user's one-liner does. Does not depend on build-so / this PR's own .so:
+  # this job tests the INSTALLER's mechanics (exapump bucketfs upload, DDL,
+  # SCRIPT_LANGUAGES registration, fingerprint smoke test), not query
+  # correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
+  # ponytail: only the `exasol` compose service is started (no MinIO/Iceberg
+  # REST/Spark fixtures) — this job never queries a Virtual Schema, so it
+  # doesn't need catalog/object-storage services. SaaS mode has no CI job:
+  # it needs a real SaaS tenant + PAT that CI doesn't have (tracked in #252).
+  install-script-e2e:
+    name: Install Script E2E (BucketFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Pull Exasol image
+        run: docker compose pull --quiet exasol
+
+      # Same root cause and fix as the `e2e` job: register_slc/create_engine_scripts
+      # spawn real Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
+      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
+      - name: Start stack (Exasol only)
+        run: docker compose up -d --wait exasol
+
+      - name: Install exapump
+        run: curl -fsSL https://raw.githubusercontent.com/exasol-labs/exapump/main/install.sh | sh
+
+      # Fresh container, so no exapump profile exists yet. Same BucketFS
+      # write-password extraction the Makefile's install-slc/bucketfs-upload-so
+      # targets already use — read straight out of EXAConf, no manual secret.
+      - name: Create exapump profile for the compose stack
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          BFSPASS=$(docker exec lakehouse-engine-rs-exasol-1 bash -c \
+            "awk '/\[\[Bucket.*default\]\]/{f=1} f&&/WritePasswd/{print \$3;exit}' /exa/etc/EXAConf | base64 -d")
+          exapump profile add ci-bucketfs \
+            --host localhost --port "${LH_EXASOL_PORT:-28563}" \
+            --user sys --password "${EXASOL_SYS_PASSWORD:-exasol}" \
+            --validate-certificate false \
+            --bfs-host localhost --bfs-port "${LH_BUCKETFS_PORT:-22581}" \
+            --bfs-write-password "$BFSPASS" \
+            --default
+
+      # No --lakehouse-version/--slc-version pin: fetches each repo's latest
+      # release, same as a real user's default invocation. GITHUB_TOKEN is the
+      # standard Actions-provided token — it already has read access to this
+      # (private) repo's own releases, and language-container-rs is public.
+      - name: Run install.sh (BucketFS target)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash deploy/scripts/install.sh --profile ci-bucketfs
+
+      - name: Dump Exasol logs on failure
+        if: failure()
+        run: |
+          docker compose ps || true
+          docker compose logs exasol | tail -150 || true
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
 
   # ── viability gate: full local Exasol + MinIO + Iceberg-REST stack ───────
   e2e:
     name: E2E
     runs-on: ubuntu-latest
-    needs: [build-so, lint, unit-tests, licenses]
+    # build-so only — its .so artifact is all this job consumes. NOT also
+    # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
+    # serialization: all three are separately-required checks (ruleset + merge
+    # queue), so any red one blocks the merge on its own — e2e needn't wait on
+    # them to keep broken code off main.
+    # Trade: a PR with a clippy error still burns a full E2E run; revert by
+    # re-adding to `needs`. `release` lists them explicitly so main still can't
+    # ship broken.
+    needs: [build-so]
     # Observed 16-20 min end-to-end historically, but pre-test setup (disk
     # cleanup + image loads) has grown slower as the hosted runner image
     # bundles more pre-installed content to prune through — one run burned
@@ -329,7 +384,7 @@ jobs:
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
       # Stabilizes the rust-cache key against the runner image's preinstalled
-      # Rust drifting between writer/reader jobs — see the `build` job's
+      # Rust drifting between writer/reader jobs — see the `lint` job's
       # matching step for the full rationale (#133).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
@@ -440,12 +495,13 @@ jobs:
   # Mirrors the `e2e` job's setup steps; the compose overlay adds Keycloak +
   # Lakekeeper + its Postgres backend on top of the base stack (reuses base
   # `minio` and `exasol`). Independent of `e2e` (same upstream `needs`, no
-  # dependency between the two) so they run in parallel; not a `release` gate
-  # — only `e2e` is (see the `release` job's `needs`).
+  # dependency between the two) so they run in parallel; gates `release`
+  # alongside `e2e` (see the `release` job's `needs`).
   e2e-lakekeeper:
     name: E2E (Lakekeeper)
     runs-on: ubuntu-latest
-    needs: [build-so, lint, unit-tests, licenses]
+    # See `e2e`'s identical `needs` and its rationale.
+    needs: [build-so]
     # This stack's own healthchecks (docker-compose.lakekeeper.yml) already
     # bound each service's time-to-healthy (interval × retries + start_period);
     # this is the wall-clock backstop for the whole job, same rationale as
@@ -475,6 +531,7 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
+      # See the `e2e` job's identical step (and the writer in `unit-tests`).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -574,7 +631,14 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [e2e]
+    # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
+    # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
+    # build-so, a main push with failing tests would otherwise mint a tag +
+    # Release. No latency cost — the e2e jobs dominate the chain. install-script
+    # and install-script-e2e are listed for the same reason: install.sh is
+    # served straight off `main` (see its own job comment), so a broken script
+    # on `main` must never reach a release-gated push either.
+    needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -697,6 +761,11 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          # deploy/scripts/install.sh is deliberately NOT listed here. Users
+          # fetch it from the contents API on `main` (docs/install.md), and
+          # `?ref=<tag>` on that same API already covers pinning — a release
+          # asset would instead freeze installer bugs into every past release
+          # forever. Don't "fix" this by adding it back.
           files: |
             lakehouse-engine.tar.gz
             THIRD-PARTY-LICENSES.md

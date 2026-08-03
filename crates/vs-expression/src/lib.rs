@@ -14,26 +14,240 @@ use serde_json::Value as Json;
 /// Which SQL parser the rendered fragment must satisfy.
 ///
 /// The SAME recursive translator feeds two different parsers depending on the
-/// call site. Threaded through every node (not just CAST) so any future
-/// rendering rule that differs by target parser has a place to branch;
-/// currently only the CAST target (`render_cast_target`) actually does,
-/// where the two dialects have OPPOSITE requirements for character-type CAST
-/// targets:
+/// call site, threaded through every node:
 /// - `DataFusion`: the rendered fragment is embedded in a `ScanSpec`
 ///   (`filter`/`projection`/`group_keys`) and parsed by DataFusion's SQL
-///   frontend INSIDE the scan UDF. datafusion-sql rejects `VARCHAR(n)` with a
-///   length unless `support_varchar_with_length` is enabled (this project does
-///   not enable it), so a character CAST target must be bare `VARCHAR`.
+///   frontend INSIDE the scan UDF.
 /// - `Exasol`: the rendered fragment becomes part of the outer wrapper SQL text
 ///   parsed by Exasol's own core engine (the qualified single-table / N-scan
 ///   join wrapper in `joins.rs`, the grouped-aggregate outer-merge wrapper in
-///   `grouped_agg.rs`). Exasol has no length-less VARCHAR/CHAR type — `VARCHAR`
-///   MUST be followed by `(n)` — so a character CAST target needs an explicit
-///   length.
+///   `grouped_agg.rs`).
+///
+/// The governing rule for the `Exasol` dialect: render what Exasol sent —
+/// reproduce the original name, argument order, and argument count, so
+/// Exasol evaluates exactly the call it emitted rather than a
+/// DataFusion-shaped rewrite its own engine cannot parse.
+///
+/// `TRANSLATED_SCALAR_FNS` is the one declaration the `function_scalar` gate
+/// reads (76 names). Each declared name carries an `ExasolForm`:
+/// - `VerbatimCall` — rendered ahead of the per-name dispatch as
+///   `<NAME>(<rendered args>)` from the node's own uppercased name, with NO
+///   arity check.
+/// - `Shaped` — falls through to the per-name arm, which owns both dialects.
+///
+/// Ten names have an Exasol form the gate's `<NAME>(<rendered args>)` rule
+/// cannot derive — either because it is not a call at all, or because the
+/// DataFusion side is not — and are `Shaped`. They fall into six groups:
+/// - the five operator wire names `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` —
+///   SQL operators, not calls;
+/// - `MOD` — Exasol requires the `MOD(a, b)` form, DataFusion the `%`
+///   operator;
+/// - `CONCAT` — the wire encoding of Exasol's `||` operator, so it renders as
+///   chained `||` in both dialects rather than a `CONCAT(...)` call;
+/// - `CAST` — dispatches to `render_cast_target`, which branches on dialect
+///   in its own right: the two dialects have OPPOSITE requirements for
+///   character-type CAST targets. datafusion-sql rejects a length-qualified
+///   `VARCHAR(n)` unless `support_varchar_with_length` is enabled (this
+///   project does not enable it), so the DataFusion target must be bare
+///   `VARCHAR`; Exasol has no length-less VARCHAR/CHAR type, so `VARCHAR`
+///   MUST be followed by `(n)`;
+/// - the `REGEXP_LIKE` alternate `function_scalar` encoding — Exasol's own
+///   form is the infix predicate `(<subject> REGEXP_LIKE <pattern>)`, not a
+///   call;
+/// - `CASE` — renders as `CASE WHEN ... THEN ... [ELSE ...] END`, not a call.
+///
+/// Absence from `TRANSLATED_SCALAR_FNS` is how a translation is retired: the
+/// gate declines the name in both dialects with `unsupported scalar
+/// function: <name>`, and no per-name arm is reachable without a row here.
+/// The now-family — `CURRENT_DATE`, `CURRENT_TIMESTAMP`, `SYSDATE`, and
+/// `SYSTIMESTAMP` — is the current instance: the scan UDF receives no time
+/// zone, no clock, and no statement anchor, so these four are unadvertised
+/// and left for Exasol to evaluate itself.
+///
+/// Five node types outside `function_scalar` also branch on dialect —
+/// `function_scalar_extract`, `function_scalar_cast`, `predicate_like_regexp`,
+/// `literal_timestamp`, and `literal_timestamp_utc` — but none of them is
+/// declared here: they are covered by their own rows in the
+/// `exasol_dialect_renders_declared_verbatim_surface` sweep test, not by this
+/// declaration.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dialect {
     DataFusion,
     Exasol,
+}
+
+/// How a translated `function_scalar` name is rendered in the Exasol dialect.
+#[derive(Clone, Copy)]
+enum ExasolForm {
+    /// Rendered ahead of the per-name dispatch as `<NAME>(<rendered args>)`, from
+    /// the node's own uppercased name and with NO arity check: Exasol's own
+    /// compiler emitted the call and Exasol's own engine evaluates it, so
+    /// reproducing the name, argument order, and argument count cannot be wrong.
+    VerbatimCall,
+    /// Rendered by the name's own per-name arm, which owns BOTH dialects. This is
+    /// for names whose Exasol form the gate's `<NAME>(<rendered args>)` rule
+    /// cannot derive: either because it is not a call at all — an operator, an
+    /// infix predicate, a `CASE`, or a per-dialect CAST target — or because the
+    /// DataFusion side is not, as with `MOD`, whose Exasol form IS the call
+    /// `MOD(a, b)` but whose DataFusion side is the `%` operator, so the arm
+    /// must own both dialects.
+    Shaped,
+}
+
+/// Every `function_scalar` name this translator translates, with its
+/// Exasol-dialect form.
+///
+/// This is the single declaration of the translated surface, and it GATES the
+/// dispatch: a name absent from it is declined in both dialects before any
+/// per-name arm is reached. A per-name arm added without a row here is therefore
+/// unreachable, rather than silently rendering DataFusion SQL on the
+/// Exasol-parsed path — and absence is likewise how a translation is retired.
+///
+/// The ten [`ExasolForm::Shaped`] names lead the list, because they are the
+/// exceptions a reader needs first: every other name renders verbatim. Order is
+/// otherwise immaterial — the lookup is by name, not by position, which is the
+/// whole point of moving the decision out of arm ordering.
+const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
+    // ---- Shaped: the ten names whose Exasol form is NOT a `<NAME>(<args>)` call,
+    // so their own arm owns both dialects.
+    //
+    // Arithmetic and unary negation: SQL operators, not calls.
+    ("ADD", ExasolForm::Shaped),
+    ("SUB", ExasolForm::Shaped),
+    ("MULT", ExasolForm::Shaped),
+    ("FLOAT_DIV", ExasolForm::Shaped),
+    ("NEG", ExasolForm::Shaped),
+    // CAST: the target type is rendered per dialect by `render_cast_target`.
+    ("CAST", ExasolForm::Shaped),
+    // REGEXP_LIKE: Exasol's own form is an infix predicate, not a call.
+    ("REGEXP_LIKE", ExasolForm::Shaped),
+    // MOD: Exasol requires the MOD(a, b) form, DataFusion the `%` operator. The
+    // Exasol side happens to be a call, but the DataFusion side is not, so the arm
+    // owns both dialects rather than the gate owning one of them (#197).
+    ("MOD", ExasolForm::Shaped),
+    // CONCAT: the wire encoding of Exasol's `||` operator, so it renders as
+    // chained `||` in both dialects rather than as a CONCAT(...) call.
+    ("CONCAT", ExasolForm::Shaped),
+    // CASE: `CASE WHEN ... THEN ... [ELSE ...] END`, not a call.
+    ("CASE", ExasolForm::Shaped),
+    // ---- VerbatimCall: every remaining name. Exasol has all of them, so the
+    // Exasol dialect re-emits the name, argument order, and argument count Exasol
+    // itself sent, and each per-name arm below serves the DataFusion dialect alone.
+    // The rule is applied to the whole set rather than only to the names whose
+    // DataFusion rendering fails to compile on Exasol: a rule applied to some names
+    // and not others cannot be reasoned about, because the next reader cannot tell
+    // which renderings are principled and which merely happen to work.
+    //
+    // Math family. DataFusion renders SIGN as `signum`, which Exasol does not have
+    // ("function or script SIGNUM not found", 42000). SIGN is also why the gate
+    // sits ahead of the WHOLE `match fn_name.as_str()` rather than being a guard
+    // inside it: the math arm matches SIGN, so any guard placed after that arm
+    // would still render `signum` (issue #209).
+    ("ABS", ExasolForm::VerbatimCall),
+    ("FLOOR", ExasolForm::VerbatimCall),
+    ("CEIL", ExasolForm::VerbatimCall),
+    ("SQRT", ExasolForm::VerbatimCall),
+    ("EXP", ExasolForm::VerbatimCall),
+    ("LN", ExasolForm::VerbatimCall),
+    ("SIGN", ExasolForm::VerbatimCall),
+    ("DEGREES", ExasolForm::VerbatimCall),
+    ("RADIANS", ExasolForm::VerbatimCall),
+    ("SIN", ExasolForm::VerbatimCall),
+    ("COS", ExasolForm::VerbatimCall),
+    ("TAN", ExasolForm::VerbatimCall),
+    ("ASIN", ExasolForm::VerbatimCall),
+    ("ACOS", ExasolForm::VerbatimCall),
+    ("ATAN", ExasolForm::VerbatimCall),
+    ("SINH", ExasolForm::VerbatimCall),
+    ("COSH", ExasolForm::VerbatimCall),
+    ("TANH", ExasolForm::VerbatimCall),
+    ("COT", ExasolForm::VerbatimCall),
+    ("ROUND", ExasolForm::VerbatimCall),
+    ("TRUNC", ExasolForm::VerbatimCall),
+    ("LOG", ExasolForm::VerbatimCall),
+    ("POWER", ExasolForm::VerbatimCall),
+    ("ATAN2", ExasolForm::VerbatimCall),
+    // String family. This is what lets a 3-argument `INSTR(s, sub, start)` or
+    // `LOCATE(sub, s, start)` evaluate correctly on the Exasol-parsed path (issue
+    // #210): Exasol's own INSTR/LOCATE already understand the optional start
+    // argument, so there is nothing to translate and an arity check could only
+    // reject valid input. The DataFusion dialect needs the name-mapping and
+    // argument-reordering arms instead, having no function of these exact names and
+    // arities (LENGTH -> character_length, UNICODE -> ascii, INSTR/LOCATE -> strpos).
+    ("LOWER", ExasolForm::VerbatimCall),
+    ("UPPER", ExasolForm::VerbatimCall),
+    ("SUBSTR", ExasolForm::VerbatimCall),
+    ("TRIM", ExasolForm::VerbatimCall),
+    ("LTRIM", ExasolForm::VerbatimCall),
+    ("RTRIM", ExasolForm::VerbatimCall),
+    ("REPLACE", ExasolForm::VerbatimCall),
+    ("REPEAT", ExasolForm::VerbatimCall),
+    ("REVERSE", ExasolForm::VerbatimCall),
+    ("LPAD", ExasolForm::VerbatimCall),
+    ("RPAD", ExasolForm::VerbatimCall),
+    ("ASCII", ExasolForm::VerbatimCall),
+    ("CHR", ExasolForm::VerbatimCall),
+    ("INITCAP", ExasolForm::VerbatimCall),
+    ("LEFT", ExasolForm::VerbatimCall),
+    ("RIGHT", ExasolForm::VerbatimCall),
+    ("TRANSLATE", ExasolForm::VerbatimCall),
+    ("LENGTH", ExasolForm::VerbatimCall),
+    ("OCTET_LENGTH", ExasolForm::VerbatimCall),
+    ("UNICODE", ExasolForm::VerbatimCall),
+    ("UNICODECHR", ExasolForm::VerbatimCall),
+    ("INSTR", ExasolForm::VerbatimCall),
+    ("LOCATE", ExasolForm::VerbatimCall),
+    // Comparison and null-handling family. All five already parsed in Exasol, so
+    // the rendering changes only in name case for GREATEST/LEAST/NULLIF —
+    // NULLIFZERO and ZEROIFNULL additionally shed their DataFusion emulations
+    // (`nullif(v, 0)` and `coalesce(v, 0)`), gaining parity by construction.
+    ("GREATEST", ExasolForm::VerbatimCall),
+    ("LEAST", ExasolForm::VerbatimCall),
+    ("NULLIF", ExasolForm::VerbatimCall),
+    ("NULLIFZERO", ExasolForm::VerbatimCall),
+    ("ZEROIFNULL", ExasolForm::VerbatimCall),
+    // Date field shortcuts. DataFusion renders these as `date_part('<FIELD>', x)`,
+    // and Exasol has no DATE_PART at all ("function or script DATE_PART not
+    // found", 42000), so this is the second family issue #209 reported failing.
+    ("YEAR", ExasolForm::VerbatimCall),
+    ("MONTH", ExasolForm::VerbatimCall),
+    ("DAY", ExasolForm::VerbatimCall),
+    ("HOUR", ExasolForm::VerbatimCall),
+    ("MINUTE", ExasolForm::VerbatimCall),
+    ("SECOND", ExasolForm::VerbatimCall),
+    ("WEEK", ExasolForm::VerbatimCall),
+    // DATE_TRUNC, TO_DATE, and TO_TIMESTAMP share Exasol's name and argument order,
+    // and both dialects forward the format/unit literal untouched, so the verbatim
+    // rendering differs only in name case.
+    ("DATE_TRUNC", ExasolForm::VerbatimCall),
+    ("TO_DATE", ExasolForm::VerbatimCall),
+    ("TO_TIMESTAMP", ExasolForm::VerbatimCall),
+    // Date-difference family. DataFusion has none of these names and emulates them
+    // (a CAST-to-DATE difference, or a `date_part('epoch', …)` difference), so the
+    // *_BETWEEN pushdown shipped in `add-date-arithmetic-pushdown` was broken on the
+    // Exasol-parsed path from day one — DATE_PART again.
+    ("DAYS_BETWEEN", ExasolForm::VerbatimCall),
+    ("HOURS_BETWEEN", ExasolForm::VerbatimCall),
+    ("MINUTES_BETWEEN", ExasolForm::VerbatimCall),
+    ("SECONDS_BETWEEN", ExasolForm::VerbatimCall),
+    // NOT declared, and therefore not translated in either dialect: CURRENT_DATE,
+    // SYSDATE, CURRENT_TIMESTAMP, and SYSTIMESTAMP. The verbatim rule works because
+    // Exasol's compiler emitted the call and Exasol's engine will evaluate it; it
+    // cannot help a function whose value depends on context the scan never receives.
+    // The scan UDF gets neither SESSIONTIMEZONE nor DBTIMEZONE, opens no
+    // connect-back session, and holds no statement anchor, so it read its container
+    // clock in UTC once per shard. Their capabilities are withdrawn too
+    // (`capabilities.rs`), so Exasol keeps the work and evaluates its own clock
+    // once per statement in its own zones. See `now_family_falls_through`.
+];
+
+/// The declared Exasol-dialect form of a `function_scalar` name, or `None` when
+/// the translator does not translate that name at all.
+fn declared_scalar_fn(name: &str) -> Option<ExasolForm> {
+    TRANSLATED_SCALAR_FNS
+        .iter()
+        .find(|(declared, _)| declared.eq_ignore_ascii_case(name))
+        .map(|(_, form)| *form)
 }
 
 // ---------------------------------------------------------------------------
@@ -64,11 +278,72 @@ fn is_empty_opt(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
+/// Whether a VS expression node type always yields a boolean result —
+/// literal booleans and the predicate family. Used to detect a boolean
+/// operand being converted to string (CAST or CONCAT/`||`) so the rendering
+/// can substitute Exasol's TRUE/FALSE casing instead of leaking DataFusion's
+/// lowercase boolean->Utf8 cast (#200).
+fn is_boolean_producing(kind: &str) -> bool {
+    matches!(
+        kind,
+        "literal_bool"
+            | "predicate_equal"
+            | "predicate_notequal"
+            | "predicate_less"
+            | "predicate_lessequal"
+            | "predicate_greater"
+            | "predicate_greaterequal"
+            | "predicate_and"
+            | "predicate_or"
+            | "predicate_not"
+            | "predicate_is_null"
+            | "predicate_is_not_null"
+            | "predicate_in_constlist"
+            | "predicate_between"
+            | "predicate_like"
+            | "predicate_like_regexp"
+    )
+}
+
+/// Render a boolean SQL fragment as an Exasol-cased, NULL-preserving string.
+///
+/// Exasol renders BOOLEAN as `TRUE`/`FALSE`; DataFusion's boolean->Utf8 cast
+/// kernel renders lowercase `true`/`false`. The simple-CASE form evaluates
+/// `bool_expr` once and falls through to `ELSE NULL` when it is NULL, so a
+/// NULL boolean converts to NULL rather than the string `'NULL'` or a
+/// coerced `'FALSE'` (#200).
+fn render_bool_to_string_case(bool_expr: &str) -> String {
+    format!("(CASE {bool_expr} WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)")
+}
+
 fn quote_literal(value: Option<&Json>) -> String {
     match value {
         None | Some(Json::Null) => "NULL".to_string(),
         Some(Json::String(s)) => format!("'{}'", sql_escape(s)),
         Some(other) => format!("'{}'", sql_escape(&json_scalar_to_string(other))),
+    }
+}
+
+/// The Exasol-dialect rendering shared by `literal_timestamp` and
+/// `literal_timestamp_utc`.
+///
+/// Both node types render the SAME bare `TIMESTAMP '<value>'` literal — the value
+/// Exasol's own compiler sent, single-quoted with internal quotes doubled as for
+/// `literal_string`. Owned in one place so the two arms cannot drift into
+/// rendering different strings for the same instant, which is the defect this
+/// form fixes: the DataFusion dialect appends a `+00:00` offset for the UTC node
+/// type, and Exasol's literal format (`YYYY-MM-DD HH24:MI:SS.FF9`) has no offset
+/// field, rejecting one with `data exception - invalid character value for cast`
+/// (22018).
+///
+/// An absent or JSON-null value renders as the bare `NULL` keyword rather than a
+/// typed literal, because `TIMESTAMP NULL` is a syntax error on Exasol
+/// (`unexpected TIMESTAMP_`, 42000) while `NULL` is valid in every position a
+/// timestamp literal can occupy.
+fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
+    match value {
+        None | Some(Json::Null) => "NULL".to_string(),
+        Some(v) => format!("TIMESTAMP {}", quote_literal(Some(v))),
     }
 }
 
@@ -238,6 +513,25 @@ fn render_cast(
         .ok_or_else(|| UdfError::User("CAST expression is null".into()))?;
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let target_type = render_cast_target(data_type, dialect)?;
+
+    // A boolean source cast to a string type must render Exasol's TRUE/FALSE
+    // casing, not DataFusion's lowercase boolean->Utf8 cast kernel (#200).
+    let target_is_string = matches!(
+        data_type
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(str::to_uppercase)
+            .as_deref(),
+        Some("VARCHAR") | Some("CHAR")
+    );
+    let source_is_boolean = args[0]
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(is_boolean_producing);
+    if target_is_string && source_is_boolean {
+        return Ok(Some(render_bool_to_string_case(&inner)));
+    }
+
     Ok(Some(format!("CAST({inner} AS {target_type})")))
 }
 
@@ -289,16 +583,38 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
         }
         "literal_date" => return Ok(Some(format!("DATE {}", quote_literal(value("value"))))),
         "literal_timestamp" => {
+            // Exasol's core engine parses the wrapper SQL and has no `arrow_cast`
+            // ("function or script ARROW_CAST not found", 42000), so re-emit the
+            // bare literal Exasol itself sent.
+            if dialect == Dialect::Exasol {
+                return Ok(Some(render_exasol_timestamp_literal(value("value"))));
+            }
             // Render via arrow_cast at explicit microsecond precision: a bare
             // `TIMESTAMP '...'` is typed Timestamp(Nanosecond) by DataFusion's SQL
             // frontend, which overflows in simplify_expressions when unified with
             // the scan's microsecond-typed columns on far-future values (#155).
+            //
+            // An absent or JSON-null `value` reaches `quote_literal` as the bare
+            // NULL keyword, so this arm renders `arrow_cast(NULL, …)` whereas the
+            // `literal_timestamp_utc` arm below short-circuits to a bare `NULL`.
+            // Both DataFusion renderings predate the dialect split and are frozen
+            // by `renders_null_valued_timestamp_literal_per_dialect`; the two are
+            // deliberately NOT aligned with each other.
             return Ok(Some(format!(
                 "arrow_cast({}, 'Timestamp(Microsecond, None)')",
                 quote_literal(value("value"))
             )));
         }
         "literal_timestamp_utc" => {
+            // The Exasol dialect renders the same bare literal as
+            // `literal_timestamp` and appends NO offset: Exasol's TIMESTAMP format
+            // has no offset field and rejects one with sqlCode 22018. The value
+            // Exasol sends is already UTC-normalised, and this project maps
+            // Iceberg `timestamptz` to plain Exasol `TIMESTAMP`, so the wrapper's
+            // counterpart column is a plain UTC TIMESTAMP.
+            if dialect == Dialect::Exasol {
+                return Ok(Some(render_exasol_timestamp_literal(value("value"))));
+            }
             // Append +00:00 so the value parses as UTC, then render via arrow_cast
             // at explicit microsecond precision (see literal_timestamp above). The
             // cast target tz label is "UTC" (not "+00:00") to match the scan's
@@ -322,8 +638,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             // A `tableAlias` (injected by the caller for a multi-table render, e.g.
             // the join two-scan wrapper) qualifies the reference as
             // `"ALIAS"."NAME"`, disambiguating a name shared by two joined subqueries.
-            // Absent (the default single-table path), a bare quoted name is rendered
-            // exactly as before.
+            // For a single-relation target the caller strips `tableAlias` before
+            // calling this renderer, which then falls through to a bare quoted name.
             return Ok(Some(
                 match value("tableAlias")
                     .and_then(|a| a.as_str())
@@ -448,7 +764,13 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     .ok_or_else(|| {
                         UdfError::User("predicate_like_regexp missing 'pattern'".into())
                     })?;
-            Ok(Some(format!("regexp_like({subject}, {pattern})")))
+            Ok(Some(match dialect {
+                // Exasol's own parser accepts only the infix REGEXP_LIKE
+                // predicate form, not a `regexp_like(...)` call ("syntax error,
+                // unexpected REGEXP_LIKE_", 42000).
+                Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
+                Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
+            }))
         }
         // Exasol sends EXTRACT as its own node type with the field in `toExtract`:
         // {"type":"function_scalar_extract","name":"EXTRACT","toExtract":"DAY","arguments":[<src>]}
@@ -471,9 +793,15 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }
             let src = render_expression_inner(&args[0], dialect)?
                 .ok_or_else(|| UdfError::User("EXTRACT source is null".into()))?;
-            // DataFusion 54 (default features) has no EXTRACT(field FROM expr) ExprPlanner;
-            // render the portable function form date_part('FIELD', expr) instead.
-            Ok(Some(format!("date_part('{field}', {src})")))
+            Ok(Some(match dialect {
+                // Exasol's own EXTRACT takes the field as a bare keyword, not a
+                // quoted string literal.
+                Dialect::Exasol => format!("EXTRACT({field} FROM {src})"),
+                // DataFusion 54 (default features) has no EXTRACT(field FROM expr)
+                // ExprPlanner; render the portable function form
+                // date_part('FIELD', expr) instead.
+                Dialect::DataFusion => format!("date_part('{field}', {src})"),
+            }))
         }
         // Exasol encodes CASE (and CASE-expanded functions like NULLIF/ZEROIFNULL) as
         // its own node type:
@@ -525,9 +853,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             Ok(Some(format!("({sql})")))
         }
         // Exasol sends CAST as its own top-level node type carrying the target
-        // in `dataType` (verified against the engine source
-        // `[redacted]` — `[redacted]`
-        // is the sole CAST emitter):
+        // in `dataType` (verified against the real Exasol wire shape):
         //   {"type":"function_scalar_cast","name":"CAST","dataType":{...},"arguments":[<src>]}
         // This is the shape real Exasol traffic hits; the nested
         // `function_scalar`+name=CAST arm below is a defensive alternate encoding.
@@ -566,6 +892,29 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 .unwrap_or("")
                 .to_uppercase();
             let args = value("arguments").and_then(|a| a.as_array());
+
+            // The declaration gates the dispatch. An undeclared name is not
+            // translated in either dialect, so a per-name arm below with no
+            // `TRANSLATED_SCALAR_FNS` row is unreachable. In the Exasol dialect, a
+            // declared `VerbatimCall` renders here, AHEAD of the per-name arms, so
+            // arm order carries no dialect precedence; a declared `Shaped` name (or
+            // any name in the DataFusion dialect) falls through to its own arm,
+            // which owns both dialects.
+            match declared_scalar_fn(&fn_name) {
+                None => {
+                    return Err(UdfError::User(format!(
+                        "unsupported scalar function: {fn_name}"
+                    )));
+                }
+                Some(ExasolForm::VerbatimCall) if dialect == Dialect::Exasol => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
+                    })?;
+                    let rendered = render_args(args, dialect)?;
+                    return Ok(Some(format!("{fn_name}({})", rendered.join(", "))));
+                }
+                _ => {}
+            }
 
             match fn_name.as_str() {
                 // Arithmetic binary operators. The `function_scalar` node name Exasol
@@ -615,8 +964,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 }
                 // CAST as a function_scalar (defensive alternate encoding).
                 // Real Exasol traffic emits CAST as the top-level
-                // `function_scalar_cast` node handled above (engine source
-                // `[redacted]` emits CAST exclusively that way); this arm is kept
+                // `function_scalar_cast` node handled above; this arm is kept
                 // defensively — like the REGEXP_LIKE alternate encoding below — and
                 // shares the same body via `render_cast`.
                 "CAST" => render_cast(args, value("dataType"), dialect),
@@ -635,7 +983,13 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("REGEXP_LIKE subject is null".into()))?;
                     let pattern = render_expression_inner(&args[1], dialect)?
                         .ok_or_else(|| UdfError::User("REGEXP_LIKE pattern is null".into()))?;
-                    Ok(Some(format!("regexp_like({subject}, {pattern})")))
+                    Ok(Some(match dialect {
+                        // Same infix form as the predicate_like_regexp node type
+                        // above — this alternate encoding must render
+                        // byte-identically to it within a dialect.
+                        Dialect::Exasol => format!("({subject} REGEXP_LIKE {pattern})"),
+                        Dialect::DataFusion => format!("regexp_like({subject}, {pattern})"),
+                    }))
                 }
                 // Math functions: name-mapping table
                 // Arity: 1-arg: ABS FLOOR CEIL SQRT EXP LN SIGN DEGREES RADIANS SIN COS TAN ASIN
@@ -716,11 +1070,46 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         Dialect::DataFusion => format!("({left} % {right})"),
                     }))
                 }
-                // String functions: name-mapping table
-                "CONCAT" | "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM"
-                | "REPLACE" | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR"
-                | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH"
-                | "UNICODE" | "UNICODECHR" => {
+                // CONCAT → the wire encoding of Exasol's `||` operator, so it
+                // is rendered as chained `||`, not DataFusion's concat()
+                // function: concat() silently ignores NULL arguments
+                // (`concat(NULL, 'x')` = `'x'`), while both Exasol's `||` and
+                // DataFusion's `||` operator propagate NULL (`NULL || 'x'` =
+                // `NULL`) — using concat() would drop the NULL-preservation
+                // this rewrite depends on. A boolean operand is rewritten to
+                // the Exasol-cased form before joining, since DataFusion's
+                // boolean->Utf8 cast (which `||` falls back to for a raw
+                // boolean operand) renders lowercase `true`/`false` (#200).
+                "CONCAT" => {
+                    let args = args.ok_or_else(|| {
+                        UdfError::User("function_scalar CONCAT missing 'arguments'".into())
+                    })?;
+                    let rendered = args
+                        .iter()
+                        .map(|arg| {
+                            let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
+                                UdfError::User("CONCAT argument rendered to null".into())
+                            })?;
+                            let is_bool = arg
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .is_some_and(is_boolean_producing);
+                            Ok(if is_bool {
+                                render_bool_to_string_case(&r)
+                            } else {
+                                r
+                            })
+                        })
+                        .collect::<Result<Vec<String>, UdfError>>()?;
+                    Ok(Some(format!("({})", rendered.join(" || "))))
+                }
+                // String functions: name-mapping table (DataFusion dialect). The
+                // Exasol dialect never reaches this arm — those names are declared
+                // `VerbatimCall`, so the gate above renders them from Exasol's own
+                // name, order, and argument count.
+                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+                | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR" | "INITCAP" | "LEFT"
+                | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH" | "UNICODE" | "UNICODECHR" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
@@ -739,7 +1128,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let rendered = render_args(args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
-                // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring)
+                // INSTR(string, substring) and LOCATE(substring, string) both → strpos(string, substring).
+                // DataFusion dialect only — the Exasol dialect renders both verbatim
+                // at the gate, ahead of this dispatch.
                 // INSTR: arg[0]=string, arg[1]=substring → strpos(arg[0], arg[1])
                 // LOCATE: arg[0]=substring, arg[1]=string → strpos(arg[1], arg[0])
                 "INSTR" => {
@@ -925,9 +1316,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         .ok_or_else(|| UdfError::User("DATE_TRUNC source is null".into()))?;
                     Ok(Some(format!("date_trunc({unit}, {src})")))
                 }
-                // Now-family: zero-argument date/time functions
-                "CURRENT_DATE" | "SYSDATE" => Ok(Some("current_date()".into())),
-                "CURRENT_TIMESTAMP" | "SYSTIMESTAMP" => Ok(Some("now()".into())),
                 // TO_DATE / TO_TIMESTAMP — forward all args (source + optional format)
                 "TO_DATE" => {
                     let args = args.ok_or_else(|| {
@@ -1018,6 +1406,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         _ => unreachable!(),
                     }))
                 }
+                // Backstop only: the gate above already declined every undeclared
+                // name with this exact message, so this arm is reachable only if a
+                // declared name loses its per-name arm.
                 other => Err(UdfError::User(format!(
                     "unsupported scalar function: {other}"
                 ))),
@@ -1113,8 +1504,14 @@ pub fn render_expression_safe(expr: &Json) -> Option<String> {
 ///
 /// Returns `None` when:
 /// - rendering fails (unsupported node types, malformed input), or
-/// - the filter is trivially true (`TRUE` or `NULL`) — the adapter omits
-///   it from the scan spec and lets Exasol keep it as a correctness backstop.
+/// - the filter is trivially true (`TRUE` or `NULL`).
+///
+/// These two causes are NOT distinguishable from this function's `None` alone, and
+/// this function does not decide what a `None` means for the request as a whole —
+/// that is the caller's responsibility (see `datafusion_renderable` in the adapter's
+/// `pushdown/support.rs`), which is the only place that knows whether the filter was
+/// absent, trivially true, or actually declined and therefore needs self-applying
+/// rather than omitting.
 ///
 /// DataFusion dialect — see [`render_expression`]; the Exasol-dialect twin is
 /// [`render_df_filter_exasol_safe`].
@@ -1154,7 +1551,9 @@ pub fn render_expression_exasol_safe(expr: &Json) -> Option<String> {
 /// Render a VS filter expression to an **Exasol** SQL WHERE fragment.
 ///
 /// Returns `None` when rendering fails or the filter is trivially true
-/// (`TRUE`/`NULL`), mirroring [`render_df_filter_safe`] exactly. Exasol
+/// (`TRUE`/`NULL`), mirroring [`render_df_filter_safe`] exactly — including that
+/// those two causes are not distinguishable here, and what a `None` means for the
+/// request as a whole is the caller's responsibility, not this function's. Exasol
 /// dialect — see [`render_expression_exasol`]; the DataFusion-dialect twin is
 /// [`render_df_filter_safe`].
 pub fn render_df_filter_exasol_safe(filter_expr: &Json) -> Option<String> {
@@ -1643,9 +2042,8 @@ mod tests {
     //
     // Fixtures use the real Exasol wire shape `{"type":"function_scalar_cast",
     // "name":"CAST","dataType":{...},"arguments":[...]}` — the shape the engine
-    // actually emits (verified against `[redacted]` `[redacted]`
-    // `[redacted]`), NOT the earlier `{"type":"function_scalar",...}`
-    // shape whose mismatch let a dispatch bug hide (CAST never reached its arm).
+    // actually emits, NOT the earlier `{"type":"function_scalar",...}` shape
+    // whose mismatch let a dispatch bug hide (CAST never reached its arm).
 
     #[test]
     fn renders_cast_varchar() {
@@ -1706,6 +2104,49 @@ mod tests {
             "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    }
+
+    #[test]
+    fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
+        // #200: CAST(<bool> AS VARCHAR) must render Exasol's TRUE/FALSE
+        // casing, not DataFusion's lowercase boolean->Utf8 cast.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{
+                "type": "predicate_greater",
+                "left": {"type": "column", "name": "c_acctbal"},
+                "right": {"type": "literal_exactnumeric", "value": 0}
+            }],
+            "dataType": {"type": "VARCHAR", "size": 10}
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+        );
+    }
+
+    #[test]
+    fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
+        // A boolean-producing predicate other than a comparison (here
+        // `predicate_is_null`) is detected the same way, confirming the CASE
+        // rewrite isn't special-cased to `predicate_greater` alone. Runtime
+        // NULL-preservation itself (a NULL comparison falling through the
+        // CASE's `ELSE NULL`, never 'NULL' or a coerced 'FALSE') is exercised
+        // end-to-end in `boolean_to_string_casing_test.rs`.
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{
+                "type": "predicate_is_null",
+                "expression": {"type": "column", "name": "x"}
+            }],
+            "dataType": {"type": "VARCHAR", "size": 10}
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CASE ("X" IS NULL) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+        );
     }
 
     #[test]
@@ -1799,12 +2240,15 @@ mod tests {
     }
 
     #[test]
-    fn cast_to_unsupported_target_falls_back() {
+    fn cast_to_unsupported_target_declines() {
         // Exasol CAST targets with no faithful DataFusion 54 equivalent. Each is
         // sent with the dataType descriptor shape shown (verified against the
-        // Exasol virtual-schema data-types API). The translator must decline
-        // (Err in raising mode, None in safe mode) so the adapter omits the CAST
-        // and Exasol evaluates it as a correctness backstop.
+        // Exasol virtual-schema data-types API). The translator declines these
+        // targets (Err in raising mode, None in safe mode); there is no
+        // Exasol-side re-check of an advertised capability, so it is the
+        // caller's job to decide what to do with that `None`/`Err` — the
+        // adapter's declined-predicate route errors rather than omitting the
+        // CAST.
         //
         // TIMESTAMP WITH LOCAL TIME ZONE is the trap: Exasol serialises it as
         // type "TIMESTAMP" with `withLocalTimeZone: true` — NOT a distinct type
@@ -1947,6 +2391,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn renders_timestamp_literals_as_bare_timestamp_in_exasol_dialect() {
+        // `arrow_cast` is DataFusion-only: Exasol's core engine rejects the
+        // wrapper SQL with "function or script ARROW_CAST not found" (42000,
+        // verified on live Exasol 2025.2.1). The Exasol dialect re-emits the bare
+        // `TIMESTAMP '<value>'` literal Exasol's own compiler sent, while the
+        // DataFusion rendering stays byte-identical so the scan keeps the
+        // explicit microsecond typing that issue #155 depends on.
+        let ts = json!({"type": "literal_timestamp", "value": "2024-01-15 12:00:00"});
+        let ts_utc = json!({"type": "literal_timestamp_utc", "value": "2024-03-01 10:00:00"});
+
+        let ts_exasol = render_expression_exasol(&ts).unwrap();
+        assert_eq!(ts_exasol, "TIMESTAMP '2024-01-15 12:00:00'");
+        assert_eq!(
+            render_expression_exasol(&ts_utc).unwrap(),
+            "TIMESTAMP '2024-03-01 10:00:00'"
+        );
+        assert!(
+            !ts_exasol.contains("arrow_cast"),
+            "Exasol rejects arrow_cast with sqlCode 42000: {ts_exasol}"
+        );
+
+        // Internal single quotes are doubled, exactly as for `literal_string`, so
+        // no literal value can terminate the quoted literal early.
+        assert_eq!(
+            render_expression_exasol(&json!({
+                "type": "literal_timestamp",
+                "value": "2024-01-15 12:00:00' OR '1'='1"
+            }))
+            .unwrap(),
+            "TIMESTAMP '2024-01-15 12:00:00'' OR ''1''=''1'"
+        );
+
+        // The DataFusion dialect is frozen.
+        assert_eq!(
+            render_expression(&ts).unwrap(),
+            "arrow_cast('2024-01-15 12:00:00', 'Timestamp(Microsecond, None)')"
+        );
+        assert_eq!(
+            render_expression(&ts_utc).unwrap(),
+            "arrow_cast('2024-03-01 10:00:00+00:00', 'Timestamp(Microsecond, Some(\"UTC\"))')"
+        );
+    }
+
+    #[test]
+    fn renders_timestamp_utc_literal_without_offset_in_exasol_dialect() {
+        // Exasol's TIMESTAMP literal format is `YYYY-MM-DD HH24:MI:SS.FF9`, which
+        // has no offset field: the DataFusion dialect's `+00:00` suffix raises
+        // "data exception - invalid character value for cast" (22018, verified on
+        // live Exasol 2025.2.1). Both timestamp node types therefore render the
+        // SAME bare literal in the Exasol dialect; the offset exists only in the
+        // DataFusion dialect, where it pins the arrow timezone label.
+        let value = "2024-03-01 10:00:00";
+        let ts_utc = json!({"type": "literal_timestamp_utc", "value": value});
+        let ts = json!({"type": "literal_timestamp", "value": value});
+
+        let exasol = render_expression_exasol(&ts_utc).unwrap();
+        assert_eq!(exasol, "TIMESTAMP '2024-03-01 10:00:00'");
+        assert!(
+            !exasol.contains("+00:00"),
+            "Exasol rejects an offset in a TIMESTAMP literal with sqlCode 22018: {exasol}"
+        );
+        assert_eq!(
+            exasol,
+            render_expression_exasol(&ts).unwrap(),
+            "both timestamp node types must render the same bare Exasol literal"
+        );
+
+        assert!(
+            render_expression(&ts_utc).unwrap().contains("+00:00"),
+            "the DataFusion dialect keeps the offset that types the literal UTC"
+        );
+    }
+
+    #[test]
+    fn renders_null_valued_timestamp_literal_per_dialect() {
+        // `TIMESTAMP NULL` is a syntax error on Exasol ("unexpected TIMESTAMP_",
+        // 42000, verified live on 2025.2.1), so an absent or JSON-null `value`
+        // renders as the bare NULL keyword rather than as a typed literal.
+        //
+        // The DataFusion dialect is ASYMMETRIC across the two node types, and
+        // that asymmetry is frozen rather than a defect to align:
+        // `literal_timestamp` wraps the NULL keyword in `arrow_cast`, while
+        // `literal_timestamp_utc` short-circuits to bare `NULL` before it can
+        // build a cast. Pinning both stops a later reader from "fixing" one to
+        // match the other and silently changing a frozen DataFusion rendering.
+        let cases = [
+            (
+                "literal_timestamp",
+                "arrow_cast(NULL, 'Timestamp(Microsecond, None)')",
+            ),
+            ("literal_timestamp_utc", "NULL"),
+        ];
+        for (node_type, expected_datafusion) in cases {
+            for (variant, node) in [
+                (
+                    "carrying a JSON-null value",
+                    json!({"type": node_type, "value": null}),
+                ),
+                ("with no value key at all", json!({"type": node_type})),
+            ] {
+                assert_eq!(
+                    render_expression_exasol(&node).unwrap(),
+                    "NULL",
+                    "{node_type} {variant}, Exasol dialect"
+                );
+                assert_eq!(
+                    render_expression(&node).unwrap(),
+                    expected_datafusion,
+                    "{node_type} {variant}, DataFusion dialect"
+                );
+            }
+        }
+    }
+
     // --- REGEXP_LIKE predicate and function_scalar ---
 
     #[test]
@@ -1971,6 +2530,75 @@ mod tests {
         });
         let sql2 = render_expression(&expr2).unwrap();
         assert_eq!(sql2, r#"regexp_like("NAME", '^B.*')"#);
+    }
+
+    #[test]
+    fn renders_regexp_like_as_infix_predicate_in_exasol_dialect() {
+        // Exasol's parser has no `regexp_like(...)` function; it accepts only the
+        // infix `(<subject> REGEXP_LIKE <pattern>)` predicate form
+        // ("syntax error, unexpected REGEXP_LIKE_", 42000). Both wire encodings —
+        // the dedicated `predicate_like_regexp` node type and the alternate
+        // `function_scalar` REGEXP_LIKE encoding — must render that same infix
+        // form on the Exasol-parsed path, byte-identically to each other, while
+        // the DataFusion-dialect rendering of both stays `regexp_like(s, p)`.
+        let predicate = json!({
+            "type": "predicate_like_regexp",
+            "expression": {"type": "column", "name": "name"},
+            "pattern": {"type": "literal_string", "value": "^A.*"}
+        });
+        let scalar = json!({
+            "type": "function_scalar",
+            "name": "REGEXP_LIKE",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "literal_string", "value": "^A.*"}
+            ]
+        });
+
+        let predicate_exasol = render_expression_exasol(&predicate).unwrap();
+        let scalar_exasol = render_expression_exasol(&scalar).unwrap();
+        assert_eq!(predicate_exasol, r#"("NAME" REGEXP_LIKE '^A.*')"#);
+        assert_eq!(
+            scalar_exasol, predicate_exasol,
+            "the two REGEXP_LIKE encodings must render byte-identically in the Exasol dialect"
+        );
+
+        assert_eq!(
+            render_expression(&predicate).unwrap(),
+            r#"regexp_like("NAME", '^A.*')"#
+        );
+        assert_eq!(
+            render_expression(&scalar).unwrap(),
+            r#"regexp_like("NAME", '^A.*')"#
+        );
+    }
+
+    #[test]
+    fn regexp_like_predicate_missing_operand_errors_in_both_dialects() {
+        let missing_pattern = json!({
+            "type": "predicate_like_regexp",
+            "expression": {"type": "column", "name": "name"}
+        });
+        assert!(render_expression(&missing_pattern).is_err());
+        assert!(render_expression_exasol(&missing_pattern).is_err());
+
+        let missing_expression = json!({
+            "type": "predicate_like_regexp",
+            "pattern": {"type": "literal_string", "value": "^A.*"}
+        });
+        assert!(render_expression(&missing_expression).is_err());
+        assert!(render_expression_exasol(&missing_expression).is_err());
+    }
+
+    #[test]
+    fn regexp_like_scalar_arity_errors_in_both_dialects() {
+        let one_arg = json!({
+            "type": "function_scalar",
+            "name": "REGEXP_LIKE",
+            "arguments": [{"type": "column", "name": "name"}]
+        });
+        assert!(render_expression(&one_arg).is_err());
+        assert!(render_expression_exasol(&one_arg).is_err());
     }
 
     // --- Math scalar functions (ABS/ROUND/SIGN→signum/trig/...) ---
@@ -2096,7 +2724,6 @@ mod tests {
     fn renders_string_scalar_functions() {
         // Pass-through lowercased
         let cases_lower = [
-            "CONCAT",
             "LOWER",
             "UPPER",
             "TRIM",
@@ -2196,6 +2823,57 @@ mod tests {
             ]
         });
         assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+    }
+
+    // --- CONCAT → chained `||` (NULL-propagating, unlike DataFusion's concat()) ---
+
+    #[test]
+    fn renders_concat_as_chained_pipe_operator() {
+        // Two args: joined with `||`, not concat() — concat() silently turns a
+        // NULL operand into empty string (#200's GROUP BY repro shape).
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_string", "value": ""}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("S" || '')"#);
+
+        // Three args: chained, still no concat() call.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"},
+                {"type": "column", "name": "c"}
+            ]
+        });
+        assert_eq!(render_expression(&expr).unwrap(), r#"("A" || "B" || "C")"#);
+    }
+
+    #[test]
+    fn renders_concat_bool_operand_as_exasol_case() {
+        // A boolean-producing argument (here `predicate_equal`) is rewritten to
+        // the Exasol-cased CASE form before joining — DataFusion's `||` falls
+        // back to its lowercase boolean->Utf8 cast for a raw boolean operand
+        // otherwise (#200).
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "predicate_equal",
+                 "left": {"type": "column", "name": "active"},
+                 "right": {"type": "literal_bool", "value": true}},
+                {"type": "literal_string", "value": ""}
+            ]
+        });
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) || '')"#
+        );
     }
 
     // --- CASE WHEN ... THEN ... ELSE ... END ---
@@ -2422,6 +3100,29 @@ mod tests {
     }
 
     #[test]
+    fn renders_extract_as_exasol_extract_from_in_exasol_dialect() {
+        // Exasol's parser has no DATE_PART function; the EXTRACT-carrying node
+        // must render Exasol's own EXTRACT(<FIELD> FROM <src>) form, with the
+        // field as a bare keyword (not a quoted string literal), on the
+        // Exasol-parsed path. The DataFusion-dialect rendering of the same
+        // node stays unchanged (date_part('<FIELD>', <src>)).
+        let expr = json!({
+            "type": "function_scalar_extract",
+            "name": "EXTRACT",
+            "toExtract": "DAY",
+            "arguments": [{"type": "column", "name": "ts"}]
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"EXTRACT(DAY FROM "TS")"#
+        );
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_part('DAY', "TS")"#
+        );
+    }
+
+    #[test]
     fn renders_year_month_day_extract() {
         let shortcuts = ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"];
         for field in shortcuts {
@@ -2457,24 +3158,58 @@ mod tests {
         );
     }
 
-    // --- CURRENT_DATE / SYSDATE / CURRENT_TIMESTAMP / SYSTIMESTAMP ---
+    // --- CURRENT_DATE / SYSDATE / CURRENT_TIMESTAMP / SYSTIMESTAMP: withdrawn ---
 
     #[test]
-    fn renders_now_family() {
-        for name in ["CURRENT_DATE", "SYSDATE"] {
+    fn now_family_falls_through() {
+        // The now-family is the one translation this change RETIRES rather than
+        // re-renders, because no rendering can be right in either dialect. Exasol's
+        // four names are three semantics over one instant — CURRENT_TIMESTAMP reads
+        // it in the session zone, SYSTIMESTAMP the same instant in the database
+        // zone, and CURRENT_DATE/SYSDATE are TO_DATE of each — while the scan UDF
+        // receives neither SESSIONTIMEZONE nor DBTIMEZONE, opens no connect-back
+        // session, and holds no statement anchor. It read its container clock in UTC
+        // once per shard, so a select-list SYSTIMESTAMP returned 15:02:02 through the
+        // virtual schema against 17:02:03 natively in the same session, and one
+        // statement returned two different timestamps over a two-file table.
+        //
+        // Withdrawal is total and paired: the four names carry no
+        // TRANSLATED_SCALAR_FNS row, so the gate declines them before any per-name
+        // arm, and capabilities.rs advertises none of them, so Exasol never delegates
+        // one and evaluates its own clock instead. Pinned to the generic decline text
+        // as well as the name (same reason as
+        // `bitwise_operator_functions_fall_through`): a future arm that merely
+        // validated arity would also name the function, and would silently defeat
+        // this decline-lock.
+        for name in [
+            "CURRENT_DATE",
+            "SYSDATE",
+            "CURRENT_TIMESTAMP",
+            "SYSTIMESTAMP",
+        ] {
             let expr = json!({"type": "function_scalar", "name": name, "arguments": []});
-            assert_eq!(
-                render_expression(&expr).unwrap(),
-                "current_date()",
-                "failed for {name}"
+            for (dialect, rendered) in [
+                ("DataFusion", render_expression(&expr)),
+                ("Exasol", render_expression_exasol(&expr)),
+            ] {
+                let err = rendered.unwrap_err().to_string();
+                assert!(
+                    err.contains("unsupported scalar function"),
+                    "{name} must fall through the generic unsupported-scalar-function \
+                     path in the {dialect} dialect: {err}"
+                );
+                assert!(
+                    err.contains(name),
+                    "the {dialect}-dialect error must name '{name}': {err}"
+                );
+            }
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "{name} must be None in the DataFusion safe variant"
             );
-        }
-        for name in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
-            let expr = json!({"type": "function_scalar", "name": name, "arguments": []});
-            assert_eq!(
-                render_expression(&expr).unwrap(),
-                "now()",
-                "failed for {name}"
+            assert!(
+                render_expression_exasol_safe(&expr).is_none(),
+                "{name} must be None in the Exasol safe variant"
             );
         }
     }
@@ -2588,7 +3323,7 @@ mod tests {
     // ADD_HOURS / ADD_MINUTES have no rendering test: they were withdrawn after
     // E2E parity (task 3.1) showed the microsecond round-trip diverges on a DATE
     // argument (Exasol expects TIMESTAMP(0), the rendering yields TIMESTAMP(3)).
-    // They now fall through — see `unsupported_date_fn_falls_through`.
+    // They now fall through — see `unsupported_date_functions_decline_in_both_dialects`.
 
     // --- DAYS_BETWEEN (whole-day date difference) ---
 
@@ -2698,6 +3433,33 @@ mod tests {
         }
     }
 
+    /// Pins the dialect asymmetry `fix-declined-filter-self-apply` relies on:
+    /// `SECOND` is a DataFusion field-shortcut (exactly 1 argument) but an Exasol
+    /// `VerbatimCall` (any arity, rendered as written). A 2-argument `SECOND(ts, 3)`
+    /// therefore declines under the DataFusion dialect while still rendering under
+    /// the Exasol dialect — the asymmetry a declined filter must be self-applied
+    /// through, in Exasol's own dialect, rather than omitted.
+    #[test]
+    fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "arguments": [
+                {"type": "column", "name": "ts"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "SECOND(ts, 3) must decline under the DataFusion dialect"
+        );
+        assert!(
+            render_expression_exasol_safe(&expr).is_some(),
+            "SECOND(ts, 3) must still render under the Exasol dialect"
+        );
+    }
+
     // --- Integer division DIV is deliberately not translated ---
 
     #[test]
@@ -2762,13 +3524,19 @@ mod tests {
     // --- Regexp scalar functions are deliberately not translated (issue #106) ---
 
     #[test]
-    fn regexp_scalar_functions_fall_through() {
+    fn regexp_scalar_functions_decline_in_both_dialects() {
         // The Rust `regex` crate (DataFusion 54) rejects backreferences and
         // lookaround that Exasol's PCRE dialect accepts (blocks all four),
         // lacks regexp_substr (blocks REGEXP_SUBSTR), and REGEXP_REPLACE /
         // REGEXP_INSTR's argument shapes differ from Exasol's position/
         // occurrence/return options (REGEXP_COUNT's shape actually aligns) —
         // so all four scalar regexp functions decline (issue #106).
+        //
+        // The decline is a property of the declaration, not of a dialect: these
+        // names carry no TRANSLATED_SCALAR_FNS row, so the gate declines them
+        // identically in both dialects. Asserting the Exasol dialect too is what
+        // stops the verbatim rule from quietly re-admitting a name whose Exasol
+        // form would parse but whose semantics were never the reason it declined.
         let unsupported = [
             "REGEXP_REPLACE",
             "REGEXP_SUBSTR",
@@ -2784,14 +3552,24 @@ mod tests {
                     {"type": "literal_string", "value": "a+"}
                 ]
             });
-            let err = render_expression(&expr).unwrap_err();
-            assert!(
-                err.to_string().contains(name),
-                "error must name the unsupported function '{name}': {err}"
+            let expected = format!("unsupported scalar function: {name}");
+            assert_eq!(
+                render_expression(&expr).unwrap_err().to_string(),
+                expected,
+                "the DataFusion dialect must decline {name}"
+            );
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap_err().to_string(),
+                expected,
+                "the Exasol dialect must decline {name}"
             );
             assert!(
                 render_expression_safe(&expr).is_none(),
-                "{name} must be None in safe mode without panicking"
+                "{name} must be None in the DataFusion safe variant"
+            );
+            assert!(
+                render_expression_exasol_safe(&expr).is_none(),
+                "{name} must be None in the Exasol safe variant"
             );
         }
     }
@@ -2864,6 +3642,68 @@ mod tests {
         }
     }
 
+    // --- The declaration gates the dispatch (issue #209) ---
+
+    #[test]
+    fn undeclared_scalar_function_declines_in_both_dialects() {
+        // `TRANSLATED_SCALAR_FNS` declares the whole translated `function_scalar`
+        // surface, and the gate at the head of that arm reads it BEFORE any
+        // per-name arm runs. A name the declaration does not carry is therefore
+        // declined in BOTH dialects, with the same `unsupported scalar function:
+        // <name>` message the generic fall-through raised before the gate existed.
+        // That is what makes a per-name arm added without a declaration row
+        // unreachable, rather than silently rendering DataFusion SQL on the
+        // Exasol-parsed path.
+        //
+        // SUBSTRING and SOUNDEX are real Exasol functions this translator does not
+        // translate. The remaining rows pin the gate's own edges: the name is
+        // uppercased before the lookup, the declaration is consulted before the
+        // `arguments` key (so an undeclared name declines as undeclared, not as
+        // malformed), and a node carrying no `name` key declines under the empty
+        // name.
+        let arg = json!([{"type": "column", "name": "a"}]);
+        let cases = [
+            (
+                "SUBSTRING",
+                json!({"type": "function_scalar", "name": "SUBSTRING", "arguments": arg.clone()}),
+            ),
+            (
+                "SOUNDEX",
+                json!({"type": "function_scalar", "name": "SOUNDEX", "arguments": arg.clone()}),
+            ),
+            (
+                "SUBSTRING",
+                json!({"type": "function_scalar", "name": "substring", "arguments": arg.clone()}),
+            ),
+            (
+                "SUBSTRING",
+                json!({"type": "function_scalar", "name": "SUBSTRING"}),
+            ),
+            ("", json!({"type": "function_scalar", "arguments": arg})),
+        ];
+        for (declined_name, expr) in cases {
+            let expected = format!("unsupported scalar function: {declined_name}");
+            assert_eq!(
+                render_expression(&expr).unwrap_err().to_string(),
+                expected,
+                "DataFusion dialect must decline the undeclared node {expr}"
+            );
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap_err().to_string(),
+                expected,
+                "Exasol dialect must decline the undeclared node {expr}"
+            );
+            assert!(
+                render_expression_safe(&expr).is_none(),
+                "DataFusion safe variant must be None for {expr}"
+            );
+            assert!(
+                render_expression_exasol_safe(&expr).is_none(),
+                "Exasol safe variant must be None for {expr}"
+            );
+        }
+    }
+
     #[test]
     fn regexp_scalar_exclusion_leaves_regexp_like_untouched() {
         // The scalar-regexp exclusion (issue #106) must not affect the REGEXP_LIKE
@@ -2895,7 +3735,7 @@ mod tests {
     // --- Unsupported date functions return an error ---
 
     #[test]
-    fn unsupported_date_fn_falls_through() {
+    fn unsupported_date_functions_decline_in_both_dialects() {
         // Remaining excluded set per the date-fns spec Background: the date-arithmetic,
         // date-difference, and other date scalars whose DataFusion 54 equivalents still
         // diverge from Exasol (or don't exist at all). DAYS_BETWEEN, HOURS_BETWEEN,
@@ -2905,6 +3745,13 @@ mod tests {
         // ARE still here: their arm was withdrawn after E2E parity (task 3.1) showed
         // the microsecond round-trip diverges on a DATE argument (Exasol expects
         // TIMESTAMP(0), the rendering yields TIMESTAMP(3)).
+        //
+        // Every one of these names EXISTS in Exasol, so the Exasol-dialect assertion
+        // is the load-bearing half: the verbatim rule could render each of them as a
+        // compiling call, and it deliberately does not. Absence from
+        // TRANSLATED_SCALAR_FNS is what keeps them Exasol's own work. The four
+        // now-family names decline the same way but have their own test,
+        // `now_family_falls_through`, which records why no rendering can be right.
         let unsupported = [
             // Date-arithmetic
             "ADD_HOURS",
@@ -2929,14 +3776,24 @@ mod tests {
                 "name": name,
                 "arguments": [{"type": "column", "name": "x"}]
             });
-            let err = render_expression(&expr).unwrap_err();
-            assert!(
-                err.to_string().contains(name),
-                "error must name the unsupported function '{name}': {err}"
+            let expected = format!("unsupported scalar function: {name}");
+            assert_eq!(
+                render_expression(&expr).unwrap_err().to_string(),
+                expected,
+                "the DataFusion dialect must decline {name}"
+            );
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap_err().to_string(),
+                expected,
+                "the Exasol dialect must decline {name}"
             );
             assert!(
                 render_expression_safe(&expr).is_none(),
-                "safe mode must return None for '{name}'"
+                "{name} must be None in the DataFusion safe variant"
+            );
+            assert!(
+                render_expression_exasol_safe(&expr).is_none(),
+                "{name} must be None in the Exasol safe variant"
             );
         }
     }
@@ -3143,5 +4000,1002 @@ mod tests {
             render_expression_exasol(&expr).unwrap(),
             r#"CAST("X" AS VARCHAR(2000000))"#
         );
+    }
+
+    // --- Exasol-dialect verbatim rendering, per family (issue #209) ---
+    //
+    // In the Exasol dialect the translator renders what Exasol sent: the same name,
+    // argument order, and argument count, taken from the node's own uppercased
+    // `name`. The expression tree came from Exasol's own compiler, so reproducing
+    // its call means Exasol's engine evaluates exactly the call it emitted — which
+    // is why these renderings need no arity check and cannot be wrong.
+    //
+    // Every test below is PAIRED: it asserts the Exasol-dialect rendering and, on
+    // the SAME node, that the DataFusion-dialect rendering is unchanged. That
+    // pairing is what freezes the DataFusion output while the Exasol output moves,
+    // and it is the convention `renders_cast_timestamp_precision_per_dialect`
+    // established. `renders_mod_as_function_call_in_exasol_dialect` above is the
+    // same shape for the one arm (#197) that already owned both dialects.
+
+    #[test]
+    fn renders_math_family_verbatim_in_exasol_dialect() {
+        // Exasol has every one of these names natively, so the Exasol dialect
+        // re-emits the call. The DataFusion dialect keeps its lowercase mapping,
+        // including SIGN -> signum, whose name Exasol does not have at all.
+        let one_arg = [
+            ("ABS", "abs"),
+            ("FLOOR", "floor"),
+            ("CEIL", "ceil"),
+            ("SQRT", "sqrt"),
+            ("EXP", "exp"),
+            ("LN", "ln"),
+            ("SIGN", "signum"),
+            ("DEGREES", "degrees"),
+            ("RADIANS", "radians"),
+            ("SIN", "sin"),
+            ("COS", "cos"),
+            ("TAN", "tan"),
+            ("ASIN", "asin"),
+            ("ACOS", "acos"),
+            ("ATAN", "atan"),
+            ("SINH", "sinh"),
+            ("COSH", "cosh"),
+            ("TANH", "tanh"),
+            ("COT", "cot"),
+        ];
+        for (exasol_name, df_name) in one_arg {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": exasol_name,
+                "arguments": [{"type": "column", "name": "x"}]
+            });
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"{exasol_name}("X")"#),
+                "the Exasol dialect must render {exasol_name} verbatim"
+            );
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!(r#"{df_name}("X")"#),
+                "the DataFusion dialect must stay unchanged for {exasol_name}"
+            );
+        }
+
+        // ROUND / TRUNC / LOG take 1 or 2 arguments and POWER / ATAN2 exactly 2;
+        // the Exasol dialect reproduces whichever count Exasol sent.
+        let two_arg = [
+            ("ROUND", "round"),
+            ("TRUNC", "trunc"),
+            ("LOG", "log"),
+            ("POWER", "power"),
+            ("ATAN2", "atan2"),
+        ];
+        for (exasol_name, df_name) in two_arg {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": exasol_name,
+                "arguments": [
+                    {"type": "column", "name": "v"},
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            });
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"{exasol_name}("V", 2)"#),
+                "the Exasol dialect must render {exasol_name} verbatim"
+            );
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!(r#"{df_name}("V", 2)"#),
+                "the DataFusion dialect must stay unchanged for {exasol_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_sign_as_native_sign_in_exasol_dialect() {
+        // The headline failure of issue #209: `SELECT l_returnflag, SIGN(SUM(
+        // l_discount) - 0.5) ... GROUP BY l_returnflag` aborted with "function or
+        // script SIGNUM not found" (42000), because the grouped-aggregate wrapper
+        // splices this rendering into SQL that Exasol's own core engine parses.
+        //
+        // SIGN is also why the gate sits AHEAD of `match fn_name.as_str()` instead
+        // of being a widened guard inside it: the math arm matches SIGN and precedes
+        // any such guard, so an in-place widening would still have rendered `signum`.
+        // Arm order now carries no dialect precedence at all.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "SIGN",
+            "arguments": [{
+                "type": "function_scalar",
+                "name": "SUB",
+                "arguments": [
+                    {"type": "function_aggregate", "name": "SUM",
+                     "arguments": [{"type": "column", "name": "l_discount"}]},
+                    {"type": "literal_double", "value": 0.5}
+                ]
+            }]
+        });
+        let exasol = render_expression_exasol(&expr).unwrap();
+        assert_eq!(exasol, r#"SIGN((SUM("L_DISCOUNT") - 0.5))"#);
+        assert!(
+            !exasol.contains("signum"),
+            "the Exasol dialect must not emit DataFusion's signum: {exasol}"
+        );
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"signum((SUM("L_DISCOUNT") - 0.5))"#
+        );
+    }
+
+    #[test]
+    fn renders_string_family_verbatim_in_exasol_dialect() {
+        // Issue #210 shipped this family's Exasol rendering with no translator-side
+        // test; this is that test. Four of the names have no DataFusion function of
+        // the same name at all (LENGTH -> character_length, OCTET_LENGTH ->
+        // octet_length, UNICODE -> ascii, UNICODECHR -> chr), which is why the
+        // DataFusion dialect keeps its name-mapping arm.
+        let one_arg = [
+            ("LOWER", "lower"),
+            ("UPPER", "upper"),
+            ("TRIM", "trim"),
+            ("LTRIM", "ltrim"),
+            ("RTRIM", "rtrim"),
+            ("REPLACE", "replace"),
+            ("REPEAT", "repeat"),
+            ("REVERSE", "reverse"),
+            ("LPAD", "lpad"),
+            ("RPAD", "rpad"),
+            ("ASCII", "ascii"),
+            ("CHR", "chr"),
+            ("INITCAP", "initcap"),
+            ("LEFT", "left"),
+            ("RIGHT", "right"),
+            ("TRANSLATE", "translate"),
+            ("LENGTH", "character_length"),
+            ("OCTET_LENGTH", "octet_length"),
+            ("UNICODE", "ascii"),
+            ("UNICODECHR", "chr"),
+        ];
+        for (exasol_name, df_name) in one_arg {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": exasol_name,
+                "arguments": [{"type": "column", "name": "s"}]
+            });
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"{exasol_name}("S")"#),
+                "the Exasol dialect must render {exasol_name} verbatim"
+            );
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!(r#"{df_name}("S")"#),
+                "the DataFusion dialect must stay unchanged for {exasol_name}"
+            );
+        }
+
+        // SUBSTR carries its own explicit mapping and a 3-argument shape.
+        let substr = json!({
+            "type": "function_scalar",
+            "name": "SUBSTR",
+            "arguments": [
+                {"type": "column", "name": "s"},
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&substr).unwrap(),
+            r#"SUBSTR("S", 1, 3)"#
+        );
+        assert_eq!(render_expression(&substr).unwrap(), r#"substr("S", 1, 3)"#);
+    }
+
+    #[test]
+    fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
+        // Exasol's INSTR(string, substring [, start]) and LOCATE(substring, string
+        // [, start]) already understand the optional start position, so the Exasol
+        // dialect has nothing to translate: reproducing the name, order, and count is
+        // the whole rendering, and an arity check there could only reject valid input
+        // Exasol's own compiler emitted (issue #210).
+        //
+        // The DataFusion dialect maps both onto strpos(string, substring), which
+        // takes no start position — so it reorders LOCATE's operands and DROPS a
+        // third argument. That drop is a pre-existing limitation of the DataFusion
+        // rendering, outside this change's scope (which freezes DataFusion output);
+        // it is pinned here so the Exasol side cannot silently regress onto it.
+        let instr = json!({
+            "type": "function_scalar",
+            "name": "INSTR",
+            "arguments": [
+                {"type": "literal_string", "value": "hello"},
+                {"type": "literal_string", "value": "l"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&instr).unwrap(),
+            "INSTR('hello', 'l', 3)"
+        );
+        assert_eq!(render_expression(&instr).unwrap(), "strpos('hello', 'l')");
+
+        let locate = json!({
+            "type": "function_scalar",
+            "name": "LOCATE",
+            "arguments": [
+                {"type": "literal_string", "value": "l"},
+                {"type": "literal_string", "value": "hello"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&locate).unwrap(),
+            "LOCATE('l', 'hello', 3)"
+        );
+        assert_eq!(render_expression(&locate).unwrap(), "strpos('hello', 'l')");
+    }
+
+    #[test]
+    fn renders_greatest_least_verbatim_in_exasol_dialect() {
+        // Both names already parse in Exasol, so the rendering changes only in case.
+        // They join the verbatim rule anyway: a rule applied to some names and not
+        // others cannot be reasoned about, because the next reader cannot tell which
+        // renderings are principled and which merely happen to work.
+        let greatest = json!({
+            "type": "function_scalar",
+            "name": "GREATEST",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"},
+                {"type": "column", "name": "c"}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&greatest).unwrap(),
+            r#"GREATEST("A", "B", "C")"#
+        );
+        assert_eq!(
+            render_expression(&greatest).unwrap(),
+            r#"greatest("A", "B", "C")"#
+        );
+
+        let least = json!({
+            "type": "function_scalar",
+            "name": "LEAST",
+            "arguments": [
+                {"type": "column", "name": "x"},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&least).unwrap(),
+            r#"LEAST("X", 0)"#
+        );
+        assert_eq!(render_expression(&least).unwrap(), r#"least("X", 0)"#);
+    }
+
+    #[test]
+    fn renders_nullifzero_zeroifnull_verbatim_in_exasol_dialect() {
+        // DataFusion has neither name, so it emulates: NULLIFZERO(v) ->
+        // nullif(v, 0) and ZEROIFNULL(v) -> coalesce(v, 0). Exasol has both
+        // natively, and the verbatim rendering gains parity by construction — there
+        // is no emulation left on that path to diverge.
+        let nullifzero = json!({
+            "type": "function_scalar",
+            "name": "NULLIFZERO",
+            "arguments": [{"type": "column", "name": "v"}]
+        });
+        assert_eq!(
+            render_expression_exasol(&nullifzero).unwrap(),
+            r#"NULLIFZERO("V")"#
+        );
+        assert_eq!(render_expression(&nullifzero).unwrap(), r#"nullif("V", 0)"#);
+
+        let zeroifnull = json!({
+            "type": "function_scalar",
+            "name": "ZEROIFNULL",
+            "arguments": [{"type": "column", "name": "v"}]
+        });
+        assert_eq!(
+            render_expression_exasol(&zeroifnull).unwrap(),
+            r#"ZEROIFNULL("V")"#
+        );
+        assert_eq!(
+            render_expression(&zeroifnull).unwrap(),
+            r#"coalesce("V", 0)"#
+        );
+    }
+
+    #[test]
+    fn renders_nullif_verbatim_in_exasol_dialect() {
+        // NULLIF is one of the names where the two dialects differ only in case, so
+        // this test carries the composition check as well: the verbatim gate renders
+        // its arguments in the SAME dialect it was called with, which is why the
+        // nested MOD becomes Exasol's MOD(a, b) and not DataFusion's `%`. Without
+        // that, a wrapper-bound NULLIF(MOD(id, 5), 0) group key would still splice
+        // `%` — which Exasol's parser rejects — into Exasol-parsed SQL.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "NULLIF",
+            "arguments": [
+                {
+                    "type": "function_scalar",
+                    "name": "MOD",
+                    "arguments": [
+                        {"type": "column", "name": "id"},
+                        {"type": "literal_exactnumeric", "value": "5"}
+                    ]
+                },
+                {"type": "literal_exactnumeric", "value": "0"}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"NULLIF(MOD("ID", 5), 0)"#
+        );
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"nullif(("ID" % 5), 0)"#
+        );
+    }
+
+    #[test]
+    fn renders_date_field_shortcuts_verbatim_in_exasol_dialect() {
+        // `SELECT COUNT(DISTINCT YEAR(l_shipdate)) FROM <vs>.LINEITEM` aborted with
+        // "function or script DATE_PART not found" (42000): Exasol has no DATE_PART
+        // at all, but it has every one of these six shortcuts natively.
+        for field in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"] {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": field,
+                "arguments": [{"type": "column", "name": "ts"}]
+            });
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"{field}("TS")"#),
+                "the Exasol dialect must render {field} verbatim"
+            );
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                format!(r#"date_part('{field}', "TS")"#),
+                "the DataFusion dialect must stay unchanged for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_week_as_native_week_in_exasol_dialect() {
+        // Exasol's own WEEK is what the DataFusion date_part('week') rendering was
+        // chosen to match (both ISO-8601, weeks beginning Monday, week 1 containing
+        // the year's first Thursday), so on the Exasol-parsed path re-emitting WEEK
+        // is both the form that compiles and the one that is exactly equivalent.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "WEEK",
+            "arguments": [{"type": "column", "name": "d"}]
+        });
+        assert_eq!(render_expression_exasol(&expr).unwrap(), r#"WEEK("D")"#);
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_part('week', "D")"#
+        );
+    }
+
+    #[test]
+    fn renders_date_trunc_verbatim_in_exasol_dialect() {
+        // Exasol's DATE_TRUNC(format, datetime) has the same name and the same
+        // argument order as DataFusion's, so the verbatim rendering differs only in
+        // case — and the format literal Exasol sent is forwarded untouched by both
+        // dialects rather than being re-interpreted by either.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "DATE_TRUNC",
+            "arguments": [
+                {"type": "literal_string", "value": "month"},
+                {"type": "column", "name": "ts"}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"DATE_TRUNC('month', "TS")"#
+        );
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"date_trunc('month', "TS")"#
+        );
+    }
+
+    #[test]
+    fn renders_to_date_to_timestamp_verbatim_in_exasol_dialect() {
+        // Both names exist in Exasol and both dialects forward the optional format
+        // argument unchanged. The format model in the node is Exasol's own
+        // ('YYYY-MM-DD'), which is exactly why re-emitting Exasol's call is safe on
+        // the Exasol-parsed path: Exasol parses the model it wrote itself.
+        for (exasol_name, df_name) in [("TO_DATE", "to_date"), ("TO_TIMESTAMP", "to_timestamp")] {
+            let bare = json!({
+                "type": "function_scalar",
+                "name": exasol_name,
+                "arguments": [{"type": "column", "name": "s"}]
+            });
+            assert_eq!(
+                render_expression_exasol(&bare).unwrap(),
+                format!(r#"{exasol_name}("S")"#),
+                "the Exasol dialect must render {exasol_name} verbatim"
+            );
+            assert_eq!(
+                render_expression(&bare).unwrap(),
+                format!(r#"{df_name}("S")"#),
+                "the DataFusion dialect must stay unchanged for {exasol_name}"
+            );
+
+            let formatted = json!({
+                "type": "function_scalar",
+                "name": exasol_name,
+                "arguments": [
+                    {"type": "column", "name": "s"},
+                    {"type": "literal_string", "value": "YYYY-MM-DD"}
+                ]
+            });
+            assert_eq!(
+                render_expression_exasol(&formatted).unwrap(),
+                format!(r#"{exasol_name}("S", 'YYYY-MM-DD')"#),
+                "the Exasol dialect must forward {exasol_name}'s format model verbatim"
+            );
+            assert_eq!(
+                render_expression(&formatted).unwrap(),
+                format!(r#"{df_name}("S", 'YYYY-MM-DD')"#),
+                "the DataFusion dialect must stay unchanged for {exasol_name} with a format"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_days_between_verbatim_in_exasol_dialect() {
+        // The DataFusion rendering is a CAST-to-DATE difference — an emulation of a
+        // function DataFusion does not have. Exasol has DAYS_BETWEEN, so the Exasol
+        // dialect re-emits it and the emulation stays on the DataFusion side only.
+        let expr = json!({
+            "type": "function_scalar",
+            "name": "DAYS_BETWEEN",
+            "arguments": [
+                {"type": "column", "name": "a"},
+                {"type": "column", "name": "b"}
+            ]
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"DAYS_BETWEEN("A", "B")"#
+        );
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            r#"(CAST("A" AS DATE) - CAST("B" AS DATE))"#
+        );
+    }
+
+    #[test]
+    fn renders_between_family_verbatim_in_exasol_dialect() {
+        // The *_BETWEEN pushdown shipped in `add-date-arithmetic-pushdown` was broken
+        // on the Exasol-parsed path from day one: its epoch-difference emulation
+        // calls DATE_PART, which Exasol does not have (42000). Exasol has all three
+        // names natively, so the Exasol dialect re-emits them.
+        let df_epoch = r#"(date_part('epoch', "A") - date_part('epoch', "B"))"#;
+        let cases = [
+            ("HOURS_BETWEEN", format!("({df_epoch} / 3600)")),
+            ("MINUTES_BETWEEN", format!("({df_epoch} / 60)")),
+            ("SECONDS_BETWEEN", df_epoch.to_string()),
+        ];
+        for (name, df_expected) in cases {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"}
+                ]
+            });
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                format!(r#"{name}("A", "B")"#),
+                "the Exasol dialect must render {name} verbatim"
+            );
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                df_expected,
+                "the DataFusion dialect must stay unchanged for {name}"
+            );
+        }
+    }
+
+    // --- Systemic sweep over the whole declared surface (issue #209) ---
+
+    /// The verbatim rule is only durable if a forgotten name fails a test rather
+    /// than a review, so this test iterates `TRANSLATED_SCALAR_FNS` itself rather
+    /// than a parallel hand-written name list: a name added to the declaration
+    /// with no fixture fails here BY NAME, and a fixture for a name nobody
+    /// declared fails here too. A `VerbatimCall` expectation is DERIVED from the
+    /// node's own uppercased `name` by the same rule the gate applies, so the 66
+    /// verbatim names cannot be blessed one hand-written string at a time — a
+    /// rewrite back to a DataFusion name (`signum`, `date_part`, `strpos`) fails
+    /// the derived comparison. Only the ten `Shaped` names and the five
+    /// dialect-branching node types outside `function_scalar` declare an expected
+    /// string, because each of those has a shape of its own.
+    ///
+    /// Every fixture argument is a dialect-invariant node (a column or a plain
+    /// literal) on purpose: the derivation renders the arguments through the same
+    /// entry point under test, so a dialect-sensitive argument would make that
+    /// half of the expectation self-fulfilling. The dialect-sensitive nodes get
+    /// their own rows instead.
+    #[test]
+    fn exasol_dialect_renders_declared_verbatim_surface() {
+        struct ScalarFixture {
+            name: &'static str,
+            node: Json,
+            shaped_exasol: Option<&'static str>,
+        }
+
+        fn col(name: &str) -> Json {
+            json!({"type": "column", "name": name})
+        }
+        fn num(value: i64) -> Json {
+            json!({"type": "literal_exactnumeric", "value": value})
+        }
+        fn text(value: &str) -> Json {
+            json!({"type": "literal_string", "value": value})
+        }
+        fn scalar(name: &str, args: Vec<Json>) -> Json {
+            json!({"type": "function_scalar", "name": name, "arguments": args})
+        }
+        fn verbatim(name: &'static str, args: Vec<Json>) -> ScalarFixture {
+            ScalarFixture {
+                name,
+                node: scalar(name, args),
+                shaped_exasol: None,
+            }
+        }
+        fn shaped(name: &'static str, node: Json, exasol: &'static str) -> ScalarFixture {
+            ScalarFixture {
+                name,
+                node,
+                shaped_exasol: Some(exasol),
+            }
+        }
+
+        let mut fixtures: Vec<ScalarFixture> = Vec::new();
+
+        // Math family: the one-argument names, then the five taking a second.
+        for name in [
+            "ABS", "FLOOR", "CEIL", "SQRT", "EXP", "LN", "SIGN", "DEGREES", "RADIANS", "SIN",
+            "COS", "TAN", "ASIN", "ACOS", "ATAN", "SINH", "COSH", "TANH", "COT",
+        ] {
+            fixtures.push(verbatim(name, vec![col("x")]));
+        }
+        for name in ["ROUND", "TRUNC", "LOG", "POWER", "ATAN2"] {
+            fixtures.push(verbatim(name, vec![col("v"), num(2)]));
+        }
+
+        // String family.
+        for name in [
+            "LOWER",
+            "UPPER",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "REVERSE",
+            "ASCII",
+            "INITCAP",
+            "LENGTH",
+            "OCTET_LENGTH",
+            "UNICODE",
+        ] {
+            fixtures.push(verbatim(name, vec![col("s")]));
+        }
+        for name in ["CHR", "UNICODECHR"] {
+            fixtures.push(verbatim(name, vec![num(65)]));
+        }
+        for name in ["SUBSTR", "LEFT", "RIGHT", "REPEAT", "LPAD", "RPAD"] {
+            fixtures.push(verbatim(name, vec![col("s"), num(3)]));
+        }
+        fixtures.push(verbatim("REPLACE", vec![col("s"), text("a")]));
+        fixtures.push(verbatim(
+            "TRANSLATE",
+            vec![col("s"), text("ab"), text("xy")],
+        ));
+        // INSTR(string, substring) against LOCATE(substring, string): opposite
+        // argument orders, which is exactly what the verbatim rule preserves and
+        // what the DataFusion dialect has to reorder into strpos.
+        fixtures.push(verbatim("INSTR", vec![col("s"), text("a")]));
+        fixtures.push(verbatim("LOCATE", vec![text("a"), col("s")]));
+
+        // Comparison and null-handling family.
+        for name in ["GREATEST", "LEAST", "NULLIF"] {
+            fixtures.push(verbatim(name, vec![col("a"), col("b")]));
+        }
+        for name in ["NULLIFZERO", "ZEROIFNULL"] {
+            fixtures.push(verbatim(name, vec![col("v")]));
+        }
+
+        // Date field shortcuts, then the conversion and truncation names.
+        for name in ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND", "WEEK"] {
+            fixtures.push(verbatim(name, vec![col("ts")]));
+        }
+        fixtures.push(verbatim("DATE_TRUNC", vec![text("month"), col("ts")]));
+        fixtures.push(verbatim("TO_DATE", vec![col("s"), text("YYYY-MM-DD")]));
+        fixtures.push(verbatim(
+            "TO_TIMESTAMP",
+            vec![col("s"), text("YYYY-MM-DD HH24:MI:SS")],
+        ));
+
+        // Date-difference family.
+        for name in [
+            "DAYS_BETWEEN",
+            "HOURS_BETWEEN",
+            "MINUTES_BETWEEN",
+            "SECONDS_BETWEEN",
+        ] {
+            fixtures.push(verbatim(name, vec![col("a"), col("b")]));
+        }
+
+        // The ten Shaped names, each declaring the string its own arm renders.
+        fixtures.extend([
+            shaped(
+                "ADD",
+                scalar("ADD", vec![col("a"), col("b")]),
+                r#"("A" + "B")"#,
+            ),
+            shaped(
+                "SUB",
+                scalar("SUB", vec![col("a"), col("b")]),
+                r#"("A" - "B")"#,
+            ),
+            shaped(
+                "MULT",
+                scalar("MULT", vec![col("a"), col("b")]),
+                r#"("A" * "B")"#,
+            ),
+            shaped(
+                "FLOAT_DIV",
+                scalar("FLOAT_DIV", vec![col("a"), col("b")]),
+                r#"("A" / "B")"#,
+            ),
+            shaped("NEG", scalar("NEG", vec![col("a")]), r#"(-"A")"#),
+            shaped(
+                "MOD",
+                scalar("MOD", vec![col("a"), col("b")]),
+                r#"MOD("A", "B")"#,
+            ),
+            shaped(
+                "CONCAT",
+                scalar("CONCAT", vec![col("a"), col("b")]),
+                r#"("A" || "B")"#,
+            ),
+            shaped(
+                "CAST",
+                json!({
+                    "type": "function_scalar", "name": "CAST",
+                    "arguments": [col("v")],
+                    "dataType": {"type": "VARCHAR", "size": 50}
+                }),
+                r#"CAST("V" AS VARCHAR(50))"#,
+            ),
+            shaped(
+                "REGEXP_LIKE",
+                scalar("REGEXP_LIKE", vec![col("s"), text("^a")]),
+                r#"("S" REGEXP_LIKE '^a')"#,
+            ),
+            shaped(
+                "CASE",
+                scalar(
+                    "CASE",
+                    vec![
+                        json!({"type": "predicate_greater", "left": col("x"), "right": num(0)}),
+                        num(1),
+                        num(0),
+                    ],
+                ),
+                r#"CASE WHEN ("X" > 0) THEN 1 ELSE 0 END"#,
+            ),
+        ]);
+
+        // Completeness in both directions, before anything is rendered: a
+        // declared name with no fixture, and a fixture nobody declared, must each
+        // fail by name.
+        let missing: Vec<&str> = TRANSLATED_SCALAR_FNS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !fixtures.iter().any(|f| f.name == *name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every name declared in TRANSLATED_SCALAR_FNS needs a sweep fixture; missing: \
+             {missing:?}"
+        );
+        let undeclared: Vec<&str> = fixtures
+            .iter()
+            .map(|f| f.name)
+            .filter(|name| declared_scalar_fn(name).is_none())
+            .collect();
+        assert!(
+            undeclared.is_empty(),
+            "every sweep fixture must name a declared function; undeclared: {undeclared:?}"
+        );
+        assert_eq!(
+            fixtures.len(),
+            TRANSLATED_SCALAR_FNS.len(),
+            "the fixture map and the declaration must line up one to one; a duplicated row on \
+             either side is the only way both subset checks above can pass at different sizes"
+        );
+
+        let mut swept: Vec<String> = Vec::new();
+
+        for (declared_name, form) in TRANSLATED_SCALAR_FNS {
+            let fixture = fixtures
+                .iter()
+                .find(|f| f.name == *declared_name)
+                .expect("fixture completeness is asserted above");
+            // One declaration lookup gates BOTH dialects, so a declaration row is
+            // a promise about the DataFusion dialect too. A `VerbatimCall` returns
+            // AHEAD of the per-name arms in the Exasol dialect, so every Exasol
+            // assertion below passes whether or not the arm still exists — this
+            // call is the only one that reaches the arms. No expected string is
+            // asserted: the per-family paired tests own the frozen DataFusion
+            // output, and a second copy here would drift from them.
+            if let Err(err) = render_expression(&fixture.node) {
+                panic!(
+                    "{declared_name} is declared in TRANSLATED_SCALAR_FNS, which gates BOTH \
+                     dialects from one lookup, so it MUST render in the DataFusion dialect too; \
+                     it declined with {err:?}. A declared name that has lost its per-name arm \
+                     still renders in the Exasol dialect through the verbatim gate, so this is \
+                     the only assertion that catches it."
+                );
+            }
+            let rendered = render_expression_exasol(&fixture.node)
+                .unwrap_or_else(|err| panic!("{declared_name} failed to render: {err:?}"));
+            match form {
+                ExasolForm::VerbatimCall => {
+                    assert!(
+                        fixture.shaped_exasol.is_none(),
+                        "{declared_name} is declared VerbatimCall, so its expectation MUST be \
+                         derived from the node, never hand-written"
+                    );
+                    let node_name = fixture
+                        .node
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .expect("fixture node carries a name")
+                        .to_uppercase();
+                    let rendered_args: Vec<String> = fixture
+                        .node
+                        .get("arguments")
+                        .and_then(|a| a.as_array())
+                        .expect("fixture node carries arguments")
+                        .iter()
+                        .map(|arg| render_expression_exasol(arg).expect("argument renders"))
+                        .collect();
+                    assert_eq!(
+                        rendered,
+                        format!("{node_name}({})", rendered_args.join(", ")),
+                        "the Exasol dialect must re-emit {declared_name} as the call Exasol sent"
+                    );
+                }
+                ExasolForm::Shaped => {
+                    let expected = fixture.shaped_exasol.unwrap_or_else(|| {
+                        panic!(
+                            "{declared_name} is declared Shaped, so its fixture MUST declare the \
+                             expected Exasol string"
+                        )
+                    });
+                    assert_eq!(
+                        rendered, expected,
+                        "{declared_name} is outside the <NAME>(<args>) shape and must render its \
+                         own declared form"
+                    );
+                }
+            }
+            swept.push(rendered);
+        }
+
+        // The five dialect-branching node types outside `function_scalar`. They
+        // are node types rather than function names, so the declaration does not
+        // carry them and each row asserts both dialects itself.
+        let node_type_rows = [
+            (
+                json!({
+                    "type": "function_scalar_extract", "name": "EXTRACT",
+                    "toExtract": "YEAR", "arguments": [col("ts")]
+                }),
+                r#"EXTRACT(YEAR FROM "TS")"#,
+                r#"date_part('YEAR', "TS")"#,
+            ),
+            (
+                json!({
+                    "type": "function_scalar_cast", "name": "CAST",
+                    "arguments": [col("v")],
+                    "dataType": {"type": "VARCHAR", "size": 50}
+                }),
+                r#"CAST("V" AS VARCHAR(50))"#,
+                r#"CAST("V" AS VARCHAR)"#,
+            ),
+            (
+                json!({
+                    "type": "predicate_like_regexp",
+                    "expression": col("s"), "pattern": text("^a")
+                }),
+                r#"("S" REGEXP_LIKE '^a')"#,
+                r#"regexp_like("S", '^a')"#,
+            ),
+            (
+                json!({"type": "literal_timestamp", "value": "2024-03-01 12:34:56.789"}),
+                "TIMESTAMP '2024-03-01 12:34:56.789'",
+                "arrow_cast('2024-03-01 12:34:56.789', 'Timestamp(Microsecond, None)')",
+            ),
+            (
+                json!({"type": "literal_timestamp_utc", "value": "2024-03-01 12:34:56.789"}),
+                "TIMESTAMP '2024-03-01 12:34:56.789'",
+                r#"arrow_cast('2024-03-01 12:34:56.789+00:00', 'Timestamp(Microsecond, Some("UTC"))')"#,
+            ),
+        ];
+        for (node, expected_exasol, expected_datafusion) in node_type_rows {
+            let node_type = node["type"]
+                .as_str()
+                .expect("row carries a node type")
+                .to_string();
+            let rendered = render_expression_exasol(&node)
+                .unwrap_or_else(|err| panic!("{node_type} failed to render: {err:?}"));
+            assert_eq!(
+                rendered, expected_exasol,
+                "{node_type} in the Exasol dialect"
+            );
+            assert_eq!(
+                render_expression(&node).unwrap(),
+                expected_datafusion,
+                "{node_type} in the DataFusion dialect"
+            );
+            swept.push(rendered);
+        }
+
+        // Secondary guard over everything swept above. The comparison is
+        // deliberately case-SENSITIVE: `OCTET_LENGTH("S")` and `NULLIF("A", "B")`
+        // are correct Exasol renderings, and it is their lowercase DataFusion
+        // twins that must never reach an Exasol-parsed wrapper. `current_date()`
+        // and `now()` are live guards now that the now-family is undeclared —
+        // re-adding a DataFusion-shaped now-family arm trips them.
+        for rendered in &swept {
+            for token in [
+                "signum",
+                "date_part",
+                "strpos",
+                "arrow_cast",
+                "character_length",
+                "octet_length",
+                "regexp_like(",
+                "current_date()",
+                "now()",
+                "nullif(",
+                "coalesce(",
+            ] {
+                assert!(
+                    !rendered.contains(token),
+                    "Exasol-dialect output must not contain the DataFusion-only token `{token}`, \
+                     but rendered: {rendered}"
+                );
+            }
+        }
+    }
+
+    // --- Dialect-invariant surface (regression freeze) ---
+    //
+    // This plan branches `function_scalar_extract`, `predicate_like_regexp`, the
+    // `REGEXP_LIKE` alternate encoding, and the two timestamp-literal node types
+    // on `dialect`. Everything else was not meant to move. These three tests
+    // freeze the surface that MUST stay dialect-invariant, so a future change
+    // that accidentally starts branching one of these paths on `dialect` fails
+    // here instead of only showing up as a silent divergence downstream.
+
+    #[test]
+    fn arithmetic_operators_render_identically_in_both_dialects() {
+        // The five operator wire names never inspect `dialect` in their own
+        // arm — `render_expression_inner` renders the same `(<left> <op>
+        // <right>)` / `(-<operand>)` shape regardless of which dialect is
+        // requested. Pins that invariance directly, on the same node, for
+        // both dialects at once.
+        let binary = [
+            ("ADD", "+"),
+            ("SUB", "-"),
+            ("MULT", "*"),
+            ("FLOAT_DIV", "/"),
+        ];
+        for (name, op) in binary {
+            let expr = json!({
+                "type": "function_scalar",
+                "name": name,
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "literal_exactnumeric", "value": 1}
+                ]
+            });
+            let expected = format!(r#"("A" {op} 1)"#);
+            assert_eq!(
+                render_expression(&expr).unwrap(),
+                expected,
+                "{name} DataFusion dialect"
+            );
+            assert_eq!(
+                render_expression_exasol(&expr).unwrap(),
+                expected,
+                "{name} Exasol dialect"
+            );
+        }
+
+        let neg = json!({
+            "type": "function_scalar",
+            "name": "NEG",
+            "arguments": [{"type": "column", "name": "a"}]
+        });
+        let expected_neg = r#"(-"A")"#;
+        assert_eq!(
+            render_expression(&neg).unwrap(),
+            expected_neg,
+            "NEG DataFusion dialect"
+        );
+        assert_eq!(
+            render_expression_exasol(&neg).unwrap(),
+            expected_neg,
+            "NEG Exasol dialect"
+        );
+    }
+
+    #[test]
+    fn non_timestamp_literals_render_identically_in_both_dialects() {
+        // Every literal node type except `literal_timestamp` and
+        // `literal_timestamp_utc` (branched on dialect by task 5) renders the
+        // same string in both dialects, because none of these arms reads
+        // `dialect` at all.
+        let cases: [(Json, &str); 7] = [
+            (json!({"type": "literal_null"}), "NULL"),
+            (json!({"type": "literal_bool", "value": true}), "TRUE"),
+            (json!({"type": "literal_bool", "value": false}), "FALSE"),
+            (
+                json!({"type": "literal_string", "value": "it's"}),
+                "'it''s'",
+            ),
+            (json!({"type": "literal_exactnumeric", "value": 42}), "42"),
+            (json!({"type": "literal_double", "value": 0.5}), "0.5"),
+            (
+                json!({"type": "literal_date", "value": "2024-01-15"}),
+                "DATE '2024-01-15'",
+            ),
+        ];
+        for (node, expected) in cases {
+            let node_type = node["type"].as_str().unwrap();
+            assert_eq!(
+                render_expression(&node).unwrap(),
+                expected,
+                "{node_type} DataFusion dialect"
+            );
+            assert_eq!(
+                render_expression_exasol(&node).unwrap(),
+                expected,
+                "{node_type} Exasol dialect"
+            );
+        }
+    }
+
+    #[test]
+    fn exasol_df_filter_suppresses_trivially_true() {
+        // Exasol-dialect twin of `true_filter_returns_none_in_safe_mode` /
+        // `null_filter_returns_none_in_safe_mode` above: `render_df_filter_exasol_safe`
+        // suppresses a trivially-true (`TRUE` or `NULL`) filter exactly like
+        // `render_df_filter_safe` does. A trivially-true filter is a correct
+        // no-op to omit from the scan spec — but that is one of two
+        // distinguishable causes of a `None` return, regardless of which
+        // dialect rendered the fragment. The other cause, a genuine decline,
+        // must be self-applied by the caller — a declined predicate omitted
+        // here would be silently lost, not backstopped.
+        let true_filter = json!({"type": "literal_bool", "value": true});
+        assert!(render_df_filter_exasol_safe(&true_filter).is_none());
+
+        let null_filter = json!({"type": "literal_null"});
+        assert!(render_df_filter_exasol_safe(&null_filter).is_none());
     }
 }

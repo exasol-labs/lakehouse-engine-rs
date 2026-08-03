@@ -1,25 +1,23 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
-    NameMappingEntry, ProjectionItem, StorageProps,
+    NameMappingEntry, ProjectionItem, StorageBackend,
 };
+use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::TableIdent;
 use serde_json::Value as Json;
 
-use super::credentials::{
-    CatalogSession, build_s3_file_io, extract_vended_endpoint, extract_vended_keys,
-    extract_vended_path_style, extract_vended_region, load_table_any_auth,
-    merge_vended_into_storage,
+use lakehouse_catalog::{
+    CatalogSession, load_table_any_auth, parse_table_ident, redact_credentials, redact_error_text,
+    resolve_vended_storage,
 };
+
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
-use super::namespace::parse_table_ident;
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{
-    aggregate_exasol_types, emits_ident, exasol_type_from_json, redact_catalog_error,
-};
+use super::support::{aggregate_exasol_types, emits_ident};
 use super::{GroupedSelectItem, build_logical_schema};
 
 /// Emit a file path relative to `table_root` when the file lives under it,
@@ -176,71 +174,54 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// Resolve the data-file list from the Iceberg REST catalog for a single table.
+/// Resolve the data-file list from the Iceberg REST catalog for one table, on a
+/// [`CatalogSession`] the caller already built.
 ///
-/// This is the resolve-once seam: called exactly once per single-table pushdown in
-/// the adapter; the file list is passed explicitly to the scan UDF. The table
-/// identifier is validated BEFORE any catalog HTTP (parse-before-config: a malformed
-/// identifier issues zero `/v1/config` traffic and returns the same parse error),
-/// then a single-use [`CatalogSession`] is built and the work delegated to
-/// [`resolve_file_list_with_session`] — the shared-session core join legs reuse.
+/// This is the resolve-once seam AND the only file-resolution entry point: the
+/// single-table pushdown path, every join leg, and the external E2E callers all come
+/// through here; the resolved file list is passed explicitly to the scan UDF. Taking
+/// the session rather than a `catalog_uri` is what makes a per-table session rebuild
+/// inexpressible — the catalog-auth strategy, `/v1/config` prefix, and pooled HTTP
+/// client are resolved once per query into the passed session and reused across every
+/// table's `loadTable` GET (e.g. each leg of a join). A `catalog_uri` parameter
+/// alongside the session would be a second copy of a value the session already
+/// carries, free to disagree with it.
 ///
-/// `filter_json` is the raw pushdown filter JSON forwarded for Iceberg-level file
-/// pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
-pub async fn resolve_file_list(
-    catalog_uri: &str,
-    catalog_props: &CatalogProps,
-    storage: &StorageProps,
-    creds: &ConnectionCreds,
-    filter_json: Option<&Json>,
-) -> Result<
-    (
-        Vec<FileEntry>,
-        StorageProps,
-        Vec<LogicalField>,
-        String,
-        Vec<NameMappingEntry>,
-    ),
-    UdfError,
-> {
-    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
-    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
-    // identifier issues zero catalog HTTP and returns the same parse error.
-    parse_table_ident(&catalog_props.table)?;
-    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
-    resolve_file_list_with_session(&session, catalog_props, storage, creds, filter_json).await
-}
-
-/// Resolve the data-file list from the Iceberg REST catalog, reusing an existing
-/// per-query [`CatalogSession`].
-///
-/// This is the shared-session core of [`resolve_file_list`]: the catalog-auth
-/// strategy, `/v1/config` prefix, and pooled HTTP client are resolved once per query
-/// into the passed [`CatalogSession`] and reused across every table's `loadTable`
-/// GET (e.g. each leg of a join), never rebuilt per table.
+/// The parse-before-config guarantee therefore belongs to the CALLER: because the
+/// session is built outside this function, the involved-table identifier must be
+/// validated at the `handle_pushdown` seam BEFORE `CatalogSession::resolve`, so a
+/// malformed identifier issues zero catalog HTTP and surfaces a parse error rather
+/// than a transport error from an unreachable catalog. This function parses the
+/// identifier again below to build the `TableIdent`, so skipping the caller-side
+/// check costs the guarantee, never correctness.
 ///
 /// The catalog load_table request is self-issued via `load_table_any_auth`, which
 /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
 /// none). Vended-credential extraction is gated SOLELY on
 /// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it
-/// is true the returned `StorageProps` carries the vended STS keys (merged over
+/// is true the returned `StorageBackend` carries the vended STS keys (merged over
 /// the static `storage` props, and the vended `client.region` when present) so
 /// every per-shard `ScanSpec.storage` uses the vended creds. When it is false,
 /// returns `(files, storage.clone())` — byte-identical to the no-vending behaviour
 /// on every auth mode.
 ///
+/// Every error surfaced from here on is redacted against the secret values of the
+/// EFFECTIVE storage, not the static one: the `file_io` built from it is what talks
+/// to object storage, so those are exactly the values an underlying provider error
+/// can echo back.
+///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
-pub(crate) async fn resolve_file_list_with_session(
+pub async fn resolve_file_list(
     session: &CatalogSession,
     catalog_props: &CatalogProps,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
 ) -> Result<
     (
         Vec<FileEntry>,
-        StorageProps,
+        StorageBackend,
         Vec<LogicalField>,
         String,
         Vec<NameMappingEntry>,
@@ -270,37 +251,20 @@ pub(crate) async fn resolve_file_list_with_session(
         &catalog_props.warehouse
     };
     let effective_storage = if creds.use_vended_credentials {
-        let (ak, sk, st) = extract_vended_keys(&result, anchor);
-        let mut merged = merge_vended_into_storage(storage, &ak, &sk, st.as_deref());
-        // Adopt the vended region only when the response advertises one; otherwise
-        // preserve the static region.
-        if let Some(region) = extract_vended_region(&result, anchor) {
-            merged.region = region;
-        }
-        // Adopt the vended S3 endpoint and path-style flag when advertised. An
-        // S3-compatible store (e.g. MinIO behind Lakekeeper) vends the concrete
-        // `s3.endpoint`/`s3.path-style-access`, and a vended CONNECTION carries no
-        // static endpoint; AWS S3 omits them, so absence preserves the static
-        // values and the Glue vended path is unchanged.
-        if let Some(endpoint) = extract_vended_endpoint(&result, anchor) {
-            merged.endpoint = endpoint;
-        }
-        if let Some(path_style) = extract_vended_path_style(&result, anchor) {
-            merged.path_style = path_style;
-        }
-        merged
+        resolve_vended_storage(&result, storage, anchor)
     } else {
         storage.clone()
     };
+    let secrets = effective_storage.secret_values();
 
     // Build the iceberg Table so plan_files() can read manifests from S3.
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
     let table_ident = TableIdent::new(namespace, table_name);
-    let file_io = build_s3_file_io(&effective_storage);
+    let file_io = effective_storage.file_io();
     let runtime = iceberg::Runtime::try_current().map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_catalog_error(&e.to_string())
+            redact_error_text(&e.to_string(), &secrets)
         ))
     })?;
     let table_builder = iceberg::table::Table::builder()
@@ -316,7 +280,7 @@ pub(crate) async fn resolve_file_list_with_session(
     .map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_catalog_error(&e.to_string())
+            redact_error_text(&e.to_string(), &secrets)
         ))
     })?;
 
@@ -341,9 +305,9 @@ pub(crate) async fn resolve_file_list_with_session(
     // deletion vector, ORC/Avro data or delete file) BEFORE building any
     // scan-driving SQL. This must run before `plan_files_from_table` so the deletes
     // it associates are guaranteed to be applicable Parquet positional deletes.
-    ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
+    ensure_supported_delete_mechanisms(&table, &catalog_props.table, &secrets).await?;
 
-    let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
+    let files = plan_files_from_table(table, &catalog_props.table, filter_json, &secrets).await?;
     Ok((
         files,
         effective_storage,
@@ -432,7 +396,7 @@ fn classify_manifest_file(
 ///
 /// The message names ONLY the mechanism (never a file path, which could in
 /// principle embed a presigned credential) and is defensively passed through
-/// [`redact_catalog_error`] so no secret can survive into surfaced SQL/error text.
+/// [`redact_credentials`] so no secret can survive into surfaced SQL/error text.
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
@@ -441,7 +405,7 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
         table_name,
         mechanism.describe(),
     );
-    UdfError::User(redact_catalog_error(&msg))
+    UdfError::User(redact_credentials(&msg))
 }
 
 /// Fail loud at plan time if the table's current snapshot uses ANY delete/data
@@ -456,9 +420,14 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 /// Parquet positional delete from a deletion vector.
 ///
 /// A table with no current snapshot (empty table) trivially passes.
+///
+/// Every manifest read here goes through the caller's object-store credentials, so
+/// `secrets` carries their literal values for the value-based half of
+/// [`redact_error_text`].
 async fn ensure_supported_delete_mechanisms(
     table: &iceberg::table::Table,
     table_name: &str,
+    secrets: &[&str],
 ) -> Result<(), UdfError> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
@@ -472,7 +441,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to open Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?
         .read()
@@ -481,7 +450,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to read Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?;
 
@@ -493,7 +462,7 @@ async fn ensure_supported_delete_mechanisms(
         UdfError::User(format!(
             "failed to parse Iceberg manifest list for '{}': {}",
             table_name,
-            redact_catalog_error(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
@@ -502,7 +471,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to load Iceberg manifest for '{}': {}",
                 table_name,
-                redact_catalog_error(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?;
         for entry in manifest.entries() {
@@ -520,11 +489,6 @@ async fn ensure_supported_delete_mechanisms(
     Ok(())
 }
 
-/// Drive the iceberg scan and collect the data-file paths with their sizes.
-///
-/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
-/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
-/// remains the row-level correctness backstop; this is pruning-only.
 /// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
 ///
 /// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
@@ -544,10 +508,20 @@ fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileConte
     }
 }
 
+/// Drive the iceberg scan and collect the data-file paths with their sizes.
+///
+/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
+/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
+/// remains the row-level correctness backstop; this is pruning-only.
+///
+/// `secrets` carries the literal values of the object-store credentials the scan
+/// planning below reads manifests with, for the value-based half of
+/// [`redact_error_text`].
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
     filter_json: Option<&Json>,
+    secrets: &[&str],
 ) -> Result<Vec<FileEntry>, UdfError> {
     let mut scan_builder = table.scan();
     if let Some(fj) = filter_json {
@@ -556,23 +530,25 @@ async fn plan_files_from_table(
             scan_builder = scan_builder.with_filter(pred);
         }
     }
-    let scan = scan_builder
-        .select_all()
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build Iceberg scan: {e}")))?;
+    let scan = scan_builder.select_all().build().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg scan: {}",
+            redact_error_text(&e.to_string(), secrets)
+        ))
+    })?;
 
     let task_stream = scan.plan_files().await.map_err(|e| {
         UdfError::User(format!(
             "failed to plan Iceberg files for '{}': {}",
             table_name,
-            redact_catalog_error(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
     let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
         UdfError::User(format!(
             "failed to collect Iceberg file tasks: {}",
-            redact_catalog_error(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
@@ -602,30 +578,31 @@ async fn plan_files_from_table(
         .collect())
 }
 
-/// Resolve the Iceberg table schema for `createVirtualSchema`.
+/// Resolve one Iceberg table's schema for `createVirtualSchema` on the
+/// [`CatalogSession`] the caller already built.
 ///
 /// Returns (field_name, exasol_type_string) pairs. The table metadata is loaded
 /// via the unified `load_table_any_auth` (SigV4 | bearer | OAuth2-bearer | none).
 /// Schema resolution only reads `table.metadata().current_schema()` — no S3
 /// manifest access is needed, so vended credentials do not affect this path.
+///
+/// Takes the session by shared reference and holds no means to build one, so a
+/// per-table OAuth2 grant is structurally inexpressible: `adapter/mod.rs` builds
+/// ONE session ahead of the table-enumeration loop and every table's schema
+/// resolves on it, and a grant failure surfaces there — once, before the loop —
+/// rather than at whichever table happened to be resolved first. There is no
+/// `catalog_uri` parameter because the session already carries it and a second
+/// copy could disagree with it.
+///
+/// `catalog_props.table` names the table; `load_table_any_auth` parses that
+/// identifier before it issues any HTTP, so a malformed identifier still returns
+/// the parse error without a `loadTable` GET.
 pub async fn resolve_table_schema(
-    catalog_uri: &str,
+    session: &CatalogSession,
     catalog_props: &CatalogProps,
     creds: &ConnectionCreds,
 ) -> Result<Vec<(String, String)>, UdfError> {
-    // Parse-before-config (intent-fidelity): validate the table identifier BEFORE
-    // `CatalogSession::resolve` issues the `/v1/config` lookup, so a malformed
-    // identifier issues zero catalog HTTP and returns the same parse error —
-    // mirroring the guard at the single-table pushdown seam in `mod.rs`.
-    parse_table_ident(&catalog_props.table)?;
-
-    // Build a single-use session inline (one OAuth grant, one `/v1/config` lookup)
-    // and load the table metadata on it via the unified auth-mode-agnostic loader.
-    // Schema resolution reads only `current_schema()`; vended credentials never
-    // affect it. Cost is unchanged from the pre-refactor path: one grant, one
-    // config lookup, one `loadTable` GET.
-    let session = CatalogSession::resolve(catalog_uri, &catalog_props.warehouse, creds).await?;
-    let result = load_table_any_auth(&session, catalog_props, creds).await?;
+    let result = load_table_any_auth(session, catalog_props, creds).await?;
     let table_metadata = result.metadata;
 
     let schema = table_metadata.current_schema();
@@ -650,15 +627,22 @@ pub async fn resolve_table_schema(
 /// Routing goes through the SAME shared [`classify_request_shape`] the non-empty
 /// dispatcher uses, so the empty and non-empty positional column shapes are
 /// identical by construction — the 3-tier priority (grouped → single-group → row
-/// scan), the `validate_agg_col_types` numeric gates, and the
-/// non-numeric-grouped-with-HAVING hard-error decline all live in the classifier,
-/// never re-derived here. Each arm renders only its own empty shape:
+/// scan), the `validate_agg_col_types` numeric gates, and the grouped HAVING
+/// merge-render — whose failure routes to `GroupByWrapper` rather than erroring —
+/// all live in the classifier, never re-derived here. Each arm renders only its own
+/// empty shape:
 /// - `Grouped` → zero rows in the full grouped output shape (`empty_grouped_sql`);
 /// - `GroupByWrapper` → a zero-row result typed from `selectListDataTypes`
 ///   (`empty_select_list_typed_sql`), falling back to the full-row empty shape when
 ///   `selectListDataTypes` is absent or empty;
 /// - `SingleGroupAgg` → one shape-correct empty aggregate row (`empty_agg_sql`);
-/// - `RowScan` → a typed empty projection (`empty_pushdown_sql`).
+/// - `RowScan` → a typed empty projection (`empty_pushdown_sql`), or — when
+///   `projection_widened` — the same `selectListDataTypes` zero-row shape as
+///   `GroupByWrapper`.
+///
+/// `projection_widened` is `project_columns`'s widening signal for the
+/// `proj_cols`/`proj_types` pair: `true` means they are the full base row rather
+/// than one item per select-list item (#196).
 ///
 /// No scan or distinct-merge UDF is referenced: with zero files there is nothing to
 /// scan or merge, and a zero-row result already satisfies any HAVING/ORDER BY/LIMIT.
@@ -666,9 +650,10 @@ pub(super) fn empty_result_sql(
     pushdown_req: &Json,
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
+    projection_widened: bool,
     col_types: &[(String, String)],
 ) -> Result<Json, UdfError> {
-    match classify_request_shape(pushdown_req, col_types)? {
+    match classify_request_shape(pushdown_req, col_types) {
         // A zero-row result satisfies any HAVING, so the classifier's `having` is
         // deliberately ignored on the empty path.
         RequestShape::Grouped { detection, .. } => {
@@ -696,6 +681,16 @@ pub(super) fn empty_result_sql(
             .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types))),
         RequestShape::SingleGroupAgg { items } => {
             Ok(empty_agg_sql(&items, &aggregate_exasol_types(pushdown_req)))
+        }
+        // A widened derived projection is the full base row, so the non-empty path
+        // routes it to the qualified single-table wrapper whose output columns ARE
+        // the `selectList` items (#196). Mirror that shape here for the same reason
+        // the `GroupByWrapper` arm above does: emitting the full base row instead
+        // would diverge from the non-empty column shape and trip Exasol's positional
+        // `04000` check.
+        RequestShape::RowScan if projection_widened => {
+            Ok(empty_select_list_typed_sql(pushdown_req)
+                .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types)))
         }
         RequestShape::RowScan => Ok(empty_pushdown_sql(proj_cols, proj_types)),
     }
@@ -932,6 +927,53 @@ mod tests {
         );
     }
 
+    /// A manifest-read error that echoes Azure static credentials verbatim has
+    /// BOTH literal values stripped — not merely their labels.
+    ///
+    /// The two credentials fail the label heuristic in different ways, so each
+    /// independently requires the value-based pass:
+    ///   - the account key is echoed bare inside a string-to-sign, with no
+    ///     recognizable label anywhere near it;
+    ///   - the SAS token carries its OWN `sig=` label, so a label-only pass
+    ///     rewrites the middle of the token and leaves its permission and expiry
+    ///     fields verbatim.
+    #[test]
+    fn manifest_read_errors_redact_the_literal_azure_secret_values() {
+        let account_key = "Zm9vYmFyYmF6cXV1eGNvcmdlc2VjcmV0QUNDT1VOVEtFWT09";
+        let sas_permissions = "sp=racwdlmeop";
+        let sas_token = format!(
+            "sv=2024-11-04&ss=bf&srt=sco&{sas_permissions}&se=2026-12-31T23:59:59Z&sig=aB3%2FxQ7"
+        );
+        let raw = format!(
+            "AuthenticationFailed: Server failed to authenticate the request. \
+             String to sign used was: {account_key}. \
+             Request URL: https://acct.dfs.core.windows.net/c/meta/snap.avro?{sas_token}"
+        );
+        let secrets = [account_key, sas_token.as_str()];
+
+        let surfaced = format!(
+            "failed to read Iceberg manifest list for 'ns.tbl': {}",
+            redact_error_text(&raw, &secrets)
+        );
+
+        assert!(
+            !surfaced.contains(account_key),
+            "account key value must not survive: {surfaced}"
+        );
+        assert!(
+            !surfaced.contains(&sas_token),
+            "SAS token value must not survive: {surfaced}"
+        );
+        assert!(
+            !surfaced.contains(sas_permissions),
+            "the SAS token's permission field must not survive either: {surfaced}"
+        );
+        assert!(
+            surfaced.contains("failed to read Iceberg manifest list for 'ns.tbl'"),
+            "the actionable context must be preserved: {surfaced}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
     // ---------------------------------------------------------------------------
@@ -1048,6 +1090,31 @@ mod tests {
                 "round-trip must be identity for {original}"
             );
         }
+    }
+
+    /// The `abfss://` scheme carries userinfo (the container name) in its
+    /// authority (`abfss://<container>@<account>.dfs.core.windows.net/...`),
+    /// unlike `s3://`'s bare-bucket authority. The relativize/reconstruct round
+    /// trip must still be lossless: relativizing an under-root `abfss://` file
+    /// path against its table root and reconstructing via the scan UDF's join
+    /// rule must reproduce the original URI byte-for-byte, exactly like the
+    /// `s3://` case above.
+    #[test]
+    fn abfss_paths_relativize_and_reconstruct_losslessly() {
+        let root = "abfss://container@account.dfs.core.windows.net/db/table";
+        let original = format!("{root}/data/part-0.parquet");
+
+        let relative = relativize_path_to_root(&original, root);
+        assert_eq!(
+            relative, "data/part-0.parquet",
+            "abfss path under the root must relativize just like s3"
+        );
+
+        let reconstructed = reconstruct_abs_uri_mirror(&relative, root);
+        assert_eq!(
+            reconstructed, original,
+            "reconstructed abfss URI must equal the original byte-for-byte"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1228,7 +1295,7 @@ mod tests {
             "VARCHAR(10)".to_string(),
         ];
 
-        let empty = empty_result_sql(&pushdown_req, &proj_cols, &proj_types, &col_types)
+        let empty = empty_result_sql(&pushdown_req, &proj_cols, &proj_types, false, &col_types)
             .expect("empty Case 2/3 result must build");
         let empty_sql = empty["sql"].as_str().unwrap();
 
@@ -1396,11 +1463,11 @@ mod tests {
                 {"type": "decimal", "precision": 18, "scale": 0},
             ],
         });
-        let grouped_sql =
-            empty_result_sql(&grouped, &proj, &proj_types, &col_types).unwrap()["sql"]
-                .as_str()
-                .unwrap()
-                .to_string();
+        let grouped_sql = empty_result_sql(&grouped, &proj, &proj_types, false, &col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(
             grouped_sql.contains("WHERE 1=0"),
             "grouped shape is zero rows: {grouped_sql}"
@@ -1410,7 +1477,8 @@ mod tests {
             "selectList": [agg_item("SUM", Some("amount"), false)],
             "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
         });
-        let single_sql = empty_result_sql(&single, &proj, &proj_types, &col_types).unwrap()["sql"]
+        let single_sql = empty_result_sql(&single, &proj, &proj_types, false, &col_types).unwrap()
+            ["sql"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1426,8 +1494,14 @@ mod tests {
             "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
         });
         let non_numeric_col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
-        let row_sql = empty_result_sql(&non_numeric, &proj, &proj_types, &non_numeric_col_types)
-            .unwrap()["sql"]
+        let row_sql = empty_result_sql(
+            &non_numeric,
+            &proj,
+            &proj_types,
+            false,
+            &non_numeric_col_types,
+        )
+        .unwrap()["sql"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1463,7 +1537,7 @@ mod tests {
             ],
         });
 
-        let row_sql = empty_result_sql(&grouped_non_numeric, &proj, &proj_types, &col_types)
+        let row_sql = empty_result_sql(&grouped_non_numeric, &proj, &proj_types, false, &col_types)
             .unwrap()["sql"]
             .as_str()
             .unwrap()
@@ -1476,11 +1550,13 @@ mod tests {
         );
     }
 
-    /// A non-numeric grouped aggregate that also carries a HAVING cannot silently
-    /// demote (AGGREGATE_HAVING is advertised, so Exasol will not re-apply it):
-    /// the empty path must decline with the same `Err` the non-empty path returns.
+    /// A non-numeric grouped aggregate that also carries a HAVING no longer hard
+    /// errors: the classifier routes it to `GroupByWrapper` (the HAVING renders
+    /// natively over the wrapper rather than being dropped), so the empty path must
+    /// mirror the SAME selectList-typed empty shape as the no-HAVING sibling above,
+    /// not an `Err`.
     #[test]
-    fn empty_files_grouped_non_numeric_aggregate_with_having_declines() {
+    fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
         let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
         let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(2000000)".to_string()];
         let col_types = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
@@ -1499,14 +1575,78 @@ mod tests {
             "having": {"type": "predicate_greater"},
         });
 
-        let err = empty_result_sql(&grouped_having, &proj, &proj_types, &col_types).unwrap_err();
-        match err {
-            UdfError::User(msg) => assert!(
-                msg.contains("HAVING present"),
-                "decline message must name the HAVING conflict: {msg}"
+        let row_sql = empty_result_sql(&grouped_having, &proj, &proj_types, false, &col_types)
+            .unwrap()["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            row_sql,
+            "SELECT CAST(NULL AS DECIMAL(20,0)), CAST(NULL AS DECIMAL(36,2)) FROM DUAL WHERE 1=0",
+            "declined grouped aggregate with HAVING over zero files must produce the same \
+             selectList-typed empty shape as the wrapper it now falls through to, not an error"
+        );
+    }
+
+    /// A row-scan request whose derived projection WIDENED to the full base row is
+    /// routed on the non-empty path to the qualified single-table wrapper, whose
+    /// output columns are the `selectList` items (#196). The empty path must mirror
+    /// that shape — one `selectListDataTypes`-typed zero-row column — never the
+    /// wider full base row, whose column count trips Exasol's positional `04000`
+    /// check. The widening signal alone decides this: the identical request with a
+    /// non-widened projection still gets the full-row shape.
+    #[test]
+    fn empty_result_sql_widened_row_scan_uses_select_list_types() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [
+                {"type": "function_scalar", "name": "LENGTH", "arguments": [
+                    {"type": "column", "name": "SCORE", "tableName": "T"}]},
+            ],
+            "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+        });
+        let col_types = vec![
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+            ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        ];
+        // No aggregate anywhere, so the shared classifier picks `RowScan` — the arm
+        // under test, not the `GroupByWrapper` arm that already emits this shape.
+        assert!(
+            matches!(
+                classify_request_shape(&pushdown_req, &col_types),
+                RequestShape::RowScan
             ),
-            other => panic!("expected UdfError::User, got {other:?}"),
-        }
+            "the fixture must classify as RowScan for this test to exercise its arm"
+        );
+
+        // The widened projection IS the full base row: three columns for one item.
+        let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into(), "SCORE".into()];
+        let proj_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+
+        let widened = empty_result_sql(&pushdown_req, &proj, &proj_types, true, &col_types)
+            .expect("the widened empty row-scan result must build")["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            widened, "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
+            "a widened row-scan projection over zero files must produce ONE \
+             selectListDataTypes-typed column, not the 3-column base row: {widened}"
+        );
+
+        let not_widened = empty_result_sql(&pushdown_req, &proj, &proj_types, false, &col_types)
+            .expect("the non-widened empty row-scan result must build")["sql"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            not_widened,
+            empty_pushdown_sql(&proj, &proj_types)["sql"]
+                .as_str()
+                .unwrap(),
+            "the non-widened path must stay byte-identical to the full-row empty \
+             shape: {not_widened}"
+        );
     }
 
     // ---------------------------------------------------------------------------

@@ -1,0 +1,33 @@
+[package]
+name = "lakehouse-catalog"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+name = "lakehouse_catalog"
+
+[dependencies]
+exasol-udf-sdk = { workspace = true }
+
+iceberg                 = { workspace = true }
+iceberg-catalog-rest    = { workspace = true }
+# `opendal-azdls`: ADLS Gen2 backend for the `OpenDalStorageFactory` FileIO
+# registration in `storage.rs`/`session.rs`; unions with the workspace `opendal-s3`.
+iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+url        = { workspace = true }
+
+# SigV4 signing for Glue REST catalog requests.
+# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
+aws-sigv4              = { workspace = true }
+aws-credential-types   = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+
+# Async reqwest client for signed catalog/storage requests.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

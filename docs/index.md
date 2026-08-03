@@ -4,18 +4,38 @@
 
 # lakehouse-engine documentation
 
-`lakehouse-engine` is an Exasol Virtual Schema that runs the
-[DataFusion](https://datafusion.apache.org/) engine in place, inside Rust UDFs, to
-query Apache Iceberg and Databricks-managed tables straight from Exasol SQL. The VS
-stays thin (translation, pushdown analysis, parallelization planning, schema mapping);
-all execution happens in disposable, node-local DataFusion runtimes. Every query is
-stateless — no caching, no materialization, no data movement.
+`lakehouse-engine` is an Exasol Virtual Schema that queries Apache Iceberg and
+Databricks-managed tables straight from Exasol SQL. It runs the
+[DataFusion](https://datafusion.apache.org/) engine in place, inside Rust UDFs on the
+Exasol nodes. Scans therefore run where the cluster already is. The VS layer stays
+thin: it does query translation, pushdown analysis, parallelization planning, and schema
+mapping. All execution happens in disposable, node-local DataFusion runtimes. Every query
+is stateless: no caching, no materialization, no data copied out.
 
-## Guides
+After you deploy it, you query lakehouse tables like any other Exasol schema:
 
-- [Install](install.md) — build the `.so`, register the Rust SLC, deploy the scripts + CONNECTION + Virtual Schema, run E2E — plus a fully manual path (curl/SQL, no `exapump` BucketFS access) for platforms like Exasol SaaS
-- [Catalogs](catalogs.md) — supported catalogs and CONNECTION recipes (local/generic REST, AWS Glue, Lakekeeper, Databricks), with a tested-status callout per catalog
-- [Capabilities](capabilities.md) — pushdown support matrix — what runs in DataFusion vs. Exasol
-- [Architecture](architecture.md) — parallelism, sharding & how pushdown combines with parent-level Exasol execution
-- [Performance](performance.md) — benchmark results
-- [Tuning](tuning.md) — parameters reference & telemetry
+```sql
+SELECT l_returnflag, SUM(l_quantity)
+FROM my_lakehouse.lineitem
+WHERE l_shipdate <= DATE '1998-09-01'
+GROUP BY l_returnflag;
+```
+
+## Documentation
+
+| Guide | What it covers |
+|-------|----------------|
+| [Install](install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
+| [Catalogs](catalogs.md) | Connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs: CONNECTION objects, credentials, and object-storage access. |
+| [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
+| [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
+| [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
+| [Tuning](tuning.md) | Configuration parameters reference and runtime telemetry. |
+| [Debugging pushdown](debugging-pushdown.md) | Use `EXPLAIN VIRTUAL` to inspect what the adapter pushes down for a query. |
+
+## Start here
+
+- **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data.
+- **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
+- **Tuning a running deployment?** Read [Capabilities](capabilities.md) and [Tuning](tuning.md).
+- **A query does not push down the way you expect?** Read [Debugging pushdown](debugging-pushdown.md).

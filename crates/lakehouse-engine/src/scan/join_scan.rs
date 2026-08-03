@@ -78,7 +78,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         ));
     }
 
-    // Both sides share the one set of storage credentials (StorageProps); the
+    // Both sides share the one storage backend (StorageBackend); the
     // dimension side carries its own table_root, file list, logical schema, and
     // per-file positional deletes, which register_file_list applies to the
     // dimension registration exactly as it does for the fact side.

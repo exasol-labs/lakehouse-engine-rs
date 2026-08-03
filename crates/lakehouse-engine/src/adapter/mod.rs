@@ -9,19 +9,20 @@ pub mod pushdown;
 #[cfg(test)]
 mod pushdown_surface_probe;
 pub mod sharding;
-pub mod sigv4;
 pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
-use crate::adapter::pushdown::{handle_pushdown, list_namespace_tables, resolve_table_schema};
+use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
 use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
-use crate::scan::spec::StorageProps;
+use crate::scan::spec::StorageBackend;
+use crate::types::mapping::exasol_type_to_json;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
+use lakehouse_catalog::{CatalogSession, list_namespace_tables};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 
@@ -33,19 +34,6 @@ const PROP_ICEBERG_NAMESPACE: &str = "ICEBERG_NAMESPACE";
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 // Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-// Key written into the createVirtualSchema response under
-// schemaMetadata.adapterNotes (a stringified JSON object) so that subsequent
-// requests (pushdown, refresh, setProperties) can read the resolved node count back from
-// `schemaMetadataInfo.adapterNotes`.
-//
-// adapterNotes is used rather than schemaMetadata.properties because Exasol
-// (2025.2.1) does NOT persist adapter-returned schemaMetadata.properties — they
-// are silently dropped and never appear in any catalog view. adapterNotes, by
-// contrast, is persisted at the schema level, passed back in
-// schemaMetadataInfo.adapterNotes, and is queryable via
-// SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES. Exasol requires adapterNotes to be
-// a JSON *string* (a raw JSON object fails with "No valid json string").
-const NOTE_CLUSTER_NODES: &str = "CLUSTER_NODES";
 // adapterNotes key for the per-node CPU core count captured at createVirtualSchema time.
 const NOTE_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property name for the parallelism factor (oversubscription multiplier).
@@ -73,11 +61,11 @@ const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
 const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
 /// Pushdown-path fallback for `target_partitions` when the adapterNote is absent or
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_target_partitions`.)
+/// `resolve_df_fixed_count`.)
 const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
 /// Pushdown-path fallback for threads-per-UDF when the adapterNote is absent or
 /// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_threads_per_udf`.)
+/// `resolve_df_fixed_count`.)
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
 // VS property and adapterNotes key names for the DataFusion batch_size parameter.
 const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
@@ -148,23 +136,37 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
-            // Resolve credentials synchronously before entering the async runtime.
-            // ctx.connection() is a synchronous call that must not be invoked inside
-            // an async context (it may block on the UDF host). Mirror the pattern
-            // used by resolve_cluster_nodes. ctx.script_schema() is likewise a
-            // synchronous handshake read, and is the schema that qualifies the
-            // scan/distributor/merge UDF names in the generated pushdown SQL.
+            // Resolve credentials synchronously before entering the async runtime:
+            // ctx.connection(), reached via resolve_connection_config, is a
+            // connect-back round-trip that may block on the UDF host, so it must
+            // not run inside the tokio runtime built below.
+            //
+            // ctx.script_schema() and cluster_nodes_from_context(ctx) are captured
+            // here too, but for a different reason — they are plain handshake-
+            // metadata field reads, not connect-back calls. Capturing them outside
+            // the async block keeps the planning body free of ambient-state reads
+            // and of a dependency on the UDF delivery mechanism. script_schema is
+            // the schema that qualifies the scan/distributor/merge UDF names in the
+            // generated pushdown SQL.
             let props = get_properties(request);
             let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
             let script_schema = ctx.script_schema();
+            let cluster_nodes = cluster_nodes_from_context(ctx);
 
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
             rt.block_on(async {
-                handle_pushdown_request(request, &catalog_uri, &storage, &creds, &script_schema)
-                    .await
+                handle_pushdown_request(
+                    request,
+                    &catalog_uri,
+                    &storage,
+                    &creds,
+                    &script_schema,
+                    cluster_nodes,
+                )
+                .await
             })
         }
         other => Err(UdfError::User(format!(
@@ -183,12 +185,12 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageProps, ConnectionCreds), UdfError> {
-    let resolved = read_connection(ctx, str_prop(props, PROP_CATALOG_CONNECTION))?;
-    let mut storage = storage_block(&resolved.creds);
-    storage.allow_http = str_prop(props, PROP_ALLOW_HTTP)
+) -> Result<(String, StorageBackend, ConnectionCreds), UdfError> {
+    let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION))?;
+    let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let storage = storage_block(&resolved.creds, allow_http);
     Ok((resolved.uri, storage, resolved.creds))
 }
 
@@ -206,7 +208,7 @@ fn handle_create_virtual_schema(
     };
     let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
 
-    let iceberg_namespace = str_prop(&props, PROP_ICEBERG_NAMESPACE)
+    let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
         .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
         .to_string();
 
@@ -215,7 +217,7 @@ fn handle_create_virtual_schema(
         .map(|s| s.to_string())
         .collect();
 
-    let (cluster_nodes, nr_of_cores) = resolve_cluster_nodes(ctx, &props);
+    let nr_of_cores = resolve_nr_of_cores(&props);
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
     // At createVirtualSchema the file list is not yet known, so the per-node UDF
     // instance share cannot use the file-count clamp. Before that clamp,
@@ -247,22 +249,9 @@ fn handle_create_virtual_schema(
         })
         .map_err(|e| redact_error(&storage, e))?;
 
-    // `build_virtual_tables` is pure (no `ctx`, no `storage`) so it cannot redact
-    // its own propagated abort-path errors — the caller applies the same
-    // `redact_error` the old inline loop applied per-table, now applied once over
-    // the whole enumeration result, preserving the no-credential-leak guarantee.
-    let (tables_json, table_map, skipped_idents) = build_virtual_tables(
-        &configured_ns,
-        &table_idents,
-        |ident: &iceberg::TableIdent| {
-            let iceberg_id = iceberg_identifier_string(ident);
-            let per_table_catalog = catalog_block(&creds, &catalog_uri, &iceberg_id);
-            rt.block_on(async {
-                resolve_table_schema(&catalog_uri, &per_table_catalog, &creds).await
-            })
-        },
-    )
-    .map_err(|e| redact_error(&storage, e))?;
+    let (tables_json, table_map, skipped_idents) =
+        resolve_namespace_virtual_tables(&rt, &catalog_uri, &creds, &configured_ns, &table_idents)
+            .map_err(|e| redact_error(&storage, e))?;
 
     for ident in &skipped_idents {
         udf_log!(
@@ -276,7 +265,6 @@ fn handle_create_virtual_schema(
     // Build adapterNotes including TABLE_MAP (merge, not clobber).
     let adapter_notes = build_adapter_notes(
         request,
-        cluster_nodes,
         nr_of_cores,
         parallelism_factor,
         df_threading_mode,
@@ -296,6 +284,54 @@ fn handle_create_virtual_schema(
     });
 
     Ok(build_schema_response(request, schema_metadata))
+}
+
+/// Resolve every enumerated table's schema into its `createVirtualSchema` entry.
+///
+/// Owns the catalog session for the whole enumeration, so the schema loop's OAuth2
+/// grant and `/v1/config` lookup each run once for the namespace instead of once per
+/// table — sound because a session is scoped to one `(catalog_uri, warehouse)` tuple
+/// and every table here shares both, varying only `CatalogProps.table`.
+///
+/// An EMPTY namespace builds NO session and therefore makes no catalog contact at
+/// all. That input is reachable (a namespace with no tables) and it is what the
+/// pre-hoist per-table loop cost for it: hoisting the build unconditionally would
+/// charge an empty enumeration an OAuth2 grant it never needed and would fail a
+/// request that used to succeed with an empty table list. With at least one table the
+/// build happens before the loop, so a grant failure surfaces once for the whole
+/// request rather than at whichever table happened to be resolved first.
+///
+/// `list_namespace_tables` keeps its own independent auth path and is deliberately
+/// NOT folded onto this session, so on the OAuth2 client-credentials mode its
+/// `RestCatalog` grant remains and such a request still performs two grants in total,
+/// not one.
+///
+/// Errors propagate unredacted — no `ctx` and no `StorageBackend` reach here, so the
+/// caller applies the same `redact_error` the old inline loop applied per-table, once
+/// over the whole enumeration result, preserving the no-credential-leak guarantee.
+fn resolve_namespace_virtual_tables(
+    rt: &tokio::runtime::Runtime,
+    catalog_uri: &str,
+    creds: &ConnectionCreds,
+    configured_ns: &[String],
+    table_idents: &[iceberg::TableIdent],
+) -> Result<VirtualTables, UdfError> {
+    if table_idents.is_empty() {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
+
+    let session =
+        rt.block_on(async { CatalogSession::resolve(catalog_uri, &creds.warehouse, creds).await })?;
+
+    build_virtual_tables(
+        configured_ns,
+        table_idents,
+        |ident: &iceberg::TableIdent| {
+            let iceberg_id = iceberg_identifier_string(ident);
+            let per_table_catalog = catalog_block(creds, &iceberg_id);
+            rt.block_on(async { resolve_table_schema(&session, &per_table_catalog, creds).await })
+        },
+    )
 }
 
 /// Assemble the createVirtualSchema / refresh / setProperties response.
@@ -327,17 +363,16 @@ fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
 async fn handle_pushdown_request(
     request: &Json,
     catalog_uri: &str,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
     script_schema: &str,
+    cluster_nodes: usize,
 ) -> Result<Json, UdfError> {
-    // CLUSTER_NODES and PARALLELISM_FACTOR are carried in adapterNotes (persisted
-    // by Exasol), NOT in properties (dropped by Exasol). Read them from
-    // schemaMetadataInfo.adapterNotes; default to safe values when absent.
-    let cluster_nodes = adapter_note(request, NOTE_CLUSTER_NODES)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(1);
+    // PARALLELISM_FACTOR and the other tuning values below are carried in
+    // adapterNotes (persisted by Exasol), NOT in properties (dropped by
+    // Exasol). Read them from schemaMetadataInfo.adapterNotes; default to
+    // safe values when absent. cluster_nodes is no longer one of them — it
+    // arrives as a parameter, captured from the live handshake in dispatch.
     let parallelism_factor = adapter_note(request, NOTE_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
@@ -372,7 +407,7 @@ async fn handle_pushdown_request(
 
     // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
-    let catalog = catalog_block(creds, catalog_uri, &iceberg_identifier);
+    let catalog = catalog_block(creds, &iceberg_identifier);
 
     handle_pushdown(
         request,
@@ -446,9 +481,14 @@ fn merge_set_properties(request: &Json) -> Json {
     Json::Object(merged)
 }
 
-fn str_prop<'a>(props: &'a Json, key: &str) -> Option<&'a str> {
-    props
-        .get(key)
+/// Read `key` from a JSON object as a non-empty string.
+///
+/// Returns `Some` only for a present, string-typed, non-empty value — absent,
+/// null, non-string, and empty-string all fall through to `None`, so callers
+/// can chain `.unwrap_or(default)` and treat every one of those cases as
+/// "use the default" uniformly.
+fn nonempty_str<'a>(obj: &'a Json, key: &str) -> Option<&'a str> {
+    obj.get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
@@ -609,7 +649,7 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 }
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
-/// *string* (Exasol rejects a raw object) carrying CLUSTER_NODES, NR_OF_CORES,
+/// *string* (Exasol rejects a raw object) carrying NR_OF_CORES,
 /// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
 /// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
@@ -620,7 +660,6 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 #[allow(clippy::too_many_arguments)]
 fn build_adapter_notes(
     request: &Json,
-    cluster_nodes: u32,
     nr_of_cores: u32,
     parallelism_factor: usize,
     df_threading_mode: ThreadingMode,
@@ -634,10 +673,6 @@ fn build_adapter_notes(
     table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
-    notes.insert(
-        NOTE_CLUSTER_NODES.to_string(),
-        Json::String(cluster_nodes.to_string()),
-    );
     notes.insert(
         NOTE_NR_OF_CORES.to_string(),
         Json::String(nr_of_cores.to_string()),
@@ -694,7 +729,7 @@ fn build_adapter_notes(
 /// floored at `DEFAULT_PARALLELISM_FACTOR` so a dev VM or failed core-count
 /// lookup (nr_of_cores = 0) never collapses the factor below a useful minimum.
 fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_PARALLELISM_FACTOR)
+    nonempty_str(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
@@ -728,7 +763,7 @@ impl ThreadingMode {
 /// Parses `AUTO` / `FIXED` case-insensitively. An absent, empty, or unrecognized
 /// value resolves to `Auto`.
 fn resolve_threading_mode(props: &Json) -> ThreadingMode {
-    match str_prop(props, PROP_DF_THREADING_MODE) {
+    match nonempty_str(props, PROP_DF_THREADING_MODE) {
         Some(s) if s.eq_ignore_ascii_case("FIXED") => ThreadingMode::Fixed,
         _ => ThreadingMode::Auto,
     }
@@ -752,8 +787,8 @@ fn resolve_df_threading(
 ) -> (usize, usize) {
     match mode {
         ThreadingMode::Fixed => (
-            resolve_df_target_partitions(props, nr_of_cores),
-            resolve_df_threads_per_udf(props, nr_of_cores),
+            resolve_df_fixed_count(props, PROP_DF_TARGET_PARTITIONS, nr_of_cores),
+            resolve_df_fixed_count(props, PROP_DF_THREADS_PER_UDF, nr_of_cores),
         ),
         ThreadingMode::Auto => {
             let threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
@@ -775,27 +810,15 @@ fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usiz
     ((nr_of_cores as usize) / instances).max(1)
 }
 
-/// Read and validate the DATAFUSION_TARGET_PARTITIONS VS property.
+/// Read and validate a FIXED-mode DataFusion count property (target partitions or
+/// threads-per-UDF, selected by `key`).
 ///
 /// An explicit positive-integer property wins. When absent, empty, zero, or
 /// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
 /// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
 /// the default falls back to `1`, preserving prior single-threaded behavior.
-fn resolve_df_target_partitions(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_DF_TARGET_PARTITIONS)
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or_else(|| (nr_of_cores as usize).max(1))
-}
-
-/// Read and validate the DATAFUSION_THREADS_PER_UDF VS property.
-///
-/// An explicit positive-integer property wins. When absent, empty, zero, or
-/// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
-/// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
-/// the default falls back to `1`, preserving prior single-threaded behavior.
-fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
-    str_prop(props, PROP_DF_THREADS_PER_UDF)
+fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
+    nonempty_str(props, key)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| (nr_of_cores as usize).max(1))
@@ -808,8 +831,8 @@ fn resolve_df_threads_per_udf(props: &Json, nr_of_cores: u32) -> usize {
 /// partition/thread pair behind `DATAFUSION_THREADING_MODE`):
 ///
 /// * An explicit positive-integer `S3_MAX_CONNECTIONS` property is used verbatim
-///   (FIXED-like) — same `str_prop → parse → filter(>=1)` shape as
-///   `resolve_df_threads_per_udf`.
+///   (FIXED-like) — same `nonempty_str → parse → filter(>=1)` shape as
+///   `resolve_df_fixed_count`.
 /// * Absent/empty/zero/invalid triggers an AUTO derivation from `nr_of_cores` and
 ///   the per-node UDF-instance share. When `nr_of_cores == 0` (unknown) it falls
 ///   back to `DEFAULT_S3_MAX_CONNECTIONS`, mirroring the `0`-cores handling across
@@ -842,7 +865,7 @@ fn resolve_s3_max_connections(
     nr_of_cores: u32,
     udf_instances_per_node: usize,
 ) -> usize {
-    if let Some(explicit) = str_prop(props, PROP_S3_MAX_CONNECTIONS)
+    if let Some(explicit) = nonempty_str(props, PROP_S3_MAX_CONNECTIONS)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
     {
@@ -863,7 +886,7 @@ fn resolve_s3_max_connections(
 /// invalid the default is `DEFAULT_DF_BATCH_SIZE` (8192, matching DataFusion's
 /// built-in default). A supplied value is clamped to ≥1.
 fn resolve_df_batch_size(props: &Json) -> usize {
-    str_prop(props, PROP_DF_BATCH_SIZE)
+    nonempty_str(props, PROP_DF_BATCH_SIZE)
         .and_then(|s| s.parse::<usize>().ok())
         .map(|n| n.max(1))
         .unwrap_or(DEFAULT_DF_BATCH_SIZE)
@@ -874,7 +897,7 @@ fn resolve_df_batch_size(props: &Json) -> usize {
 /// Accepts any value in the range (0.0, 1.0]. When the property is absent, empty,
 /// zero, out-of-range, or unparseable the default is `DEFAULT_MEMORY_POOL_FRACTION`.
 fn resolve_memory_pool_fraction(props: &Json) -> f64 {
-    str_prop(props, PROP_MEMORY_POOL_FRACTION)
+    nonempty_str(props, PROP_MEMORY_POOL_FRACTION)
         .and_then(|s| s.parse::<f64>().ok())
         .filter(|&x| x > 0.0 && x <= 1.0)
         .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION)
@@ -886,7 +909,7 @@ fn resolve_memory_pool_fraction(props: &Json) -> f64 {
 /// property is absent, empty, or unparseable the default is
 /// `DEFAULT_INSTANCE_OVERHEAD_MB`.
 fn resolve_instance_overhead_mb(props: &Json) -> u64 {
-    str_prop(props, PROP_INSTANCE_OVERHEAD_MB)
+    nonempty_str(props, PROP_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
 }
@@ -898,7 +921,7 @@ fn resolve_instance_overhead_mb(props: &Json) -> u64 {
 /// `DEFAULT_JOIN_BROADCAST_MAX_BYTES` (128 MiB). See backlog BL-001 / plan
 /// `add-join-pushdown-broadcast`.
 fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
-    str_prop(props, PROP_JOIN_BROADCAST_MAX_BYTES)
+    nonempty_str(props, PROP_JOIN_BROADCAST_MAX_BYTES)
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
@@ -911,33 +934,33 @@ fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
 /// non-numeric values, signalling that the caller should fall back to
 /// auto-detection via `std::thread::available_parallelism()`.
 fn parse_nr_of_cores_override(props: &Json) -> Option<u32> {
-    str_prop(props, PROP_NR_OF_CORES)
+    nonempty_str(props, PROP_NR_OF_CORES)
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n >= 1)
 }
 
-/// Resolve the cluster topology `(cluster_nodes, nr_of_cores)` entirely
-/// in-process — no SQL round-trip, no connect-back session.
+/// Per-node CPU core count used to derive the AUTO parallelism, DataFusion
+/// threading, and S3 connection budgets.
 ///
-/// `cluster_nodes` comes from the UDF handshake metadata via
-/// [`UdfContext::node_count`]. A live cluster reports its node count directly
-/// (`1` on a single node); a `0` (stub, test double, or missing handshake) maps
-/// to `1` so `createVirtualSchema` keeps the single-shard fallback behaviour.
-///
-/// `nr_of_cores` comes from the `NR_OF_CORES` VS property override (via
+/// Comes from the `NR_OF_CORES` VS property override (via
 /// [`parse_nr_of_cores_override`]) when it resolves to a positive integer;
 /// otherwise it is auto-detected from `std::thread::available_parallelism()`.
-/// A `nr_of_cores` of `0` signals "unknown" (auto-detect unavailable); callers
-/// must handle the floor case.
-fn resolve_cluster_nodes(ctx: &mut dyn UdfContext, props: &Json) -> (u32, u32) {
-    let cluster_nodes = match ctx.node_count() {
+/// A result of `0` signals "unknown" (auto-detect unavailable); callers must
+/// handle the floor case.
+fn resolve_nr_of_cores(props: &Json) -> u32 {
+    parse_nr_of_cores_override(props).unwrap_or_else(available_parallelism_or_0)
+}
+
+/// Cluster node count for pushdown sharding, read directly from the UDF
+/// handshake via [`UdfContext::node_count`] — no persisted note, no
+/// create-time capture. A live cluster reports its node count directly (`1`
+/// on a single node); a `0` (stub, test double, or missing handshake) maps
+/// to `1` so sharding keeps the single-shard fallback behaviour.
+fn cluster_nodes_from_context(ctx: &dyn UdfContext) -> usize {
+    match ctx.node_count() {
         0 => 1,
-        n => n,
-    };
-
-    let nr_of_cores = parse_nr_of_cores_override(props).unwrap_or_else(available_parallelism_or_0);
-
-    (cluster_nodes, nr_of_cores)
+        n => n as usize,
+    }
 }
 
 /// Per-node CPU core count from `std::thread::available_parallelism()`, or `0`
@@ -948,58 +971,10 @@ fn available_parallelism_or_0() -> u32 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// JSON type serialization helpers
-// ---------------------------------------------------------------------------
-
-/// Convert an Exasol type string to the VS column dataType JSON object.
-/// Minimal implementation covering the types produced by our mapping.
-fn exasol_type_to_json(exasol_type: &str) -> Json {
-    let upper = exasol_type.to_uppercase();
-    if upper == "BOOLEAN" {
-        return json!({"type": "boolean"});
-    }
-    if upper == "DOUBLE PRECISION" {
-        return json!({"type": "double"});
-    }
-    if upper == "DATE" {
-        return json!({"type": "date"});
-    }
-    if upper == "TIMESTAMP" {
-        return json!({"type": "timestamp"});
-    }
-    if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
-        return json!({"type": "timestamp", "withLocalTimeZone": true});
-    }
-    if let Some(inner) = upper
-        .strip_prefix("DECIMAL(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        let parts: Vec<&str> = inner.splitn(2, ',').collect();
-        if parts.len() == 2
-            && let (Ok(p), Ok(s)) = (
-                parts[0].trim().parse::<u64>(),
-                parts[1].trim().parse::<u64>(),
-            )
-        {
-            return json!({"type": "decimal", "precision": p, "scale": s});
-        }
-    }
-    // Default: VARCHAR(size)
-    let size = if let Some(inner) = upper
-        .strip_prefix("VARCHAR(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        inner.trim().parse::<u64>().unwrap_or(2000000)
-    } else {
-        2000000
-    };
-    json!({"type": "varchar", "size": size})
-}
-
 /// Returns `true` iff `err` is the catalog's "table not found" (HTTP 404)
 /// signal — the deterministic prefix the single catalog error site
-/// (`authed_get_json`'s non-success branch in `pushdown::credentials`) emits as
+/// (`authed_get_json`'s non-success branch in `lakehouse_catalog`'s
+/// `iceberg_io`) emits as
 /// `format!("catalog returned HTTP {}: {}", status.as_u16(), redact(&body))`.
 ///
 /// A 404 marks a namespace entry that is absent or not an Iceberg table (AWS
@@ -1028,7 +1003,7 @@ fn is_table_not_found(err: &UdfError) -> bool {
 /// Strips the literal secret values held in `storage` (value-based) and then
 /// applies the label-based heuristic, so credentials cannot leak through error
 /// shapes the label heuristic misses.
-fn redact_error(storage: &StorageProps, e: UdfError) -> UdfError {
+fn redact_error(storage: &StorageBackend, e: UdfError) -> UdfError {
     match e {
         UdfError::User(msg) => {
             let stripped = crate::scan::emit::redact_secret_values(&msg, &storage.secret_values());
@@ -1222,14 +1197,14 @@ mod tests {
         let merged = merge_set_properties(&req);
 
         // Request value wins over the persisted value.
-        assert_eq!(str_prop(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
+        assert_eq!(nonempty_str(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
         // A null request value removes the persisted property entirely.
         assert!(
             merged.get("ALLOW_HTTP").is_none(),
             "a null request value must unset the property"
         );
         // A persisted property the request does not mention is retained.
-        assert_eq!(str_prop(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
+        assert_eq!(nonempty_str(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
     }
 
     // Stub UdfContext whose `connection()` resolves successfully, so a
@@ -1306,39 +1281,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exasol_type_to_json_roundtrip() {
-        let cases = [
-            ("BOOLEAN", "boolean"),
-            ("DOUBLE PRECISION", "double"),
-            ("DATE", "date"),
-            ("TIMESTAMP", "timestamp"),
-        ];
-        for (ty, expected_type) in cases {
-            let j = exasol_type_to_json(ty);
-            assert_eq!(
-                j["type"].as_str().unwrap().to_lowercase(),
-                expected_type,
-                "type mismatch for {ty}"
-            );
-        }
-        let dec = exasol_type_to_json("DECIMAL(18,4)");
-        assert_eq!(dec["precision"].as_u64().unwrap(), 18);
-        assert_eq!(dec["scale"].as_u64().unwrap(), 4);
-    }
-
-    #[test]
-    fn exasol_type_to_json_timestamp_with_local_time_zone() {
-        let tstz = exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE");
-        assert_eq!(
-            tstz,
-            serde_json::json!({"type": "timestamp", "withLocalTimeZone": true})
-        );
-
-        let ts = exasol_type_to_json("TIMESTAMP");
-        assert_eq!(ts, serde_json::json!({"type": "timestamp"}));
-    }
-
     // Minimal UdfContext for dispatch tests that need no I/O. Its `node_count()`
     // uses the trait default (0), exercising the `0 → 1` topology fallback.
     struct NoopCtx;
@@ -1381,118 +1323,23 @@ mod tests {
     }
 
     #[test]
-    fn cluster_nodes_defaults_to_one_when_node_count_zero() {
+    fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
         // A context reporting node_count() == 0 (no live handshake — the trait
-        // default, as on NoopCtx) maps to CLUSTER_NODES == 1.
-        let props = serde_json::json!({});
-        let (count, _cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
-        assert_eq!(count, 1u32);
-
-        // The same default holds for a StubCtx explicitly reporting 0.
-        let (count, _cores) = resolve_cluster_nodes(&mut StubCtx { node_count: 0 }, &props);
-        assert_eq!(count, 1u32);
+        // default, as on NoopCtx) maps to 1.
+        assert_eq!(cluster_nodes_from_context(&NoopCtx), 1usize);
+        assert_eq!(
+            cluster_nodes_from_context(&StubCtx { node_count: 0 }),
+            1usize
+        );
     }
 
     #[test]
-    fn cluster_nodes_passes_through_reported_node_count() {
+    fn cluster_nodes_from_context_passes_through_reported_node_count() {
         // A live cluster reporting node_count() == N (> 1) is passed through
-        // verbatim to CLUSTER_NODES with no defaulting.
-        let props = serde_json::json!({});
-        let (count, _cores) = resolve_cluster_nodes(&mut StubCtx { node_count: 4 }, &props);
-        assert_eq!(count, 4u32);
-    }
-
-    /// Verifies that the createVirtualSchema response JSON carries CLUSTER_NODES
-    /// in schemaMetadata.adapterNotes (a JSON *string*, the only channel Exasol
-    /// persists), driven off the node count reported by the context.
-    ///
-    /// Exercises the JSON-assembly seam without catalog or network I/O.
-    #[test]
-    fn create_response_carries_cluster_nodes_property() {
-        let props = serde_json::json!({});
-        let (cluster_nodes, nr_of_cores) =
-            resolve_cluster_nodes(&mut StubCtx { node_count: 1 }, &props);
-        assert_eq!(cluster_nodes, 1u32, "stubbed cluster_nodes must be 1");
-
-        // Replicate the schema_metadata construction from handle_create_virtual_schema.
-        // The request has no pre-existing adapterNotes (clean set path).
-        let request = serde_json::json!({"type": "createVirtualSchema"});
-        let adapter_notes = build_adapter_notes(
-            &request,
-            cluster_nodes,
-            nr_of_cores,
-            DEFAULT_PARALLELISM_FACTOR,
-            ThreadingMode::Auto,
-            DEFAULT_DF_TARGET_PARTITIONS,
-            DEFAULT_DF_THREADS_PER_UDF,
-            DEFAULT_DF_BATCH_SIZE,
-            DEFAULT_MEMORY_POOL_FRACTION,
-            DEFAULT_INSTANCE_OVERHEAD_MB,
-            DEFAULT_S3_MAX_CONNECTIONS,
-            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-            &[],
-        );
-        let schema_metadata = serde_json::json!({
-            "tables": [],
-            "adapterNotes": adapter_notes,
-        });
-        let response = serde_json::json!({
-            "type": "createVirtualSchema",
-            "schemaMetadata": schema_metadata,
-        });
-
-        // adapterNotes MUST be a JSON string (Exasol rejects a raw object).
-        let notes_str = response["schemaMetadata"]["adapterNotes"]
-            .as_str()
-            .unwrap_or_else(|| {
-                panic!("schemaMetadata.adapterNotes must be a JSON string: {response}")
-            });
-        // The string parses to an object carrying CLUSTER_NODES = "1".
-        let parsed: serde_json::Value =
-            serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
-        let val = parsed[NOTE_CLUSTER_NODES]
-            .as_str()
-            .unwrap_or_else(|| panic!("adapterNotes.CLUSTER_NODES must be a string: {parsed}"));
+        // verbatim, widened to usize.
         assert_eq!(
-            val, "1",
-            "CLUSTER_NODES must be \"1\" for a single-node context, got \"{val}\""
-        );
-    }
-
-    /// Verifies the round-trip: a CLUSTER_NODES written into adapterNotes by
-    /// createVirtualSchema is read back by the pushdown path from
-    /// schemaMetadataInfo.adapterNotes (the channel Exasol actually persists).
-    #[test]
-    fn adapter_notes_cluster_nodes_round_trips() {
-        // createVirtualSchema produces the adapterNotes string for, say, 4 nodes.
-        let create_req = serde_json::json!({"type": "createVirtualSchema"});
-        let notes = build_adapter_notes(
-            &create_req,
-            4,
-            0,
-            DEFAULT_PARALLELISM_FACTOR,
-            ThreadingMode::Auto,
-            DEFAULT_DF_TARGET_PARTITIONS,
-            DEFAULT_DF_THREADS_PER_UDF,
-            DEFAULT_DF_BATCH_SIZE,
-            DEFAULT_MEMORY_POOL_FRACTION,
-            DEFAULT_INSTANCE_OVERHEAD_MB,
-            DEFAULT_S3_MAX_CONNECTIONS,
-            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-            &[],
-        );
-        let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-
-        // Exasol persists that string and hands it back under
-        // schemaMetadataInfo.adapterNotes on the next pushdown request.
-        let pushdown_req = serde_json::json!({
-            "type": "pushdown",
-            "schemaMetadataInfo": { "adapterNotes": notes_str },
-        });
-        assert_eq!(
-            adapter_note(&pushdown_req, NOTE_CLUSTER_NODES).as_deref(),
-            Some("4"),
-            "CLUSTER_NODES must round-trip through adapterNotes"
+            cluster_nodes_from_context(&StubCtx { node_count: 4 }),
+            4usize
         );
     }
 
@@ -1502,25 +1349,25 @@ mod tests {
     fn adapter_note_absent_or_unparseable_yields_none() {
         // No schemaMetadataInfo at all.
         let bare = serde_json::json!({"type": "pushdown"});
-        assert!(adapter_note(&bare, NOTE_CLUSTER_NODES).is_none());
+        assert!(adapter_note(&bare, NOTE_PARALLELISM_FACTOR).is_none());
 
         // adapterNotes present but not valid JSON.
         let garbage = serde_json::json!({
             "type": "pushdown",
             "schemaMetadataInfo": { "adapterNotes": "not json" },
         });
-        assert!(adapter_note(&garbage, NOTE_CLUSTER_NODES).is_none());
+        assert!(adapter_note(&garbage, NOTE_PARALLELISM_FACTOR).is_none());
 
         // adapterNotes empty string.
         let empty = serde_json::json!({
             "type": "pushdown",
             "schemaMetadataInfo": { "adapterNotes": "" },
         });
-        assert!(adapter_note(&empty, NOTE_CLUSTER_NODES).is_none());
+        assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
     }
 
-    /// Verifies merge-not-clobber: a pre-existing adapterNotes key survives when
-    /// createVirtualSchema rewrites the notes with the resolved node count.
+    /// Verifies merge-not-clobber: a pre-existing adapterNotes key survives
+    /// `build_adapter_notes`.
     #[test]
     fn build_adapter_notes_merges_existing() {
         let req = serde_json::json!({
@@ -1531,7 +1378,6 @@ mod tests {
         });
         let notes = build_adapter_notes(
             &req,
-            3,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1552,9 +1398,41 @@ mod tests {
             "pre-existing adapterNotes keys must be preserved"
         );
         assert_eq!(
-            parsed[NOTE_CLUSTER_NODES].as_str(),
-            Some("3"),
-            "CLUSTER_NODES must be updated to the freshly resolved value"
+            parsed["CLUSTER_NODES"].as_str(),
+            Some("1"),
+            "pre-existing adapterNotes keys must be preserved, including foreign ones"
+        );
+    }
+
+    /// Verifies that the createVirtualSchema response's adapterNotes carry no
+    /// CLUSTER_NODES key at all — the note is no longer written.
+    #[test]
+    fn adapter_notes_omit_cluster_nodes() {
+        let request = serde_json::json!({"type": "createVirtualSchema"});
+        let notes = build_adapter_notes(
+            &request,
+            0,
+            DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            &[],
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+        assert!(
+            parsed.get("CLUSTER_NODES").is_none(),
+            "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
+        );
+        assert_eq!(
+            parsed[NOTE_PARALLELISM_FACTOR].as_str(),
+            Some(DEFAULT_PARALLELISM_FACTOR.to_string().as_str()),
+            "other notes must still be recorded"
         );
     }
 
@@ -1579,7 +1457,6 @@ mod tests {
         let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
         let notes = build_adapter_notes(
             &req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1634,7 +1511,6 @@ mod tests {
         let request = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &request,
-            2,
             16,
             factor,
             ThreadingMode::Auto,
@@ -1673,15 +1549,14 @@ mod tests {
         );
     }
 
-    /// Task 2.2 — Both CLUSTER_NODES and PARALLELISM_FACTOR round-trip through adapterNotes.
-    /// Covers scenario `adapter_notes_carry_cluster_nodes_and_parallelism_factor`.
+    /// Task 2.2 — PARALLELISM_FACTOR round-trips through adapterNotes.
+    /// Covers scenario `adapter_notes_carry_parallelism_factor`.
     #[test]
-    fn adapter_notes_carry_cluster_nodes_and_parallelism_factor() {
-        // createVirtualSchema records both values.
+    fn adapter_notes_carry_parallelism_factor() {
+        // createVirtualSchema records the value.
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            6,
             0,
             12,
             ThreadingMode::Auto,
@@ -1702,11 +1577,6 @@ mod tests {
             "schemaMetadataInfo": { "adapterNotes": notes_str },
         });
         assert_eq!(
-            adapter_note(&pushdown_req, NOTE_CLUSTER_NODES).as_deref(),
-            Some("6"),
-            "CLUSTER_NODES must round-trip through adapterNotes"
-        );
-        assert_eq!(
             adapter_note(&pushdown_req, NOTE_PARALLELISM_FACTOR).as_deref(),
             Some("12"),
             "PARALLELISM_FACTOR must round-trip through adapterNotes"
@@ -1723,7 +1593,6 @@ mod tests {
         let req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &req,
-            2,
             16,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1751,7 +1620,7 @@ mod tests {
     #[test]
     fn nr_of_cores_from_available_parallelism_when_unavailable() {
         let props = serde_json::json!({});
-        let (_nodes, nr_of_cores) = resolve_cluster_nodes(&mut NoopCtx, &props);
+        let nr_of_cores = resolve_nr_of_cores(&props);
         assert!(
             nr_of_cores >= 1,
             "nr_of_cores must be auto-detected from available_parallelism() (>= 1), got {nr_of_cores}"
@@ -1815,27 +1684,38 @@ mod tests {
     #[test]
     fn df_target_partitions_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_target_partitions(&absent, 0), 1, "absent → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&absent, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "absent → 1"
+        );
 
         let zero = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "0" });
-        assert_eq!(resolve_df_target_partitions(&zero, 0), 1, "zero → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&zero, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "zero → 1"
+        );
 
         let invalid = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "bad" });
-        assert_eq!(resolve_df_target_partitions(&invalid, 0), 1, "invalid → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&invalid, PROP_DF_TARGET_PARTITIONS, 0),
+            1,
+            "invalid → 1"
+        );
     }
 
     /// Scenario: An explicit positive DATAFUSION_TARGET_PARTITIONS property is used as-is.
     #[test]
     fn df_target_partitions_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
-        let val = resolve_df_target_partitions(&props, 0);
+        let val = resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0);
         assert_eq!(val, 4, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
         let req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1889,7 +1769,6 @@ mod tests {
         let req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1921,27 +1800,38 @@ mod tests {
     #[test]
     fn df_threads_per_udf_defaults_to_one() {
         let absent = serde_json::json!({});
-        assert_eq!(resolve_df_threads_per_udf(&absent, 0), 1, "absent → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&absent, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "absent → 1"
+        );
 
         let zero = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "0" });
-        assert_eq!(resolve_df_threads_per_udf(&zero, 0), 1, "zero → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&zero, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "zero → 1"
+        );
 
         let invalid = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "not-a-number" });
-        assert_eq!(resolve_df_threads_per_udf(&invalid, 0), 1, "invalid → 1");
+        assert_eq!(
+            resolve_df_fixed_count(&invalid, PROP_DF_THREADS_PER_UDF, 0),
+            1,
+            "invalid → 1"
+        );
     }
 
     /// Scenario: An explicit positive DATAFUSION_THREADS_PER_UDF property is used as-is.
     #[test]
     fn df_threads_per_udf_uses_supplied_value() {
         let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-        let val = resolve_df_threads_per_udf(&props, 0);
+        let val = resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0);
         assert_eq!(val, 2, "explicit value must be returned");
 
         // Verify it round-trips through adapterNotes.
         let req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -1978,7 +1868,7 @@ mod tests {
             "absent → default 0.6"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "" });
         assert_eq!(
             resolve_memory_pool_fraction(&empty),
@@ -2030,7 +1920,7 @@ mod tests {
             "absent → default 200"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "" });
         assert_eq!(
             resolve_instance_overhead_mb(&empty),
@@ -2081,7 +1971,7 @@ mod tests {
             "default must be exactly 128 MiB"
         );
 
-        // Empty string → default (str_prop filters empty strings).
+        // Empty string → default (nonempty_str filters empty strings).
         let empty = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "" });
         assert_eq!(
             resolve_join_broadcast_max_bytes(&empty),
@@ -2129,7 +2019,6 @@ mod tests {
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2156,13 +2045,12 @@ mod tests {
     }
 
     /// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through
-    /// build_adapter_notes → adapter_note (mirroring adapter_notes_cluster_nodes_round_trips).
+    /// build_adapter_notes → adapter_note.
     #[test]
     fn memory_budget_params_round_trip_through_adapter_notes() {
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2217,13 +2105,9 @@ mod tests {
             "NR_OF_CORES=1 (minimum valid) must return Some(1)"
         );
 
-        // When the override is present, resolve_cluster_nodes returns it directly
-        // instead of auto-detecting; the node count comes from ctx.node_count().
-        let (nodes, cores) = resolve_cluster_nodes(
-            &mut StubCtx { node_count: 3 },
-            &serde_json::json!({ PROP_NR_OF_CORES: "8" }),
-        );
-        assert_eq!(nodes, 3u32, "cluster nodes come from ctx.node_count()");
+        // When the override is present, resolve_nr_of_cores returns it directly
+        // instead of auto-detecting.
+        let cores = resolve_nr_of_cores(&serde_json::json!({ PROP_NR_OF_CORES: "8" }));
         assert_eq!(cores, 8u32, "NR_OF_CORES override must be returned");
     }
 
@@ -2239,7 +2123,7 @@ mod tests {
             "absent NR_OF_CORES must return None"
         );
 
-        // Empty string → None (str_prop filters empty strings).
+        // Empty string → None (nonempty_str filters empty strings).
         assert_eq!(
             parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "" })),
             None,
@@ -2267,11 +2151,9 @@ mod tests {
             "NR_OF_CORES=bad must return None"
         );
 
-        // With no override, resolve_cluster_nodes auto-detects the core count from
-        // available_parallelism() (positive, host-sourced) and defaults the node
-        // count to 1 when node_count() is 0.
-        let (nodes, cores) = resolve_cluster_nodes(&mut NoopCtx, &serde_json::json!({}));
-        assert_eq!(nodes, 1u32);
+        // With no override, resolve_nr_of_cores auto-detects the core count from
+        // available_parallelism() (positive, host-sourced).
+        let cores = resolve_nr_of_cores(&serde_json::json!({}));
         assert!(
             cores >= 1,
             "no override must fall back to available_parallelism() (>= 1), got {cores}"
@@ -2284,7 +2166,7 @@ mod tests {
         let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
         // Even with nr_of_cores=8, explicit "3" must win.
         assert_eq!(
-            resolve_df_target_partitions(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
             3,
             "explicit DATAFUSION_TARGET_PARTITIONS must override nr_of_cores default"
         );
@@ -2295,7 +2177,7 @@ mod tests {
     fn df_target_partitions_defaults_to_nr_of_cores() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_target_partitions(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
             8,
             "absent property with nr_of_cores=8 must default to 8"
         );
@@ -2306,7 +2188,7 @@ mod tests {
     fn df_target_partitions_unknown_cores_defaults_to_1() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_target_partitions(&props, 0),
+            resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0),
             1,
             "absent property with nr_of_cores=0 (unknown) must default to 1"
         );
@@ -2318,7 +2200,7 @@ mod tests {
         let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
         // Even with nr_of_cores=16, explicit "2" must win.
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 16),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 16),
             2,
             "explicit DATAFUSION_THREADS_PER_UDF must override nr_of_cores default"
         );
@@ -2329,7 +2211,7 @@ mod tests {
     fn df_threads_per_udf_defaults_to_nr_of_cores() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 8),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 8),
             8,
             "absent property with nr_of_cores=8 must default to 8"
         );
@@ -2340,7 +2222,7 @@ mod tests {
     fn df_threads_per_udf_unknown_cores_defaults_to_1() {
         let props = serde_json::json!({});
         assert_eq!(
-            resolve_df_threads_per_udf(&props, 0),
+            resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0),
             1,
             "absent property with nr_of_cores=0 (unknown) must default to 1"
         );
@@ -2395,7 +2277,6 @@ mod tests {
         let req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2504,7 +2385,6 @@ mod tests {
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2544,7 +2424,6 @@ mod tests {
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2583,7 +2462,6 @@ mod tests {
         });
         let notes = build_adapter_notes(
             &req,
-            5,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2599,7 +2477,11 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
         assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
-        assert_eq!(parsed[NOTE_CLUSTER_NODES].as_str(), Some("5"));
+        assert_eq!(
+            parsed["CLUSTER_NODES"].as_str(),
+            Some("5"),
+            "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
+        );
         assert!(parsed[NOTE_TABLE_MAP].is_object());
     }
 
@@ -2630,7 +2512,6 @@ mod tests {
         let create_req = serde_json::json!({"type": "createVirtualSchema"});
         let notes = build_adapter_notes(
             &create_req,
-            1,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2848,6 +2729,59 @@ mod tests {
         assert_eq!(skipped.len(), 2, "every non-Iceberg table is skipped");
     }
 
+    /// A namespace the catalog reports as holding NO table costs zero catalog
+    /// contact: there is nothing to resolve, so no session is built.
+    ///
+    /// Driven against an unreachable `catalog_uri` with OAuth2 client-credentials —
+    /// the mode whose session build issues a token grant — so an unguarded build
+    /// could only fail. The call must still succeed with an empty table list, which
+    /// is the boundary an unconditionally hoisted session build silently changed:
+    /// one grant instead of none, and a request that used to return an empty schema
+    /// now failing on the grant.
+    #[test]
+    fn create_virtual_schema_over_empty_namespace_contacts_no_catalog_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let creds = ConnectionCreds {
+            warehouse: "warehouse".into(),
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            session_token: None,
+            path_style: true,
+            use_sigv4: false,
+            use_vended_credentials: false,
+            token: None,
+            client_id: Some("oauth-client-id-sentinel".into()),
+            client_secret: Some("oauth-client-secret-sentinel".into()),
+            oauth2_server_uri: None,
+            scope: None,
+            account_name: None,
+            account_key: None,
+            sas_token: None,
+        };
+        let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+
+        let (tables_json, table_map, skipped) = resolve_namespace_virtual_tables(
+            &rt,
+            "http://127.0.0.1:1",
+            &creds,
+            &configured_ns,
+            &[],
+        )
+        .expect("an empty namespace must resolve without contacting the catalog");
+
+        assert!(
+            tables_json.is_empty(),
+            "an empty namespace advertises no virtual table"
+        );
+        assert!(table_map.is_empty(), "no table → empty TABLE_MAP");
+        assert!(skipped.is_empty(), "no table → nothing skipped");
+    }
+
     /// A non-404 per-table failure (transport / non-404 HTTP) aborts the whole
     /// enumeration — genuine catalog faults must still fail loudly.
     #[test]
@@ -2921,7 +2855,7 @@ mod tests {
         ];
         let table_map = build_table_map(&configured_ns, &idents).unwrap();
 
-        // Simulate a request with a pre-existing CLUSTER_NODES note.
+        // Simulate a request with a pre-existing, foreign adapterNotes key.
         let request = serde_json::json!({
             "type": "createVirtualSchema",
             "schemaMetadataInfo": {
@@ -2930,7 +2864,6 @@ mod tests {
         });
         let notes = build_adapter_notes(
             &request,
-            3,
             0,
             DEFAULT_PARALLELISM_FACTOR,
             ThreadingMode::Auto,
@@ -2962,11 +2895,11 @@ mod tests {
             "TABLE_MAP must map EU__ORDERS → prod.finance.eu.orders"
         );
 
-        // Pre-existing CLUSTER_NODES must survive the merge (not clobbered).
+        // A pre-existing, foreign adapterNotes key must survive the merge.
         assert_eq!(
-            parsed[NOTE_CLUSTER_NODES].as_str(),
+            parsed["CLUSTER_NODES"].as_str(),
             Some("3"),
-            "CLUSTER_NODES must be preserved after build_adapter_notes"
+            "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
         );
     }
 

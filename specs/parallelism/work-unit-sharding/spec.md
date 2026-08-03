@@ -17,10 +17,12 @@ and no file is scanned twice.
 
 ## Background
 
-* The cluster node count is taken from the `CLUSTER_NODES` entry in the virtual
-  schema's `adapterNotes` (captured once at `createVirtualSchema` via
-  `UdfContext::node_count()`), round-tripped to the adapter at pushdown time
-  (default `1`).
+* The cluster node count is read per pushdown from the running adapter script's own
+  UDF handshake via `UdfContext::node_count()`, captured synchronously in `dispatch`
+  before the tokio runtime is entered and threaded into the planning path. It is NOT
+  taken from an `adapterNotes` entry, so no create-time node count is persisted or
+  round-tripped. A `node_count()` of `0` (no live handshake) maps to `1`. See
+  `vs-adapter/pushdown-planning`.
 * The shard count G is `node_count × parallelism_factor`, where
   `parallelism_factor` is a VS property. G is capped at `300` so it
   stays at or below Exasol's `max_dynamic_group_count` default — at or below that
@@ -56,9 +58,9 @@ and no file is scanned twice.
 
 ### Scenario: Shard count oversubscribes the cluster and is capped at the round-robin threshold
 
-* *GIVEN* a resolved data-file list, a `CLUSTER_NODES` value, and a `PARALLELISM_FACTOR` VS property
+* *GIVEN* a resolved data-file list, a node count read from `UdfContext::node_count()` at pushdown, and a `PARALLELISM_FACTOR` VS property
 * *WHEN* the adapter computes the shard count G for the scan-driving query
-* *THEN* the adapter SHALL compute `G = CLUSTER_NODES × PARALLELISM_FACTOR`
+* *THEN* the adapter SHALL compute `G = node_count × PARALLELISM_FACTOR`
 * *AND* the adapter SHALL cap G at 300 so the resulting group set stays in Exasol's round-robin distribution regime
 * *AND* the adapter SHALL clamp G to be at least 1 and at most the resolved file count
 

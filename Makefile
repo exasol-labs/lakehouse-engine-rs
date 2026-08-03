@@ -21,9 +21,12 @@ UDF_BUILDER_IMAGE ?= rust:1.94-bookworm
 # workspace lock change (mtime check). E2E targets depend on it so tests never
 # run against a stale binary — and an unchanged crate is a sub-second no-op.
 VS_SO   := target/release/liblakehouse_engine.so
-VS_SRCS := $(shell find crates/lakehouse-engine/src crates/vs-expression/src -name '*.rs') \
+VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src crates/vs-expression/src -name '*.rs') \
            crates/lakehouse-engine/Cargo.toml \
+           crates/lakehouse-catalog/Cargo.toml \
            crates/vs-expression/Cargo.toml \
+           Cargo.toml \
+           .cargo/config.toml \
            Cargo.lock
 
 # Persistent cargo registry volume — downloads happen once, not on every docker
@@ -74,7 +77,7 @@ export LH_REST_PORT
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 test-e2e: cross-musl-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test -- --test-threads=1
 
 # Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
 # stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:
@@ -167,6 +170,20 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
+# Pure-bash unit tests for deploy/scripts/install.sh. Stubs exapump and curl on
+# a temp PATH — no live Exasol, no network. CI's install-script job runs this;
+# install-script-e2e (docker-based, real Exasol) is separate and lives only in
+# ci.yml, since it needs a live compose stack this target does not bring up.
+test-install:
+	bash deploy/scripts/tests/install.test.sh
+
+# Optional: gated on shellcheck being present locally so it's not a hard
+# prereq for `make`. CI's install-script job runs shellcheck unconditionally.
+lint-install:
+	@command -v shellcheck >/dev/null 2>&1 \
+	  && shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh \
+	  || echo "shellcheck not installed locally — skipping (CI enforces it)"
+
 # Manually-invoked live benchmark: docker (self-contained local stack) or remote
 # (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
 # working-tree .so, then runs bench/run.sh, which reads config from a gitignored
@@ -174,4 +191,4 @@ lint:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench test-install lint-install

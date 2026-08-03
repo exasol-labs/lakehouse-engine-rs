@@ -24,7 +24,7 @@ use lakehouse_engine::adapter::pushdown::{
 };
 use lakehouse_engine::scan::spec::{
     AggKind, CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType,
-    ProjectionItem, ScanSpec, SortKey, StorageProps,
+    ProjectionItem, ScanSpec, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -66,14 +66,14 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some(r#""ID" >= 10"#.into()),
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
@@ -378,14 +378,14 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
                 r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
             ),
             aggregates: Some(aggregates),
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         },
         files: Vec::new(),
@@ -446,6 +446,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         &[],                            // proj cols — unused on the aggregate path
         &[],                            // proj types — unused on the aggregate path
         None,                           // limit
+        None,                           // request_limit
         &[],                            // col_types — a product has no source column
         &["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
         "LAKEHOUSE_SCAN",
@@ -509,6 +510,7 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         &proj,
         &types,
         None,
+        None,
         &[],
         &[],
         "LAKEHOUSE_SCAN",
@@ -569,6 +571,7 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
         &proj,
         &types,
         Some(20),
+        None,
         &[],
         &[],
         "LAKEHOUSE_SCAN",
@@ -600,15 +603,15 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
 }
 
 /// Minimal MinIO-style storage for spec construction (no secrets asserted here).
-fn test_storage() -> StorageProps {
-    StorageProps {
+fn test_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".to_string(),
         region: "us-east-1".to_string(),
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// pushdown-planning-join "Broadcast-eligible inner equi-join is planned as a
@@ -657,6 +660,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         &shards,
         &proj,
         &types,
+        None,
         None,
         &[],
         &[],

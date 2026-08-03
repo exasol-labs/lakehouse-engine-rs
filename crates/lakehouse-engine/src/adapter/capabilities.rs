@@ -1,7 +1,7 @@
 /// Virtual Schema capabilities for the Lakehouse VS adapter.
 ///
-/// Reports projection, filter predicates, LIMIT, ORDER BY (bare column keys), and
-/// single-group aggregate pushdown.
+/// Reports projection, filter predicates, LIMIT, ORDER BY (bare-column and
+/// expression sort keys), and single-group aggregate pushdown.
 use serde_json::{Value as Json, json};
 
 /// The set of capabilities this VS adapter advertises to Exasol.
@@ -41,9 +41,15 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_PRED_REGEXP_LIKE",
     // LIMIT pushdown
     "LIMIT",
-    // ORDER BY pushdown: bare-column sort keys only (add-topn-pushdown).
-    // ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET stay unadvertised — no backing path.
+    // ORDER BY pushdown: bare-column sort keys (add-topn-pushdown) and expression
+    // sort keys (issue #198), backed by the declined row-scan wrapper, the grouped
+    // merge, and the qualified wrapper — see docs/capabilities.md for the full
+    // explanation. LIMIT_WITH_OFFSET is now backed by the same three wrappers
+    // (issue #191); the per-shard bounded top-N never carries an offset — a
+    // non-zero offset always declines that path to the row-scan wrapper instead.
     "ORDER_BY_COLUMN",
+    "ORDER_BY_EXPRESSION",
+    "LIMIT_WITH_OFFSET",
     // Arithmetic binary-operator functions (issue #59, task 1.2)
     "FN_ADD",
     "FN_SUB",
@@ -51,9 +57,11 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_FLOAT_DIV",
     // Unary negation (issue #105): composes inside aggregates (e.g. SUM(-col)).
     "FN_NEG",
-    // Type conversion (issue #104): CAST over its faithful target-type set
-    // (VARCHAR/CHAR/DECIMAL(p,s)/DOUBLE/BOOLEAN/DATE/TIMESTAMP); declines (falls
-    // back) for INTERVAL/GEOMETRY/HASHTYPE/TIMESTAMP WITH LOCAL TIME ZONE.
+    // Type conversion (issue #104): CAST is advertised over its faithful
+    // target-type set (VARCHAR/CHAR/DECIMAL(p,s)/DOUBLE/BOOLEAN/DATE/TIMESTAMP).
+    // A CAST target renderable under neither dialect (INTERVAL/GEOMETRY/HASHTYPE/
+    // TIMESTAMP WITH LOCAL TIME ZONE) fails the query — it can be applied nowhere
+    // (see `pushdown`'s module header).
     "FN_CAST",
     // Math scalar functions
     "FN_ABS",
@@ -106,9 +114,22 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_UNICODE",
     "FN_UNICODECHR",
     "FN_UPPER",
-    // Date/time scalar functions
-    "FN_CURRENT_DATE",
-    "FN_CURRENT_TIMESTAMP",
+    // Date/time scalar functions. FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/
+    // FN_SYSTIMESTAMP (the now-family) are NOT advertised: rendering Exasol's three
+    // distinct now-family semantics (session-zone CURRENT_TIMESTAMP, database-zone
+    // SYSTIMESTAMP, and their TO_DATE forms) needs SESSIONTIMEZONE/DBTIMEZONE, but
+    // neither reaches the scan UDF — the pushdown request carries no zone,
+    // CommonScanSpec carries no temporal field, the scan opens no connect-back
+    // session, and the SDK's UdfContext exposes no clock or zone. The scan can only
+    // read its own container clock in UTC, once per shard (a fresh SessionContext
+    // per invocation), so a pushed clock call would be evaluated G times with no
+    // statement anchor while Exasol's now-family is statement-constant. Measured
+    // live against Exasol 2025.2.1: a pushed SYSTIMESTAMP returned a value ~2 hours
+    // off native (UTC container clock vs EUROPE/BERLIN DBTIMEZONE/SESSIONTIMEZONE),
+    // and GROUP BY SYSTIMESTAMP over a two-file table returned two distinct
+    // timestamps against one statement-constant native value. Withdrawn so Exasol
+    // evaluates its own clock instead — see
+    // vs-adapter/pushdown-planning-capability-extensions.
     "FN_DATE_TRUNC",
     "FN_DAY",
     "FN_EXTRACT",
@@ -116,8 +137,6 @@ pub const CAPABILITIES: &[&str] = &[
     "FN_MINUTE",
     "FN_MONTH",
     "FN_SECOND",
-    "FN_SYSDATE",
-    "FN_SYSTIMESTAMP",
     "FN_TO_DATE",
     "FN_TO_TIMESTAMP",
     "FN_YEAR",
@@ -334,6 +353,11 @@ mod tests {
         // FN_ADD_HOURS/FN_ADD_MINUTES were withdrawn after E2E parity (task 3.1):
         // the microsecond round-trip diverges on a DATE argument (Exasol infers
         // TIMESTAMP(0), the rendering yields TIMESTAMP(3), pushdown rejected).
+        // FN_CURRENT_DATE/FN_CURRENT_TIMESTAMP/FN_SYSDATE/FN_SYSTIMESTAMP (the
+        // now-family) were withdrawn: no time zone, clock, or statement anchor
+        // reaches the scan UDF, so no rendering matches Exasol's statement-constant,
+        // zone-aware now-family — see the CAPABILITIES const above and
+        // vs-adapter/pushdown-planning-capability-extensions.
         for name in &[
             "FN_DIV",
             "FN_TO_CHAR",
@@ -355,6 +379,10 @@ mod tests {
             "FN_DAYOFWEEK",
             "FN_LAST_DAY",
             "FN_CONVERT_TZ",
+            "FN_CURRENT_DATE",
+            "FN_CURRENT_TIMESTAMP",
+            "FN_SYSDATE",
+            "FN_SYSTIMESTAMP",
         ] {
             assert!(
                 !cap_strs.contains(name),
@@ -477,8 +505,6 @@ mod tests {
 
         // --- task 1.3: date/time scalar functions ---
         for name in &[
-            "FN_CURRENT_DATE",
-            "FN_CURRENT_TIMESTAMP",
             "FN_DATE_TRUNC",
             "FN_DAY",
             "FN_EXTRACT",
@@ -486,8 +512,6 @@ mod tests {
             "FN_MINUTE",
             "FN_MONTH",
             "FN_SECOND",
-            "FN_SYSDATE",
-            "FN_SYSTIMESTAMP",
             "FN_TO_DATE",
             "FN_TO_TIMESTAMP",
             "FN_YEAR",
@@ -552,19 +576,19 @@ mod tests {
             !has_listagg,
             "LISTAGG/GROUP_CONCAT must not be advertised: {cap_strs:?}"
         );
-        // ORDER_BY_COLUMN is now advertised (add-topn-pushdown): a bare-column sort
-        // key backs the per-shard bounded top-N + Exasol-side merge. Expression sort
-        // keys and OFFSET remain unadvertised — no backing path exists for either.
+        // ORDER_BY_COLUMN backs the per-shard bounded top-N + Exasol-side merge.
+        // Backing-path detail (incl. ORDER_BY_EXPRESSION, issue #198) is documented
+        // once on the `CAPABILITIES` const above; its advertisement is covered by
+        // `advertises_order_by_column_and_expression`. LIMIT_WITH_OFFSET (issue #191)
+        // is now backed by the same three wrappers — see docs/capabilities.md.
         assert!(
             cap_strs.contains(&"ORDER_BY_COLUMN"),
             "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
         );
-        for name in &["ORDER_BY_EXPRESSION", "LIMIT_WITH_OFFSET"] {
-            assert!(
-                !cap_strs.contains(name),
-                "{name} must NOT be advertised: {cap_strs:?}"
-            );
-        }
+        assert!(
+            cap_strs.contains(&"LIMIT_WITH_OFFSET"),
+            "LIMIT_WITH_OFFSET must be advertised: {cap_strs:?}"
+        );
         // Inner equi-join pushdown is advertised (add-join-pushdown-broadcast);
         // outer joins, non-equi ("all condition") joins, and any Cartesian product
         // remain out of scope and must not be advertised.
@@ -592,7 +616,24 @@ mod tests {
         }
     }
 
-    /// Scenario: Adapter advertises projection, filter, and LIMIT capabilities.
+    /// Scenario: Adapter advertises both bare-column and expression ORDER BY sort
+    /// keys (issue #198) — backing paths documented on the `CAPABILITIES` const above.
+    #[test]
+    fn advertises_order_by_column_and_expression() {
+        let resp = get_capabilities_response();
+        let caps = resp["capabilities"].as_array().unwrap();
+        let cap_strs: Vec<&str> = caps.iter().map(|c| c.as_str().unwrap()).collect();
+
+        assert!(
+            cap_strs.contains(&"ORDER_BY_COLUMN"),
+            "ORDER_BY_COLUMN must be advertised: {cap_strs:?}"
+        );
+        assert!(
+            cap_strs.contains(&"ORDER_BY_EXPRESSION"),
+            "ORDER_BY_EXPRESSION must be advertised: {cap_strs:?}"
+        );
+    }
+
     #[test]
     fn reports_projection_filter_and_limit_capabilities() {
         let resp = get_capabilities_response();

@@ -1,11 +1,11 @@
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageProps};
+use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::credentials::CatalogSession;
-use super::super::file_resolution::resolve_file_list_with_session;
-use super::super::support::{exasol_type_from_json, extract_limit, order_by_present};
+use super::super::file_resolution::resolve_file_list;
+use super::super::support::{column_types, extract_limit, order_by_present};
+use lakehouse_catalog::CatalogSession;
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///
@@ -205,7 +205,7 @@ pub(crate) struct ResolvedJoinSide {
     /// query on the same `resolve_file_list` path as `logical_schema`.
     pub name_mapping: Vec<NameMappingEntry>,
     /// Effective storage for this side (vended STS creds when applicable).
-    pub effective_storage: StorageProps,
+    pub effective_storage: StorageBackend,
     /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
     pub total_bytes: u64,
 }
@@ -221,7 +221,7 @@ impl ResolvedJoinSide {
         files: Vec<FileEntry>,
         logical_schema: Vec<LogicalField>,
         name_mapping: Vec<NameMappingEntry>,
-        effective_storage: StorageProps,
+        effective_storage: StorageBackend,
     ) -> Self {
         let total_bytes = files
             .iter()
@@ -327,7 +327,7 @@ pub(super) async fn resolve_one_join_side(
     table_name: &str,
     iceberg_ident: &str,
     session: &CatalogSession,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
     filter_json: Option<&Json>,
@@ -337,7 +337,7 @@ pub(super) async fn resolve_one_join_side(
         ..catalog.clone()
     };
     let (files, effective_storage, logical_schema, table_root, name_mapping) =
-        resolve_file_list_with_session(session, &side_catalog, storage, creds, filter_json).await?;
+        resolve_file_list(session, &side_catalog, storage, creds, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         iceberg_ident.to_string(),
@@ -349,33 +349,36 @@ pub(super) async fn resolve_one_join_side(
     ))
 }
 
-/// The `(UPPERCASE name, Exasol type)` columns of the named involved table.
+/// The (folded name, Exasol type) columns of the named involved table.
 ///
 /// Locates the `involvedTables[]` entry whose `name` equals `table_name` (the
-/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns
-/// exactly as the single-table projection does — uppercased names, Exasol types
-/// from `dataType`. Returns an empty vec when the table or its columns are absent.
+/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns to
+/// `support::column_types`' folded names plus Exasol types from `dataType`.
+/// Returns an empty vec when the table or its columns are absent.
+///
+/// A partial application of `support::column_types`, supplying the find-by-name
+/// selection.
+///
+/// CROSS-FOLD SEAM: this output travels into `referenced_side_columns`
+/// (`joins/rendering.rs`) as `full_cols`, where it is string-matched against the name
+/// set `collect_side_column_names` builds with the ASCII-only `to_ascii_uppercase`.
+/// The two folds are different BY DESIGN and MUST NOT be reconciled by changing
+/// either one: `column_types` owns this side's fold, and unifying the collect walks'
+/// is forbidden by `walk_column_nodes`' doc comment and by
+/// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
+/// column-collecting walk" scenario. The two sides agree not by construction but by
+/// premise — `resolve_table_schema` Unicode-uppercases every name it declares, so no
+/// LOWERCASE name reaches either side. Non-ASCII letters can still reach both sides
+/// (e.g. `über` uppercases to `ÜBER`, not to an ASCII form); the folds still agree
+/// there because `to_ascii_uppercase` only touches ASCII `a`-`z`, none of which
+/// remain once a name is already Unicode-uppercased. The E2E test
+/// `non_ascii_table_and_column_stay_queryable` guards that premise.
 pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
-    request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .and_then(|tables| {
-            tables
-                .iter()
-                .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
-        })
-        .and_then(|t| t.get("columns"))
-        .and_then(|c| c.as_array())
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| {
-                    let name = c.get("name")?.as_str()?.to_ascii_uppercase();
-                    let dt_json = c.get("dataType")?;
-                    Some((name, exasol_type_from_json(dt_json)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    column_types(request, |tables: &[Json]| {
+        tables
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))
+    })
 }
 
 /// The disjoint-column-name guard for reusing the `vs-expression` translator

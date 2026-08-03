@@ -49,6 +49,8 @@ use common::int96_fixtures::{
 };
 use common::stack::{wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio};
 
+use lakehouse_engine::scan::spec::StorageBackend;
+
 use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
@@ -116,8 +118,9 @@ fn vs_table(vs_name: &str, table: &str) -> String {
 }
 
 /// Read a data file's raw bytes from MinIO through the SAME `object_store` S3
-/// client the scan UDF uses (`build_s3_store` in `scan/mod.rs`), so the
-/// fixture-shape guard inspects the exact bytes the scan path would decode.
+/// client the scan UDF uses (the `StorageBackend::S3` arm of
+/// `register_side_store` in `scan/object_store.rs`), so the fixture-shape
+/// guard inspects the exact bytes the scan path would decode.
 ///
 /// `resolve_file_list` yields an absolute `s3://<bucket>/<key>` (or `s3a://…`)
 /// URI; this splits off the bucket and reads the object by its key.
@@ -130,7 +133,9 @@ async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
         .split_once('/')
         .unwrap_or_else(|| panic!("data file URI must have a <bucket>/<key> form, got: {uri}"));
 
-    let storage = local_stack_storage();
+    let StorageBackend::S3(storage) = local_stack_storage() else {
+        panic!("LocalStack fixture is S3-only")
+    };
     let store = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region(&storage.region)

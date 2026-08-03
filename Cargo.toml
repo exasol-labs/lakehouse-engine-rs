@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/lakehouse-engine", "crates/vs-expression"]
+members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression"]
 # The UDF crate is a cdylib that MUST be compiled inside rust:1.94-bookworm
 # (glibc 2.36) via `make cross-musl-udf-build`. A bare host `cargo build
 # --release` must never emit the .so — it would write a host-glibc binary that
@@ -10,12 +10,24 @@ members = ["crates/lakehouse-engine", "crates/vs-expression"]
 # individual crates must be addressed with `-p`.
 resolver = "2"
 
+# No [profile.*] here — it lives in .cargo/config.toml so CI's cache key tracks
+# it (rationale there; upstream Swatinem/rust-cache#268).
+
 [workspace.package]
 license = "MIT"
 
-[workspace.dependencies]
 # Shared single-version pins. Member crates reference these with
 # `{ workspace = true }`, optionally adding per-crate features.
+#
+# CAUTION: nothing in this file enters CI's cache key (same #268 blind spot as
+# profiles). Version bumps are covered indirectly via Cargo.lock, but a
+# `features`/`default-features` edit that doesn't move the lockfile rotates
+# nothing and poisons the cache permanently. Prefer declaring features on the
+# member crate — member manifests ARE hashed. If you change one here and CI
+# starts recompiling every run, bust the cache by hand: bump the `shared-key`
+# suffix (`workspace-rlib` → `workspace-rlib2`) on ALL FOUR rust-cache steps in
+# ci.yml at once — a partial bump leaves the readers permanently cold (#133).
+[workspace.dependencies]
 
 # Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
 arrow   = { version = "58", default-features = false }
@@ -62,3 +74,17 @@ anyhow     = { version = "1" }
 chrono  = { version = "0.4" }
 futures = { version = "0.3" }
 url     = { version = "2" }
+
+# AWS SigV4 signing for the Glue REST catalog: lakehouse-catalog signs every
+# catalog request it issues on that path.
+# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
+aws-sigv4              = { version = "1.4", default-features = true }
+aws-credential-types   = { version = "1.2" }
+# A direct dependency of aws-sigv4 (for Identity), declared explicitly so the
+# `use aws_smithy_runtime_api::client::identity::Identity` import resolves without
+# relying on a transitive re-export.
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+
+# Async HTTP client for the catalog's self-issued signed `loadTable` GET. The
+# engine's test harness adds `features = ["blocking"]` on top for its own use.
+reqwest = { version = "0.12" }

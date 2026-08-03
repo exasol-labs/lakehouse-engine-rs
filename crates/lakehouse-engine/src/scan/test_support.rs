@@ -4,7 +4,7 @@
 //! functional submodule's `#[cfg(test)] mod tests` reaches these through
 //! `super::test_support` (or `crate::scan::test_support` from a nested module).
 
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
+use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps};
 
 /// The byte size of the local file behind a `file://` URL.
 ///
@@ -23,14 +23,14 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
 pub(super) fn minimal_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "testkey".into(),
                 secret_key: "testsecret".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024)],

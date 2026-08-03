@@ -1,61 +1,43 @@
 # Feature: Pushdown Planning — Capability Extensions
 
-Extends pushdown planning (`vs-adapter/pushdown-planning`) with the newly advertised
-capabilities: scalar select-list expression pushdown, HAVING clause pushdown, and
-decomposable statistical aggregate pushdown via sufficient statistics. Each extends the
-translator or aggregate planner with a shard-associative partial/merge path.
+Extends pushdown planning (`vs-adapter/pushdown-planning`) with the getCapabilities-level
+capability advertisements for scalar and type-conversion functions the adapter has added
+since the base feature: arithmetic operator scalar functions, CAST/unary-negation, and ISO
+week — plus the capabilities that were considered and deliberately kept absent (regexp
+scalar functions, bitwise operator functions). Each advertised capability is gated on a
+`crates/vs-expression` translator arm that renders it faithfully; each absent capability
+records why no faithful translation exists. Ordered-sort-key capability advertisement
+(`ORDER_BY_COLUMN` / `ORDER_BY_EXPRESSION`) lives in its own sibling feature,
+`vs-adapter/pushdown-planning-order-by-capability`. Related capability-driven extensions —
+scalar select-list expression pushdown, HAVING pushdown, statistical aggregates, and literal
+projection — live in their own sibling features too (see the "See also" note at the end of
+the Background).
 
 ## Background
 
-* Filter, select-list, group-key, and HAVING expressions are all rendered by the shared
-  `crates/vs-expression` translator; an untranslatable expression is omitted/falls back
-  rather than producing an incorrect result.
-* An aggregate is pushed down only when it decomposes into a shard-associative
-  partial/merge plan; otherwise the adapter falls back to row scanning.
-* Credentials MUST NOT appear in any returned SQL or error message.
 * A scalar-function capability is advertised only once a `crates/vs-expression` arm renders it and
   the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
   `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, the divergent date
   functions, and the bitwise operator functions do not and stay unadvertised.
+* Credentials MUST NOT appear in any returned SQL or error message.
+* Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
+  spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
+  that could bear on this change are the ones governing what a reader must resolve —
+  schema/field-id resolution ("Schemas and Data Types", "Column Projection") and scan
+  planning ("Scan Planning", manifest/partition filtering). This feature touches none of
+  them: it changes only which scalar/type-conversion capabilities the adapter advertises,
+  reading no manifest and resolving no snapshot, field id, delete, or type mapping. No
+  normative requirement applies, so there is no deviation to fix and none to track.
+* See also: ordered-sort-key capability advertisement (`ORDER_BY_COLUMN` /
+  `ORDER_BY_EXPRESSION`) lives in `vs-adapter/pushdown-planning-order-by-capability`;
+  scalar/boolean select-list expression pushdown and widened-projection routing live in
+  `vs-adapter/pushdown-planning-selectlist-expressions`; HAVING pushdown and statistical
+  aggregates live in `vs-adapter/pushdown-planning-aggregate-extensions`; literal/constant
+  select-list projection lives in `vs-adapter/pushdown-planning-literal-projection`.
+* **A capability is withdrawn when the scan cannot evaluate the function faithfully, not only when the translator cannot render it.** The four now-family names — `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, `SYSTIMESTAMP` — render as valid SQL in both dialects today, yet the node-local scan cannot produce Exasol's value for any of them. Exasol's four names are three distinct semantics over one instant: `CURRENT_TIMESTAMP` interprets it in the session time zone (`TIMESTAMP(3) WITH LOCAL TIME ZONE`), `SYSTIMESTAMP` interprets the same instant in the database time zone (`TIMESTAMP(3)`), and `CURRENT_DATE`/`SYSDATE` are `TO_DATE` of each. Rendering that distinction needs `SESSIONTIMEZONE` and `DBTIMEZONE`. Neither value reaches the scan UDF: the pushdown request carries no zone, `CommonScanSpec` carries no temporal field, the scan script declares only the common blob and the per-file list, the scan opens no connect-back session, and the SDK's `UdfContext` exposes no clock and no zone. The scan therefore reads its own container clock in UTC. It also reads that clock once per shard — the fan-out builds and drops a `SessionContext` per invocation — so a pushed clock call is evaluated G times with no statement anchor, while Exasol's now-family is statement-constant. Withdrawal is the correctness fix: Exasol never delegates a capability the adapter does not advertise, so Exasol evaluates its own clock, once, in its own zones. All three claims were measured against live Exasol 2025.2.1 rather than inferred from the advertised capability set: `EXPLAIN VIRTUAL` over a select-list `SYSTIMESTAMP` pushes `"projection":[{"expr":"now()"}, …]` with `"emit_exa_types":["TIMESTAMP(3)", …]`, and a filter-position `CURRENT_TIMESTAMP` pushes `"filter":"(now() < \"EVENT_TS\")"`, so the node is genuinely delegated; the same select returned `15:02:02.716` through the virtual schema against `17:02:03.141` from Exasol in one session, with `DBTIMEZONE` and `SESSIONTIMEZONE` both `EUROPE/BERLIN` over a UTC container clock; and `GROUP BY SYSTIMESTAMP` over a two-file table returned two distinct timestamps against one statement-constant native value. A pure-constant predicate is not a valid probe, because Exasol constant-folds it before building the pushdown request.
+* **Withdrawing a capability is the safe direction; advertising without a backing path is the unsafe one.** An unadvertised function is never delegated, so Exasol keeps it and evaluates it over the returned rows (`docs/capabilities.md` § Handled by Exasol). Advertising a capability the adapter cannot honour is what produces silent wrong answers — verified live for `ORDER_BY_EXPRESSION` with no backing path (see `vs-adapter/pushdown-planning-order-by-capability`). The now-family withdrawal moves these four names from the delegated side to the Exasol-evaluated side, so it cannot lose or mistranslate a clause.
 
 ## Scenarios
-
-### Scenario: Scalar select-list expression is pushed into the scan-driving query
-
-* *GIVEN* a query whose select list contains a scalar expression over table columns (e.g. `UPPER(name)`, `price * qty`, `EXTRACT(YEAR FROM order_date)`, `CAST(id AS VARCHAR(2000000))`, or `CASE WHEN qty > 0 THEN 1 ELSE 0 END`)
-* *AND* the adapter advertises `SELECTLIST_EXPRESSIONS`
-* *WHEN* Exasol sends the `pushdown` request carrying that select-list expression
-* *THEN* the adapter SHALL render each select-list expression node — recognizing the distinct `function_scalar_cast`, `function_scalar_extract`, and `function_scalar_case` node types Exasol emits for CAST, EXTRACT, and CASE (including CASE-expanded NULLIF/ZEROIFNULL), not only the generic `function_scalar` node — to a DataFusion SQL fragment using the VS expression translator (raising mode), and SHALL carry the rendered fragments in the scan spec so the scan UDF projects exactly those expressions rather than triggering the full-base-row fallback that yields a column count Exasol rejects
-* *AND* the UDF's declared EMITS column list SHALL match the rendered select-list expressions in order and result type, where result types are read from the parallel top-level `selectListDataTypes` array in the pushdown request
-* *AND* a select-list item the adapter cannot translate SHALL cause the adapter to fall back to projecting the underlying columns and let Exasol evaluate the expression, rather than producing an incorrect result
-
-### Scenario: HAVING predicate is pushed into the grouped scan plan
-
-* *GIVEN* a grouped aggregate `pushdown` request carrying a `having` predicate over the grouped aggregates and/or group keys
-* *AND* the adapter advertises `AGGREGATE_HAVING`
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL render the HAVING predicate to a DataFusion SQL fragment using the same VS expression translator path used for WHERE predicates
-* *AND* the adapter SHALL apply the rendered HAVING predicate only in the OUTER wrapper SQL that merges the per-shard partial-aggregate rows, never inside the per-shard partial scan (a per-shard HAVING would discard groups that only meet the threshold after merge)
-* *AND* a HAVING predicate the adapter cannot translate SHALL be omitted from the wrapper SQL and retained by Exasol as a correctness backstop rather than producing an incorrect result
-
-### Scenario: Decomposable statistical aggregate is pushed down via sufficient statistics
-
-* *GIVEN* a query selecting `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, or `VAR_SAMP` over a column, optionally with a GROUP BY clause
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL instruct the scan UDF to emit, per shard (and per group when grouped), the sufficient statistics `COUNT(col)`, `SUM(col)`, and `SUM(col*col)` rather than a per-shard standard deviation or variance
-* *AND* the outer wrapper SQL SHALL merge the per-shard sufficient statistics into the final variance as `(SUM(sum_sq) - SUM(sum)*SUM(sum)/SUM(cnt)) / d`, where `d` is `SUM(cnt)` for the population forms and `SUM(cnt) - 1` for the sample forms, and the final standard deviation as the square root of that variance
-* *AND* the wrapper SHALL yield NULL (never divide by zero or take the square root of a negative rounding artifact) when the merged count is zero, or one for the sample forms
-* *AND* both single-group and grouped aggregate merge expressions SHALL be wrapped in `CAST(<expr> AS <declared_type>)` to match the declared Exasol output column type, satisfying Exasol's strict pushdown output-type validation
-* *AND* the merged result SHALL equal the result of the same statistical aggregate evaluated over all rows on a single node within floating-point tolerance
-
-### Scenario: Adapter falls back for non-decomposable aggregates
-
-* *GIVEN* a `pushdown` request whose select list contains an aggregate the adapter does not advertise as decomposable (e.g. `MEDIAN`, `APPROXIMATE_COUNT_DISTINCT`, `LISTAGG`, `GROUP_CONCAT`, or a `COUNT(DISTINCT ...)` that appears inside a GROUP BY request)
-* *WHEN* Exasol sends the request
-* *THEN* the adapter SHALL fall back to row scanning (emitting a row-scan ScanSpec with no aggregates field)
-* *AND* Exasol SHALL compute the aggregate on the returned rows using its own engine
-* *AND* the adapter MUST NOT emit a partial/merge plan for any aggregate it cannot decompose into a shard-associative partial/merge plan, because doing so would yield an incorrect result
-* *AND* a single-group (no GROUP BY) `COUNT(DISTINCT col)` SHALL NOT fall back here — it is decomposed via `vs-adapter/pushdown-planning-count-distinct` — while a `COUNT(DISTINCT ...)` inside a GROUP BY request SHALL still fall back
 
 ### Scenario: Arithmetic operator scalar-function capabilities are advertised so arithmetic expression trees are pushed down
 
@@ -71,22 +53,6 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *WHEN* the `crates/vs-expression` translator cannot render a particular arithmetic node (e.g. an operator or operand shape it does not handle)
 * *THEN* the adapter SHALL fall back on the affected clause exactly as for any other untranslatable expression — a filter is omitted and retained by Exasol, a select-list expression falls back to projecting underlying columns, and an aggregate over the unrenderable argument falls back to row scanning
 * *AND* the adapter MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-
-### Scenario: ORDER_BY_COLUMN is advertised so ordered top-N queries can be pushed down
-
-* *GIVEN* the adapter's advertised capability set
-* *WHEN* Exasol requests `getCapabilities`
-* *THEN* the response SHALL advertise `ORDER_BY_COLUMN` so Exasol pushes column sort keys (with direction and NULL placement) and the accompanying `LIMIT` into the `pushdown` request, enabling the ordered-top-N partial/merge path in `vs-adapter/pushdown-planning-topn`
-* *AND* `ORDER_BY_EXPRESSION` SHALL remain absent, so Exasol never pushes an expression sort key the adapter has no bounded-sort path for
-* *AND* `LIMIT_WITH_OFFSET` SHALL remain absent, so Exasol never pushes an OFFSET and the ordered-top-N path needs no offset handling
-* *AND* Cartesian-product capabilities SHALL remain absent, and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`, see `vs-adapter/pushdown-planning-join`) SHALL be advertised — advertising `ORDER_BY_COLUMN` MUST NOT introduce any additional join or cross-join capability
-
-### Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
-
-* *GIVEN* the adapter advertises `ORDER_BY_COLUMN` and Exasol pushes an `order_by` in a `pushdown` request that the adapter cannot serve as an ordered top-N (no accompanying `LIMIT`, a sort key that is not a bare projected column, or a request that also carries aggregates / group keys / a `having`)
-* *WHEN* the adapter builds the scan-driving SQL
-* *THEN* the adapter SHALL fall back to the pre-existing scan plan for that shape without pushing a per-shard row limit ahead of the ordering, and MUST NOT emit a scan spec that would compute a different result than single-node evaluation
-* *AND* the adapter SHALL rely on Exasol to apply the `ORDER BY` it retains over the returned rows, exactly as it already retains a `LIMIT` and a `HAVING` it pushed as a correctness backstop
 
 ### Scenario: Conversion and unary-negation capabilities are advertised so CAST and unary-minus expressions push down
 
@@ -121,25 +87,12 @@ translator or aggregate planner with a shard-associative partial/merge path.
 * *AND* Exasol SHALL post-process bitwise operator functions rather than pushing them to the node-local scan, because at pinned DataFusion 54.0.0 no faithful translation exists for any of the eleven over Exasol's bit-function domain (issue #108): Exasol bit functions operate on unsigned 64-bit integers (range `0`–`18446744073709551615`, result `DECIMAL(20,0)`), while DataFusion's `&`/`|`/`#`/`<<`/`>>` act on the operand's signed Arrow integer type — Iceberg sources carry only signed integers (`int` = 32-bit signed, `long` = 64-bit signed; the Iceberg spec defines no unsigned integer primitive), so a bit-63-set result is a large positive value in Exasol but negative under signed `Int64` and the `Int64` → `DECIMAL(20,0)` mapping carries the negative value; `BIT_RSHIFT` diverges unconditionally on any bit-63-set operand because DataFusion's signed `>>` is arithmetic (sign-extending) whereas Exasol's is logical (zero-fill); and DataFusion 54.0.0 provides no operator or scalar function at all for `BIT_NOT` (its SQL planner rejects unary `~`), `BIT_LROTATE`, `BIT_RROTATE`, `BIT_CHECK`, `BIT_SET`, or `BIT_TO_NUM`
 * *AND* `FN_BIT_LENGTH` SHALL be treated as out of scope for this decision — it is an Exasol string function (bit count of a string), not a bitwise operator — and only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`) SHALL be advertised, so this decision introduces no additional join, cross-join, or string-function capability change
 
-### Scenario: Projected literal select-list item is pushed into the scan-driving query
+### Scenario: Now-family date/time capabilities are withdrawn so Exasol evaluates its own clock
 
-* *GIVEN* a row-scan or inner-join `pushdown` request that carries NO aggregate and NO GROUP BY, whose select list contains one or more bare literal/constant items — any of `literal_null`, `literal_bool`, `literal_exactnumeric`, `literal_double`, `literal_string`, `literal_date`, `literal_timestamp` (e.g. `SELECT 1 FROM t`, `SELECT 1, name, 1 FROM t`, the constant-folded `SELECT 2+3` Exasol sends as a single `literal_exactnumeric`, OR the single-element `[{"type":"literal_null"}]` select list Exasol synthesizes for its documented Virtual-Schema-API "selectList is an empty array: select any one column or expression" contract when a LIMIT barrier sits between an outer aggregate and the derived table it wraps — for example the inner derived-table request behind `SELECT COUNT(*) FROM (SELECT c_custkey FROM t LIMIT 5)`, which arrives on the wire as `"selectList":[{"type":"literal_null"}]` with `"selectListDataTypes":[{"type":"BOOLEAN"}]`, a one-element array carrying a `literal_null` item, NOT a JSON `null` and NOT an empty `[]` array — issue #205)
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL render each literal select-list item through the `crates/vs-expression` translator into a POSITIONAL `Expr` projection item — one projection item per select-list item, typed from the parallel top-level `selectListDataTypes` array — exactly as the `function_scalar` select-list branch already does, and MUST NOT trigger the full-base-row fallback that emits every base column and yields the column-count mismatch Exasol rejects ("Expected number of columns is 1 but pushdown query has N", issues #190 and #205)
-* *AND* the emitted scan's column arity SHALL equal the query's select-list arity, so two structurally identical literal items — such as the two `1` items in `SELECT 1, name, 1` — SHALL each occupy their own projected position and MUST NOT be collapsed into one
-* *AND* each projected literal SHALL be evaluated once per scanned source row, so `SELECT <literal> FROM t` returns one constant-valued row per source table row, and the synthesized `literal_null` item behind a LIMIT barrier SHALL emit one single-column row per admitted row so the outer `COUNT(*)` counts exactly the rows the inner LIMIT admits (issue #205)
-* *AND* a literal the translator cannot render, or one whose declared EMITS type is not a valid Exasol UDF EMITS output type (see the decline scenario below), SHALL fall back to projecting the underlying columns and let Exasol evaluate the select list, the same correctness backstop the scalar select-list path uses
-
-### Scenario: Projected constant whose declared EMITS type Exasol rejects declines to the full base row
-
-* *GIVEN* a row-scan `pushdown` request whose select list contains a rendered literal or scalar item whose declared result type in `selectListDataTypes` is `TIMESTAMP WITH LOCAL TIME ZONE` (e.g. a `literal_timestamp_utc` constant, which the translator renders successfully but whose declared type Exasol rejects as a UDF EMITS output type, sqlCode 22002)
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL push a rendered select-list item as a positional `Expr` ONLY when its declared EMITS type is a valid Exasol UDF EMITS output type, so an item declared `TIMESTAMP WITH LOCAL TIME ZONE` SHALL decline to the full-base-row fallback — the same path an untranslatable CAST takes — rather than emit an EMITS clause that fails at scan time
-* *AND* projected `TIMESTAMP WITH LOCAL TIME ZONE` constants SHALL remain unsupported — they hit the full-base-row fallback and Exasol post-processes the select list — an accurately-scoped tracked exception, `(#218)`
-
-### Scenario: Projected literal with an ORDER BY on an unprojected column declines to the full base row
-
-* *GIVEN* a row-scan `pushdown` request whose select list projects only literal/constant items and whose `orderBy` sorts on a source column absent from that projection (e.g. `SELECT 1 FROM t ORDER BY name LIMIT 5`), which the adapter cannot serve as a bounded top-N
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL project the full base row for this shape so the declined-ORDER-BY wrapper's outer `ORDER BY` resolves against emitted columns, and MUST NOT emit a narrowed literal-only projection whose declined-ORDER-BY wrapper references a column the scan no longer emits
-* *AND* this SHALL preserve the pre-fix behavior for this unsupported shape (a well-formed declined-ORDER-BY wrapper) rather than introduce a distinct scan-time failure mode
+* *GIVEN* the adapter's advertised capability set
+* *WHEN* Exasol requests `getCapabilities`
+* *THEN* the response SHALL NOT advertise `FN_CURRENT_DATE`, `FN_CURRENT_TIMESTAMP`, `FN_SYSDATE`, or `FN_SYSTIMESTAMP`
+* *AND* Exasol SHALL evaluate the now-family natively rather than pushing it to the node-local scan, because no time zone, clock, or statement anchor reaches the scan UDF, so the scan can only read its own container clock in UTC, independently per shard — see the Background and `sql-comprehension/vs-expression-translator-date-fns`
+* *AND* the four names SHALL be declined by the expression translator in BOTH dialects with the `unsupported scalar function: <name>` error, keeping the capability set and the translator coherent the same way the regexp, bitwise, and `ADD_*` date-arithmetic withdrawals do
+* *AND* the withdrawal SHALL NOT alter any other advertised capability — `FN_DATE_TRUNC`, `FN_EXTRACT`, the field shortcuts (`FN_DAY`, `FN_HOUR`, `FN_MINUTE`, `FN_MONTH`, `FN_SECOND`, `FN_YEAR`, `FN_WEEK`), `FN_TO_DATE`, `FN_TO_TIMESTAMP`, and the `*_BETWEEN` family SHALL all remain advertised because each takes its datetime from its own arguments rather than from a clock — and Cartesian-product capabilities SHALL remain absent with only the inner equi-join capabilities (`JOIN`/`JOIN_TYPE_INNER`/`JOIN_CONDITION_EQUI`) advertised, so this withdrawal introduces no join or cross-join capability change
+* *AND* `docs/capabilities.md` SHALL NOT list the four withdrawn capabilities in its pushed-down scalar-function table, so the operator-facing documentation cannot claim a pushdown the adapter no longer advertises

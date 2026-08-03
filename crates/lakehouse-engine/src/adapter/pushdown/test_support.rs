@@ -5,51 +5,17 @@
 //! these through `super::test_support`.
 
 use super::*;
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef};
+use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, StorageProps};
 
-pub(super) fn sample_storage() -> StorageProps {
-    StorageProps {
+pub(super) fn sample_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".into(),
         region: "us-east-1".into(),
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         allow_http: true,
         ..Default::default()
-    }
-}
-
-/// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
-/// Individual tests set only the auth fields under test.
-pub(super) fn base_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "warehouse".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-    }
-}
-
-/// Static storage with the sentinel keys `STATIC_AK_SENTINEL` / `STATIC_SK_SENTINEL`
-/// (matching the credentials-cluster test sentinels in `credentials::tests`).
-pub(super) fn static_storage() -> StorageProps {
-    StorageProps {
-        endpoint: "https://s3.amazonaws.com".into(),
-        region: "us-east-1".into(),
-        access_key: "STATIC_AK_SENTINEL".into(),
-        secret_key: "STATIC_SK_SENTINEL".into(),
-        path_style: false,
-        ..Default::default()
-    }
+    })
 }
 
 /// Assemble the scan-driving SQL from a known file list + spec — the same
@@ -105,6 +71,7 @@ pub(super) fn build_sql_for_fixture_n(
         &proj_items,
         &proj_types,
         limit,
+        None,
         &col_types,
         &[],
         SCAN_UDF_NAME,
@@ -121,6 +88,49 @@ pub(super) fn common_arg_literal(sql: &str) -> &str {
     let rest = &sql[start..];
     let end = rest.find('\'').expect("common literal must be closed");
     &rest[..end]
+}
+
+/// The contents of the scan UDF's `EMITS (...)` clause — the scan's EMITTED column
+/// set, which on a declined-`ORDER BY` path is WIDER than the query's visible column
+/// set (it also carries the appended hidden sort-key columns).
+///
+/// Extracted paren-balanced: the declared types carry their own parentheses
+/// (`DECIMAL(20,0)`), so the clause does not end at the first `)`. Exactly one
+/// `EMITS (` appears in a fan-out — the distributor call carries none (its LUA SET
+/// script declares a static EMITS).
+pub(super) fn emits_clause(sql: &str) -> &str {
+    let open = sql.find("EMITS (").expect("SQL must carry an EMITS clause") + "EMITS ".len();
+    let mut depth = 0usize;
+    for (offset, ch) in sql[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &sql[open + 1..open + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("EMITS clause must be closed: {sql}");
+}
+
+/// The declined-`ORDER BY` wrapper's VISIBLE select list: everything between the
+/// leading `SELECT ` and the first ` FROM (`. A visible select list never contains
+/// ` FROM (` itself, so the first occurrence is always the wrapper's own — even for a
+/// multi-shard fan-out, which nests a second ` FROM (` inside.
+///
+/// Panics when the SQL carries no wrapper; use a `!sql.contains(" FROM (")`
+/// assertion for the no-wrapper cases instead.
+pub(super) fn outer_select_list(sql: &str) -> &str {
+    let list = sql
+        .strip_prefix("SELECT ")
+        .expect("SQL must start with SELECT");
+    let end = list
+        .find(" FROM (")
+        .expect("SQL must carry a wrapping outer SELECT … FROM (");
+    &list[..end]
 }
 
 /// A single-table request with the NQ4 shape: two projected columns and an
@@ -201,6 +211,7 @@ pub(super) fn build_row_sql_with_root(
         &shards,
         &proj_items,
         &proj_types,
+        None,
         None,
         &col_types,
         &[],
