@@ -96,7 +96,12 @@ mod dispatch_golden;
 /// `add-join-pushdown-broadcast`.
 ///
 /// `creds` — the resolved CONNECTION credentials, used to determine whether
-/// to sign catalog requests and whether to apply vended S3 credentials.
+/// to sign catalog requests and whether to apply vended storage credentials.
+///
+/// `allow_http` — the resolved `ALLOW_HTTP` virtual-schema property (read once in
+/// `resolve_connection_config`). Under vending it is the operator's consent gate for
+/// plaintext transport, so a catalog cannot move vended credentials onto plain
+/// `http://` or `abfs://` on its own authority.
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///
@@ -123,6 +128,7 @@ pub async fn handle_pushdown(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
     creds: &ConnectionCreds,
+    allow_http: bool,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
         .get("pushdownRequest")
@@ -160,6 +166,7 @@ pub async fn handle_pushdown(
                 storage,
                 catalog,
                 creds,
+                allow_http,
                 scan_schema,
                 cluster_nodes,
                 parallelism_factor,
@@ -213,8 +220,15 @@ pub async fn handle_pushdown(
     // Iceberg-level file pruning; ScanSpec.filter (DataFusion SQL string) is set
     // separately above and left completely unchanged.
     let session = CatalogSession::resolve(catalog_uri, &catalog.warehouse, creds).await?;
-    let (files, effective_storage, logical_schema, table_root, name_mapping) =
-        resolve_file_list(&session, catalog, storage, creds, filter_json_raw).await?;
+    let (files, effective_storage, logical_schema, table_root, name_mapping) = resolve_file_list(
+        &session,
+        catalog,
+        storage,
+        creds,
+        allow_http,
+        filter_json_raw,
+    )
+    .await?;
     let storage = &effective_storage;
 
     if files.is_empty() {
@@ -2798,6 +2812,7 @@ mod tests {
             4,
             1024,
             &creds,
+            false,
         )
         .await;
 

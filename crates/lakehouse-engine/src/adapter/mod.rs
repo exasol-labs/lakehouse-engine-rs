@@ -149,7 +149,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // the schema that qualifies the scan/distributor/merge UDF names in the
             // generated pushdown SQL.
             let props = get_properties(request);
-            let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
+            let (catalog_uri, storage, creds, allow_http) = resolve_connection_config(ctx, &props)?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
 
@@ -163,6 +163,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
                     &catalog_uri,
                     &storage,
                     &creds,
+                    allow_http,
                     &script_schema,
                     cluster_nodes,
                 )
@@ -182,16 +183,22 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 /// is synchronous and must be called before entering any async runtime.
 /// Table identity is no longer fixed at config-resolution time; callers build
 /// `CatalogProps` with the specific per-table identifier when known.
+///
+/// The returned `bool` is the resolved `ALLOW_HTTP` virtual-schema property. It is
+/// returned rather than only consumed here because BOTH storage selectors need it:
+/// `storage_block` bakes it into the static S3 payload, and the vended selector
+/// takes it as its plaintext-transport consent gate. Reading the property in this
+/// one place is what keeps those two from disagreeing.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageBackend, ConnectionCreds), UdfError> {
+) -> Result<(String, StorageBackend, ConnectionCreds, bool), UdfError> {
     let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION))?;
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let storage = storage_block(&resolved.creds, allow_http);
-    Ok((resolved.uri, storage, resolved.creds))
+    Ok((resolved.uri, storage, resolved.creds, allow_http))
 }
 
 fn handle_create_virtual_schema(
@@ -206,7 +213,10 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
-    let (catalog_uri, storage, creds) = resolve_connection_config(ctx, &props)?;
+    // `ALLOW_HTTP` is discarded here: schema enumeration resolves no data-file
+    // storage, so it reaches no vended selector. `storage_block` has already baked
+    // it into `storage` for the manifest-read path.
+    let (catalog_uri, storage, creds, _) = resolve_connection_config(ctx, &props)?;
 
     let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
         .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
@@ -365,6 +375,7 @@ async fn handle_pushdown_request(
     catalog_uri: &str,
     storage: &StorageBackend,
     creds: &ConnectionCreds,
+    allow_http: bool,
     script_schema: &str,
     cluster_nodes: usize,
 ) -> Result<Json, UdfError> {
@@ -425,6 +436,7 @@ async fn handle_pushdown_request(
         s3_max_connections,
         join_broadcast_max_bytes,
         creds,
+        allow_http,
     )
     .await
     .map_err(|e| redact_error(storage, e))

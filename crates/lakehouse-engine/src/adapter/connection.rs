@@ -763,6 +763,97 @@ mod tests {
         }
     }
 
+    /// A single well-formed credential set (S3 XOR Azure) is ACCEPTED together
+    /// with `use_vended_credentials = true` — not rejected. This is existing,
+    /// already-shipped behavior: `validate_creds` never reads
+    /// `use_vended_credentials` at all, because a CONNECTION legitimately
+    /// carries static storage fields under vending for an unrelated reason —
+    /// SigV4 signing of the catalog request needs `access_key`/`secret_key`
+    /// regardless of whether storage credentials end up vended or static.
+    /// Static fields under vending go unused (the vended credential source
+    /// wins at scan time), never rejected. This test is a regression guard
+    /// for that acceptance, not a behavior change.
+    ///
+    /// It also pins the mixed-fields guard and the SigV4 field requirement
+    /// WITH `use_vended_credentials: true` set, not merely alongside it: both
+    /// guards live in `validate_creds`, which this change had to leave alone,
+    /// so a regression that skipped validation whenever vending is requested
+    /// would otherwise pass every other test in this module unnoticed.
+    #[test]
+    fn static_storage_fields_with_vending_are_accepted_and_unused() {
+        let s3_password = serde_json::json!({
+            "warehouse": "wh",
+            "region": "us-east-1",
+            "secret_key": S3_SECRET,
+            "use_vended_credentials": true,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &s3_password);
+        let resolved = read_connection(&ctx, Some("MY_CONN"))
+            .expect("a single S3 credential set together with vending must be accepted");
+        assert!(resolved.creds.use_vended_credentials);
+        assert_eq!(resolved.creds.secret_key, S3_SECRET);
+
+        let azure_password = serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "account_key": AZURE_ACCOUNT_KEY,
+            "use_vended_credentials": true,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &azure_password);
+        let resolved = read_connection(&ctx, Some("MY_CONN"))
+            .expect("a single Azure credential set together with vending must be accepted");
+        assert!(resolved.creds.use_vended_credentials);
+        assert_eq!(
+            resolved.creds.account_key.as_deref(),
+            Some(AZURE_ACCOUNT_KEY)
+        );
+
+        // The mixed-fields guard still rejects Azure + S3 fields together, even
+        // with vending requested.
+        let mixed_password = serde_json::json!({
+            "warehouse": "wh",
+            "account_name": "myaccount",
+            "account_key": AZURE_ACCOUNT_KEY,
+            "region": "us-east-1",
+            "secret_key": S3_SECRET,
+            "use_vended_credentials": true,
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &mixed_password);
+        let err = read_connection(&ctx, Some("MY_CONN"))
+            .expect_err("mixed Azure and S3 credential fields must still be rejected under vending")
+            .to_string();
+        assert!(
+            err.contains("Azure and S3 storage credentials cannot both be supplied"),
+            "{err}"
+        );
+        assert!(!err.contains(AZURE_ACCOUNT_KEY), "{err}");
+        assert!(!err.contains(S3_SECRET), "{err}");
+
+        // The SigV4 field requirement still fires for a missing access_key, even
+        // with vending requested.
+        let sigv4_password = serde_json::json!({
+            "warehouse": "wh",
+            "use_sigv4": true,
+            "use_vended_credentials": true,
+            "secret_key": S3_SECRET,
+            "region": "us-east-1",
+        })
+        .to_string();
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &sigv4_password);
+        let err = read_connection(&ctx, Some("MY_CONN"))
+            .expect_err("a missing access_key under SigV4 must still be rejected under vending")
+            .to_string();
+        assert!(err.contains("access_key"), "must name missing field: {err}");
+        assert!(
+            err.to_lowercase().contains("sigv4"),
+            "must reference SigV4: {err}"
+        );
+        assert!(!err.contains(S3_SECRET), "{err}");
+    }
+
     /// `storage_block` is total. A credential set that never passed
     /// `validate_creds` — two Azure credentials at once, or a credential with no
     /// account name — resolves deterministically to S3 instead of panicking,

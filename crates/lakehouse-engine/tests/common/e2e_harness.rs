@@ -373,7 +373,9 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         .await
         .unwrap_or_else(|e| panic!("CatalogSession::resolve({table}) must succeed: {e}"));
 
-    let (files, ..) = resolve_file_list(&session, &catalog_props, &storage, &creds, None)
+    // `allow_http = true` mirrors the `ALLOW_HTTP = 'true'` every VS this harness
+    // creates carries: the local stack's MinIO is reached over plain HTTP.
+    let (files, ..) = resolve_file_list(&session, &catalog_props, &storage, &creds, true, None)
         .await
         .unwrap_or_else(|e| panic!("resolve_file_list({table}) must succeed: {e}"));
     files

@@ -1,33 +1,71 @@
-//! Iceberg REST vended-storage resolution: read the S3 keys, region, endpoint,
-//! and path-style a `loadTable` response vends for one table location, and
-//! overlay them onto the statically configured storage.
+//! Iceberg REST vended-storage resolution: derive a table's effective scan
+//! storage from what its `loadTable` response vends for that table's own
+//! location, with no CONNECTION-supplied storage value involved.
 //!
 //! [`resolve_vended_storage`] is the whole public surface. Everything below it is
 //! a private step: the caller states the intent (resolve the effective storage
 //! for this response) and never handles the recipe — which of two credential
-//! sources applies, which six config keys carry the vended values, or how each
-//! spells absence.
+//! sources applies, which backend the location's URI scheme selects, which
+//! config keys carry that backend's vended values, or how each spells absence.
 
-use crate::{StorageBackend, StorageProps};
+use crate::{AdlsCred, StorageBackend, StorageProps};
+use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
-/// Resolve the effective scan storage for a table from its `loadTable` response.
+/// The vended ADLS SAS keys are host-suffixed — `adls.sas-token.<host>` — which
+/// is the iceberg Java `AzureProperties` convention a catalog emits, not a key
+/// the Iceberg REST spec enumerates. The reader downstream understands only the
+/// flat `adls.sas-token` spelling, so the suffix is recovered here and never
+/// travels any further.
+const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
+
+/// Resolve the effective scan storage for a table from its `loadTable` response,
+/// the URI scheme of that table's own location, and the operator's resolved
+/// `ALLOW_HTTP` consent.
 ///
-/// For an `S3` backend, selects the vended credential source ONCE for `anchor`
-/// and overlays every value it advertises onto `base`'s wrapped `StorageProps`,
-/// returning a fresh [`StorageBackend::S3`]. A value the response does not
-/// advertise keeps `base`'s, so a response carrying no vended credentials at
-/// all resolves to `base` unchanged.
+/// This is the VENDED half of a selector pair. It reads the catalog's response
+/// and nothing else; `storage_block` reads the CONNECTION and nothing else; one
+/// `use_vended_credentials` branch at the call site picks between them, so the
+/// two selectors run on disjoint inputs and neither can override the other.
+/// Taking no [`StorageBackend`] and no `ConnectionCreds` is the design rather
+/// than an omission: it makes "no CONNECTION storage FIELD is read under
+/// vending" a property of this signature instead of a rule an auditor has to
+/// re-verify by reading the body. That guarantee covers storage fields only —
+/// `anchor` itself is caller-supplied and is not guaranteed CONNECTION-free:
+/// when a table's metadata carries no location, the caller
+/// (`resolve_file_list`) substitutes the CONNECTION's `warehouse`, and on that
+/// fallback path a CONNECTION-derived string chooses the backend variant, the
+/// credential-source prefix match, and (for ADLS) the SAS host. `allow_http`
+/// does not reopen the storage-field door either — it carries one
+/// virtual-schema property resolved outside this crate, names no credential,
+/// and cannot supply one.
 ///
-/// `anchor` must be the table's own S3 location — that is what
-/// `storage_credentials[*].prefix` matches against. An HTTPS catalog URI can
-/// never prefix-match an S3 prefix and would silently select the flat `config`
-/// map instead.
+/// The backend variant comes from `anchor`'s scheme ALONE, matched
+/// case-insensitively per RFC 3986 §3.1: `s3://`/`S3://` and `s3a://`/`S3A://`
+/// resolve S3, `abfss://` and `abfs://` (in any casing) resolve ADLS, and every
+/// other scheme — including a location carrying no scheme at all — is a
+/// `UdfError::User`, because a default backend would be a guess about where the
+/// operator's data lives. The mapping is a total function over the scheme
+/// string rather than a match on [`StorageBackend`], so a third variant added
+/// to that enum still compiles here; `catalog_public_surface.rs`'s
+/// source-level variant probe is the compensating gate.
 ///
-/// For an `Adls` backend, `base` passes through unchanged: vended Azure SAS
-/// credentials are a tracked exception (#276), so the effective backend is
-/// already selected once at `parse_creds`/`storage_block` time and this
-/// function does no Azure-specific extraction.
+/// Whatever the response does not advertise is ABSENT: there is no static value
+/// underneath to preserve it from, so a credential or a store address the
+/// catalog does not vend is reported rather than substituted. Plaintext
+/// transport needs the operator's consent, but the two schemes below are gated
+/// for different reasons: a vended plain-`http://` endpoint really is
+/// plaintext on the wire, while an `abfs://` location is not — this engine has
+/// no plaintext Azure path and would silently read it over HTTPS instead — but
+/// naming a plaintext scheme the engine will not actually honour as plaintext
+/// is itself misleading, so honouring the location still requires the
+/// operator's explicit `ALLOW_HTTP` acknowledgement rather than a silent scheme
+/// upgrade.
+///
+/// `anchor` must be the table's own location. It is both what
+/// `storage_credentials[*].prefix` matches against and what the variant is read
+/// from, so a catalog URI passed here is rejected as an unsupported scheme
+/// rather than silently selecting the flat `config` map.
 ///
 /// Whether vending applies at all is the caller's decision, not this function's:
 /// `use_vended_credentials` gates the call rather than being a parameter,
@@ -35,15 +73,28 @@ use std::collections::HashMap;
 /// its input is a decision the function declined to make.
 pub fn resolve_vended_storage(
     result: &iceberg_catalog_rest::LoadTableResult,
-    base: &StorageBackend,
     anchor: &str,
-) -> StorageBackend {
-    match base {
-        StorageBackend::S3(props) => {
-            let vended = select_credential_source(result, anchor);
-            StorageBackend::S3(merge_vended_into_storage(props, vended))
-        }
-        StorageBackend::Adls { .. } => base.clone(),
+    allow_http: bool,
+) -> Result<StorageBackend, UdfError> {
+    let scheme = anchor
+        .split_once("://")
+        .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase());
+    let vended = select_credential_source(result, anchor);
+    match scheme.as_str() {
+        "s3" | "s3a" => s3_backend_from_vended(vended, anchor, allow_http),
+        "abfss" => adls_backend_from_vended(vended, anchor),
+        "abfs" if allow_http => adls_backend_from_vended(vended, anchor),
+        "abfs" => Err(UdfError::User(format!(
+            "vended credentials were requested for the plaintext table location {anchor}, but the \
+             ALLOW_HTTP virtual-schema property is false: abfs:// names plaintext transport, and \
+             this engine has no plaintext Azure path — it would silently read the location over \
+             HTTPS instead, so honouring it requires the operator's explicit ALLOW_HTTP \
+             acknowledgement rather than a silent scheme upgrade"
+        ))),
+        _ => Err(UdfError::User(format!(
+            "vended credentials were requested, but the table location {anchor} names no storage \
+             backend this engine can read: expected an s3://, s3a://, abfss://, or abfs:// scheme"
+        ))),
     }
 }
 
@@ -71,25 +122,141 @@ fn select_credential_source<'a>(
         .map_or(&result.config, |entry| &entry.config)
 }
 
-fn merge_vended_into_storage(
-    base: &StorageProps,
+/// The S3 backend the vended credential source describes, constructed from that
+/// source ALONE. The key pair is required, and so is at least one of
+/// `client.region` and `s3.endpoint`, because with no static payload underneath
+/// those two are the only values left that can place the store. Everything else
+/// is absent when the source omits it — there is nothing to preserve it from.
+///
+/// `path_style` is the one value that is not resolved in isolation, because it is
+/// not an independent field to its consumer: `register_side_store` treats it as
+/// the gate on whether `endpoint` reaches `AmazonS3Builder` at all. A vended
+/// endpoint resolved beside `path_style: false` is therefore an address the scan
+/// cannot use — it would silently drop the endpoint and read a virtual-hosted AWS
+/// host derived from the region instead, which is the wrong store rather than a
+/// plan-time error. So a response that omits `s3.path-style-access`, or spells it
+/// unparseably, resolves it from whether an endpoint was vended; a value the
+/// response does state still wins, since a catalog naming virtual-hosted
+/// addressing outright is describing its own store.
+fn s3_backend_from_vended(
     vended: &HashMap<String, String>,
-) -> StorageProps {
-    StorageProps {
-        endpoint: vended_config_value(vended, "s3.endpoint")
-            .unwrap_or_else(|| base.endpoint.clone()),
-        region: vended_config_value(vended, "client.region").unwrap_or_else(|| base.region.clone()),
-        access_key: vended_config_value(vended, "s3.access-key-id")
-            .unwrap_or_else(|| base.access_key.clone()),
-        secret_key: vended_config_value(vended, "s3.secret-access-key")
-            .unwrap_or_else(|| base.secret_key.clone()),
-        session_token: vended_config_value(vended, "s3.session-token")
-            .or_else(|| base.session_token.clone()),
-        allow_http: base.allow_http,
-        path_style: vended_config_value(vended, "s3.path-style-access")
-            .and_then(|s| s.parse::<bool>().ok())
-            .unwrap_or(base.path_style),
+    anchor: &str,
+    allow_http: bool,
+) -> Result<StorageBackend, UdfError> {
+    let access_key = required_vended_value(vended, "s3.access-key-id", anchor)?;
+    let secret_key = required_vended_value(vended, "s3.secret-access-key", anchor)?;
+    let region = vended_config_value(vended, "client.region");
+    let endpoint = vended_config_value(vended, "s3.endpoint");
+
+    if region.is_none() && endpoint.is_none() {
+        return Err(UdfError::User(format!(
+            "vended credentials for table location {anchor} leave the store address undetermined: \
+             the selected credential source carries neither a non-empty client.region nor a \
+             non-empty s3.endpoint, and under vending no CONNECTION value can supply one"
+        )));
     }
+    if !allow_http
+        && let Some(endpoint) = endpoint.as_deref()
+        && endpoint
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+    {
+        return Err(UdfError::User(format!(
+            "the catalog vended the plaintext endpoint {endpoint} for table location {anchor}, but \
+             the ALLOW_HTTP virtual-schema property is false: a catalog cannot move vended \
+             credentials onto plaintext transport without the operator's consent"
+        )));
+    }
+
+    let path_style = vended_config_value(vended, "s3.path-style-access")
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(endpoint.is_some());
+
+    Ok(StorageBackend::S3(StorageProps {
+        endpoint: endpoint.unwrap_or_default(),
+        region: region.unwrap_or_default(),
+        access_key,
+        secret_key,
+        session_token: vended_config_value(vended, "s3.session-token"),
+        allow_http,
+        path_style,
+    }))
+}
+
+/// A vended value the resolved backend cannot be built without, reported when
+/// the selected source omits it or spells it empty. Reported rather than
+/// substituted: a static value read here would be a credential the operator
+/// believed was unused, and the whole point of vending is that the catalog
+/// supplies it.
+fn required_vended_value(
+    vended: &HashMap<String, String>,
+    key: &str,
+    anchor: &str,
+) -> Result<String, UdfError> {
+    vended_config_value(vended, key).ok_or_else(|| {
+        UdfError::User(format!(
+            "vended credentials were requested for table location {anchor}, but the catalog \
+             returned none: the selected credential source carries no non-empty {key} value"
+        ))
+    })
+}
+
+/// The ADLS backend the vended credential source describes, selected by the
+/// anchor's OWN storage host. Reading the account name and the SAS from that one
+/// host is what keeps the pair internally consistent: `adls.account-name` is the
+/// downstream wrong-account guard, so an account name that disagreed with the
+/// account the SAS was minted for would disarm it or fail the manifest read.
+///
+/// The vended key spelling is host-suffixed while the iceberg ADLS reader
+/// accepts only the flat `adls.sas-token`, so recovering the host here and
+/// assembling the flat SAS state is what keeps every consumer downstream unaware
+/// that a second spelling exists.
+fn adls_backend_from_vended(
+    vended: &HashMap<String, String>,
+    anchor: &str,
+) -> Result<StorageBackend, UdfError> {
+    let host = anchor_host(anchor);
+    let account_name = host
+        .split('.')
+        .next()
+        .filter(|label| !label.is_empty())
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "vended credentials were requested for table location {anchor}, but its storage \
+                 host '{host}' carries no leading label to read an ADLS account name from: \
+                 expected the <account> of <account>.dfs.core.windows.net"
+            ))
+        })?;
+    let sas = vended
+        .keys()
+        .find(|key| key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX) == Some(host))
+        .and_then(|key| vended_config_value(vended, key))
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "vended credentials were requested for storage host {host} (table location \
+                 {anchor}), but the catalog returned none: the selected credential source carries \
+                 no non-empty {VENDED_SAS_TOKEN_KEY_PREFIX}{host} key"
+            ))
+        })?;
+
+    Ok(StorageBackend::Adls {
+        account_name: account_name.to_string(),
+        cred: AdlsCred::Sas(sas),
+    })
+}
+
+/// The storage host of a table location: its authority segment, read after any
+/// `<container>@` userinfo. For an ADLS location that is the
+/// `<account>.dfs.core.windows.net` the vended SAS keys are suffixed with, which
+/// is why one reading serves both the SAS selection and the account name.
+fn anchor_host(anchor: &str) -> &str {
+    let after_scheme = anchor.split_once("://").map_or(anchor, |(_, rest)| rest);
+    let authority = after_scheme
+        .split_once('/')
+        .map_or(after_scheme, |(authority, _)| authority);
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 fn vended_config_value(vended: &HashMap<String, String>, key: &str) -> Option<String> {
@@ -99,13 +266,35 @@ fn vended_config_value(vended: &HashMap<String, String>, key: &str) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::AdlsCred;
     use crate::test_support::*;
 
     const VENDED_AK: &str = "VENDED_AK_SENTINEL";
     const VENDED_SK: &str = "VENDED_SK_SENTINEL";
     const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
     const VENDED_REGION: &str = "eu-west-2";
+    const VENDED_SAS: &str = "VENDED_SAS_SENTINEL";
+    /// A SAS minted for an account the anchor does not name — the wrong-account
+    /// value every host-selection assertion is measured against.
+    const OTHER_HOST_SAS: &str = "OTHER_HOST_SAS_SENTINEL";
+    /// An `adls.account-key` beside the vended SAS. The vended selector has no
+    /// reader for it, so no resolved backend may ever carry it.
+    const VENDED_ACCOUNT_KEY: &str = "VENDED_ACCOUNT_KEY_SENTINEL";
+    const ADLS_ACCOUNT: &str = "myaccount";
+    const ADLS_HOST: &str = "myaccount.dfs.core.windows.net";
+    const OTHER_ADLS_HOST: &str = "otheraccount.dfs.core.windows.net";
+
+    /// Every credential value this module's fixtures carry. A refusal may name
+    /// none of them, whichever fixture drew it.
+    const CREDENTIAL_SENTINELS: &[&str] = &[
+        VENDED_AK,
+        VENDED_SK,
+        VENDED_TOK,
+        VENDED_SAS,
+        OTHER_HOST_SAS,
+        VENDED_ACCOUNT_KEY,
+        STATIC_AK,
+        STATIC_SK,
+    ];
 
     /// Build a minimal LoadTableResult for testing.
     #[allow(clippy::type_complexity)]
@@ -177,8 +366,101 @@ mod tests {
         )
     }
 
+    /// A `LoadTableResult` whose flat config vends one host-suffixed SAS per
+    /// entry — the `adls.sas-token.<host>` shape a catalog emits for an ADLS
+    /// warehouse, spelled through the production key prefix so a change to that
+    /// constant cannot leave these fixtures asserting a stale spelling.
+    fn adls_vended_result(sas_per_host: &[(&str, &str)]) -> iceberg_catalog_rest::LoadTableResult {
+        let keys: Vec<(String, &str)> = sas_per_host
+            .iter()
+            .map(|(host, sas)| (format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"), *sas))
+            .collect();
+        make_load_table_result(
+            None,
+            keys.iter().map(|(key, sas)| (key.as_str(), *sas)).collect(),
+        )
+    }
+
+    /// The S3 payload the vended selector resolves — for the tests whose subject
+    /// is which values it reads rather than whether the request was satisfiable.
+    fn vended_s3(
+        result: &iceberg_catalog_rest::LoadTableResult,
+        anchor: &str,
+        allow_http: bool,
+    ) -> StorageProps {
+        s3_payload(
+            resolve_vended_storage(result, anchor, allow_http)
+                .expect("the vended request must be satisfiable"),
+        )
+    }
+
+    /// The message a refused vended request reports — for the tests whose subject
+    /// is the refusal. Any variant other than `UdfError::User` is itself a
+    /// failure: an unsatisfied vended request is an operator-actionable
+    /// condition, not an internal one.
+    fn vended_user_error(
+        result: &iceberg_catalog_rest::LoadTableResult,
+        anchor: &str,
+        allow_http: bool,
+    ) -> String {
+        let error = resolve_vended_storage(result, anchor, allow_http)
+            .expect_err("an unsatisfied vended request must not resolve a backend");
+        assert!(
+            matches!(error, UdfError::User(_)),
+            "an unsatisfied vended request must be a user error, got {error:?}"
+        );
+        error.to_string()
+    }
+
+    /// The account name and SAS the vended selector resolves for an ADLS anchor —
+    /// for the tests whose subject is which values it reads. That the SAS state is
+    /// the only state it can reach is asserted separately, by
+    /// [`vended_adls_backend_holds_the_sas_state_never_the_account_key_state`].
+    fn vended_adls_sas(
+        result: &iceberg_catalog_rest::LoadTableResult,
+        anchor: &str,
+        allow_http: bool,
+    ) -> (String, String) {
+        match resolve_vended_storage(result, anchor, allow_http)
+            .expect("the vended request must be satisfiable")
+        {
+            StorageBackend::Adls {
+                account_name,
+                cred: AdlsCred::Sas(sas),
+            } => (account_name, sas),
+            other => panic!("expected an ADLS backend carrying a vended SAS, got {other:?}"),
+        }
+    }
+
+    fn assert_names_no_credential_value(message: &str) {
+        for secret in CREDENTIAL_SENTINELS {
+            assert!(
+                !message.contains(secret),
+                "a refusal must name no credential value, found {secret} in: {message}"
+            );
+        }
+    }
+
+    /// Every refusal a vended request can draw has the same three obligations: it
+    /// names the table location it was for, it names the config key or property
+    /// that was not satisfied, and it names no credential value.
+    fn assert_refused(message: &str, anchor: &str, named: &[&str]) {
+        assert!(
+            message.contains(anchor),
+            "the refusal must name the table location {anchor}: {message}"
+        );
+        for name in named {
+            assert!(
+                message.contains(name),
+                "the refusal must name {name}: {message}"
+            );
+        }
+        assert_names_no_credential_value(message);
+    }
+
     // ---------------------------------------------------------------------------
-    // Task 4.1 — Vended credential extraction from LoadTableResult
+    // Credential-source selection: which of the two sources a loadTable response
+    // carries applies to a given table location.
     // ---------------------------------------------------------------------------
 
     /// Scenario: storage_credentials entry with the matching prefix provides vended creds.
@@ -191,6 +473,7 @@ mod tests {
                     ("s3.access-key-id", "VENDED_AK"),
                     ("s3.secret-access-key", "VENDED_SK"),
                     ("s3.session-token", "VENDED_TOK"),
+                    ("client.region", VENDED_REGION),
                 ],
             )]),
             // config also has keys — must be ignored when storage_credentials matches
@@ -200,11 +483,7 @@ mod tests {
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            result.metadata.location(),
-        ));
+        let merged = vended_s3(&result, result.metadata.location(), false);
 
         assert_eq!(
             merged.access_key, "VENDED_AK",
@@ -224,6 +503,7 @@ mod tests {
                     vec![
                         ("s3.access-key-id", "SHORT_AK"),
                         ("s3.secret-access-key", "SHORT_SK"),
+                        ("client.region", VENDED_REGION),
                     ],
                 ),
                 (
@@ -231,6 +511,7 @@ mod tests {
                     vec![
                         ("s3.access-key-id", "LONG_AK"),
                         ("s3.secret-access-key", "LONG_SK"),
+                        ("client.region", VENDED_REGION),
                     ],
                 ),
                 (
@@ -238,17 +519,14 @@ mod tests {
                     vec![
                         ("s3.access-key-id", "MID_AK"),
                         ("s3.secret-access-key", "MID_SK"),
+                        ("client.region", VENDED_REGION),
                     ],
                 ),
             ]),
             vec![],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
+        let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
 
         assert_eq!(
             merged.access_key, "LONG_AK",
@@ -268,14 +546,11 @@ mod tests {
             vec![
                 ("s3.access-key-id", "CONFIG_AK"),
                 ("s3.secret-access-key", "CONFIG_SK"),
+                ("client.region", VENDED_REGION),
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
+        let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
 
         assert_eq!(
             merged.access_key, "CONFIG_AK",
@@ -293,14 +568,11 @@ mod tests {
                 ("s3.access-key-id", "CONFIG_AK"),
                 ("s3.secret-access-key", "CONFIG_SK"),
                 ("s3.session-token", "CONFIG_TOK"),
+                ("client.region", VENDED_REGION),
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
+        let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
 
         assert_eq!(merged.access_key, "CONFIG_AK");
         assert_eq!(merged.secret_key, "CONFIG_SK");
@@ -308,8 +580,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // R2 — vended-credential anchor must be the S3 table location, not the
-    // HTTPS catalog URI or the metadata_location JSON path.
+    // The anchor is the table's OWN location: it is both what a
+    // storage_credentials prefix matches against and what the backend variant is
+    // read from, so the catalog's own HTTPS URI is refused rather than quietly
+    // reaching the flat config map.
     // ---------------------------------------------------------------------------
 
     /// Scenario: the correct anchor for longest-prefix matching is
@@ -317,9 +591,9 @@ mod tests {
     /// endpoint or the metadata-file JSON path.
     ///
     /// `make_load_table_result` sets `metadata.location = "s3://bucket/db/t"`.
-    /// A prefix `"s3://bucket/db"` matches that S3 location.
-    /// An HTTPS catalog URI such as `"https://glue.amazonaws.com/..."` would
-    /// never match an S3 prefix, silently returning no vended creds.
+    /// A prefix `"s3://bucket/db"` matches that S3 location. An HTTPS catalog URI
+    /// matches no S3 prefix AND names no storage backend, so it is now a refusal
+    /// rather than a silent fall-back to the flat config's own credentials.
     #[test]
     fn vended_storage_anchor_is_the_s3_table_location() {
         let result = make_load_table_result(
@@ -328,15 +602,15 @@ mod tests {
                 vec![
                     ("s3.access-key-id", "VENDED_AK"),
                     ("s3.secret-access-key", "VENDED_SK"),
+                    ("client.region", VENDED_REGION),
                 ],
             )]),
             vec![
                 ("s3.access-key-id", "CONFIG_AK"),
                 ("s3.secret-access-key", "CONFIG_SK"),
+                ("client.region", VENDED_REGION),
             ],
         );
-
-        let base = static_backend();
 
         // The S3 table location ("s3://bucket/db/t") matches the prefix "s3://bucket/db".
         // Verify vended creds are returned when the anchor is the S3 table location.
@@ -345,168 +619,110 @@ mod tests {
             s3_anchor.starts_with("s3://"),
             "metadata.location() must be an S3 URI, got: {s3_anchor}"
         );
-        let merged_s3 = s3_payload(resolve_vended_storage(&result, &base, &s3_anchor));
+        let merged_s3 = vended_s3(&result, &s3_anchor, false);
         assert_eq!(
             merged_s3.access_key, "VENDED_AK",
             "S3 table location anchor must match the storage_credentials prefix"
         );
 
-        // If we mistakenly used the HTTPS catalog URI as the anchor, no prefix matches
-        // and we fall back to the flat config — pin that failure mode here.
+        // Passing the HTTPS catalog URI instead is refused: it matches no S3
+        // prefix and names no backend, so reaching the flat config's credentials
+        // from it would read the wrong store with the wrong keys.
         let https_anchor = "https://glue.us-east-1.amazonaws.com/v1/catalog";
-        let merged_https = s3_payload(resolve_vended_storage(&result, &base, https_anchor));
-        assert_eq!(
-            merged_https.access_key, "CONFIG_AK",
-            "HTTPS URI must not match any S3 prefix, must fall back to flat config"
+        let message = vended_user_error(&result, https_anchor, false);
+        assert!(
+            message.contains(https_anchor),
+            "the refusal must name the location it could not read: {message}"
+        );
+        assert!(
+            !message.contains("CONFIG_AK"),
+            "an unsupported location must not reach the flat config: {message}"
         );
     }
 
     // ---------------------------------------------------------------------------
-    // Task 4.2 — merge_vended_into_storage
+    // The vended source is the WHOLE storage source: the resolved backend carries
+    // what the response advertises and nothing else.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: Vended S3 credentials from load_table override static credentials
-    /// in the scan spec (access_key, secret_key, session_token). A vended source
-    /// that advertises only the three S3 key fields leaves `endpoint`, `region`,
-    /// `path_style`, and `allow_http` at their `base` values — this fixture's
-    /// vended source advertises none of those four fields, so they fall through.
+    /// Scenario: the storage the scan spec carries under vending is the vended
+    /// credential set — access key, secret key, and session token — with no
+    /// static value beside it for anything the response does advertise.
     #[test]
-    fn vended_creds_override_static_in_spec() {
-        let base = StorageProps {
-            endpoint: "https://s3.amazonaws.com".into(),
-            region: "us-east-1".into(),
-            access_key: "STATIC_AK".into(),
-            secret_key: "STATIC_SK".into(),
-            session_token: Some("OLD_TOKEN".into()),
-            path_style: false,
-            ..Default::default()
-        };
-
+    fn vended_creds_are_the_sole_storage_source_in_spec() {
         let result = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", "VENDED_AK"),
                 ("s3.secret-access-key", "VENDED_SK"),
                 ("s3.session-token", "VENDED_TOK"),
+                ("client.region", VENDED_REGION),
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base.clone()),
-            result.metadata.location(),
-        ));
+        let merged = vended_s3(&result, result.metadata.location(), false);
 
         assert_eq!(
             merged.access_key, "VENDED_AK",
-            "vended access_key must override static"
+            "access_key must be the vended value"
         );
         assert_eq!(
             merged.secret_key, "VENDED_SK",
-            "vended secret_key must override static"
+            "secret_key must be the vended value"
         );
         assert_eq!(
             merged.session_token.as_deref(),
             Some("VENDED_TOK"),
-            "vended session_token must override static"
-        );
-        // endpoint, region, path_style, and allow_http fall through to base
-        // because this fixture's vended source advertises none of them.
-        assert_eq!(
-            merged.endpoint, base.endpoint,
-            "endpoint must be preserved from static"
-        );
-        assert_eq!(
-            merged.region, base.region,
-            "region must be preserved from static"
-        );
-        assert!(
-            !merged.path_style,
-            "path_style must be preserved from static"
-        );
-        assert!(
-            !merged.allow_http,
-            "allow_http must be preserved from static"
+            "session_token must be the vended value"
         );
     }
 
-    /// Scenario: Static credentials are used for data files when vending is disabled.
+    /// Scenario: once vending IS requested, an empty vended key is a missing
+    /// credential rather than a licence to read the static one. The refusal names
+    /// the config key the catalog left empty and carries no credential value.
     ///
-    /// When use_vended_credentials=false, resolve_file_list returns the static storage
-    /// unchanged. We test this via resolve_vended_storage with empty vended keys —
-    /// the static keys must be preserved.
+    /// The vending-DISABLED half of that rule is deliberately not asserted here.
+    /// It is not this crate's branch to reach: `resolve_vended_storage` takes no
+    /// static storage, so the decision lives entirely in the engine crate's
+    /// `use_vended_credentials` check at the call site, and the E2E suites are what
+    /// cover it. A local `StorageProps` cloned and compared against itself would
+    /// assert nothing about either.
     #[test]
-    fn vending_disabled_keeps_static_creds() {
-        let base = StorageProps {
-            endpoint: "http://minio:9000".into(),
-            region: "us-east-1".into(),
-            access_key: "STATIC_AK".into(),
-            secret_key: "STATIC_SK".into(),
-            allow_http: true,
-            ..Default::default()
-        };
-
-        // Empty vended keys — falls back to static.
+    fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() {
         let result = make_load_table_result(
             None,
             vec![("s3.access-key-id", ""), ("s3.secret-access-key", "")],
         );
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base.clone()),
-            result.metadata.location(),
-        ));
 
-        assert_eq!(
-            merged.access_key, "STATIC_AK",
-            "empty vended access_key must keep static"
+        let message = vended_user_error(&result, result.metadata.location(), true);
+
+        assert!(
+            message.contains("s3.access-key-id"),
+            "the refusal must name the config key the catalog left empty: {message}"
         );
-        assert_eq!(
-            merged.secret_key, "STATIC_SK",
-            "empty vended secret_key must keep static"
-        );
-        assert_eq!(
-            merged.session_token, None,
-            "no session_token when both empty and static absent"
-        );
-        assert_eq!(merged.endpoint, base.endpoint);
-        assert_eq!(merged.region, base.region);
-        assert!(merged.path_style);
-        assert!(merged.allow_http);
+        assert_names_no_credential_value(&message);
     }
 
-    /// Scenario: vended session_token overrides an existing static session_token.
+    /// Scenario: the vended `s3.session-token` is the session token the resolved
+    /// storage carries.
     #[test]
-    fn vended_storage_session_token_overrides_static() {
-        let base = StorageProps {
-            endpoint: "https://s3.us-east-1.amazonaws.com".into(),
-            region: "us-east-1".into(),
-            access_key: "STATIC_AK".into(),
-            secret_key: "STATIC_SK".into(),
-            session_token: Some("OLD_STS_TOKEN".into()),
-            path_style: false,
-            ..Default::default()
-        };
-
+    fn vended_storage_adopts_the_vended_session_token() {
         let result = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", "VENDED_AK"),
                 ("s3.secret-access-key", "VENDED_SK"),
                 ("s3.session-token", "NEW_STS_TOKEN"),
+                ("client.region", VENDED_REGION),
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base),
-            result.metadata.location(),
-        ));
+        let merged = vended_s3(&result, result.metadata.location(), false);
 
         assert_eq!(
             merged.session_token.as_deref(),
             Some("NEW_STS_TOKEN"),
-            "new vended session_token must replace old static one"
+            "the vended session_token must be the resolved one"
         );
     }
 
@@ -518,7 +734,8 @@ mod tests {
 
     /// The vended flat config's `s3.endpoint` and `s3.path-style-access` are
     /// extracted so an S3-compatible store (MinIO behind Lakekeeper) is reachable
-    /// even though the vended CONNECTION carries no static endpoint.
+    /// even though the vended CONNECTION carries no static endpoint. The endpoint
+    /// is plaintext, which the operator's `ALLOW_HTTP` consent admits.
     #[test]
     fn vended_storage_adopts_endpoint_and_path_style_from_flat_config() {
         let result = make_load_table_result(
@@ -531,11 +748,7 @@ mod tests {
             ],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
+        let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", true);
 
         assert_eq!(merged.endpoint, "http://minio:9000/");
         assert!(merged.path_style);
@@ -549,6 +762,8 @@ mod tests {
             Some(vec![(
                 "s3://bucket/db",
                 vec![
+                    ("s3.access-key-id", "VENDED_AK"),
+                    ("s3.secret-access-key", "VENDED_SK"),
                     ("s3.endpoint", "http://minio:9000/"),
                     ("s3.path-style-access", "true"),
                 ],
@@ -556,11 +771,7 @@ mod tests {
             vec![("s3.endpoint", "http://wrong:1/")],
         );
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &static_backend(),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
+        let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", true);
 
         assert_eq!(
             merged.endpoint, "http://minio:9000/",
@@ -569,103 +780,26 @@ mod tests {
         assert!(merged.path_style);
     }
 
-    /// AWS S3 omits `s3.endpoint`/`s3.path-style-access`; their absence preserves
-    /// the static endpoint and path-style (Glue vended path unchanged).
-    #[test]
-    fn vended_storage_keeps_static_endpoint_and_path_style_when_absent() {
-        let result = make_load_table_result(
-            None,
-            vec![
-                ("s3.access-key-id", "VENDED_AK"),
-                ("s3.secret-access-key", "VENDED_SK"),
-            ],
-        );
-        let base = static_storage();
-
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base.clone()),
-            "s3://bucket/db/t/metadata/v1.json",
-        ));
-
-        assert_eq!(merged.endpoint, base.endpoint);
-        assert_eq!(merged.path_style, base.path_style);
-    }
-
     // ---------------------------------------------------------------------------
     // Group C — redaction hardening + vended-auth-orthogonality tests
-    // (Tasks 3.1, 4.1, 4.2, 4.3, 4.4, 4.5)
     // ---------------------------------------------------------------------------
 
-    // ---------------------------------------------------------------------------
-    // Task 4.1 — Vending orthogonal to auth mode
-    // ---------------------------------------------------------------------------
-
-    /// Scenario: Unsigned catalog path is unchanged when SigV4 and vending are
-    /// both disabled.
-    ///
-    /// When `use_vended_credentials=false`, the vended resolution is skipped
-    /// entirely and the static credentials stay unchanged.
-    #[test]
-    fn no_vending_no_sigv4_uses_static_storage_unchanged() {
-        let storage = static_storage();
-        // Simulate the effective_storage derivation when use_vended_credentials=false:
-        // static storage is returned as-is (no vended path entered).
-        let effective = storage.clone();
-
-        assert_eq!(effective.access_key, STATIC_AK, "access_key must be static");
-        assert_eq!(effective.secret_key, STATIC_SK, "secret_key must be static");
-        assert_eq!(effective.session_token, None, "no session_token");
-        assert_eq!(effective.region, "us-east-1", "region must be static");
-        assert_eq!(effective.endpoint, storage.endpoint, "endpoint preserved");
-        assert!(!effective.path_style, "path_style preserved");
-        assert!(!effective.allow_http, "allow_http preserved");
-
-        // Also confirm that a loadTable result carrying vended creds does NOT
-        // affect the storage when we skip vended extraction.
-        let result = vended_result_flat_config();
-        let if_applied = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(storage.clone()),
-            "s3://bucket/db/t",
-        ));
-        // The keys are present in the result but we never apply them.
-        assert_eq!(
-            if_applied.access_key, VENDED_AK,
-            "vended keys exist in result"
-        );
-        assert_eq!(
-            if_applied.secret_key, VENDED_SK,
-            "vended keys exist in result"
-        );
-        // The static storage remains unchanged.
-        assert_eq!(
-            storage.access_key, STATIC_AK,
-            "static storage must be unchanged"
-        );
-    }
-
-    /// Scenario: Vended S3 credentials override static credentials regardless
-    /// of catalog auth mode.
+    /// Scenario: Vended S3 credentials are the sole storage source regardless of
+    /// catalog auth mode.
     ///
     /// Vended extraction is a pure post-processing step on the `LoadTableResult`;
     /// the auth mode that produced the result is irrelevant. This test simulates
     /// the result of all three non-SigV4 modes and confirms that the same vended
     /// storage is derived from each.
     #[test]
-    fn vended_overrides_static_across_all_auth_modes() {
-        let storage = static_storage();
+    fn vended_creds_are_the_sole_storage_source_across_all_auth_modes() {
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
         // The vended extraction logic is auth-mode-independent: run it for each
         // logical auth mode and confirm identical output.
         for mode_label in ["no-auth", "bearer", "oauth2"] {
-            let merged = s3_payload(resolve_vended_storage(
-                &result,
-                &StorageBackend::S3(storage.clone()),
-                &anchor,
-            ));
+            let merged = vended_s3(&result, &anchor, false);
 
             assert_eq!(
                 merged.access_key, VENDED_AK,
@@ -682,15 +816,8 @@ mod tests {
             );
             assert_ne!(
                 merged.access_key, STATIC_AK,
-                "{mode_label}: static access_key must be replaced"
+                "{mode_label}: the static access_key must never appear"
             );
-            // Static infrastructure fields are preserved.
-            assert_eq!(
-                merged.endpoint, storage.endpoint,
-                "{mode_label}: endpoint preserved"
-            );
-            assert!(!merged.path_style, "{mode_label}: path_style preserved");
-            assert!(!merged.allow_http, "{mode_label}: allow_http preserved");
         }
     }
 
@@ -702,15 +829,10 @@ mod tests {
     /// the flat config map. The extraction must work identically to the SigV4 path.
     #[test]
     fn bearer_token_path_extracts_vended_from_config() {
-        let storage = static_storage();
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(storage.clone()),
-            &anchor,
-        ));
+        let merged = vended_s3(&result, &anchor, false);
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -727,8 +849,6 @@ mod tests {
         );
         // Static token must NOT bleed into storage.
         assert_ne!(merged.access_key, STATIC_AK);
-        // Endpoint preserved.
-        assert_eq!(merged.endpoint, storage.endpoint);
     }
 
     /// Scenario: Vended credentials are extracted on the OAuth2 client-credentials
@@ -739,11 +859,10 @@ mod tests {
     /// config shape. Extraction is auth-mode-independent.
     #[test]
     fn oauth2_path_extracts_vended_credentials() {
-        let storage = static_backend();
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(&result, &storage, &anchor));
+        let merged = vended_s3(&result, &anchor, false);
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -763,63 +882,18 @@ mod tests {
         assert_ne!(merged.secret_key, CLIENT_SECRET);
     }
 
-    /// Scenario: Static credentials are used for data files when vending is disabled.
-    ///
-    /// For each catalog-auth mode, when `use_vended_credentials=false` the
-    /// effective storage equals the static storage unchanged.
-    #[test]
-    fn vending_disabled_uses_static_on_every_mode() {
-        let storage = static_storage();
-        let result = vended_result_flat_config();
-        let anchor = result.metadata.location().to_string();
-
-        // When use_vended_credentials=false, the adapter skips extraction entirely
-        // and clones static storage. Confirm that static storage is byte-identical
-        // regardless of the auth mode used.
-        for mode_label in ["no-auth", "bearer", "oauth2", "sigv4"] {
-            // The vended extraction is NOT applied (use_vended_credentials=false).
-            let effective = storage.clone();
-
-            assert_eq!(
-                effective.access_key, STATIC_AK,
-                "{mode_label}: static access_key must not be replaced"
-            );
-            assert_eq!(
-                effective.secret_key, STATIC_SK,
-                "{mode_label}: static secret_key must not be replaced"
-            );
-            assert_eq!(
-                effective.session_token, None,
-                "{mode_label}: no vended session_token"
-            );
-            // Confirm the result has vended keys (but we ignored them).
-            let if_applied = s3_payload(resolve_vended_storage(
-                &result,
-                &StorageBackend::S3(storage.clone()),
-                &anchor,
-            ));
-            assert_eq!(
-                if_applied.access_key, VENDED_AK,
-                "{mode_label}: result has vended keys (not applied)"
-            );
-        }
-    }
-
     // ---------------------------------------------------------------------------
-    // Task 4.3 — client.region from config overrides static region
+    // Region, endpoint, and path-style come from the response and nowhere else.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: Vended-credentials request adopts the vended region from
-    /// `client.region` in the loadTable response config.
-    ///
-    /// When `use_vended_credentials=true` AND the response carries `client.region`,
-    /// the effective storage region is set to the vended value. When `client.region`
-    /// is absent, the static region is preserved.
+    /// Scenario: a vended-credentials request takes every S3 transport value from
+    /// the response — the region it advertises is adopted, the endpoint and
+    /// path-style it omits are absent — and a response that advertises neither
+    /// region nor endpoint leaves the store address undetermined.
     #[test]
-    fn vended_storage_adopts_region_from_flat_config() {
-        let storage = static_storage();
-
-        // Part A: client.region present → vended region adopted.
+    fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() {
+        // Part A: client.region present → vended region adopted, and the two
+        // transport values the response omits are absent, not filled in.
         let result_with_region = make_load_table_result(
             None,
             vec![
@@ -831,35 +905,42 @@ mod tests {
         );
         let anchor = result_with_region.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result_with_region,
-            &StorageBackend::S3(storage.clone()),
-            &anchor,
-        ));
+        let merged = vended_s3(&result_with_region, &anchor, false);
         assert_eq!(
             merged.region, VENDED_REGION,
-            "vended region must override static region"
+            "the vended region must be the resolved region"
         );
-        assert_ne!(merged.region, "us-east-1", "static region must be replaced");
+        assert_ne!(
+            merged.region, "us-east-1",
+            "no static region may appear under vending"
+        );
+        assert!(
+            merged.endpoint.is_empty(),
+            "an endpoint the response omits is absent, got {}",
+            merged.endpoint
+        );
+        assert!(
+            !merged.path_style,
+            "a path-style the response omits is absent"
+        );
 
-        // Part B: client.region absent → static region preserved.
-        let result_no_region = make_load_table_result(
+        // Part B: neither client.region nor s3.endpoint → nothing left can place
+        // the store, and no static value may supply one.
+        let result_no_address = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", VENDED_AK),
                 ("s3.secret-access-key", VENDED_SK),
             ],
         );
-        let anchor2 = result_no_region.metadata.location().to_string();
-        let merged2 = s3_payload(resolve_vended_storage(
-            &result_no_region,
-            &StorageBackend::S3(storage.clone()),
-            &anchor2,
-        ));
-        assert_eq!(
-            merged2.region, "us-east-1",
-            "static region must be preserved when client.region absent"
+        let anchor_no_address = result_no_address.metadata.location().to_string();
+
+        let message = vended_user_error(&result_no_address, &anchor_no_address, false);
+        assert!(
+            message.contains("client.region") && message.contains("s3.endpoint"),
+            "the refusal must name both keys that could have placed the store: {message}"
         );
+        assert_names_no_credential_value(&message);
     }
 
     /// Scenario: the `X-Iceberg-Access-Delegation` header is sent when vending is
@@ -903,7 +984,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Task 4.5 / 3.1 — Redaction: vended STS values never in error messages
+    // Redaction: vended STS values never in error messages
     // ---------------------------------------------------------------------------
 
     /// Scenario: vended STS values (access key, secret key, session token) never
@@ -927,93 +1008,84 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // resolve_vended_storage behavior-parity: the six absence and precedence
-    // cases plus the single-selection guarantee.
+    // Absence, precedence, and single selection: what the S3 arm does with each
+    // value the selected source omits, spells empty, or spells unparseably.
     // ---------------------------------------------------------------------------
 
     /// Scenario: an empty vended `s3.access-key-id` is absent per the uniform
-    /// convention (`vended_config_value` filters empty strings), so the static
-    /// `base` access_key is preserved. Other vended values still apply, proving
-    /// the empty key is treated individually, not as a signal to reject the
-    /// whole vended source.
+    /// convention (`vended_config_value` filters empty strings), and an absent
+    /// credential under vending is a refusal — there is no static value beneath
+    /// it to read instead. The sibling non-empty vended values do not soften it:
+    /// a credential set missing one required member is not usable.
     #[test]
-    fn resolve_vended_storage_empty_access_key_preserves_static() {
-        let base = static_backend();
+    fn resolve_vended_storage_empty_access_key_is_a_missing_credential() {
         let result = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", ""),
                 ("s3.secret-access-key", VENDED_SK),
                 ("s3.session-token", VENDED_TOK),
+                ("client.region", VENDED_REGION),
             ],
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
+        let message = vended_user_error(&result, &anchor, false);
 
-        assert_eq!(
-            merged.access_key, STATIC_AK,
-            "empty vended access_key must preserve the static value"
+        assert!(
+            message.contains("s3.access-key-id"),
+            "the refusal must name the empty config key: {message}"
         );
-        assert_eq!(
-            merged.secret_key, VENDED_SK,
-            "a sibling non-empty vended value must still apply"
-        );
-        assert_eq!(merged.session_token.as_deref(), Some(VENDED_TOK));
+        assert_names_no_credential_value(&message);
     }
 
     /// Scenario: an empty vended `s3.secret-access-key` is absent per the same
-    /// convention, so the static `base` secret_key is preserved.
+    /// convention, and equally a refusal.
     #[test]
-    fn resolve_vended_storage_empty_secret_key_preserves_static() {
-        let base = static_backend();
+    fn resolve_vended_storage_empty_secret_key_is_a_missing_credential() {
         let result = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", VENDED_AK),
                 ("s3.secret-access-key", ""),
                 ("s3.session-token", VENDED_TOK),
+                ("client.region", VENDED_REGION),
             ],
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
+        let message = vended_user_error(&result, &anchor, false);
 
-        assert_eq!(
-            merged.secret_key, STATIC_SK,
-            "empty vended secret_key must preserve the static value"
+        assert!(
+            message.contains("s3.secret-access-key"),
+            "the refusal must name the empty config key: {message}"
         );
-        assert_eq!(merged.access_key, VENDED_AK);
-        assert_eq!(merged.session_token.as_deref(), Some(VENDED_TOK));
+        assert_names_no_credential_value(&message);
     }
 
-    /// Scenario: an absent or empty vended `s3.session-token` preserves whatever
-    /// `base.session_token` already held — covering both the absent-key case and
-    /// the empty-string case in one test, since both spell "no vended token" per
-    /// `vended_config_value`.
+    /// Scenario: an absent or empty vended `s3.session-token` resolves to `None`
+    /// — covering both the absent-key case and the empty-string case in one
+    /// test, since both spell "no vended token" per `vended_config_value`.
+    ///
+    /// A session token is not required: a vended long-lived key pair carries
+    /// none. What it must never be is a static token the operator believed was
+    /// unused, so absent resolves to absent.
     #[test]
-    fn resolve_vended_storage_absent_session_token_preserves_static() {
-        let mut base = static_storage();
-        base.session_token = Some("STATIC_TOKEN_SENTINEL".into());
-
+    fn resolve_vended_storage_absent_session_token_is_absent() {
         // Case 1: the key is absent from the vended config entirely.
         let result_absent = make_load_table_result(
             None,
             vec![
                 ("s3.access-key-id", VENDED_AK),
                 ("s3.secret-access-key", VENDED_SK),
+                ("client.region", VENDED_REGION),
             ],
         );
         let anchor_absent = result_absent.metadata.location().to_string();
-        let merged_absent = s3_payload(resolve_vended_storage(
-            &result_absent,
-            &StorageBackend::S3(base.clone()),
-            &anchor_absent,
-        ));
+        let merged_absent = vended_s3(&result_absent, &anchor_absent, false);
         assert_eq!(
-            merged_absent.session_token.as_deref(),
-            Some("STATIC_TOKEN_SENTINEL"),
-            "an absent vended session_token key must preserve the static token"
+            merged_absent.session_token, None,
+            "an absent vended session_token key resolves to no token"
         );
 
         // Case 2: the key is present but empty.
@@ -1023,107 +1095,194 @@ mod tests {
                 ("s3.access-key-id", VENDED_AK),
                 ("s3.secret-access-key", VENDED_SK),
                 ("s3.session-token", ""),
+                ("client.region", VENDED_REGION),
             ],
         );
         let anchor_empty = result_empty.metadata.location().to_string();
-        let merged_empty = s3_payload(resolve_vended_storage(
-            &result_empty,
-            &StorageBackend::S3(base.clone()),
-            &anchor_empty,
-        ));
+        let merged_empty = vended_s3(&result_empty, &anchor_empty, false);
         assert_eq!(
-            merged_empty.session_token.as_deref(),
-            Some("STATIC_TOKEN_SENTINEL"),
-            "an empty vended session_token value must preserve the static token"
+            merged_empty.session_token, None,
+            "an empty vended session_token value resolves to no token"
         );
     }
 
-    /// Scenario: an unparseable `s3.path-style-access` string preserves the
-    /// static `path_style`. `bool::from_str` is case-sensitive — only the exact
-    /// lowercase `"true"`/`"false"` parse — so a differently-cased value such as
-    /// `"TRUE"` must fail to parse and fall through to `base`, not be treated as
-    /// truthy.
+    /// Scenario: an unparseable `s3.path-style-access` string on a response that
+    /// vends NO endpoint resolves to `false`. `bool::from_str` is case-sensitive —
+    /// only the exact lowercase `"true"`/`"false"` parse — so a differently-cased
+    /// value such as `"TRUE"` must fail to parse and fall to the default, not be
+    /// treated as truthy.
+    ///
+    /// The default it falls to is whether an endpoint was vended, so the absence of
+    /// an endpoint here is what makes the expected value `false`: with only
+    /// `client.region` to place the store, virtual-hosted addressing is all that is
+    /// left to address it with. The endpoint-present half of the same default is
+    /// [`vended_endpoint_without_path_style_stays_reachable_by_the_scan`].
     #[test]
-    fn resolve_vended_storage_unparseable_path_style_preserves_static() {
-        let mut base = static_storage();
-        base.path_style = false;
-        let result = make_load_table_result(None, vec![("s3.path-style-access", "TRUE")]);
+    fn resolve_vended_storage_unparseable_path_style_without_an_endpoint_is_false() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("client.region", VENDED_REGION),
+                ("s3.path-style-access", "TRUE"),
+            ],
+        );
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base),
-            &anchor,
-        ));
+        let merged = vended_s3(&result, &anchor, false);
 
         assert!(
+            merged.endpoint.is_empty(),
+            "the fixture must vend no endpoint, or the default under test is the other one"
+        );
+        assert!(
             !merged.path_style,
-            "an unparseable path-style string must preserve the static value, not parse as true"
+            "an unparseable path-style string must fall to the default, not parse as true"
+        );
+    }
+
+    /// Scenario: a response vending an `s3.endpoint` but no `s3.path-style-access`
+    /// resolves `path_style: true`. `path_style` is what decides whether the scan
+    /// hands that endpoint to `AmazonS3Builder` at all, so resolving it `false`
+    /// beside a non-empty endpoint produces an address the scan silently discards —
+    /// it would fall back to a virtual-hosted AWS host derived from the (here
+    /// empty) region and read the wrong store. This is the shape a catalog
+    /// fronting an S3-compatible store vends.
+    #[test]
+    fn vended_endpoint_without_path_style_stays_reachable_by_the_scan() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.endpoint", "http://minio:9000/"),
+            ],
+        );
+        let anchor = result.metadata.location().to_string();
+
+        let merged = vended_s3(&result, &anchor, true);
+
+        assert_eq!(
+            merged.endpoint, "http://minio:9000/",
+            "the vended endpoint must be the resolved endpoint"
+        );
+        assert!(
+            merged.path_style,
+            "a vended endpoint with no path-style flag must resolve path_style true, or the scan \
+             drops the endpoint the catalog just supplied"
+        );
+    }
+
+    /// Scenario: an `s3.path-style-access` the response DOES state still wins over
+    /// the endpoint-coupled default. The coupling above fills in a value the
+    /// catalog left unstated; it must not overwrite one the catalog stated, or a
+    /// store that asked for virtual-hosted addressing would be addressed
+    /// path-style against its own endpoint.
+    #[test]
+    fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
+        let result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.endpoint", "https://s3.example.com/"),
+                ("s3.path-style-access", "false"),
+            ],
+        );
+        let anchor = result.metadata.location().to_string();
+
+        assert!(
+            !vended_s3(&result, &anchor, false).path_style,
+            "a path-style of false that the response states must not be overridden by the \
+             presence of an endpoint"
         );
     }
 
     /// Scenario: a matched `storage_credentials` entry that omits a key must
     /// NOT fall back to the flat `config` map for that key — the entry, once
-    /// selected, is authoritative for the whole credential set. The flat
-    /// `config` map here carries a different, wrong secret_key to prove that
-    /// value never leaks into the result.
+    /// selected, is authoritative for the whole credential set.
+    ///
+    /// The refusal IS the compliance evidence: the flat `config` map here carries
+    /// the secret_key the entry omits, so a per-key second selection would have
+    /// resolved successfully with that value. Only a single selection can turn
+    /// this fixture into a missing-credential error.
     #[test]
     fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config() {
-        let base = static_backend();
         let result = make_load_table_result(
             Some(vec![(
                 "s3://bucket/db",
-                vec![("s3.access-key-id", VENDED_AK)], // secret_key omitted from the entry
+                vec![
+                    ("s3.access-key-id", VENDED_AK),
+                    ("client.region", VENDED_REGION),
+                    // secret_key omitted from the entry
+                ],
             )]),
             vec![("s3.secret-access-key", "CONFIG_SK_MUST_NOT_LEAK")],
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(&result, &base, &anchor));
+        let message = vended_user_error(&result, &anchor, false);
 
-        assert_eq!(
-            merged.access_key, VENDED_AK,
-            "the key present in the matched entry must apply"
+        assert!(
+            message.contains("s3.secret-access-key"),
+            "the refusal must name the key the matched entry omits: {message}"
         );
-        assert_eq!(
-            merged.secret_key, STATIC_SK,
-            "a key missing from the matched entry must preserve static, never the flat config"
+        assert!(
+            !message.contains("CONFIG_SK_MUST_NOT_LEAK"),
+            "the flat config's secret must never be read or named: {message}"
         );
+        assert_names_no_credential_value(&message);
     }
 
-    /// Scenario: `allow_http` is always taken from `base`, never read from the
-    /// vended result at all — there is no `allow_http` extraction function and
-    /// none of the six vended config keys map to it. Confirmed by flipping
-    /// `base.allow_http` across two calls with the identical vended result and
-    /// observing the merged value track `base` every time.
+    /// Scenario: `allow_http` is the operator's resolved `ALLOW_HTTP` property,
+    /// threaded in — never read from the vended result, which advertises no such
+    /// key. Confirmed by flipping the parameter across two calls with the
+    /// identical vended result and observing the resolved value track it.
+    ///
+    /// The same parameter is the plaintext consent gate: a catalog that vends an
+    /// `http://` endpoint cannot move the vended credentials onto plaintext
+    /// transport on its own authority.
     #[test]
-    fn resolve_vended_storage_allow_http_always_from_base() {
+    fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
         let result = vended_result_flat_config();
         let anchor = result.metadata.location().to_string();
 
-        let mut base_http = static_storage();
-        base_http.allow_http = true;
-        let merged_http = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base_http),
-            &anchor,
-        ));
         assert!(
-            merged_http.allow_http,
-            "allow_http=true on base must carry through"
+            vended_s3(&result, &anchor, true).allow_http,
+            "allow_http=true must carry through"
+        );
+        assert!(
+            !vended_s3(&result, &anchor, false).allow_http,
+            "allow_http=false must carry through, unaffected by the same vended result"
         );
 
-        let mut base_https = static_storage();
-        base_https.allow_http = false;
-        let merged_https = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base_https),
-            &anchor,
-        ));
-        assert!(
-            !merged_https.allow_http,
-            "allow_http=false on base must carry through, unaffected by the same vended result"
+        let plaintext = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.endpoint", "http://minio:9000/"),
+            ],
         );
+        let plaintext_anchor = plaintext.metadata.location().to_string();
+
+        let honoured = vended_s3(&plaintext, &plaintext_anchor, true);
+        assert_eq!(
+            honoured.endpoint, "http://minio:9000/",
+            "a vended plaintext endpoint is honoured under operator consent"
+        );
+        assert!(
+            honoured.path_style,
+            "and honouring it must leave it reachable: the scan passes the endpoint to the \
+             builder only when path_style is set"
+        );
+        let message = vended_user_error(&plaintext, &plaintext_anchor, false);
+        assert!(
+            message.contains("ALLOW_HTTP"),
+            "the refusal must name the property that withholds consent: {message}"
+        );
+        assert_names_no_credential_value(&message);
     }
 
     /// Scenario: the credential source is selected ONCE for `anchor` and that
@@ -1134,16 +1293,16 @@ mod tests {
     /// The matched `storage_credentials` entry supplies only four of the six
     /// keys (access_key, secret_key, region, endpoint); the flat `config` map
     /// carries wrong sentinel values for all six. A single selection means the
-    /// four present keys resolve to the entry's values and the two absent keys
-    /// (session_token, path_style) fall through to `base` — never to config's
-    /// wrong values, which would only be reachable through a second,
-    /// independent selection per key.
+    /// four present keys resolve to the entry's values and the two the entry
+    /// omits resolve without ever consulting config: `session_token` to absent,
+    /// and `path_style` to the endpoint-coupled default — `true` here, because
+    /// the matched entry vends an endpoint.
+    ///
+    /// Config's `s3.path-style-access` sentinel is therefore `"false"`, the
+    /// opposite of that default: a value agreeing with it could not tell a leak
+    /// from a correct resolution, which is the whole point of a sentinel.
     #[test]
     fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
-        let mut base = static_storage();
-        base.session_token = Some("STATIC_TOKEN_SENTINEL".into());
-        base.path_style = false;
-
         let result = make_load_table_result(
             Some(vec![(
                 "s3://bucket/db",
@@ -1161,16 +1320,12 @@ mod tests {
                 ("s3.session-token", "CONFIG_TOKEN_MUST_NOT_LEAK"),
                 ("client.region", "config-region-must-not-leak"),
                 ("s3.endpoint", "http://config-endpoint-must-not-leak/"),
-                ("s3.path-style-access", "true"),
+                ("s3.path-style-access", "false"),
             ],
         );
         let anchor = result.metadata.location().to_string();
 
-        let merged = s3_payload(resolve_vended_storage(
-            &result,
-            &StorageBackend::S3(base),
-            &anchor,
-        ));
+        let merged = vended_s3(&result, &anchor, true);
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -1186,36 +1341,339 @@ mod tests {
             "endpoint from matched entry"
         );
         assert_eq!(
-            merged.session_token.as_deref(),
-            Some("STATIC_TOKEN_SENTINEL"),
-            "session_token absent from the matched entry must preserve static, not read config"
+            merged.session_token, None,
+            "a session_token absent from the matched entry is absent, never the flat config's value"
         );
         assert!(
-            !merged.path_style,
-            "path_style absent from the matched entry must preserve static, not read config"
+            merged.path_style,
+            "a path-style absent from the matched entry falls to the endpoint-coupled default, \
+             never to the flat config's contradicting value"
         );
     }
 
-    /// Scenario: an `Adls` backend is returned unchanged, byte-for-byte, from a
-    /// `LoadTableResult` that carries vended S3 credentials. The effective
-    /// backend is already selected once at `parse_creds`/`storage_block` time;
-    /// vended Azure SAS credentials are a tracked exception (#276), so this
-    /// function must not attempt any Azure-specific extraction or scheme
-    /// switching — it must simply pass the `Adls` variant through.
-    #[test]
-    fn resolve_vended_storage_returns_an_adls_backend_unchanged() {
-        let base = StorageBackend::Adls {
-            account_name: "myaccount".into(),
-            cred: AdlsCred::AccountKey("static-account-key".into()),
-        };
-        let result = vended_result_flat_config();
-        let anchor = result.metadata.location().to_string();
+    // ---------------------------------------------------------------------------
+    // Scheme-driven backend selection: the table location's URI scheme is the one
+    // input that knows which store the table's data actually lives in.
+    // ---------------------------------------------------------------------------
 
-        let resolved = resolve_vended_storage(&result, &base, &anchor);
+    /// Scenario: the resolved backend variant follows the anchor's URI scheme —
+    /// `s3://` and `s3a://` resolve S3, `abfss://` and `abfs://` resolve ADLS. The
+    /// scheme is matched case-insensitively (RFC 3986 §3.1), so an upper-cased
+    /// scheme resolves the same backend as its lowercase spelling.
+    ///
+    /// The two Azure schemes are checked at the consent value each one needs:
+    /// `abfss://` is encrypted and resolves without operator consent, `abfs://` is
+    /// plaintext and resolves only with it.
+    #[test]
+    fn vended_backend_variant_comes_from_the_anchor_scheme() {
+        let s3_result = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("client.region", VENDED_REGION),
+            ],
+        );
+        for scheme in ["s3", "s3a"] {
+            let anchor = format!("{scheme}://bucket/db/t");
+            let resolved = resolve_vended_storage(&s3_result, &anchor, false)
+                .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
+            assert!(
+                matches!(resolved, StorageBackend::S3(_)),
+                "{scheme}:// must select the S3 backend, got {resolved:?}"
+            );
+        }
+
+        let adls_result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
+        for (scheme, allow_http) in [("abfss", false), ("abfs", true)] {
+            let anchor = format!("{scheme}://container@{ADLS_HOST}/db/t");
+            let resolved = resolve_vended_storage(&adls_result, &anchor, allow_http)
+                .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
+            assert!(
+                matches!(resolved, StorageBackend::Adls { .. }),
+                "{scheme}:// must select the ADLS backend, got {resolved:?}"
+            );
+        }
+
+        let resolved_upper_s3 = resolve_vended_storage(&s3_result, "S3://bucket/db/t", false)
+            .unwrap_or_else(|e| panic!("S3:// must resolve a backend: {e}"));
+        assert!(
+            matches!(resolved_upper_s3, StorageBackend::S3(_)),
+            "an upper-cased S3:// scheme must select the S3 backend, got {resolved_upper_s3:?}"
+        );
+
+        let upper_abfss_anchor = format!("ABFSS://container@{ADLS_HOST}/db/t");
+        let resolved_upper_abfss = resolve_vended_storage(&adls_result, &upper_abfss_anchor, false)
+            .unwrap_or_else(|e| panic!("ABFSS:// must resolve a backend: {e}"));
+        assert!(
+            matches!(resolved_upper_abfss, StorageBackend::Adls { .. }),
+            "an upper-cased ABFSS:// scheme must select the ADLS backend, got \
+             {resolved_upper_abfss:?}"
+        );
+    }
+
+    /// Scenario: an anchor whose scheme names no backend this engine can read is
+    /// refused, and a scheme-less warehouse fallback is one of them.
+    ///
+    /// `file_resolution.rs` substitutes `catalog_props.warehouse` for an empty
+    /// table location, and a Glue warehouse is a bare AWS account id carrying no
+    /// scheme at all — so a scheme-less anchor is a shape this function really
+    /// receives rather than a hypothetical. The catalog's own HTTPS URI is the
+    /// other, and it is the one a caller is most likely to pass by mistake.
+    #[test]
+    fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
+        let result = vended_result_flat_config();
+
+        for anchor in [
+            "https://glue.us-east-1.amazonaws.com/v1/catalog",
+            "123456789012",
+        ] {
+            let message = vended_user_error(&result, anchor, false);
+            assert_refused(
+                &message,
+                anchor,
+                &["s3://", "s3a://", "abfss://", "abfs://"],
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Refusals: every way a loadTable response can fail to satisfy a vended
+    // request, on either arm.
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: a vended request the catalog does not satisfy is a refusal naming
+    /// what was missing — never a fall-back to a static value, of which this
+    /// selector holds none.
+    #[test]
+    fn unsatisfied_vended_request_errors_without_static_fallback() {
+        let s3_anchor = "s3://bucket/db/t";
+        let abfss_anchor = format!("abfss://container@{ADLS_HOST}/db/t");
+        let abfs_anchor = format!("abfs://container@{ADLS_HOST}/db/t");
+
+        // An absent S3 key pair.
+        let absent_pair = make_load_table_result(None, vec![("client.region", VENDED_REGION)]);
+        assert_refused(
+            &vended_user_error(&absent_pair, s3_anchor, false),
+            s3_anchor,
+            &["s3.access-key-id"],
+        );
+
+        // An S3 key pair spelled empty — the same absence, per the one convention.
+        let empty_pair = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", ""),
+                ("s3.secret-access-key", ""),
+                ("client.region", VENDED_REGION),
+            ],
+        );
+        assert_refused(
+            &vended_user_error(&empty_pair, s3_anchor, false),
+            s3_anchor,
+            &["s3.access-key-id"],
+        );
+
+        // A key pair with neither region nor endpoint: nothing left can place the
+        // store, and an empty region silently misroutes an AWS store.
+        let no_address = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+            ],
+        );
+        assert_refused(
+            &vended_user_error(&no_address, s3_anchor, false),
+            s3_anchor,
+            &["client.region", "s3.endpoint"],
+        );
+
+        // An ADLS response carrying no adls.sas-token.* key at all.
+        let no_sas = make_load_table_result(None, vec![("client.region", VENDED_REGION)]);
+        assert_refused(
+            &vended_user_error(&no_sas, &abfss_anchor, false),
+            &abfss_anchor,
+            &[VENDED_SAS_TOKEN_KEY_PREFIX],
+        );
+
+        // An ADLS response whose only SAS was minted for a different host: a SAS
+        // is account-scoped, so the wrong account's is no more usable than none.
+        let wrong_host_sas = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
+        assert_refused(
+            &vended_user_error(&wrong_host_sas, &abfss_anchor, false),
+            &abfss_anchor,
+            &[VENDED_SAS_TOKEN_KEY_PREFIX, ADLS_HOST],
+        );
+
+        // A vended plaintext endpoint without the operator's consent.
+        let plaintext_endpoint = make_load_table_result(
+            None,
+            vec![
+                ("s3.access-key-id", VENDED_AK),
+                ("s3.secret-access-key", VENDED_SK),
+                ("s3.endpoint", "http://minio:9000/"),
+            ],
+        );
+        assert_refused(
+            &vended_user_error(&plaintext_endpoint, s3_anchor, false),
+            s3_anchor,
+            &["ALLOW_HTTP", "http://minio:9000/"],
+        );
+
+        // A plaintext abfs:// location without the operator's consent, refused
+        // even though this payload WOULD satisfy the same anchor over abfss://:
+        // the consent gate is on the transport, not on the credential set.
+        let satisfiable_sas = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
+        assert_refused(
+            &vended_user_error(&satisfiable_sas, &abfs_anchor, false),
+            &abfs_anchor,
+            &["ALLOW_HTTP", "abfs://"],
+        );
+    }
+
+    /// Scenario: the missing-SAS refusal still names the storage host after the
+    /// error text has passed through [`crate::redact_error_text`] on its way out.
+    ///
+    /// The refusal has to name a host to be actionable, and it also has to name
+    /// the absent `adls.sas-token.<host>` key — but redaction treats that key as a
+    /// credential label and truncates everything after it up to the next space,
+    /// host included. Naming the host earlier in the message is what survives, so
+    /// this pins that placement rather than the wording around it.
+    #[test]
+    fn adls_missing_sas_refusal_names_the_host_after_redaction() {
+        let result = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
+        let anchor = format!("abfss://container@{ADLS_HOST}/db/t");
+
+        let message = vended_user_error(&result, &anchor, false);
+        assert_names_no_credential_value(&message);
+
+        let redacted = crate::redact_error_text(&message, &[OTHER_HOST_SAS, VENDED_SAS]);
+
+        assert!(
+            !redacted.contains(&format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}")),
+            "the host suffixed onto the key name is the occurrence redaction truncates, so a \
+             refusal naming the host only there would surface no host at all: {redacted}"
+        );
+        assert!(
+            redacted.contains(ADLS_HOST),
+            "the storage host must survive redaction: {redacted}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Azure extraction: which vended SAS applies, and the account name that has to
+    // agree with it.
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: with several `adls.sas-token.<host>` keys vended at once, the SAS
+    /// the anchor's OWN storage host names is the one selected, and the account
+    /// name is read from that same host so the two cannot disagree.
+    ///
+    /// A disagreeing pair is not cosmetic: `adls.account-name` is the downstream
+    /// wrong-account guard on the manifest read, so an account name taken from
+    /// anywhere but the host the SAS was minted for would disarm it.
+    #[test]
+    fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
+        let result = adls_vended_result(&[
+            (OTHER_ADLS_HOST, OTHER_HOST_SAS),
+            (ADLS_HOST, VENDED_SAS),
+            (
+                "thirdaccount.dfs.core.windows.net",
+                "THIRD_HOST_SAS_SENTINEL",
+            ),
+        ]);
+        let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
+
+        let (account_name, sas) = vended_adls_sas(&result, &anchor, false);
 
         assert_eq!(
-            resolved, base,
-            "an Adls backend must pass through unchanged"
+            sas, VENDED_SAS,
+            "the selected SAS must be the one minted for the anchor's own host"
         );
+        assert_eq!(
+            account_name, ADLS_ACCOUNT,
+            "the account name must be the anchor host's first label"
+        );
+    }
+
+    /// Scenario: an `abfss://<container>@<host>/…` location reads its host AFTER
+    /// the `<container>@` userinfo segment, so the container name never becomes
+    /// the account name and never joins the SAS key it is matched against.
+    #[test]
+    fn vended_adls_reads_the_host_after_the_container_userinfo() {
+        let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
+
+        let with_container = vended_adls_sas(
+            &result,
+            &format!("abfss://mycontainer@{ADLS_HOST}/db/t"),
+            false,
+        );
+        let without_container =
+            vended_adls_sas(&result, &format!("abfss://{ADLS_HOST}/db/t"), false);
+
+        assert_eq!(
+            with_container.0, ADLS_ACCOUNT,
+            "the container must not be read as the account name"
+        );
+        assert_eq!(
+            with_container, without_container,
+            "the container segment must not change what the location resolves to"
+        );
+    }
+
+    /// Scenario: an anchor whose storage host carries no leading label is refused.
+    /// There is no account name to read from it, and substituting a guess would
+    /// disarm the downstream wrong-account guard instead of failing cleanly.
+    ///
+    /// Both ways a location can arrive without one: an empty authority behind a
+    /// `<container>@` segment, and a host whose first dot-separated label is
+    /// empty.
+    #[test]
+    fn vended_adls_account_name_requires_a_labelled_host() {
+        let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
+
+        for anchor in [
+            "abfss://mycontainer@/db/t",
+            "abfss://.dfs.core.windows.net/db/t",
+        ] {
+            let message = vended_user_error(&result, anchor, false);
+            assert_refused(&message, anchor, &["account name"]);
+        }
+    }
+
+    /// Scenario: the resolved ADLS backend holds the SAS state and never the
+    /// account-key state, even when the response vends an `adls.account-key`
+    /// beside the SAS.
+    ///
+    /// This pins the vended path's reach over `AdlsCred` rather than the
+    /// response's contents: the selector has no reader for an account key, so one
+    /// of the enum's two states is unreachable under vending.
+    #[test]
+    fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
+        let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");
+        let result = make_load_table_result(
+            None,
+            vec![
+                (sas_key.as_str(), VENDED_SAS),
+                ("adls.account-key", VENDED_ACCOUNT_KEY),
+            ],
+        );
+        let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
+
+        let resolved = resolve_vended_storage(&result, &anchor, false)
+            .expect("the vended request must be satisfiable");
+
+        match resolved {
+            StorageBackend::Adls {
+                cred: AdlsCred::Sas(sas),
+                ..
+            } => assert_eq!(sas, VENDED_SAS, "the SAS state must carry the vended SAS"),
+            StorageBackend::Adls {
+                cred: AdlsCred::AccountKey(_),
+                ..
+            } => panic!("the vended selector must never reach the account-key state"),
+            StorageBackend::S3(_) => panic!("an abfss:// location must not resolve to S3"),
+        }
     }
 }

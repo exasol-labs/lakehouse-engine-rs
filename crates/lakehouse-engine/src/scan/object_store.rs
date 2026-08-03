@@ -719,6 +719,36 @@ mod tests {
         }
     }
 
+    /// `s3a://` is the other S3-compatible scheme the plan admits at file-list
+    /// resolution time. `register_side_store`'s S3 arm never inspects the file
+    /// URI's scheme string — it reads only the URL's host as the bucket name —
+    /// so a `s3a://` side must register a store exactly like a `s3://` one,
+    /// just keyed under its own `s3a://` registry URL rather than translated
+    /// to `s3://`.
+    #[test]
+    fn register_side_store_registers_an_s3a_scheme_side() {
+        let mut spec = minimal_spec();
+        spec.files = vec![FileEntry::new(
+            "s3a://test-bucket/data/part-0.parquet",
+            1024,
+        )];
+        let ctx = SessionContext::new();
+        let expected = Url::parse("s3a://test-bucket").expect("URL must parse");
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("an s3a:// scheme side must register a store"),
+            Some(expected.clone())
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(&expected)
+                .is_ok(),
+            "the s3a:// side's store must be resolvable under its own registered key"
+        );
+    }
+
     /// A dimension side resolving to the fact side's bucket registers no second
     /// store: the registry already holds that key, so the call reports `None` and
     /// the already-registered fact store serves both sides. The skip is an
@@ -864,6 +894,37 @@ mod tests {
             register_side(&ctx, &spec, &join.files, &join.table_root)
                 .expect("dimension side in a different account must register"),
             Some(Url::parse("abfss://dims@acct2.dfs.core.windows.net").expect("URL must parse"))
+        );
+    }
+
+    /// `abfs://` appears nowhere else in this repository — the plan's scheme
+    /// mapping now admits it at file-list resolution time (task 1.1/1.3), but
+    /// until this test nothing proved the scan side could actually register a
+    /// store for it. `MicrosoftAzureBuilder::with_url` recognises `abfs` as a
+    /// host-suffix-matched scheme exactly like `abfss` (`object_store`'s
+    /// `azure::builder::parse_url` matches `"az" | "abfs" | "abfss"`
+    /// identically), so an `abfs://` side must register a store the same way.
+    #[test]
+    fn register_side_store_registers_an_abfs_scheme_side() {
+        let spec = adls_spec(
+            "abfs://container@acct.dfs.core.windows.net/db/table",
+            AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
+        );
+        let ctx = SessionContext::new();
+        let expected =
+            Url::parse("abfs://container@acct.dfs.core.windows.net").expect("URL must parse");
+
+        assert_eq!(
+            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
+                .expect("an abfs:// scheme side must register a store"),
+            Some(expected.clone())
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(&expected)
+                .is_ok(),
+            "the abfs:// side's store must be resolvable under its own registered key"
         );
     }
 
