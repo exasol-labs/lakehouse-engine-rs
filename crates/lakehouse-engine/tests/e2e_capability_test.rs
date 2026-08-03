@@ -1252,6 +1252,207 @@ fn e2e_stddev_variance_pushdown() {
 }
 
 // ---------------------------------------------------------------------------
+// 8.8b Statistical aggregate over an expression argument (declines, #179)
+// ---------------------------------------------------------------------------
+
+/// `STDDEV(score + id)` — a statistical aggregate over an expression rather than a
+/// bare column — returns the correct sample standard deviation.
+///
+/// The statistical family decomposes into (cnt, sum, sum_sq) sufficient statistics
+/// only over a bare source column, so the adapter declines the partial/merge
+/// decomposition for this shape and Exasol computes the statistic natively over the
+/// rows the scan returns. Before the decline the adapter accepted the shape and the
+/// query FAILED: measured 2026-07-31 against this same stack, `sqlCode 22002`,
+/// `partial aggregate SQL error: Schema error: No field named .`
+///
+/// The reference value is recomputed from the rows read back through a plain
+/// projection query, so the expectation never passes through the aggregate path
+/// under test. For this seed (id = 1..20, score = 5.0 * id) `score + id` is `6 * id`
+/// and the sample standard deviation is `6 * sqrt(35)`, asserted as a closed-form
+/// cross-check on the reference itself.
+#[test]
+fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT STDDEV(score + id) FROM {}", vs_table());
+
+    // A statistical partial column in the generated SQL is exactly the
+    // accepted-then-failing shape this decline removes.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed_sql.contains("PARTIAL_stat_"),
+        "STDDEV over an expression argument must NOT push a statistical \
+         partial/merge decomposition, got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 aggregate column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
+    let actual = parse_numeric(&cols[0][0]);
+
+    // Native reference over the SAME rows, read back as plain projected values.
+    let row_cols = conn.query_columns(&format!("SELECT score, id FROM {}", vs_table()));
+    let values: Vec<f64> = row_cols[0]
+        .iter()
+        .zip(row_cols[1].iter())
+        .map(|(score, id)| parse_numeric(score) + parse_numeric(id))
+        .collect();
+    let n = values.len() as f64;
+    assert!(
+        n > 1.0,
+        "the seed must return more than one row: {values:?}"
+    );
+    let mean = values.iter().sum::<f64>() / n;
+    let expected = (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+
+    let closed_form = 6.0 * 35.0f64.sqrt();
+    assert!(
+        (expected - closed_form).abs() / closed_form < 1e-9,
+        "the reference computed from the returned rows must match the seed's closed \
+         form {closed_form:.6}, got {expected:.6}"
+    );
+
+    let rel_err = (actual - expected).abs() / expected;
+    assert!(
+        rel_err < 1e-6,
+        "STDDEV(score + id) must be ≈{expected:.6} (sample standard deviation over \
+         the same rows), got {actual:.6} (rel_err={rel_err:.2e})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 8.8c Grouped statistical aggregate over an expression argument (declines, #179)
+// ---------------------------------------------------------------------------
+
+/// Sample standard deviation (divisor `n - 1`, matching Exasol's `STDDEV`
+/// default) of the values collected for one group.
+///
+/// Panics below two values rather than returning the NaN a relative-error
+/// comparison could not attribute to a missing row versus a wrong statistic.
+fn sample_stddev(values: &[f64]) -> f64 {
+    assert!(
+        values.len() > 1,
+        "a sample standard deviation needs more than one value: {values:?}"
+    );
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
+}
+
+/// Grouped `STDDEV(score + id)` over `GROUP BY MOD(id, 4)` returns each group's
+/// correct sample standard deviation.
+///
+/// The ungrouped sibling above covers `detect_aggregates`. Task 1.2 measured the
+/// same expression-argument shape as pushed-and-broken on the grouped
+/// `detect_group_by_aggregates` path too: `EXPLAIN VIRTUAL` returned status `ok`
+/// with a grouped partial-aggregate wrapper rendered, and execution failed with
+/// `sqlCode 22002`, `grouped partial aggregate SQL error: Schema error: No field
+/// named .` (measured 2026-07-31 against this same stack). The unit tests in
+/// `grouped_agg.rs` prove detection now declines; only a live grouped query
+/// proves Exasol then computes the right per-group statistic over the Tier 1b
+/// qualified wrapper the decline routes to.
+///
+/// The reference is recomputed in Rust from rows read back through a plain
+/// projection, never through a second aggregate query — an aggregate oracle
+/// would travel the same path under test and could agree with a wrong result.
+///
+/// For this seed (id = 1..20, score = 5.0 * id) `score + id` is `6 * id`, and
+/// each `MOD(id, 4)` group holds five ids spaced 4 apart — an arithmetic
+/// progression of common difference 24, whose sample standard deviation is
+/// `sqrt(2.5) * 24 = 12 * sqrt(10)` ≈ 37.947332 in every group. That closed form
+/// cross-checks the reference computation itself, and it sits well clear of the
+/// whole-table `6 * sqrt(35)` ≈ 35.496479, so a single global statistic repeated
+/// per group fails. Because all four groups share one standard deviation, group
+/// identity is guarded separately: the returned key set must equal the projected
+/// rows' distinct keys and the row count must equal the group count, so a
+/// dropped, duplicated, or mislabelled group cannot pass on the value alone.
+#[test]
+fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
+    const GROUP_MODULUS: i64 = 4;
+
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id, {GROUP_MODULUS}), STDDEV(score + id) FROM {} \
+         GROUP BY MOD(id, {GROUP_MODULUS}) ORDER BY 1",
+        vs_table()
+    );
+
+    // A statistical partial column in the generated SQL is exactly the
+    // accepted-then-failing grouped shape this decline removes.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed_sql.contains("PARTIAL_stat_"),
+        "grouped STDDEV over an expression argument must NOT push a statistical \
+         partial/merge decomposition, got:\n{pushed_sql}"
+    );
+
+    // Reference over the SAME rows, read back as plain projected values and
+    // grouped here rather than by any aggregate query.
+    let row_cols = conn.query_columns(&format!("SELECT id, score FROM {}", vs_table()));
+    let mut group_values: std::collections::BTreeMap<i64, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    for (id, score) in row_cols[0].iter().zip(row_cols[1].iter()) {
+        let id = parse_int(id);
+        group_values
+            .entry(id % GROUP_MODULUS)
+            .or_default()
+            .push(parse_numeric(score) + id as f64);
+    }
+    assert!(
+        !group_values.is_empty(),
+        "the seed must return rows through a plain projection"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 columns (group key, STDDEV): {cols:?}"
+    );
+    assert_eq!(
+        cols[0].len(),
+        group_values.len(),
+        "expected one row per distinct MOD(id, {GROUP_MODULUS}) group, got {} rows \
+         for {} groups — a dropped group must not pass silently: {cols:?}",
+        cols[0].len(),
+        group_values.len()
+    );
+
+    let actual: std::collections::BTreeMap<i64, f64> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(key, value)| (parse_numeric(key) as i64, parse_numeric(value)))
+        .collect();
+    assert_eq!(
+        actual.keys().copied().collect::<Vec<i64>>(),
+        group_values.keys().copied().collect::<Vec<i64>>(),
+        "the returned group keys must be exactly the projected rows' distinct \
+         MOD(id, {GROUP_MODULUS}) values"
+    );
+
+    let closed_form = 12.0 * 10.0f64.sqrt();
+    for (key, values) in &group_values {
+        let reference = sample_stddev(values);
+        assert!(
+            (reference - closed_form).abs() / closed_form < 1e-9,
+            "group {key}'s reference computed from the returned rows must match the \
+             seed's closed form {closed_form:.6}, got {reference:.6}"
+        );
+
+        let got = actual[key];
+        let rel_err = (got - reference).abs() / reference;
+        assert!(
+            rel_err < 1e-6,
+            "group {key}: STDDEV(score + id) must be ≈{reference:.6} (sample standard \
+             deviation over the same rows), got {got:.6} (rel_err={rel_err:.2e})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8.9  Filter-pushdown alignment helper (CAST / NEG / WEEK)
 // ---------------------------------------------------------------------------
 

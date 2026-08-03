@@ -2,13 +2,18 @@
 //!
 //! Extracted verbatim from the former flat `pushdown.rs`.
 
-use crate::scan::spec::{AggKind, AggregatePlan, FileEntry, ScanSpec, render_ordered};
+use crate::scan::spec::{
+    AggKind, AggregatePlan, FileEntry, PartialAggColumn, ScanSpec, partial_column_name,
+    render_ordered,
+};
 use crate::types::mapping::{exasol_type_from_json, parse_decimal_args};
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::single_group_agg::parse_agg_item;
-use super::support::{build_fan_out_inner, quote_ident, render_limit_offset};
+use super::support::{
+    build_fan_out_inner, cast_to_declared_type, quote_ident, render_limit_offset,
+};
 use super::topn::parse_sort_flags;
 
 /// Classification of one `selectList` item in a grouped-aggregate pushdown.
@@ -111,19 +116,14 @@ pub struct GroupedAggregateDetection {
 /// The result is placed in the outer wrapper SELECT (`SELECT <expr> FROM (...)
 /// GROUP BY GK_*`), so it must be a self-contained expression, never a column
 /// reference. Casting to the declared type keeps the pushdown output column type
-/// matching what Exasol validates positionally against `selectListDataTypes`
-/// (mirrors the group-key and aggregate cast discipline); the cast is skipped for
-/// the `VARCHAR(2000000)` default, matching `group_key_exasol_types`.
+/// matching what Exasol validates positionally against `selectListDataTypes`.
 fn constant_projection_sql(pushdown_req: &Json, select_index: usize, rendered: &str) -> String {
     let declared = pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array())
         .and_then(|d| d.get(select_index))
         .map(exasol_type_from_json);
-    match declared {
-        Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({rendered} AS {ty})"),
-        _ => rendered.to_string(),
-    }
+    cast_to_declared_type(rendered, declared.as_deref())
 }
 
 /// `selectList` item types that render to a bare literal value rather than a
@@ -624,11 +624,11 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // wrapper casts each back to its Exasol-declared type so the virtual-table result
     // column type matches what Exasol expects (e.g. DECIMAL for MOD(id,4)).
     let gk_select: Vec<String> = (0..group_keys.len())
-        .map(|i| match group_key_types.get(i) {
-            Some(ty) if ty != "VARCHAR(2000000)" => {
-                format!(r#"CAST("GK_{i}" AS {ty})"#)
-            }
-            _ => format!(r#""GK_{i}""#),
+        .map(|i| {
+            cast_to_declared_type(
+                &format!(r#""GK_{i}""#),
+                group_key_types.get(i).map(String::as_str),
+            )
         })
         .collect();
     let merge_items = cast_merge_items(aggregates, aggregate_types);
@@ -662,7 +662,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 declared_type,
                 ..
             } => render_scalar_over_merge(node, aggregates)
-                .map(|expr| cast_to_declared_type(&expr, declared_type)),
+                .map(|expr| cast_to_declared_type(&expr, Some(declared_type))),
         })
         .collect();
     let outer_select_str = outer_select.join(", ");
@@ -714,13 +714,18 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 
 /// Build the EMITS items for the aggregate fan-out, following the COLUMN CONTRACT.
 ///
+/// [`AggKind::partial_columns`] owns which columns exist and in what order, and
+/// [`partial_column_name`] owns what each is called; this function owns only each
+/// column's Exasol type.
+///
 /// `col_types` maps uppercase column names to their Exasol type strings.
 /// MIN/MAX partial columns use the target column's exact type.
 /// SUM partial columns: DOUBLE PRECISION stays DOUBLE PRECISION; DECIMAL(p,s) widens to
 /// DECIMAL(36,s) to avoid overflow; any other type falls back (callers should have validated
 /// via `validate_agg_col_types` before reaching here — see handle_pushdown).
-/// AVG partial sum stays DOUBLE PRECISION (AVG is inherently fractional).
-/// Stat (STDDEV/VARIANCE) family: cnt DECIMAL(20,0), sum/sumsq DOUBLE PRECISION.
+/// Every counting column is DECIMAL(20,0). AVG's partial sum and the stat family's
+/// sum/sumsq are DOUBLE PRECISION — AVG is inherently fractional, and the
+/// sufficient statistics are reconstructed in floating point.
 pub(super) fn partial_emits_items(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
@@ -734,51 +739,31 @@ pub(super) fn partial_emits_items(
             // `aggregate_exasol_types`/`selectListDataTypes`); the sole type source
             // for an expression-argument aggregate, which has no source column.
             let declared = aggregate_types.get(i).map(String::as_str);
-            match plan.kind {
-                AggKind::Count | AggKind::CountCol => {
-                    vec![format!(r#""PARTIAL_count_{i}" DECIMAL(20,0)"#)]
-                }
-                AggKind::Sum => {
-                    let ty = col_type_for(
+            plan.kind.partial_columns().iter().map(move |col| {
+                let ty = match col {
+                    PartialAggColumn::CountStar
+                    | PartialAggColumn::CountArg
+                    | PartialAggColumn::AvgCnt
+                    | PartialAggColumn::StatCnt => "DECIMAL(20,0)".to_string(),
+                    PartialAggColumn::AvgSum
+                    | PartialAggColumn::StatSum
+                    | PartialAggColumn::StatSumSq => "DOUBLE PRECISION".to_string(),
+                    PartialAggColumn::Sum => sum_emit_type(&col_type_for(
                         plan.column.as_deref(),
                         plan.arg_expr.as_deref(),
                         col_types,
                         declared,
-                    );
-                    let emit_ty = sum_emit_type(&ty);
-                    vec![format!(r#""PARTIAL_sum_{i}" {emit_ty}"#)]
-                }
-                AggKind::Min => {
-                    let ty = col_type_for(
+                    )),
+                    PartialAggColumn::Min | PartialAggColumn::Max => col_type_for(
                         plan.column.as_deref(),
                         plan.arg_expr.as_deref(),
                         col_types,
                         declared,
-                    );
-                    vec![format!(r#""PARTIAL_min_{i}" {ty}"#)]
-                }
-                AggKind::Max => {
-                    let ty = col_type_for(
-                        plan.column.as_deref(),
-                        plan.arg_expr.as_deref(),
-                        col_types,
-                        declared,
-                    );
-                    vec![format!(r#""PARTIAL_max_{i}" {ty}"#)]
-                }
-                AggKind::Avg => vec![
-                    format!(r#""PARTIAL_avg_sum_{i}" DOUBLE PRECISION"#),
-                    format!(r#""PARTIAL_avg_cnt_{i}" DECIMAL(20,0)"#),
-                ],
-                // Stat family: 3 columns — cnt (DECIMAL), sum (DOUBLE), sumsq (DOUBLE).
-                AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
-                    vec![
-                        format!(r#""PARTIAL_stat_cnt_{i}" DECIMAL(20,0)"#),
-                        format!(r#""PARTIAL_stat_sum_{i}" DOUBLE PRECISION"#),
-                        format!(r#""PARTIAL_stat_sumsq_{i}" DOUBLE PRECISION"#),
-                    ]
-                }
-            }
+                    ),
+                };
+                let name = partial_column_name(*col, i);
+                format!(r#""{name}" {ty}"#)
+            })
         })
         .collect()
 }
@@ -880,7 +865,52 @@ fn is_numeric_exasol_type(ty: &str) -> bool {
     ty == "DOUBLE PRECISION" || ty.starts_with("DECIMAL(")
 }
 
+/// The three König–Huygens SQL fragments shared by all four statistical merge
+/// formulas, rendered over the partial columns of the aggregate at ordinal `i`.
+///
+/// Held as one value so [`merge_select_items`]' four statistical arms compose
+/// them by name instead of re-inlining the text: a variance is
+/// `numer / pop_denom` or `numer / samp_denom`, and a standard deviation is
+/// [`stddev_of`] applied to either. `numer` carries its own outer parentheses,
+/// so no composition adds any.
+struct StatMergeFragments {
+    numer: String,
+    pop_denom: String,
+    samp_denom: String,
+}
+
+impl StatMergeFragments {
+    fn for_ordinal(i: usize) -> Self {
+        let cnt = partial_column_name(PartialAggColumn::StatCnt, i);
+        let sum = partial_column_name(PartialAggColumn::StatSum, i);
+        let sumsq = partial_column_name(PartialAggColumn::StatSumSq, i);
+        let pop_denom = format!(r#"NULLIF(SUM("{cnt}"), 0)"#);
+        let samp_denom =
+            format!(r#"CASE WHEN SUM("{cnt}") <= 1 THEN NULL ELSE SUM("{cnt}") - 1 END"#);
+        let numer = format!(r#"(SUM("{sumsq}") - SUM("{sum}") * SUM("{sum}") / {pop_denom})"#);
+        Self {
+            numer,
+            pop_denom,
+            samp_denom,
+        }
+    }
+}
+
+/// Render the NULL-preserving square root of a variance expression.
+///
+/// Adds exactly one parenthesis pair — around the `IS NULL` subject — and none
+/// around the `GREATEST` argument; that is the nesting the merge SQL is pinned
+/// to. See [`merge_select_items`] for why the `IS NULL` test cannot be folded
+/// into `GREATEST`.
+fn stddev_of(var: &str) -> String {
+    format!("CASE WHEN ({var}) IS NULL THEN NULL ELSE SQRT(GREATEST(0.0, {var})) END")
+}
+
 /// Build the outer merge SELECT items following the COLUMN CONTRACT.
+///
+/// Every partial column name comes from [`partial_column_name`], so a rename can
+/// never land here without also landing in the scan's aliases and the `EMITS`
+/// clause; this function owns only the re-aggregation formula per [`AggKind`].
 ///
 /// AVG uses `SUM(sum) / NULLIF(SUM(cnt), 0)` — the NULLIF guard ensures division
 /// by zero yields NULL rather than an error (Exasol: `x / NULL = NULL`).
@@ -904,58 +934,46 @@ fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
         .iter()
         .enumerate()
         .map(|(i, plan)| match plan.kind {
-            AggKind::Count | AggKind::CountCol => format!(r#"SUM("PARTIAL_count_{i}")"#),
-            AggKind::Sum => format!(r#"SUM("PARTIAL_sum_{i}")"#),
-            AggKind::Min => format!(r#"MIN("PARTIAL_min_{i}")"#),
-            AggKind::Max => format!(r#"MAX("PARTIAL_max_{i}")"#),
+            AggKind::Count => {
+                let count = partial_column_name(PartialAggColumn::CountStar, i);
+                format!(r#"SUM("{count}")"#)
+            }
+            AggKind::CountCol => {
+                let count = partial_column_name(PartialAggColumn::CountArg, i);
+                format!(r#"SUM("{count}")"#)
+            }
+            AggKind::Sum => {
+                let sum = partial_column_name(PartialAggColumn::Sum, i);
+                format!(r#"SUM("{sum}")"#)
+            }
+            AggKind::Min => {
+                let min = partial_column_name(PartialAggColumn::Min, i);
+                format!(r#"MIN("{min}")"#)
+            }
+            AggKind::Max => {
+                let max = partial_column_name(PartialAggColumn::Max, i);
+                format!(r#"MAX("{max}")"#)
+            }
             AggKind::Avg => {
-                format!(r#"SUM("PARTIAL_avg_sum_{i}") / NULLIF(SUM("PARTIAL_avg_cnt_{i}"), 0)"#)
+                let sum = partial_column_name(PartialAggColumn::AvgSum, i);
+                let cnt = partial_column_name(PartialAggColumn::AvgCnt, i);
+                format!(r#"SUM("{sum}") / NULLIF(SUM("{cnt}"), 0)"#)
             }
             AggKind::VarPop => {
-                // numer / SUM(cnt); NULL when cnt = 0
-                format!(
-                    concat!(
-                        r#"(SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0)"#,
-                    ),
-                    i = i
-                )
+                let stat = StatMergeFragments::for_ordinal(i);
+                format!("{} / {}", stat.numer, stat.pop_denom)
             }
             AggKind::VarSamp => {
-                // numer / (N-1); NULL when cnt <= 1
-                format!(
-                    concat!(
-                        r#"(SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END"#,
-                    ),
-                    i = i
-                )
+                let stat = StatMergeFragments::for_ordinal(i);
+                format!("{} / {}", stat.numer, stat.samp_denom)
             }
             AggKind::StddevPop => {
-                // CASE IS NULL guard: Exasol GREATEST(0.0, NULL) = 0.0, not NULL.
-                // Without the CASE, N=0 would yield SQRT(0.0) = 0.0 instead of NULL.
-                format!(
-                    concat!(
-                        r#"CASE WHEN ((SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0)) IS NULL THEN NULL"#,
-                        r#" ELSE SQRT(GREATEST(0.0, (SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))) END"#,
-                    ),
-                    i = i
-                )
+                let stat = StatMergeFragments::for_ordinal(i);
+                stddev_of(&format!("{} / {}", stat.numer, stat.pop_denom))
             }
             AggKind::StddevSamp => {
-                // CASE IS NULL guard: Exasol GREATEST(0.0, NULL) = 0.0, not NULL.
-                // Without the CASE, N<=1 would yield SQRT(0.0) = 0.0 instead of NULL.
-                format!(
-                    concat!(
-                        r#"CASE WHEN ((SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END) IS NULL THEN NULL"#,
-                        r#" ELSE SQRT(GREATEST(0.0, (SUM("PARTIAL_stat_sumsq_{i}") - SUM("PARTIAL_stat_sum_{i}") * SUM("PARTIAL_stat_sum_{i}") / NULLIF(SUM("PARTIAL_stat_cnt_{i}"), 0))"#,
-                        r#" / CASE WHEN SUM("PARTIAL_stat_cnt_{i}") <= 1 THEN NULL ELSE SUM("PARTIAL_stat_cnt_{i}") - 1 END)) END"#,
-                    ),
-                    i = i
-                )
+                let stat = StatMergeFragments::for_ordinal(i);
+                stddev_of(&format!("{} / {}", stat.numer, stat.samp_denom))
             }
         })
         .collect()
@@ -1103,24 +1121,8 @@ pub(super) fn cast_merge_items(
     merge_select_items(aggregates)
         .into_iter()
         .enumerate()
-        .map(|(i, expr)| match aggregate_types.get(i) {
-            Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
-            _ => expr,
-        })
+        .map(|(i, expr)| cast_to_declared_type(&expr, aggregate_types.get(i).map(String::as_str)))
         .collect()
-}
-
-/// Wrap an already-rendered outer-wrapper expression in `CAST(... AS <ty>)` unless
-/// the declared type is the `VARCHAR(2000000)` default — the same cast discipline
-/// as `cast_merge_items`, `constant_projection_sql`, and the group-key cast, so a
-/// scalar-over-aggregate item's output column type matches what Exasol validates
-/// positionally against `selectListDataTypes`.
-fn cast_to_declared_type(expr: &str, declared_type: &str) -> String {
-    if declared_type != "VARCHAR(2000000)" {
-        format!("CAST({expr} AS {declared_type})")
-    } else {
-        expr.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -3603,6 +3605,80 @@ mod tests {
         }
     }
 
+    /// The scan's partial SELECT list and the adapter's `EMITS` clause name the
+    /// same partial columns, in the same order, for every `AggKind`.
+    ///
+    /// The two lists are built in different modules and are otherwise only
+    /// validated against each other at query time inside Exasol, where a
+    /// mismatch surfaces as a wrong value or an `EMITS` arity error rather than
+    /// as a test failure. The variant list below is an explicit literal: a
+    /// variant added later that it omits is caught by the compile error
+    /// `AggKind::partial_columns` raises, not here, so this test asserts
+    /// alignment and never doubles as an exhaustiveness check it cannot enforce.
+    #[test]
+    fn scan_select_list_and_emits_agree_per_agg_kind() {
+        /// Every `PARTIAL_…` name in `text`, in order of appearance. Both sides
+        /// terminate the name with a double quote — the scan as
+        /// `AS "PARTIAL_…"`, the `EMITS` item as `"PARTIAL_…" <type>`.
+        fn partial_names_in(text: &str) -> Vec<String> {
+            let mut names = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find("PARTIAL_") {
+                let tail = &rest[start..];
+                let end = tail
+                    .find('"')
+                    .expect("a PARTIAL_ name is always double-quote terminated");
+                names.push(tail[..end].to_string());
+                rest = &tail[end..];
+            }
+            names
+        }
+
+        let all_kinds = [
+            AggKind::Count,
+            AggKind::CountCol,
+            AggKind::Sum,
+            AggKind::Min,
+            AggKind::Max,
+            AggKind::Avg,
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ];
+        let col_types = vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
+
+        let plan_for = |kind: &AggKind| AggregatePlan {
+            kind: kind.clone(),
+            column: match kind {
+                AggKind::Count => None,
+                _ => Some("SCORE".to_string()),
+            },
+            arg_expr: None,
+        };
+
+        for kind in &all_kinds {
+            let plans = vec![plan_for(kind)];
+            let scan_names =
+                partial_names_in(&crate::scan::build_partial_agg_sql(&plans, "aliased"));
+            let emits_names =
+                partial_names_in(&partial_emits_items(&plans, &col_types, &[]).join(", "));
+            assert_eq!(
+                scan_names, emits_names,
+                "{kind:?}: scan SELECT list and EMITS clause disagree"
+            );
+        }
+
+        // The same agreement under mixed arities, where a plan ordinal and a
+        // column ordinal diverge — the shape a per-kind check cannot reach.
+        let mixed: Vec<AggregatePlan> = all_kinds.iter().map(plan_for).collect();
+        assert_eq!(
+            partial_names_in(&crate::scan::build_partial_agg_sql(&mixed, "aliased")),
+            partial_names_in(&partial_emits_items(&mixed, &col_types, &[]).join(", ")),
+            "mixed-arity plan list: scan SELECT list and EMITS clause disagree"
+        );
+    }
+
     /// merge_select_items produces the correct reconstruction SQL for VAR_POP.
     #[test]
     fn var_pop_merge_formula_divides_by_n() {
@@ -3790,6 +3866,94 @@ mod tests {
         assert!(
             having_pos > group_by_pos,
             "HAVING must appear after GROUP BY: {sql}"
+        );
+    }
+
+    /// Grouped path: a `function_aggregate` select item whose statistical aggregate
+    /// takes an expression argument declines the WHOLE grouped detection, so the
+    /// request routes to the Tier 1b qualified single-table wrapper and Exasol
+    /// computes the statistic over its rows.
+    ///
+    /// Measured 2026-07-31 against the Docker Exasol container: `SELECT MOD(id, 4),
+    /// STDDEV(score + id) FROM MY_LAKEHOUSE.EVENTS GROUP BY MOD(id, 4)` is PUSHED by
+    /// Exasol and fails with `sqlCode 22002`, `grouped partial aggregate SQL error:
+    /// Schema error: No field named .`
+    #[test]
+    fn grouped_stat_aggregate_over_expression_argument_declines() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([
+                mod_item("ID", 4),
+                agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
+            ]),
+            serde_json::json!([decimal_type(9, 0), {"type": "double"}]),
+        );
+        assert!(
+            detect_group_by_aggregates(&req).is_none(),
+            "a grouped STDDEV over an expression argument must decline the grouped \
+             partial/merge path"
+        );
+    }
+
+    /// Grouped scalar-over-aggregate path: a select item WRAPPING a statistical
+    /// aggregate over an expression argument (`SQRT(STDDEV(<expr>))`) does not
+    /// classify, which declines the whole grouped detection and routes the request
+    /// to the qualified single-table wrapper.
+    ///
+    /// Measured 2026-07-31: `SELECT MOD(id, 4), SQRT(STDDEV(score + id)) FROM
+    /// MY_LAKEHOUSE.EVENTS GROUP BY MOD(id, 4)` is PUSHED by Exasol as a
+    /// scalar-over-aggregate — the merge wrapper renders — and fails with `sqlCode
+    /// 22002`, `grouped partial aggregate SQL error: Schema error: No field named .`
+    #[test]
+    fn scalar_over_stat_aggregate_with_expression_argument_declines() {
+        let sqrt_over_stat = serde_json::json!({
+            "type": "function_scalar",
+            "name": "SQRT",
+            "arguments": [agg_item_expr("STDDEV", mod_item("SCORE", 4), false)],
+        });
+        assert!(
+            classify_scalar_over_aggregate(&sqrt_over_stat).is_none(),
+            "a scalar wrapping a stat aggregate over an expression must not classify"
+        );
+
+        let req = make_group_by_request_with_types(
+            serde_json::json!([mod_item("ID", 4)]),
+            serde_json::json!([mod_item("ID", 4), sqrt_over_stat]),
+            serde_json::json!([decimal_type(9, 0), {"type": "double"}]),
+        );
+        assert!(
+            detect_group_by_aggregates(&req).is_none(),
+            "an unclassifiable scalar-over-aggregate item must decline the whole \
+             grouped detection"
+        );
+    }
+
+    /// HAVING path: a HAVING comparing a statistical aggregate over an expression
+    /// argument does not render over the merge wrapper, so `classify_request_shape`
+    /// routes the request to the qualified single-table wrapper rather than emit a
+    /// HAVING over a partial column no scan produces.
+    ///
+    /// The `plans` slot here is the shape the pre-decline parse produced — a
+    /// statistical kind carrying neither a source column nor a rendered argument.
+    /// Matching that slot is what the decline now prevents; the realistic route,
+    /// where the select list carries the same shape, is declined earlier by
+    /// `grouped_stat_aggregate_over_expression_argument_declines`.
+    #[test]
+    fn having_over_stat_aggregate_with_expression_argument_declines() {
+        let having = serde_json::json!({
+            "type": "predicate_greater",
+            "left": agg_item_expr("STDDEV", mod_item("SCORE", 4), false),
+            "right": {"type": "literal_double", "value": 5.0},
+        });
+        let plans = vec![AggregatePlan {
+            kind: AggKind::StddevSamp,
+            column: None,
+            arg_expr: None,
+        }];
+        assert!(
+            render_having_over_merge(&having, &plans).is_none(),
+            "a HAVING over a stat aggregate with an expression argument must not \
+             render over the merge wrapper"
         );
     }
 }
