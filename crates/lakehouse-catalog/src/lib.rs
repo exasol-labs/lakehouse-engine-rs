@@ -19,8 +19,8 @@ mod test_support;
 
 pub use creds::{CatalogProps, ConnectionCreds, StorageProps};
 pub use namespace::{list_namespace_tables, parse_table_ident};
-pub use redaction::{redact_credentials, redact_secret_values};
+pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};
-pub use storage::StorageBackend;
+pub use storage::{AdlsCred, StorageBackend};
 
 pub use vended::resolve_vended_storage;

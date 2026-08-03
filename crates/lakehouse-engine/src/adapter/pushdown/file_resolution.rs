@@ -10,7 +10,7 @@ use iceberg::TableIdent;
 use serde_json::Value as Json;
 
 use lakehouse_catalog::{
-    CatalogSession, load_table_any_auth, parse_table_ident, redact_credentials,
+    CatalogSession, load_table_any_auth, parse_table_ident, redact_credentials, redact_error_text,
     resolve_vended_storage,
 };
 
@@ -205,6 +205,11 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 /// returns `(files, storage.clone())` — byte-identical to the no-vending behaviour
 /// on every auth mode.
 ///
+/// Every error surfaced from here on is redacted against the secret values of the
+/// EFFECTIVE storage, not the static one: the `file_io` built from it is what talks
+/// to object storage, so those are exactly the values an underlying provider error
+/// can echo back.
+///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
 pub async fn resolve_file_list(
@@ -250,6 +255,7 @@ pub async fn resolve_file_list(
     } else {
         storage.clone()
     };
+    let secrets = effective_storage.secret_values();
 
     // Build the iceberg Table so plan_files() can read manifests from S3.
     let (namespace, table_name) = parse_table_ident(&catalog_props.table)?;
@@ -258,7 +264,7 @@ pub async fn resolve_file_list(
     let runtime = iceberg::Runtime::try_current().map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_credentials(&e.to_string())
+            redact_error_text(&e.to_string(), &secrets)
         ))
     })?;
     let table_builder = iceberg::table::Table::builder()
@@ -274,7 +280,7 @@ pub async fn resolve_file_list(
     .map_err(|e| {
         UdfError::User(format!(
             "failed to build Iceberg table: {}",
-            redact_credentials(&e.to_string())
+            redact_error_text(&e.to_string(), &secrets)
         ))
     })?;
 
@@ -299,9 +305,9 @@ pub async fn resolve_file_list(
     // deletion vector, ORC/Avro data or delete file) BEFORE building any
     // scan-driving SQL. This must run before `plan_files_from_table` so the deletes
     // it associates are guaranteed to be applicable Parquet positional deletes.
-    ensure_supported_delete_mechanisms(&table, &catalog_props.table).await?;
+    ensure_supported_delete_mechanisms(&table, &catalog_props.table, &secrets).await?;
 
-    let files = plan_files_from_table(table, &catalog_props.table, filter_json).await?;
+    let files = plan_files_from_table(table, &catalog_props.table, filter_json, &secrets).await?;
     Ok((
         files,
         effective_storage,
@@ -414,9 +420,14 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
 /// Parquet positional delete from a deletion vector.
 ///
 /// A table with no current snapshot (empty table) trivially passes.
+///
+/// Every manifest read here goes through the caller's object-store credentials, so
+/// `secrets` carries their literal values for the value-based half of
+/// [`redact_error_text`].
 async fn ensure_supported_delete_mechanisms(
     table: &iceberg::table::Table,
     table_name: &str,
+    secrets: &[&str],
 ) -> Result<(), UdfError> {
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
@@ -430,7 +441,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to open Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_credentials(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?
         .read()
@@ -439,7 +450,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to read Iceberg manifest list for '{}': {}",
                 table_name,
-                redact_credentials(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?;
 
@@ -451,7 +462,7 @@ async fn ensure_supported_delete_mechanisms(
         UdfError::User(format!(
             "failed to parse Iceberg manifest list for '{}': {}",
             table_name,
-            redact_credentials(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
@@ -460,7 +471,7 @@ async fn ensure_supported_delete_mechanisms(
             UdfError::User(format!(
                 "failed to load Iceberg manifest for '{}': {}",
                 table_name,
-                redact_credentials(&e.to_string())
+                redact_error_text(&e.to_string(), secrets)
             ))
         })?;
         for entry in manifest.entries() {
@@ -478,11 +489,6 @@ async fn ensure_supported_delete_mechanisms(
     Ok(())
 }
 
-/// Drive the iceberg scan and collect the data-file paths with their sizes.
-///
-/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
-/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
-/// remains the row-level correctness backstop; this is pruning-only.
 /// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
 ///
 /// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
@@ -502,10 +508,20 @@ fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileConte
     }
 }
 
+/// Drive the iceberg scan and collect the data-file paths with their sizes.
+///
+/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
+/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
+/// remains the row-level correctness backstop; this is pruning-only.
+///
+/// `secrets` carries the literal values of the object-store credentials the scan
+/// planning below reads manifests with, for the value-based half of
+/// [`redact_error_text`].
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
     filter_json: Option<&Json>,
+    secrets: &[&str],
 ) -> Result<Vec<FileEntry>, UdfError> {
     let mut scan_builder = table.scan();
     if let Some(fj) = filter_json {
@@ -514,23 +530,25 @@ async fn plan_files_from_table(
             scan_builder = scan_builder.with_filter(pred);
         }
     }
-    let scan = scan_builder
-        .select_all()
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build Iceberg scan: {e}")))?;
+    let scan = scan_builder.select_all().build().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg scan: {}",
+            redact_error_text(&e.to_string(), secrets)
+        ))
+    })?;
 
     let task_stream = scan.plan_files().await.map_err(|e| {
         UdfError::User(format!(
             "failed to plan Iceberg files for '{}': {}",
             table_name,
-            redact_credentials(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
     let tasks: Vec<_> = task_stream.try_collect().await.map_err(|e| {
         UdfError::User(format!(
             "failed to collect Iceberg file tasks: {}",
-            redact_credentials(&e.to_string())
+            redact_error_text(&e.to_string(), secrets)
         ))
     })?;
 
@@ -909,6 +927,53 @@ mod tests {
         );
     }
 
+    /// A manifest-read error that echoes Azure static credentials verbatim has
+    /// BOTH literal values stripped — not merely their labels.
+    ///
+    /// The two credentials fail the label heuristic in different ways, so each
+    /// independently requires the value-based pass:
+    ///   - the account key is echoed bare inside a string-to-sign, with no
+    ///     recognizable label anywhere near it;
+    ///   - the SAS token carries its OWN `sig=` label, so a label-only pass
+    ///     rewrites the middle of the token and leaves its permission and expiry
+    ///     fields verbatim.
+    #[test]
+    fn manifest_read_errors_redact_the_literal_azure_secret_values() {
+        let account_key = "Zm9vYmFyYmF6cXV1eGNvcmdlc2VjcmV0QUNDT1VOVEtFWT09";
+        let sas_permissions = "sp=racwdlmeop";
+        let sas_token = format!(
+            "sv=2024-11-04&ss=bf&srt=sco&{sas_permissions}&se=2026-12-31T23:59:59Z&sig=aB3%2FxQ7"
+        );
+        let raw = format!(
+            "AuthenticationFailed: Server failed to authenticate the request. \
+             String to sign used was: {account_key}. \
+             Request URL: https://acct.dfs.core.windows.net/c/meta/snap.avro?{sas_token}"
+        );
+        let secrets = [account_key, sas_token.as_str()];
+
+        let surfaced = format!(
+            "failed to read Iceberg manifest list for 'ns.tbl': {}",
+            redact_error_text(&raw, &secrets)
+        );
+
+        assert!(
+            !surfaced.contains(account_key),
+            "account key value must not survive: {surfaced}"
+        );
+        assert!(
+            !surfaced.contains(&sas_token),
+            "SAS token value must not survive: {surfaced}"
+        );
+        assert!(
+            !surfaced.contains(sas_permissions),
+            "the SAS token's permission field must not survive either: {surfaced}"
+        );
+        assert!(
+            surfaced.contains("failed to read Iceberg manifest list for 'ns.tbl'"),
+            "the actionable context must be preserved: {surfaced}"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
     // ---------------------------------------------------------------------------
@@ -1025,6 +1090,31 @@ mod tests {
                 "round-trip must be identity for {original}"
             );
         }
+    }
+
+    /// The `abfss://` scheme carries userinfo (the container name) in its
+    /// authority (`abfss://<container>@<account>.dfs.core.windows.net/...`),
+    /// unlike `s3://`'s bare-bucket authority. The relativize/reconstruct round
+    /// trip must still be lossless: relativizing an under-root `abfss://` file
+    /// path against its table root and reconstructing via the scan UDF's join
+    /// rule must reproduce the original URI byte-for-byte, exactly like the
+    /// `s3://` case above.
+    #[test]
+    fn abfss_paths_relativize_and_reconstruct_losslessly() {
+        let root = "abfss://container@account.dfs.core.windows.net/db/table";
+        let original = format!("{root}/data/part-0.parquet");
+
+        let relative = relativize_path_to_root(&original, root);
+        assert_eq!(
+            relative, "data/part-0.parquet",
+            "abfss path under the root must relativize just like s3"
+        );
+
+        let reconstructed = reconstruct_abs_uri_mirror(&relative, root);
+        assert_eq!(
+            reconstructed, original,
+            "reconstructed abfss URI must equal the original byte-for-byte"
+        );
     }
 
     // ---------------------------------------------------------------------------
