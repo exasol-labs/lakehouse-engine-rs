@@ -52,7 +52,7 @@ use common::seed::{
     seed_events_table_with_auth,
 };
 use common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
+    self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
     wait_for_exasol, wait_for_minio, wait_for_url,
 };
 
@@ -125,7 +125,10 @@ fn setup() {
         let host_catalog = lakekeeper_catalog_url_host();
         for warehouse in [WAREHOUSE_STATIC, WAREHOUSE_VENDED] {
             let token = lakekeeper::keycloak_client_credentials_token();
-            let auth = SeedCatalogAuth { token: Some(token) };
+            let auth = SeedCatalogAuth {
+                token: Some(token),
+                ..Default::default()
+            };
             rt.block_on(async {
                 seed_events_table_with_auth(&host_catalog, warehouse, auth)
                     .await
@@ -574,13 +577,7 @@ fn lakekeeper_credentials_never_appear_in_output() {
         Ok(_) => panic!("expected execute() to fail on the malformed credential-bearing DDL"),
         Err(p) => p,
     };
-    let panic_msg: String = if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        String::new()
-    };
+    let panic_msg = stack::panic_payload_message(&*payload).unwrap_or_default();
 
     assert!(
         !panic_msg.is_empty(),

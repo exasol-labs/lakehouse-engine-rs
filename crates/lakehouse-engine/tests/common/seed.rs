@@ -34,7 +34,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use futures::TryStreamExt;
 use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS,
+    S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
     DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveType, Schema as IcebergSchema,
@@ -132,20 +133,44 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     Ok(events_handle)
 }
 
-/// Optional authentication for a seed catalog. `Default` (`None`) reproduces
-/// the unauthenticated, static-MinIO-credential baseline that
+/// Which object store a seed catalog writes its data files through.
+///
+/// `Default` is the static MinIO baseline every pre-Azure suite seeds against, so
+/// `SeedCatalogAuth::default()` keeps reproducing the original behavior exactly.
+#[derive(Clone, Default)]
+pub enum SeedStorage {
+    /// Static MinIO admin credentials — the baseline for the REST-fixture and
+    /// Lakekeeper MinIO suites.
+    #[default]
+    Minio,
+    /// ADLS Gen2 under a storage-account key — the Azure suite's path under
+    /// test. The container-lifecycle service principal must never appear here,
+    /// or seeding would succeed without exercising the account-key path.
+    Adls {
+        account_name: String,
+        account_key: String,
+    },
+}
+
+/// Optional authentication and storage selection for a seed catalog. `Default`
+/// reproduces the unauthenticated, static-MinIO-credential baseline that
 /// [`build_seed_catalog`] shipped before Lakekeeper support.
 ///
 /// A non-empty `token` is sent to the REST catalog as a static bearer
 /// credential. This is the only catalog-auth mode the Lakekeeper E2E suite uses:
 /// its setup obtains a bearer token from Keycloak's client-credentials grant and
 /// passes it here. (The suite does NOT drive the REST client's own OAuth2
-/// client-credentials flow for seeding, nor does it override S3 storage
-/// credentials — the storage credentials are forced static unconditionally by
-/// [`build_seed_catalog_with_auth`]; see there for why.)
+/// client-credentials flow for seeding.)
+///
+/// `storage` selects the object store. [`SeedStorage::Minio`] forces static S3
+/// credentials, overriding whatever the catalog vends (see
+/// [`build_seed_catalog_with_auth`]); [`SeedStorage::Adls`] carries its account
+/// key in the properties and overrides nothing — a `sas-enabled: false` ADLS
+/// warehouse vends no credentials to override.
 #[derive(Clone, Default)]
 pub struct SeedCatalogAuth {
     pub token: Option<String>,
+    pub storage: SeedStorage,
 }
 
 // REST-catalog auth property key (literal string, fixed by `iceberg-catalog-rest`;
@@ -203,26 +228,39 @@ impl ProvideCredential for StaticS3CredentialProvider {
 /// Build the REST-catalog property map for a seed catalog from `auth`.
 ///
 /// Pure (no I/O) so the credential/storage wiring is unit-testable without a
-/// live catalog. Storage is the static MinIO baseline; catalog auth is a static
-/// bearer `token` when supplied (non-empty), otherwise none.
+/// live catalog. Storage properties follow `auth.storage`; catalog auth is a static
+/// bearer `token` when supplied (non-empty), otherwise none. The two storage arms
+/// are mutually exclusive: an ADLS seed carries no S3 property at all, so a MinIO
+/// credential can never travel with an Azure warehouse.
 fn seed_catalog_props(
     catalog_url: &str,
     warehouse: &str,
     auth: &SeedCatalogAuth,
 ) -> HashMap<String, String> {
-    let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
-
     let mut props = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_url.to_string());
     props.insert(
         REST_CATALOG_PROP_WAREHOUSE.to_string(),
         warehouse.to_string(),
     );
-    props.insert(S3_ENDPOINT.to_string(), endpoint);
-    props.insert(S3_REGION.to_string(), region);
-    props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
-    props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
-    props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
+
+    match &auth.storage {
+        SeedStorage::Minio => {
+            let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
+            props.insert(S3_ENDPOINT.to_string(), endpoint);
+            props.insert(S3_REGION.to_string(), region);
+            props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
+            props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
+            props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
+        }
+        SeedStorage::Adls {
+            account_name,
+            account_key,
+        } => {
+            props.insert(ADLS_ACCOUNT_NAME.to_string(), account_name.clone());
+            props.insert(ADLS_ACCOUNT_KEY.to_string(), account_key.clone());
+        }
+    }
 
     if let Some(token) = auth.token.as_deref().filter(|v| !v.is_empty()) {
         props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
@@ -247,9 +285,9 @@ pub async fn build_seed_catalog(
 /// Build a REST catalog client for seed operations with explicit `auth`.
 ///
 /// Extends [`build_seed_catalog`] so seeding can target an OAuth2-secured
-/// Lakekeeper warehouse via a static bearer catalog-auth token.
-/// `SeedCatalogAuth::default()` reproduces the unauthenticated static-MinIO
-/// baseline exactly.
+/// Lakekeeper warehouse via a static bearer catalog-auth token, over either
+/// storage backend. `SeedCatalogAuth::default()` reproduces the unauthenticated
+/// static-MinIO baseline exactly.
 pub async fn build_seed_catalog_with_auth(
     catalog_url: &str,
     warehouse: &str,
@@ -258,31 +296,42 @@ pub async fn build_seed_catalog_with_auth(
 ) -> Result<impl Catalog> {
     let props = seed_catalog_props(catalog_url, warehouse, &auth);
 
-    // Force the STATIC S3 credentials for ALL storage I/O, overriding whatever the
-    // catalog vends per-table. Lakekeeper's `sts-enabled` (vended) warehouse
-    // returns short-lived STS session-token credentials in each table's
-    // `loadTable`/`config` response, and iceberg-catalog-rest merges that config
-    // OVER the static builder props (`RestCatalog::load_file_io`: `props.extend(
-    // config)`), so the seed WRITE path would otherwise sign with the vended
-    // session token — which MinIO rejects with `InvalidTokenId`. Installing a
-    // `CustomAwsCredentialLoader` makes opendal's S3 backend use this
-    // credential-provider chain in place of the config-derived credentials (a
-    // user-supplied chain REPLACES the default/static provider), so seeding always
-    // writes with the static admin credentials regardless of the warehouse's
-    // vended-creds flag. The static warehouse never vends creds, so its seeding
-    // behavior is unchanged (the loader returns the same `minioadmin` credentials
-    // the props already carried). This is a seed-harness-only override; the
-    // adapter's own read path handles vended credentials correctly.
-    let (_, _, access_key, secret_key, _) = seed_storage_config();
-    let credential_loader = CustomAwsCredentialLoader::new(StaticS3CredentialProvider {
-        access_key_id: access_key,
-        secret_access_key: secret_key,
-    });
+    let storage_factory: Arc<dyn StorageFactory> = match &auth.storage {
+        // Force the STATIC S3 credentials for ALL storage I/O, overriding whatever
+        // the catalog vends per-table. Lakekeeper's `sts-enabled` (vended) warehouse
+        // returns short-lived STS session-token credentials in each table's
+        // `loadTable`/`config` response, and iceberg-catalog-rest merges that config
+        // OVER the static builder props (`RestCatalog::load_file_io`: `props.extend(
+        // config)`), so the seed WRITE path would otherwise sign with the vended
+        // session token — which MinIO rejects with `InvalidTokenId`. Installing a
+        // `CustomAwsCredentialLoader` makes opendal's S3 backend use this
+        // credential-provider chain in place of the config-derived credentials (a
+        // user-supplied chain REPLACES the default/static provider), so seeding
+        // always writes with the static admin credentials regardless of the
+        // warehouse's vended-creds flag. The static warehouse never vends creds, so
+        // its seeding behavior is unchanged (the loader returns the same
+        // `minioadmin` credentials the props already carried). This is a
+        // seed-harness-only override; the adapter's own read path handles vended
+        // credentials correctly.
+        SeedStorage::Minio => {
+            let (_, _, access_key, secret_key, _) = seed_storage_config();
+            Arc::new(OpenDalStorageFactory::S3 {
+                customized_credential_load: Some(CustomAwsCredentialLoader::new(
+                    StaticS3CredentialProvider {
+                        access_key_id: access_key,
+                        secret_access_key: secret_key,
+                    },
+                )),
+            })
+        }
+        // No override needed: the Azure warehouse is `sas-enabled: false`, so
+        // Lakekeeper vends nothing here to clobber — the account-key property
+        // `seed_catalog_props` set is the only credential in play.
+        SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
+    };
 
     RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(credential_loader),
-        }))
+        .with_storage_factory(storage_factory)
         .load(label, props)
         .await
         .context("connect to Iceberg REST catalog for seeding")
@@ -2984,12 +3033,52 @@ mod seed_catalog_props_tests {
         assert!(get(&props, "oauth2-server-uri").is_none());
         assert!(get(&props, "scope").is_none());
         assert!(get(&props, "token").is_none());
+        // The storage arms are mutually exclusive: no ADLS property rides along on
+        // the MinIO baseline.
+        assert!(get(&props, ADLS_ACCOUNT_NAME).is_none());
+        assert!(get(&props, ADLS_ACCOUNT_KEY).is_none());
+    }
+
+    #[test]
+    fn adls_storage_carries_the_account_key_and_no_s3_property() {
+        let auth = SeedCatalogAuth {
+            token: Some("bearer-xyz".to_string()),
+            storage: SeedStorage::Adls {
+                account_name: "lhrsstatic".to_string(),
+                account_key: "a2V5".to_string(),
+            },
+        };
+        let props = seed_catalog_props("http://lk:8181/catalog", "wh-azure", &auth);
+
+        assert_eq!(get(&props, ADLS_ACCOUNT_NAME), Some("lhrsstatic"));
+        assert_eq!(get(&props, ADLS_ACCOUNT_KEY), Some("a2V5"));
+        assert_eq!(get(&props, REST_CATALOG_PROP_WAREHOUSE), Some("wh-azure"));
+        // Catalog auth is orthogonal to storage: an ADLS seed still needs its
+        // Lakekeeper bearer token.
+        assert_eq!(get(&props, "token"), Some("bearer-xyz"));
+
+        // `azdls_config_parse` discards `s3.*` properties silently, so a stray one
+        // wouldn't fail the seed — it would just leak MinIO admin credentials into
+        // an Azure run invisibly.
+        for s3_prop in [
+            S3_ENDPOINT,
+            S3_REGION,
+            S3_ACCESS_KEY_ID,
+            S3_SECRET_ACCESS_KEY,
+            S3_PATH_STYLE_ACCESS,
+        ] {
+            assert!(
+                get(&props, s3_prop).is_none(),
+                "an ADLS seed must carry no {s3_prop}"
+            );
+        }
     }
 
     #[test]
     fn static_bearer_token_is_injected_when_no_client_credentials() {
         let auth = SeedCatalogAuth {
             token: Some("bearer-xyz".to_string()),
+            ..Default::default()
         };
         let props = seed_catalog_props("http://lk:8181/catalog", "wh", &auth);
 
