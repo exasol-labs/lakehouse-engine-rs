@@ -2,7 +2,8 @@
 #![cfg(any(
     feature = "exasol-e2e",
     feature = "cloud-e2e",
-    feature = "lakekeeper-e2e"
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
 ))]
 
 use std::time::{Duration, Instant};
@@ -260,7 +261,11 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
 }
 
 /// Path (host-side) of the compiled lakehouse-engine .so.
-#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
+))]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -310,6 +315,10 @@ pub struct CatalogConnectionPassword {
     pub oauth2_server_uri: Option<String>,
     /// Optional OAuth2 scope. Absent when not supplied.
     pub scope: Option<String>,
+    /// Azure storage account name (ADLS static credential). Absent when not supplied.
+    pub account_name: Option<String>,
+    /// Azure storage account key (ADLS static credential). Absent when not supplied.
+    pub account_key: Option<String>,
 }
 
 impl CatalogConnectionPassword {
@@ -345,6 +354,12 @@ impl CatalogConnectionPassword {
         if let Some(scope) = &self.scope {
             obj["scope"] = serde_json::Value::String(scope.clone());
         }
+        if let Some(account_name) = &self.account_name {
+            obj["account_name"] = serde_json::Value::String(account_name.clone());
+        }
+        if let Some(account_key) = &self.account_key {
+            obj["account_key"] = serde_json::Value::String(account_key.clone());
+        }
         // Escape single quotes for safe SQL embedding (SQL string literal).
         obj.to_string().replace('\'', "''")
     }
@@ -374,7 +389,11 @@ pub fn build_create_connection_sql(
 /// Uses the same internal URLs that `create_virtual_schema` uses for
 /// CATALOG_URI / S3_ENDPOINT — these are the addresses reachable from
 /// inside the Exasol UDF container.
-#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
+))]
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
@@ -388,6 +407,19 @@ pub fn local_stack_connection_password() -> CatalogConnectionPassword {
         use_vended_credentials: false,
         ..Default::default()
     }
+}
+
+/// Extract a libtest panic payload as an owned `String`, when it carries one.
+///
+/// A panic always carries either a `&'static str` or a `String` — libtest's
+/// payload contract — so these are the only two downcasts tried; anything else
+/// yields `None`. Centralizes the downcast shared by every credential-redaction
+/// panic-message assertion under `tests/`.
+pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
 }
 
 #[cfg(test)]
@@ -416,6 +448,8 @@ mod catalog_connection_password_tests {
             "client_secret",
             "oauth2_server_uri",
             "scope",
+            "account_name",
+            "account_key",
         ] {
             assert!(
                 parsed.get(key).is_none(),
@@ -441,5 +475,18 @@ mod catalog_connection_password_tests {
         assert_eq!(parsed["client_secret"], "my-secret");
         assert_eq!(parsed["oauth2_server_uri"], "https://idp.example.com/token");
         assert_eq!(parsed["scope"], "catalog");
+    }
+
+    #[test]
+    fn serializes_azure_account_fields_when_present() {
+        let password = CatalogConnectionPassword {
+            account_name: Some("mystorageacct".to_string()),
+            account_key: Some("base64-encoded-key".to_string()),
+            ..base_password()
+        };
+        let json_str = password.to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["account_name"], "mystorageacct");
+        assert_eq!(parsed["account_key"], "base64-encoded-key");
     }
 }
