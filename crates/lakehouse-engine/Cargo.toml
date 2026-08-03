@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.31.1"
+version = "0.32.0"
 edition = "2024"
 license.workspace = true
 
@@ -20,6 +20,10 @@ cloud-e2e = []
 # Keycloak stack) behind this feature. Test code enabled by this feature must
 # FAIL (not skip) when the stack is unreachable — same contract as exasol-e2e.
 lakekeeper-e2e = []
+# Gate Azure (ADLS Gen2) static-credential E2E tests behind this feature. Test
+# code enabled by this feature must FAIL (not skip) when the stack or the
+# Azure container is unreachable — same contract as exasol-e2e.
+azure-e2e = []
 
 [dependencies]
 exasol-udf-sdk    = { version = "0.21.0", features = ["emit-arrow"] }
@@ -80,7 +84,12 @@ iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 # Seed harness only (tests/common/seed.rs) builds its own FileIO via
 # `OpenDalStorageFactory`; the production path uses lakehouse-catalog's.
-iceberg-storage-opendal = { workspace = true }
+# `opendal-azdls`: the seed dispatch's ADLS arm names
+# `OpenDalStorageFactory::Azdls`, which that feature gates. Declared here rather
+# than left to Cargo feature unification through `lakehouse-catalog`, so these
+# tests do not silently depend on another crate's feature choice. Unions with the
+# workspace `opendal-s3`.
+iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 reqwest             = { workspace = true, features = ["blocking"] }
 # Seed harness only: name reqsign-core's `Context`/`Result` to implement a
 # `ProvideCredential` that forces static MinIO admin S3 credentials for the seed
@@ -88,6 +97,16 @@ reqwest             = { workspace = true, features = ["blocking"] }
 # `build_seed_catalog_with_auth`). Pinned to the version already in the tree via
 # iceberg-storage-opendal/opendal so the `AwsCredential`/`Context` types match.
 reqsign-core        = "3.0.1"
+# Azure container lifecycle for the `azure-e2e` suite (tests/common/azure.rs),
+# dev-only — never linked into the `.so`. The official azure-sdk-for-rust 1.x line
+# authenticates with Entra ID only, so the harness creates and deletes its per-run
+# container under a service principal while the data path under test keeps using the
+# account key. Default features resolve onto the reqwest 0.13 + rustls and tokio
+# already in the lockfile, so no second HTTP or TLS stack enters the graph.
+# `azure_core` is a direct dependency for `credentials::Secret` and `http::Url`.
+azure_storage_blob  = "1.0"
+azure_identity      = "1.0"
+azure_core          = "1.1"
 tungstenite         = { version = "0.29.0", features = ["native-tls"] }
 native-tls          = "0.2"
 rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }

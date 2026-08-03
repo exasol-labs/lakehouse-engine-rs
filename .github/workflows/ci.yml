@@ -217,6 +217,40 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace
 
+      # The azure-e2e binary's offline subset — nine checks spanning
+      # container-name legality, the credential-variable readers, Azure error
+      # classification (the container-guard code-to-decision predicates), the
+      # ADLS warehouse/CONNECTION shapes, gitignore hygiene, and the Make
+      # target's shape. All nine are pure file/string/enum assertions needing no
+      # Azure account and no Docker stack, but they otherwise run ONLY under
+      # `make test-e2e-azure`, which is same-repo-guarded and outside the release
+      # gate. Running them here is what puts the slice's real logic (the
+      # container-name sanitizer and the error-classification predicates) under
+      # every PR, forks included.
+      #
+      # The count guard is the point, not decoration: a libtest name filter that
+      # matches NOTHING exits 0 ("0 passed; 0 failed; N filtered out"), so a
+      # renamed or deleted test would silently stop being covered while the step
+      # stayed green. `>= 9` (not `== 9`) so adding an offline check doesn't break
+      # CI — it just requires bumping this floor, which is the guard working
+      # rather than friction to route around. An empty/unparsed count floors to
+      # 0 and fails. pipefail is explicit because the GitHub default shell is
+      # `bash -e` WITHOUT it — `tee` would otherwise swallow a real cargo test
+      # failure.
+      - name: Azure offline checks (no Azure account, no Docker stack)
+        run: |
+          set -o pipefail
+          cargo test --features azure-e2e --test e2e_azure_test -- azure_offline_ \
+            2>&1 | tee azure-offline.log
+          PASSED=$(grep -oE '[0-9]+ passed' azure-offline.log | head -1 | cut -d' ' -f1)
+          # Exactly 9 tests carry the azure_offline_ prefix today; bump this floor
+          # when you add one.
+          if [ "${PASSED:-0}" -lt 9 ]; then
+            echo "::error::azure_offline_ matched ${PASSED:-0} tests, expected at least 9 — a renamed, deleted, or un-prefixed offline test stops being covered without turning this step red."
+            exit 1
+          fi
+          echo "azure_offline_ offline checks: $PASSED passed"
+
   licenses:
     name: License Check
     runs-on: ubuntu-latest
@@ -627,6 +661,176 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
 
+  # ── third viability gate: REAL Azure ADLS Gen2 storage, local catalog ────
+  # Storage is a real Azure Data Lake Storage Gen2 account — Azure has no working
+  # local substitute (Azurite's `dfs` endpoint is incomplete and Lakekeeper's
+  # `adls` profile can't address it; see e2e_azure_test.rs's module docs). The
+  # catalog (Lakekeeper), OIDC (Keycloak), and Exasol stay local Docker, so this
+  # job runs the same compose overlay as `e2e-lakekeeper`.
+  #
+  # REQUIRED REPOSITORY CONFIGURATION — the suite fails loudly naming the absent
+  # variable (an unset secret/variable interpolates to the empty string, which
+  # the harness rejects exactly like an absent one) until all five exist:
+  #   vars.AZURE_STORAGE_ACCOUNT_NAME     data path, not a secret
+  #   secrets.AZURE_STORAGE_ACCOUNT_KEY   the credential UNDER TEST (AdlsCred::AccountKey)
+  #   secrets.AZURE_TENANT_ID             ┐ Entra ID service principal — the
+  #   secrets.AZURE_CLIENT_ID             │ harness's own container lifecycle
+  #   secrets.AZURE_CLIENT_SECRET         ┘ ONLY, never the scan under test
+  #
+  # The service principal MUST hold exactly **Storage Blob Data Contributor** on
+  # the test storage account. Container create/delete are that role's
+  # `containers/write` + `containers/delete` actions: a custom role carrying only
+  # the `containers/blobs/*` data actions returns 403 on container creation, while
+  # `Storage Blob Data Owner` and account-level `Contributor` are over-privileged.
+  # Point all five values at a DEDICATED test-only storage account — the account
+  # key is a full-access, non-scopable, non-expiring credential and it lives here
+  # as a repository secret readable by workflow runs.
+  #
+  # Deliberately NOT in `release`'s `needs` (see that job's comment): a live
+  # third-party account in the release gate turns an Azure incident or a rotated
+  # secret into a blocked release, and the suite's fail-loud contract gives it no
+  # way to degrade. It still runs, and fails visibly, on every main push.
+  #
+  # A fork PR is not SCHEDULED at all (see the `if` below) — a fork cannot read
+  # the account-key secret, so the fail-loud suite would go red on every external
+  # contribution. That is job-level scheduling, not the suite skipping: the
+  # offline subset still runs on every PR, forks included, in `unit-tests`.
+  #
+  # Known ceiling: a run cancelled mid-suite (superseded PR push — see the
+  # workflow `concurrency` block) SIGKILLs the test process, so the container
+  # guard's Drop never fires and that run's blob container survives. Out-of-band
+  # sweep tracked in #291; Azure lifecycle policies delete blobs, not containers.
+  e2e-azure:
+    name: E2E (Azure)
+    runs-on: ubuntu-latest
+    # See `e2e`'s identical `needs` and its rationale.
+    needs: [build-so]
+    # Same-repository guard: true for push / merge_group / workflow_dispatch
+    # (where `pull_request` is null) and for a same-repo PR; false only for a fork
+    # PR. Draft PRs keep cascade-skipping through `needs: [build-so]` — this `if`
+    # carries no `always()`, so a skipped upstream still skips this job.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`; the extra
+    # cost here is real-cloud round-trips, not extra local services.
+    timeout-minutes: 45
+    env:
+      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      LH_EXASOL_CPUS: "2"
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Download liblakehouse_engine.so
+        uses: actions/download-artifact@v8
+        with:
+          name: lakehouse-engine-so
+          path: target/release/
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
+      # See the `e2e` job's identical step (and the writer in `unit-tests`).
+      - name: Restore cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: workspace-rlib
+          save-if: "false"
+
+      # Only the services this suite starts, unlike `e2e-lakekeeper`'s bare
+      # `pull`: the Spark fixture and Iceberg-REST images are multi-GB and this
+      # job never runs either. Anything missed would still be pulled by `up`.
+      - name: Pull stack images
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+            pull --quiet exasol minio keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+
+      # Same root cause and fix as the `e2e` job: this suite also spawns Exasol
+      # UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
+      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+
+      # Two-phase, same rationale as `e2e-lakekeeper`'s four-phase bring-up: the
+      # one-shot `lakekeeper-migrate` is `docker wait`-ed to completion before the
+      # long-running services are brought up with `--wait`.
+      #
+      # `minio-init` and `minio-lakekeeper-init` are deliberately NOT run here:
+      # both provision the S3 warehouse bucket and the MinIO STS user, which this
+      # ADLS suite never touches (its module docs keep MinIO out of the readiness
+      # contract for the same reason — an unrelated MinIO outage must not fail an
+      # Azure run). `minio` itself still comes up and must be healthy, because
+      # `lakekeeper` declares it as a healthy-dependency; its healthcheck hits
+      # /minio/health/live and does not depend on either init job.
+      - name: Start stack (Exasol + Keycloak + Lakekeeper)
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+
+          $COMPOSE up -d lakekeeper-migrate
+          MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
+          if [ "$MIGRATE_EXIT" != "0" ]; then
+            echo "::error::lakekeeper-migrate exited $MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs lakekeeper-migrate
+            exit 1
+          fi
+
+          $COMPOSE up -d --wait exasol minio keycloak lakekeeper-db lakekeeper
+
+      # The five credential variables are scoped to THIS step only — no later
+      # step (log dumping, artifact upload) has any use for them.
+      - name: Run Azure E2E suite
+        env:
+          AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
+          AZURE_STORAGE_ACCOUNT_KEY: ${{ secrets.AZURE_STORAGE_ACCOUNT_KEY }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: make test-e2e-azure
+
+      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
+      # only shows up in the host kernel ring buffer, not DB-side logs.
+      - name: Dump Azure stack logs on failure
+        if: failure()
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+          echo "=== container stats / host free ==="
+          $COMPOSE ps || true
+          free -m || true
+          echo "=== HOST kernel ring buffer (sudo) ==="
+          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
+          echo "--- last 40 kernel lines (fallback) ---"
+          sudo dmesg --ctime | tail -40 || true
+          echo "=== keycloak logs ==="
+          $COMPOSE logs keycloak | tail -100 || true
+          echo "=== lakekeeper-migrate logs ==="
+          $COMPOSE logs lakekeeper-migrate | tail -100 || true
+          echo "=== lakekeeper logs ==="
+          $COMPOSE logs lakekeeper | tail -100 || true
+          echo "=== exasql crash logs ==="
+          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
+          echo "=== collecting /exa/logs tree for artifact ==="
+          rm -rf exa-logs-azure && mkdir -p exa-logs-azure
+          $COMPOSE cp exasol:/exa/logs exa-logs-azure/ 2>/dev/null || true
+
+      # Distinct artifact name: upload-artifact@v7 rejects a name already used by
+      # another job in the same run (`e2e` / `e2e-lakekeeper` own the other two).
+      - name: Upload Azure Exasol logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: exa-logs-azure
+          path: exa-logs-azure/
+          if-no-files-found: ignore
+
+      - name: Stop stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
+
   # ── release: main-push-with-version-bump, or a direct tag push ──────────
   release:
     name: Release
@@ -638,6 +842,11 @@ jobs:
     # and install-script-e2e are listed for the same reason: install.sh is
     # served straight off `main` (see its own job comment), so a broken script
     # on `main` must never reach a release-gated push either.
+    #
+    # `e2e-azure` is deliberately ABSENT and must stay absent (full rationale in
+    # that job's comment): it depends on a live third-party Azure account, so an
+    # Azure incident or a rotated secret would block every release. Don't "fix"
+    # this by adding it.
     needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:

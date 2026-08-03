@@ -1,6 +1,9 @@
 /target
 **/*.so
 
+# Test environment properties
+test.env
+
 # Serena MCP workspace cache
 .serena/
 
