@@ -143,12 +143,9 @@ pub enum SeedStorage {
     /// Lakekeeper MinIO suites.
     #[default]
     Minio,
-    /// ADLS Gen2 under a storage-account key.
-    ///
-    /// This is the Azure suite's data path under test: the same account key backs
-    /// the warehouse storage credential and the Exasol CONNECTION. The
-    /// container-lifecycle service principal must never appear here, or seeding
-    /// would succeed without exercising the account-key path at all.
+    /// ADLS Gen2 under a storage-account key — the Azure suite's path under
+    /// test. The container-lifecycle service principal must never appear here,
+    /// or seeding would succeed without exercising the account-key path.
     Adls {
         account_name: String,
         account_key: String,
@@ -165,11 +162,11 @@ pub enum SeedStorage {
 /// passes it here. (The suite does NOT drive the REST client's own OAuth2
 /// client-credentials flow for seeding.)
 ///
-/// `storage` selects the object store. Under [`SeedStorage::Minio`] the S3 storage
-/// credentials are forced static, overriding whatever the catalog vends — see
-/// [`build_seed_catalog_with_auth`] for why. [`SeedStorage::Adls`] instead carries
-/// its account key in the properties and overrides nothing, because a
-/// `sas-enabled: false` ADLS warehouse vends no credentials to override.
+/// `storage` selects the object store. [`SeedStorage::Minio`] forces static S3
+/// credentials, overriding whatever the catalog vends (see
+/// [`build_seed_catalog_with_auth`]); [`SeedStorage::Adls`] carries its account
+/// key in the properties and overrides nothing — a `sas-enabled: false` ADLS
+/// warehouse vends no credentials to override.
 #[derive(Clone, Default)]
 pub struct SeedCatalogAuth {
     pub token: Option<String>,
@@ -327,11 +324,9 @@ pub async fn build_seed_catalog_with_auth(
                 )),
             })
         }
-        // No credential override on ADLS: the Azure suite's warehouse is
-        // `sas-enabled: false`, so Lakekeeper vends nothing for the merge above to
-        // clobber, and the `adls.account-key` property `seed_catalog_props` set is
-        // the only credential in play — which is exactly the static path under
-        // test. An override here would mask that path instead of exercising it.
+        // No override needed: the Azure warehouse is `sas-enabled: false`, so
+        // Lakekeeper vends nothing here to clobber — the account-key property
+        // `seed_catalog_props` set is the only credential in play.
         SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
     };
 
@@ -3062,10 +3057,9 @@ mod seed_catalog_props_tests {
         // Lakekeeper bearer token.
         assert_eq!(get(&props, "token"), Some("bearer-xyz"));
 
-        // The MinIO baseline must not leak into an Azure seed. `azdls_config_parse`
-        // discards `s3.*` properties silently, so a stray one would not fail the
-        // seed — it would just ship MinIO admin credentials into a run that has no
-        // business carrying them, and the leak would stay invisible.
+        // `azdls_config_parse` discards `s3.*` properties silently, so a stray one
+        // wouldn't fail the seed — it would just leak MinIO admin credentials into
+        // an Azure run invisibly.
         for s3_prop in [
             S3_ENDPOINT,
             S3_REGION,

@@ -1,12 +1,11 @@
 //! Azure credential accessors and per-run container naming for the `azure-e2e` suite.
 //!
-//! Two credential paths live here side by side and are never conflated: the
-//! account name/key pair is the data path under test — it reaches the Exasol
-//! CONNECTION the scan reads through — while the tenant/client/secret triple
-//! exists only so the harness can create and delete its own container. Nothing
-//! picks either up implicitly: `azure_identity` 1.x ships no environment-scanning
-//! credential, so every value is read explicitly here and an absent one fails the
-//! run loudly instead of surfacing later as an authorization failure.
+//! Two credential paths, never conflated: the account name/key pair is the data
+//! path under test (reaches the Exasol CONNECTION), while the tenant/client/secret
+//! triple only lets the harness create and delete its own container. Every value
+//! is read explicitly — `azure_identity` 1.x has no environment-scanning
+//! credential — and an absent one panics immediately rather than surfacing later
+//! as an opaque authorization failure.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,10 +62,9 @@ fn read_var(name: &str) -> String {
 
 /// Return `value` trimmed, panicking when the variable is unset or blank.
 ///
-/// Takes the value as a parameter rather than reading the environment so the
-/// absent-variable contract is testable without mutating the process
-/// environment, which every other test in the binary shares. The panic names
-/// only the variable: three of the five values are credentials.
+/// Takes `value` as a parameter so the panic path is testable without mutating
+/// the process environment other tests share. Panics name only the variable,
+/// never the value — three of the five are credentials.
 fn require_var(name: &str, value: Option<&str>) -> String {
     let Some(value) = value else {
         panic!("the azure-e2e suite requires environment variable {name}, which is not set");
@@ -81,10 +79,10 @@ fn require_var(name: &str, value: Option<&str>) -> String {
 
 /// Container name for this run: `lhrs-e2e-<sanitized-user>-<millis>`.
 ///
-/// The millisecond suffix keeps an orphaned container attributable to one run and
-/// makes a create-time collision a defect rather than a tolerable state; the
-/// `$USER` segment keeps it attributable to a person. An unset `$USER` is
-/// cosmetic, not a credential, so it degrades to no segment rather than failing.
+/// The millisecond suffix makes a create-time name collision a defect rather
+/// than tolerable, and keeps an orphan attributable to one run; `$USER` keeps it
+/// attributable to a person. An unset `$USER` degrades to no segment instead of
+/// failing — it's cosmetic, not a credential.
 pub fn per_run_container_name() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -95,14 +93,12 @@ pub fn per_run_container_name() -> String {
 
 /// Build the per-run container name from an arbitrary `user` and `millis`.
 ///
-/// Azure and Lakekeeper both accept only 3 to 63 characters of `[a-z0-9-]` with
-/// no consecutive hyphens and no leading or trailing hyphen, and Lakekeeper
-/// rejects a violation at warehouse-creation time rather than at scan time — so
-/// legality is enforced here, at the one place the name is built. `user` is
-/// arbitrary: it may be empty, mixed-case, dotted, non-ASCII, or longer than the
-/// whole budget. It is therefore sanitized and truncated to whatever the fixed
-/// prefix and suffix leave, and dropped entirely when nothing legal survives,
-/// rather than emitting the `--` an empty segment would otherwise produce.
+/// Azure and Lakekeeper both require 3-63 characters of `[a-z0-9-]`, no
+/// consecutive/leading/trailing hyphens — enforced here since Lakekeeper rejects
+/// a violation at warehouse-creation time, not at scan time. `user` is arbitrary
+/// (empty, mixed-case, dotted, non-ASCII, over-long), so it's sanitized,
+/// truncated to the remaining budget, and dropped entirely rather than leaving
+/// the `--` an empty segment would produce.
 fn derive_container_name(user: &str, millis: u128) -> String {
     let suffix = millis.to_string();
     let hyphens = 2;
@@ -135,12 +131,12 @@ fn sanitize_segment(raw: &str, max_len: usize) -> String {
     segment.trim_matches('-').to_string()
 }
 
-/// Everything needed to reach the per-run container: the account and container
-/// names, plus the container-lifecycle service principal's three Entra ID values.
+/// Everything needed to reach the per-run container: account/container names
+/// plus the container-lifecycle service principal's three Entra ID values.
 ///
-/// Deliberately plain owned data — no client and no runtime handle. That is what
-/// lets one clone cross into the teardown thread and satisfy `std::thread::spawn`'s
-/// `'static` bound, which `Drop`'s `&mut self` cannot.
+/// Plain owned data, no client or runtime handle, so a clone can cross into the
+/// teardown thread and satisfy `spawn`'s `'static` bound — which `Drop`'s
+/// `&mut self` cannot.
 #[derive(Clone)]
 struct ContainerAccess {
     account_name: String,
@@ -163,15 +159,11 @@ impl ContainerAccess {
 
     /// Build a client for this container on the calling thread's current runtime.
     ///
-    /// Rebuilt per use rather than stored, because `azure_core` gives every client
-    /// its own `reqwest` connection pool (`Transport::default` calls
-    /// `new_http_client`, which memoizes nothing) and a pool's keep-alive
-    /// connections are driven by tasks on whichever runtime opened them. Reusing the
-    /// construction-time client for the delete would dispatch it to the fixture's
-    /// runtime, which is blocked in `Drop`'s own `join()` at that moment and polling
-    /// nothing — so the delete would never complete and the suite would deadlock
-    /// with no timeout to break it, orphaning the container anyway. Three cheap
-    /// values and one extra token acquisition buy that deadlock's absence.
+    /// Rebuilt per use rather than cached: `azure_core` gives each client its own
+    /// connection pool driven by tasks on whichever runtime created it. Reusing
+    /// the construction-time client from `Drop` would dispatch onto the
+    /// fixture's runtime, which is blocked in `Drop`'s own `join()` and polling
+    /// nothing — deadlocking the delete with no timeout to break it.
     fn blob_container_client(&self) -> Result<BlobContainerClient> {
         let credential = ClientSecretCredential::new(
             &self.tenant_id,
@@ -209,18 +201,14 @@ impl ContainerAccess {
     }
 }
 
-/// The Azure error code `error` carried, paired with a printable rendering of it.
+/// The Azure error code `error` carried, paired with a printable rendering.
 ///
-/// `TryFrom` consumes the error and hands the original back when the failure never
-/// produced a service response — a DNS, TLS or timeout failure carries no Azure
-/// code — so both halves are taken in the single pass the conversion allows. A
-/// failure that reached no service must therefore never be reported as a code:
-/// inventing one would let [`ContainerAccess::delete`] read a transport failure as
-/// `ContainerNotFound` and call a still-present container cleaned up.
-///
-/// A code this SDK release does not map arrives as `UnknownValue`, and the rendering
-/// says so: `StorageError`'s own `Display` prints a mapped and an unmapped code
-/// identically, yet only the latter means service/SDK version skew.
+/// A failure that never reached the service (DNS/TLS/timeout) carries no Azure
+/// code — inventing one here would let [`ContainerAccess::delete`] misread a
+/// transport failure as `ContainerNotFound` and call a still-present container
+/// cleaned up. An unmapped code arrives as `UnknownValue`; the rendering flags
+/// that explicitly, since `StorageError`'s `Display` prints mapped and unmapped
+/// codes identically.
 fn azure_failure(error: azure_core::Error) -> (Option<StorageErrorCode>, String) {
     match StorageError::try_from(error) {
         Ok(storage_error) => {
@@ -237,39 +225,32 @@ fn azure_failure(error: azure_core::Error) -> (Option<StorageErrorCode>, String)
     }
 }
 
-/// Whether `code` means the delete already reached its desired end state.
-///
-/// Implements the container-guard clause that a container already absent at
-/// delete time SHALL be treated as deleted. Exactly one code qualifies: any
-/// other code, a code this SDK release does not map (`UnknownValue`), and the
-/// `None` of a failure that reached no service must all be reported instead, or
-/// teardown calls a container it did not delete cleaned up.
+/// Whether `code` means the container was already absent — delete's desired
+/// end state. Only `ContainerNotFound` qualifies; every other code, an unmapped
+/// code, or `None` must be reported instead, or teardown would call a
+/// surviving container cleaned up.
 fn delete_reached_desired_state(code: Option<&StorageErrorCode>) -> bool {
     matches!(code, Some(StorageErrorCode::ContainerNotFound))
 }
 
-/// Whether `code` means the container name was already taken.
-///
-/// Implements the container-guard clause that a name collision at create time
-/// SHALL fail the run — [`per_run_container_name`]'s millisecond suffix makes a
-/// collision a defect, not a state to adopt. Exactly one code qualifies; every
-/// other create failure keeps its own description rather than being reported as
-/// a name collision.
+/// Whether `code` means the container name was already taken — a defect, since
+/// [`per_run_container_name`]'s millisecond suffix should make collisions
+/// impossible. Only `ContainerAlreadyExists` qualifies; every other code keeps
+/// its own description.
 fn is_name_collision(code: Option<&StorageErrorCode>) -> bool {
     matches!(code, Some(StorageErrorCode::ContainerAlreadyExists))
 }
 
 /// An Azure blob container that lives exactly as long as this value.
 ///
-/// Lakekeeper creates no ADLS filesystem and validates physical access when the
-/// warehouse is created, so the container must exist first — and must be deleted, or
-/// the shared test account accumulates one container per run. Hold this on a test
-/// function's stack: unwinding runs `Drop`, so a panicking test cleans up too. A
-/// guard parked in a `OnceLock` would never clean up at all, because statics are not
-/// dropped at process exit.
+/// Lakekeeper validates physical access at warehouse-creation time, so the
+/// container must exist first and be deleted after, or the shared test account
+/// accumulates one per run. Hold this on a test function's stack — unwinding
+/// runs `Drop`, so a panicking test still cleans up; a guard parked in a
+/// `OnceLock` never would, since statics aren't dropped at process exit.
 ///
-/// Known ceiling: cleanup rides on unwinding, so a *killed* process still orphans a
-/// container. The per-run name keeps that orphan attributable to one run.
+/// Known ceiling: a *killed* process skips `Drop` and orphans the container;
+/// the per-run name keeps it attributable.
 pub struct AzureContainer {
     access: ContainerAccess,
 }
@@ -277,13 +258,12 @@ pub struct AzureContainer {
 impl AzureContainer {
     /// Create `container_name` in the test storage account and own its deletion.
     ///
-    /// Authenticates with the container-lifecycle service principal, because the
-    /// official blob crate accepts Entra ID only; the account key stays on the data
-    /// path under test and never reaches this call. An already-existing container
-    /// fails the run rather than being adopted: [`per_run_container_name`]'s
-    /// millisecond suffix makes a collision a defect, and adopting one would hand
-    /// `Drop` a container this run did not create. The guard is returned only once
-    /// the container exists, so `Drop` never chases one that was never created.
+    /// Authenticates with the container-lifecycle service principal — the
+    /// official blob crate accepts Entra ID only, so the account key never
+    /// reaches this call. An already-existing container fails the run rather
+    /// than being adopted: a collision is a defect (see
+    /// [`per_run_container_name`]), and adopting one would hand `Drop` a
+    /// container this run didn't create.
     pub async fn create(container_name: &str) -> Result<Self> {
         let access = ContainerAccess::from_environment(container_name);
         let client = access.blob_container_client()?;
@@ -309,14 +289,14 @@ impl AzureContainer {
 impl Drop for AzureContainer {
     /// Delete the container on a thread of its own, with a runtime of its own.
     ///
-    /// `Drop` is synchronous and ordinarily fires inside the fixture's
-    /// `rt.block_on(…)`, where driving the delete on the ambient runtime would panic
-    /// with "Cannot start a runtime from within a runtime" — while unwinding, that
-    /// aborts the process and deletes nothing. A separate thread carrying its own
-    /// runtime and its own client behaves identically inside and outside a runtime
-    /// context. Nothing here panics: every failure is reported and names the
-    /// container, so an unwinding test keeps its original failure as the reported one
-    /// and any orphan stays traceable.
+    /// `Drop` fires synchronously inside the fixture's `rt.block_on(…)`; driving
+    /// the delete on that ambient runtime would panic with "Cannot start a
+    /// runtime from within a runtime", aborting the process instead of deleting
+    /// anything while unwinding. A separate thread with its own runtime and
+    /// client works regardless of whether `Drop` fires inside or outside a
+    /// runtime context. Nothing here panics — every failure is reported by
+    /// name, so an unwinding test keeps its original failure and any orphan
+    /// stays traceable.
     fn drop(&mut self) {
         let container_name = self.access.container_name.clone();
         let access = self.access.clone();
@@ -327,10 +307,9 @@ impl Drop for AzureContainer {
             .name("azure-container-teardown".to_string())
             .spawn(move || {
                 tokio::runtime::Builder::new_current_thread()
-                    // The HTTP stack needs the IO driver and its timeouts need the
-                    // timer. Named rather than `enable_all`, which silently skips
-                    // the IO driver when tokio's `net` feature is off and would fail
-                    // at runtime instead of here at compile time.
+                    // HTTP needs the IO driver, timeouts need the timer. Named
+                    // explicitly — `enable_all` silently skips IO when tokio's
+                    // `net` feature is off.
                     .enable_io()
                     .enable_time()
                     .build()
@@ -359,13 +338,11 @@ impl Drop for AzureContainer {
     }
 }
 
-/// Whether `container_name` currently exists in the test storage account, per a
-/// freshly built client under the container-lifecycle service principal.
+/// Whether `container_name` currently exists in the test storage account.
 ///
-/// Reuses [`ContainerAccess`]'s own environment reading and client construction
-/// rather than duplicating either — this exists only so a container-guard test
-/// can prove a container is gone after its owning guard's scope ends, without
-/// holding a second `AzureContainer` of its own.
+/// Reuses [`ContainerAccess`] rather than duplicating it — exists only so a
+/// container-guard test can prove a container is gone after its guard's scope
+/// ends, without holding a second `AzureContainer`.
 pub async fn container_exists(container_name: &str) -> Result<bool> {
     let access = ContainerAccess::from_environment(container_name);
     let client = access.blob_container_client()?;
@@ -510,15 +487,12 @@ mod azure_error_classification_tests {
 
     /// A code is only ever reported when Azure actually sent one.
     ///
-    /// This is the arm that keeps teardown honest. `delete` treats exactly
-    /// `ContainerNotFound` as "already gone", so a classifier that invented a code
-    /// for a failure which never reached the service would let a transport error
-    /// pass as a cleaned-up container — the container would survive and the run
-    /// would say nothing. An HTTP failure whose raw response is absent is included
-    /// deliberately: the code string alone is not trusted, because `TryFrom` needs
-    /// the response body to build a `StorageError` and hands the error back
-    /// untouched without it. Erring toward reporting a leak beats erring toward
-    /// silently leaving one.
+    /// `delete` treats exactly `ContainerNotFound` as "already gone", so
+    /// inventing a code for a failure that never reached the service would
+    /// misreport a transport error as a cleaned-up container. An HTTP failure
+    /// with no raw response is included deliberately: `TryFrom` needs the
+    /// response body to build a `StorageError` and hands the error back
+    /// untouched without it.
     #[test]
     fn failure_without_a_service_response_carries_no_error_code() {
         let failures = [
@@ -552,13 +526,10 @@ mod azure_error_classification_tests {
 
     /// Each container-guard clause keys on exactly one Azure code.
     ///
-    /// The two clauses — "a name collision at create time SHALL fail the run" and
-    /// "a container already absent at delete time SHALL be treated as deleted" —
-    /// are one code wide each. Everything else must fall through to the reporting
-    /// arm: the sibling code, a code this SDK release does not map, and the `None`
-    /// of a failure that reached no service. Widening the delete clause would make
-    /// teardown call a surviving container cleaned up; widening the create clause
-    /// would blame a name collision for an unrelated create failure.
+    /// Widening the delete clause (only `ContainerNotFound`) would make
+    /// teardown call a surviving container cleaned up; widening the create
+    /// clause (only `ContainerAlreadyExists`) would blame a name collision for
+    /// an unrelated create failure.
     #[test]
     fn container_guard_keys_each_spec_clause_on_exactly_one_code() {
         let unmapped = StorageErrorCode::UnknownValue("SomethingNew".to_string());

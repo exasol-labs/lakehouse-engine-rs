@@ -275,15 +275,12 @@ impl WarehouseProfile {
 }
 
 /// A storage profile for a Lakekeeper warehouse over a real ADLS Gen2 container.
+/// Per-run (not constant): the container is created/deleted by the owning run,
+/// and the account name and key come from the environment.
 ///
-/// Unlike the two MinIO profiles this is per-run, not constant: the container is
-/// created and deleted by the run that owns it, and the account name and key
-/// arrive from the environment.
-///
-/// Delegation is off. `sas-enabled` is stated explicitly because Lakekeeper
-/// v0.13.1 defaults it to `true`: a warehouse left vending SAS tokens would let a
-/// scan succeed without ever using the account key, which is the credential this
-/// suite exists to verify.
+/// `sas-enabled` is stated explicitly because Lakekeeper v0.13.1 defaults it to
+/// `true`; a vending warehouse would let the scan pass without exercising the
+/// account key this suite exists to verify.
 pub struct AdlsWarehouseProfile {
     name: String,
     account_name: String,
@@ -295,13 +292,11 @@ impl AdlsWarehouseProfile {
     /// Build the static-credential ADLS profile for the run that owns
     /// `container_name`.
     ///
-    /// The warehouse name is derived from the container rather than supplied, so
-    /// two properties hold by construction. It carries the container's per-run
-    /// suffix, so a repeated local run never binds to a surviving warehouse whose
-    /// container has already been deleted. And its `-static` tail keeps this
-    /// warehouse's `key-prefix` disjoint from that of any sibling warehouse
-    /// sharing the run's container — Lakekeeper rejects a second warehouse whose
-    /// key-prefix overlaps an existing one's.
+    /// The warehouse name is derived from the container (not supplied): the
+    /// per-run suffix stops a repeat run binding to a deleted container's
+    /// warehouse, and the `-static` tail keeps this warehouse's `key-prefix`
+    /// disjoint from any sibling sharing the container — Lakekeeper rejects an
+    /// overlapping key-prefix.
     pub fn new(container_name: &str, account_name: &str, account_key: &str) -> Self {
         AdlsWarehouseProfile {
             name: format!("{container_name}-static"),
@@ -337,11 +332,8 @@ impl AdlsWarehouseProfile {
 }
 
 /// Create the MinIO-backed warehouse for `profile` via Lakekeeper's management
-/// API.
-///
-/// Builds only the `s3` request body and delegates to [`post_warehouse`], which
-/// owns the endpoint, the already-exists idempotency rule, and the contract that
-/// no response body reaches a panic message.
+/// API. Builds the `s3` request body; [`post_warehouse`] owns the endpoint,
+/// idempotency, and panic-safety contracts.
 pub fn lakekeeper_create_warehouse(profile: &WarehouseProfile) {
     // MinIO is reached by Lakekeeper (and embedded into vended creds / table
     // metadata) via its Docker-network name. A per-warehouse key-prefix keeps
@@ -367,17 +359,12 @@ pub fn lakekeeper_create_warehouse(profile: &WarehouseProfile) {
 }
 
 /// Create the per-run ADLS warehouse for `profile` via Lakekeeper's management
-/// API.
+/// API. Builds the `adls` request body; [`post_warehouse`] covers idempotency
+/// and panic-safety for the account key it carries.
 ///
-/// Builds only the `adls` request body and delegates to the same
-/// [`post_warehouse`] the MinIO arm uses, so that helper's idempotency handling
-/// and its never-echo-the-response-body contract cover the account key this
-/// request body carries.
-///
-/// The container must already exist: Lakekeeper creates no filesystem and
-/// validates physical access here by writing and deleting a probe object, so a
-/// missing container or a wrong account key fails this call rather than surfacing
-/// later as a scan error.
+/// The container must already exist: Lakekeeper validates access by writing and
+/// deleting a probe object, so a missing container or wrong key fails here
+/// rather than surfacing later as a scan error.
 pub fn lakekeeper_create_adls_warehouse(profile: &AdlsWarehouseProfile) {
     post_warehouse(
         &profile.name,
@@ -387,21 +374,18 @@ pub fn lakekeeper_create_adls_warehouse(profile: &AdlsWarehouseProfile) {
 }
 
 /// POST one warehouse to Lakekeeper's management API and fail loudly unless it
-/// exists afterwards.
+/// exists afterwards. Single owner of the create-warehouse endpoint for every
+/// storage backend.
 ///
-/// The single owner of the create-warehouse endpoint for every storage backend,
-/// so the two contracts below hold identically for each of them.
+/// Idempotent: Lakekeeper 0.13.1 reports an already-provisioned warehouse as
+/// HTTP 400 `CreateWarehouseStorageProfileOverlap` (profile overlaps an
+/// existing warehouse's), NOT 409 — both are treated as success. Each harness
+/// warehouse has a unique key-prefix, so an overlap can only mean this same
+/// warehouse already exists.
 ///
-/// Idempotent: an already-provisioned warehouse is treated as success so the
-/// helper is safe against a persisted stack. Lakekeeper 0.13.1 reports this as an
-/// HTTP 400 `CreateWarehouseStorageProfileOverlap` (the storage profile overlaps
-/// the existing warehouse's), NOT a 409 Conflict, so both are accepted. Each
-/// harness warehouse has a unique key-prefix, so an overlap can only mean this
-/// same warehouse already exists.
-///
-/// Credential-safe: `storage_credential` carries an S3 secret key or an Azure
-/// account key, so the response body is NEVER surfaced in a panic message — only
-/// the endpoint, the warehouse name, and the status code are.
+/// Credential-safe: `storage_credential` carries an S3 secret or Azure account
+/// key, so the response body never reaches a panic message — only the
+/// endpoint, warehouse name, and status code do.
 fn post_warehouse(
     warehouse_name: &str,
     storage_profile: serde_json::Value,
@@ -495,23 +479,17 @@ pub fn lakekeeper_connection_password(
 /// Build the `CatalogConnectionPassword` for an Azure (ADLS) Lakekeeper
 /// CONNECTION.
 ///
-/// Populated for the OAuth2 client-credentials flow the adapter runs against
-/// Keycloak at query time, plus the storage credential under test: the account
-/// name and account key, which is the `AdlsCred::AccountKey` path. The
-/// container-lifecycle service principal deliberately has no representation here
-/// — a CONNECTION reaching Azure through it would let the suite pass while
-/// exercising nothing the production read path ships.
+/// Carries the OAuth2 client-credentials fields plus the account name/key under
+/// test (the `AdlsCred::AccountKey` path) — never the container-lifecycle
+/// service principal, which would let the suite pass without exercising the
+/// account-key path.
 ///
-/// Every static S3 storage field is left empty. The adapter reads an empty string
-/// as absent and rejects a CONNECTION naming both an Azure and an S3 storage
-/// field as an ambiguous credential set, so leaving them empty — rather than
-/// inheriting the MinIO builder's endpoint and region — is what makes this an
-/// Azure CONNECTION.
+/// Every static S3 field is left empty: the adapter reads an empty string as
+/// absent and rejects a CONNECTION naming both Azure and S3 storage fields as
+/// ambiguous.
 ///
-/// `warehouse_name` is the per-run ADLS warehouse NAME (the value passed to
-/// `GET /v1/config?warehouse=`), not an `abfss://` path. It is the one field that
-/// cannot be empty: an empty `warehouse` is rejected before any Azure validation
-/// runs, and its value carries the run's own suffix.
+/// `warehouse_name` is the warehouse NAME (not an `abfss://` path); it cannot be
+/// empty, since an empty `warehouse` is rejected before Azure validation runs.
 pub fn lakekeeper_adls_connection_password(
     warehouse_name: &str,
     account_name: &str,
@@ -536,13 +514,11 @@ pub fn lakekeeper_adls_connection_password(
 /// Fetch `warehouse_name`'s storage profile exactly as Lakekeeper's management
 /// API reports it.
 ///
-/// Lists warehouses rather than fetching by id, because every caller here only
-/// ever has the warehouse NAME — the create path never learns the server-assigned
-/// id, and adding a name-to-id lookup step would buy nothing this single list
-/// call doesn't already give. Credential-safe like every other call in this
-/// file: on failure the panic names only the endpoint and status, never the
-/// response body — though on success the body is safe to return in full, since
-/// Lakekeeper's warehouse representation never echoes a storage credential.
+/// Lists warehouses rather than fetching by id: every caller here only has the
+/// warehouse NAME, and the create path never learns the server-assigned id.
+/// Credential-safe: on failure the panic names only the endpoint and status; on
+/// success the full body is safe to return since Lakekeeper's warehouse
+/// representation never echoes a storage credential.
 pub fn lakekeeper_warehouse_storage_profile(warehouse_name: &str) -> serde_json::Value {
     let token = keycloak_client_credentials_token();
     let url = format!("{}/warehouse", management_base());
@@ -696,9 +672,7 @@ mod tests {
             pw.oauth2_server_uri.as_deref(),
             Some("http://keycloak:8080/realms/iceberg/protocol/openid-connect/token")
         );
-        // Every static S3 storage field stays empty, which the adapter reads as
-        // absent: a CONNECTION naming both an Azure and an S3 storage field is
-        // rejected as an ambiguous credential set.
+        // Static S3 fields stay empty — ambiguous otherwise (see doc comment above).
         assert_eq!(pw.endpoint, "");
         assert_eq!(pw.region, "");
         assert_eq!(pw.access_key, "");

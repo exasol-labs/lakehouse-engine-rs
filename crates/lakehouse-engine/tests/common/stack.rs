@@ -411,12 +411,10 @@ pub fn local_stack_connection_password() -> CatalogConnectionPassword {
 
 /// Extract a libtest panic payload as an owned `String`, when it carries one.
 ///
-/// A panic raised through `panic!`/`assert!` always carries either a `&'static
-/// str` (a literal message) or a `String` (a formatted one) — libtest's own
-/// payload contract — so these are the only two downcasts worth trying; any
-/// other payload type yields `None` rather than a guess. Centralizes the
-/// downcast dance shared by every credential-redaction panic-message assertion
-/// under `tests/`, so a change to that contract is made once.
+/// A panic always carries either a `&'static str` or a `String` — libtest's
+/// payload contract — so these are the only two downcasts tried; anything else
+/// yields `None`. Centralizes the downcast shared by every credential-redaction
+/// panic-message assertion under `tests/`.
 pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     payload
         .downcast_ref::<String>()

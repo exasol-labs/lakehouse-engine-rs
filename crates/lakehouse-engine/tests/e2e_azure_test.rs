@@ -1,35 +1,28 @@
-//! End-to-end integration tests for the lakehouse-engine Virtual Schema against
-//! a **real Azure Data Lake Storage Gen2** account, catalogued by a local
-//! Lakekeeper (OpenID-secured via Keycloak).
+//! End-to-end integration tests for the lakehouse-engine Virtual Schema against a
+//! **real Azure Data Lake Storage Gen2** account, catalogued by a local Lakekeeper
+//! (OpenID-secured via Keycloak).
 //!
 //! Azure has no working local substitute — Azurite's `dfs` endpoint is incomplete
-//! and Lakekeeper v0.13.1's `adls` profile addresses `https://<account>.<host>`
-//! with a bare hostname, so an Azurite endpoint is not expressible through it at
-//! all. Storage is therefore real cloud; the catalog, Keycloak, and Exasol stay
-//! local Docker. The suite FAILS (never skips) when the stack, any of the five
-//! credential variables, or the Azure account is unavailable.
+//! and Lakekeeper's `adls` profile can't address it. Storage is therefore real
+//! cloud; the catalog, Keycloak, and Exasol stay local Docker. The suite FAILS
+//! (never skips) when the stack, any credential variable, or the Azure account is
+//! unavailable.
 //!
-//! All tests share one Exasol provisioning, so they must run serially
-//! (`--test-threads=1`); the `make test-e2e-azure` target passes the flag.
+//! All tests share one Exasol provisioning, so they run serially
+//! (`--test-threads=1`, set by the `make test-e2e-azure` target).
 //!
-//! # Two credentials, two purposes, never conflated
+//! Two credentials, never conflated: the harness creates and deletes its own
+//! blob container under an **Entra ID service principal** (the official Azure
+//! blob crate accepts no account key), while everything under test — the
+//! warehouse storage credential, the seed `FileIO`, and the Exasol CONNECTION —
+//! carries the **account key**, the `AdlsCred::AccountKey` path this suite exists
+//! to verify.
 //!
-//! The harness creates and deletes its own blob container under an **Entra ID
-//! service principal**, because the official Azure blob crate accepts no account
-//! key. Everything under test — the warehouse storage credential, the seed
-//! `FileIO`, and the Exasol CONNECTION the scan reads through — carries the
-//! **account key**, which is the `AdlsCred::AccountKey` path this suite exists to
-//! verify. A service principal reaching the CONNECTION would let the suite pass
-//! while exercising nothing the production read path ships.
-//!
-//! # Provisioning is split by whether it needs cleaning up
-//!
-//! [`setup`] holds only what is idempotent and leaves nothing behind: the
-//! readiness waits, the Lakekeeper bootstrap, and the shared SLC / `.so` /
-//! script provisioning. Everything with a lifecycle lives on [`AzureFixture`],
-//! which a test holds as a local so `Drop` deletes the run's container at scope
-//! end — including while unwinding from a panic. A guard parked in the `OnceLock`
-//! would never clean up at all: statics are not dropped at process exit.
+//! [`setup`] holds only what's idempotent and cleanup-free: readiness waits,
+//! Lakekeeper bootstrap, shared SLC/`.so`/script provisioning. Everything with a
+//! lifecycle lives on [`AzureFixture`], held as a test-function local so `Drop`
+//! deletes the run's container at scope end — including while unwinding from a
+//! panic, which a guard parked in a `OnceLock` never would.
 #![cfg(feature = "azure-e2e")]
 
 mod common;
@@ -85,10 +78,8 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 /// Provision everything this binary shares and nothing that needs cleaning up.
 ///
-/// MinIO is deliberately absent from the readiness waits: this suite's storage is
-/// Azure, and waiting on a service it never reads would make an unrelated MinIO
-/// outage fail it. The scan path comes from the SHARED `common::e2e_harness`
-/// definition, so the script DDL is byte-identical to every other E2E binary.
+/// MinIO is deliberately absent from the readiness waits: this suite's storage
+/// is Azure, so waiting on MinIO would fail it on an unrelated outage.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         // 1. Readiness — fail loud, never skip.
@@ -116,11 +107,9 @@ fn setup() {
 /// One run's Azure container, ADLS warehouse, seeded table, CONNECTION, and
 /// Virtual Schema.
 ///
-/// **Hold this as a local in the test that provisions it.** Its container is
-/// deleted by `_container`'s `Drop`, which runs on a normal return and while
-/// unwinding from a panic — but only if the value is still owned by the test's
-/// stack frame. Do not move `_container` out and do not park a fixture in a
-/// static.
+/// **Hold this as a local in the test that provisions it.** `_container`'s
+/// `Drop` deletes the container on return or panic, but only while it's still
+/// owned by the test's stack frame — never move it out or park it in a static.
 struct AzureFixture {
     /// Storage account under test — the `abfss://` authority the scan reads.
     account_name: String,
@@ -137,24 +126,21 @@ struct AzureFixture {
 
 impl AzureFixture {
     /// Create the run's container, warehouse, seeded table, CONNECTION, and
-    /// Virtual Schema, in that order.
+    /// Virtual Schema, in that order — not a preference. Lakekeeper validates
+    /// physical access at warehouse-creation time via a probe write/delete, so
+    /// the container must exist first, or a missing container / wrong key fails
+    /// warehouse creation immediately instead of surfacing later as a scan
+    /// error.
     ///
-    /// The order is a requirement, not a preference. Lakekeeper creates no ADLS
-    /// filesystem and validates physical access at warehouse-creation time by
-    /// writing and deleting a probe object, so the container must exist first — a
-    /// missing container or a wrong account key then fails warehouse creation
-    /// immediately instead of surfacing later as a scan error.
-    ///
-    /// Every blocking HTTP or WebSocket call stays outside `rt.block_on`: issuing
-    /// one from inside a runtime context panics, and a panic here would unwind
-    /// through the container guard rather than reaching a test assertion.
+    /// Blocking HTTP/WebSocket calls (`exa_conn`, DDL) stay outside
+    /// `rt.block_on`: issuing one from inside a runtime context panics,
+    /// unwinding through the container guard instead of reaching a test
+    /// assertion.
     fn provision() -> Self {
         setup();
 
-        // The data path under test, read before anything exists in Azure, so an
-        // absent variable fails the run with no container to clean up. The three
-        // Entra ID values are read by `AzureContainer::create`, which validates
-        // all of them before it creates anything.
+        // Read before anything exists in Azure, so an absent variable fails the
+        // run with no container to clean up yet.
         let account_name = azure::account_name();
         let account_key = azure::account_key();
 
@@ -168,17 +154,15 @@ impl AzureFixture {
             .block_on(AzureContainer::create(&container_name))
             .unwrap_or_else(|e| panic!("create per-run Azure container '{container_name}': {e:#}"));
 
-        // The warehouse name is derived from the container by the profile, so it
-        // carries the same per-run suffix: a repeated local run can never bind to
-        // a surviving warehouse whose container has already been deleted.
+        // The warehouse name derives from the container, so it carries the same
+        // per-run suffix — a repeated run can't bind to a stale warehouse whose
+        // container is already gone.
         let profile = AdlsWarehouseProfile::new(&container_name, &account_name, &account_key);
         let warehouse = profile.name().to_string();
         lakekeeper_create_adls_warehouse(&profile);
 
-        // Seeding authenticates to the catalog with a host-side Keycloak bearer
-        // token (fetched here, so a short token lifetime cannot go stale
-        // mid-write) and writes its data files through `abfss://` under the
-        // account key — the same credential the CONNECTION below carries.
+        // Fetched here, not earlier, so a short token lifetime can't go stale
+        // mid-write.
         let token = lakekeeper::keycloak_client_credentials_token();
         let seeded = rt
             .block_on(seed_events_table_with_auth(
@@ -194,10 +178,8 @@ impl AzureFixture {
             ))
             .unwrap_or_else(|e| panic!("seed events into ADLS warehouse '{warehouse}': {e:#}"));
 
-        // The CONNECTION and the Virtual Schema, from the shared harness helper.
-        // The password names the per-run warehouse and carries the account key;
-        // it leaves every static S3 field empty, which is what makes the adapter
-        // read it as an Azure CONNECTION rather than an ambiguous one.
+        // Leaving every static S3 field empty is what makes the adapter read
+        // this as an Azure CONNECTION rather than an ambiguous one.
         let password = lakekeeper_adls_connection_password(&warehouse, &account_name, &account_key);
         let mut conn = exa_conn();
         create_virtual_schema_with_password(
@@ -230,18 +212,13 @@ impl AzureFixture {
 // End-to-end scan over the static-credential ADLS warehouse.
 // ---------------------------------------------------------------------------
 
-/// The Azure fixture provisions a per-run container, a delegation-disabled ADLS
-/// warehouse seeded over `abfss://`, and a Virtual Schema over it. This single
-/// test carries three sets of assertions over that one fixture — the storage
-/// profile Lakekeeper reports, the seeded `abfss://` paths, projection/filter/
-/// LIMIT correctness, and the shared-harness script DDL — because splitting them
-/// would triple the live-Azure cost and the orphan surface for no added coverage.
+/// One fixture (container, ADLS warehouse, seeded table, Virtual Schema) carries
+/// four assertion groups — storage profile, seeded `abfss://` paths, projection/
+/// filter/LIMIT correctness, and shared-harness script DDL — in one test rather
+/// than four, to avoid tripling the live-Azure cost and orphan surface.
 ///
-/// The Virtual Schema existing is the downstream proof that the whole chain ran:
-/// a VS cannot be created over a warehouse whose container is missing (Lakekeeper
-/// would have rejected the warehouse), whose account key is wrong (the seed write
-/// would have failed), or whose table was never seeded (enumeration would find
-/// nothing).
+/// The Virtual Schema existing is itself proof the chain ran: it couldn't be
+/// created over a missing container, a wrong account key, or an unseeded table.
 #[test]
 fn azure_static_creds_end_to_end() {
     let fixture = AzureFixture::provision();
@@ -381,18 +358,14 @@ fn azure_static_creds_end_to_end() {
 // Container guard deletes on panic, even nested inside an active runtime.
 // ---------------------------------------------------------------------------
 
-/// The container guard deletes its container while unwinding from a panic,
-/// including when that unwind crosses an active `rt.block_on` — the exact case
-/// `AzureContainer::drop`'s own teardown thread exists to survive, since driving
-/// the delete on the ambient runtime from `Drop` would re-enter "Cannot start a
-/// runtime from within a runtime".
+/// The container guard deletes its container while unwinding from a panic that
+/// crosses an active `rt.block_on` — the case `AzureContainer::drop`'s own
+/// teardown thread exists to survive (driving the delete on the ambient runtime
+/// from `Drop` would re-enter "Cannot start a runtime from within a runtime").
 ///
-/// `std::panic::catch_unwind` cannot stand in for `futures::FutureExt::catch_unwind`
-/// here: it takes a synchronous closure, but the guard's construction
-/// (`AzureContainer::create`) is `async`, and driving it with a nested
-/// `Handle::block_on` inside a synchronous closure would itself panic with
-/// "Cannot start a runtime from within a runtime" — the very failure mode this
-/// test exists to prove was fixed, not a way to avoid triggering it.
+/// Uses `futures::FutureExt::catch_unwind`, not `std::panic::catch_unwind`: the
+/// guard's construction is `async`, and a nested `Handle::block_on` inside a
+/// synchronous closure would trigger the very panic this test proves is fixed.
 #[test]
 fn azure_container_guard_deletes_on_panic() {
     let container_name = azure::per_run_container_name();
@@ -437,17 +410,14 @@ fn azure_container_guard_deletes_on_panic() {
 // Fail-not-skip when the stack is down.
 // ---------------------------------------------------------------------------
 
-/// The Azure suite's readiness contract is fail-loud, mirroring the Lakekeeper
-/// suite's own `lakekeeper_suite_fails_when_stack_unavailable`: a readiness wait
-/// against an unreachable stack PANICS (never returns cleanly), so a down stack
-/// surfaces as a test failure, never a silent skip. This exercises the very
-/// `wait_for_url` helper `setup`'s readiness waits are built on, pointed at a
-/// closed local port with a short deadline.
+/// Mirrors the Lakekeeper suite's `lakekeeper_suite_fails_when_stack_unavailable`:
+/// a readiness wait against an unreachable stack PANICS rather than returning,
+/// so a down stack fails the test instead of silently skipping it.
 #[test]
 fn azure_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
-        // 127.0.0.1:1 refuses immediately; the poll loop hits the short deadline
-        // and panics rather than returning — the fail-not-skip contract.
+        // 127.0.0.1:1 refuses immediately, so the poll loop hits the deadline
+        // and panics — the fail-not-skip contract.
         wait_for_url("http://127.0.0.1:1/health", Duration::from_secs(2));
     });
     assert!(
@@ -460,14 +430,10 @@ fn azure_suite_fails_when_stack_unavailable() {
 // No credential value ever appears in captured output / panic messages.
 // ---------------------------------------------------------------------------
 
-/// A failing, credential-bearing Azure CONNECTION DDL executed through a
-/// redacting `ExaConn` must not surface the SQL text or either sentinel value in
-/// the failure output.
-///
-/// Mirrors the Lakekeeper suite's own `lakekeeper_credentials_never_appear_in_output`:
-/// obviously-fake sentinels carry `account_name`/`account_key`, an invalid
-/// trailing token forces the DDL-failure path, and the captured panic message is
-/// asserted to contain neither sentinel nor the SQL text.
+/// A failing, credential-bearing Azure CONNECTION DDL through a redacting
+/// `ExaConn` must not leak the SQL text or either sentinel value into the
+/// failure output. Mirrors the Lakekeeper suite's
+/// `lakekeeper_credentials_never_appear_in_output`.
 #[test]
 fn azure_credentials_never_appear_in_output() {
     const SENTINEL_ACCOUNT_NAME: &str = "azdummyaccountnamesentinel";
@@ -525,10 +491,8 @@ const WORKSPACE_GITIGNORE: &str = include_str!("../../../.gitignore");
 /// Committed `test.env.example`, embedded at compile time.
 const TEST_ENV_EXAMPLE: &str = include_str!("../../../test.env.example");
 
-/// `.gitignore` lists `test.env` (a filled-in credential file is never
-/// committable) and the committed `test.env.example` names all five Azure
-/// variables, each still carrying only the `placeholder` sentinel — never a real
-/// credential value.
+/// `.gitignore` must list `test.env`, and `test.env.example` must name all five
+/// Azure variables with only the `placeholder` sentinel — never a real value.
 #[test]
 fn azure_local_credential_file_is_gitignored() {
     assert!(
@@ -560,12 +524,9 @@ fn azure_local_credential_file_is_gitignored() {
 /// Workspace `Makefile`, embedded at compile time.
 const WORKSPACE_MAKEFILE: &str = include_str!("../../../Makefile");
 
-/// `make test-e2e-azure`'s shape, asserted against the Makefile's text rather
-/// than by actually running `make` (which would trigger the full Docker/build
-/// pipeline inside a test): the target rebuilds the `.so` through
-/// `cross-musl-udf-build` before running anything, its `test.env` sourcing and
-/// its `cargo test` invocation share one recipe line, and that line passes
-/// `--test-threads=1` — all tests in this binary share one Exasol provisioning.
+/// `make test-e2e-azure`'s shape, asserted against the Makefile text rather than
+/// by running `make` (which would trigger the full Docker/build pipeline inside
+/// a test).
 #[test]
 fn azure_make_target_rebuilds_so_and_runs_serially() {
     let target_start = WORKSPACE_MAKEFILE

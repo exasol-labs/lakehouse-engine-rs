@@ -629,50 +629,25 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
 
   # ── third viability gate: REAL Azure ADLS Gen2 storage, local catalog ────
-  # Storage is a real Azure Data Lake Storage Gen2 account — Azure has no working
-  # local substitute (Azurite's `dfs` endpoint is incomplete and Lakekeeper's
-  # `adls` profile can't address it; see e2e_azure_test.rs's module docs). The
-  # catalog (Lakekeeper), OIDC (Keycloak), and Exasol stay local Docker, so this
-  # job runs the same compose overlay as `e2e-lakekeeper`.
+  # No local ADLS Gen2 substitute exists (Azurite's `dfs` endpoint is
+  # incomplete), so this suite runs against a real Azure account; catalog
+  # (Lakekeeper), OIDC (Keycloak), and Exasol stay local Docker, same overlay
+  # as `e2e-lakekeeper`.
   #
-  # REQUIRED REPOSITORY CONFIGURATION — the suite fails loudly naming the absent
-  # variable (an unset secret/variable interpolates to the empty string, which
-  # the harness rejects exactly like an absent one) until all five exist:
+  # Requires five repository secrets/vars (fails loudly naming any missing):
   #   vars.AZURE_STORAGE_ACCOUNT_NAME     data path, not a secret
-  #   secrets.AZURE_STORAGE_ACCOUNT_KEY   the credential UNDER TEST (AdlsCred::AccountKey)
-  #   secrets.AZURE_TENANT_ID             ┐ Entra ID service principal — the
-  #   secrets.AZURE_CLIENT_ID             │ harness's own container lifecycle
-  #   secrets.AZURE_CLIENT_SECRET         ┘ ONLY, never the scan under test
+  #   secrets.AZURE_STORAGE_ACCOUNT_KEY   the credential UNDER TEST
+  #   secrets.AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET
+  #     service principal for container lifecycle only, never the scan itself
+  # The service principal needs exactly Storage Blob Data Contributor — a
+  # data-actions-only role 403s on container create/delete. Use a dedicated
+  # test-only storage account.
   #
-  # The service principal MUST hold exactly **Storage Blob Data Contributor** on
-  # the test storage account. Container create/delete are that role's
-  # `containers/write` + `containers/delete` actions: a custom role carrying only
-  # the `containers/blobs/*` data actions returns 403 on container creation, while
-  # `Storage Blob Data Owner` and account-level `Contributor` are over-privileged.
-  # Point all five values at a DEDICATED test-only storage account — the account
-  # key is a full-access, non-scopable, non-expiring credential and it lives here
-  # as a repository secret readable by workflow runs.
+  # Not in `release`'s `needs`: a live third-party account there would let an
+  # Azure incident or rotated secret block every release.
   #
-  # Deliberately NOT in `release`'s `needs` (see that job's comment): a live
-  # third-party account in the release gate turns an Azure incident or a rotated
-  # secret into a blocked release, and the suite's fail-loud contract gives it no
-  # way to degrade. It still runs, and fails visibly, on every main push.
-  #
-  # No same-repository `if` guard here: the job schedules on the same events as
-  # `e2e` and `e2e-lakekeeper`, forks included. Draft PRs are the one exclusion,
-  # and it is not this job's own — `needs: [build-so]` cascade-skips it whenever
-  # build-so's draft guard skips (see that job's `if`). A fork PR cannot read the
-  # account-key secret, so the job runs for a fork and fails loudly naming the
-  # missing credential variable, per the suite's fail-loud-never-skip contract.
-  # That failure blocks nothing: `E2E (Azure)` is not a required status check on
-  # `main` — the enumerated required checks live in
-  # specs/e2e-harness/azure-e2e-harness/spec.md's CI-scheduling Background bullet
-  # — so a fork PR still merges.
-  #
-  # Known ceiling: a run cancelled mid-suite (superseded PR push — see the
-  # workflow `concurrency` block) SIGKILLs the test process, so the container
-  # guard's Drop never fires and that run's blob container survives. Out-of-band
-  # sweep tracked in #291; Azure lifecycle policies delete blobs, not containers.
+  # Known ceiling: a run cancelled mid-suite SIGKILLs the process before the
+  # container-cleanup guard fires, leaking a blob container. Sweep tracked in #291.
   e2e-azure:
     name: E2E (Azure)
     runs-on: ubuntu-latest
@@ -724,17 +699,9 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sysctl kernel.apparmor_restrict_unprivileged_userns
 
-      # Two-phase, same rationale as `e2e-lakekeeper`'s four-phase bring-up: the
-      # one-shot `lakekeeper-migrate` is `docker wait`-ed to completion before the
-      # long-running services are brought up with `--wait`.
-      #
-      # `minio-init` and `minio-lakekeeper-init` are deliberately NOT run here:
-      # both provision the S3 warehouse bucket and the MinIO STS user, which this
-      # ADLS suite never touches (its module docs keep MinIO out of the readiness
-      # contract for the same reason — an unrelated MinIO outage must not fail an
-      # Azure run). `minio` itself still comes up and must be healthy, because
-      # `lakekeeper` declares it as a healthy-dependency; its healthcheck hits
-      # /minio/health/live and does not depend on either init job.
+      # Two-phase bring-up, same pattern as `e2e-lakekeeper`. Skips `minio-init` /
+      # `minio-lakekeeper-init` (S3 bucket + STS setup this ADLS suite doesn't
+      # use); `minio` itself still starts since `lakekeeper` requires it healthy.
       - name: Start stack (Exasol + Keycloak + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
@@ -811,10 +778,8 @@ jobs:
     # served straight off `main` (see its own job comment), so a broken script
     # on `main` must never reach a release-gated push either.
     #
-    # `e2e-azure` is deliberately ABSENT and must stay absent (full rationale in
-    # that job's comment): it depends on a live third-party Azure account, so an
-    # Azure incident or a rotated secret would block every release. Don't "fix"
-    # this by adding it.
+    # `e2e-azure` is deliberately absent: a live third-party account there would
+    # let an Azure incident or rotated secret block every release.
     needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
