@@ -35,7 +35,7 @@ jobs:
     name: Build release .so (Docker)
     runs-on: ubuntu-latest
     # Skip draft PRs; still run on push/merge_group (where pull_request is null).
-    # e2e/e2e-lakekeeper cascade-skip via `needs: [build-so]`.
+    # e2e / e2e-lakekeeper / e2e-azure cascade-skip via `needs: [build-so]`.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
     # release build). 60 min is a safety backstop against a genuine hang, not
@@ -212,44 +212,11 @@ jobs:
           shared-key: workspace-rlib
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # exasol-e2e / cloud-e2e are opt-in features, off by default, so this
-      # never touches a live stack.
+      # exasol-e2e, cloud-e2e, lakekeeper-e2e and azure-e2e are all opt-in
+      # features, off by default, so this compiles none of them and never touches
+      # a live stack or a cloud account.
       - name: Run unit tests
         run: cargo test --workspace
-
-      # The azure-e2e binary's offline subset — nine checks spanning
-      # container-name legality, the credential-variable readers, Azure error
-      # classification (the container-guard code-to-decision predicates), the
-      # ADLS warehouse/CONNECTION shapes, gitignore hygiene, and the Make
-      # target's shape. All nine are pure file/string/enum assertions needing no
-      # Azure account and no Docker stack, but they otherwise run ONLY under
-      # `make test-e2e-azure`, which is same-repo-guarded and outside the release
-      # gate. Running them here is what puts the slice's real logic (the
-      # container-name sanitizer and the error-classification predicates) under
-      # every PR, forks included.
-      #
-      # The count guard is the point, not decoration: a libtest name filter that
-      # matches NOTHING exits 0 ("0 passed; 0 failed; N filtered out"), so a
-      # renamed or deleted test would silently stop being covered while the step
-      # stayed green. `>= 9` (not `== 9`) so adding an offline check doesn't break
-      # CI — it just requires bumping this floor, which is the guard working
-      # rather than friction to route around. An empty/unparsed count floors to
-      # 0 and fails. pipefail is explicit because the GitHub default shell is
-      # `bash -e` WITHOUT it — `tee` would otherwise swallow a real cargo test
-      # failure.
-      - name: Azure offline checks (no Azure account, no Docker stack)
-        run: |
-          set -o pipefail
-          cargo test --features azure-e2e --test e2e_azure_test -- azure_offline_ \
-            2>&1 | tee azure-offline.log
-          PASSED=$(grep -oE '[0-9]+ passed' azure-offline.log | head -1 | cut -d' ' -f1)
-          # Exactly 9 tests carry the azure_offline_ prefix today; bump this floor
-          # when you add one.
-          if [ "${PASSED:-0}" -lt 9 ]; then
-            echo "::error::azure_offline_ matched ${PASSED:-0} tests, expected at least 9 — a renamed, deleted, or un-prefixed offline test stops being covered without turning this step red."
-            exit 1
-          fi
-          echo "azure_offline_ offline checks: $PASSED passed"
 
   licenses:
     name: License Check
@@ -691,10 +658,16 @@ jobs:
   # secret into a blocked release, and the suite's fail-loud contract gives it no
   # way to degrade. It still runs, and fails visibly, on every main push.
   #
-  # A fork PR is not SCHEDULED at all (see the `if` below) — a fork cannot read
-  # the account-key secret, so the fail-loud suite would go red on every external
-  # contribution. That is job-level scheduling, not the suite skipping: the
-  # offline subset still runs on every PR, forks included, in `unit-tests`.
+  # No same-repository `if` guard here: the job schedules on the same events as
+  # `e2e` and `e2e-lakekeeper`, forks included. Draft PRs are the one exclusion,
+  # and it is not this job's own — `needs: [build-so]` cascade-skips it whenever
+  # build-so's draft guard skips (see that job's `if`). A fork PR cannot read the
+  # account-key secret, so the job runs for a fork and fails loudly naming the
+  # missing credential variable, per the suite's fail-loud-never-skip contract.
+  # That failure blocks nothing: `E2E (Azure)` is not a required status check on
+  # `main` — the enumerated required checks live in
+  # specs/e2e-harness/azure-e2e-harness/spec.md's CI-scheduling Background bullet
+  # — so a fork PR still merges.
   #
   # Known ceiling: a run cancelled mid-suite (superseded PR push — see the
   # workflow `concurrency` block) SIGKILLs the test process, so the container
@@ -705,11 +678,6 @@ jobs:
     runs-on: ubuntu-latest
     # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
-    # Same-repository guard: true for push / merge_group / workflow_dispatch
-    # (where `pull_request` is null) and for a same-repo PR; false only for a fork
-    # PR. Draft PRs keep cascade-skipping through `needs: [build-so]` — this `if`
-    # carries no `always()`, so a skipped upstream still skips this job.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`; the extra
     # cost here is real-cloud round-trips, not extra local services.
     timeout-minutes: 45

@@ -420,7 +420,7 @@ mod azure_credentials_and_naming_tests {
     }
 
     #[test]
-    fn azure_offline_container_name_is_azure_and_lakekeeper_legal() {
+    fn container_name_is_azure_and_lakekeeper_legal() {
         let ninety_chars = "A".repeat(90);
         let truncated_at_a_hyphen = format!("{}.tail", "a".repeat(39));
 
@@ -475,7 +475,7 @@ mod azure_credentials_and_naming_tests {
     }
 
     #[test]
-    fn azure_offline_missing_credential_variable_fails_loud() {
+    fn missing_credential_variable_fails_loud() {
         for absent in [None, Some(""), Some("   ")] {
             let message = panic_message(|| {
                 require_var("AZURE_CLIENT_SECRET", absent);
@@ -492,7 +492,7 @@ mod azure_credentials_and_naming_tests {
     }
 
     #[test]
-    fn azure_offline_present_credential_variable_is_read_without_surrounding_whitespace() {
+    fn present_credential_variable_is_read_without_surrounding_whitespace() {
         assert_eq!(
             require_var("AZURE_STORAGE_ACCOUNT_KEY", Some(" a2V5\n")),
             "a2V5",
@@ -520,7 +520,7 @@ mod azure_error_classification_tests {
     /// untouched without it. Erring toward reporting a leak beats erring toward
     /// silently leaving one.
     #[test]
-    fn azure_offline_failure_without_a_service_response_carries_no_error_code() {
+    fn failure_without_a_service_response_carries_no_error_code() {
         let failures = [
             azure_core::Error::with_message(ErrorKind::Connection, "connection refused"),
             azure_core::Error::with_message(ErrorKind::Io, "read timed out"),
@@ -560,7 +560,7 @@ mod azure_error_classification_tests {
     /// teardown call a surviving container cleaned up; widening the create clause
     /// would blame a name collision for an unrelated create failure.
     #[test]
-    fn azure_offline_container_guard_keys_each_spec_clause_on_exactly_one_code() {
+    fn container_guard_keys_each_spec_clause_on_exactly_one_code() {
         let unmapped = StorageErrorCode::UnknownValue("SomethingNew".to_string());
 
         assert!(

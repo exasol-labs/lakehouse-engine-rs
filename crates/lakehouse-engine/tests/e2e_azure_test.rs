@@ -530,7 +530,7 @@ const TEST_ENV_EXAMPLE: &str = include_str!("../../../test.env.example");
 /// variables, each still carrying only the `placeholder` sentinel — never a real
 /// credential value.
 #[test]
-fn azure_offline_local_credential_file_is_gitignored() {
+fn azure_local_credential_file_is_gitignored() {
     assert!(
         WORKSPACE_GITIGNORE
             .lines()
@@ -567,7 +567,7 @@ const WORKSPACE_MAKEFILE: &str = include_str!("../../../Makefile");
 /// its `cargo test` invocation share one recipe line, and that line passes
 /// `--test-threads=1` — all tests in this binary share one Exasol provisioning.
 #[test]
-fn azure_offline_make_target_rebuilds_so_and_runs_serially() {
+fn azure_make_target_rebuilds_so_and_runs_serially() {
     let target_start = WORKSPACE_MAKEFILE
         .find("test-e2e-azure:")
         .expect("Makefile must define a test-e2e-azure target");

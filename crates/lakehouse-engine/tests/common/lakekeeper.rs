@@ -656,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_offline_adls_warehouse_matches_lakekeeper_profile_shape() {
+    fn adls_warehouse_matches_lakekeeper_profile_shape() {
         let profile = AdlsWarehouseProfile::new("lhrs-e2e-user-42", "acct", "a2V5");
 
         assert_eq!(
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn azure_offline_adls_connection_password_is_unambiguously_azure() {
+    fn adls_connection_password_is_unambiguously_azure() {
         let pw = lakekeeper_adls_connection_password("lhrs-e2e-user-42-static", "acct", "a2V5");
 
         assert_eq!(pw.warehouse, "lhrs-e2e-user-42-static");

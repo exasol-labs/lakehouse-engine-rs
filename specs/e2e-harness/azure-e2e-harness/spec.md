@@ -60,10 +60,15 @@ account key carried in the Exasol CONNECTION.
   location. The harness therefore creates the container before creating the
   warehouse, and a wrong account key or a missing container fails warehouse
   creation immediately rather than surfacing later as a scan error.
-* CI schedules the job only where the account key is reachable; a fork pull request
-  has no access to the repository secret. Not scheduling a job is distinct from the
-  suite skipping: whenever the suite does run, an absent variable or an unreachable
-  service fails it.
+* CI schedules the `E2E (Azure)` job on the same events as the `E2E` and `E2E
+  (Lakekeeper)` jobs, forks included; a draft pull request is the one exclusion, and
+  it is not this job's own — the job cascade-skips through its `needs` on the `.so`
+  build job, whose draft guard it inherits. A fork pull request cannot read the
+  account-key secret, so the job runs and fails loudly naming the missing variable,
+  per this spec's fail-loud-never-skip contract for an absent credential variable.
+  That failure blocks nothing: `E2E (Azure)` is not a required status check on `main`
+  (`Check & Lint`, `Unit Tests`, `License Check`, `E2E`, and `E2E (Lakekeeper)` are),
+  so a fork pull request with a red `E2E (Azure)` can still be merged.
 * **Known ceiling — orphaned containers.** The per-run container is deleted by a
   `Drop` guard, which runs both on a normal return and while unwinding from a test
   panic (this workspace compiles tests with unwinding panics, so a panicking test
