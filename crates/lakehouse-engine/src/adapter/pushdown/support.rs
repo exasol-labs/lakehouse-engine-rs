@@ -1077,20 +1077,44 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
     Some(rewrite_decimal_stringifications(&expr, col_types))
 }
 
+/// The SOLE owner of "a tree the DataFusion scan may be handed": one
+/// [`apply_type_rewrites`] pass AND renderability established on the tree that pass
+/// produced. `Some(tree)` is that pushable tree; `None` means either half rejected it
+/// — a guard declined, or the rewritten tree does not render.
+///
+/// Renderability is checked on the REWRITTEN tree, never the raw one, because the
+/// rewritten tree is what a scan spec carries: screening the raw tree would let a
+/// type-accepted-but-unrenderable tree pass the screen, then vanish when
+/// [`render_df_filter_safe`] silently dropped it — pushed nowhere, which returns wrong
+/// rows.
+///
+/// Every push decision asks this one function, whole-filter
+/// ([`classify_where_filter`]) or per-conjunct
+/// ([`type_screened_leg_filter`](super::joins::rendering::type_screened_leg_filter)),
+/// so adding a pipeline pass or changing which renderability check gates a push is a
+/// one-site edit instead of two surfaces that can silently disagree. What a `None`
+/// MEANS stays each caller's own decision: decline the whole surface, or route that
+/// one conjunct into a residual `WHERE`.
+pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    apply_type_rewrites(expr, col_types).filter(datafusion_renderable)
+}
+
 /// Splits a request's raw WHERE filter into the predicate the scan spec carries and
 /// the predicate the adapter must self-apply. Returns `(scan_filter, declined)`,
 /// mutually exclusive; both `None` for no filter or a trivially-true one. Sole owner
-/// of this classification (see `_decision/045`). `declined` is the original,
+/// of this classification (see `_decision/045`), while the acceptance predicate
+/// underneath it belongs to [`type_accepted_rewrite`]. `declined` is the original,
 /// un-rewritten tree — the type rewrites target the DataFusion dialect only.
 pub(super) fn classify_where_filter<'a>(
     filter_json_raw: Option<&'a Json>,
     col_types: &[(String, String)],
 ) -> (Option<String>, Option<&'a Json>) {
-    let rewritten = filter_json_raw.and_then(|f| apply_type_rewrites(f, col_types));
-    match (filter_json_raw, &rewritten) {
+    match (
+        filter_json_raw,
+        filter_json_raw.and_then(|f| type_accepted_rewrite(f, col_types)),
+    ) {
         (Some(raw), None) => (None, Some(raw)),
-        (Some(raw), Some(tree)) if !datafusion_renderable(tree) => (None, Some(raw)),
-        _ => (rewritten.as_ref().and_then(render_df_filter_safe), None),
+        (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
     }
 }
 

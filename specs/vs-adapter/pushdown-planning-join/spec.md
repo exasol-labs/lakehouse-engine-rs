@@ -20,6 +20,26 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * The broadcast contract is: exactly two involved tables, `join_type = "inner"`, an equi-join condition, disjoint column-name sets across the two tables, no Exasol postprocessing (aggregate / GROUP BY / HAVING / ORDER BY / LIMIT) in the request, and a condition/filter/projection the `crates/vs-expression` translator can render; any deviation is served by the unified unaccelerated fallback (`vs-adapter/pushdown-planning-join-fallback`) instead. Broadcast is an optimization selected within the single join path, never a second rendering implementation of that path.
 * The dimension side rides once in the shard-invariant common spec (full file list, table root, logical schema, join condition); only the fact side's per-shard file subset flows through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor, so every shard joins its fact subset against the same replicated dimension side node-locally.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
+* The recorded clause "rendered via the same `crates/vs-expression` translator path used for
+  single-table filters" was already inaccurate before this delta: the single-table path runs the
+  filter tree through the type-rewrite pipeline (`apply_type_rewrites`) BEFORE handing it to the
+  translator, and the broadcast site skipped that pass entirely and pre-screened only SYNTACTICALLY
+  (`datafusion_renderable`). This delta makes the clause true rather than adding a new requirement:
+  the broadcast site now runs the same pipeline behind the same owner
+  (`classify_where_filter`), so "the same path" means the same path. Issue #215.
+* The broadcast site's column-type universe is the UNION of both involved tables' columns, matched
+  by bare column name, and it is read only AFTER `disjoint_schema_guard` has passed — which is
+  exactly what makes a bare name resolve to one Exasol type. Broadcast rendering is side-agnostic
+  bare-name (see this feature's own render contract), so a bare-name universe is the matching one.
+  The ordering is therefore load-bearing, not incidental.
+* This delta adds no new decline OUTCOME. A type-rewrite decline is routed through the SAME
+  `Ok(None)` fall-through the syntactically-unrenderable-filter decline already takes, and that
+  outcome stays owned by `vs-adapter/pushdown-declined-filter-self-apply`. Only the set of triggers
+  widens. See `vs-adapter/pushdown-planning-like-type-coercion` for the per-surface type dispatch.
+* A DATE-column LIKE is a REWRITE, not a decline, so it keeps the broadcast plan. Rendering the
+  REWRITTEN tree rather than the raw one is what distinguishes "coerce and stay broadcast" from
+  "decline and forfeit broadcast"; rendering the raw tree after a successful rewrite would silently
+  discard the coercion and reintroduce the hard scan failure.
 
 ## Scenarios
 
@@ -59,10 +79,13 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * *WHEN* the adapter resolves the projection and renders the WHERE filter
 * *THEN* the adapter SHALL resolve each projected column's Exasol output type from the involved table it belongs to, matching the column against that table's involved-table column metadata
 * *AND* the scan-driving SQL's declared EMITS column list SHALL match the projected join output columns in order and type
-* *AND* a WHERE filter over columns of either side SHALL be rendered via the same `crates/vs-expression` translator path used for single-table filters and carried in the common spec
-* *AND* a filter that is PRESENT and non-trivial but that the translator DECLINES SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition already does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
+* *AND* a WHERE filter over columns of either side SHALL be rendered via the same path used for single-table filters — the type-rewrite pipeline over the union of both involved tables' column metadata, THEN the `crates/vs-expression` translator over the pipeline's REWRITTEN tree — and carried in the common spec
+* *AND* that column-type universe SHALL be read only AFTER the disjoint-column-name guard has passed, because a bare column name resolves to exactly one Exasol type only once the two sides' names are known disjoint
+* *AND* a filter that is PRESENT and non-trivial but that DECLINES — because the translator cannot express a node in the tree OR because the type-rewrite pipeline returned no tree — SHALL cause the adapter to decline the broadcast plan and take the unified unaccelerated fallback, exactly as an unrenderable join condition already does, because the broadcast SQL carries no outer `WHERE` in which the predicate could be applied
 * *AND* the adapter SHALL distinguish an ABSENT or trivially-true filter, which leaves the broadcast plan eligible and emits no scan-spec filter, from a DECLINED one, which forfeits the broadcast plan
 * *AND* the adapter MUST NOT emit a broadcast plan whose scan spec omits a declined predicate, because the result would carry extra rows — see `vs-adapter/pushdown-declined-filter-self-apply`
+* *AND* a filter the pipeline REWRITES rather than declines — a DATE LIKE subject rewrapped as CAST-to-VARCHAR, a governed string function's argument coerced, a DECIMAL stringification trimmed — SHALL keep the broadcast plan eligible and SHALL be carried in the common spec in its REWRITTEN form, never its raw form
+* *AND* a filter the pipeline leaves untriggered SHALL render byte-identically to its pre-change output, so no golden-SQL fixture over such a filter changes
 
 ### Scenario: Join condition is rendered via the vs-expression translator
 
