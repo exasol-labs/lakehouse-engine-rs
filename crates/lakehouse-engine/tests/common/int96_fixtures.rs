@@ -22,12 +22,14 @@
 //!
 //! WHY `timestamp` and not `timestamptz`: this fixture's column is
 //! deliberately an Iceberg `timestamp` (WITHOUT time zone) column, not
-//! `timestamptz`. `timestamptz` cannot reach the scan-emit path today —
-//! Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output
-//! type (sqlCode 22002), tracked as the open issue #118. Using `timestamptz`
-//! here would make this fixture fail for a reason unrelated to the INT96
-//! overflow fix under test. This is a deliberate scope choice by this plan,
-//! not an oversight.
+//! `timestamptz`. The INT96 overflow decode fix (`coerce_int96`, `#143`) is
+//! the behavior under test, and a naive `timestamp` column is the minimal
+//! carrier for it — `timestamptz` would add an unrelated time-zone-mapping
+//! variable to a fixture whose only job is proving the overflow fix. `#118`
+//! (closed) already established that `timestamptz` COLUMNS reach the
+//! scan-emit path fine (`types/mapping.rs` maps them to plain Exasol
+//! `TIMESTAMP`), so this fixture's `timestamp` choice is scope narrowing, not
+//! a workaround for a column-path constraint.
 
 /// Namespace shared with the other E2E seed tables (`seed::E2E_NAMESPACE`).
 pub const NAMESPACE: &str = "e2e_lakehouse";

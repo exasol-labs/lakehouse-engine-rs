@@ -143,6 +143,7 @@ const LITERAL_SELECTLIST_TYPES: &[&str] = &[
     "literal_date",
     "literal_timestamp",
     "literal_timestamp_utc",
+    "literal_timestamputc",
 ];
 
 /// Whether a `selectList` item's `type` is a bare literal (see

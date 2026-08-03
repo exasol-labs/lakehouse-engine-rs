@@ -64,11 +64,15 @@ use serde_json::Value as Json;
 /// zone, no clock, and no statement anchor, so these four are unadvertised
 /// and left for Exasol to evaluate itself.
 ///
-/// Five node types outside `function_scalar` also branch on dialect —
+/// Six node types outside `function_scalar` also branch on dialect —
 /// `function_scalar_extract`, `function_scalar_cast`, `predicate_like_regexp`,
-/// `literal_timestamp`, and `literal_timestamp_utc` — but none of them is
+/// `literal_timestamp`, `literal_timestamp_utc`, and `literal_timestamputc` (the
+/// last two are the same TSTZ literal shape under two wire names — `literal_timestamputc`
+/// is the one Exasol actually sends, #242) — but none of them is
 /// declared here: they are covered by their own rows in the
-/// `exasol_dialect_renders_declared_verbatim_surface` sweep test, not by this
+/// `exasol_dialect_renders_declared_verbatim_surface` sweep test (the first five) or
+/// their own dedicated test (`literal_timestamputc`, which unlike the other five
+/// declines rather than renders in the DataFusion dialect), not by this
 /// declaration.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dialect {
@@ -347,6 +351,29 @@ fn render_exasol_timestamp_literal(value: Option<&Json>) -> String {
     }
 }
 
+/// The Exasol-dialect rendering for a TSTZ literal (`literal_timestamp_utc` /
+/// `literal_timestamputc`). The wire value is UTC-normalized, so converting it
+/// into `SESSIONTIMEZONE` and re-declaring it TSTZ reproduces the SAME value
+/// Exasol's own engine computes for the equivalent native expression —
+/// verified live (Exasol 2025.2.1) against both a projected constant and a
+/// self-applied filter comparison (#218): a bare comparison of this literal
+/// against a plain-`TIMESTAMP` column disagrees with Exasol's own
+/// `TIMESTAMP` vs `TIMESTAMP WITH LOCAL TIME ZONE` coercion rule, which reads
+/// the naive side as session-local rather than comparing raw values.
+/// `SESSIONTIMEZONE` is referenced symbolically, never resolved by the
+/// adapter. NULL stays bare (`NULL`, matching `render_exasol_timestamp_literal`
+/// above) — `CAST`/`CONVERT_TZ` add nothing to a three-valued NULL comparison
+/// or projection.
+fn render_exasol_tstz_literal(value: Option<&Json>) -> String {
+    match value {
+        None | Some(Json::Null) => "NULL".to_string(),
+        Some(_) => format!(
+            "CAST(CONVERT_TZ({}, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE)",
+            render_exasol_timestamp_literal(value)
+        ),
+    }
+}
+
 fn json_scalar_to_string(value: &Json) -> String {
     match value {
         Json::String(s) => s.clone(),
@@ -606,14 +633,12 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             )));
         }
         "literal_timestamp_utc" => {
-            // The Exasol dialect renders the same bare literal as
-            // `literal_timestamp` and appends NO offset: Exasol's TIMESTAMP format
-            // has no offset field and rejects one with sqlCode 22018. The value
-            // Exasol sends is already UTC-normalised, and this project maps
-            // Iceberg `timestamptz` to plain Exasol `TIMESTAMP`, so the wrapper's
-            // counterpart column is a plain UTC TIMESTAMP.
+            // The Exasol dialect converts the UTC-normalized wire value into
+            // SESSIONTIMEZONE and re-declares it TSTZ — see
+            // `render_exasol_tstz_literal`'s doc for the live-verified reasoning
+            // (#218).
             if dialect == Dialect::Exasol {
-                return Ok(Some(render_exasol_timestamp_literal(value("value"))));
+                return Ok(Some(render_exasol_tstz_literal(value("value"))));
             }
             // Append +00:00 so the value parses as UTC, then render via arrow_cast
             // at explicit microsecond precision (see literal_timestamp above). The
@@ -628,6 +653,21 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             return Ok(Some(format!(
                 "arrow_cast({quoted}, 'Timestamp(Microsecond, Some(\"UTC\"))')"
             )));
+        }
+        "literal_timestamputc" => {
+            // Exasol's REAL wire node name for a TSTZ literal — no underscore before
+            // `utc` — which `literal_timestamp_utc` above never matches on real
+            // traffic (#242). Accept it in the Exasol dialect only, rendering
+            // identically to the arm above (`render_exasol_tstz_literal`). The
+            // DataFusion dialect keeps declining it — `None`, the same unmatched
+            // outcome as today — so the pushed `ScanSpec.filter` stays
+            // byte-identical: accepting it there would start pushing TSTZ
+            // predicates into DataFusion, whose coercion against a naive
+            // `timestamp_us` column is unverified (#242, deliberately deferred).
+            if dialect == Dialect::Exasol {
+                return Ok(Some(render_exasol_tstz_literal(value("value"))));
+            }
+            return Ok(None);
         }
         "column" => {
             let name = value("name")
@@ -2399,15 +2439,14 @@ mod tests {
         // `TIMESTAMP '<value>'` literal Exasol's own compiler sent, while the
         // DataFusion rendering stays byte-identical so the scan keeps the
         // explicit microsecond typing that issue #155 depends on.
+        //
+        // `literal_timestamp_utc` is NOT bare in the Exasol dialect — see
+        // `renders_timestamp_utc_literal_via_convert_tz_in_exasol_dialect` below.
         let ts = json!({"type": "literal_timestamp", "value": "2024-01-15 12:00:00"});
         let ts_utc = json!({"type": "literal_timestamp_utc", "value": "2024-03-01 10:00:00"});
 
         let ts_exasol = render_expression_exasol(&ts).unwrap();
         assert_eq!(ts_exasol, "TIMESTAMP '2024-01-15 12:00:00'");
-        assert_eq!(
-            render_expression_exasol(&ts_utc).unwrap(),
-            "TIMESTAMP '2024-03-01 10:00:00'"
-        );
         assert!(
             !ts_exasol.contains("arrow_cast"),
             "Exasol rejects arrow_cast with sqlCode 42000: {ts_exasol}"
@@ -2436,33 +2475,78 @@ mod tests {
     }
 
     #[test]
-    fn renders_timestamp_utc_literal_without_offset_in_exasol_dialect() {
-        // Exasol's TIMESTAMP literal format is `YYYY-MM-DD HH24:MI:SS.FF9`, which
-        // has no offset field: the DataFusion dialect's `+00:00` suffix raises
-        // "data exception - invalid character value for cast" (22018, verified on
-        // live Exasol 2025.2.1). Both timestamp node types therefore render the
-        // SAME bare literal in the Exasol dialect; the offset exists only in the
-        // DataFusion dialect, where it pins the arrow timezone label.
+    fn renders_timestamp_utc_literal_via_convert_tz_in_exasol_dialect() {
+        // The wire value is UTC-normalized (Exasol's TIMESTAMP literal format,
+        // `YYYY-MM-DD HH24:MI:SS.FF9`, has no offset field and rejects one with
+        // sqlCode 22018, so the value carries no zone marker of its own).
+        // Converting it into SESSIONTIMEZONE and re-declaring it TSTZ reproduces
+        // the value Exasol's own engine computes for the equivalent native
+        // expression — verified live (#218): a BARE comparison of this literal
+        // against a plain-TIMESTAMP column disagrees with Exasol's own
+        // TIMESTAMP-vs-TSTZ coercion rule (session-local interpretation of the
+        // naive side), so the Exasol dialect must NOT render it bare like
+        // `literal_timestamp` does.
         let value = "2024-03-01 10:00:00";
         let ts_utc = json!({"type": "literal_timestamp_utc", "value": value});
-        let ts = json!({"type": "literal_timestamp", "value": value});
 
         let exasol = render_expression_exasol(&ts_utc).unwrap();
-        assert_eq!(exasol, "TIMESTAMP '2024-03-01 10:00:00'");
+        assert_eq!(
+            exasol,
+            "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 10:00:00', 'UTC', SESSIONTIMEZONE) \
+             AS TIMESTAMP WITH LOCAL TIME ZONE)"
+        );
         assert!(
             !exasol.contains("+00:00"),
             "Exasol rejects an offset in a TIMESTAMP literal with sqlCode 22018: {exasol}"
-        );
-        assert_eq!(
-            exasol,
-            render_expression_exasol(&ts).unwrap(),
-            "both timestamp node types must render the same bare Exasol literal"
         );
 
         assert!(
             render_expression(&ts_utc).unwrap().contains("+00:00"),
             "the DataFusion dialect keeps the offset that types the literal UTC"
         );
+    }
+
+    #[test]
+    fn literal_timestamputc_wire_name_renders_exasol_only() {
+        // Exasol's real wire node name for a TSTZ literal is `literal_timestamputc`
+        // (no underscore before `utc`) — `literal_timestamp_utc` above never
+        // matches real traffic (#242). The Exasol dialect accepts the real name
+        // and renders it identically to `literal_timestamp_utc`.
+        let value = "2024-03-01 09:00:00";
+        let real_wire_name = json!({"type": "literal_timestamputc", "value": value});
+        assert_eq!(
+            render_expression_exasol(&real_wire_name).unwrap(),
+            "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 09:00:00', 'UTC', SESSIONTIMEZONE) \
+             AS TIMESTAMP WITH LOCAL TIME ZONE)"
+        );
+
+        // The DataFusion dialect keeps declining it — the SAME unmatched/`None`
+        // outcome as an entirely unknown node type — so the pushed `ScanSpec.filter`
+        // stays byte-identical for every request. Locked here so a later change
+        // cannot silently widen the scan filter without also touching this test
+        // (#242 stays a deliberate, tracked deferral, not accepted by accident).
+        assert!(render_expression_safe(&real_wire_name).is_none());
+    }
+
+    #[test]
+    fn renders_null_valued_tstz_literal_bare_in_exasol_dialect() {
+        // NULL stays bare (no CONVERT_TZ/CAST) for both TSTZ literal node
+        // types: CAST/CONVERT_TZ add nothing to a three-valued NULL comparison
+        // or projection, and `TIMESTAMP NULL` is a syntax error on Exasol
+        // (`unexpected TIMESTAMP_`, 42000), so `render_exasol_timestamp_literal`'s
+        // existing bare-`NULL` short-circuit is reused rather than duplicated.
+        for node_type in ["literal_timestamp_utc", "literal_timestamputc"] {
+            for node in [
+                json!({"type": node_type, "value": null}),
+                json!({"type": node_type}),
+            ] {
+                assert_eq!(
+                    render_expression_exasol(&node).unwrap(),
+                    "NULL",
+                    "{node_type} with a null/absent value must render bare NULL"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4831,7 +4915,8 @@ mod tests {
             ),
             (
                 json!({"type": "literal_timestamp_utc", "value": "2024-03-01 12:34:56.789"}),
-                "TIMESTAMP '2024-03-01 12:34:56.789'",
+                "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 12:34:56.789', 'UTC', SESSIONTIMEZONE) \
+                 AS TIMESTAMP WITH LOCAL TIME ZONE)",
                 r#"arrow_cast('2024-03-01 12:34:56.789+00:00', 'Timestamp(Microsecond, Some("UTC"))')"#,
             ),
         ];
