@@ -360,45 +360,8 @@ jobs:
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
     steps:
-      # Freed before the cache restore below (not just before the docker
-      # pulls) — restoring the shared rust-cache tarball onto an
-      # already-tight runner disk can itself ENOSPC. android + dotnet alone
-      # recover ~80% of the space the extra directories (ghc/ghcup/CodeQL/
-      # powershell/swift/jvm) and `docker image prune -af` used to reclaim
-      # here, for a fraction of the time — matching the minimal form the
-      # other jobs already use (#121), and matching their step order too.
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
-
-      # Downloaded after checkout, so its mtime is newer than the checked-out
-      # sources — the Makefile's mtime-based `test-e2e → cross-musl-udf-build`
-      # dependency then sees the artifact as up to date and skips rebuilding.
-      - name: Download liblakehouse_engine.so
-        uses: actions/download-artifact@v8
-        with:
-          name: lakehouse-engine-so
-          path: target/release/
-
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
-
-      # Stabilizes the rust-cache key against the runner image's preinstalled
-      # Rust drifting between writer/reader jobs — see the `lint` job's
-      # matching step for the full rationale (#133).
-      - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
-
-      # Read-only restore of the shared workspace cache to warm the host debug
-      # build of the e2e test binary. save-if:false so this job doesn't prune
-      # target/ (which would delete the .so downloaded into target/release/
-      # above) and doesn't save a redundant copy.
-      - name: Restore cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: workspace-rlib
-          save-if: "false"
+      - uses: ./.github/actions/e2e-setup
 
       # No tarball cache here (tried it, dropped it): restoring a GHA cache
       # tarball and `docker load`-ing it is a wash against a direct registry
@@ -411,19 +374,6 @@ jobs:
       # lines in the non-interactive CI log. Errors and image names still print.
       - name: Pull stack images
         run: docker compose pull --quiet
-
-      # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
-      # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
-      # Exasol launches nschroot to sandbox the UDF, which needs CAP_SYS_ADMIN
-      # inside an unprivileged user namespace. Ubuntu 24.04 ships
-      # kernel.apparmor_restrict_unprivileged_userns=1, which denies that even
-      # inside a --privileged container. lakehouse-engine-rs's E2E suite
-      # actually spawns UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), so
-      # it hits this exact failure without the fix below.
-      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          sysctl kernel.apparmor_restrict_unprivileged_userns
 
       # Two-phase: `docker compose up --wait` doesn't reliably support a
       # one-shot container (minio-init) in the same wait set as long-running
@@ -515,39 +465,11 @@ jobs:
       # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
       LH_EXASOL_CPUS: "2"
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
-
-      - name: Download liblakehouse_engine.so
-        uses: actions/download-artifact@v8
-        with:
-          name: lakehouse-engine-so
-          path: target/release/
-
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
-
-      - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
-
-      # See the `e2e` job's identical step (and the writer in `unit-tests`).
-      - name: Restore cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: workspace-rlib
-          save-if: "false"
+      - uses: ./.github/actions/e2e-setup
 
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
-
-      # Same root cause and fix as the `e2e` job: this suite also spawns
-      # Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
-      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          sysctl kernel.apparmor_restrict_unprivileged_userns
 
       # Four-phase bring-up, same rationale as the `e2e` job's two-phase one:
       # `docker compose up --wait` doesn't reliably support a one-shot
@@ -645,9 +567,6 @@ jobs:
   #
   # Not in `release`'s `needs`: a live third-party account there would let an
   # Azure incident or rotated secret block every release.
-  #
-  # Known ceiling: a run cancelled mid-suite SIGKILLs the process before the
-  # container-cleanup guard fires, leaking a blob container. Sweep tracked in #291.
   e2e-azure:
     name: E2E (Azure)
     runs-on: ubuntu-latest
@@ -660,29 +579,8 @@ jobs:
       # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
       LH_EXASOL_CPUS: "2"
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
-
-      - name: Download liblakehouse_engine.so
-        uses: actions/download-artifact@v8
-        with:
-          name: lakehouse-engine-so
-          path: target/release/
-
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
-
-      - name: Drop the runner's preinstalled Rust (stabilize cache key)
-        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
-
-      # See the `e2e` job's identical step (and the writer in `unit-tests`).
-      - name: Restore cargo & build artifacts
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: workspace-rlib
-          save-if: "false"
+      - uses: ./.github/actions/e2e-setup
 
       # Only the services this suite starts, unlike `e2e-lakekeeper`'s bare
       # `pull`: the Spark fixture and Iceberg-REST images are multi-GB and this
@@ -690,21 +588,15 @@ jobs:
       - name: Pull stack images
         run: |
           docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
-            pull --quiet exasol minio keycloak lakekeeper-db lakekeeper-migrate lakekeeper
-
-      # Same root cause and fix as the `e2e` job: this suite also spawns Exasol
-      # UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
-      - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          sysctl kernel.apparmor_restrict_unprivileged_userns
+            -f docker-compose.lakekeeper.azure.yml \
+            pull --quiet exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 
       # Two-phase bring-up, same pattern as `e2e-lakekeeper`. Skips `minio-init` /
       # `minio-lakekeeper-init` (S3 bucket + STS setup this ADLS suite doesn't
-      # use); `minio` itself still starts since `lakekeeper` requires it healthy.
+      # use) and `minio` itself — docker-compose.lakekeeper.azure.yml.
       - name: Start stack (Exasol + Keycloak + Lakekeeper)
         run: |
-          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -714,7 +606,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol minio keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol keycloak lakekeeper-db lakekeeper
 
       # The five credential variables are scoped to THIS step only — no later
       # step (log dumping, artifact upload) has any use for them.
@@ -732,7 +624,7 @@ jobs:
       - name: Dump Azure stack logs on failure
         if: failure()
         run: |
-          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
           echo "=== container stats / host free ==="
           $COMPOSE ps || true
           free -m || true
@@ -764,7 +656,7 @@ jobs:
 
       - name: Stop stack
         if: always()
-        run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
+        run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml down -v
 
   # ── release: main-push-with-version-bump, or a direct tag push ──────────
   release:

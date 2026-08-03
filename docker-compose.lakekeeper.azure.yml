@@ -1,0 +1,20 @@
+# Azure E2E overlay — layered ON TOP of docker-compose.yml AND
+# docker-compose.lakekeeper.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+#     -f docker-compose.lakekeeper.azure.yml up -d --wait \
+#     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#
+# Drops `lakekeeper`'s `minio: service_healthy` dependency — this suite's
+# warehouse storage is ADLS Gen2, not MinIO. `!override` (not a plain key) is
+# required: Compose merges depends_on maps by key, so a plain override can't
+# remove an entry.
+services:
+  lakekeeper:
+    depends_on: !override
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      lakekeeper-db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy

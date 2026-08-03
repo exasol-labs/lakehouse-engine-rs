@@ -1,0 +1,60 @@
+name: E2E setup
+description: >
+  Common preparation shared by the e2e, e2e-lakekeeper and e2e-azure jobs.
+  Callers must run `actions/checkout` themselves before this action.
+runs:
+  using: composite
+  steps:
+    # Freed before the cache restore below (not just before the docker
+    # pulls) — restoring the shared rust-cache tarball onto an
+    # already-tight runner disk can itself ENOSPC. android + dotnet alone
+    # recover ~80% of the space the extra directories (ghc/ghcup/CodeQL/
+    # powershell/swift/jvm) and `docker image prune -af` used to reclaim
+    # here, for a fraction of the time (#121).
+    - name: Free disk space
+      shell: bash
+      run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+    # Downloaded after the caller's checkout, so its mtime is newer than the
+    # checked-out sources — the Makefile's mtime-based
+    # `test-e2e → cross-musl-udf-build` dependency then sees the artifact as
+    # up to date and skips rebuilding.
+    - name: Download liblakehouse_engine.so
+      uses: actions/download-artifact@v8
+      with:
+        name: lakehouse-engine-so
+        path: target/release/
+
+    - name: Install Rust 1.94
+      uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+    # Stabilizes the rust-cache key against the runner image's preinstalled
+    # Rust drifting between writer/reader jobs — see the `lint` job's
+    # matching step for the full rationale (#133).
+    - name: Drop the runner's preinstalled Rust (stabilize cache key)
+      shell: bash
+      run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
+    # Read-only restore of the shared workspace cache to warm the host debug
+    # build of the e2e test binary. save-if:false so this job doesn't prune
+    # target/ (which would delete the .so downloaded into target/release/
+    # above) and doesn't save a redundant copy.
+    - name: Restore cargo & build artifacts
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: workspace-rlib
+        save-if: "false"
+
+    # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
+    # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
+    # Exasol launches nschroot to sandbox the UDF, which needs CAP_SYS_ADMIN
+    # inside an unprivileged user namespace. Ubuntu 24.04 ships
+    # kernel.apparmor_restrict_unprivileged_userns=1, which denies that even
+    # inside a --privileged container. Every caller of this action spawns UDF
+    # sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), so each hits this exact
+    # failure without the fix below.
+    - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
+      shell: bash
+      run: |
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        sysctl kernel.apparmor_restrict_unprivileged_userns

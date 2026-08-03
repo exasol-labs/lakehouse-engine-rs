@@ -89,10 +89,15 @@ test-e2e: cross-musl-udf-build
 test-e2e-lakekeeper: cross-musl-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
-# Azure E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak stack
-# (same overlay as test-e2e-lakekeeper) plus real Azure Blob Storage credentials.
-# Credentials come from a gitignored ./test.env (see test.env.example) when
-# present, or from the environment otherwise (e.g. CI secrets). They FAIL (not
+# Azure E2E tests require a live Exasol + Lakekeeper + Keycloak stack — bring
+# it up with the `docker-compose.lakekeeper.yml` + `docker-compose.lakekeeper.azure.yml`
+# overlays:
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+#     -f docker-compose.lakekeeper.azure.yml up -d --wait \
+#     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+# Also requires real Azure Blob Storage credentials. Credentials come from a
+# gitignored ./test.env (see test.env.example) when present, or from the
+# environment otherwise (e.g. CI secrets). They FAIL (not
 # skip) when unavailable — same contract as test-e2e. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 #
