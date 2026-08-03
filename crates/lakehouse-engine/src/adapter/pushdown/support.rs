@@ -1502,6 +1502,20 @@ pub(super) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Wrap `expr` in `CAST(... AS <declared>)` unless `declared` is absent or the
+/// `VARCHAR(2000000)` default, so a pushdown output column's type matches what
+/// Exasol validates positionally against `selectListDataTypes`. `VARCHAR(2000000)`
+/// is exempt because it is the catch-all `crate::types::mapping` returns for any
+/// Arrow type it cannot map (see `mapping.rs:22-28`), so its presence signals "no
+/// usable declared type" rather than a type Exasol actually declared, and casting
+/// to it would mislabel the value.
+pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> String {
+    match declared {
+        Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
+        _ => expr.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
@@ -6430,5 +6444,20 @@ mod tests {
             )),
             "the inner TRIM's DECIMAL argument must be coerced exactly once"
         );
+    }
+
+    /// `cast_to_declared_type` casts when a declared type is present and not the
+    /// `VARCHAR(2000000)` default, and returns the expression unwrapped otherwise.
+    #[test]
+    fn cast_to_declared_type_skips_the_varchar_default_and_absent_type() {
+        assert_eq!(
+            cast_to_declared_type("SUM(x)", Some("DECIMAL(18,2)")),
+            "CAST(SUM(x) AS DECIMAL(18,2))"
+        );
+        assert_eq!(
+            cast_to_declared_type("SUM(x)", Some("VARCHAR(2000000)")),
+            "SUM(x)"
+        );
+        assert_eq!(cast_to_declared_type("SUM(x)", None), "SUM(x)");
     }
 }

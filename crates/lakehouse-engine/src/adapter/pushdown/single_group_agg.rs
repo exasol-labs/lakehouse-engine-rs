@@ -195,19 +195,51 @@ fn parse_count_distinct(item: &Json) -> Option<DistinctCount> {
     Some(DistinctCount { column, arg_expr })
 }
 
+/// Function names resolved through the expression-capable argument path
+/// ([`arg_column_or_expr`]): a bare column takes the fast path, any other
+/// renderable expression populates `arg_expr`.
+const EXPR_CAPABLE_AGG_KINDS: &[(&str, AggKind)] = &[
+    ("SUM", AggKind::Sum),
+    ("MIN", AggKind::Min),
+    ("MAX", AggKind::Max),
+    ("AVG", AggKind::Avg),
+];
+
+/// STDDEV/VARIANCE family function names, resolved through the bare-column-only
+/// argument path ([`column_from_first_arg`]).
+const STAT_AGG_KINDS: &[(&str, AggKind)] = &[
+    ("STDDEV", AggKind::StddevSamp),
+    ("STDDEV_SAMP", AggKind::StddevSamp),
+    ("STDDEV_POP", AggKind::StddevPop),
+    ("VARIANCE", AggKind::VarSamp),
+    ("VAR_SAMP", AggKind::VarSamp),
+    ("VAR_POP", AggKind::VarPop),
+];
+
 /// Parse a single `function_aggregate` select-list item into an `AggregatePlan`.
 ///
 /// Returns `None` when the item uses `distinct: true` (single-group
 /// `COUNT(DISTINCT)` is handled by [`parse_count_distinct`] before this is
 /// called; every other distinct — and grouped `COUNT(DISTINCT)` — declines
 /// here), when the function name is not one of COUNT, SUM, MIN, MAX, AVG, the
-/// STDDEV/VARIANCE family, or when a COUNT/SUM/MIN/MAX/AVG argument is a scalar
-/// expression the VS translator cannot render.
+/// STDDEV/VARIANCE family, when a COUNT/SUM/MIN/MAX/AVG argument is a scalar
+/// expression the VS translator cannot render, or when a STDDEV/VARIANCE
+/// argument is anything but a bare `column`.
 ///
 /// For COUNT/SUM/MIN/MAX/AVG a bare `column` argument takes the fast path
 /// (`column` populated, `arg_expr` None); any other renderable expression is
-/// carried in `arg_expr` (`column` None). The STDDEV/VARIANCE family keeps its
-/// bare-column-only behavior unchanged.
+/// carried in `arg_expr` (`column` None).
+///
+/// The STDDEV/VARIANCE family is bare-column-only: its (cnt, sum, sum_sq)
+/// decomposition has no rendered-argument form, so an expression argument
+/// declines rather than yielding a plan with neither `column` nor `arg_expr` —
+/// a shape that passes type validation on the declared-type default, is given
+/// three `EMITS` columns, and then fails inside the scan on an argument that
+/// names no field. Declining instead routes the request to the row-scan or
+/// qualified-wrapper fallback, where Exasol computes the statistic natively.
+///
+/// Every plan this returns therefore carries an argument — `column` or
+/// `arg_expr` — except `AggKind::Count`, which is `COUNT(*)` and has none.
 ///
 /// The caller must verify `item.type == "function_aggregate"` before calling.
 pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
@@ -223,8 +255,8 @@ pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
 
     let args = item.get("arguments").and_then(|a| a.as_array());
 
-    let plan = match fn_name.as_str() {
-        "COUNT" => match args.and_then(|a| a.first()) {
+    if fn_name == "COUNT" {
+        return Some(match args.and_then(|a| a.first()) {
             // COUNT(*) — no argument: count every row.
             None => AggregatePlan {
                 kind: AggKind::Count,
@@ -242,64 +274,30 @@ pub(super) fn parse_agg_item(item: &Json) -> Option<AggregatePlan> {
                     arg_expr,
                 }
             }
-        },
-        "SUM" => {
-            let (column, arg_expr) = arg_column_or_expr(args)?;
-            AggregatePlan {
-                kind: AggKind::Sum,
-                column,
-                arg_expr,
-            }
-        }
-        "MIN" => {
-            let (column, arg_expr) = arg_column_or_expr(args)?;
-            AggregatePlan {
-                kind: AggKind::Min,
-                column,
-                arg_expr,
-            }
-        }
-        "MAX" => {
-            let (column, arg_expr) = arg_column_or_expr(args)?;
-            AggregatePlan {
-                kind: AggKind::Max,
-                column,
-                arg_expr,
-            }
-        }
-        "AVG" => {
-            let (column, arg_expr) = arg_column_or_expr(args)?;
-            AggregatePlan {
-                kind: AggKind::Avg,
-                column,
-                arg_expr,
-            }
-        }
-        // STDDEV/VARIANCE family — decompose into (cnt, sum, sum_sq) sufficient statistics.
-        // STDDEV and STDDEV_SAMP are the sample forms; VARIANCE / VAR_SAMP likewise.
-        "STDDEV" | "STDDEV_SAMP" => AggregatePlan {
-            kind: AggKind::StddevSamp,
-            column: column_from_first_arg(args),
+        });
+    }
+
+    if let Some((_, kind)) = EXPR_CAPABLE_AGG_KINDS
+        .iter()
+        .find(|(name, _)| *name == fn_name)
+    {
+        let (column, arg_expr) = arg_column_or_expr(args)?;
+        return Some(AggregatePlan {
+            kind: kind.clone(),
+            column,
+            arg_expr,
+        });
+    }
+
+    if let Some((_, kind)) = STAT_AGG_KINDS.iter().find(|(name, _)| *name == fn_name) {
+        return Some(AggregatePlan {
+            kind: kind.clone(),
+            column: Some(column_from_first_arg(args)?),
             arg_expr: None,
-        },
-        "STDDEV_POP" => AggregatePlan {
-            kind: AggKind::StddevPop,
-            column: column_from_first_arg(args),
-            arg_expr: None,
-        },
-        "VARIANCE" | "VAR_SAMP" => AggregatePlan {
-            kind: AggKind::VarSamp,
-            column: column_from_first_arg(args),
-            arg_expr: None,
-        },
-        "VAR_POP" => AggregatePlan {
-            kind: AggKind::VarPop,
-            column: column_from_first_arg(args),
-            arg_expr: None,
-        },
-        _ => return None,
-    };
-    Some(plan)
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -854,5 +852,44 @@ mod tests {
             );
             assert_eq!(plan.column.as_deref(), Some("AMOUNT"));
         }
+    }
+
+    /// A statistical aggregate whose first argument is not a bare `column` node
+    /// declines, so the whole single-group select list declines and Exasol computes
+    /// the statistic natively over the Tier 3 row scan.
+    ///
+    /// Before this decline such an item parsed to a plan carrying NEITHER `column`
+    /// nor `arg_expr`, passed type validation on the declared-type default, was
+    /// given three `EMITS` columns, and then failed inside the scan on an argument
+    /// naming no field. Measured 2026-07-31 against the Docker Exasol container:
+    /// `SELECT STDDEV(score + id) FROM MY_LAKEHOUSE.EVENTS` is PUSHED by Exasol and
+    /// fails with `sqlCode 22002`, `partial aggregate SQL error: Schema error: No
+    /// field named .`
+    #[test]
+    fn stat_aggregate_over_expression_argument_declines() {
+        for arg in [length_expr("SCORE"), mult_expr("SCORE", "ID")] {
+            let item = agg_item_expr("STDDEV", arg.clone(), false);
+            assert!(
+                parse_agg_item(&item).is_none(),
+                "STDDEV over a non-column argument must decline: {arg}"
+            );
+            let req = serde_json::json!({"selectList": [item]});
+            assert!(
+                detect_aggregates(&req).is_none(),
+                "one declining stat aggregate must decline the whole select list: {arg}"
+            );
+        }
+    }
+
+    /// The bare-column form is untouched by the expression-argument decline:
+    /// `STDDEV(SCORE)` still decomposes into the (cnt, sum, sum_sq) triple over the
+    /// source column, with no rendered argument.
+    #[test]
+    fn stat_aggregate_over_bare_column_still_parses() {
+        let plan = parse_agg_item(&agg_item("STDDEV", Some("SCORE"), false))
+            .expect("STDDEV over a bare column must still parse");
+        assert_eq!(plan.kind, AggKind::StddevSamp);
+        assert_eq!(plan.column.as_deref(), Some("SCORE"));
+        assert_eq!(plan.arg_expr, None);
     }
 }

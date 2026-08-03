@@ -17,7 +17,7 @@ use lakehouse_catalog::{
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::request_shape::{RequestShape, classify_request_shape};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{aggregate_exasol_types, emits_ident};
+use super::support::{aggregate_exasol_types, cast_to_declared_type, emits_ident};
 use super::{GroupedSelectItem, build_logical_schema};
 
 /// Emit a file path relative to `table_root` when the file lives under it,
@@ -752,10 +752,7 @@ fn empty_agg_sql(items: &[SingleGroupItem], aggregate_types: &[String]) -> Json 
                 SingleGroupItem::Distinct(_) => "0",
                 SingleGroupItem::Aggregate(plan) => empty_agg_literal(&plan.kind),
             };
-            match aggregate_types.get(i) {
-                Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({literal} AS {ty})"),
-                _ => literal.to_string(),
-            }
+            cast_to_declared_type(literal, aggregate_types.get(i).map(String::as_str))
         })
         .collect();
     let sql = format!("SELECT {} FROM DUAL", literals.join(", "));
@@ -789,15 +786,12 @@ fn empty_grouped_sql(
                 .get(*plan_slot)
                 .map(|ty| format!("CAST(NULL AS {ty})")),
             GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
-            // A scalar-over-aggregate column is NULL over zero rows, typed to the
-            // item's own declared type (mirrors the group-key/aggregate cast so the
-            // empty grouped shape never drifts from the non-empty wrapper).
+            // A scalar-over-aggregate column is NULL over zero rows and goes through
+            // the shared `cast_to_declared_type`, so — unlike the GroupKey/Aggregate
+            // arms above, which cast unconditionally — it emits a bare NULL when the
+            // item's declared type is the VARCHAR(2000000) default.
             GroupedSelectItem::ScalarOverAggregate { declared_type, .. } => {
-                Some(if declared_type != "VARCHAR(2000000)" {
-                    format!("CAST(NULL AS {declared_type})")
-                } else {
-                    "NULL".to_string()
-                })
+                Some(cast_to_declared_type("NULL", Some(declared_type)))
             }
         })
         .collect();
