@@ -8,21 +8,13 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Gate E2E tests (require a live Exasol + MinIO + REST catalog stack) behind this
-# feature. Test code enabled by this feature must FAIL (not skip) when the stack
-# is unreachable.
+# Requires a live Exasol + MinIO + REST catalog stack; must FAIL (not skip) if unreachable.
 exasol-e2e = []
-# Gate cloud E2E tests (require real AWS Glue + Exasol cluster) behind this
-# feature. Test code enabled by this feature SKIPS (never fails) when the
-# required environment variables are absent — the opposite of exasol-e2e.
+# Requires real AWS Glue + Exasol; SKIPS (not fails) when required env vars are absent.
 cloud-e2e = []
-# Gate Lakekeeper E2E tests (require a live Exasol + MinIO + Lakekeeper +
-# Keycloak stack) behind this feature. Test code enabled by this feature must
-# FAIL (not skip) when the stack is unreachable — same contract as exasol-e2e.
+# Requires a live Exasol + MinIO + Lakekeeper + Keycloak stack; same FAIL contract as exasol-e2e.
 lakekeeper-e2e = []
-# Gate Azure (ADLS Gen2) static-credential E2E tests behind this feature. Test
-# code enabled by this feature must FAIL (not skip) when the stack or the
-# Azure container is unreachable — same contract as exasol-e2e.
+# Requires the Azure (ADLS Gen2) static-credential stack; same FAIL contract as exasol-e2e.
 azure-e2e = []
 
 [dependencies]
@@ -38,19 +30,16 @@ datafusion = { workspace = true }
 
 # `azure`: ADLS Gen2 (`abfss://`) object store; unions with the workspace `aws`.
 object_store = { workspace = true, features = ["azure"] }
-# Required to implement object_store's `#[async_trait]` `ObjectStore` trait for the
-# spec-size HEAD wrapper. Already resolved transitively via object_store/datafusion.
+# Implements object_store's #[async_trait] ObjectStore for the spec-size HEAD wrapper.
 async-trait = "0.1"
 
-# Positional-delete set: the scan UDF unions delete positions into a
-# `RoaringTreemap` and feeds the vendored `build_deletes_row_selection`.
+# Unions delete positions into a RoaringTreemap for the vendored build_deletes_row_selection.
 roaring = { workspace = true }
 
 iceberg = { workspace = true }
 
-# rt-multi-thread: scan UDF builds a multi-thread runtime when DATAFUSION_THREADS_PER_UDF > 1.
-# sync: tokio::sync::Semaphore (the shared delete-read limiter) declared directly rather
-# than relying on it being pulled in transitively (via aws-smithy-async / tokio-stream).
+# rt-multi-thread: for DATAFUSION_THREADS_PER_UDF > 1. sync: tokio::sync::Semaphore
+# (shared delete-read limiter), declared directly rather than pulled in transitively.
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
@@ -59,57 +48,31 @@ chrono  = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
 
-# `udf_log!` (the lc-rs debug surface) and the scan phase-telemetry gate expand
-# to `tracing::Level`; `ctx.debug_level()` returns it. Direct dep so those names
-# resolve in this crate. default-features off: only the `Level` type is used, no
-# subscriber machinery crosses into the `.so`.
+# udf_log! and ctx.debug_level() need tracing::Level; default-features off so no
+# subscriber machinery crosses into the .so.
 tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-# time: tokio::time::sleep, used by the concurrency-bound integration tests to force
-# deterministic overlap in fake delete-file reads.
-# net + io-util: the loopback catalog fake in `adapter/pushdown/file_resolution.rs`'s
-# unit tests binds a `tokio::net::TcpListener` (`net`) and serves one HTTP/1.1
-# response over `tokio::io::{AsyncReadExt, AsyncWriteExt}` (`io-util`). Declared here
-# rather than left to Cargo feature unification through reqwest/hyper-util, so those
-# tests do not compile by accident and break the moment that transitive choice
-# changes — the same discipline the `iceberg-storage-opendal` entry below applies.
+# time: forces deterministic overlap in concurrency-bound tests. net + io-util: the
+# loopback catalog fake in file_resolution.rs's unit tests. Declared directly rather
+# than left to transitive feature unification.
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
-# Test fixtures (tests/common/seed.rs, tests/tpch_loader.rs) build Arrow
-# RecordBatch + parquet WriterProperties directly with the workspace arrow/parquet
-# 58 and feed them into iceberg 0.10.0's writer stack, which also links
-# arrow 58 — a single arrow-58 tree end to end, no per-tree aliases or IPC bridge.
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
-# TPC-H core row generator for the live smoke-test loader (tests/tpch_loader.rs).
-# `tpchgen` core has zero dependencies (no arrow); the loader builds arrow-58
-# RecordBatches from its rows by hand, so `tpchgen-arrow` (which has no arrow-58
-# release: 2.0.2→arrow 57, 3.0.0→arrow 59) is no longer needed.
+# TPC-H row generator for tpch_loader.rs; core has no arrow dep, so tpchgen-arrow
+# (no arrow-58 release) isn't needed.
 tpchgen             = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-# Seed harness only (tests/common/seed.rs) builds its own FileIO via
-# `OpenDalStorageFactory`; the production path uses lakehouse-catalog's.
-# `opendal-azdls`: the seed dispatch's ADLS arm names
-# `OpenDalStorageFactory::Azdls`, which that feature gates. Declared here rather
-# than left to Cargo feature unification through `lakehouse-catalog`, so these
-# tests do not silently depend on another crate's feature choice. Unions with the
-# workspace `opendal-s3`.
+# opendal-azdls: seed.rs's ADLS arm needs OpenDalStorageFactory::Azdls, declared
+# directly rather than relying on lakehouse-catalog's feature unification.
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 reqwest             = { workspace = true, features = ["blocking"] }
-# Seed harness only: name reqsign-core's `Context`/`Result` to implement a
-# `ProvideCredential` that forces static MinIO admin S3 credentials for the seed
-# write path, overriding Lakekeeper's vended STS session token (see seed.rs
-# `build_seed_catalog_with_auth`). Pinned to the version already in the tree via
-# iceberg-storage-opendal/opendal so the `AwsCredential`/`Context` types match.
+# Seed harness: implements ProvideCredential to force static MinIO admin credentials
+# over Lakekeeper's vended STS token (seed.rs build_seed_catalog_with_auth).
 reqsign-core        = "3.0.1"
-# Azure container lifecycle for the `azure-e2e` suite (tests/common/azure.rs),
-# dev-only — never linked into the `.so`. The official azure-sdk-for-rust 1.x line
-# authenticates with Entra ID only, so the harness creates and deletes its per-run
-# container under a service principal while the data path under test keeps using the
-# account key. Default features resolve onto the reqwest 0.13 + rustls and tokio
-# already in the lockfile, so no second HTTP or TLS stack enters the graph.
-# `azure_core` is a direct dependency for `credentials::Secret` and `http::Url`.
+# azure-e2e harness only (tests/common/azure.rs): per-run container lifecycle via
+# Entra ID service-principal auth, while the scan path under test uses the account key.
 azure_storage_blob  = "1.0"
 azure_identity      = "1.0"
 azure_core          = "1.1"
