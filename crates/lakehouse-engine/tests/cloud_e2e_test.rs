@@ -25,6 +25,8 @@
 mod common;
 use common::exasol_ws::ExaConn;
 use common::stack::{CatalogConnectionPassword, build_create_connection_sql};
+use lakehouse_catalog::{CatalogProps, CatalogSession, ConnectionCreds, load_table_any_auth};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // Environment variable names
@@ -156,6 +158,33 @@ impl CloudEnv {
         CatalogConnectionPassword {
             use_vended_credentials: true,
             ..self.catalog_connection_password()
+        }
+    }
+
+    /// The `ConnectionCreds` the adapter parses out of this suite's vended CONNECTION,
+    /// derived from `catalog_connection_password_vended` so the two cannot describe
+    /// different CONNECTIONs. `sas_token` is absent: `CatalogConnectionPassword` carries
+    /// no inline-SAS field to project from.
+    fn vended_connection_creds(&self) -> ConnectionCreds {
+        let password = self.catalog_connection_password_vended();
+        ConnectionCreds {
+            warehouse: password.warehouse,
+            endpoint: password.endpoint,
+            region: password.region,
+            access_key: password.access_key,
+            secret_key: password.secret_key,
+            session_token: password.session_token,
+            path_style: password.path_style,
+            use_sigv4: password.use_sigv4,
+            use_vended_credentials: password.use_vended_credentials,
+            token: password.token,
+            client_id: password.client_id,
+            client_secret: password.client_secret,
+            oauth2_server_uri: password.oauth2_server_uri,
+            scope: password.scope,
+            account_name: password.account_name,
+            account_key: password.account_key,
+            sas_token: None,
         }
     }
 }
@@ -597,6 +626,159 @@ fn cloud_scan_reads_with_vended_credentials() {
 
     // Credential values must not appear in printed output above.
     // (Static keys and vended keys are never embedded in any printed variable.)
+}
+
+/// The one vended credential source that applies to `location`: the
+/// `storage_credentials` entry whose non-empty `prefix` is the longest prefix of
+/// `location`, else the flat `config` map. Mirrors the shipped resolver's selection
+/// rule — including comparing both sides with the URI scheme lowercased (RFC 3986
+/// §3.1) — since reading the response instead of calling the resolver is the point: a
+/// resolved backend cannot say which config key the catalog left out.
+fn vended_source_for<'a>(
+    result: &'a iceberg_catalog_rest::LoadTableResult,
+    location: &str,
+) -> &'a HashMap<String, String> {
+    let location = lowercase_scheme(location);
+    result
+        .storage_credentials
+        .as_ref()
+        .and_then(|credentials| {
+            credentials
+                .iter()
+                .filter(|entry| {
+                    !entry.prefix.is_empty()
+                        && location.starts_with(lowercase_scheme(&entry.prefix).as_str())
+                })
+                .max_by_key(|entry| entry.prefix.len())
+        })
+        .map_or(&result.config, |entry| &entry.config)
+}
+
+/// `uri` with its URI scheme lowercased and everything after `://` verbatim, mirroring
+/// the resolver's own scheme folding.
+fn lowercase_scheme(uri: &str) -> String {
+    match uri.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+        None => uri.to_string(),
+    }
+}
+
+/// Whether the vended source carries a usable value for `key`, spelling absence as
+/// the shipped resolver does: omitted and empty are both ABSENT. Answers with the
+/// presence alone, so no credential value can reach an assertion message.
+fn vended_key_present(vended: &HashMap<String, String>, key: &str) -> bool {
+    vended.get(key).is_some_and(|value| !value.is_empty())
+}
+
+/// One key's presence as a word for the report line.
+fn presence_label(present: bool) -> &'static str {
+    if present { "VENDED" } else { "ABSENT" }
+}
+
+/// AWS Glue's vended payload carries a usable S3 credential set AND a store
+/// address for the table's own location.
+///
+/// Evidence `cloud_scan_reads_with_vended_credentials` cannot supply: that CONNECTION
+/// also carries static AWS keys, so a green scan there is compatible with Glue vending
+/// nothing at all. This test issues the access-delegated `loadTable` GET itself and
+/// reads the response's vended config keys, which no static CONNECTION value can
+/// populate. A key absent here is a plan-time failure for every vended Glue virtual
+/// schema, which is why the assertions name the absent key rather than a failed scan.
+///
+/// The anchor is the table's OWN location, derived exactly as `resolve_file_list`
+/// derives it; there is no fallback for it, so this test asserts it is present rather
+/// than substituting the CONNECTION's `warehouse`.
+///
+/// `s3.session-token` is REPORTED, not required — a permanent IAM identity vends a key
+/// pair with no token. Run with `--nocapture` to read the report line. Skips when the
+/// cloud env vars are absent, like every test in this module.
+#[test]
+fn cloud_glue_vends_s3_key_pair_and_store_address() {
+    let env = match CloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_glue_vends_s3_key_pair_and_store_address — env vars absent");
+            return;
+        }
+    };
+
+    let creds = env.vended_connection_creds();
+    assert!(
+        creds.use_vended_credentials,
+        "the vended CONNECTION must request access delegation: without that flag the loadTable \
+         GET carries no X-Iceberg-Access-Delegation header and its response evidences nothing"
+    );
+
+    let catalog = CatalogProps {
+        warehouse: env.glue_warehouse.clone(),
+        table: env.glue_table.clone(),
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for the Glue vended-payload test");
+
+    let result = rt.block_on(async {
+        let session = CatalogSession::resolve(&env.glue_catalog_uri, &catalog.warehouse, &creds)
+            .await
+            .unwrap_or_else(|e| panic!("CatalogSession::resolve must succeed against Glue: {e}"));
+        load_table_any_auth(&session, &catalog, &creds)
+            .await
+            .unwrap_or_else(|e| panic!("the access-delegated loadTable GET must succeed: {e}"))
+    });
+
+    let anchor = result.metadata.location();
+    assert!(
+        !anchor.is_empty(),
+        "Glue's loadTable response carries no table `location`: the Iceberg spec marks it \
+         required in v1-v3, and `resolve_file_list` errors on an absent one rather than \
+         substituting the catalog `warehouse`, so a scan of this table resolves no backend \
+         at all and the S3 keys below have no anchor to be selected by"
+    );
+    assert!(
+        anchor.starts_with("s3://") || anchor.starts_with("s3a://"),
+        "Glue's table location {anchor} names no s3 scheme: the backend variant is read from \
+         that URI alone, so the S3 keys this test reads would not be the credential set a scan \
+         of this table resolves"
+    );
+
+    let vended = vended_source_for(&result, anchor);
+    let access_key_vended = vended_key_present(vended, "s3.access-key-id");
+    let secret_key_vended = vended_key_present(vended, "s3.secret-access-key");
+    let region_vended = vended_key_present(vended, "client.region");
+    let endpoint_vended = vended_key_present(vended, "s3.endpoint");
+    let session_token_vended = vended_key_present(vended, "s3.session-token");
+
+    assert!(
+        access_key_vended,
+        "the credential source Glue vended for table location {anchor} carries no non-empty \
+         s3.access-key-id: under scheme-driven resolution no CONNECTION value can supply one, \
+         so every vended Glue virtual schema fails at plan time"
+    );
+    assert!(
+        secret_key_vended,
+        "the credential source Glue vended for table location {anchor} carries no non-empty \
+         s3.secret-access-key: under scheme-driven resolution no CONNECTION value can supply \
+         one, so every vended Glue virtual schema fails at plan time"
+    );
+    assert!(
+        region_vended || endpoint_vended,
+        "the credential source Glue vended for table location {anchor} carries neither a \
+         non-empty client.region nor a non-empty s3.endpoint: the store address is undetermined \
+         and under scheme-driven resolution no CONNECTION value can supply it"
+    );
+
+    println!(
+        "cloud_glue_vends_s3_key_pair_and_store_address: table location {anchor} — \
+         s3.access-key-id {}, s3.secret-access-key {}, client.region {}, s3.endpoint {}, \
+         s3.session-token {}",
+        presence_label(access_key_vended),
+        presence_label(secret_key_vended),
+        presence_label(region_vended),
+        presence_label(endpoint_vended),
+        presence_label(session_token_vended),
+    );
 }
 
 /// Catalog token/OAuth2 auth end-to-end: resolves a file list from a REST catalog

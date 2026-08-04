@@ -3141,9 +3141,10 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .expect("CatalogSession::resolve must succeed");
 
     // --- baseline: no filter → 3 data files (one per partition) ---
+    // All three calls pass `allow_http = true`: the local stack's MinIO is plain HTTP.
     let all_files = rt
         .block_on(async {
-            resolve_file_list(&session, &catalog_props, &storage, &creds, None).await
+            resolve_file_list(&session, &catalog_props, &storage, &creds, true, None).await
         })
         .expect("resolve_file_list (no filter) must succeed");
     let all_files = all_files.0;
@@ -3169,6 +3170,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
                 &catalog_props,
                 &storage,
                 &creds,
+                true,
                 Some(&partition_filter),
             )
             .await
@@ -3206,6 +3208,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
                 &catalog_props,
                 &storage,
                 &creds,
+                true,
                 Some(&range_filter),
             )
             .await

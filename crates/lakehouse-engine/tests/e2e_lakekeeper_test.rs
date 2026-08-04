@@ -323,34 +323,34 @@ fn lakekeeper_static_creds_projection_filter_limit() {
 // ---------------------------------------------------------------------------
 
 /// End-to-end projection + filter over the VENDED-credential warehouse returns
-/// rows identical to the static warehouse's, AND the access-delegation path is
-/// proven to have executed.
+/// rows identical to the static warehouse's, over a CONNECTION that carries no
+/// static storage field at all.
 ///
-/// The delegation proof is deterministic, not incidental: the vended CONNECTION
-/// password carries NO static S3 credentials (empty access key, secret key, and
-/// endpoint — verified below). The UDF therefore has no static way to reach
-/// MinIO; the only path by which the scan can read the warehouse's data files is
-/// the `X-Iceberg-Access-Delegation: vended-credentials` `loadTable` request that
-/// vends short-lived MinIO STS credentials. A correct row set from an empty-static
-/// connection is only reachable through that delegation path — mirroring the proof
-/// standard the Glue vended-credential test established, applied against MinIO/STS.
+/// The empty-static shape asserted below is the REQUIRED shape of a vended CONNECTION,
+/// not merely sufficient evidence of delegation: scheme-driven resolution builds the
+/// backend from the `loadTable` response ALONE, so a static `endpoint`, `region`, or
+/// key pair would be a live credential that is never read. With nothing to substitute
+/// for either a credential or the store address, the row set below can only have come
+/// through the `X-Iceberg-Access-Delegation: vended-credentials` request.
 #[test]
 fn lakekeeper_vended_creds_projection_filter() {
     setup();
     let mut conn = exa_conn();
 
-    // Deterministic delegation proof: the vended connection has no static S3 creds.
+    // The required shape: a vended CONNECTION carries no static storage field.
     let vended_pw = lakekeeper_connection_password(WAREHOUSE_VENDED, true);
     assert!(
         vended_pw.use_vended_credentials,
         "vended warehouse CONNECTION must request access delegation"
     );
     assert!(
-        vended_pw.access_key.is_empty()
-            && vended_pw.secret_key.is_empty()
-            && vended_pw.endpoint.is_empty(),
-        "vended CONNECTION must carry NO static S3 credentials, so a successful \
-         scan is only reachable via the vended-credentials delegation path"
+        vended_pw.endpoint.is_empty()
+            && vended_pw.region.is_empty()
+            && vended_pw.access_key.is_empty()
+            && vended_pw.secret_key.is_empty(),
+        "a vended CONNECTION must carry NO static storage field: scheme-driven resolution \
+         builds the backend from the loadTable response alone, so a static endpoint, region, \
+         or key pair would be an unread credential rather than a fallback"
     );
 
     // Same query shape as the static warehouse — results must be identical.
