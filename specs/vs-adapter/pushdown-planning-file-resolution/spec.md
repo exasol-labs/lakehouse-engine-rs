@@ -1,30 +1,27 @@
-# Feature: Pushdown Planning
+# Feature: Pushdown File Resolution
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves
-the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and
-any supported aggregate, extracts the table's current Iceberg schema for field-id-based
-projection, and emits the SQL that drives the DataFusion scan. Cluster fan-out is
-separated from the scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor
-subquery (`GROUP BY shard_key`) spreads each shard's per-file list across nodes, and an
-outer ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list
-node-locally and streams the rows. The scan-driving SQL splices the shard-invariant parts
-(projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once
-as the scalar scan UDF's first-argument common literal and flows each shard's per-file
-subset through the distributor as the second argument. A single-shard plan short-circuits
-the distributor and calls the scalar scan directly on the file-list literal. See
-`vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute
-path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the
-guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate
-sub-select) that don't map onto the source table's own columns. This feature also extends
-the resolve-once seam to associate each data file's positional-delete files and carry them
-minimally in the per-shard argument. Single-group aggregate pushdown (capability
-advertisement, partial-aggregate scan-spec translation, wrapper merge SQL, and AVG
-sum/count decomposition) is covered separately in
-`vs-adapter/pushdown-planning-single-group-agg`.
+Resolves an Iceberg table's identity and current file state exactly once per pushdown,
+before any SQL is built. Recovers the target Iceberg table from the Exasol involved-table
+name via the persisted `TABLE_MAP`, builds a multi-level `TableIdent` when the identifier
+spans more than one namespace segment, and resolves that table's Iceberg snapshot,
+data-file list, each file's byte size, and — for merge-on-read tables — each file's
+associated positional-delete files, all at one resolve-once seam so the scan UDF never
+discovers files, delete files, or sizes itself. The same seam extracts the table's current
+Iceberg schema (field-id, current name, Arrow type, nullability) for field-id-based
+projection. A `loadTable` response that carries no table `location` is rejected here,
+before the vended/static storage split, so every path depending on a table root —
+including each join side — fails identically rather than resolving an empty root. See
+`vs-adapter/pushdown-planning` for how the resolved table identity, file list, byte sizes,
+delete-file references, and logical schema feed the scan-driving SQL.
 
 ## Background
 
-* **This feature becomes the single owner of the absent-table-location rule.** The rule was
+* The data-file list, each file's byte size (from the Iceberg manifest), and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
+* The logical schema carried into the common scan-spec argument identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
+* Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
+* The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
+* Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
+* **This feature is the single owner of the absent-table-location rule.** The rule was
   previously stated only inside `vs-adapter/pushdown-planning-cloud-credentials`' vended
   scheme-selection scenario, which made it read as a vended-path guarantee. It is
   path-independent: it holds with vending disabled, with vending enabled, and on every join
@@ -94,7 +91,40 @@ sum/count decomposition) is covered separately in
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
+### Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
+
+* *GIVEN* a virtual schema created over a namespace containing multiple Iceberg tables, whose `adapterNotes` carry the `TABLE_MAP` recorded at create time
+* *AND* a `pushdown` request whose `involvedTables[0].name` is the Exasol (uppercased, `__`-flattened) name of one of those tables
+* *WHEN* Exasol sends the `pushdown` request
+* *THEN* the adapter SHALL read `TABLE_MAP` back from `schemaMetadataInfo.adapterNotes` and look up the involved virtual table name to recover its original-cased fully-qualified Iceberg identifier
+* *AND* the adapter SHALL resolve the data-file list and build the scan-driving SQL for exactly that one Iceberg table, carrying its identifier in the per-shard `CatalogProps.table`
+* *AND* a `pushdown` request whose involved virtual table name is absent from `TABLE_MAP` SHALL fail with an error naming the unknown virtual table, never silently scanning a different or stale table
+
+### Scenario: Pushdown resolves the file list once and builds a scan-driving query
+
+* *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
+* *AND* a query that projects a subset of columns from one of those tables
+* *WHEN* Exasol sends the corresponding `pushdown` request
+* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
+* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
+* *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
+* *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
+
+### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
+
+* *GIVEN* a `TABLE_MAP` entry whose value is a multi-level Iceberg identifier such as `prod.finance.orders`
+* *WHEN* the adapter resolves that identifier to load the table from the catalog
+* *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
+* *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path
+
+### Scenario: Positional-delete file references are carried in the per-shard files argument
+
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by MinIO, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
+* *WHEN* Exasol sends the corresponding pushdown request
+* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
+* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
+* *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
+
 ### Scenario: File resolution rejects a loadTable response that carries no table location
 
 * *GIVEN* a `pushdown` request for a table whose `loadTable` response carries an EMPTY table metadata `location`
@@ -110,4 +140,3 @@ sum/count decomposition) is covered separately in
 * *AND* the `createVirtualSchema` schema-resolution path SHALL be unchanged, because it reads only the table's `current_schema()` and reads no table location, so nothing there can be substituted for one
 * *AND* the empty-table-root branch SHALL be retained on both sides of the wire — `relativize_path_to_root` in the adapter and the three empty-table-root clauses of `datafusion-scan/scan-execution-file-metadata` (two normative `SHALL` clauses and one descriptive Background bullet) — because this rejection makes an empty root unreachable from a `loadTable` response, which makes that branch unreachable rather than dead, and it MUST NOT be deleted or converted into a second error
 * *AND* a `loadTable` body that OMITS the `location` key SHALL also be rejected as a `UdfError::User`, at deserialization rather than by this guard, and MUST NOT be reported by any message that substitutes the `warehouse`; that message names the unparseable response rather than the `location` field, which this feature records as a known diagnostic-specificity difference rather than leaving it unstated
-<!-- /DELTA:NEW -->
