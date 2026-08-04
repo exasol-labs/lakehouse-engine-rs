@@ -1,6 +1,6 @@
 name: Azure Orphan Container Sweep
 
-# See specs/e2e-harness/azure-orphan-container-sweep/spec.md.
+# See specs/azure-e2e/azure-orphan-container-sweep/spec.md.
 
 on:
   schedule:

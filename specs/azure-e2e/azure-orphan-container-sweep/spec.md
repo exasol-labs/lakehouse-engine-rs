@@ -7,7 +7,7 @@ shared test storage account.
 ## Background
 
 * This sweep is the out-of-band backstop for the gap named in
-  `e2e-harness/azure-e2e-harness`: the per-run container's `Drop` guard runs on
+  `azure-e2e/azure-e2e-harness`: the per-run container's `Drop` guard runs on
   normal return and on panic unwind, but never when the process is killed
   (`SIGKILL`, CI cancellation, OOM), so a killed run orphans its container
   permanently. Azure Blob lifecycle-management policies act on blobs, never on
