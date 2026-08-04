@@ -78,7 +78,7 @@ account key carried in the Exasol CONNECTION.
   lifecycle-management policies act on blobs, never on containers, so no lifecycle
   rule can sweep an orphaned container. An in-repo scheduled GitHub Actions
   workflow (see `e2e-harness/azure-orphan-container-sweep` and the superseding
-  decision `azure-e2e-orphan-sweep-out-of-band`) now reclaims a stale orphan
+  decision `azure-orphan-sweep-in-repo-workflow`) now reclaims a stale orphan
   instead. The account already held leftovers from earlier spike runs, so the
   sweep answers a real operational need, not a hypothetical.
 * No credential value — account key, Keycloak client secret, or bearer token —
