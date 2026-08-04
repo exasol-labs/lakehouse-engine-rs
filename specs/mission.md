@@ -72,7 +72,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 |------|------------|
 | Virtual Schema (VS) | Exasol adapter that makes an external data source queryable as a schema; here a thin stateless translation + planning layer |
 | Pushdown | Exasol delegating projection / filter / limit / aggregation to the VS so it executes at the source |
-| IPROC / NPROC | `IPROC()` = node number, `NPROC()` = active node count. The shard-count node number is captured once at `createVirtualSchema` from `UdfContext::node_count()` (the UDF handshake), not from `NPROC()` over connect-back; sharding does NOT group on `IPROC()` (that would cap parallelism at the node count) |
+| IPROC / NPROC | `IPROC()` = node number, `NPROC()` = active node count. The shard-count node count is read from `UdfContext::node_count()` per pushdown request, not from `NPROC()` over connect-back; sharding does NOT group on `IPROC()` (that would cap parallelism at the node count) |
 | Work-unit shard | One of G oversubscribed scan units (G = node_count × parallelism_factor, capped 300); each is its own `shard_key` group multiplexed onto a node's per-node VM pool (sized to `NR_OF_CORES`) |
 | DataFusion runtime | A node-local vectorized query engine instance created inside a UDF for the lifetime of one query |
 | Partial result | Per-node output (raw rows or node-local aggregate) merged by Exasol into the final result |
@@ -94,7 +94,9 @@ Every query is executed independently, starts from source metadata, and leaves n
 > Sibling projects: the sibling project (VS adapter + UDF conventions) and `language-container-rs` (the Rust
 > SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
 > standalone `crates/vs-expression` expression-translation crate is designed to be shared with
-> the sibling project and will migrate to a monorepo layout when the projects converge.
+> the sibling project and will migrate to a monorepo layout when the projects converge. `crates/lakehouse-catalog`
+> (Iceberg REST catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
+> sibling-shared crate — both still build into the one `.so` that carries both UDF entry points.
 
 ## Commands
 
@@ -116,11 +118,18 @@ cargo clippy --all-targets && cargo fmt
 
 ```
 lakehouse-engine/
-├── specs/          # mission.md and spec library (speq)
-├── crates/         # VS adapter + DataFusion-in-UDF crate(s)
+├── specs/                  # mission.md and spec library (speq)
+├── crates/
+│   ├── lakehouse-engine/   # Iceberg file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
+│   ├── lakehouse-catalog/  # Iceberg REST catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
+│   └── vs-expression/      # expression-translation crate, shared with the sibling project
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-musl-udf-build, test-e2e
 ```
+
+One `.so` still carries both entry points (VS adapter + DataFusion scan SET UDF): `lakehouse-catalog`
+compiles into `lakehouse-engine`'s cdylib as a workspace dependency, so the crate split changes only
+the source layout, not the UDF packaging model.
 
 ## Architecture
 

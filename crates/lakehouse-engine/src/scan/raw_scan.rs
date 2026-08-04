@@ -170,7 +170,7 @@ pub(super) async fn register_file_list(
     table_root: &str,
     logical_schema: &[crate::scan::spec::LogicalField],
     name_mapping: &[NameMappingEntry],
-    storage: &crate::scan::spec::StorageProps,
+    storage: &crate::scan::spec::StorageBackend,
     delete_read_limiter: Arc<Semaphore>,
 ) -> Result<(), UdfError> {
     let first = files.first().ok_or_else(|| {

@@ -22,9 +22,10 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_EVO_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
-    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
-    EVO_NEW_COL, EVO_TOTAL_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
+    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS,
+    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
+    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
     PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
     SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns, seed_added_columns_initial_default,
     seed_events, seed_renamed_column,
@@ -34,6 +35,7 @@ use common::stack::{
     wait_for_minio,
 };
 
+use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
 
 use std::sync::OnceLock;
@@ -102,6 +104,19 @@ fn vs_lineitem_table() -> String {
     format!("{VS_NAME}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
+/// `dim_customer` / `fact_orders` — seeded by `seed_events` (via
+/// `seed_star_schema`) alongside `events`, so already available under this
+/// file's `VS_NAME`. Used ONLY for the #193 outer-join-decline re-push shape,
+/// which `events` (a single table with no FK relationship) cannot express.
+fn vs_dim_table() -> String {
+    format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
+}
+
+/// `fact_orders` counterpart to [`vs_dim_table`] — same seeding, same scope.
+fn vs_fact_table() -> String {
+    format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -168,6 +183,79 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
             "name '{n}' does not match expected id {expected_id}"
         );
     }
+
+    // #193 regression: aliased FROM (`EVENTS e`) must resolve exactly like the
+    // unaliased query above, proving the aliased projection + filter + top-N
+    // shape strips the leaked `tableAlias` and resolves bare names. Ordering
+    // explicitly by score ASC pins the exact row set: with score = 5.0*id
+    // (seed.rs), the 5 lowest scores > 15.0 are ids 4..8.
+    let sql_aliased = format!(
+        "SELECT e.id, e.name, e.score FROM {} e WHERE e.score > 15.0 ORDER BY e.score LIMIT 5",
+        vs_table()
+    );
+    let cols_aliased = conn.query_columns(&sql_aliased);
+    assert_eq!(
+        cols_aliased.len(),
+        3,
+        "aliased query expected 3 columns (id, name, score): {cols_aliased:?}"
+    );
+    assert_eq!(
+        cols_aliased[0].len(),
+        5,
+        "aliased query expected exactly 5 rows from LIMIT 5: {cols_aliased:?}"
+    );
+    let aliased_ids: Vec<i64> = cols_aliased[0].iter().map(parse_int).collect();
+    let expected_aliased_ids: Vec<i64> = vec![4, 5, 6, 7, 8];
+    assert_eq!(
+        aliased_ids, expected_aliased_ids,
+        "aliased ORDER BY e.score LIMIT 5 must return the 5 lowest scores > 15.0 \
+         (ids 4..8, score = 5.0*id): {aliased_ids:?}"
+    );
+
+    // #193 regression: a scalar select-list expression over an aliased column
+    // (`e.score + 1`) must render the bare "SCORE" name under the scan
+    // relation, not the leaked "E"."SCORE". Row count matches
+    // SEED_ROWS_SCORE_GT_15 and every value is the filtered score + 1.
+    let sql_expr = format!(
+        "SELECT e.score + 1 FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    );
+    let cols_expr = conn.query_columns(&sql_expr);
+    assert_eq!(
+        cols_expr.len(),
+        1,
+        "scalar expression query expected 1 column: {cols_expr:?}"
+    );
+    assert_eq!(
+        cols_expr[0].len(),
+        SEED_ROWS_SCORE_GT_15,
+        "scalar expression query expected {SEED_ROWS_SCORE_GT_15} rows: {cols_expr:?}"
+    );
+    // score = 5.0*id, so score + 1 always ends in .0 with score % 5.0 == 0,
+    // meaning (score + 1) % 5.0 == 1.0 — this fails if the `+ 1` is dropped.
+    for v in &cols_expr[0] {
+        let plus_one = parse_numeric(v);
+        assert_eq!(
+            plus_one % 5.0,
+            1.0,
+            "e.score + 1 must equal a multiple of 5 plus 1 (score = 5.0*id), got {plus_one}"
+        );
+    }
+
+    // #193 regression: an UNQUALIFIED filter column (`score`, no `e.` prefix)
+    // under an aliased FROM. Exasol still stamps `tableAlias:"E"` on this
+    // column node even though the user wrote no qualifier — the leak this
+    // fix targets. Row count must match the same SEED_ROWS_SCORE_GT_15 the
+    // unaliased/qualified cases above use.
+    let row_count_unqualified = conn.query_row_count(&format!(
+        "SELECT id FROM {} e WHERE score > 15.0",
+        vs_table()
+    ));
+    assert_eq!(
+        row_count_unqualified, SEED_ROWS_SCORE_GT_15 as i64,
+        "unqualified filter under alias (FROM ... e WHERE score > 15.0) must \
+         return {SEED_ROWS_SCORE_GT_15} rows, got {row_count_unqualified}"
+    );
 }
 
 /// Create VS maps the Iceberg table schema to Exasol types correctly.
@@ -1037,8 +1125,9 @@ fn ordered_topn_pushes_down_matches_single_node() {
 /// Regression check: `ORDER BY score DESC` with NO `LIMIT` must decline the
 /// ordered-top-N pushdown — `detect_topn` requires a `limit` to be present
 /// (decision: the shape is "single table, no GROUP BY/aggregates/HAVING,
-/// limit present with no offset, ...") — and fall back to the pre-existing
-/// plan, relying on Exasol's own backstop `ORDER BY` for correctness. This
+/// limit present with a zero (or absent) offset, ...") — and fall back to
+/// the pre-existing plan, relying on Exasol's own backstop `ORDER BY` for
+/// correctness. This
 /// proves the new top-N capability did not silently widen what counts as
 /// "matched" in a way that breaks the existing, unchanged fallback behavior
 /// for a plain (unbounded) sort.
@@ -1104,22 +1193,21 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// After createVirtualSchema the CLUSTER_NODES count is recorded in the schema's
-/// adapterNotes and is >= 1.
+/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR
+/// and NR_OF_CORES, but no CLUSTER_NODES key — the node count is no longer
+/// persisted in adapterNotes at all; `pushdown` now reads it live from
+/// `UdfContext::node_count()` on every request instead.
 ///
 /// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
 /// column for adapter-controlled schema state. Exasol does NOT persist
 /// adapter-returned schemaMetadata.properties (they are silently dropped and
-/// never appear in any catalog view), so the adapter carries CLUSTER_NODES in
-/// adapterNotes (a JSON string), which Exasol DOES persist and surface here.
+/// never appear in any catalog view), so the adapter carries its persisted
+/// properties in adapterNotes (a JSON string), which Exasol DOES persist and
+/// surface here.
 ///
 /// (The view is keyed by SCHEMA_NAME, confirmed against the live DB.)
-///
-/// CLUSTER_NODES is sourced from `ctx.node_count()` (the live UDF handshake
-/// metadata), defaulting to 1 when the count is 0 — so asserting >= 1 (not
-/// == cluster size) is correct and robust across single- and multi-node runs.
 #[test]
-fn create_vs_records_cluster_nodes_property() {
+fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -1145,16 +1233,64 @@ fn create_vs_records_cluster_nodes_property() {
         "ADAPTER_NOTES must be non-empty (Exasol must have persisted it): {notes:?}"
     );
 
-    // adapterNotes is a JSON string carrying {"CLUSTER_NODES":"<n>"}.
     let parsed: serde_json::Value = serde_json::from_str(notes)
         .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
-    let raw = parsed["CLUSTER_NODES"]
-        .as_str()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry CLUSTER_NODES as a string: {notes:?}"));
-    let n: i64 = raw
-        .parse()
-        .unwrap_or_else(|_| panic!("CLUSTER_NODES value '{raw}' is not an integer"));
-    assert!(n >= 1, "CLUSTER_NODES must be >= 1, got {n}");
+    assert!(
+        parsed.get("PARALLELISM_FACTOR").is_some(),
+        "ADAPTER_NOTES must carry PARALLELISM_FACTOR: {notes:?}"
+    );
+    assert!(
+        parsed.get("NR_OF_CORES").is_some(),
+        "ADAPTER_NOTES must carry NR_OF_CORES: {notes:?}"
+    );
+    assert!(
+        parsed.get("CLUSTER_NODES").is_none(),
+        "ADAPTER_NOTES must NOT carry CLUSTER_NODES (node count is read live \
+         from UdfContext::node_count() per pushdown request, never persisted): \
+         {notes:?}"
+    );
+}
+
+/// Even with CLUSTER_NODES no longer persisted in adapterNotes,
+/// `EXPLAIN VIRTUAL` over a multi-file scan against the (now note-free)
+/// virtual schema still produces the `LAKEHOUSE_DISTRIBUTE_FILES` shard
+/// fan-out — i.e. dropping the persisted note did not break shard-fan-out
+/// emission: `pushdown` still plans the fan-out with no adapterNotes node
+/// count available.
+///
+/// This test cannot distinguish the handshake node-count source
+/// (`UdfContext::node_count()`, captured in `dispatch` and threaded through
+/// as `cluster_nodes`) from the pre-refactor absent-note default: the
+/// `events` fixture commits exactly two data files, which clamps
+/// `shard_count` to 2 for every node count >= 1, so the fan-out markers below
+/// are insensitive to the node count by construction on this single-node
+/// suite. The plan's `parallelism/work-unit-sharding (GATE: four-node
+/// staging)` manual check is the only one that distinguishes a correctly
+/// read four-node count from the `0 => 1` floor.
+///
+/// Uses the same fan-out marker style as
+/// `ordered_topn_pushes_down_matches_single_node`: the literal
+/// `AS shards(shard_key, files) GROUP BY shard_key)` string is the adapter's
+/// own emitted fan-out SQL, not an echo of Exasol's pushdown request, so it
+/// is a precise, non-false-positive marker.
+#[test]
+fn pushdown_shards_from_handshake_node_count_without_note() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT id, name, score FROM {}", vs_table());
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LAKEHOUSE_DISTRIBUTE_FILES"),
+        "multi-file scan must push down as a LAKEHOUSE_DISTRIBUTE_FILES shard \
+         fan-out, got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
+        "shard fan-out must carry the shards(shard_key, files) VALUES table \
+         grouped by shard_key, got:\n{pushed_sql}"
+    );
 }
 
 /// COUNT(col) aggregate pushdown returns the correct non-null row count.
@@ -1215,6 +1351,127 @@ fn aggregate_count_col_returns_correct_value() {
     assert_eq!(
         count_star, SEED_ROWS_SCORE_GT_15 as i64,
         "COUNT(*) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_star}"
+    );
+
+    // #193 regression: the same COUNT(e.score) / COUNT(*) aggregates over an
+    // ALIASED FROM, with the filter column qualified by the alias. Expected
+    // values are the SAME SEED_ROWS_SCORE_GT_15 the unaliased case above
+    // asserts, proving alias stripping leaves single-group aggregate
+    // pushdown (aggregate args + filter) unchanged.
+    let cols_aliased_col = conn.query_columns(&format!(
+        "SELECT COUNT(e.score) FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    ));
+    let count_aliased_col = cols_aliased_col[0][0]
+        .as_i64()
+        .or_else(|| cols_aliased_col[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| {
+            panic!(
+                "aliased COUNT(e.score) result not integer: {:?}",
+                cols_aliased_col[0][0]
+            )
+        });
+    assert_eq!(
+        count_aliased_col, SEED_ROWS_SCORE_GT_15 as i64,
+        "aliased COUNT(e.score) WHERE e.score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, \
+         got {count_aliased_col}"
+    );
+
+    let cols_aliased_star = conn.query_columns(&format!(
+        "SELECT COUNT(*) FROM {} e WHERE e.score > 15.0",
+        vs_table()
+    ));
+    let count_aliased_star = cols_aliased_star[0][0]
+        .as_i64()
+        .or_else(|| {
+            cols_aliased_star[0][0]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "aliased COUNT(*) result not integer: {:?}",
+                cols_aliased_star[0][0]
+            )
+        });
+    assert_eq!(
+        count_aliased_star, SEED_ROWS_SCORE_GT_15 as i64,
+        "aliased COUNT(*) WHERE e.score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, \
+         got {count_aliased_star}"
+    );
+
+    // #193 regression: a GROUP BY under an aliased FROM (group key + aggregate
+    // argument both alias-qualified). Grouping by the near-unique `id` under
+    // the same `e.score > 15.0` filter yields exactly SEED_ROWS_SCORE_GT_15
+    // groups (one per matching id), each with COUNT(e.score) == 1 — proving
+    // alias stripping applies to GROUP BY keys, not just filters/aggregates.
+    let cols_grouped = conn.query_columns(&format!(
+        "SELECT e.id, COUNT(e.score) FROM {} e WHERE e.score > 15.0 GROUP BY e.id",
+        vs_table()
+    ));
+    assert_eq!(
+        cols_grouped.len(),
+        2,
+        "grouped aliased query expected 2 columns (id, count): {cols_grouped:?}"
+    );
+    assert_eq!(
+        cols_grouped[0].len(),
+        SEED_ROWS_SCORE_GT_15,
+        "GROUP BY e.id WHERE e.score > 15.0 must yield {SEED_ROWS_SCORE_GT_15} groups \
+         (one per matching id), got {}",
+        cols_grouped[0].len()
+    );
+    for count in &cols_grouped[1] {
+        let c = count
+            .as_i64()
+            .or_else(|| count.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or_else(|| panic!("grouped count not integer: {count:?}"));
+        assert_eq!(
+            c, 1,
+            "each group (unique id) must have COUNT(e.score) == 1, got {c}"
+        );
+    }
+}
+
+/// #193 regression: a declined outer join re-pushes a PLAIN single-table scan
+/// carrying the alias filter. The join gate hard-declines LEFT/RIGHT/FULL
+/// joins (see `pushdown-planning-join-fallback`); Exasol then falls back to
+/// executing the join itself over two adapter-returned single-table scans,
+/// each still carrying its own alias (`c`, `o`) on the WHERE filter. This is
+/// the one shape `events` cannot express (it has no FK relationship to join
+/// against), so it reuses the existing `dim_customer`/`fact_orders` star
+/// schema fixture instead of the events fixture the other cases use.
+///
+/// Every order's `O_CUSTKEY` cycles `1..=DIM_CUSTOMER_ROWS` across the seeded
+/// orders, so each of `C_CUSTKEY` 1, 2, 3 matches `FACT_ORDERS_ROWS /
+/// DIM_CUSTOMER_ROWS` orders and every customer has at least one order (no
+/// NULL-extended rows) — the LEFT JOIN filtered to `C_CUSTKEY <= 3` therefore
+/// yields exactly `3 * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS)` rows.
+#[test]
+fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} c LEFT JOIN {} o ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE c.C_CUSTKEY <= 3",
+        vs_dim_table(),
+        vs_fact_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "COUNT(*) must return one column: {cols:?}");
+    assert_eq!(cols[0].len(), 1, "COUNT(*) must return one row: {cols:?}");
+    let count = cols[0][0]
+        .as_i64()
+        .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("COUNT(*) result not integer: {:?}", cols[0][0]));
+    let expected_count = 3 * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS) as i64;
+    assert_eq!(
+        count,
+        expected_count,
+        "declined LEFT JOIN dim_customer c ... WHERE c.C_CUSTKEY <= 3 must yield \
+         {expected_count} rows (3 matching customers x {} orders each), got {count}",
+        FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS
     );
 }
 
@@ -1985,17 +2242,42 @@ fn test_group_by_expr_key_after_agg() {
     );
 }
 
-/// Aggregate-first GROUP BY combined with HAVING — exercises the HAVING-present
-/// outer-wrapper path with the aggregate ahead of the group key in the select
-/// list: `SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4) HAVING SUM(score) > n`.
+/// Aggregate-first GROUP BY combined with HAVING — covers four HAVING shapes
+/// against the same EVENTS fixture (per-group `SUM(score)` = {0: 300.0, 1:
+/// 225.0, 2: 250.0, 3: 275.0}; 5 rows per `MOD(id,4)` group, 20 rows total,
+/// seeded `name` values `event-01`..`event-20`, all unique):
 ///
-/// Group sums (from `test_group_by_agg_before_key`): {0: 300.0, 1: 225.0, 2:
-/// 250.0, 3: 275.0}. HAVING SUM(score) > 250.0 keeps groups 0 and 3 only.
+/// 1. **Matched control** — `SELECT SUM(score), MOD(id,4) ... HAVING
+///    SUM(score) > 250.0`, the aggregate ahead of the group key in the select
+///    list. The HAVING aggregate is selected, so this decomposes into the
+///    accelerated grouped partial/merge pushdown.
+/// 2. **Unmatched aggregate** (issue #195) — `SELECT MOD(id,4), COUNT(*) ...
+///    HAVING SUM(score) > 250.0`. `SUM(score)` is not in the select list, so
+///    `render_having_over_merge` cannot rewrite it over the merge; the request
+///    falls back to the qualified single-table wrapper (`LHS_T0`) instead of
+///    hard-erroring at `EXPLAIN VIRTUAL` time.
+/// 3. **Mixed AND junction** — same select list, `HAVING COUNT(*) > 0 AND
+///    SUM(score) > 250.0`. Only one conjunct matches a selected aggregate;
+///    the whole junction is unrenderable over the merge, so this also falls
+///    back to the wrapper.
+/// 4. **`COUNT(DISTINCT)` in HAVING** (issue #195's own repro shape) —
+///    `HAVING COUNT(DISTINCT name) > 4`/`> 5`. `parse_agg_item` rejects
+///    `distinct: true` unconditionally, so this is a third route to the same
+///    unrenderable-HAVING fallback. All `name` values are unique per group of
+///    5, so every group has exactly 5 distinct names: `> 4` keeps all 4
+///    groups and `> 5` keeps none — the pair that proves the HAVING was
+///    actually applied rather than silently dropped (a dropped HAVING would
+///    return all 4 groups for both thresholds).
+///
+/// Cases 2 and 3 assert the fallback shape inline via `explain_virtual_sql`:
+/// the pushed SQL must contain `LHS_T0` and must not contain `PARTIAL_`.
 #[test]
 fn test_group_by_agg_first_with_having() {
     setup_e2e();
     let mut conn = exa_conn();
 
+    // Case 1: matched control — HAVING aggregate is selected, decomposes into
+    // the accelerated grouped pushdown. Unchanged from before this fix.
     let sql = format!(
         "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
         vs_table()
@@ -2032,6 +2314,124 @@ fn test_group_by_agg_first_with_having() {
             "group key {key}: SUM(score) must satisfy HAVING > 250.0, got {sum}"
         );
     }
+
+    // Case 2: unmatched aggregate — SUM(score) is not selected, so the merge
+    // rewrite cannot find it. MUST succeed via the wrapper fallback, not error.
+    let unmatched_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
+        vs_table()
+    );
+    let unmatched_pushed_sql = explain_virtual_sql(&mut conn, &unmatched_sql);
+    assert!(
+        unmatched_pushed_sql.contains("LHS_T0"),
+        "unmatched-aggregate HAVING must fall back to the qualified single-table \
+         wrapper (pushed SQL must contain 'LHS_T0'), got:\n{unmatched_pushed_sql}"
+    );
+    assert!(
+        !unmatched_pushed_sql.contains("PARTIAL_"),
+        "unmatched-aggregate HAVING must NOT use the accelerated grouped \
+         partial/merge pushdown (pushed SQL must not contain 'PARTIAL_'), \
+         got:\n{unmatched_pushed_sql}"
+    );
+
+    let unmatched_cols = conn.query_columns(&unmatched_sql);
+    assert_eq!(
+        unmatched_cols.len(),
+        2,
+        "expected 2 columns (key, count): {unmatched_cols:?}"
+    );
+    let mut unmatched_pairs: Vec<(i64, i64)> = unmatched_cols[0]
+        .iter()
+        .zip(unmatched_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    unmatched_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        unmatched_pairs,
+        vec![(0i64, 5i64), (3, 5)],
+        "unmatched-aggregate HAVING must keep exactly groups 0 and 3, each with \
+         COUNT(*) = 5: {unmatched_pairs:?}"
+    );
+
+    // Case 3: mixed AND junction — one conjunct matches a selected aggregate,
+    // the other does not. The whole junction is unrenderable over the merge,
+    // so this must also fall back to the wrapper with the same result.
+    let mixed_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(*) > 0 AND SUM(score) > 250.0",
+        vs_table()
+    );
+    let mixed_pushed_sql = explain_virtual_sql(&mut conn, &mixed_sql);
+    assert!(
+        mixed_pushed_sql.contains("LHS_T0"),
+        "mixed-junction HAVING must fall back to the qualified single-table \
+         wrapper (pushed SQL must contain 'LHS_T0'), got:\n{mixed_pushed_sql}"
+    );
+    assert!(
+        !mixed_pushed_sql.contains("PARTIAL_"),
+        "mixed-junction HAVING must NOT use the accelerated grouped \
+         partial/merge pushdown (pushed SQL must not contain 'PARTIAL_'), \
+         got:\n{mixed_pushed_sql}"
+    );
+
+    let mixed_cols = conn.query_columns(&mixed_sql);
+    assert_eq!(
+        mixed_cols.len(),
+        2,
+        "expected 2 columns (key, count): {mixed_cols:?}"
+    );
+    let mut mixed_pairs: Vec<(i64, i64)> = mixed_cols[0]
+        .iter()
+        .zip(mixed_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    mixed_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        mixed_pairs,
+        vec![(0i64, 5i64), (3, 5)],
+        "mixed-junction HAVING must keep exactly groups 0 and 3, each with \
+         COUNT(*) = 5: {mixed_pairs:?}"
+    );
+
+    // Case 4: COUNT(DISTINCT) in HAVING (issue #195's own repro shape). Every
+    // group has exactly 5 distinct `name` values, so `> 4` keeps all 4 groups
+    // and `> 5` keeps none — the pair that proves the HAVING was applied.
+    let distinct_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(DISTINCT name) > 4",
+        vs_table()
+    );
+    let distinct_cols = conn.query_columns(&distinct_sql);
+    assert_eq!(
+        distinct_cols.len(),
+        2,
+        "expected 2 columns (key, count): {distinct_cols:?}"
+    );
+    let mut distinct_pairs: Vec<(i64, i64)> = distinct_cols[0]
+        .iter()
+        .zip(distinct_cols[1].iter())
+        .map(|(k, c)| (parse_int(k), parse_int(c)))
+        .collect();
+    distinct_pairs.sort_by_key(|(k, _)| *k);
+    assert_eq!(
+        distinct_pairs,
+        vec![(0i64, 5i64), (1, 5), (2, 5), (3, 5)],
+        "COUNT(DISTINCT name) > 4 must keep all 4 groups, each with COUNT(*) = 5: \
+         {distinct_pairs:?}"
+    );
+
+    let distinct_zero_sql = format!(
+        "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
+         HAVING COUNT(DISTINCT name) > 5",
+        vs_table()
+    );
+    assert_eq!(
+        conn.query_row_count(&distinct_zero_sql),
+        0,
+        "COUNT(DISTINCT name) > 5 must keep zero groups (every group has \
+         exactly 5 distinct names) — a non-zero result here would mean the \
+         HAVING was silently dropped rather than applied"
+    );
 }
 
 /// Expression-valued multi-key tuple GROUP BY — every key element is itself an
@@ -2732,10 +3132,18 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .build()
         .expect("tokio runtime for file-count pruning test");
 
+    // One `CatalogSession` built once and reused across all three pruning calls
+    // below, mirroring the single-session-per-query contract `resolve_file_list`
+    // now requires (see `adapter/mod.rs`'s hoisted enumeration session and
+    // `pushdown/mod.rs`'s `handle_pushdown`).
+    let session = rt
+        .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
+        .expect("CatalogSession::resolve must succeed");
+
     // --- baseline: no filter → 3 data files (one per partition) ---
     let all_files = rt
         .block_on(async {
-            resolve_file_list(&catalog_uri, &catalog_props, &storage, &creds, None).await
+            resolve_file_list(&session, &catalog_props, &storage, &creds, None).await
         })
         .expect("resolve_file_list (no filter) must succeed");
     let all_files = all_files.0;
@@ -2757,7 +3165,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let pruned_partition = rt
         .block_on(async {
             resolve_file_list(
-                &catalog_uri,
+                &session,
                 &catalog_props,
                 &storage,
                 &creds,
@@ -2794,7 +3202,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let pruned_range = rt
         .block_on(async {
             resolve_file_list(
-                &catalog_uri,
+                &session,
                 &catalog_props,
                 &storage,
                 &creds,
@@ -2935,5 +3343,345 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
         unique_group_count, 20,
         "COUNT(*) over (GROUP BY id) sub-select must be 20 (distinct ids), \
          got {unique_group_count}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #191 — ORDER BY ... LIMIT n OFFSET m regression coverage
+// ---------------------------------------------------------------------------
+//
+// Before this fix, `LIMIT_WITH_OFFSET` was unadvertised: Exasol stripped the
+// `offset` from every pushdown request and applied neither bound itself, so
+// every one of these shapes silently returned ranks 1..n instead of the
+// requested (m+1)..(m+n) window. `render_limit_offset` (`support.rs`) is now
+// the single seam all three reachable wrapper sites route through; these
+// tests exercise each site end to end, plus the two shapes the design
+// declares permanently unreachable with a non-zero offset (S3, S4/S5), whose
+// `debug_assert!` guards compile out of the release-profile `.so` and so have
+// no live backstop other than these two canaries.
+
+/// The issue's literal repro: `ORDER BY score DESC LIMIT 12 OFFSET 3` over a
+/// PROJECTED sort key (`score` is in the select list). A non-zero offset
+/// always declines the per-shard bounded top-N (`detect_topn`'s guard is now
+/// a non-zero-offset test, not a presence test), so this renders on the
+/// declined row-scan wrapper (S1, `topn.rs`): `... GROUP BY shard_key)) ORDER
+/// BY "SCORE" DESC NULLS FIRST LIMIT 12 OFFSET 3`, live-verified via
+/// `EXPLAIN VIRTUAL` during this task.
+///
+/// Seeded data: `score = 5.0 * id` for id in 1..=20, so the ranks by score
+/// DESC are exactly ids 20,19,...,1 in order. Ranks 4-15 (LIMIT 12 OFFSET 3)
+/// are ids 17,16,...,6 — NOT ids 20..=9 (ranks 1-12), which is the #191 bug:
+/// silent collapse to OFFSET 0.
+#[test]
+fn ordered_limit_offset_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id, score FROM {} ORDER BY score DESC LIMIT 12 OFFSET 3",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LIMIT 12 OFFSET 3"),
+        "a non-zero offset must render on the wrapper as LIMIT 12 OFFSET 3, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let expected_ids: Vec<i64> = (6..=17).rev().collect();
+    assert_eq!(
+        ids, expected_ids,
+        "ORDER BY score DESC LIMIT 12 OFFSET 3 must return ranks 4-15 \
+         ({expected_ids:?}), NOT ranks 1-12 (ids 20..=9) — the #191 silent \
+         collapse to OFFSET 0 — got {ids:?}"
+    );
+    let scores: Vec<f64> = cols[1].iter().map(parse_numeric).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        let expected_score = 5.0 * id as f64;
+        assert!(
+            (scores[i] - expected_score).abs() < 1e-9,
+            "row {i}: score for id {id} must be {expected_score}, got {}",
+            scores[i]
+        );
+    }
+}
+
+/// Same declined-row-scan-wrapper site (S1) as
+/// [`ordered_limit_offset_returns_shifted_window`], but with an UNPROJECTED
+/// sort key: `score` drives the ORDER BY but is not in the select list. This
+/// is the shape `add-topn-pushdown` (#225/#189) and `fix/198-orderby-expr-hidden-col`
+/// hardened against leaking a hidden internal sort column into the wrapper's
+/// select list; this test pins that the OFFSET renders correctly on top of
+/// that fix, not just on the simpler projected-sort-key case above.
+///
+/// `LIMIT 5 OFFSET 2` over score DESC ranks: rank 1-2 are ids 20,19; ranks 3-7
+/// (the requested window) are ids 18,17,16,15,14.
+#[test]
+fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} ORDER BY score DESC LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LIMIT 5 OFFSET 2"),
+        "a non-zero offset must render on the wrapper as LIMIT 5 OFFSET 2, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (id): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![18, 17, 16, 15, 14],
+        "ORDER BY score DESC LIMIT 5 OFFSET 2 (unprojected sort key) must \
+         return ranks 3-7 (ids 18,17,16,15,14), got {ids:?}"
+    );
+}
+
+/// The grouped merge wrapper (S2, `grouped_agg.rs`) renders the request's
+/// OFFSET alongside its LIMIT: `GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET
+/// 1`.
+///
+/// Seeded ids 1..=20 cycle `MOD(id,4)` through 1,2,3,0 repeating, so all four
+/// groups (k=0,1,2,3) have exactly 5 members each. Ranked by k ascending,
+/// `LIMIT 2 OFFSET 1` must return groups ranked 2-3 (k=1, k=2), NOT the
+/// groups ranked 1-2 (k=0, k=1) that the pre-fix silent-OFFSET-0 collapse
+/// would have produced.
+#[test]
+fn grouped_order_by_limit_offset_returns_shifted_groups() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id,4) AS k, COUNT(*) AS c FROM {} GROUP BY MOD(id,4) \
+         ORDER BY 1 LIMIT 2 OFFSET 1",
+        vs_table()
+    );
+
+    // Pin the render site: the same `group_keys` + `PARTIAL_` markers
+    // `assert_group_by_pushed_down` uses to evidence the grouped
+    // partial-aggregate builder (S2, `grouped_agg.rs`), not the qualified
+    // single-table wrapper (S6, which has no `group_keys`/`PARTIAL_` — see
+    // `qualified_wrapper_limit_offset_returns_shifted_window`'s `LHS_T0`
+    // check), plus the shifted-window shape itself.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("group_keys") && pushed_sql.contains("PARTIAL_"),
+        "GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1 must render via the \
+         grouped partial-aggregate builder (scan spec carries 'group_keys' \
+         and a 'PARTIAL_' column), got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("GROUP BY") && pushed_sql.contains("LIMIT 2 OFFSET 1"),
+        "pushed SQL must carry a GROUP BY merge with LIMIT 2 OFFSET 1, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (k, c): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "LIMIT 2 OFFSET 1 must cap the result to exactly 2 groups: {cols:?}"
+    );
+    let ks: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let counts: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    assert_eq!(
+        ks,
+        vec![1, 2],
+        "GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1 must return groups \
+         ranked 2-3 (k=1, k=2), NOT ranks 1-2 (k=0, k=1), got {ks:?}"
+    );
+    assert_eq!(
+        counts,
+        vec![5, 5],
+        "each of the 4 MOD(id,4) groups has exactly 5 members, got {counts:?}"
+    );
+}
+
+/// The qualified single-table wrapper (S6, `joins/sql_builders.rs`) renders
+/// the request's OFFSET, exercised via its `GROUP BY` + `COUNT(DISTINCT)`
+/// entry point — capture row 8 in the plan (`GROUP BY MOD(id,4)` with
+/// `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2 OFFSET 1`).
+///
+/// Same seeded groups as
+/// [`grouped_order_by_limit_offset_returns_shifted_groups`] (k=0..3, 5
+/// members each, all distinct ids so `COUNT(DISTINCT id)` == `COUNT(*)` per
+/// group): the shifted window must return groups ranked 2-3 (k=1, k=2).
+#[test]
+fn qualified_wrapper_limit_offset_returns_shifted_window() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT MOD(id,4) AS k, COUNT(DISTINCT id) AS c FROM {} \
+         GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET 1",
+        vs_table()
+    );
+
+    // Pin the render site: `LHS_T0` is the qualified single-table wrapper's
+    // (S6, `joins/sql_builders.rs`) own aliasing scheme, the same marker used
+    // at `unmatched_pushed_sql.contains("LHS_T0")` above — distinct from the
+    // plain grouped-merge builder (S2), which never aliases `LHS_T0` and
+    // instead carries `group_keys`/`PARTIAL_` (see
+    // `grouped_order_by_limit_offset_returns_shifted_groups`).
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("LHS_T0"),
+        "GROUP BY MOD(id,4) + COUNT(DISTINCT id) must render via the \
+         qualified single-table wrapper (pushed SQL must contain 'LHS_T0'), \
+         got:\n{pushed_sql}"
+    );
+    assert!(
+        pushed_sql.contains("LIMIT 2 OFFSET 1"),
+        "pushed SQL must carry LIMIT 2 OFFSET 1 on the qualified wrapper, \
+         got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (k, c): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        2,
+        "LIMIT 2 OFFSET 1 must cap the result to exactly 2 groups: {cols:?}"
+    );
+    let ks: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    let counts: Vec<i64> = cols[1].iter().map(parse_int).collect();
+    assert_eq!(
+        ks,
+        vec![1, 2],
+        "GROUP BY MOD(id,4) + COUNT(DISTINCT id) ORDER BY 1 LIMIT 2 OFFSET 1 \
+         must return groups ranked 2-3 (k=1, k=2), NOT ranks 1-2 (k=0, k=1), \
+         got {ks:?}"
+    );
+    assert_eq!(
+        counts,
+        vec![5, 5],
+        "every group's 5 ids are distinct, so COUNT(DISTINCT id) == 5 per \
+         group, got {counts:?}"
+    );
+}
+
+/// Fact 6 canary (S4, S5 — grammar assertion). Exasol's grammar ties OFFSET
+/// to a non-aggregated select: `OFFSET` on an ungrouped aggregated select
+/// (`SELECT COUNT(*) ... ORDER BY 1 LIMIT 5 OFFSET 2`, no `GROUP BY`) is
+/// rejected by Exasol itself, BEFORE the adapter is ever consulted — this is
+/// the live, release-mode backstop for the `debug_assert!`s at the two
+/// one-row merge builders (`build_aggregate_scan_sql`,
+/// `build_count_distinct_scan_sql`, both in `support.rs`), which compile out
+/// of the release-profile `.so` and so guard nothing there. A future Exasol
+/// build that relaxes this grammar rule must fail this test rather than
+/// silently return the single aggregate row where an offset should apply.
+///
+/// Live-verified: Exasol's WebSocket response for this shape is
+/// `{"status":"error","exception":{"sqlCode":"42000","text":"OFFSET not
+/// allowed in aggregated selects ..."}}`.
+#[test]
+fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT COUNT(*) FROM {} ORDER BY 1 LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+    let resp = conn.try_execute(&sql);
+
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "OFFSET on a single-group aggregate must be rejected by Exasol \
+         itself (the adapter is never consulted), got: {resp}"
+    );
+    assert_eq!(
+        resp["exception"]["sqlCode"].as_str(),
+        Some("42000"),
+        "expected sqlCode 42000, got: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("OFFSET") && msg.contains("aggregated"),
+        "expected Exasol's 'OFFSET not allowed in aggregated selects' \
+         message, got: {msg}"
+    );
+}
+
+/// Fact 5 canary (S3 — unrenderable-ordering invariant). `HASH_MD5(id)` is an
+/// ordering Exasol cannot delegate to the adapter: for this shape Exasol
+/// pushes NEITHER `orderBy` NOR `limit` at all (live-verified via `EXPLAIN
+/// VIRTUAL`: the returned scan spec carries no `order_by` field and the
+/// pushed SQL carries no `LIMIT`/`OFFSET` token) and windows the result
+/// itself. This is the live backstop for the invariant `extract_offset(req) >
+/// 0 IMPLIES order_by_present(req)` that `build_row_scan_sql`'s
+/// `debug_assert!` (S3, `support.rs`) states but cannot enforce in the
+/// release-profile `.so`: if a future Exasol build ever pushed a bare `limit`
+/// with no `orderBy` for this shape, S3 would render ` LIMIT 5` with no
+/// ORDER BY and no OFFSET, silently reopening #191.
+///
+/// The VS-side query and a single-node native reference (no VS involved,
+/// `ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2` over a literal 1..=20 values
+/// list) must return the SAME 5 ids in the SAME order. The reference casts
+/// each literal to `DECIMAL(20,0)` — the VS's own `ID` column type (Arrow
+/// `Int64` maps to `DECIMAL(20,0)`, see this project's type-mapping table) —
+/// because `HASH_MD5` hashes the value's on-the-wire representation, so an
+/// uncast literal (which Exasol infers as a narrower `DECIMAL`) hashes
+/// differently and would produce a different (wrong) reference ordering;
+/// this was confirmed live during this task.
+#[test]
+fn unrenderable_ordering_with_offset_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT id FROM {} ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2",
+        vs_table()
+    );
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed_sql.contains("\"order_by\":"),
+        "HASH_MD5(id) is an unrenderable ordering: the adapter's scan spec \
+         must carry no 'order_by' field, got:\n{pushed_sql}"
+    );
+    // The precise field-shaped marker, not a bare `contains("LIMIT")` — as in
+    // `ordered_topn_pushes_down_matches_single_node` and
+    // `order_by_without_limit_falls_back_correctly`, `explain_virtual_sql`
+    // echoes Exasol's own incoming `pushdownRequest`, which can carry a
+    // literal "LIMIT" token unrelated to the adapter's own scan spec, so a
+    // raw substring search would false-positive regardless of this shape.
+    assert!(
+        !pushed_sql.contains("\"limit\":"),
+        "HASH_MD5(id) is an unrenderable ordering: Exasol withholds the \
+         limit entirely (fact 5), so the adapter's scan spec must carry no \
+         'limit' field, got:\n{pushed_sql}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(cols.len(), 1, "expected 1 column (id): {cols:?}");
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(ids.len(), 5, "expected exactly 5 ids: {ids:?}");
+
+    let native_sql = "SELECT CAST(id AS DECIMAL(20,0)) AS id FROM (VALUES \
+         (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),\
+         (16),(17),(18),(19),(20)) AS t(id) \
+         ORDER BY HASH_MD5(CAST(id AS DECIMAL(20,0))) LIMIT 5 OFFSET 2";
+    let native_cols = conn.query_columns(native_sql);
+    let native_ids: Vec<i64> = native_cols[0].iter().map(parse_int).collect();
+
+    assert_eq!(
+        ids, native_ids,
+        "ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2 through the VS must match a \
+         single-node native evaluation of the same ordering over the same \
+         20 ids (no VS involved), got VS={ids:?} native={native_ids:?}"
     );
 }

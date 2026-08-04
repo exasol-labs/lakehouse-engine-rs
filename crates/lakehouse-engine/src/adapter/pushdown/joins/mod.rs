@@ -1,11 +1,11 @@
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, StorageProps};
+use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::credentials::CatalogSession;
 use super::file_resolution::empty_result_sql;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
+use lakehouse_catalog::CatalogSession;
 
 mod planning;
 mod rendering;
@@ -30,7 +30,12 @@ use planning::{
     select_broadcast_sides,
 };
 use rendering::side_local_filter;
-use sql_builders::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
+// Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
+// (a sibling of `joins` under `pushdown`, gated `#[cfg(test)]`) can drive both
+// join SQL builders directly to pin cross-site golden-SQL fixtures — the same
+// reachability pattern already used for `qualified_single_table_fallback_pushdown`
+// above.
+pub(super) use sql_builders::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
 
 /// Schema-qualify a UDF/script name for a pushdown-driving query.
 ///
@@ -55,6 +60,12 @@ pub(super) fn qualify_udf(scan_schema: Option<&str>, udf: &str) -> String {
 /// a `User` error — surfaced by the FFI shim as a hard `F-UDF-CL-RUST-9001` client
 /// error with no native re-plan (`vs-adapter/pushdown-planning-join` "declined
 /// safely", last resort).
+///
+/// Not merged with `sql_builders::join_render_decline`: that one covers the six
+/// separate qualified-N-scan render-decline sites (an unrenderable select-list
+/// item, join condition, GROUP BY key, HAVING, ORDER BY key, or missing column
+/// metadata), each a plain `{clause}; this is a hard error, not a native re-plan`
+/// sentence with no extra clause inserted.
 pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError {
     let detail = match reason {
         IneligibleJoinReason::NotInnerJoinType => "the join is not an inner join",
@@ -93,7 +104,7 @@ pub(super) async fn plan_join(
     pushdown_req: &Json,
     join: &DetectedJoin,
     session: &CatalogSession,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
     scan_schema: Option<&str>,
@@ -135,8 +146,8 @@ pub(super) async fn plan_join(
         for leaf in &join.tables {
             combined.extend(involved_table_columns(request, &leaf.table_name));
         }
-        let (proj_cols, proj_types) = project_columns(pushdown_req, combined.clone())?;
-        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, &combined);
+        let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
+        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined);
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);

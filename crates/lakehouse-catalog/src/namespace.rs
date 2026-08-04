@@ -1,10 +1,36 @@
-use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::StorageProps;
+//! Namespace enumeration for `createVirtualSchema`, plus the Iceberg identifier
+//! parsing every catalog request needs.
+//!
+//! Moved verbatim from the engine's `adapter/pushdown/namespace.rs`.
+//! `parse_table_ident` arrived ahead of the rest because the `loadTable` GET
+//! this crate owns calls it.
+
+use crate::redaction::redact_credentials;
+use crate::session::{build_rest_catalog, glue_catalog_prefix};
+use crate::{CatalogProps, ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use super::credentials::{build_rest_catalog, glue_catalog_prefix};
-use super::support::redact_catalog_error;
+/// Parse a fully-qualified Iceberg identifier into `(NamespaceIdent, table_name)`.
+///
+/// The trailing `.`-delimited segment is the table name; all preceding segments form the
+/// namespace. Supports any number of namespace levels:
+/// - `"db.table"` → `(NamespaceIdent(["db"]), "table")`
+/// - `"prod.finance.orders"` → `(NamespaceIdent(["prod","finance"]), "orders")`
+///
+/// Returns an error when the input contains no `.` (a bare table name with no namespace).
+pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), UdfError> {
+    let mut parts: Vec<&str> = qualified.split('.').collect();
+    if parts.len() < 2 {
+        return Err(UdfError::User(format!(
+            "table property must be 'namespace.table', got: '{qualified}'"
+        )));
+    }
+    let table_name = parts.pop().unwrap().to_string();
+    let ns_ident = NamespaceIdent::from_vec(parts.iter().map(|s| s.to_string()).collect())
+        .map_err(|e| UdfError::User(format!("invalid namespace in '{qualified}': {e}")))?;
+    Ok((ns_ident, table_name))
+}
 
 // ---------------------------------------------------------------------------
 // Namespace enumeration (createVirtualSchema)
@@ -22,7 +48,7 @@ use super::support::redact_catalog_error;
 pub async fn list_namespace_tables(
     catalog_uri: &str,
     configured_ns: &[String],
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
     let ns_ident = NamespaceIdent::from_vec(configured_ns.to_vec()).map_err(|e| {
@@ -50,12 +76,11 @@ async fn list_namespace_tables_unsigned(
     catalog_uri: &str,
     parent: &NamespaceIdent,
     warehouse: &str,
-    storage: &StorageProps,
+    storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
     // Build a temporary CatalogProps with an empty table to construct the RestCatalog.
-    let dummy_catalog = crate::scan::spec::CatalogProps {
-        uri: catalog_uri.to_string(),
+    let dummy_catalog = CatalogProps {
         warehouse: warehouse.to_string(),
         table: String::new(),
     };
@@ -78,7 +103,7 @@ fn list_in_namespace_unsigned<'a>(
             UdfError::User(format!(
                 "failed to list tables in namespace '{}': {}",
                 ns.join("."),
-                redact_catalog_error(&e.to_string())
+                redact_credentials(&e.to_string())
             ))
         })?;
         all.extend(tables);
@@ -91,7 +116,7 @@ fn list_in_namespace_unsigned<'a>(
                 UdfError::User(format!(
                     "failed to list namespaces under '{}': {}",
                     ns.join("."),
-                    redact_catalog_error(&e.to_string())
+                    redact_credentials(&e.to_string())
                 ))
             })?;
 
@@ -146,7 +171,7 @@ async fn signed_get_json(
         .build()
         .map_err(|e| UdfError::User(format!("failed to build catalog request: {e}")))?;
 
-    let signed = crate::adapter::sigv4::sign_request(
+    let signed = crate::sigv4::sign_request(
         request,
         &creds.access_key,
         &creds.secret_key,
@@ -157,14 +182,14 @@ async fn signed_get_json(
     .map_err(|e| {
         UdfError::User(format!(
             "failed to sign catalog request: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
     let response = client.execute(signed).await.map_err(|e| {
         UdfError::User(format!(
             "catalog request failed: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })?;
 
@@ -177,14 +202,14 @@ async fn signed_get_json(
         return Err(UdfError::User(format!(
             "catalog returned HTTP {}: {}",
             status.as_u16(),
-            redact_catalog_error(&body)
+            redact_credentials(&body)
         )));
     }
 
     response.json::<serde_json::Value>().await.map_err(|e| {
         UdfError::User(format!(
             "failed to parse catalog response: {}",
-            redact_catalog_error(&e.to_string())
+            redact_credentials(&e.to_string())
         ))
     })
 }
@@ -211,7 +236,7 @@ fn list_in_namespace_signed<'a>(
             UdfError::User(format!(
                 "failed to list tables in namespace '{}': {}",
                 ns.join("."),
-                redact_catalog_error(&e.to_string())
+                redact_credentials(&e.to_string())
             ))
         })?;
         let tables_response: ListTablesResponse =
@@ -219,7 +244,7 @@ fn list_in_namespace_signed<'a>(
                 UdfError::User(format!(
                     "failed to parse list-tables response for namespace '{}': {}",
                     ns.join("."),
-                    redact_catalog_error(&e.to_string())
+                    redact_credentials(&e.to_string())
                 ))
             })?;
         all.extend(tables_response.identifiers);
@@ -251,31 +276,10 @@ fn list_in_namespace_signed<'a>(
     })
 }
 
-/// Parse a fully-qualified Iceberg identifier into `(NamespaceIdent, table_name)`.
-///
-/// The trailing `.`-delimited segment is the table name; all preceding segments form the
-/// namespace. Supports any number of namespace levels:
-/// - `"db.table"` → `(NamespaceIdent(["db"]), "table")`
-/// - `"prod.finance.orders"` → `(NamespaceIdent(["prod","finance"]), "orders")`
-///
-/// Returns an error when the input contains no `.` (a bare table name with no namespace).
-pub(super) fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), UdfError> {
-    let mut parts: Vec<&str> = qualified.split('.').collect();
-    if parts.len() < 2 {
-        return Err(UdfError::User(format!(
-            "table property must be 'namespace.table', got: '{qualified}'"
-        )));
-    }
-    let table_name = parts.pop().unwrap().to_string();
-    let ns_ident = NamespaceIdent::from_vec(parts.iter().map(|s| s.to_string()).collect())
-        .map_err(|e| UdfError::User(format!("invalid namespace in '{qualified}': {e}")))?;
-    Ok((ns_ident, table_name))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::*;
     use super::*;
+    use crate::test_support::*;
 
     /// Scenario: single-level namespace — returns (NamespaceIdent::new("mydb"), "mytable").
     #[test]
@@ -372,7 +376,7 @@ mod tests {
         });
 
         let catalog_uri = format!("http://127.0.0.1:{port}");
-        let storage = static_storage();
+        let storage = static_backend();
         let mut creds = base_creds();
         creds.use_sigv4 = true;
         creds.warehouse = "123456789012".into();

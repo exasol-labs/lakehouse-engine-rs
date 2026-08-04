@@ -138,9 +138,9 @@ All four scripts below (`athena_compare.sh`, `trino_compare.sh`, `import_jdbc_tr
 `spark_compare.sh`) support `BENCH_WITH_DELETES=1` (see the "Delete-bearing benchmark" section
 above for the override vars and namespace resolution). When on, each appends `-deletes` to its
 `TIMING <engine> <query> <seconds>` engine label (e.g. `athena` → `athena-deletes`) so a
-with-deletes run's results can be told apart from a without-deletes run once hand-curated into
-`docs/performance.md` — `compare_all.sh`'s aggregation is line-based (`grep '^TIMING '`) and
-unaffected by the extra suffix. `compare_all.sh` itself stays single-variant per invocation: run
+with-deletes run's results can be told apart from a without-deletes run in your own report —
+`compare_all.sh`'s aggregation is line-based (`grep '^TIMING '`) and unaffected by the extra
+suffix. `compare_all.sh` itself stays single-variant per invocation: run
 it once with `BENCH_WITH_DELETES=0` and once with `=1` to get both tables — it does not
 auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
 
@@ -186,8 +186,7 @@ auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
 **The `TIMING` line convention**: every compare script appends lines of the exact form
 `TIMING <engine> <query-name> <seconds>` to its own report. `compare_all.sh` does nothing
 engine-specific beyond `grep`-ing `^TIMING ` across the reports it produced into one aligned
-table — no CSV/JSON, no dashboard, hand-curate the interesting numbers into
-[`../docs/performance.md`](../docs/performance.md) afterward, same as every other bench result.
+table — no CSV/JSON, no dashboard; reports land in `bench/reports/` for you to read directly.
 
 Query text (Presto/Trino/Spark dialect, identical across all three) is duplicated inline in each
 script, translated from `run.sh`'s Q1-Q9b and NQ1-NQ5 — keep all four in sync if you edit one.

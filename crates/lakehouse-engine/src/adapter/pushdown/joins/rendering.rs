@@ -2,38 +2,36 @@ use crate::scan::spec::ProjectionItem;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use vs_expression::{
-    render_df_filter_exasol_safe, render_expression_exasol_safe, render_expression_safe,
-};
+use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
-use super::super::support::{project_columns, quote_ident};
+use super::super::support::{
+    datafusion_renderable, project_columns, quote_ident, type_accepted_rewrite, walk_column_nodes,
+};
 use super::planning::{DetectedJoin, involved_table_columns};
 
-/// Render a join's equi-condition node to a DataFusion SQL boolean expression via
-/// the `vs-expression` translator (bare column names). `None` when the node cannot
-/// be rendered — a defensive decline, since [`plan_join`] only reaches the broadcast
-/// path for a `predicate_equal` condition. Uses `render_expression` (not the filter
-/// renderer) so the boolean expression is returned verbatim, never suppressed as
-/// trivially true.
-pub(super) fn render_join_condition(condition: &Json) -> Option<String> {
-    render_expression_safe(condition)
+/// The SOLE producer of a join's column-type union: `join.tables[0]`'s
+/// [`involved_table_columns`] extended with `join.tables[1]`'s. Broadcast is a
+/// two-table optimization, so `join.tables[0]`/`[1]` are the two involved tables.
+///
+/// Every consumer that needs "the type universe a broadcast-join filter or
+/// projection may be screened against" MUST call this rather than re-deriving the
+/// union itself — [`extract_join_projection`] and `render_broadcast_join`'s
+/// `classify_where_filter` call both do. The caller must have already passed the
+/// [`disjoint_schema_guard`](super::planning::disjoint_schema_guard) so the union
+/// carries no name collision — a bare column name resolves to exactly one Exasol
+/// type only once that guard has passed.
+pub(super) fn join_col_types(request: &Json, join: &DetectedJoin) -> Vec<(String, String)> {
+    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
+    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
+    combined
 }
 
-/// The cross-table projection and Exasol EMITS types for a broadcast join.
-///
-/// Reuses [`project_columns`] against the disjoint union of both involved tables'
-/// columns, so a projected column spanning either side is typed from whichever
-/// side owns it. The caller must have already passed the [`disjoint_schema_guard`]
-/// so the union carries no name collision. Broadcast is a two-table optimization,
-/// so `join.tables[0]`/`[1]` are the two involved tables.
 pub(super) fn extract_join_projection(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
-    let mut combined = involved_table_columns(request, &join.tables[0].table_name);
-    combined.extend(involved_table_columns(request, &join.tables[1].table_name));
-    project_columns(pushdown_req, combined)
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
+    project_columns(pushdown_req, join_col_types(request, join))
 }
 
 /// Render one projection item as an outer-query SELECT expression: a bare column is
@@ -87,11 +85,24 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
 /// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
 /// node cannot be rendered.
 ///
+/// One recursive translator covers every node shape the qualified N-scan wrapper's
+/// select list needs — columns, literals, scalar expressions, a top-level
+/// `function_aggregate`, AND a `function_aggregate` nested inside a scalar function
+/// — with no separate select-list-specific renderer. The translator splices an
+/// Exasol aggregate `name` verbatim (Exasol pushed it, so it is a valid Exasol
+/// aggregate — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, the STDDEV/VARIANCE family),
+/// renders each argument by recursion (table-qualifying any column argument via its
+/// `tableAlias`), handles `COUNT(*)`, and honors `DISTINCT`. This is byte-compatible
+/// with the former top-level `render_aggregate_qualified` (single-arg aggregate →
+/// `NAME(<arg>)`, `COUNT(*)` → `COUNT(*)`), and additionally renders a scalar
+/// expression that wraps aggregates (e.g. `ROUND(100.0 * SUM(CASE …) / COUNT(*),
+/// 2)`) instead of declining.
+///
 /// This whole module builds outer-wrapper SQL that Exasol's own core engine
 /// parses directly, so CAST targets must use Exasol syntax (length-qualified
-/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in this
-/// file (`render_join_condition`, `render_broadcast_join`) which stay on the
-/// bare-`VARCHAR` DataFusion dialect.
+/// `VARCHAR(n)`), unlike the DataFusion-side `ScanSpec` renders elsewhere in the
+/// join-rendering path (`render_broadcast_join`'s `render_expression_safe` call)
+/// which stay on the bare-`VARCHAR` DataFusion dialect.
 pub(super) fn render_expression_qualified(
     expr: &Json,
     alias_of: &HashMap<String, String>,
@@ -101,10 +112,12 @@ pub(super) fn render_expression_qualified(
 
 /// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
 /// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
-/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract,
-/// so a dropped predicate is Exasol's own backstop responsibility exactly as
-/// elsewhere. Uses the Exasol-dialect entry point because the wrapper WHERE is
-/// parsed by Exasol's core engine (length-qualified CAST targets).
+/// or unrenderable — mirroring the single-table `render_df_filter_safe` contract.
+/// A `None` here is never Exasol's problem to catch: the caller must itself
+/// self-apply a declined filter (e.g. as an outer WHERE) rather than omit it
+/// (`pushdown`'s module header). Uses
+/// the Exasol-dialect entry point because the wrapper WHERE is parsed by Exasol's
+/// core engine (length-qualified CAST targets).
 pub(super) fn render_df_filter_qualified(
     filter: &Json,
     alias_of: &HashMap<String, String>,
@@ -112,39 +125,27 @@ pub(super) fn render_df_filter_qualified(
     render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
 }
 
-/// Walk an expression tree, recording every `column` node's owning side: its
-/// UPPERCASE `tableName` into `tables`, or `has_untagged` when a `column` carries
-/// no `tableName`. `any_column` becomes true on the first `column` node seen.
+/// Walk an expression tree, returning every `column` node's owning side: the set of
+/// UPPERCASE `tableName`s seen, whether any `column` carried no `tableName`
+/// (`has_untagged`), and whether any `column` node was seen at all (`any_column`).
 ///
 /// `tableName` is the SAME attribution signal [`annotate_columns_with_alias`] uses,
 /// so conjunct-to-side attribution is by table identity — never by column name,
 /// which keeps the shared-column-name case (both tables carry an `ID`) correct.
-pub(super) fn collect_column_tables(
-    expr: &Json,
-    tables: &mut std::collections::HashSet<String>,
-    has_untagged: &mut bool,
-    any_column: &mut bool,
-) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                *any_column = true;
-                match map.get("tableName").and_then(|t| t.as_str()) {
-                    Some(tn) => {
-                        tables.insert(tn.to_ascii_uppercase());
-                    }
-                    None => *has_untagged = true,
-                }
+pub(super) fn column_tables(expr: &Json) -> (std::collections::HashSet<String>, bool, bool) {
+    let mut tables = std::collections::HashSet::new();
+    let mut has_untagged = false;
+    let mut any_column = false;
+    walk_column_nodes(expr, &mut |map| {
+        any_column = true;
+        match map.get("tableName").and_then(|t| t.as_str()) {
+            Some(tn) => {
+                tables.insert(tn.to_ascii_uppercase());
             }
-            for value in map.values() {
-                collect_column_tables(value, tables, has_untagged, any_column);
-            }
+            None => has_untagged = true,
         }
-        Json::Array(items) => items
-            .iter()
-            .for_each(|item| collect_column_tables(item, tables, has_untagged, any_column)),
-        _ => {}
-    }
+    });
+    (tables, has_untagged, any_column)
 }
 
 /// The single side a conjunct is local to — `Some(UPPERCASE table name)` iff every
@@ -157,10 +158,7 @@ pub(super) fn collect_column_tables(
 /// condition for that side's rows to survive the join, so using it to prune that
 /// side can never drop a row the join would have kept.
 fn conjunct_single_side(conjunct: &Json) -> Option<String> {
-    let mut tables = std::collections::HashSet::new();
-    let mut has_untagged = false;
-    let mut any_column = false;
-    collect_column_tables(conjunct, &mut tables, &mut has_untagged, &mut any_column);
+    let (tables, has_untagged, any_column) = column_tables(conjunct);
     if has_untagged || !any_column || tables.len() != 1 {
         return None;
     }
@@ -187,9 +185,10 @@ fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
 /// into one sub-predicate: `None` when none are kept, the bare conjunct when exactly
 /// one is, else a `predicate_and` over all kept conjuncts.
 ///
-/// The shared shape of [`side_local_filter`] (keep conjuncts local to one side) and
-/// [`cross_side_residual_filter`] (keep the cross-side complement) — only the `keep`
-/// predicate differs, so the two are the exact set-partition halves of one filter.
+/// The shared shape of the two complementary screen pairs over one filter — only
+/// the `keep` predicate differs: [`side_local_filter`] (conjuncts local to one
+/// side) against [`cross_side_residual_filter`] (the cross-side complement), and
+/// [`renderable_only`] against [`declined_only`].
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
     let mut conjuncts = Vec::new();
     flatten_conjuncts(filter, &mut conjuncts);
@@ -210,12 +209,25 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 
 /// The side-local sub-predicate of `filter` for `table_name`: the AND of exactly
 /// those top-level conjuncts every column of which is attributed to `table_name`.
-/// `None` when no conjunct is side-local to it.
+/// `None` when no conjunct is side-local to it. Attribution by `tableName` alone —
+/// this makes NO renderability decision, and each consumer screens (or does not
+/// screen) its own input before calling.
 ///
-/// This is what is threaded into (a) that side's `resolve_file_list` for Iceberg
-/// manifest pruning and (b) that side's fan-out `ScanSpec.filter` for DataFusion
-/// row-group pruning + row filtering. Cross-table conjuncts and OR-spanning
-/// conjuncts are withheld here and applied only by the outer wrapper's WHERE.
+/// THREE consumers receive DIFFERENT trees built from this function's output,
+/// deliberately:
+/// (a) that side's `resolve_file_list` for Iceberg manifest pruning is given the
+/// RAW filter, unscreened, so every side-local conjunct prunes manifests even when
+/// the DataFusion dialect cannot render it — screening here would silently open
+/// more files while still returning correct rows;
+/// (b) that side's fan-out `ScanSpec.filter` is given a tree first screened by
+/// [`renderable_only`], then screened AND REWRITTEN per side by
+/// [`type_screened_leg_filter`], so the leg receives only conjuncts that are both
+/// syntactically renderable and type-correct for that side's own columns; and
+/// (c) the outer wrapper's residual `WHERE` receives the RAW conjuncts
+/// [`type_screened_leg_filter`] hands back declined, because the wrapper renders in
+/// the Exasol dialect and a DataFusion-rewritten tree is the wrong input there.
+/// Cross-table conjuncts and OR-spanning conjuncts are withheld from (a) and (b)
+/// and applied only by the outer wrapper's WHERE, alongside the type-declined half.
 pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
     let target = table_name.to_ascii_uppercase();
     partition_conjuncts(filter, |c| {
@@ -228,35 +240,111 @@ pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json>
 /// OR-spanning, untagged, or column-free conjuncts (`conjunct_single_side` is
 /// `None`). `None` when every conjunct is side-local.
 ///
-/// This is the exact set-complement of the per-side [`side_local_filter`] slices:
-/// every conjunct is either side-local to exactly one table (pushed into that side's
-/// fan-out leg) or cross-side residual (kept here, in the outer wrapper's WHERE), so
-/// the partition is total and disjoint — no conjunct is dropped or double-applied.
+/// The complement it forms is over WHATEVER TREE IT IS GIVEN, not over the request's
+/// raw filter: it is the exact set-complement of the per-side [`side_local_filter`]
+/// slices of that same tree, and nothing more. On the render path it is given the
+/// [`renderable_only`] half, so the outer wrapper's WHERE additionally carries
+/// [`declined_only`] — the total partition of the request's filter is therefore
+/// `renderable_only`/`declined_only` composed with these two, and it is that
+/// composition, not this function alone, that leaves no conjunct dropped or
+/// double-applied.
 pub(super) fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, |c| conjunct_single_side(c).is_none())
 }
 
-/// Deep-clone `expr` with every `tableAlias` key removed, so the reused
-/// `vs-expression` translator renders BARE column names.
+/// The DataFusion-RENDERABLE half of `filter`'s top-level conjuncts, and
+/// [`declined_only`] its exact complement — the sole renderability screen on the
+/// N-scan render path, applied at [`super::sql_builders::build_n_scan_join_sql`]'s
+/// two render sites and NOWHERE else.
 ///
-/// Exasol sends each column node with BOTH its `tableName` and the query's
-/// `tableAlias` (e.g. `FROM fact_orders o` yields `tableAlias: "O"`), and the
-/// translator emits `"ALIAS"."NAME"` whenever `tableAlias` is present. A single-table
-/// fan-out ([`build_side_fan_out_sql`]) scans one relation exposing BARE uppercase
-/// column names, so an alias-qualified reference would not resolve against it — the
-/// fan-out's pushed filter must be bare, exactly like the single-table scan path.
-/// `tableName` is left intact (the translator ignores it; conjunct attribution has
-/// already read it upstream).
-pub(super) fn strip_table_alias(expr: &Json) -> Json {
-    match expr {
-        Json::Object(map) => Json::Object(
-            map.iter()
-                .filter(|(key, _)| key.as_str() != "tableAlias")
-                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
-                .collect(),
-        ),
-        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
-        other => other.clone(),
+/// It sits at the render sites rather than inside [`side_local_filter`] because
+/// that function has a second consumer that must NOT be screened: `plan_join`
+/// passes its result to Iceberg manifest pruning, where dropping a declined
+/// conjunct would silently open more files while still returning correct rows —
+/// a regression no test could catch. Only the leg's `ScanSpec.filter` is
+/// rendered, so only it needs screening; a conjunct this rejects is carried by
+/// the outer wrapper's WHERE in the Exasol dialect instead of being omitted.
+pub(super) fn renderable_only(filter: &Json) -> Option<Json> {
+    partition_conjuncts(filter, datafusion_renderable)
+}
+
+/// The DataFusion-DECLINED half of `filter`'s top-level conjuncts — the exact
+/// complement of [`renderable_only`], and the set the outer wrapper's WHERE must
+/// carry because no leg can apply it.
+pub(super) fn declined_only(filter: &Json) -> Option<Json> {
+    partition_conjuncts(filter, |c| !datafusion_renderable(c))
+}
+
+/// Split ONE side's side-local conjuncts into the REWRITTEN set its fan-out leg may
+/// render and the RAW set the outer wrapper must apply: returns
+/// `(leg_filter, type_declined)`, a partition of `side_local`'s top-level conjuncts
+/// that is total (every conjunct lands in exactly one half) and type-correct for that
+/// one side.
+///
+/// The N-scan analog of the broadcast surface's
+/// [`classify_where_filter`](super::super::support::classify_where_filter), and
+/// deliberately NOT a call to it: that function owns a WHOLE-filter classification
+/// against ONE type universe, which neither half of this surface's situation matches.
+/// Both surfaces do share the acceptance predicate underneath, and ask
+/// [`type_accepted_rewrite`] for it rather than each encoding it.
+///
+/// PER-SIDE, POST-ATTRIBUTION. The N-scan path has no disjoint-column-name
+/// precondition (the broadcast path's `disjoint_schema_guard` is what earns the
+/// broadcast surface its single union universe), so a bare column name here can
+/// resolve to a DIFFERENT Exasol type on each side. The only universe that answers
+/// "will DataFusion accept this conjunct in THIS leg" is the owning side's own
+/// `col_types` — knowable only after [`side_local_filter`] has attributed the
+/// conjunct, hence a screen that runs after attribution rather than over the request's
+/// whole filter.
+///
+/// PER-CONJUNCT, NOT PER-TREE. One type-declining conjunct must not forfeit its
+/// side's other pushable conjuncts; the outer wrapper's WHERE absorbs exactly the
+/// rejected ones. The single-table WHERE surface declines whole-filter only because it
+/// has no partition to absorb one conjunct into.
+///
+/// SCREENED ON THE REWRITTEN TREE. The leg renders what this function returns — the
+/// REWRITTEN tree — so renderability must be established on that tree, not on the raw
+/// one. [`type_accepted_rewrite`] is what establishes it, for the per-conjunct screen
+/// and the re-formed tree alike, and the broadcast site inherits the same guarantee
+/// from the same call.
+///
+/// FAILS CLOSED TOWARDS THE RESIDUAL. Should the re-formed accepted tree not itself
+/// survive [`type_accepted_rewrite`], the WHOLE side-local set becomes residual. A
+/// conjunct applied nowhere returns wrong rows; a conjunct applied in the outer
+/// wrapper instead of a leg is merely slower.
+///
+/// The declined half is returned RAW because the outer wrapper renders it in the
+/// EXASOL dialect: the rewrites synthesize DataFusion-dialect nodes, so a rewritten
+/// tree is the wrong input there — the same reason `classify_where_filter` returns its
+/// declined half un-rewritten.
+pub(super) fn type_screened_leg_filter(
+    side_local: &Json,
+    col_types: &[(String, String)],
+) -> (Option<Json>, Option<Json>) {
+    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
+    let declined = partition_conjuncts(side_local, |c| !accepts(c));
+    match partition_conjuncts(side_local, accepts) {
+        None => (None, declined),
+        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
+            Some(rewritten) => (Some(rewritten), declined),
+            None => (None, Some(side_local.clone())),
+        },
+    }
+}
+
+/// AND two optional sub-predicates into one: the `predicate_and` of both when
+/// both are present, the present one alone when only one is, `None` when neither
+/// is.
+///
+/// Callers must pass DISJOINT conjunct sets — this de-duplicates nothing, so
+/// overlapping inputs would double-apply a predicate.
+pub(super) fn conjoin_filters(left: Option<Json>, right: Option<Json>) -> Option<Json> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [l, r],
+        })),
+        (l, r) => l.or(r),
     }
 }
 
@@ -267,25 +355,53 @@ fn collect_side_column_names(
     table_name: &str,
     out: &mut std::collections::HashSet<String>,
 ) {
-    match expr {
-        Json::Object(map) => {
-            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
-                let tn = map.get("tableName").and_then(|t| t.as_str());
-                let name = map.get("name").and_then(|n| n.as_str());
-                if let (Some(tn), Some(name)) = (tn, name)
-                    && tn.eq_ignore_ascii_case(table_name)
-                {
-                    out.insert(name.to_ascii_uppercase());
-                }
-            }
-            for value in map.values() {
-                collect_side_column_names(value, table_name, out);
-            }
+    walk_column_nodes(expr, &mut |map| {
+        let tn = map.get("tableName").and_then(|t| t.as_str());
+        let name = map.get("name").and_then(|n| n.as_str());
+        if let (Some(tn), Some(name)) = (tn, name)
+            && tn.eq_ignore_ascii_case(table_name)
+        {
+            out.insert(name.to_ascii_uppercase());
         }
-        Json::Array(items) => items
-            .iter()
-            .for_each(|item| collect_side_column_names(item, table_name, out)),
-        _ => {}
+    });
+}
+
+/// Visit every clause of `pushdown_req` whose rendered SQL can name a source column:
+/// `selectList`, a non-null `filter`, `groupBy`, `orderBy`, then a non-null `having`.
+///
+/// The single owner of *which* clauses those are, so adding or removing one is a
+/// one-function edit rather than a two-function edit kept in sync by hand. It owns the
+/// clause set and nothing else: the per-node collector is a parameter because the two
+/// callers must stay divergent in ways this walk has no business reconciling. They
+/// fold case differently — [`referenced_side_columns`] collects through
+/// `collect_side_column_names`' ASCII-only `to_ascii_uppercase`,
+/// `referenced_column_projection` through `collect_all_column_names`' Unicode
+/// `to_uppercase`, a disagreement `walk_column_nodes`' doc comment and
+/// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
+/// column-collecting walk" scenario both forbid unifying — and they fall back
+/// differently when the narrowing selects nothing.
+///
+/// [`referenced_side_columns`] deliberately keeps its own absent/empty-`selectList`
+/// short-circuit BEFORE calling this, so `selectList` is named twice by design. That
+/// guard MUST NOT be folded in here: it is a fallback policy, not part of the clause
+/// set, and folding it in would hand `referenced_column_projection` a short-circuit
+/// that `vs-adapter/pushdown-joins-module-structure`'s "One clause walk feeds both
+/// wrapper column-narrowing routines" scenario forbids it — that path must keep
+/// narrowing through the remaining clauses when the select list is absent or empty.
+pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMut(&Json)) {
+    if let Some(list) = pushdown_req.get("selectList") {
+        visit(list);
+    }
+    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
+        visit(f);
+    }
+    for key in ["groupBy", "orderBy"] {
+        if let Some(v) = pushdown_req.get(key) {
+            visit(v);
+        }
+    }
+    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
+        visit(h);
     }
 }
 
@@ -296,40 +412,47 @@ fn collect_side_column_names(
 /// The kept set is every column of this side referenced by any clause the wrapper
 /// renders: the SELECT list, the join condition, the WHERE (the FULL predicate —
 /// the outer wrapper renders all of it, so a side-local *or* cross-table filter
-/// column must survive), GROUP BY, HAVING, and ORDER BY. Order and Exasol types are
+/// column must survive), GROUP BY, HAVING, and ORDER BY. The request's share of that
+/// set comes from [`referenced_clause_values`]; the join condition is collected
+/// separately because it is not a clause of the request. Order and Exasol types are
 /// preserved from `full_cols`.
 ///
 /// Two total-safety fallbacks keep the wrapper buildable: an absent/empty SELECT
 /// list means `SELECT *` over both fan-outs, so every column is kept; and an
 /// (unreachable) empty result keeps `full_cols` rather than emit a zero-column leg.
+///
+/// The `names.contains(name)` narrowing below is a CROSS-FOLD string match: `full_cols`
+/// arrives from [`involved_table_columns`] folded by `support::column_types`' Unicode
+/// `to_uppercase`, while `names` is folded by `collect_side_column_names`' ASCII-only
+/// `to_ascii_uppercase`. The two agree only by premise — `resolve_table_schema`
+/// Unicode-uppercases every name it declares, so no LOWERCASE name reaches either side
+/// (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`). Non-ASCII
+/// letters can still reach both sides (e.g. `über` uppercases to `ÜBER`, not to an
+/// ASCII form) — the two folds still agree there because `to_ascii_uppercase` only
+/// touches ASCII `a`-`z`, none of which remain once a name is already
+/// Unicode-uppercased. Repair any divergence at that premise, never by unifying the
+/// two folds. If the premise ever weakens, `full_cols` would hold `STRASSE` where
+/// `names` holds `STRAßE`; this filter would then drop a column the outer wrapper
+/// still references, and the empty-result fallback named above rescues only a
+/// *fully* empty narrowing — a partial mismatch narrows a referenced column away
+/// instead. That is a dropped column, not necessarily a silent one: if the outer
+/// wrapper's rendered SQL still references it elsewhere, Exasol surfaces a
+/// column-not-found error rather than a silently wrong result.
 pub(super) fn referenced_side_columns(
     pushdown_req: &Json,
     condition: &Json,
     table_name: &str,
     full_cols: &[(String, String)],
 ) -> Vec<(String, String)> {
+    // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
+    if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
+        return full_cols.to_vec();
+    }
     let mut names = std::collections::HashSet::new();
-    match pushdown_req.get("selectList") {
-        Some(Json::Array(list)) if !list.is_empty() => {
-            for item in list {
-                collect_side_column_names(item, table_name, &mut names);
-            }
-        }
-        // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
-        _ => return full_cols.to_vec(),
-    }
     collect_side_column_names(condition, table_name, &mut names);
-    if let Some(f) = pushdown_req.get("filter").filter(|f| !f.is_null()) {
-        collect_side_column_names(f, table_name, &mut names);
-    }
-    for key in ["groupBy", "orderBy"] {
-        if let Some(v) = pushdown_req.get(key) {
-            collect_side_column_names(v, table_name, &mut names);
-        }
-    }
-    if let Some(h) = pushdown_req.get("having").filter(|h| !h.is_null()) {
-        collect_side_column_names(h, table_name, &mut names);
-    }
+    referenced_clause_values(pushdown_req, |v| {
+        collect_side_column_names(v, table_name, &mut names)
+    });
     let narrowed: Vec<(String, String)> = full_cols
         .iter()
         .filter(|(name, _)| names.contains(name))
@@ -342,29 +465,9 @@ pub(super) fn referenced_side_columns(
     }
 }
 
-/// Render one select-list item to a table-qualified outer-SELECT expression through
-/// the SINGLE `vs-expression` path — columns, literals, scalar expressions, a
-/// top-level `function_aggregate`, AND a `function_aggregate` nested inside a scalar
-/// function all render through the same recursive translator.
-///
-/// The translator splices an Exasol aggregate `name` verbatim (Exasol pushed it, so
-/// it is a valid Exasol aggregate — `SUM`, `COUNT`, `AVG`, `MIN`, `MAX`, the
-/// STDDEV/VARIANCE family), renders each argument by recursion (table-qualifying any
-/// column argument via its `tableAlias`), handles `COUNT(*)`, and honors `DISTINCT`.
-/// This is byte-compatible with the former top-level `render_aggregate_qualified`
-/// (single-arg aggregate → `NAME(<arg>)`, `COUNT(*)` → `COUNT(*)`), and additionally
-/// renders a scalar expression that wraps aggregates (e.g.
-/// `ROUND(100.0 * SUM(CASE …) / COUNT(*), 2)`) instead of declining. `None` only when
-/// the node genuinely cannot be rendered.
-pub(super) fn render_selectlist_item_qualified(
-    item: &Json,
-    alias_of: &HashMap<String, String>,
-) -> Option<String> {
-    render_expression_qualified(item, alias_of)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::super::support::collect_all_column_names;
     use super::super::planning::{JoinSides, disjoint_schema_guard};
     use super::super::sql_builders::{
         JoinScanTuning, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
@@ -374,8 +477,9 @@ mod tests {
         detected_join, equi_condition, join_request, resolved_side, two_scan_tuning,
     };
     use super::*;
+    use crate::adapter::pushdown::support::apply_type_rewrites;
     use crate::adapter::pushdown::test_support::*;
-    use vs_expression::render_df_filter_safe;
+    use vs_expression::{render_df_filter_safe, render_expression_safe};
 
     // ---------------------------------------------------------------------------
     // Join rendering: disjoint-column guard + condition/filter/projection
@@ -435,7 +539,7 @@ mod tests {
     #[test]
     fn join_condition_renders_via_translator() {
         assert_eq!(
-            render_join_condition(&equi_condition()).as_deref(),
+            render_expression_safe(&equi_condition()).as_deref(),
             Some(r#"("C_CUSTKEY" = "O_CUSTKEY")"#),
             "the equi-condition must render to a bare-name DataFusion boolean expr"
         );
@@ -493,7 +597,7 @@ mod tests {
     fn join_projection_emits_attribute_each_side_owning_type() {
         let request = join_request(Json::Null, equi_condition());
         let detected = detected_join(&request);
-        let (projection, types) =
+        let (projection, types, _widened) =
             extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
 
         assert_eq!(
@@ -530,7 +634,7 @@ mod tests {
         ]);
 
         let detected = detected_join(&request);
-        let (projection, _types) =
+        let (projection, _types, _widened) =
             extract_join_projection(&request, &pd(&request), &detected).expect("projectable");
 
         assert_eq!(
@@ -543,6 +647,159 @@ mod tests {
             matches!(projection[0], ProjectionItem::Expr { .. }),
             "a rendered CAST expression must be an Expr projection item, not a bare Column: \
              {projection:?}"
+        );
+    }
+
+    /// `string_function_arg_type_guard` (issue #210) reaches through the join-shared
+    /// `project_columns`, exercised across two calls into `extract_join_projection`
+    /// on the same detected join:
+    ///
+    /// (a) `UPPER(C_CUSTKEY)` (CUSTOMER's DECIMAL column) still projects as a single
+    ///     coerced `ProjectionItem::Expr` carrying the trimmed decimal-to-string
+    ///     form — proving coercion reaches through the join-shared `project_columns`,
+    ///     not just the single-table path.
+    /// (b) A decline falls back to the FULL projection over the UNION of BOTH
+    ///     joined tables' columns, not just one side.
+    ///
+    /// `join_request`'s fixture carries no DOUBLE-typed column on either side, so the
+    /// decline trigger used for (b) is the #228 ARITY decline instead —
+    /// `INSTR(C_NAME, 'b', 3)`, three arguments, over CUSTOMER's own VARCHAR column —
+    /// which reaches the exact same `None` path a type decline would, with no
+    /// fixture change.
+    #[test]
+    fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
+        let request = join_request(Json::Null, equi_condition());
+        let detected = detected_join(&request);
+
+        let mut coerce_request = request.clone();
+        coerce_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "function_scalar",
+                "name": "UPPER",
+                "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
+            }
+        ]);
+        let (projection, _types, _widened) =
+            extract_join_projection(&coerce_request, &pd(&coerce_request), &detected)
+                .expect("projectable");
+        assert_eq!(
+            projection.len(),
+            1,
+            "UPPER(C_CUSTKEY) must project a single expression, not the full two-table \
+             row: {projection:?}"
+        );
+        let ProjectionItem::Expr { expr } = &projection[0] else {
+            panic!("must be a rendered expression, not a bare column: {projection:?}");
+        };
+        assert!(
+            expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_CUSTKEY" AS VARCHAR)"#),
+            "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
+             form: {expr}"
+        );
+
+        let mut decline_request = request.clone();
+        decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "function_scalar",
+                "name": "INSTR",
+                "arguments": [
+                    {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                    {"type": "literal_string", "value": "b"},
+                    {"type": "literal_exactnumeric", "value": 3}
+                ]
+            }
+        ]);
+        let (projection, _types, _widened) =
+            extract_join_projection(&decline_request, &pd(&decline_request), &detected)
+                .expect("projectable");
+        let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
+            + involved_table_columns(&decline_request, "ORDERS").len();
+        assert_eq!(
+            projection.len(),
+            expected_full_row_len,
+            "the arity-decline INSTR must fall back to the full projection over BOTH \
+             joined tables' columns, not a truncated strpos: {projection:?}"
+        );
+    }
+
+    /// `like_subject_type_guard` (issue #219) reaches through the join-shared
+    /// `project_columns`, exercised across two calls into `extract_join_projection`
+    /// on the same detected join — the select-list analog of
+    /// [`join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity`]:
+    ///
+    /// (a) `C_NAME LIKE 'A%'` (CUSTOMER's VARCHAR(100) column) still projects as a
+    ///     single `ProjectionItem::Expr`, proving the guard's pass-through for a
+    ///     string subject reaches the broadcast-join SELECT list.
+    /// (b) `C_CUSTKEY LIKE '1%'` (CUSTOMER's DECIMAL column) declines and falls back
+    ///     to the FULL projection over the UNION of BOTH joined tables' columns —
+    ///     the reach this plan wires by adding `like_subject_type_guard` as the
+    ///     first pass of `apply_type_rewrites`.
+    #[test]
+    fn join_projection_like_guard_reaches_join_select_list() {
+        let request = join_request(Json::Null, equi_condition());
+        let detected = detected_join(&request);
+
+        let mut string_request = request.clone();
+        string_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+                "pattern": {"type": "literal_string", "value": "A%"}
+            }
+        ]);
+        let (projection, _types, widened) =
+            extract_join_projection(&string_request, &pd(&string_request), &detected)
+                .expect("projectable");
+        assert!(
+            !widened,
+            "a VARCHAR subject must keep the broadcast projection, not widen to the \
+             full row: {projection:?}"
+        );
+        assert_eq!(
+            projection.len(),
+            1,
+            "C_NAME LIKE 'A%' must project a single expression, not the full two-table \
+             row: {projection:?}"
+        );
+        let ProjectionItem::Expr { expr } = &projection[0] else {
+            panic!("must be a rendered expression, not a bare column: {projection:?}");
+        };
+        assert!(
+            expr.contains("C_NAME") && expr.contains("LIKE"),
+            "the VARCHAR subject must render as a LIKE expression over C_NAME: {expr}"
+        );
+
+        let mut decline_request = request.clone();
+        decline_request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                "pattern": {"type": "literal_string", "value": "1%"}
+            }
+        ]);
+        let (projection, _types, widened) =
+            extract_join_projection(&decline_request, &pd(&decline_request), &detected)
+                .expect("projectable");
+        assert!(
+            widened,
+            "the widening flag is what declines the broadcast join to the N-scan \
+             fallback (joins/sql_builders.rs:85); a DECIMAL-subject LIKE must set it: \
+             {projection:?}"
+        );
+        let expected_full_row_len = involved_table_columns(&decline_request, "CUSTOMER").len()
+            + involved_table_columns(&decline_request, "ORDERS").len();
+        assert_eq!(
+            projection.len(),
+            expected_full_row_len,
+            "a DECIMAL-subject LIKE must fall back to the full projection over BOTH \
+             joined tables' columns, not an unguarded LIKE: {projection:?}"
+        );
+        assert!(
+            projection
+                .iter()
+                .all(|item| matches!(item, ProjectionItem::Column(_))),
+            "the fallback projection must be bare columns, not a same-length vector \
+             of rendered Expr items: {projection:?}"
         );
     }
 
@@ -703,6 +960,387 @@ mod tests {
         );
     }
 
+    /// The ORDERS-side-local conjunct the DataFusion dialect CAN express.
+    fn orders_local_rendering_conjunct() -> Json {
+        serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+            "right": {"type": "literal_string", "value": "1995-01-01"}
+        })
+    }
+
+    /// The ORDERS-side-local conjunct the DataFusion dialect REFUSES (its `SECOND`
+    /// field shortcut permits exactly one argument) while Exasol renders it — the
+    /// dialect asymmetry the render-site screen exists to route.
+    fn orders_local_declined_conjunct() -> Json {
+        serde_json::json!({
+            "type": "predicate_greater",
+            "left": {
+                "type": "function_scalar",
+                "name": "SECOND",
+                "arguments": [
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                    {"type": "literal_exactnumeric", "value": 3}
+                ]
+            },
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        })
+    }
+
+    /// Both ORDERS-side-local conjuncts under one AND: one renders for DataFusion,
+    /// one declines.
+    fn orders_local_rendering_and_declined_filter() -> Json {
+        serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                orders_local_rendering_conjunct(),
+                orders_local_declined_conjunct(),
+            ],
+        })
+    }
+
+    /// A side-local conjunct whose DataFusion render DECLINES is reclassified as
+    /// residual: `declined_only` keeps exactly it, `renderable_only` keeps exactly
+    /// the complement, and it still renders in the Exasol dialect — so the outer
+    /// wrapper's WHERE can apply what no leg can.
+    #[test]
+    fn declined_side_local_conjunct_partitions_to_residual() {
+        let filter = orders_local_rendering_and_declined_filter();
+        let rendering = orders_local_rendering_conjunct();
+        let declined = orders_local_declined_conjunct();
+        assert!(
+            !datafusion_renderable(&declined) && datafusion_renderable(&rendering),
+            "precondition: exactly one of the two conjuncts declines for DataFusion"
+        );
+
+        assert_eq!(
+            declined_only(&filter),
+            Some(declined.clone()),
+            "declined_only must keep exactly the conjunct DataFusion cannot express"
+        );
+        assert_eq!(
+            renderable_only(&filter),
+            Some(rendering),
+            "renderable_only must keep exactly its complement — the two are exact halves"
+        );
+        assert!(
+            render_expression_exasol_safe(&declined).is_some(),
+            "the residual conjunct must render in the Exasol dialect, or the outer \
+             WHERE could not apply it either"
+        );
+        assert_eq!(
+            conjunct_single_side(&declined).as_deref(),
+            Some("ORDERS"),
+            "attribution is unchanged — only the RENDER declines, so the screen is \
+             the sole reason this conjunct becomes residual"
+        );
+    }
+
+    /// The complement: a side-local conjunct the DataFusion dialect CAN express
+    /// still reaches its own leg through the screened tree, so the screen costs the
+    /// rendering case nothing.
+    #[test]
+    fn rendering_side_local_conjunct_still_reaches_its_leg() {
+        let filter = orders_local_rendering_and_declined_filter();
+        let leg_eligible = renderable_only(&filter).expect("the rendering conjunct survives");
+
+        let leg = render_df_filter_safe(
+            &side_local_filter(&leg_eligible, "ORDERS").expect("still ORDERS-side-local"),
+        )
+        .expect("a DataFusion-renderable leg filter renders");
+
+        assert!(
+            leg.contains("'1995-01-01'") && !leg.contains("SECOND"),
+            "the rendering conjunct must reach the leg and the declined one must not: {leg}"
+        );
+    }
+
+    /// The Iceberg manifest-pruning input is NOT screened: `plan_join` passes the
+    /// RAW filter to `side_local_filter`, so a conjunct whose DataFusion render
+    /// declines still prunes that side's manifests. Only the leg's `ScanSpec.filter`
+    /// sees the screened tree — screening inside `side_local_filter` would silently
+    /// open more files with no failing test.
+    #[test]
+    fn join_side_pruning_input_unchanged_when_df_render_declines() {
+        let filter = orders_local_rendering_and_declined_filter();
+
+        let pruning =
+            side_local_filter(&filter, "ORDERS").expect("both conjuncts are ORDERS-side-local");
+        let mut pruning_conjuncts = Vec::new();
+        flatten_conjuncts(&pruning, &mut pruning_conjuncts);
+        assert_eq!(
+            pruning_conjuncts.len(),
+            2,
+            "pruning must still receive BOTH side-local conjuncts: {pruning}"
+        );
+        assert!(
+            pruning_conjuncts.iter().any(|c| !datafusion_renderable(c)),
+            "the declined conjunct must still be in the pruning input: {pruning}"
+        );
+
+        let leg = side_local_filter(
+            &renderable_only(&filter).expect("the rendering conjunct survives"),
+            "ORDERS",
+        )
+        .expect("the rendering conjunct is still ORDERS-side-local");
+        let mut leg_conjuncts = Vec::new();
+        flatten_conjuncts(&leg, &mut leg_conjuncts);
+        assert_eq!(
+            leg_conjuncts.len(),
+            1,
+            "the screened leg filter must carry only the rendering conjunct: {leg}"
+        );
+        assert!(
+            leg_conjuncts.iter().all(|c| datafusion_renderable(c)),
+            "the screened leg filter must omit the declined conjunct: {leg}"
+        );
+    }
+
+    /// CUSTOMER's `(name, Exasol type)` universe from the standard two-table join
+    /// request: `C_CUSTKEY DECIMAL(20,0)`, `C_NAME VARCHAR(100)`.
+    fn customer_col_types() -> Vec<(String, String)> {
+        involved_table_columns(&join_request(Json::Null, equi_condition()), "CUSTOMER")
+    }
+
+    /// ORDERS' `(name, Exasol type)` universe: `O_CUSTKEY DECIMAL(20,0)`,
+    /// `O_ORDERDATE DATE` — one type the LIKE guard declines and one it rewrites.
+    fn orders_col_types() -> Vec<(String, String)> {
+        involved_table_columns(&join_request(Json::Null, equi_condition()), "ORDERS")
+    }
+
+    fn like_over(column: &str, table: &str, pattern: &str) -> Json {
+        serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": column, "tableName": table},
+            "pattern": {"type": "literal_string", "value": pattern}
+        })
+    }
+
+    fn and_of(conjuncts: Vec<Json>) -> Json {
+        serde_json::json!({"type": "predicate_and", "expressions": conjuncts})
+    }
+
+    fn conjunct_count(filter: Option<&Json>) -> usize {
+        filter.map_or(0, |f| {
+            let mut out = Vec::new();
+            flatten_conjuncts(f, &mut out);
+            out.len()
+        })
+    }
+
+    /// Every conjunct the type pipeline accepts reaches the leg half REWRITTEN and the
+    /// declined half stays empty — so an all-accepted side keeps its full pushdown, and
+    /// the leg receives the rewritten tree (`CAST("O_ORDERDATE" AS VARCHAR) LIKE …`),
+    /// not the raw one DataFusion would refuse to coerce.
+    #[test]
+    fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
+        let filter = and_of(vec![
+            like_over("O_ORDERDATE", "ORDERS", "1995%"),
+            orders_local_rendering_conjunct(),
+        ]);
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+
+        assert!(
+            declined.is_none(),
+            "no conjunct declines, so nothing may be handed to the outer wrapper: {declined:?}"
+        );
+        let leg = leg.expect("an all-accepted side-local set must reach its leg");
+        assert_eq!(
+            conjunct_count(Some(&leg)),
+            2,
+            "both accepted conjuncts must reach the leg: {leg}"
+        );
+        let rendered = render_df_filter_safe(&leg).expect("the rewritten set must render");
+        assert!(
+            rendered.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && rendered.contains("LIKE"),
+            "the DATE LIKE subject must reach the leg CAST to VARCHAR, not bare: {rendered}"
+        );
+    }
+
+    /// When no conjunct survives the screen the leg half is `None` and the outer
+    /// wrapper receives the WHOLE side-local set in RAW form — the DECIMAL LIKE
+    /// unwrapped, because the Exasol dialect must render what the DataFusion dialect
+    /// declined, and the rewrites target the DataFusion dialect only.
+    #[test]
+    fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
+        let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
+        let filter = and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]);
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+
+        assert!(
+            leg.is_none(),
+            "no conjunct may be pushed when every one of them declines: {leg:?}"
+        );
+        let declined = declined.expect("a fully declined side-local set must go residual");
+        let mut conjuncts = Vec::new();
+        flatten_conjuncts(&declined, &mut conjuncts);
+        assert_eq!(
+            conjuncts.len(),
+            2,
+            "both declined conjuncts must reach the outer wrapper: {declined}"
+        );
+        assert!(
+            conjuncts.contains(&&decimal_like),
+            "the DECIMAL LIKE must be carried RAW so the Exasol dialect can render it: \
+             {declined}"
+        );
+    }
+
+    /// The partition is TOTAL and DISJOINT over the side-local conjuncts in every
+    /// shape — all accepted, all declined, mixed — and it FAILS CLOSED: whenever the
+    /// leg half is absent the declined half carries every conjunct, so a predicate is
+    /// never dropped from both halves (that would return wrong rows, where a residual
+    /// conjunct is merely slower).
+    #[test]
+    fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
+        let date_like = like_over("O_ORDERDATE", "ORDERS", "1995%");
+        let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
+        let mixed = and_of(vec![
+            date_like.clone(),
+            decimal_like.clone(),
+            orders_local_rendering_conjunct(),
+        ]);
+        let cases = [
+            (
+                "all accepted",
+                and_of(vec![date_like, orders_local_rendering_conjunct()]),
+            ),
+            (
+                "all declined",
+                and_of(vec![decimal_like.clone(), orders_local_declined_conjunct()]),
+            ),
+            ("mixed", mixed.clone()),
+        ];
+
+        for (label, filter) in cases {
+            let input = conjunct_count(Some(&filter));
+            let (leg, declined) = type_screened_leg_filter(&filter, &orders_col_types());
+            assert_eq!(
+                conjunct_count(leg.as_ref()) + conjunct_count(declined.as_ref()),
+                input,
+                "{label}: every conjunct must land in exactly one half — none dropped, \
+                 none double-applied"
+            );
+            if leg.is_none() {
+                assert_eq!(
+                    conjunct_count(declined.as_ref()),
+                    input,
+                    "{label}: fail closed — with no leg half the declined half must carry \
+                     the WHOLE side-local set"
+                );
+            }
+        }
+
+        let (leg, declined) = type_screened_leg_filter(&mixed, &orders_col_types());
+        let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
+            .expect("the rewritten accepted set must render for DataFusion");
+        assert!(
+            leg_sql.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && !leg_sql.contains("O_CUSTKEY"),
+            "one type-declining conjunct must not forfeit its side's other pushable \
+             conjuncts: {leg_sql}"
+        );
+        assert_eq!(
+            declined,
+            Some(decimal_like),
+            "the declined half must be exactly the type-declined conjunct, RAW"
+        );
+    }
+
+    /// A conjunct the type pipeline ACCEPTS but the DataFusion dialect cannot render
+    /// lands in the DECLINED half in RAW form, never dropped from both: the leg renders
+    /// the REWRITTEN tree, so that is the tree whose renderability decides the
+    /// partition. `SECOND(CAST(<DECIMAL col> AS VARCHAR), 3)` is exactly that shape —
+    /// the decimal pass rewrites the cast, and the two-argument `SECOND` arity is one
+    /// the DataFusion dialect refuses.
+    #[test]
+    fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
+        let col_types = customer_col_types();
+        let filter = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
+                {"type": "function_scalar_cast", "name": "CAST",
+                 "dataType": {"type": "VARCHAR", "size": 40},
+                 "arguments": [
+                     {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]},
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        });
+
+        let rewritten = apply_type_rewrites(&filter, &col_types)
+            .expect("precondition: the type pipeline ACCEPTS this tree");
+        assert!(
+            rewritten.to_string().contains("decimal_to_varchar_exasol"),
+            "precondition: the pipeline REWRITES the DECIMAL stringification: {rewritten}"
+        );
+        assert!(
+            !datafusion_renderable(&rewritten),
+            "precondition: the REWRITTEN tree still does not render for DataFusion"
+        );
+
+        let (leg, declined) = type_screened_leg_filter(&filter, &col_types);
+
+        assert!(
+            leg.is_none(),
+            "a rewrite the DataFusion dialect cannot render must not reach the leg: {leg:?}"
+        );
+        assert_eq!(
+            declined,
+            Some(filter),
+            "it must reach the outer wrapper RAW — with the plain CAST, not the \
+             DataFusion-only rewrite the Exasol dialect has no node for"
+        );
+    }
+
+    /// The N-scan path has NO disjoint-column-name precondition, so each side is
+    /// screened against ITS OWN `col_types`: the same bare `SHARED_KEY` LIKE is
+    /// accepted (and CAST) on the side declaring it `DATE` and declined on the side
+    /// declaring it `DECIMAL`. A shared union would resolve one name to two types and
+    /// screen at least one side against the wrong one.
+    #[test]
+    fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
+        let request = serde_json::json!({
+            "involvedTables": [
+                {"name": "DATED", "columns": [
+                    {"name": "SHARED_KEY", "dataType": {"type": "date"}}]},
+                {"name": "NUMBERED", "columns": [
+                    {"name": "SHARED_KEY",
+                     "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+            ]
+        });
+        let filter = like_over("SHARED_KEY", "DATED", "1995%");
+
+        let (date_leg, date_declined) =
+            type_screened_leg_filter(&filter, &involved_table_columns(&request, "DATED"));
+        let date_sql = render_df_filter_safe(
+            &date_leg.expect("the DATE side accepts the LIKE through the CAST rewrite"),
+        )
+        .expect("the CAST-rewrapped LIKE renders for DataFusion");
+        assert!(
+            date_sql.contains(r#"CAST("SHARED_KEY" AS VARCHAR)"#),
+            "the DATE side must push the CAST-rewritten LIKE into its leg: {date_sql}"
+        );
+        assert!(
+            date_declined.is_none(),
+            "the DATE side declines nothing: {date_declined:?}"
+        );
+
+        let (numeric_leg, numeric_declined) =
+            type_screened_leg_filter(&filter, &involved_table_columns(&request, "NUMBERED"));
+        assert!(
+            numeric_leg.is_none(),
+            "the DECIMAL side has no safe rewrite, so nothing may reach its leg: \
+             {numeric_leg:?}"
+        );
+        assert_eq!(
+            numeric_declined,
+            Some(filter),
+            "the DECIMAL side must hand the SAME conjunct to the outer wrapper RAW"
+        );
+    }
+
     /// The fallback projection is narrowed to the columns the outer wrapper
     /// references for a side — SELECT list + join condition + WHERE — preserving
     /// the full-column order/type, and dropping columns referenced nowhere.
@@ -757,6 +1395,63 @@ mod tests {
         assert_eq!(
             narrowed, full,
             "an absent select list ⇒ SELECT *, keep every column"
+        );
+    }
+
+    /// A narrowing that selects no column of this side keeps the FULL column set —
+    /// `referenced_side_columns` never emits a zero-column fan-out leg. That full-set
+    /// fallback is its own policy; `referenced_column_projection` falls back to only
+    /// the first column instead, and the two MUST stay divergent.
+    #[test]
+    fn referenced_side_columns_keeps_all_when_narrowing_empty() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        });
+        let condition = equi_condition();
+        let full = vec![
+            ("L_ORDERKEY".to_string(), "DECIMAL(20,0)".to_string()),
+            ("L_QUANTITY".to_string(), "DECIMAL(18,2)".to_string()),
+        ];
+        let narrowed = referenced_side_columns(&pushdown_req, &condition, "LINEITEM", &full);
+        assert_eq!(
+            narrowed, full,
+            "no clause references a LINEITEM column ⇒ keep every column rather than \
+             emit a zero-column leg"
+        );
+    }
+
+    /// The two column collectors MUST keep their divergent case folding:
+    /// `collect_all_column_names` folds with Unicode `to_uppercase`,
+    /// `collect_side_column_names` with ASCII-only `to_ascii_uppercase`. `ß` is the
+    /// witness — Unicode folds it to `SS`, ASCII leaves it untouched. No other test in
+    /// this crate uses a non-ASCII identifier, so without this test reconciling the two
+    /// folds (which sharing one clause walk invites) would change behavior while the
+    /// whole suite still passed.
+    #[test]
+    fn column_collectors_keep_divergent_case_folding() {
+        let expr = serde_json::json!({
+            "type": "column", "name": "straße", "tableName": "CUSTOMER",
+        });
+
+        let mut unicode_folded = std::collections::HashSet::new();
+        collect_all_column_names(&expr, &mut unicode_folded);
+        assert_eq!(
+            unicode_folded,
+            std::collections::HashSet::from(["STRASSE".to_string()]),
+            "collect_all_column_names folds ß to SS via Unicode to_uppercase"
+        );
+
+        let mut ascii_folded = std::collections::HashSet::new();
+        collect_side_column_names(&expr, "CUSTOMER", &mut ascii_folded);
+        assert_eq!(
+            ascii_folded,
+            std::collections::HashSet::from(["STRAßE".to_string()]),
+            "collect_side_column_names leaves ß untouched via to_ascii_uppercase"
+        );
+
+        assert_ne!(
+            unicode_folded, ascii_folded,
+            "the two folds are NOT interchangeable and MUST NOT be unified"
         );
     }
 

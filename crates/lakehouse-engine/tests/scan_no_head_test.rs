@@ -40,7 +40,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageProps,
+    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -243,15 +244,15 @@ impl ObjectStore for CountingHeadStore {
 
 /// Storage props are never dialed for a local `file://` scan; a placeholder keeps
 /// the spec well-formed.
-fn dummy_storage() -> StorageProps {
-    StorageProps {
+fn dummy_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
         region: "us-east-1".into(),
         access_key: "k".into(),
         secret_key: "s".into(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Build a raw-scan `ScanSpec` over `files` (already `(path, size)` shaped) with

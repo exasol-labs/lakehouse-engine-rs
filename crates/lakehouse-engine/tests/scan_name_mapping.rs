@@ -32,7 +32,8 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -94,15 +95,15 @@ impl UdfContext for FakeCtx {
 
 /// Storage props are never dialed for a local `file://` scan; a placeholder
 /// keeps the spec well-formed (copied from `scan_no_head_test.rs`).
-fn dummy_storage() -> StorageProps {
-    StorageProps {
+fn dummy_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
         region: "us-east-1".into(),
         access_key: "k".into(),
         secret_key: "s".into(),
         allow_http: true,
         ..Default::default()
-    }
+    })
 }
 
 /// Write a local Parquet at `dir/relative` with two Int64 columns

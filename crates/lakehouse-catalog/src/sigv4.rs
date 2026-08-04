@@ -1,13 +1,15 @@
-/// SigV4 request-signing helper for AWS Glue catalog REST requests.
-///
-/// Signs a `reqwest::Request` with an AWS SigV4 `Authorization` header.
-///
-/// Credential safety guarantees:
-///   - `aws_credential_types::Credentials` redacts `secret_access_key` in its `Debug`
-///     impl ("** redacted **") — the test `credentials_debug_redacts_secret` verifies this.
-///   - This module never stores raw key material in any struct. Keys are accepted as
-///     short-lived `&str` function parameters and are handed directly to the signing library.
-///   - `SigningError` from aws-sigv4 carries no credential fields.
+//! SigV4 request-signing helper for AWS Glue catalog REST requests.
+//!
+//! Signs a `reqwest::Request` with an AWS SigV4 `Authorization` header. This is the
+//! signing mechanism behind `iceberg_io`'s authenticated GET and `namespace`'s signed
+//! enumeration; crate-private by design.
+//!
+//! Credential safety guarantees:
+//!   - `aws_credential_types::Credentials` redacts `secret_access_key` in its `Debug`
+//!     impl ("** redacted **") — the test `credentials_debug_redacts_secret` verifies this.
+//!   - This module never stores raw key material in any struct. Keys are accepted as
+//!     short-lived `&str` function parameters and are handed directly to the signing library.
+//!   - `SigningError` from aws-sigv4 carries no credential fields.
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SigningError, SigningSettings, sign,
@@ -22,7 +24,11 @@ use std::time::SystemTime;
 /// and — when a session token is present — an `x-amz-security-token` header.
 ///
 /// Signing keys are never stored, logged, or embedded in any error message.
-pub fn sign_request(
+///
+/// Crate-private: signing is a mechanism of this crate's catalog and storage
+/// access, never a service it offers outward. Keeping it inside the crate also
+/// keeps `aws_sigv4`'s `SigningError` off the public surface.
+pub(crate) fn sign_request(
     mut request: reqwest::Request,
     access_key: &str,
     secret_key: &str,

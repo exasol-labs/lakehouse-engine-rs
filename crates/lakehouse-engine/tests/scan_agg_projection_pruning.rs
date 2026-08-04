@@ -35,7 +35,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use lakehouse_engine::scan::spec::{
-    AggKind, AggregatePlan, CommonScanSpec, FileEntry, ScanSpec, StorageProps,
+    AggKind, AggregatePlan, CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_alias_items, build_grouped_partial_agg_sql, build_partial_agg_sql_filtered,
@@ -94,14 +94,14 @@ fn agg_spec(file_url: String) -> ScanSpec {
         .len();
     ScanSpec {
         common: CommonScanSpec {
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],

@@ -40,7 +40,9 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
-use lakehouse_engine::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{
+    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+};
 use lakehouse_engine::scan::{
     build_scan_runtime, read_scan_spec, run_raw_scan_with_session, run_scan_one,
     session_config_for_spec,
@@ -149,14 +151,14 @@ fn spec_for_file(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -196,14 +198,14 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
             projection: vec!["CATEGORY".into()],
             distinct: true,
             emit_exa_types: vec!["VARCHAR(2000000)".into()],
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             df_batch_size: 64,
             ..Default::default()
         },

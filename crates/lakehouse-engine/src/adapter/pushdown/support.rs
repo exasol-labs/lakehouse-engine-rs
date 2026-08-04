@@ -14,9 +14,10 @@ use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
 };
+use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use vs_expression::render_expression_safe;
+use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 /// The registered SQL name of the scan SCALAR EMIT UDF entry point.
 pub(super) const SCAN_UDF_NAME: &str = "LAKEHOUSE_SCAN";
@@ -81,6 +82,11 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
 /// `aggregate_types` holds the Exasol-declared result type of each aggregate (from
 /// `aggregate_exasol_types`); the single-group merge casts each item to its declared
 /// type. Pass `&[]` to emit uncast merge items (row scans never read it).
+///
+/// `request_limit` is the RAW request limit, distinct from `limit` (which the
+/// row-scan sub-path renders unchanged). It is consumed ONLY by the aggregate
+/// sub-path: `LIMIT n` on a guaranteed one-row merge is a no-op for `n >= 1` and
+/// correct for `n = 0`. The row-scan sub-path ignores it entirely.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -88,6 +94,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
+    request_limit: Option<u64>,
     col_types: &[(String, String)],
     aggregate_types: &[String],
     udf_name: &str,
@@ -100,6 +107,7 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
             aggregates,
             col_types,
             aggregate_types,
+            request_limit,
             udf_name,
             distribute_udf_name,
         )
@@ -195,6 +203,12 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
 /// The EMITS clause names and types follow the COLUMN CONTRACT defined in
 /// `crate::scan::build_partial_agg_sql`.  The outer merge SELECT consumes those
 /// exact column names.
+///
+/// `request_limit` renders as a trailing `LIMIT n` on the outer merge SELECT when
+/// `Some(n)` — a no-op over the guaranteed one-row merge for `n >= 1`, correct for
+/// `n = 0` (issue #198: a pushed `LIMIT 0` must return zero rows, not be silently
+/// dropped because the aggregate sub-path had no limit value to render before this
+/// parameter existed).
 #[allow(clippy::too_many_arguments)]
 fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -202,6 +216,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
     aggregate_types: &[String],
+    request_limit: Option<u64>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
@@ -217,7 +232,11 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     // those partials equals the single-node aggregate (result-equivalence, [7]).
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
-    format!("SELECT {merge_select} FROM ({fan_out})")
+    let mut sql = format!("SELECT {merge_select} FROM ({fan_out})");
+    if let Some(n) = request_limit {
+        sql.push_str(&format!(" LIMIT {n}"));
+    }
+    sql
 }
 
 /// Build the outer wrapper SQL for a lone single-group `COUNT(DISTINCT ...)` — Case 1
@@ -236,7 +255,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 /// "emitting function in expression").
 ///
 /// LIMIT/OFFSET/ORDER BY are NEVER pushed into the distinct fan-out (leaking one would
-/// truncate the per-shard distinct set → a wrong count); the caller-guarded `limit` is
+/// truncate the per-shard distinct set → a wrong count); the request's raw `limit` is
 /// applied only to the outer wrapper. The native `COUNT(DISTINCT "V")` yields exactly
 /// the type Exasol declares for a `COUNT(DISTINCT)`, so the count needs no output cast.
 ///
@@ -413,12 +432,20 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     )
 }
 
-/// Extract all columns and their Exasol types from the first involved table.
-pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
+/// The `(folded name, Exasol type)` columns of ONE involved table of `request`.
+///
+/// The ONE `col_types` builder: it owns the `involvedTables` walk, the `name`/`dataType`
+/// read, and the [`exasol_type_from_json`] mapping. An absent `involvedTables`, a table
+/// `select_table` does not select, and absent `columns` each yield an empty vec; a column
+/// missing either `name` or `dataType` is skipped.
+pub(super) fn column_types(
+    request: &Json,
+    select_table: impl FnOnce(&[Json]) -> Option<&Json>,
+) -> Vec<(String, String)> {
     request
         .get("involvedTables")
         .and_then(|v| v.as_array())
-        .and_then(|tables| tables.first())
+        .and_then(|tables| select_table(tables))
         .and_then(|t| t.get("columns"))
         .and_then(|c| c.as_array())
         .map(|cols| {
@@ -433,6 +460,128 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
         .unwrap_or_default()
 }
 
+/// Extract all columns and their Exasol types from the first involved table.
+pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
+    column_types(request, |tables: &[Json]| tables.first())
+}
+
+/// Deep-clone `expr` with every `tableAlias` key removed, so the reused
+/// `vs-expression` translator renders BARE column names.
+///
+/// Exasol stamps EVERY `column` node with the query's `tableAlias` as soon as the
+/// `FROM` aliases the table (`FROM fact_orders o` yields `tableAlias: "O"` on every
+/// column, even one written unqualified), and the translator emits `"ALIAS"."NAME"`
+/// whenever `tableAlias` is present. Every scan this adapter drives is a
+/// SINGLE-relation scan whose relation exposes BARE uppercase column names, so an
+/// alias-qualified reference does not resolve against it (`No field named
+/// "O"."O_ORDERDATE"`). Both such callers therefore strip first: the single-table
+/// pushdown chokepoint in `handle_pushdown` (issue #193) and the per-side join
+/// fan-out leg (`build_side_fan_out_sql`).
+///
+/// This is a CALLER-side concern, not a translator default: the join outer wrapper
+/// deliberately re-qualifies each column to its own subquery alias
+/// (`annotate_columns_with_alias`), which overwrites any `tableAlias` a caller left
+/// in place — so stripping upstream of it is harmless there too.
+///
+/// `tableName` is left intact (the translator ignores it; join conjunct attribution
+/// and the wrapper's re-qualification both read it, and both run on `tableName`
+/// alone).
+pub(super) fn strip_table_alias(expr: &Json) -> Json {
+    match expr {
+        Json::Object(map) => Json::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "tableAlias")
+                .map(|(key, value)| (key.clone(), strip_table_alias(value)))
+                .collect(),
+        ),
+        Json::Array(items) => Json::Array(items.iter().map(strip_table_alias).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Answers whether the DataFusion dialect can express `expr` as a scan-spec
+/// filter.
+///
+/// A predicate this returns `false` for cannot be pushed into the
+/// DataFusion-in-UDF scan spec; the caller MUST self-apply it in the adapter's
+/// own returned SQL instead, never omit it (no Exasol-side fallback — see
+/// CLAUDE.md § "Virtual Schema pushdown delegation"). A trivially-true
+/// predicate (renders to `TRUE`/`NULL`) answers `true`: omitting a no-op
+/// predicate is correct, not a decline.
+pub(super) fn datafusion_renderable(expr: &Json) -> bool {
+    render_expression_safe(expr).is_some()
+}
+
+/// The expression-grammar fields whose value is an ARRAY of child expressions.
+/// Curated deliberately — see [`rewrite_expr_tree`].
+const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
+
+/// The expression-grammar fields whose value is a SINGLE child expression.
+/// Curated deliberately — see [`rewrite_expr_tree`].
+const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
+
+/// Rewrite an Exasol pushdown expression tree bottom-up: at every node each curated
+/// child is rewritten FIRST, then `f` is applied to that node with its
+/// already-rewritten children in place.
+///
+/// The single owner of the traversal the type-aware guards share; each of them
+/// supplies only its per-node decision as `f`.
+///
+/// ## Post-order is load-bearing
+///
+/// A guard's own check sees rewritten children, which is what makes a NESTED
+/// occurrence reachable: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`, so a
+/// check inspecting only the outer node's direct arguments would never reach the
+/// inner ones. It is also what stops a double rewrite at the outer level — an inner
+/// argument already coerced is no longer a bare column when the outer check runs.
+///
+/// ## A decline propagates to the root
+///
+/// `f` returning `None` declines the WHOLE tree, not just the declining subtree: the
+/// `None` travels out through every enclosing level via `?`. That mirrors the
+/// all-or-nothing untranslatable-predicate backstop — the whole filter or the whole
+/// select-list item is declined. This is NOT a case where Exasol safely evaluates the
+/// decline natively — the caller must itself self-apply the declined filter (or fall
+/// back to the base row for a select-list item). An INFALLIBLE rewriter composes as
+/// the never-declining case: with a statically always-`Some` `f` the result is always
+/// `Some`, so such a caller keeps its `-> Json` signature by unwrapping with a
+/// fallback rather than a panic.
+///
+/// ## Why the field list is curated
+///
+/// [`EXPR_ARRAY_FIELDS`] and [`EXPR_SINGLE_FIELDS`] enumerate this grammar's
+/// child-bearing fields by hand instead of walking every map value. A blind walk
+/// would descend into a node's object-valued `dataType` sub-object (e.g.
+/// `{"type":"VARCHAR"}`) and hand it to `f` as if it were an expression, letting a
+/// guard rewrite a declared type. `name` is excluded too, though for a different
+/// reason: it always carries a bare identifier string in this grammar, never an
+/// object, so keeping it off the curated list keeps identifiers unrewritable.
+/// Widening the reach therefore means adding a field to one of the two consts, which
+/// all callers inherit.
+///
+/// Child shapes are matched as the grammar sends them: an array field is descended
+/// into only when it really is a `Json::Array`, a single-child field only when the
+/// child is an object. A leaf — a literal, a `column`, any non-object node — has no
+/// curated children and is handed straight to `f`.
+fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<Json> {
+    let mut out = node.clone();
+    for field in EXPR_ARRAY_FIELDS {
+        if let Some(Json::Array(children)) = node.get(field) {
+            let rewritten: Option<Vec<Json>> =
+                children.iter().map(|c| rewrite_expr_tree(c, f)).collect();
+            out[field] = Json::Array(rewritten?);
+        }
+    }
+    for field in EXPR_SINGLE_FIELDS {
+        if let Some(child) = node.get(field)
+            && child.is_object()
+        {
+            out[field] = rewrite_expr_tree(child, f)?;
+        }
+    }
+    f(&out)
+}
+
 /// Make a pushed-down `LIKE` / `REGEXP_LIKE` filter type-safe for the DataFusion
 /// scan, using the column-type map from [`extract_all_column_types`].
 ///
@@ -445,18 +594,30 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
 /// decision belongs in the adapter, not in the stateless (and sibling-shared)
 /// `vs-expression` translator (decision-log [1]).
 ///
-/// Walks the filter tree through the only node types that can nest a
-/// `predicate_like`/`predicate_like_regexp` in this codebase's expression grammar —
-/// `predicate_and` / `predicate_or` (children under `expressions`) and
-/// `predicate_not` (child under `expression`). A `LIKE` reachable only through some
-/// other node (e.g. buried in a `function_scalar_case` inside the filter) is out of
-/// scope, matching the single-table scope of this fix; it renders as before and is
-/// the pre-existing risk. Any node that is neither a junction nor a `LIKE` is
-/// returned unchanged — this guard only inspects `LIKE` subjects.
+/// Walks the filter tree through [`rewrite_expr_tree`], the same post-order primitive
+/// [`string_function_arg_type_guard`] and [`rewrite_decimal_stringifications`] run on:
+/// every curated child under [`EXPR_ARRAY_FIELDS`]/[`EXPR_SINGLE_FIELDS`] is visited,
+/// not only the `predicate_and`/`predicate_or`/`predicate_not` junctions a narrower,
+/// pre-migration traversal used to stop at. A `predicate_like` buried inside a
+/// `function_scalar_case`, under a comparison predicate's `left`/`right`, or inside a
+/// scalar function's `arguments` is now reached the same as one sitting directly
+/// under a junction — the #207 blind spot that narrower traversal left open is
+/// closed. Any node that is not itself a `predicate_like`/`predicate_like_regexp` is
+/// returned unchanged by the closure below; this guard only inspects `LIKE` subjects.
+///
+/// Widening the reach widens the decline trade [`guard_like_subject`] already made,
+/// in two different directions depending on why it declines. Where the subject's
+/// Exasol type RESOLVES to a non-string type, a `LIKE` newly reached by this wider
+/// traversal used to hard-fail the DataFusion scan outright (`There isn't a common
+/// type to coerce <Type> and Utf8 in LIKE expression`) and now declines to native
+/// Exasol evaluation instead — strictly a fix, never a cost. Where the subject's
+/// column NAME does not resolve in `col_types` (a lookup miss, fail-safe decline), a
+/// `LIKE` that previously rendered unguarded — because the narrower traversal never
+/// reached it — may now decline a filter that would have pushed down and worked:
+/// slower, never wrong.
 ///
 /// At each `predicate_like` / `predicate_like_regexp` whose `expression` (subject)
-/// is a bare `column` node, the subject name is uppercased (mirroring
-/// [`extract_all_column_types`]'s uppercasing convention) and looked up in
+/// is a bare `column` node, the subject name is uppercased and looked up in
 /// `col_types`, then dispatched:
 ///
 /// | Exasol type | Action |
@@ -474,44 +635,66 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
 /// Exasol's default; an altered session format is an accepted tracked exception
 /// (#216, decision-log [8]).
 ///
+/// ## Descending into a `LIKE` node's own children is inert
+///
+/// [`rewrite_expr_tree`] is post-order, so a `LIKE` node's `expression` (subject) and
+/// `pattern` are rewritten BEFORE the node itself is dispatched to
+/// [`guard_like_subject`]. That descent cannot disturb the dispatch: the per-node
+/// closure acts on the two `LIKE` node types and clones everything else, so a bare
+/// `column` subject (and a literal pattern) comes back as the same value and
+/// [`guard_like_subject`] sees exactly the node it would have seen without the
+/// descent. The `function_scalar_cast` the DATE arm wraps the subject in is
+/// synthesized by the closure itself, after the descent is finished, so the traversal
+/// never revisits it and cannot double-wrap it.
+///
+/// Skipping a NON-object child (which [`rewrite_expr_tree`] does, descending only into
+/// an object) is inert for the same reason: a non-object node has no curated child
+/// field of its own and falls to the closure's clone-everything-else arm, so
+/// descending into one would only put back the value that is already in place.
+///
 /// Returns:
 /// - `Some(tree)` — render this (possibly DATE-rewrapped) tree.
 /// - `None` — decline the WHOLE top-level filter. A decline found anywhere in the
 ///   tree propagates to the outer call, mirroring the all-or-nothing
-///   untranslatable-predicate backstop (`mod.rs:14-15`) and composing with
-///   `render_df_filter_safe`'s `None`-means-omit contract, so Exasol evaluates the
-///   predicate natively (decision-log [3]).
-pub(super) fn like_subject_type_guard(
-    filter: &Json,
-    col_types: &[(String, String)],
-) -> Option<Json> {
-    let node_type = filter.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    match node_type {
-        // Junctions: recurse into every child; a single declined child (`None`)
-        // short-circuits the whole tree via `?`.
-        "predicate_and" | "predicate_or" => {
-            let mut out = filter.clone();
-            if let Some(Json::Array(children)) = filter.get("expressions") {
-                let mut rewritten = Vec::with_capacity(children.len());
-                for child in children {
-                    rewritten.push(like_subject_type_guard(child, col_types)?);
-                }
-                out["expressions"] = Json::Array(rewritten);
-            }
-            Some(out)
-        }
-        "predicate_not" => {
-            let mut out = filter.clone();
-            if let Some(child) = filter.get("expression") {
-                out["expression"] = like_subject_type_guard(child, col_types)?;
-            }
-            Some(out)
-        }
-        "predicate_like" | "predicate_like_regexp" => guard_like_subject(filter, col_types),
-        // Any other node (predicate_equal, column, literals, …) is not a LIKE and
-        // cannot nest one in this grammar — returned unchanged.
-        _ => Some(filter.clone()),
-    }
+///   untranslatable-predicate backstop (`super`'s module header). A decline here is
+///   NOT safely deferred to Exasol — the caller must itself self-apply the declined
+///   filter (e.g. as an outer WHERE) rather than omit it (decision-log [3]).
+fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    rewrite_expr_tree(
+        filter,
+        &|out: &Json| match out.get("type").and_then(|t| t.as_str()) {
+            Some("predicate_like" | "predicate_like_regexp") => guard_like_subject(out, col_types),
+            _ => Some(out.clone()),
+        },
+    )
+}
+
+/// The Exasol type `node`'s column name resolves to in `col_types`, if any.
+///
+/// The ONE `col_types` lookup for the type-rewrite guards: read `name`, fold it with the
+/// full-Unicode `to_uppercase` to match the keys `extract_all_column_types` builds, then
+/// scan. `involved_table_columns` applies that same Unicode fold to its own keys, so this
+/// lookup's fold matches both builders' output for any column name — not a claim that the
+/// two builders' lists are the same vector, which they are not (they differ by table
+/// selection). Separately, `resolve_table_schema` Unicode-uppercases names before declaring
+/// them, so no LOWERCASE name ever reaches this lookup — a premise guarded by
+/// `non_ascii_table_and_column_stay_queryable`. Non-ASCII letters can still reach it (e.g.
+/// `über` uppercases to `ÜBER`, not to an ASCII form); `to_uppercase` is idempotent, so the
+/// name is already a fixed point regardless of whether it happens to be ASCII. `None` means
+/// the type is not resolvable — the node carries no `name`, or its folded name is absent
+/// from the list — two cases every caller already treats identically.
+///
+/// Deliberately does NOT test `node`'s `type` tag. A non-`column` node is a PASS-THROUGH
+/// for [`guard_like_subject`] and [`coerce_string_position_arg`] but an unresolvable type
+/// is a DECLINE, so absorbing the tag test here would turn every literal and computed
+/// argument into a decline. Each caller keeps its own tag test and its own meaning for a
+/// `None`.
+fn column_exa_type<'t>(node: &Json, col_types: &'t [(String, String)]) -> Option<&'t str> {
+    let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
+    col_types
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, t)| t.as_str())
 }
 
 /// Type-check and, if needed, rewrite a single `predicate_like` /
@@ -529,40 +712,409 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
     }
     let subject = subject.expect("is_bare_column implies expression is present");
 
-    // Uppercase the subject name before lookup, matching `extract_all_column_types`'s
-    // uppercasing (`support.rs:411`). A nameless column is unresolvable → fail-safe
-    // decline.
-    let name = subject
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_uppercase())?;
-    let exa_type = col_types
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, t)| t.as_str());
-
-    match exa_type {
+    match column_exa_type(subject, col_types).map(classify_exa_type) {
         // String subject: DataFusion coerces it natively — leave unchanged.
-        Some(t) if t.starts_with("VARCHAR") || t.starts_with("CHAR") => Some(like_node.clone()),
-        // DATE: rewrap the subject as CAST(<col> AS VARCHAR). `render_cast_target`'s
-        // DataFusion arm renders `{"type":"VARCHAR"}` as bare `VARCHAR` (no length),
-        // yielding `CAST(<col> AS VARCHAR)`; DataFusion's Date32→Utf8 cast is
-        // `YYYY-MM-DD`.
-        Some("DATE") => {
+        Some(ExaTypeClass::Character) => Some(like_node.clone()),
+        // DATE: rewrap the subject as CAST(<col> AS VARCHAR); DataFusion's Date32→Utf8
+        // cast is `YYYY-MM-DD`.
+        Some(ExaTypeClass::Date) => {
             let mut out = like_node.clone();
-            out["expression"] = serde_json::json!({
-                "type": "function_scalar_cast",
-                "name": "CAST",
-                "dataType": {"type": "VARCHAR"},
-                "arguments": [subject.clone()],
-            });
+            out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
         // Every other non-string type (DECIMAL incl. integer DECIMAL(p,0), DOUBLE,
-        // BOOLEAN, TIMESTAMP, …) and a lookup miss decline the WHOLE filter: DataFusion's
+        // BOOLEAN, TIMESTAMP, …) and an unresolvable type decline the WHOLE filter: DataFusion's
         // formatting of these to string diverges from Exasol's, so a native-eval
         // fallback is safer than a silently-wrong or hard-failing cast (decision-log [2]).
-        _ => None,
+        Some(ExaTypeClass::Decimal | ExaTypeClass::Other) | None => None,
+    }
+}
+
+/// Rewrite every place a bare DECIMAL column is DIRECTLY stringified into a
+/// `decimal_to_varchar_exasol` node wrapping that column, so the rendered SQL
+/// reproduces Exasol's shortest-form DECIMAL→string conversion (trailing scale
+/// zeros trimmed) instead of DataFusion's fixed-declared-scale rendering
+/// (issue #211).
+///
+/// Exasol trims trailing scale zeros when converting a DECIMAL to string
+/// (`2912.00`→`'2912'`); DataFusion's `CAST(decimal AS VARCHAR)` and its implicit
+/// decimal→utf8 coercion (used by `CONCAT`/`||` and `LENGTH`) both render the full
+/// declared scale — a silent wrong-result divergence. A DECIMAL column carries no
+/// `dataType` on an expression node (types live only in
+/// `involvedTables[0].columns`), so this type-aware rewrite belongs in the adapter,
+/// not in the stateless `vs-expression` translator (mirrors [`like_subject_type_guard`]).
+///
+/// The three stringifier shapes rewritten (using the `col_types` map from
+/// [`extract_all_column_types`]) are, when the DIRECT argument is a bare DECIMAL
+/// column:
+///
+/// - `CAST(<decimal column> AS VARCHAR|CHAR)` — the WHOLE cast node is replaced with
+///   `{"type":"decimal_to_varchar_exasol","arguments":[<column>]}` (the synthesized
+///   node already produces the correct VARCHAR-typed trimmed string, so it is NOT
+///   nested inside the original CAST).
+/// - `CONCAT(...)` — each argument that is a bare DECIMAL column is replaced with a
+///   `decimal_to_varchar_exasol`-wrapping node; every other argument is left as-is.
+/// - `LENGTH(<decimal column>)` — its single argument is wrapped, same as CONCAT.
+///
+/// A DECIMAL column in ANY other context (arithmetic, comparison, `CAST` to a
+/// non-string target, a `LIKE` subject, etc.) is left untouched, and a
+/// non-DECIMAL column argument (or a computed-expression argument, whose type is
+/// not resolvable from `col_types`) is left untouched — the latter a tracked
+/// exception in the spec.
+///
+/// ## Post-order recursion is load-bearing
+///
+/// The traversal is [`rewrite_expr_tree`]: children are rewritten FIRST (post-order),
+/// then the node's own stringifier check runs as that primitive's per-node closure.
+/// Post-order is what makes NESTED occurrences reachable: Exasol encodes `a||b||c`
+/// as NESTED `CONCAT(a, CONCAT(b, c))` (confirmed live for
+/// `id||'-'||c_decimal_a`), so a rewriter inspecting only the OUTER `CONCAT`'s direct
+/// arguments would never reach `c_decimal_a` (a direct argument only of the INNER
+/// `CONCAT`). [`rewrite_expr_tree`] walks every field in [`EXPR_ARRAY_FIELDS`] and
+/// [`EXPR_SINGLE_FIELDS`] — this codebase's curated child-bearing fields — so a
+/// stringifier buried arbitrarily deep (inside a `CASE` branch, inside a logical
+/// connective, inside another `CONCAT`) is still found and rewritten.
+///
+/// Reached via [`apply_type_rewrites`] — the one pipeline function that runs this
+/// pass as the third step of its three-pass order for every caller — and is this
+/// pass's only PRODUCTION caller (the pass corpus in `mod tests` calls it directly).
+///
+/// The closure passed to [`rewrite_expr_tree`] is statically always-`Some` — it has
+/// no decline path, only unconditional per-node-type rewrites — so `rewrite_expr_tree`
+/// can never actually return `None` here. The `.unwrap_or_else` below is therefore an
+/// unreachable-in-practice fallback kept only to compose with `rewrite_expr_tree`'s
+/// `Option`-returning signature, not a real decline path; it deliberately falls back
+/// to a clone rather than panicking, so a change that somehow broke the invariant
+/// would degrade to a no-op rewrite instead of taking down query planning.
+fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)]) -> Json {
+    rewrite_expr_tree(node, &|out: &Json| {
+        // With children already rewritten (by `rewrite_expr_tree`'s post-order
+        // traversal), check whether THIS node is one of the three stringifier shapes
+        // over a (still-)bare DECIMAL column argument.
+        let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        Some(match node_type {
+            "function_scalar_cast" => {
+                let target_is_string = out
+                    .get("dataType")
+                    .and_then(|d| d.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.to_uppercase())
+                    .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
+                if target_is_string
+                    && let Some(Json::Array(args)) = out.get("arguments")
+                    && let [arg] = args.as_slice()
+                    && is_bare_decimal_column(arg, col_types)
+                {
+                    // Replace the WHOLE cast node — `decimal_to_varchar_exasol` already
+                    // yields the correct VARCHAR-typed trimmed string; do not re-nest it
+                    // inside the original CAST.
+                    return Some(wrap_decimal_to_varchar(arg));
+                }
+                out.clone()
+            }
+            "function_scalar" => {
+                let fn_name = out
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+                let mut out = out.clone();
+                // CONCAT and LENGTH both implicitly stringify each DECIMAL argument.
+                // Per-argument replacement: wrap only the bare DECIMAL columns, leave
+                // literals, non-DECIMAL columns, and already-recursed nested nodes as-is.
+                if (fn_name == "CONCAT" || fn_name == "LENGTH")
+                    && let Some(Json::Array(args)) = out.get("arguments")
+                {
+                    let rewritten: Vec<Json> = args
+                        .iter()
+                        .map(|a| {
+                            if is_bare_decimal_column(a, col_types) {
+                                wrap_decimal_to_varchar(a)
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect();
+                    out["arguments"] = Json::Array(rewritten);
+                }
+                out
+            }
+            // Any other node type (comparison predicate, arithmetic function, CAST to a
+            // non-string target, …): return the children-rewritten node unchanged. A bare
+            // DECIMAL column that is a direct argument here is NOT wrapped — this is what
+            // keeps `c_decimal_a > 5` and `CAST(c_decimal_a AS DOUBLE)` untouched.
+            _ => out.clone(),
+        })
+    })
+    .unwrap_or_else(|| node.clone())
+}
+
+/// Whether `node` is a bare `column` node whose (uppercased) name resolves in
+/// `col_types` to [`ExaTypeClass::Decimal`]. Integer columns are wire-encoded as
+/// `DECIMAL(p,0)`, which also classifies as `Decimal` (harmless: the trim is a
+/// no-op on a scale-0 value).
+fn is_bare_decimal_column(node: &Json, col_types: &[(String, String)]) -> bool {
+    if node.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return false;
+    }
+    matches!(
+        column_exa_type(node, col_types).map(classify_exa_type),
+        Some(ExaTypeClass::Decimal)
+    )
+}
+
+/// Wrap a (bare-column) node in the adapter-synthesized `decimal_to_varchar_exasol`
+/// node that `vs-expression`'s `render_expression_inner` renders via
+/// `format_decimal_exasol_style`. This node is NEVER sent by Exasol on the wire — it
+/// only ever appears because this rewriter synthesizes it.
+fn wrap_decimal_to_varchar(column: &Json) -> Json {
+    serde_json::json!({
+        "type": "decimal_to_varchar_exasol",
+        "arguments": [column.clone()],
+    })
+}
+
+/// Wrap a node in an explicit `CAST(<node> AS VARCHAR)` (`function_scalar_cast`).
+/// `render_cast_target`'s DataFusion arm renders `{"type":"VARCHAR"}` as bare
+/// `VARCHAR` (no length), yielding `CAST(<node> AS VARCHAR)`. Shared by
+/// [`guard_like_subject`] and [`coerce_string_position_arg`] so both DATE branches are
+/// provably identical.
+fn wrap_cast_to_varchar(node: &Json) -> Json {
+    serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "dataType": {"type": "VARCHAR"},
+        "arguments": [node.clone()],
+    })
+}
+
+/// Which arguments of an Exasol string function carry a STRING value — the ones
+/// Exasol implicitly converts to VARCHAR before evaluating, and which therefore have
+/// to be type-dispatched before the DataFusion scan sees them (issue #210). Returned
+/// by [`string_position_args`].
+#[derive(Debug, PartialEq, Eq)]
+enum StringPositionArgs {
+    /// Not a governed string function: the caller leaves the node unchanged and NEVER
+    /// declines on it. Covers `CHR` / `UNICODECHR` (their single argument is a genuine
+    /// integer codepoint) and every non-string function.
+    NotGoverned,
+    /// The string-position argument indices, every one guaranteed `< arg_count`.
+    Coerce(Vec<usize>),
+    /// Decline the whole tree: this function at this arity is not rendered faithfully.
+    Decline,
+}
+
+/// Resolve which of a string function's arguments are string positions, from its name
+/// and arity alone — a pure table, with no column types involved (those are
+/// [`coerce_string_position_arg`]'s job).
+///
+/// | Function | String-position indices |
+/// |----------|-------------------------|
+/// | `CONCAT`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `TRANSLATE` | all of `0..arg_count` |
+/// | `LOWER`, `UPPER`, `ASCII`, `INITCAP`, `REVERSE`, `LENGTH`, `OCTET_LENGTH`, `UNICODE`, `SUBSTR`, `REPEAT`, `LEFT`, `RIGHT` | `[0]` — every further argument is a genuine number (a start offset, a length, a repeat count) |
+/// | `LPAD`, `RPAD` | `[0, 2]` when the optional pad STRING is present, else `[0]` — never the numeric length at index 1 |
+/// | `INSTR`, `LOCATE` | `[0, 1]`, clamped to the arity, at two or fewer arguments; [`StringPositionArgs::Decline`] beyond two |
+/// | `CHR`, `UNICODECHR`, anything else | [`StringPositionArgs::NotGoverned`] |
+///
+/// `fn_name` is uppercased before matching. Every returned index is filtered to
+/// `< arg_count`, so a caller may index `arguments` with it directly.
+///
+/// `INSTR` / `LOCATE` beyond two arguments DECLINE unconditionally on argument type,
+/// and that branch must not be "simplified" into a `Coerce(vec![0, 1])`:
+/// `vs-expression`'s `INSTR` / `LOCATE` arms
+/// (`crates/vs-expression/src/lib.rs:741-772`) read only `args[0]` / `args[1]` and
+/// silently drop the third and fourth, so coercing index 0 would let a TRUNCATED
+/// rendering plan successfully and return a position computed from offset 1 — a
+/// silently wrong answer, where today there is a loud DataFusion planning error
+/// (tracked as issue #228). Declining keeps those calls on native Exasol evaluation.
+///
+/// `LOCATE`'s argument REORDER does not affect this table: Exasol's
+/// `LOCATE(substring, string)` renders as `strpos(string, substring)`
+/// (`crates/vs-expression/src/lib.rs:757-772`), but that swap happens at RENDER time,
+/// after this dispatch — both of its indices are string positions either way.
+fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
+    let coerce_in_range = |indices: Vec<usize>| {
+        StringPositionArgs::Coerce(indices.into_iter().filter(|i| *i < arg_count).collect())
+    };
+    match fn_name.to_uppercase().as_str() {
+        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => {
+            coerce_in_range((0..arg_count).collect())
+        }
+        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
+        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => coerce_in_range(vec![0]),
+        "LPAD" | "RPAD" if arg_count > 2 => coerce_in_range(vec![0, 2]),
+        "LPAD" | "RPAD" => coerce_in_range(vec![0]),
+        "INSTR" | "LOCATE" if arg_count > 2 => StringPositionArgs::Decline,
+        "INSTR" | "LOCATE" => coerce_in_range(vec![0, 1]),
+        _ => StringPositionArgs::NotGoverned,
+    }
+}
+
+/// Make every pushed-down Exasol string function type-safe for the DataFusion scan,
+/// using the column-type map from [`extract_all_column_types`] (issue #210).
+///
+/// Exasol implicitly converts a numeric or DATE string-function argument to VARCHAR
+/// before evaluating; DataFusion refuses and the scan dies at PLAN time, so each
+/// string-position argument ([`string_position_args`] decides which those are) is
+/// dispatched on its Exasol type by [`coerce_string_position_arg`] before rendering.
+///
+/// The traversal is the same [`rewrite_expr_tree`] primitive
+/// [`rewrite_decimal_stringifications`] runs on, so both share one owner for the
+/// post-order-plus-curated-field-list traversal. Both halves earn their keep:
+/// post-order is what coerces the INNER call of a nested `UPPER(TRIM(<decimal
+/// column>))` before the outer check runs (which then sees a non-column argument and
+/// cannot re-wrap it), and the broad field list is what reaches a string function
+/// under a COMPARISON predicate — `UPPER(c) = 'X'` is a `predicate_equal` with the
+/// function under `left`, the shape issue #210's WHERE-clause repro takes.
+///
+/// Returns:
+/// - `Some(tree)` — render this (possibly coerced) tree.
+/// - `None` — decline. A decline anywhere in the tree propagates to the outer call
+///   through `?`, mirroring [`like_subject_type_guard`]: the WHOLE filter or the
+///   WHOLE select-list item is declined. This decline is NOT safely deferred to
+///   Exasol — the caller must itself self-apply the declined filter (or fall back to
+///   the base row for a select-list item) rather than omit it. A `NotGoverned` node
+///   never declines, whatever its arguments' types.
+///
+/// Runs BEFORE [`rewrite_decimal_stringifications`] in [`apply_type_rewrites`], the
+/// one pipeline function that chains the two and is the sole enforcer of that
+/// ordering: a coerced argument is no longer a bare column, so the decimal rewriter
+/// no-ops on it instead of double-wrapping.
+fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    rewrite_expr_tree(node, &|out: &Json| {
+        // With children already guarded (by `rewrite_expr_tree`'s post-order
+        // traversal), dispatch THIS node's own string-position arguments. Only a
+        // `function_scalar` can be a string function; every other node type passes
+        // through unchanged.
+        if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
+            return Some(out.clone());
+        }
+        // `fn_name` is passed un-uppercased: `string_position_args` uppercases it itself.
+        let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let arg_count = out
+            .get("arguments")
+            .and_then(|a| a.as_array())
+            .map_or(0, |a| a.len());
+        match string_position_args(fn_name, arg_count) {
+            // Not a governed string function: leave it alone WITHOUT declining, even over a
+            // non-coercible argument — `CHR`/`UNICODECHR` take a genuine integer codepoint.
+            StringPositionArgs::NotGoverned => Some(out.clone()),
+            // An arity `vs-expression` renders incompletely (#228) — decline it rather than
+            // push a truncated rendering.
+            StringPositionArgs::Decline => None,
+            StringPositionArgs::Coerce(indices) => {
+                // Every index is clamped to `arg_count` by `string_position_args`, so a
+                // non-empty `indices` implies `out["arguments"]` exists as an array —
+                // indexing it here can never synthesize a missing field.
+                let mut out = out.clone();
+                for i in indices {
+                    let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
+                    out["arguments"][i] = coerced;
+                }
+                Some(out)
+            }
+        }
+    })
+}
+
+/// Type-dispatch ONE string-position argument:
+///
+/// | Exasol type | Action |
+/// |-------------|--------|
+/// | `VARCHAR…` / `CHAR…` | unchanged — DataFusion needs no help with a string |
+/// | `DATE` | `CAST(<col> AS VARCHAR)`, i.e. `YYYY-MM-DD` in both engines' defaults |
+/// | `DECIMAL…` (incl. integer `DECIMAL(p,0)`) | #211's trimmed `decimal_to_varchar_exasol` |
+/// | any other resolvable type, or a lookup miss | `None` — decline, fail-safe |
+///
+/// A non-`column` argument (a literal, a computed expression) is returned UNCHANGED:
+/// its type is not resolvable from `col_types`, a tracked exception (#223) that must not
+/// decline.
+fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
+        return Some(arg.clone());
+    }
+    match column_exa_type(arg, col_types).map(classify_exa_type) {
+        Some(ExaTypeClass::Character) => Some(arg.clone()),
+        Some(ExaTypeClass::Date) => Some(wrap_cast_to_varchar(arg)),
+        Some(ExaTypeClass::Decimal) => Some(wrap_decimal_to_varchar(arg)),
+        // BOOLEAN, DOUBLE PRECISION, TIMESTAMP, … and an unresolvable type all decline: their
+        // text forms diverge between the two engines, so a cast would convert a crash
+        // into a wrong answer (same reasoning as `guard_like_subject`).
+        Some(ExaTypeClass::Other) | None => None,
+    }
+}
+
+/// Run the ordered type-rewrite pass sequence over a JSON expression tree, before it
+/// is rendered or projected for the DataFusion scan: [`like_subject_type_guard`] →
+/// [`string_function_arg_type_guard`] → [`rewrite_decimal_stringifications`]. One
+/// ordered pass list serves every caller, whether the tree is a whole filter or a
+/// single select-list item.
+///
+/// - [`like_subject_type_guard`] (issue #207): may decline the whole tree, or rewrap
+///   a DATE subject.
+/// - [`string_function_arg_type_guard`] (issue #210): coerces string-position
+///   arguments, or declines.
+/// - [`rewrite_decimal_stringifications`] (issue #211): runs last, never declines.
+///
+/// The string-function guard MUST run BEFORE the decimal rewrite, not after: a
+/// coerced argument is no longer a bare column, so the decimal rewriter no-ops on it
+/// instead of double-wrapping it into two trim wrappers — see
+/// [`string_function_arg_type_guard`]'s doc for the full argument.
+///
+/// The three passes disagree on fallibility — the first two decline via `Option`,
+/// the decimal rewrite never declines — so this function is also the fallibility
+/// bridge: `?` propagates either guard's decline, and the infallible decimal pass's
+/// plain `Json` return is wrapped in `Some`, sparing every caller from re-deriving
+/// that bridge itself.
+///
+/// Returns:
+/// - `Some(tree)` — this (possibly rewritten) tree is safe to render or project.
+/// - `None` — a guard declined somewhere in the tree; the caller decides what a
+///   decline means for its own render surface.
+pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    let expr = like_subject_type_guard(expr, col_types)?;
+    let expr = string_function_arg_type_guard(&expr, col_types)?;
+    Some(rewrite_decimal_stringifications(&expr, col_types))
+}
+
+/// The SOLE owner of "a tree the DataFusion scan may be handed": one
+/// [`apply_type_rewrites`] pass AND renderability established on the tree that pass
+/// produced. `Some(tree)` is that pushable tree; `None` means either half rejected it
+/// — a guard declined, or the rewritten tree does not render.
+///
+/// Renderability is checked on the REWRITTEN tree, never the raw one, because the
+/// rewritten tree is what a scan spec carries: screening the raw tree would let a
+/// type-accepted-but-unrenderable tree pass the screen, then vanish when
+/// [`render_df_filter_safe`] silently dropped it — pushed nowhere, which returns wrong
+/// rows.
+///
+/// Every push decision asks this one function, whole-filter
+/// ([`classify_where_filter`]) or per-conjunct
+/// ([`type_screened_leg_filter`](super::joins::rendering::type_screened_leg_filter)),
+/// so adding a pipeline pass or changing which renderability check gates a push is a
+/// one-site edit instead of two surfaces that can silently disagree. What a `None`
+/// MEANS stays each caller's own decision: decline the whole surface, or route that
+/// one conjunct into a residual `WHERE`.
+pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
+    apply_type_rewrites(expr, col_types).filter(datafusion_renderable)
+}
+
+/// Splits a request's raw WHERE filter into the predicate the scan spec carries and
+/// the predicate the adapter must self-apply. Returns `(scan_filter, declined)`,
+/// mutually exclusive; both `None` for no filter or a trivially-true one. Sole owner
+/// of this classification (see `_decision/045`), while the acceptance predicate
+/// underneath it belongs to [`type_accepted_rewrite`]. `declined` is the original,
+/// un-rewritten tree — the type rewrites target the DataFusion dialect only.
+pub(super) fn classify_where_filter<'a>(
+    filter_json_raw: Option<&'a Json>,
+    col_types: &[(String, String)],
+) -> (Option<String>, Option<&'a Json>) {
+    match (
+        filter_json_raw,
+        filter_json_raw.and_then(|f| type_accepted_rewrite(f, col_types)),
+    ) {
+        (Some(raw), None) => (None, Some(raw)),
+        (_, tree) => (tree.as_ref().and_then(render_df_filter_safe), None),
     }
 }
 
@@ -578,10 +1130,14 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
 /// column set so Exasol can post-process the expression, GROUP BY, and aggregate —
 /// correctness over pushdown. The returned projection is positional: exactly one
 /// item per select-list item, in select-list order.
+///
+/// The third element is the widening signal: `true` means the derived projection is
+/// the full base row, NOT one item per select-list item, so every consumer that owes
+/// Exasol a select-list-shaped result must route the request elsewhere (#196).
 pub(super) fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     project_columns(pushdown_req, extract_all_column_types(request))
 }
 
@@ -602,10 +1158,21 @@ fn is_valid_emits_output_type(ty: &str) -> bool {
 /// logic here lets the join path reuse it verbatim — a projected column's EMITS
 /// type is looked up in whichever side owns it, with no bespoke join code — while
 /// the single-table path is unchanged.
+///
+/// The third element is the widening signal: `true` means the derived projection is
+/// the full base row, NOT one item per select-list item — a select-list item was
+/// untranslatable, EMITS-rejected, or a node type this function deliberately keeps
+/// off the projection (an aggregate), so the whole select list widened. It is the
+/// producer's own decision, piped out verbatim rather than re-derived downstream by
+/// comparing the projection's arity against the select list's: the two coincide
+/// whenever the base table happens to have as many columns as the query selects
+/// (#196). A `None`/empty/non-array select list is NOT a widening — the full base row
+/// is the correct answer there, and `false` keeps a genuine `SELECT *` on the scan
+/// path.
 pub(super) fn project_columns(
     pushdown_req: &Json,
     all_cols: Vec<(String, String)>,
-) -> Result<(Vec<ProjectionItem>, Vec<String>), UdfError> {
+) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
     if all_cols.is_empty() {
         return Err(UdfError::User(
             "pushdown request has no column metadata".into(),
@@ -634,6 +1201,14 @@ pub(super) fn project_columns(
         (names, types)
     };
 
+    // If any item can't be projected as-is (untranslatable scalar, EMITS-rejected
+    // declared type, or an aggregate/unknown node), we can't emit a per-item
+    // projection — repeating `first_col_name` would yield duplicate EMITS names.
+    // Instead project the full base row so Exasol has every column to post-process
+    // the expression, GROUP BY, and aggregate itself. Declared out here, not inside
+    // the select-list arm, because it is also this function's third return value —
+    // the widening signal its callers route on (#196).
+    let mut needs_full_fallback = false;
     let select_list = pushdown_req.get("selectList");
     let (proj_names, proj_types): (Vec<ProjectionItem>, Vec<String>) = match select_list {
         None | Some(Json::Null) => full_row(),
@@ -651,16 +1226,23 @@ pub(super) fn project_columns(
                 .and_then(|v| v.as_array());
             let mut names = Vec::with_capacity(list.len());
             let mut types = Vec::with_capacity(list.len());
-            // If any item can't be projected as-is (untranslatable scalar, or an
-            // aggregate/unknown node), we can't emit a per-item projection — repeating
-            // `first_col_name` would yield duplicate EMITS names. Instead project the
-            // full base row so Exasol has every column to post-process the expression,
-            // GROUP BY, and aggregate itself.
-            let mut needs_full_fallback = false;
             for (i, e) in list.iter().enumerate() {
                 let declared_type = declared_types
                     .and_then(|d| d.get(i))
                     .map(exasol_type_from_json);
+                // On `None` the item can't be
+                // safely pushed down at all; fall back to the full base row for the
+                // whole select list, like every other "untranslatable item" arm below.
+                // `project_columns` has THREE callers — `extract_projection`
+                // (single-table), `extract_join_projection` (`joins/rendering.rs`,
+                // whose `col_types` is the UNION of both joined tables' columns), and
+                // `joins/mod.rs`'s empty-side path — so this decline reaches the
+                // broadcast-join SELECT list too, not just the single-table path.
+                let Some(e) = apply_type_rewrites(e, &all_cols) else {
+                    needs_full_fallback = true;
+                    continue;
+                };
+                let e = &e;
                 let item_type = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match item_type {
                     "column" => {
@@ -701,8 +1283,20 @@ pub(super) fn project_columns(
                             }
                         }
                     }
+                    // This arm must list every remaining node type `render_expression_safe`
+                    // renders that isn't already handled by an earlier arm in this match,
+                    // EXCEPT `function_aggregate` — an aggregate must reach the aggregate
+                    // planner, not be evaluated per shard as a projection item — and
+                    // `predicate_greater` / `predicate_greaterequal`, which are unreachable
+                    // here: Exasol normalises `a > b` to `b < a` (`capabilities.rs:29-30`),
+                    // so a select-list `>` already arrives as `predicate_less` (#196).
                     "function_scalar"
                     | "function_scalar_cast"
+                    // A `function_scalar_cast` of a bare DECIMAL column to VARCHAR/CHAR
+                    // is rewritten above into a TOP-LEVEL `decimal_to_varchar_exasol`
+                    // node; it must dispatch to the SAME `render_expression_safe` branch
+                    // rather than falling into the `_ =>` full-row fallback (issue #211).
+                    | "decimal_to_varchar_exasol"
                     | "function_scalar_extract"
                     | "function_scalar_case"
                     | "predicate_equal"
@@ -711,7 +1305,13 @@ pub(super) fn project_columns(
                     | "predicate_like"
                     | "predicate_and"
                     | "predicate_or"
-                    | "predicate_not" => {
+                    | "predicate_not"
+                    | "predicate_in_constlist"
+                    | "predicate_between"
+                    | "predicate_is_null"
+                    | "predicate_is_not_null"
+                    | "predicate_notequal"
+                    | "predicate_like_regexp" => {
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
@@ -748,7 +1348,67 @@ pub(super) fn project_columns(
         _ => full_row(),
     };
 
-    Ok((proj_names, proj_types))
+    Ok((proj_names, proj_types, needs_full_fallback))
+}
+
+/// Walk every `column` node reachable from `expr`, invoking `f` once per node found.
+///
+/// Owns both the recursion and the `type == "column"` test because every current
+/// caller acts only on `column` nodes — pushing that test back into each caller's
+/// closure would just relocate one duplication into three smaller ones. Traversal
+/// is blind (every object field, every array element) rather than schema-aware,
+/// because a collect rebuilds nothing: blind descent is what reaches a column
+/// buried inside a `CASE` or a function call, and it is safe precisely because
+/// nothing here reconstructs the tree. This MUST NOT be merged with issue #257's
+/// curated post-order rewrite primitive — that primitive edits the tree in place
+/// and so cannot blindly descend into a node's own `dataType`/`name` sub-objects,
+/// which a rewrite must leave untouched but a collect may safely enter.
+///
+/// Case folding is deliberately NOT owned here — each callback applies its own, and the
+/// current callers deliberately disagree: `collect_all_column_names` below folds with
+/// Unicode `to_uppercase`, while `column_tables` and `collect_side_column_names`
+/// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
+/// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
+/// under ASCII — and that divergence is pinned by `column_collectors_keep_divergent_case_folding`
+/// in `joins/rendering.rs`, which feeds `straße` through `collect_all_column_names` and
+/// `collect_side_column_names` and asserts they diverge (`STRASSE` vs `STRAßE`).
+pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
+    match expr {
+        Json::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("column") {
+                f(map);
+            }
+            for v in map.values() {
+                walk_column_nodes(v, &mut *f);
+            }
+        }
+        Json::Array(items) => {
+            for item in items {
+                walk_column_nodes(item, &mut *f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively collect every bare-column reference's UPPERCASE name found anywhere
+/// within `value` into `names` — walking arrays, objects, and nested `expression`
+/// wrappers alike, so it works uniformly over a `selectList`, a `filter`/`having`
+/// expression tree, or a `groupBy`/`orderBy` array for both of this function's
+/// callers (the topn hidden-column path and the join wrapper's column projection).
+/// Walking every nested field, not just top-level entries, matters because a column
+/// can be buried inside a function call or operator — e.g. `SUM(CASE WHEN
+/// region='R' THEN 1 END)` — and a missed nested reference would leave the inner
+/// scan without a column the wrapper's rendered SQL names.
+pub(super) fn collect_all_column_names(
+    value: &Json,
+    names: &mut std::collections::HashSet<String>,
+) {
+    walk_column_nodes(value, &mut |map| {
+        if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
+            names.insert(name.to_uppercase());
+        }
+    });
 }
 
 /// Extract LIMIT from the pushdown request.
@@ -757,6 +1417,38 @@ pub(super) fn extract_limit(pushdown_req: &Json) -> Option<u64> {
         .get("limit")
         .and_then(|l| l.get("numElements"))
         .and_then(|n| n.as_u64())
+}
+
+/// Extract the OFFSET from the pushdown request; 0 when absent.
+///
+/// Exasol sends `limit.offset` only once `LIMIT_WITH_OFFSET` is advertised, and
+/// normalises an explicit `OFFSET 0` away entirely — so an absent key and a zero
+/// offset are the same request (verified live). Sibling of [`extract_limit`]
+/// rather than a widened return type: most call sites need the limit alone.
+pub(super) fn extract_offset(pushdown_req: &Json) -> u64 {
+    pushdown_req
+        .get("limit")
+        .and_then(|l| l.get("offset"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0)
+}
+
+/// Render the trailing window clause for a wrapper SELECT: the single seam every
+/// site that renders a final `LIMIT` shares.
+///
+/// A zero offset renders the pre-offset ` LIMIT {n}` string byte-for-byte, so an
+/// already-correct plan cannot change shape. Callers must render their own
+/// `ORDER BY` ahead of this: Exasol's grammar rejects an `OFFSET` without one.
+///
+/// The `(None, _)` arm silently drops a non-zero offset with no limit; this is
+/// unreachable in production — Exasol's grammar ties `OFFSET` to a `LIMIT` (fact 4),
+/// so a bare offset without one is rejected before it ever reaches this function.
+pub(super) fn render_limit_offset(limit: Option<u64>, offset: u64) -> String {
+    match (limit, offset) {
+        (None, _) => String::new(),
+        (Some(n), 0) => format!(" LIMIT {n}"),
+        (Some(n), m) => format!(" LIMIT {n} OFFSET {m}"),
+    }
 }
 
 /// Whether the pushdown request carries a non-empty `orderBy` array.
@@ -772,89 +1464,6 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .get("orderBy")
         .and_then(|v| v.as_array())
         .is_some_and(|a| !a.is_empty())
-}
-
-/// Exasol's maximum CHAR width. A wider declaration is rejected outright:
-/// `CAST('a' AS CHAR(2001))` fails live with "specified length too long for char
-/// type - maximum is 2000". So a CHAR `size` is capped here rather than reusing
-/// VARCHAR's 2,000,000 ceiling.
-const EXASOL_CHAR_MAX_SIZE: u64 = 2000;
-
-/// Exasol's maximum VARCHAR width.
-const EXASOL_VARCHAR_MAX_SIZE: u64 = 2000000;
-
-/// The character-set suffix a CHAR/VARCHAR declaration needs, `" ASCII"` or `""`.
-///
-/// Exasol treats an unsuffixed character declaration as UTF8, so a column it
-/// declared `ASCII` must carry the suffix back or its type check reports a "Data
-/// type mismatch" (issue #136 follow-up). Shared by the CHAR and VARCHAR arms:
-/// the rule must be identical for both, and a second copy would drift (issue #52).
-fn character_set_suffix(dt: &Json) -> &'static str {
-    let is_ascii = dt
-        .get("characterSet")
-        .and_then(|v| v.as_str())
-        .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-    if is_ascii { " ASCII" } else { "" }
-}
-
-/// Derive an Exasol type string from the VS column dataType JSON.
-pub(super) fn exasol_type_from_json(dt: &Json) -> String {
-    let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
-    match type_name.to_lowercase().as_str() {
-        "boolean" => "BOOLEAN".to_string(),
-        "decimal" => {
-            let p = dt.get("precision").and_then(|v| v.as_u64()).unwrap_or(18);
-            let s = dt.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
-            if p <= 36 && s <= 36 {
-                format!("DECIMAL({p},{s})")
-            } else {
-                "VARCHAR(2000000)".to_string()
-            }
-        }
-        "double" => "DOUBLE PRECISION".to_string(),
-        "date" => "DATE".to_string(),
-        "timestamp" => {
-            let with_local_time_zone = dt
-                .get("withLocalTimeZone")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if with_local_time_zone {
-                "TIMESTAMP WITH LOCAL TIME ZONE".to_string()
-            } else {
-                "TIMESTAMP".to_string()
-            }
-        }
-        "char" => {
-            // A genuine CHAR must stay CHAR: Exasol validates the pushdown output
-            // column type positionally, and it declares an equal-length CASE, a bare
-            // string literal, and an explicit CAST-to-CHAR as CHAR(n) — rendering
-            // those VARCHAR(n) is rejected with "Data type mismatch" (issue #192).
-            //
-            // An absent `size` is unreachable from a real Exasol `dataType` — but if
-            // it occurred, it must NOT default to the maximum width: `CHAR(2000)`
-            // would blank-pad every value of that column to 2,000 characters, the
-            // most damaging default available. Instead fall back to the project's
-            // "unknown width" convention (`VARCHAR(2000000)`), matching
-            // `vs-expression`'s `render_cast_target` Exasol CHAR arm. The
-            // `EXASOL_CHAR_MAX_SIZE` cap applies only to a PRESENT `size`.
-            match dt.get("size").and_then(|v| v.as_u64()) {
-                Some(size) => {
-                    let capped = size.min(EXASOL_CHAR_MAX_SIZE);
-                    format!("CHAR({capped}){}", character_set_suffix(dt))
-                }
-                None => format!("VARCHAR({EXASOL_VARCHAR_MAX_SIZE})"),
-            }
-        }
-        _ => {
-            // VARCHAR and all others.
-            let size = dt
-                .get("size")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(EXASOL_VARCHAR_MAX_SIZE);
-            let capped = size.min(EXASOL_VARCHAR_MAX_SIZE);
-            format!("VARCHAR({capped}){}", character_set_suffix(dt))
-        }
-    }
 }
 
 /// Resolve the Exasol-declared type of each aggregate select-list item, in order.
@@ -893,9 +1502,18 @@ pub(super) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Redact credential-shaped values from a catalog error message.
-pub(super) fn redact_catalog_error(msg: &str) -> String {
-    crate::scan::emit::redact_credentials(msg)
+/// Wrap `expr` in `CAST(... AS <declared>)` unless `declared` is absent or the
+/// `VARCHAR(2000000)` default, so a pushdown output column's type matches what
+/// Exasol validates positionally against `selectListDataTypes`. `VARCHAR(2000000)`
+/// is exempt because it is the catch-all `crate::types::mapping` returns for any
+/// Arrow type it cannot map (see `mapping.rs:22-28`), so its presence signals "no
+/// usable declared type" rather than a type Exasol actually declared, and casting
+/// to it would mislabel the value.
+pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> String {
+    match declared {
+        Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
+        _ => expr.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -905,88 +1523,197 @@ mod tests {
     use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
     use vs_expression::render_df_filter_safe;
 
-    /// `exasol_type_from_json` must read the `withLocalTimeZone` flag back off a
-    /// `{"type":"timestamp", ...}` dataType JSON (the shape Exasol echoes back in
-    /// `involvedTables[].columns[].dataType` for a VS column declared via
-    /// `exasol_type_to_json`), not just the bare `"type"` string — otherwise a
-    /// TIMESTAMP WITH LOCAL TIME ZONE column round-trips back into the pushdown
-    /// path as plain TIMESTAMP and Exasol rejects the EMITS type mismatch.
+    /// `walk_column_nodes` fires its callback exactly once per `column` node
+    /// wherever one is nested — inside a function's `arguments` array, a `CASE`'s
+    /// `results`, a comparison predicate's `left`/`right`, and even a `column`
+    /// node's own child object — and never for a non-`column` object, a scalar,
+    /// or an array node itself.
     #[test]
-    fn exasol_type_from_json_reads_with_local_time_zone_flag() {
-        let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
+    fn walk_column_nodes_visits_every_nested_column_node_once() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "PLUS",
+            "arguments": [
+                {"type": "column", "name": "A", "tableName": "T"},
+                {"type": "literal_exactnumeric", "value": 1}
+            ],
+            "case": {
+                "type": "case",
+                "results": [
+                    {"type": "column", "name": "B"},
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            },
+            "predicate": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C"},
+                "right": {
+                    "type": "column",
+                    "name": "D",
+                    "nested": {"type": "column", "name": "E"}
+                }
+            }
+        });
+
+        let mut visited = Vec::new();
+        walk_column_nodes(&expr, &mut |map| {
+            visited.push(
+                map.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        });
+        visited.sort();
+
         assert_eq!(
-            exasol_type_from_json(&tstz),
-            "TIMESTAMP WITH LOCAL TIME ZONE"
+            visited,
+            vec!["A", "B", "C", "D", "E"],
+            "every column node must fire exactly once, including one nested inside another column node"
+        );
+    }
+
+    /// `walk_column_nodes` never invokes its callback for a non-container root —
+    /// `Json::Null`, a scalar string, or a scalar number fall through the `_ => {}`
+    /// arm untouched, and an empty object matches `Json::Object` but has no `type`
+    /// key and no values to recurse into, so it is a no-op too. Production hands
+    /// the primitive exactly such roots unguarded: `referenced_column_projection`
+    /// (`joins/sql_builders.rs`) and `referenced_side_columns` (`rendering.rs`)
+    /// pass `pushdown_req.get("groupBy")` / `get("orderBy")` / `get("selectList")`
+    /// straight through with no `is_null()` guard.
+    #[test]
+    fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
+        let mut invocations: usize = 0;
+
+        walk_column_nodes(&serde_json::Value::Null, &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!("REGION"), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!(7), &mut |_| invocations += 1);
+        walk_column_nodes(&serde_json::json!({}), &mut |_| invocations += 1);
+
+        assert_eq!(
+            invocations, 0,
+            "a null, scalar, or empty-object root must be a no-op: groupBy/orderBy/selectList reach walk_column_nodes unguarded"
+        );
+    }
+
+    /// `strip_table_alias` removes every `tableAlias` key at any nesting depth
+    /// (issue #193) while preserving `tableName` and `name`, recursing through
+    /// both nested objects and arrays.
+    #[test]
+    fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "PLUS",
+            "tableAlias": "O",
+            "arguments": [
+                {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
+                {"type": "literal_exactnumeric", "value": 1}
+            ]
+        });
+
+        let stripped = strip_table_alias(&expr);
+
+        assert_eq!(
+            stripped,
+            serde_json::json!({
+                "type": "function_scalar",
+                "name": "PLUS",
+                "arguments": [
+                    {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS"},
+                    {"type": "literal_exactnumeric", "value": 1}
+                ]
+            }),
+            "every tableAlias key must be gone at every depth, while name/tableName survive"
+        );
+    }
+
+    /// A predicate the DataFusion dialect can express answers `true`.
+    #[test]
+    fn datafusion_renderable_true_for_a_rendering_predicate() {
+        let expr = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "AGE"},
+            "right": {"type": "literal_exactnumeric", "value": 18}
+        });
+
+        assert!(datafusion_renderable(&expr));
+    }
+
+    /// `SECOND(ts, 3)` is a DataFusion field-shortcut arity refusal (exactly 1
+    /// argument permitted) — the dialect-asymmetric decline this plan's fix
+    /// exists to self-apply rather than silently omit.
+    #[test]
+    fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
+        let expr = serde_json::json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "arguments": [
+                {"type": "column", "name": "TS"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+
+        assert!(!datafusion_renderable(&expr));
+    }
+
+    /// A trivially-true `TRUE` literal answers `true`: `render_expression_safe`
+    /// does not suppress it, so omitting it from the scan spec is a correct
+    /// no-op, not a decline.
+    #[test]
+    fn datafusion_renderable_true_for_trivially_true_literal() {
+        let expr = serde_json::json!({"type": "literal_bool", "value": true});
+
+        assert!(datafusion_renderable(&expr));
+    }
+
+    /// `strip_table_alias` must not change the decline/accept answer:
+    /// `handle_pushdown` screens the un-stripped tree while the N-scan leg
+    /// renders the `tableAlias`-stripped one, and both must agree. Covers both
+    /// directions: a predicate that declines under both dialects (below), and
+    /// one that RENDERS under both (below) — the safety-critical direction,
+    /// since `build_side_fan_out_sql` strips the alias and re-renders AFTER
+    /// `renderable_only` screened the un-stripped tree, so a conjunct whose
+    /// answer flipped `true` -> `false` under stripping would be silently
+    /// dropped from the leg.
+    #[test]
+    fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
+        let with_alias = serde_json::json!({
+            "type": "function_scalar",
+            "name": "SECOND",
+            "tableAlias": "O",
+            "arguments": [
+                {"type": "column", "name": "TS", "tableName": "T", "tableAlias": "O"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        });
+        let stripped = strip_table_alias(&with_alias);
+
+        assert_eq!(
+            datafusion_renderable(&with_alias),
+            datafusion_renderable(&stripped),
+            "stripping tableAlias must not change whether the DataFusion dialect accepts the predicate"
+        );
+        assert!(
+            !datafusion_renderable(&stripped),
+            "SECOND(ts, 3) must still decline once table-alias-stripped"
         );
 
-        let ts = serde_json::json!({"type": "timestamp"});
-        assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
-    }
+        let renders_with_alias = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "TS", "tableName": "T", "tableAlias": "O"},
+            "right": {"type": "literal_exactnumeric", "value": 1}
+        });
+        let renders_stripped = strip_table_alias(&renders_with_alias);
 
-    /// `exasol_type_from_json` must read the `characterSet` field back off a
-    /// `{"type":"varchar", ...}` dataType JSON (Exasol's wire format for CHAR/VARCHAR
-    /// select-list items, e.g. `{"type":"CHAR","size":3,"characterSet":"ASCII"}` as
-    /// confirmed by `vs-expression`'s `renders_cast_char_as_datafusion_varchar` test) and append
-    /// `" ASCII"` when it is `"ASCII"` (case-insensitively) — otherwise a CASE/literal
-    /// expression Exasol declares as `VARCHAR(n) ASCII` round-trips back through our
-    /// EMITS clause as bare `VARCHAR(n)`, which Exasol's type checker treats as
-    /// `VARCHAR(n) UTF8` by default, causing a "Data type mismatch" pushdown error
-    /// (issue #136 follow-up).
-    #[test]
-    fn exasol_type_from_json_propagates_ascii_character_set() {
-        let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
-        assert_eq!(exasol_type_from_json(&ascii), "VARCHAR(4) ASCII");
-
-        let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
-        assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
-    }
-
-    /// `exasol_type_from_json` must render a genuine `{"type":"CHAR", ...}` dataType
-    /// JSON as `CHAR(n)` — not fall through to the catch-all's `VARCHAR(n)` the way
-    /// current code does. An equal-length CASE expression (e.g. `CASE WHEN ... THEN
-    /// 'NEG' ELSE 'POS' END`) round-trips back through this function as `CHAR(3)
-    /// ASCII`; rendering it `VARCHAR(3) ASCII` instead causes Exasol's type checker
-    /// to reject the pushdown with "Data type mismatch" (issue #192).
-    #[test]
-    fn exasol_type_from_json_renders_char_type() {
-        let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
-        assert_eq!(exasol_type_from_json(&ascii), "CHAR(3) ASCII");
-    }
-
-    /// The CHAR arm must mirror VARCHAR's `characterSet` handling exactly: append
-    /// `" ASCII"` only when `characterSet` is `"ASCII"` (case-insensitively), and
-    /// render a bare `CHAR(n)` (no suffix) for `"UTF8"` or when `characterSet` is
-    /// absent — e.g. `CAST(c_phone AS CHAR(20))`, which Exasol declares `CHAR(20)
-    /// UTF8` (live-verified), must round-trip as bare `CHAR(20)`.
-    #[test]
-    fn exasol_type_from_json_propagates_char_ascii_character_set() {
-        let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
-        assert_eq!(exasol_type_from_json(&utf8), "CHAR(20)");
-
-        let no_charset = serde_json::json!({"type": "CHAR", "size": 20});
-        assert_eq!(exasol_type_from_json(&no_charset), "CHAR(20)");
-    }
-
-    /// Exasol rejects a CHAR declaration above 2,000 characters
-    /// (`CAST('a' AS CHAR(2001))` fails live with "specified length too long for
-    /// char type - maximum is 2000"), so the CHAR arm must cap `size` at 2,000 —
-    /// unlike VARCHAR's 2,000,000 cap.
-    #[test]
-    fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
-        let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
-        assert_eq!(exasol_type_from_json(&oversized), "CHAR(2000)");
-    }
-
-    /// An absent `size` on a CHAR `dataType` is unreachable from a real Exasol
-    /// request, but if it occurred the CHAR arm must not silently default to
-    /// the *maximum* width (`CHAR(2000)`, which blank-pads every value to
-    /// 2,000 characters) — it must fall back to the project's "unknown width"
-    /// convention, matching `vs-expression`'s `render_cast_target` Exasol CHAR
-    /// arm.
-    #[test]
-    fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
-        let no_size = serde_json::json!({"type": "CHAR"});
-        assert_eq!(exasol_type_from_json(&no_size), "VARCHAR(2000000)");
+        assert_eq!(
+            datafusion_renderable(&renders_with_alias),
+            datafusion_renderable(&renders_stripped),
+            "stripping tableAlias must not change whether a RENDERING predicate is still accepted"
+        );
+        assert!(
+            datafusion_renderable(&renders_stripped),
+            "TS > 1 must still render once table-alias-stripped"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1087,6 +1814,7 @@ mod tests {
             &shards,
             &[ProjectionItem::Column("ID".into())],
             &["DECIMAL(20,0)".to_string()],
+            None,
             None,
             &[],
             &[],
@@ -1457,7 +2185,8 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // Scenario: Filter predicate is pushed into the scan spec (translatable) or
-    // omitted (untranslatable) — never mistranslated.
+    // kept out of it (untranslatable) — never mistranslated, never omitted from
+    // the query.
     // ---------------------------------------------------------------------------
 
     #[test]
@@ -1484,7 +2213,9 @@ mod tests {
         );
 
         // Untranslatable predicate (e.g., an aggregate or unknown function):
-        // render_df_filter_safe returns None → omitted from spec.
+        // render_df_filter_safe returning None keeps it out of the SCAN SPEC
+        // only — the adapter must still self-apply it elsewhere (see
+        // declined_filter_routes_every_dispatch_shape_to_qualified_wrapper).
         let untranslatable = serde_json::json!({"type": "fn_custom_agg", "args": []});
         let omitted = render_df_filter_safe(&untranslatable);
         assert!(
@@ -1492,7 +2223,10 @@ mod tests {
             "untranslatable predicate must be omitted (None), not mistranslated"
         );
 
-        // Confirm omitting the filter still produces valid SQL (correctness backstop).
+        // Confirm the scan SQL stays valid without a scan-spec filter — the
+        // adapter applies the predicate itself elsewhere rather than relying
+        // on any re-check by Exasol (see
+        // declined_filter_routes_every_dispatch_shape_to_qualified_wrapper).
         let sql_no_filter = build_sql_for_fixture(
             vec!["s3://warehouse/f.parquet".into()],
             vec!["AGE".into()],
@@ -1560,6 +2294,39 @@ mod tests {
         assert_eq!(extract_limit(&req2), Some(42));
     }
 
+    /// `extract_offset` is a sibling accessor of `extract_limit`: 0 when the
+    /// `offset` key is absent (the shape Exasol sends for a bare `LIMIT n` and,
+    /// verified live, also for an explicit `OFFSET 0`), the value otherwise.
+    #[test]
+    fn offset_extracted_from_pushdown_request() {
+        assert_eq!(extract_offset(&serde_json::json!({})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 42}})),
+            0
+        );
+        assert_eq!(extract_offset(&serde_json::json!({"offset": 3})), 0);
+        assert_eq!(
+            extract_offset(&serde_json::json!({"limit": {"numElements": 12, "offset": 3}})),
+            3
+        );
+    }
+
+    /// The one rendering seam every reachable wrapper SELECT routes through.
+    /// The `offset == 0` arm MUST stay byte-identical to the pre-change
+    /// ` LIMIT {n}` splice — every existing SQL-shape assertion depends on it.
+    #[test]
+    fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
+        assert_eq!(render_limit_offset(None, 0), "");
+        assert_eq!(render_limit_offset(None, 3), "");
+
+        for n in [0_u64, 1, 12, u64::MAX] {
+            assert_eq!(render_limit_offset(Some(n), 0), format!(" LIMIT {n}"));
+        }
+
+        assert_eq!(render_limit_offset(Some(12), 3), " LIMIT 12 OFFSET 3");
+        assert_eq!(render_limit_offset(Some(0), 3), " LIMIT 0 OFFSET 3");
+    }
+
     #[test]
     fn sql_string_literal_escapes_quotes() {
         let s = "it's a test";
@@ -1600,7 +2367,7 @@ mod tests {
             ],
         });
 
-        let (names, types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (names, types, _widened) = extract_projection(&request, &pushdown_req).unwrap();
 
         let unique: std::collections::HashSet<&str> = names.iter().map(|p| p.emit_name()).collect();
         assert_eq!(
@@ -1663,6 +2430,7 @@ mod tests {
             &shards,
             &["AMOUNT".into()],
             &["DOUBLE PRECISION".to_string()],
+            None,
             None,
             &col_types,
             &[],
@@ -1830,6 +2598,7 @@ mod tests {
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
@@ -1875,11 +2644,51 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
         )
+    }
+
+    /// The aggregate merge SELECT renders `LIMIT n` on the outer wrapper when
+    /// `request_limit` is `Some(n)` — the render site issue #198 needs so a pushed
+    /// `LIMIT 0` over a one-row aggregate merge returns zero rows instead of being
+    /// silently dropped (no limit value reachable inside the aggregate sub-path
+    /// carried the request's raw limit before this parameter existed).
+    #[test]
+    fn aggregate_merge_renders_request_limit_when_some() {
+        let plans = vec![AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        }];
+        let spec_template = ScanSpec {
+            common: CommonScanSpec {
+                aggregates: Some(plans),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+        let sql = build_scan_driving_sql(
+            &spec_template,
+            &shards,
+            &[],
+            &[],
+            None,
+            Some(0),
+            &[],
+            &[],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+        );
+        assert!(
+            sql.ends_with("LIMIT 0"),
+            "aggregate merge must render the request LIMIT: {sql}"
+        );
     }
 
     /// Aggregate wrapper merges partials: outer SELECT aggregates per-shard COUNT/SUM/MIN/MAX.
@@ -2071,6 +2880,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             &col_types,
             &aggregate_types,
             SCAN_UDF_NAME,
@@ -2104,6 +2914,7 @@ mod tests {
             &shards,
             &[],
             &[],
+            None,
             None,
             &[],
             &[],
@@ -2367,6 +3178,7 @@ mod tests {
             &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
             SCAN_UDF_NAME,
             DISTRIBUTE_FILES_UDF_NAME,
+            None,
         )
         .expect("Case 2/3 qualified wrapper must build");
 
@@ -2736,6 +3548,7 @@ mod tests {
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
             None,
+            None,
             &[],
             &[],
             SCAN_UDF_NAME,
@@ -2774,6 +3587,7 @@ mod tests {
             &shards,
             &["ID".into()],
             &["DECIMAL(20,0)".to_string()],
+            None,
             None,
             &[],
             &[],
@@ -2841,7 +3655,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // The rendered expression should be carried as an Expr projection item, NOT
         // a bare Column — so the scan splices it verbatim instead of quoting it as a
         // phantom identifier.
@@ -2882,7 +3697,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -2923,7 +3739,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -2972,7 +3789,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3014,7 +3832,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // Full base row fallback: both table columns, as bare Column items —
         // not the single rendered expression.
         assert_eq!(
@@ -3045,7 +3864,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3085,7 +3905,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
 
         assert_eq!(
             proj_cols.len(),
@@ -3135,7 +3956,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, _proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, _proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3172,7 +3994,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols,
             vec![
@@ -3206,7 +4029,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         assert_eq!(
             proj_cols.len(),
             1,
@@ -3254,8 +4078,12 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, widened) = extract_projection(&request, &pushdown_req).unwrap();
 
+        assert!(
+            !widened,
+            "a CAST-to-CHAR item must not raise the full-base-row widening signal (#196)"
+        );
         assert_eq!(
             proj_cols.len(),
             2,
@@ -3293,7 +4121,8 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types) = extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, _widened) =
+            extract_projection(&request, &pushdown_req).unwrap();
         // Fall back to the first column name
         assert_eq!(proj_cols.len(), 1);
         assert_eq!(proj_cols[0], "AMOUNT");
@@ -3365,25 +4194,6 @@ mod tests {
         assert!(
             common.contains("\"filter\"") && common.contains("42"),
             "filter must be pushed into the common arg: {common}"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Task 4.3 — No credential in error text
-    // ---------------------------------------------------------------------------
-
-    /// Scenario: redact_catalog_error removes credential-shaped values from messages.
-    #[test]
-    fn redact_catalog_error_strips_credentials() {
-        let msg = "GET failed: access_key=AKID_SECRET_VALUE region=us-east-1";
-        let safe = redact_catalog_error(msg);
-        assert!(
-            !safe.contains("AKID_SECRET_VALUE"),
-            "credential value must be redacted: {safe}"
-        );
-        assert!(
-            safe.contains("access_key"),
-            "label must be preserved: {safe}"
         );
     }
 
@@ -3485,6 +4295,27 @@ mod tests {
         );
     }
 
+    /// Scenario: a `predicate_like` over a DECIMAL-typed column pins that
+    /// [`apply_type_rewrites`] declines it — matching
+    /// `like_guard_decimal_subject_declines` above, which calls the guard directly
+    /// rather than through the pipeline. This test fails if the LIKE pass is ever
+    /// dropped from the pipeline; one pipeline now serves both render surfaces.
+    #[test]
+    fn type_rewrite_pipeline_runs_like_guard() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "amount"},
+            "pattern": {"type": "literal_string", "value": "9%"}
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        assert_eq!(
+            apply_type_rewrites(&filter, &col_types),
+            None,
+            "the type-rewrite pipeline's LIKE-subject guard must decline a DECIMAL subject"
+        );
+    }
+
     /// Scenario: LIKE on an integer column declines the whole filter. Exasol has no
     /// separate wire "INTEGER" type — an integer column arrives as `DECIMAL(20,0)`
     /// (confirmed via live payload capture this session).
@@ -3583,6 +4414,136 @@ mod tests {
         );
     }
 
+    /// Route `filter` through the production classification and then through the
+    /// qualified single-table wrapper, returning the emitted SQL.
+    ///
+    /// Asserts the fixture genuinely declines before rendering: these tests are about
+    /// WHERE a declined predicate ends up, so a fixture that quietly renders would
+    /// assert nothing. The inner scan projects the whole `col_types` universe, which is
+    /// what the production decline route passes as its projection override.
+    fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) -> String {
+        let (scan_filter, declined) = classify_where_filter(Some(filter), col_types);
+        assert!(
+            scan_filter.is_none(),
+            "fixture precondition: a declining filter must never reach the scan spec: \
+             {scan_filter:?}"
+        );
+        let declined = declined.expect(
+            "fixture precondition: a declining filter must be handed back for self-applying",
+        );
+        let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
+        let pushdown_req = serde_json::json!({"filter": filter.clone()});
+        let fan_out_spec = ScanSpec {
+            common: CommonScanSpec {
+                projection: col_types
+                    .iter()
+                    .map(|(name, _)| ProjectionItem::Column(name.clone()))
+                    .collect(),
+                emit_exa_types: col_types.iter().map(|(_, ty)| ty.clone()).collect(),
+                storage: sample_storage(),
+                ..Default::default()
+            },
+            files: vec![],
+        };
+        super::super::joins::build_qualified_single_table_fallback_sql(
+            &request,
+            &pushdown_req,
+            &fan_out_spec,
+            &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            Some(declined),
+        )
+        .expect("the wrapper must render the declined predicate")
+    }
+
+    /// The declined half of `like_guard_nested_decimal_declines_whole_filter`, carried
+    /// through to its consequence: a nested non-string LIKE declines the ENTIRE
+    /// enclosing filter, and that whole filter — the renderable `STATUS = 'OPEN'`
+    /// conjunct included — is then applied by the adapter in the wrapper's `WHERE`, not
+    /// omitted — omitting either conjunct would return rows the query excludes.
+    #[test]
+    fn nested_like_decline_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "STATUS", "tableName": "T"},
+                    "right": {"type": "literal_string", "value": "OPEN"},
+                },
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "AMOUNT", "tableName": "T"},
+                    "pattern": {"type": "literal_string", "value": "9%"},
+                },
+            ],
+        });
+        let col_types = vec![
+            ("STATUS".to_string(), "VARCHAR(2000000)".to_string()),
+            ("AMOUNT".to_string(), "DECIMAL(9,2)".to_string()),
+        ];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        let where_at = sql
+            .find(r#"AS "LHS_T0" WHERE "#)
+            .unwrap_or_else(|| panic!("the declined filter must reach the wrapper: {sql}"));
+        assert!(
+            sql[where_at..].contains(r#""LHS_T0"."AMOUNT" LIKE '9%'"#)
+                && sql[where_at..].contains(r#""LHS_T0"."STATUS" = 'OPEN'"#),
+            "the wrapper WHERE must carry the WHOLE declined filter, both conjuncts: {sql}"
+        );
+    }
+
+    /// The declined half of `like_guard_integer_subject_declines`, carried through to
+    /// its consequence: an integer column arrives as `DECIMAL(20,0)`, the LIKE declines
+    /// the filter for the scan, and the adapter applies it itself in the wrapper.
+    #[test]
+    fn declined_like_on_integer_column_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "QUANTITY", "tableName": "T"},
+            "pattern": {"type": "literal_string", "value": "1%"},
+        });
+        let col_types = vec![("QUANTITY".to_string(), "DECIMAL(20,0)".to_string())];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."QUANTITY" LIKE '1%')"#),
+            "the integer-column LIKE must be applied in the wrapper WHERE: {sql}"
+        );
+    }
+
+    /// The declined half of `like_guard_unresolvable_column_declines`, carried through
+    /// to its consequence: an unresolvable subject type is a FAIL-SAFE decline, and a
+    /// fail-safe decline must still self-apply. It cannot omit the predicate on the
+    /// grounds that it could not type it — that reasoning is what returned unfiltered
+    /// rows.
+    ///
+    /// The fixture is deliberately unreachable from Exasol, which only sends columns of
+    /// the request's own `involvedTables`, so the assertion is about the routing
+    /// decision alone: the emitted SQL names a column this artificial `col_types`
+    /// universe does not project.
+    #[test]
+    fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "MYSTERY", "tableName": "T"},
+            "pattern": {"type": "literal_string", "value": "A%"},
+        });
+        let col_types = vec![("OTHER".to_string(), "VARCHAR(2000000)".to_string())];
+
+        let sql = declined_filter_wrapper_sql(&filter, &col_types);
+
+        assert!(
+            sql.contains(r#"AS "LHS_T0" WHERE ("LHS_T0"."MYSTERY" LIKE 'A%')"#),
+            "an unresolvable-subject decline must still be applied by the adapter, \
+             never omitted: {sql}"
+        );
+    }
+
     /// Scenario: REGEXP_LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR,
     /// same as `predicate_like` — both node types dispatch through `guard_like_subject`.
     #[test]
@@ -3633,5 +4594,1950 @@ mod tests {
             result, None,
             "a DECIMAL LIKE inside predicate_not must decline the whole filter"
         );
+    }
+
+    /// Regression (#207 blind spot): a DECIMAL-typed LIKE buried inside a
+    /// `function_scalar_case`'s `arguments` (a WHEN condition) must decline the whole
+    /// filter, same as a LIKE nested under `predicate_and`/`predicate_or`/`predicate_not` —
+    /// a `LIKE` at this non-junction position is type-guarded like any other.
+    #[test]
+    fn like_guard_decimal_inside_case_declines() {
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "amount"},
+                    "pattern": {"type": "literal_string", "value": "9%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result, None,
+            "a DECIMAL LIKE buried in a function_scalar_case's arguments must decline \
+             the whole filter: {result:?}"
+        );
+    }
+
+    /// Regression (#207 blind spot): a DATE-typed LIKE buried inside a
+    /// `function_scalar_case`'s `arguments` (a WHEN condition) is rewritten in place as
+    /// `CAST(<col> AS VARCHAR)`, with the enclosing CASE structure (its `results`
+    /// THEN/ELSE branches) preserved unchanged — a `LIKE` at this non-junction position
+    /// is type-guarded like any other.
+    #[test]
+    fn like_guard_date_inside_case_wraps_cast() {
+        let column = serde_json::json!({"type": "column", "name": "signup_date"});
+        let then_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
+        let else_branch = serde_json::json!({"type": "literal_exactnumeric", "value": 0});
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": column.clone(),
+                    "pattern": {"type": "literal_string", "value": "2024%"}
+                }
+            ],
+            "results": [then_branch.clone(), else_branch.clone()]
+        });
+        let col_types = vec![("SIGNUP_DATE".to_string(), "DATE".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        let expected = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {
+                        "type": "function_scalar_cast",
+                        "name": "CAST",
+                        "dataType": {"type": "VARCHAR"},
+                        "arguments": [column]
+                    },
+                    "pattern": {"type": "literal_string", "value": "2024%"}
+                }
+            ],
+            "results": [then_branch, else_branch]
+        });
+        assert_eq!(
+            result,
+            Some(expected),
+            "a DATE LIKE buried in a function_scalar_case's arguments must be rewrapped \
+             in CAST(<col> AS VARCHAR) in place, with the CASE's results preserved: {result:?}"
+        );
+    }
+
+    /// The widened traversal must not cost a working pushdown: a VARCHAR-typed LIKE
+    /// buried inside a `function_scalar_case`'s `arguments` is now reached (it was not,
+    /// pre-migration), but since VARCHAR needs no rewrap the returned tree must equal
+    /// the input tree exactly, byte for byte.
+    #[test]
+    fn like_guard_varchar_inside_case_unchanged() {
+        let filter = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": {"type": "column", "name": "name"},
+                    "pattern": {"type": "literal_string", "value": "A%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_exactnumeric", "value": 1},
+                {"type": "literal_exactnumeric", "value": 0}
+            ]
+        });
+        let col_types = vec![("NAME".to_string(), "VARCHAR(20)".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "a VARCHAR LIKE buried in a function_scalar_case's arguments must be \
+             returned unchanged: {result:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // rewrite_expr_tree — the shared post-order traversal primitive
+    // ---------------------------------------------------------------------------
+
+    /// Post-order: when `f` runs on a node, that node's curated children are
+    /// already their rewritten selves. Proven without interior mutability — the
+    /// closure copies the child's (rewritten) type onto the parent, so the
+    /// assertion can only hold if the child was rewritten first.
+    #[test]
+    fn expr_tree_applies_f_to_children_before_their_parent() {
+        let tree = serde_json::json!({
+            "type": "outer",
+            "expression": {"type": "inner"},
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            let mut out = node.clone();
+            if node.get("type").and_then(|t| t.as_str()) == Some("inner") {
+                out["type"] = Json::from("inner_rewritten");
+            } else {
+                out["child_type_seen"] = node["expression"]["type"].clone();
+            }
+            Some(out)
+        })
+        .expect("an always-Some closure must never decline");
+
+        assert_eq!(
+            out["child_type_seen"],
+            Json::from("inner_rewritten"),
+            "the parent must see its already-rewritten child: {out}"
+        );
+    }
+
+    /// A `None` from `f` at any depth declines the WHOLE tree — it propagates out
+    /// through every enclosing level instead of dropping only the declining
+    /// subtree.
+    #[test]
+    fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
+        let tree = serde_json::json!({
+            "type": "root",
+            "expressions": [
+                {"type": "keep"},
+                {"type": "branch", "left": {"type": "decline_here"}},
+            ],
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            if node.get("type").and_then(|t| t.as_str()) == Some("decline_here") {
+                return None;
+            }
+            Some(node.clone())
+        });
+
+        assert_eq!(
+            out, None,
+            "a declined descendant must decline the whole tree"
+        );
+    }
+
+    /// Only the curated fields are descended into, and only in the shapes the
+    /// grammar sends: an array field must be a `Json::Array`, a single-child field
+    /// must be an object. A node's object-valued `dataType` sub-object is never
+    /// handed to `f`, so no guard can rewrite a declared type; `name` is excluded
+    /// too, since it always carries a bare identifier string, never an object.
+    #[test]
+    fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
+        let tree = serde_json::json!({
+            "type": "root",
+            "dataType": {"type": "VARCHAR"},
+            "arguments": {"type": "not_an_array"},
+            "pattern": "not_an_object",
+            "expression": {"type": "curated_single"},
+            "results": [{"type": "curated_array"}],
+        });
+
+        let out = rewrite_expr_tree(&tree, &|node| {
+            let mut out = node.clone();
+            out["visited"] = Json::Bool(true);
+            Some(out)
+        })
+        .expect("an always-Some closure must never decline");
+
+        assert_eq!(
+            out["expression"]["visited"],
+            Json::Bool(true),
+            "curated field `expression` must be descended into: {out}"
+        );
+        assert_eq!(
+            out["results"][0]["visited"],
+            Json::Bool(true),
+            "curated field `results` must be descended into: {out}"
+        );
+        for skipped in ["dataType", "arguments"] {
+            assert_eq!(
+                out[skipped]["visited"],
+                Json::Null,
+                "`{skipped}` must not be descended into: {out}"
+            );
+        }
+        assert_eq!(
+            out["pattern"],
+            Json::from("not_an_object"),
+            "a non-object single-child field must be left untouched: {out}"
+        );
+    }
+
+    /// A non-object node reaches `f` too: the primitive has no leaf early-return,
+    /// which is what lets the migrated walkers drop theirs.
+    #[test]
+    fn expr_tree_applies_f_to_a_non_object_node() {
+        for leaf in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                rewrite_expr_tree(&leaf, &|_| Some(Json::from("touched"))),
+                Some(Json::from("touched")),
+                "a non-object node must be handed to `f`: {leaf}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // rewrite_decimal_stringifications — issue #211 decimal-trim JSON rewrite
+    // ---------------------------------------------------------------------------
+
+    /// The column-type map shared by the rewrite and string-function-guard tests: one
+    /// DECIMAL, one integer DECIMAL(p,0), one VARCHAR, one DATE, plus the three
+    /// resolvable-but-non-coercible types the string-function guard must decline on
+    /// (issue #210). The three additions cannot disturb the #211 rewrite assertions:
+    /// those reference only the first four names, and every wired `project_columns`
+    /// test here projects a single expression rather than the full base row.
+    fn decimal_rewrite_col_types() -> Vec<(String, String)> {
+        vec![
+            ("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string()),
+            ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+            ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
+            ("D".to_string(), "DATE".to_string()),
+            ("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string()),
+            ("C_BOOL_A".to_string(), "BOOLEAN".to_string()),
+            ("C_TS_A".to_string(), "TIMESTAMP".to_string()),
+        ]
+    }
+
+    fn decimal_column() -> Json {
+        serde_json::json!({"type": "column", "name": "c_decimal_a"})
+    }
+
+    fn cast_to(target: &str, arg: Json) -> Json {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": target},
+            "arguments": [arg],
+        })
+    }
+
+    /// A non-object node is returned unchanged: `rewrite_expr_tree` finds no curated
+    /// child on it, so the always-`Some` closure's catch-all arm clones it.
+    #[test]
+    fn decimal_rewrite_passes_through_non_object_node() {
+        let col_types = decimal_rewrite_col_types();
+        for node in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                rewrite_decimal_stringifications(&node, &col_types),
+                node.clone(),
+                "a non-object node must be passed through: {node}"
+            );
+        }
+    }
+
+    /// `CAST(<decimal column> AS VARCHAR)` → the WHOLE cast node is replaced by a
+    /// `decimal_to_varchar_exasol` node wrapping the column, which renders through
+    /// `format_decimal_exasol_style` (the trailing-zero-trim regexp form).
+    #[test]
+    fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
+        let node = cast_to("VARCHAR", decimal_column());
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        assert_eq!(
+            out.get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the whole CAST node must be replaced, not nested: {out}"
+        );
+        let inner = &out["arguments"][0];
+        assert_eq!(
+            inner.get("name").and_then(|n| n.as_str()),
+            Some("c_decimal_a"),
+            "the wrapped node must be the original column: {out}"
+        );
+        // Rendering proves it goes through the trimming regexp form.
+        let sql = render_expression_safe(&out).expect("must render");
+        assert!(
+            sql.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && sql.contains("regexp_replace"),
+            "must render via format_decimal_exasol_style: {sql}"
+        );
+    }
+
+    /// `CAST(<decimal column> AS CHAR)` is also a stringification → replaced.
+    #[test]
+    fn rewrite_cast_decimal_to_char_replaces_whole_node() {
+        let node = cast_to("CHAR", decimal_column());
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        assert_eq!(
+            out.get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "CAST AS CHAR over a DECIMAL column must also be rewritten: {out}"
+        );
+    }
+
+    /// The exact nested-CONCAT shape from the live capture
+    /// (`CONCAT(ID, CONCAT('-', C_DECIMAL_A))`, i.e. `id||'-'||c_decimal_a`): ONLY
+    /// `C_DECIMAL_A` (reachable only through the INNER CONCAT) gets wrapped; the
+    /// non-decimal `ID` column and the `'-'` literal are untouched, and the nested
+    /// structure is otherwise preserved. Guards the post-order-recursion BLOCKER.
+    #[test]
+    fn rewrite_nested_concat_wraps_only_inner_decimal() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "id"},
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "-"},
+                        {"type": "column", "name": "c_decimal_a"}
+                    ]
+                }
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        // Outer CONCAT preserved; ID (integer DECIMAL(20,0)) is itself decimal so it
+        // IS wrapped as a direct outer-CONCAT argument — but the OUTER structure and
+        // its argument count are preserved.
+        assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
+        let outer_args = out["arguments"].as_array().unwrap();
+        assert_eq!(
+            outer_args.len(),
+            2,
+            "outer CONCAT arg count preserved: {out}"
+        );
+
+        // The inner CONCAT node is still a CONCAT; its literal '-' is untouched and
+        // its C_DECIMAL_A argument is now wrapped.
+        let inner = &outer_args[1];
+        assert_eq!(inner.get("name").and_then(|n| n.as_str()), Some("CONCAT"));
+        let inner_args = inner["arguments"].as_array().unwrap();
+        assert_eq!(
+            inner_args[0].get("type").and_then(|t| t.as_str()),
+            Some("literal_string"),
+            "the '-' literal must be untouched: {out}"
+        );
+        assert_eq!(
+            inner_args[1].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the inner C_DECIMAL_A must be wrapped (post-order recursion reached it): {out}"
+        );
+        assert_eq!(
+            inner_args[1]["arguments"][0]
+                .get("name")
+                .and_then(|n| n.as_str()),
+            Some("c_decimal_a"),
+        );
+    }
+
+    /// `CONCAT(NAME, C_DECIMAL_A)` — only the DECIMAL column is wrapped; the VARCHAR
+    /// column is left as a bare column reference.
+    #[test]
+    fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "column", "name": "c_decimal_a"}
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        let args = out["arguments"].as_array().unwrap();
+        assert_eq!(
+            args[0].get("type").and_then(|t| t.as_str()),
+            Some("column"),
+            "the VARCHAR column must stay a bare column: {out}"
+        );
+        assert_eq!(
+            args[1].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the DECIMAL column must be wrapped: {out}"
+        );
+    }
+
+    /// `LENGTH(<decimal column>)` → its single argument is wrapped.
+    #[test]
+    fn rewrite_length_wraps_decimal_argument() {
+        let node = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [decimal_column()]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+        assert_eq!(out.get("name").and_then(|n| n.as_str()), Some("LENGTH"));
+        assert_eq!(
+            out["arguments"][0].get("type").and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "LENGTH's DECIMAL argument must be wrapped: {out}"
+        );
+    }
+
+    /// A non-DECIMAL bare column as a CAST / CONCAT / LENGTH argument is left
+    /// COMPLETELY unchanged (VARCHAR and DATE both).
+    #[test]
+    fn rewrite_non_decimal_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let cast_varchar = cast_to(
+            "VARCHAR",
+            serde_json::json!({"type": "column", "name": "name"}),
+        );
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast_varchar, &col_types),
+            cast_varchar,
+            "CAST of a VARCHAR column must be unchanged"
+        );
+
+        let length_date = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [{"type": "column", "name": "d"}]
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&length_date, &col_types),
+            length_date,
+            "LENGTH of a DATE column must be unchanged"
+        );
+    }
+
+    /// A computed-expression argument (e.g. `c_decimal_a * 2`) to a stringifier is
+    /// left unchanged — its type is not resolvable from `col_types`, a tracked
+    /// exception in the plan's scope. The argument is not a bare column, so neither
+    /// the CAST replacement nor the CONCAT per-argument wrap fires on it.
+    #[test]
+    fn rewrite_computed_expression_argument_unchanged() {
+        let computed = serde_json::json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        });
+        let col_types = decimal_rewrite_col_types();
+
+        let cast = cast_to("VARCHAR", computed.clone());
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast, &col_types),
+            cast,
+            "CAST of a computed DECIMAL expression must be left unchanged: it is not a bare column"
+        );
+
+        let concat = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [{"type": "column", "name": "name"}, computed]
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&concat, &col_types),
+            concat,
+            "a computed-expression CONCAT argument must be left unchanged"
+        );
+    }
+
+    /// A DECIMAL column in a NON-stringifying context is NOT wrapped: neither a
+    /// comparison predicate (`c_decimal_a > 5`) nor a CAST to a non-string target
+    /// (`CAST(c_decimal_a AS DOUBLE)`). Proves the recursion does not over-wrap.
+    #[test]
+    fn rewrite_non_stringifying_context_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let cmp = serde_json::json!({
+            "type": "predicate_greater",
+            "left": decimal_column(),
+            "right": {"type": "literal_exactnumeric", "value": 5}
+        });
+        assert_eq!(
+            rewrite_decimal_stringifications(&cmp, &col_types),
+            cmp,
+            "a DECIMAL column in a comparison must not be wrapped"
+        );
+
+        let cast_double = cast_to("DOUBLE", decimal_column());
+        assert_eq!(
+            rewrite_decimal_stringifications(&cast_double, &col_types),
+            cast_double,
+            "CAST(decimal AS DOUBLE) must not be wrapped"
+        );
+    }
+
+    /// A DECIMAL stringification reachable ONLY through a `function_scalar_case` THEN
+    /// branch (its `results` field) is still found and wrapped — proves the generic
+    /// child recursion covers CASE's `results`, not just `arguments`.
+    #[test]
+    fn rewrite_reaches_decimal_inside_case_then_branch() {
+        let node = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_greater",
+                    "left": {"type": "column", "name": "id"},
+                    "right": {"type": "literal_exactnumeric", "value": 0}
+                }
+            ],
+            "results": [
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "x"},
+                        {"type": "column", "name": "c_decimal_a"}
+                    ]
+                }
+            ]
+        });
+        let out = rewrite_decimal_stringifications(&node, &decimal_rewrite_col_types());
+
+        let then_concat = &out["results"][0];
+        assert_eq!(
+            then_concat.get("name").and_then(|n| n.as_str()),
+            Some("CONCAT"),
+            "the CASE THEN CONCAT must be preserved: {out}"
+        );
+        assert_eq!(
+            then_concat["arguments"][1]
+                .get("type")
+                .and_then(|t| t.as_str()),
+            Some("decimal_to_varchar_exasol"),
+            "the DECIMAL inside the CASE THEN CONCAT must be wrapped: {out}"
+        );
+    }
+
+    /// Wiring sanity check: a select-list `CAST(c_decimal_a AS VARCHAR(20))` over a
+    /// bare DECIMAL column must
+    /// route through `render_expression_safe` — yielding a SINGLE `ProjectionItem::Expr`
+    /// carrying the trim, at the item's declared EMITS type — NOT degrade to the full
+    /// base-row fallback. This proves both wiring changes: the unconditional rewrite of
+    /// each select-list item AND `decimal_to_varchar_exasol` being recognized by the
+    /// scalar `item_type` match arm.
+    #[test]
+    fn selectlist_decimal_cast_routed_not_full_row_fallback() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", decimal_column()) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
+        });
+        let (items, types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the CAST-to-VARCHAR item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(r#"CAST("C_DECIMAL_A" AS VARCHAR)"#) && expr.contains("regexp_replace"),
+            "the projected expression must render the trimmed DECIMAL→string form: {expr}"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(20)".to_string()],
+            "the EMITS type must stay the item's declared selectListDataTypes type"
+        );
+    }
+
+    /// Exhaustive coverage: the exact nested-CONCAT JSON shape confirmed
+    /// live for `id||'-'||c_decimal_a` (`CONCAT(ID, CONCAT('-', C_DECIMAL_A))`) as a
+    /// select-list item, through `project_columns`, renders `C_DECIMAL_A`'s CAST
+    /// fragment specifically wrapped in `format_decimal_exasol_style`'s
+    /// `regexp_replace` pair — proving the wiring (not just the isolated JSON rewrite
+    /// already covered by `rewrite_nested_concat_wraps_only_inner_decimal`) reaches
+    /// the nested inner-CONCAT argument at the `project_columns` level.
+    ///
+    /// `ID` is itself `DECIMAL(20,0)`, so it too is a direct outer-CONCAT argument and
+    /// gets the same (harmless, no-op-on-scale-0) trim wrapper — documented behavior
+    /// already asserted in `rewrite_nested_concat_wraps_only_inner_decimal`. This test
+    /// only asserts what's specific to `C_DECIMAL_A`: its CAST fragment sits inside
+    /// the trim wrapper.
+    #[test]
+    fn selectlist_nested_concat_decimal_arg_rewritten() {
+        let item = serde_json::json!({
+            "type": "function_scalar",
+            "name": "CONCAT",
+            "arguments": [
+                {"type": "column", "name": "id"},
+                {
+                    "type": "function_scalar",
+                    "name": "CONCAT",
+                    "arguments": [
+                        {"type": "literal_string", "value": "-"},
+                        decimal_column()
+                    ]
+                }
+            ]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the nested-CONCAT item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(r#"regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
+            "the inner C_DECIMAL_A argument must be rendered through the trim wrapper: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `LENGTH(c_decimal_a)` as a select-list item,
+    /// through `project_columns`, renders the trim-wrapped `character_length(...)` —
+    /// the LENGTH-over-DECIMAL wiring at the projection level (mirrors
+    /// `rewrite_length_wraps_decimal_argument`'s isolated JSON check).
+    #[test]
+    fn selectlist_length_decimal_arg_rewritten() {
+        let item = serde_json::json!({
+            "type": "function_scalar",
+            "name": "LENGTH",
+            "arguments": [decimal_column()]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "the LENGTH item must project to a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!(
+                "must be a rendered expression, not a bare column / full-row fallback: {items:?}"
+            );
+        };
+        assert!(
+            expr.contains(
+                "character_length(regexp_replace(regexp_replace(CAST(\"C_DECIMAL_A\" AS VARCHAR)"
+            ),
+            "LENGTH over a DECIMAL column must render the trim-wrapped character_length: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `CAST(<VARCHAR column> AS VARCHAR(20))` through
+    /// `project_columns` renders EXACTLY as it did before this whole fix — a plain
+    /// CAST, with no `regexp_replace` / `decimal_to_varchar_exasol` involvement.
+    /// Proves the fix doesn't touch a non-DECIMAL stringification at the wired level.
+    #[test]
+    fn stringify_nondecimal_column_unchanged() {
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", serde_json::json!({"type": "column", "name": "name"})) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 20} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "must project a single expression: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert_eq!(
+            expr, r#"CAST("NAME" AS VARCHAR)"#,
+            "a CAST over a non-DECIMAL column must render unchanged, exactly as before this fix: {expr}"
+        );
+    }
+
+    /// Exhaustive coverage: `CAST(c_decimal_a * 2 AS VARCHAR)` through
+    /// `project_columns` renders a plain, untrimmed CAST — proving the adapter-level
+    /// wiring correctly leaves the tracked-exception computed-argument case alone
+    /// (issue #223's scope), consistent with
+    /// `rewrite_computed_expression_argument_unchanged` at the wired level.
+    #[test]
+    fn stringify_computed_decimal_arg_untouched() {
+        let computed = serde_json::json!({
+            "type": "function_scalar",
+            "name": "MULT",
+            "arguments": [decimal_column(), {"type": "literal_exactnumeric", "value": 2}]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ cast_to("VARCHAR", computed) ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "must project a single expression: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert_eq!(
+            expr, r#"CAST(("C_DECIMAL_A" * 2) AS VARCHAR)"#,
+            "a CAST of a computed DECIMAL expression must render unchanged: {expr}"
+        );
+        assert!(
+            !expr.contains("regexp_replace"),
+            "a computed-expression CAST must not be trimmed (tracked exception #223): {expr}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // project_columns wiring — issue #210 string_function_arg_type_guard, run
+    // BEFORE rewrite_decimal_stringifications on every select-list item
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `UPPER(c_decimal_a)` projects to a SINGLE expression carrying the
+    /// trimmed decimal-to-string form (#211's node, reached through the new guard),
+    /// at the item's declared `selectListDataTypes` type — not the full base row.
+    #[test]
+    fn selectlist_upper_decimal_arg_coerced_not_full_row() {
+        let item = string_fn("UPPER", vec![decimal_column()]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "UPPER(c_decimal_a) must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#),
+            "UPPER's DECIMAL argument must render through the trimmed decimal-to-string form: {expr}"
+        );
+        assert_eq!(
+            types,
+            vec!["VARCHAR(2000000)".to_string()],
+            "the EMITS type must stay the item's declared selectListDataTypes type"
+        );
+    }
+
+    /// Scenario: `LOWER(c_date)` (the `d` fixture column, `DATE`-typed) projects a
+    /// single expression containing `CAST("D" AS VARCHAR)`.
+    #[test]
+    fn selectlist_lower_date_arg_cast_to_varchar() {
+        let item = string_fn("LOWER", vec![column("d")]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "LOWER(c_date) must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"CAST("D" AS VARCHAR)"#),
+            "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR): {expr}"
+        );
+    }
+
+    /// Scenario: `UPPER(c_double)` (the `c_double_a` fixture column) degrades to the
+    /// FULL base row with no error — `string_function_arg_type_guard` declines a
+    /// resolvable-but-non-coercible column type, and `project_columns` falls back
+    /// exactly like any other untranslatable select-list item.
+    #[test]
+    fn selectlist_string_fn_over_double_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let item = string_fn("UPPER", vec![column("c_double_a")]);
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types, _widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "UPPER(c_double_a) must fall back to the full base row, not a truncated projection: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
+    }
+
+    /// Scenario: `INSTR(c_decimal_a, '.')` projects a single expression whose FIRST
+    /// `strpos` argument is the trimmed decimal form and whose SECOND argument is the
+    /// untouched string literal `'.'` — `INSTR(string, substring)` -> `strpos(string,
+    /// substring)`, so index 0 is the column being coerced, index 1 the literal left
+    /// alone since it is not a bare column.
+    #[test]
+    fn selectlist_instr_decimal_arg_coerces_first_position_only() {
+        let item = string_fn(
+            "INSTR",
+            vec![
+                decimal_column(),
+                serde_json::json!({"type": "literal_string", "value": "."}),
+            ],
+        );
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            1,
+            "INSTR(c_decimal_a, '.') must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.starts_with(
+                r#"strpos(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR)"#
+            ),
+            "INSTR's first (string) argument must render the trimmed decimal form: {expr}"
+        );
+        assert!(
+            expr.ends_with("'.')"),
+            "INSTR's second (substring) argument, a literal, must be left untouched: {expr}"
+        );
+    }
+
+    /// Scenario: `INSTR(c_varchar, 'b', 3)` (three arguments, all effectively
+    /// VARCHAR/literal) degrades to the FULL base row rather than projecting a
+    /// truncated `strpos` call — the #228 arity-decline path. `vs-expression` reads
+    /// only `args[0]`/`args[1]` and silently drops the third; coercing index 0 here
+    /// would let a truncated rendering plan successfully, so
+    /// `string_position_args("INSTR", 3)` returns `Decline` regardless of every
+    /// argument already being VARCHAR/literal.
+    #[test]
+    fn selectlist_instr_with_start_position_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let item = string_fn(
+            "INSTR",
+            vec![
+                column("name"),
+                serde_json::json!({"type": "literal_string", "value": "b"}),
+                serde_json::json!({"type": "literal_exactnumeric", "value": 3}),
+            ],
+        );
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 0} ],
+        });
+        let (items, _types, _widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "the arity-decline INSTR must fall back to the full base row, not a truncated strpos: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Select-list predicate node types added to the pushable whitelist (#196)
+    // ---------------------------------------------------------------------------
+
+    /// Each whitelisted select-list predicate node type (issue #196) renders as a
+    /// positional `ProjectionItem::Expr` carrying the rendered SQL fragment and the
+    /// declared `selectListDataTypes` type — not the full-base-row fallback.
+    #[test]
+    fn selectlist_predicate_node_projects_as_expr() {
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            (
+                "predicate_in_constlist",
+                serde_json::json!({
+                    "type": "predicate_in_constlist",
+                    "expression": column("name"),
+                    "arguments": [
+                        {"type": "literal_string", "value": "a"},
+                        {"type": "literal_string", "value": "b"},
+                    ]
+                }),
+                r#"("NAME" IN ('a', 'b'))"#,
+            ),
+            (
+                "predicate_between",
+                serde_json::json!({
+                    "type": "predicate_between",
+                    "expression": column("id"),
+                    "left": {"type": "literal_exactnumeric", "value": 1},
+                    "right": {"type": "literal_exactnumeric", "value": 10},
+                }),
+                r#"("ID" BETWEEN 1 AND 10)"#,
+            ),
+            (
+                "predicate_is_null",
+                serde_json::json!({
+                    "type": "predicate_is_null",
+                    "expression": column("name"),
+                }),
+                r#"("NAME" IS NULL)"#,
+            ),
+            (
+                "predicate_is_not_null",
+                serde_json::json!({
+                    "type": "predicate_is_not_null",
+                    "expression": column("name"),
+                }),
+                r#"("NAME" IS NOT NULL)"#,
+            ),
+            (
+                "predicate_notequal",
+                serde_json::json!({
+                    "type": "predicate_notequal",
+                    "left": column("id"),
+                    "right": {"type": "literal_exactnumeric", "value": 5},
+                }),
+                r#"("ID" <> 5)"#,
+            ),
+            (
+                "predicate_like_regexp",
+                serde_json::json!({
+                    "type": "predicate_like_regexp",
+                    "expression": column("name"),
+                    "pattern": {"type": "literal_string", "value": "^a.*"},
+                }),
+                r#"regexp_like("NAME", '^a.*')"#,
+            ),
+        ];
+
+        for (node_type, item, expected_frag) in cases {
+            let pushdown_req = serde_json::json!({
+                "selectList": [ item ],
+                "selectListDataTypes": [ {"type": "boolean"} ],
+            });
+            let (items, types, _widened) =
+                project_columns(&pushdown_req, decimal_rewrite_col_types())
+                    .unwrap_or_else(|e| panic!("[{node_type}] must project: {e}"));
+
+            assert_eq!(
+                items.len(),
+                1,
+                "[{node_type}] must project a single expression, not the full base row: {items:?}"
+            );
+            let ProjectionItem::Expr { expr } = &items[0] else {
+                panic!(
+                    "[{node_type}] must be a rendered expression, not a full-row fallback: {items:?}"
+                );
+            };
+            assert_eq!(
+                expr, expected_frag,
+                "[{node_type}] rendered fragment mismatch"
+            );
+            assert_eq!(
+                types,
+                vec!["BOOLEAN".to_string()],
+                "[{node_type}] declared type mismatch"
+            );
+        }
+    }
+
+    /// A `function_aggregate` select-list item still widens to the full base row —
+    /// pinning the whitelist's one deliberate exclusion (#196) as intentional, not
+    /// incidental: an aggregate must reach the aggregate planner, not be evaluated
+    /// per shard as a projection item.
+    #[test]
+    fn selectlist_function_aggregate_still_widens_to_full_row() {
+        let item = serde_json::json!({
+            "type": "function_aggregate",
+            "name": "COUNT",
+            "arguments": [],
+            "distinct": false
+        });
+        let col_types = decimal_rewrite_col_types();
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "decimal", "precision": 20, "scale": 0} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project");
+
+        assert!(
+            widened,
+            "the widening must be REPORTED, not only performed: the dispatcher routes on \
+             this flag alone (#196)"
+        );
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "function_aggregate must widen to the full base row, not project as an Expr: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
+    }
+
+    // ---------------------------------------------------------------------------
+    // like_subject_type_guard wired into apply_type_rewrites — issue #219
+    // select-list LIKE type coercion
+    // ---------------------------------------------------------------------------
+
+    /// Scenario: `predicate_like` over `d` (`DATE`) projects a SINGLE expression that
+    /// rewraps the subject as `CAST("D" AS VARCHAR)`, mirroring the filter pipeline's
+    /// DATE arm — not the full base row.
+    #[test]
+    fn selectlist_like_over_date_projects_cast_expr() {
+        let item = serde_json::json!({
+            "type": "predicate_like",
+            "expression": column("d"),
+            "pattern": {"type": "literal_string", "value": "2024%"}
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ item ],
+            "selectListDataTypes": [ {"type": "boolean"} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, decimal_rewrite_col_types()).expect("must project");
+
+        assert!(
+            !widened,
+            "a DATE LIKE subject rewraps, it must not widen to the full base row"
+        );
+        assert_eq!(
+            items.len(),
+            1,
+            "the DATE LIKE item must project a single expression, not the full base row: {items:?}"
+        );
+        let ProjectionItem::Expr { expr } = &items[0] else {
+            panic!("must be a rendered expression, not a full-row fallback: {items:?}");
+        };
+        assert!(
+            expr.contains(r#"CAST("D" AS VARCHAR)"#) && expr.contains("LIKE"),
+            "the DATE subject must be rewrapped in CAST(<col> AS VARCHAR) before the LIKE: {expr}"
+        );
+        assert_eq!(types, vec!["BOOLEAN".to_string()]);
+    }
+
+    /// Scenario: a `predicate_like`/`predicate_like_regexp` over a subject that
+    /// resolves to a non-string Exasol type (DECIMAL, integer DECIMAL(p,0), DOUBLE,
+    /// BOOLEAN, TIMESTAMP) or does not resolve at all widens the WHOLE select list to
+    /// the full base row — `Ok`, never `Err`. Mirrors
+    /// `like_guard_decimal_subject_declines`'s dispatch table, now proven wired through
+    /// `project_columns`.
+    #[test]
+    fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let cases: Vec<(&str, Json)> = vec![
+            (
+                "c_decimal_a (DECIMAL(10,2))",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "id (DECIMAL(20,0), integer)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("id"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_double_a (DOUBLE PRECISION)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_double_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_bool_a (BOOLEAN)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_bool_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "c_ts_a (TIMESTAMP)",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("c_ts_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "unresolvable column name",
+                serde_json::json!({
+                    "type": "predicate_like",
+                    "expression": column("not_a_column"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }),
+            ),
+            (
+                "predicate_like_regexp over c_decimal_a",
+                serde_json::json!({
+                    "type": "predicate_like_regexp",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "^1.*"}
+                }),
+            ),
+        ];
+
+        for (label, item) in cases {
+            let pushdown_req = serde_json::json!({
+                "selectList": [ item ],
+                "selectListDataTypes": [ {"type": "boolean"} ],
+            });
+            let (items, types, widened) = project_columns(&pushdown_req, col_types.clone())
+                .unwrap_or_else(|e| panic!("[{label}] must project (Ok), not error: {e}"));
+
+            assert!(
+                widened,
+                "[{label}] a non-string LIKE subject must widen to the full base row"
+            );
+            assert_eq!(
+                items.len(),
+                col_types.len(),
+                "[{label}] must fall back to the full base row, not a truncated projection: {items:?}"
+            );
+            let expected_names: Vec<ProjectionItem> = col_types
+                .iter()
+                .map(|(n, _)| ProjectionItem::Column(n.clone()))
+                .collect();
+            assert_eq!(
+                items, expected_names,
+                "[{label}] the full-row fallback must project every base column unchanged"
+            );
+            let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+            assert_eq!(types, expected_types, "[{label}] EMITS types mismatch");
+        }
+    }
+
+    /// Scenario: a `predicate_like` over `c_decimal_a` nested inside a
+    /// `function_scalar_case` still widens to the full base row — pinning that the
+    /// guard's [`rewrite_expr_tree`] reach (a LIKE buried under a CASE, not only a
+    /// bare top-level select-list item) is wired all the way through
+    /// `project_columns`, not just the isolated `like_subject_type_guard` call.
+    #[test]
+    fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
+        let col_types = decimal_rewrite_col_types();
+        let case_expr = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {
+                    "type": "predicate_like",
+                    "expression": column("c_decimal_a"),
+                    "pattern": {"type": "literal_string", "value": "1%"}
+                }
+            ],
+            "results": [
+                {"type": "literal_string", "value": "yes"},
+                {"type": "literal_string", "value": "no"}
+            ]
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [ case_expr ],
+            "selectListDataTypes": [ {"type": "VARCHAR", "size": 2000000} ],
+        });
+        let (items, types, widened) =
+            project_columns(&pushdown_req, col_types.clone()).expect("must project (Ok)");
+
+        assert!(
+            widened,
+            "a LIKE nested inside a CASE over a DECIMAL subject must widen the whole select list"
+        );
+        assert_eq!(
+            items.len(),
+            col_types.len(),
+            "must fall back to the full base row, not a truncated projection: {items:?}"
+        );
+        let expected_names: Vec<ProjectionItem> = col_types
+            .iter()
+            .map(|(n, _)| ProjectionItem::Column(n.clone()))
+            .collect();
+        assert_eq!(
+            items, expected_names,
+            "the full-row fallback must project every base column unchanged"
+        );
+        let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+        assert_eq!(types, expected_types);
+    }
+
+    // ---------------------------------------------------------------------------
+    // string_position_args — issue #210 string-position argument table
+    // ---------------------------------------------------------------------------
+
+    /// Every argument of `CONCAT`/`TRIM`/`LTRIM`/`RTRIM`/`REPLACE`/`TRANSLATE` is a
+    /// string position, at every arity Exasol can send.
+    #[test]
+    fn string_position_args_coerces_every_argument_of_all_string_functions() {
+        for name in ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"] {
+            assert_eq!(
+                string_position_args(name, 1),
+                StringPositionArgs::Coerce(vec![0]),
+                "{name}/1 must coerce index 0"
+            );
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0, 1]),
+                "{name}/2 must coerce both indices"
+            );
+            assert_eq!(
+                string_position_args(name, 3),
+                StringPositionArgs::Coerce(vec![0, 1, 2]),
+                "{name}/3 must coerce every index"
+            );
+        }
+    }
+
+    /// Only the FIRST argument of these is a string position; any further argument is
+    /// a genuine number (a start offset, a length, a repeat count).
+    #[test]
+    fn string_position_args_coerces_first_argument_only() {
+        for name in [
+            "LOWER",
+            "UPPER",
+            "ASCII",
+            "INITCAP",
+            "REVERSE",
+            "LENGTH",
+            "OCTET_LENGTH",
+            "UNICODE",
+            "SUBSTR",
+            "REPEAT",
+            "LEFT",
+            "RIGHT",
+        ] {
+            for arg_count in 1..=3 {
+                assert_eq!(
+                    string_position_args(name, arg_count),
+                    StringPositionArgs::Coerce(vec![0]),
+                    "{name}/{arg_count} must coerce index 0 only"
+                );
+            }
+        }
+    }
+
+    /// `LPAD`/`RPAD`'s numeric length argument (index 1) is always excluded, while
+    /// their PAD-string argument (index 2, present only at arity > 2) is still
+    /// coerced — the only mixed string/numeric arity in the table.
+    /// `SUBSTR`/`REPEAT`/`LEFT`/`RIGHT`'s single-numeric-argument exclusion is already
+    /// covered by `string_position_args_coerces_first_argument_only` above.
+    #[test]
+    fn string_position_args_excludes_numeric_arguments() {
+        for name in ["LPAD", "RPAD"] {
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0]),
+                "{name}/2 has no pad-string argument to coerce"
+            );
+            assert_eq!(
+                string_position_args(name, 3),
+                StringPositionArgs::Coerce(vec![0, 2]),
+                "{name}/3 must coerce the subject and the pad string, never the length"
+            );
+        }
+    }
+
+    /// `CHR`/`UNICODECHR` (their argument is a genuine integer codepoint) and every
+    /// non-string function are NOT governed — the caller leaves such a node alone and
+    /// never declines on it.
+    #[test]
+    fn string_position_args_not_governed_for_chr_and_non_string_functions() {
+        for name in ["CHR", "UNICODECHR", "ABS", "CASE"] {
+            for arg_count in 0..=3 {
+                assert_eq!(
+                    string_position_args(name, arg_count),
+                    StringPositionArgs::NotGoverned,
+                    "{name}/{arg_count} must not be governed"
+                );
+            }
+        }
+    }
+
+    /// The name is uppercased before matching, so a lowercase `fn_name` resolves
+    /// identically.
+    #[test]
+    fn string_position_args_matches_lowercase_function_name() {
+        assert_eq!(
+            string_position_args("upper", 1),
+            string_position_args("UPPER", 1),
+            "a lowercase name must resolve like its uppercase form"
+        );
+        assert_eq!(
+            string_position_args("upper", 1),
+            StringPositionArgs::Coerce(vec![0])
+        );
+        assert_eq!(
+            string_position_args("instr", 3),
+            StringPositionArgs::Decline,
+            "a lowercase name must reach the arity decline too"
+        );
+    }
+
+    /// No returned index may address past the end of the argument list — the caller
+    /// indexes `arguments` with them directly.
+    #[test]
+    fn string_position_args_never_returns_out_of_range_index() {
+        let governed = [
+            "CONCAT",
+            "TRIM",
+            "LTRIM",
+            "RTRIM",
+            "REPLACE",
+            "TRANSLATE",
+            "LOWER",
+            "UPPER",
+            "ASCII",
+            "INITCAP",
+            "REVERSE",
+            "LENGTH",
+            "OCTET_LENGTH",
+            "UNICODE",
+            "SUBSTR",
+            "REPEAT",
+            "LEFT",
+            "RIGHT",
+            "LPAD",
+            "RPAD",
+            "INSTR",
+            "LOCATE",
+        ];
+        for name in governed {
+            for arg_count in 0..=5 {
+                if let StringPositionArgs::Coerce(indices) = string_position_args(name, arg_count) {
+                    for i in indices {
+                        assert!(
+                            i < arg_count,
+                            "{name}/{arg_count} returned out-of-range index {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `INSTR`/`LOCATE` beyond two arguments decline on ARITY ALONE, whatever the
+    /// argument types: `vs-expression` renders only `args[0]`/`args[1]` and silently
+    /// drops the rest (#228), so coercing index 0 would turn today's loud DataFusion
+    /// error into a silently wrong position. Exactly two arguments coerce both.
+    #[test]
+    fn string_position_args_declines_instr_locate_beyond_two_args() {
+        assert_eq!(
+            string_position_args("INSTR", 3),
+            StringPositionArgs::Decline,
+            "INSTR/3 drops its start-position argument — must decline"
+        );
+        assert_eq!(
+            string_position_args("INSTR", 4),
+            StringPositionArgs::Decline,
+            "INSTR/4 drops its start-position and occurrence arguments — must decline"
+        );
+        assert_eq!(
+            string_position_args("LOCATE", 3),
+            StringPositionArgs::Decline,
+            "LOCATE/3 drops its start-position argument — must decline"
+        );
+        for name in ["INSTR", "LOCATE"] {
+            assert_eq!(
+                string_position_args(name, 2),
+                StringPositionArgs::Coerce(vec![0, 1]),
+                "{name}/2 is rendered faithfully and must coerce both arguments"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // string_function_arg_type_guard — issue #210 string-function argument typing
+    // ---------------------------------------------------------------------------
+
+    fn column(name: &str) -> Json {
+        serde_json::json!({"type": "column", "name": name})
+    }
+
+    fn string_fn(name: &str, args: Vec<Json>) -> Json {
+        serde_json::json!({
+            "type": "function_scalar",
+            "name": name,
+            "arguments": args,
+        })
+    }
+
+    fn trimmed_decimal(name: &str) -> Json {
+        serde_json::json!({
+            "type": "decimal_to_varchar_exasol",
+            "arguments": [column(name)],
+        })
+    }
+
+    fn cast_varchar(name: &str) -> Json {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "VARCHAR"},
+            "arguments": [column(name)],
+        })
+    }
+
+    fn equals(left: Json, right: Json) -> Json {
+        serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
+    }
+
+    /// A non-object node has no children and no function dispatch — passed through.
+    #[test]
+    fn string_fn_guard_passes_through_non_object_node() {
+        let col_types = decimal_rewrite_col_types();
+        for node in [
+            Json::Null,
+            serde_json::json!("UPPER"),
+            serde_json::json!(7),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                string_function_arg_type_guard(&node, &col_types),
+                Some(node.clone()),
+                "a non-object node must be passed through: {node}"
+            );
+        }
+    }
+
+    /// Scenario: a string-position VARCHAR or CHAR column argument pushes down
+    /// unchanged — DataFusion needs no help with a genuine string.
+    #[test]
+    fn string_fn_guard_leaves_varchar_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+        for name in ["UPPER", "LOWER", "TRIM", "LTRIM", "CONCAT", "LENGTH"] {
+            let node = string_fn(name, vec![column("name")]);
+            assert_eq!(
+                string_function_arg_type_guard(&node, &col_types),
+                Some(node.clone()),
+                "{name} over a VARCHAR column must be unchanged"
+            );
+        }
+        // CHAR is dispatched by the same `starts_with` prefix pair as VARCHAR.
+        let char_types = vec![("C_CHAR_A".to_string(), "CHAR(10)".to_string())];
+        let node = string_fn("UPPER", vec![column("c_char_a")]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &char_types),
+            Some(node.clone()),
+            "a CHAR column argument must be unchanged"
+        );
+    }
+
+    /// Scenario: a string-position DECIMAL column argument renders through Exasol's
+    /// trimmed decimal-to-string form (#211's `decimal_to_varchar_exasol` node, reused
+    /// verbatim so decimal formatting keeps a single owner). Integer columns arrive as
+    /// `DECIMAL(p,0)` on the wire and are covered by the same branch.
+    #[test]
+    fn string_fn_guard_wraps_decimal_argument_in_trim() {
+        let col_types = decimal_rewrite_col_types();
+
+        let out =
+            string_function_arg_type_guard(&string_fn("UPPER", vec![decimal_column()]), &col_types);
+        assert_eq!(
+            out,
+            Some(string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")])),
+            "UPPER's DECIMAL argument must be wrapped in the trimmed-string node"
+        );
+
+        for name in ["TRIM", "LTRIM"] {
+            assert_eq!(
+                string_function_arg_type_guard(
+                    &string_fn(name, vec![decimal_column()]),
+                    &col_types
+                ),
+                Some(string_fn(name, vec![trimmed_decimal("c_decimal_a")])),
+                "{name}'s DECIMAL argument must be wrapped"
+            );
+        }
+
+        // Integer column (DECIMAL(20,0)) — issue #210's `UPPER(c_custkey)` repro shape.
+        assert_eq!(
+            string_function_arg_type_guard(&string_fn("UPPER", vec![column("id")]), &col_types),
+            Some(string_fn("UPPER", vec![trimmed_decimal("id")])),
+            "an integer DECIMAL(p,0) argument must be wrapped too"
+        );
+
+        // The wrapper is what renders Exasol's shortest form, not a plain CAST.
+        let sql = render_expression_safe(
+            &string_function_arg_type_guard(
+                &string_fn("UPPER", vec![decimal_column()]),
+                &col_types,
+            )
+            .expect("must not decline"),
+        )
+        .expect("must render");
+        assert_eq!(
+            sql,
+            r#"upper(regexp_replace(regexp_replace(CAST("C_DECIMAL_A" AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', ''))"#,
+            "UPPER over a DECIMAL column must render the trimmed form: {sql}"
+        );
+    }
+
+    /// Scenario: a string-position DATE column argument is wrapped in an explicit
+    /// `CAST(<col> AS VARCHAR)` — DataFusion's Date32→Utf8 cast is `YYYY-MM-DD`, which
+    /// is also Exasol's default `NLS_DATE_FORMAT` (issue #210's `LOWER(l_shipdate)`).
+    #[test]
+    fn string_fn_guard_casts_date_argument_to_varchar() {
+        let col_types = decimal_rewrite_col_types();
+        assert_eq!(
+            string_function_arg_type_guard(&string_fn("LOWER", vec![column("d")]), &col_types),
+            Some(string_fn("LOWER", vec![cast_varchar("d")])),
+            "LOWER's DATE argument must be wrapped in CAST(<col> AS VARCHAR)"
+        );
+    }
+
+    /// Scenario: a resolvable but non-coercible column type declines. BOOLEAN, DOUBLE
+    /// and TIMESTAMP all have text forms that differ between the two engines
+    /// (`TRUE`/`true`, the space/`T` separator), so a cast would turn a crash into a
+    /// wrong answer — native Exasol evaluation is the only safe outcome.
+    #[test]
+    fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
+        let col_types = decimal_rewrite_col_types();
+        for col in ["c_bool_a", "c_double_a", "c_ts_a"] {
+            for name in ["UPPER", "TRIM", "CONCAT", "LENGTH"] {
+                assert_eq!(
+                    string_function_arg_type_guard(&string_fn(name, vec![column(col)]), &col_types),
+                    None,
+                    "{name} over {col} must decline"
+                );
+            }
+        }
+    }
+
+    /// Scenario: a string-position argument whose column name does not resolve in
+    /// `col_types` declines fail-safe.
+    #[test]
+    fn string_fn_guard_declines_unresolved_column_name() {
+        let col_types = decimal_rewrite_col_types();
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("UPPER", vec![column("mystery")]),
+                &col_types
+            ),
+            None,
+            "an unresolvable column argument must decline"
+        );
+    }
+
+    /// A `column` node with no `name` field is unresolvable — same fail-safe decline.
+    #[test]
+    fn string_fn_guard_declines_nameless_column_node() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![serde_json::json!({"type": "column"})]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            None,
+            "a nameless column argument must decline"
+        );
+    }
+
+    /// The guard reaches a string function nested under a COMPARISON predicate (under
+    /// `left`) — the shape issue #210's WHERE-clause repro takes.
+    #[test]
+    fn string_fn_guard_reaches_function_under_comparison_predicate() {
+        let col_types = decimal_rewrite_col_types();
+        let node = equals(
+            string_fn("UPPER", vec![decimal_column()]),
+            serde_json::json!({"type": "literal_string", "value": "X"}),
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(equals(
+                string_fn("UPPER", vec![trimmed_decimal("c_decimal_a")]),
+                serde_json::json!({"type": "literal_string", "value": "X"}),
+            )),
+            "a string function under `left` must be coerced"
+        );
+    }
+
+    /// A decline anywhere in the tree propagates to the ROOT, so the caller declines
+    /// the whole filter / select-list item rather than pushing a partially-guarded tree.
+    #[test]
+    fn string_fn_guard_nested_decline_propagates_to_root() {
+        let col_types = decimal_rewrite_col_types();
+        let filter = serde_json::json!({
+            "type": "predicate_and",
+            "expressions": [
+                equals(column("name"), serde_json::json!({"type": "literal_string", "value": "X"})),
+                {
+                    "type": "predicate_not",
+                    "expression": equals(
+                        string_fn("UPPER", vec![column("c_double_a")]),
+                        serde_json::json!({"type": "literal_string", "value": "X"})
+                    )
+                }
+            ]
+        });
+        assert_eq!(
+            string_function_arg_type_guard(&filter, &col_types),
+            None,
+            "a nested non-coercible string function must decline the whole tree"
+        );
+    }
+
+    /// Only string-position indices are coerced: `SUBSTR`'s start/length, `REPEAT`'s
+    /// count, `LEFT`/`RIGHT`'s length and `LPAD`'s length stay untouched, while
+    /// `LPAD`'s PAD-STRING argument is coerced. The numeric positions here hold a
+    /// DECIMAL column (`ID`), which WOULD be visibly rewritten if it were passed to
+    /// the type dispatch — a literal int could not tell the two designs apart.
+    #[test]
+    fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
+        let col_types = decimal_rewrite_col_types();
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("SUBSTR", vec![decimal_column(), column("id"), column("id")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "SUBSTR",
+                vec![trimmed_decimal("c_decimal_a"), column("id"), column("id")]
+            )),
+            "SUBSTR's start and length arguments must stay bare columns"
+        );
+
+        for name in ["REPEAT", "LEFT", "RIGHT"] {
+            assert_eq!(
+                string_function_arg_type_guard(
+                    &string_fn(name, vec![decimal_column(), column("id")]),
+                    &col_types
+                ),
+                Some(string_fn(
+                    name,
+                    vec![trimmed_decimal("c_decimal_a"), column("id")]
+                )),
+                "{name}'s numeric argument must stay a bare column"
+            );
+        }
+
+        // LPAD(str, length, pad): index 0 and 2 coerced, index 1 untouched.
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LPAD", vec![decimal_column(), column("id"), column("d")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LPAD",
+                vec![
+                    trimmed_decimal("c_decimal_a"),
+                    column("id"),
+                    cast_varchar("d")
+                ]
+            )),
+            "LPAD must coerce the subject and the pad string, never the length"
+        );
+
+        // A literal-int length is likewise never handed to the type dispatch.
+        let length_literal = serde_json::json!({"type": "literal_exactnumeric", "value": 10});
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LPAD", vec![decimal_column(), length_literal.clone()]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LPAD",
+                vec![trimmed_decimal("c_decimal_a"), length_literal]
+            )),
+            "a 2-argument LPAD must coerce index 0 only"
+        );
+    }
+
+    /// Scenario: `INSTR` and `LOCATE` coerce BOTH of their two arguments. `LOCATE`'s
+    /// render-time argument swap (`LOCATE(sub, str)` → `strpos(str, sub)`) happens
+    /// after this guard, so both indices are string positions in either order.
+    #[test]
+    fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
+        let col_types = decimal_rewrite_col_types();
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("INSTR", vec![decimal_column(), column("d")]),
+                &col_types
+            ),
+            Some(string_fn(
+                "INSTR",
+                vec![trimmed_decimal("c_decimal_a"), cast_varchar("d")]
+            )),
+            "INSTR must coerce both of its arguments"
+        );
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LOCATE", vec![column("d"), decimal_column()]),
+                &col_types
+            ),
+            Some(string_fn(
+                "LOCATE",
+                vec![cast_varchar("d"), trimmed_decimal("c_decimal_a")]
+            )),
+            "LOCATE must coerce both of its arguments"
+        );
+    }
+
+    /// Scenario: `INSTR` with 3 or 4 arguments and `LOCATE` with 3 decline THROUGH THE
+    /// GUARD even when every argument is a VARCHAR column — the arity, not a type, is
+    /// what declines (`vs-expression` drops the extra arguments, #228). The table-level
+    /// counterpart is `string_position_args_declines_instr_locate_beyond_two_args`.
+    #[test]
+    fn string_fn_guard_declines_instr_locate_beyond_two_args() {
+        let col_types = decimal_rewrite_col_types();
+        let start = serde_json::json!({"type": "literal_exactnumeric", "value": 3});
+
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("INSTR", vec![column("name"), column("name"), start.clone()]),
+                &col_types
+            ),
+            None,
+            "INSTR/3 over VARCHAR arguments must still decline"
+        );
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn(
+                    "INSTR",
+                    vec![column("name"), column("name"), start.clone(), start.clone()]
+                ),
+                &col_types
+            ),
+            None,
+            "INSTR/4 over VARCHAR arguments must still decline"
+        );
+        assert_eq!(
+            string_function_arg_type_guard(
+                &string_fn("LOCATE", vec![column("name"), column("name"), start]),
+                &col_types
+            ),
+            None,
+            "LOCATE/3 over VARCHAR arguments must still decline"
+        );
+    }
+
+    /// Scenario: `CHR`/`UNICODECHR` are excluded — their single argument is a genuine
+    /// integer codepoint, so it is neither coerced NOR a reason to decline (the
+    /// difference between "not governed" and "declines on a bad argument"). Their
+    /// children are still recursed.
+    #[test]
+    fn string_fn_guard_excludes_chr_and_unicodechr() {
+        let col_types = decimal_rewrite_col_types();
+        for name in ["CHR", "UNICODECHR"] {
+            for arg in ["id", "c_double_a"] {
+                let node = string_fn(name, vec![column(arg)]);
+                assert_eq!(
+                    string_function_arg_type_guard(&node, &col_types),
+                    Some(node.clone()),
+                    "{name}({arg}) must be left completely untouched"
+                );
+            }
+        }
+
+        // ... but a governed function nested INSIDE one is still reached.
+        let nested = string_fn("CHR", vec![string_fn("LENGTH", vec![decimal_column()])]);
+        assert_eq!(
+            string_function_arg_type_guard(&nested, &col_types),
+            Some(string_fn(
+                "CHR",
+                vec![string_fn("LENGTH", vec![trimmed_decimal("c_decimal_a")])]
+            )),
+            "a governed function under CHR must still be coerced"
+        );
+    }
+
+    /// A column name in any letter case resolves — [`column_exa_type`] uppercases the
+    /// name before the `col_types` lookup.
+    #[test]
+    fn string_fn_guard_resolves_case_mismatched_column_name() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![column("C_DeCiMaL_a")]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(string_fn("UPPER", vec![trimmed_decimal("C_DeCiMaL_a")])),
+            "a mixed-case column name must resolve against the uppercase map"
+        );
+    }
+
+    /// The one `col_types` lookup folds the node's name with the full-Unicode
+    /// `to_uppercase`, so it resolves against the Unicode-folded list
+    /// [`extract_all_column_types`] builds and MISSES a constructed ASCII-folded list
+    /// that no builder in this codebase produces.
+    ///
+    /// `STRAßE` is a CONSTRUCTED literal, not a name Exasol delivers: this crate
+    /// uppercases every Iceberg field name itself before declaring it
+    /// (`resolve_table_schema`, `file_resolution.rs:640`) and the full-Unicode fold maps
+    /// `ß` to `SS`, so a real `straße` column reaches this lookup as `STRASSE`. The
+    /// `ascii_folded` list below is likewise constructed, used here solely because Rust's
+    /// two folds disagree on `STRAßE`, which is what makes the miss assertion falsifiable.
+    #[test]
+    fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
+        let node = column("STRAßE");
+        let unicode_folded = [("STRASSE".to_string(), "VARCHAR(2000000)".to_string())];
+        let ascii_folded = [("STRAßE".to_string(), "VARCHAR(2000000)".to_string())];
+
+        assert_eq!(
+            column_exa_type(&node, &unicode_folded),
+            Some("VARCHAR(2000000)"),
+            "`STRAßE`.to_uppercase() is `STRASSE`, the key `extract_all_column_types` builds"
+        );
+        assert_eq!(
+            column_exa_type(&node, &ascii_folded),
+            None,
+            "`to_ascii_uppercase` leaves `STRAßE`, which the Unicode fold cannot match"
+        );
+    }
+
+    /// A non-bare-column string-position argument (a literal, or a computed
+    /// `c_decimal_a * 2`) is left unchanged and does NOT decline — a deliberate tracked
+    /// exception (#223), mirroring #211's convention for computed arguments.
+    #[test]
+    fn string_fn_guard_leaves_computed_argument_unchanged() {
+        let col_types = decimal_rewrite_col_types();
+
+        let literal = string_fn(
+            "UPPER",
+            vec![serde_json::json!({"type": "literal_string", "value": "x"})],
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&literal, &col_types),
+            Some(literal.clone()),
+            "a literal argument must be left unchanged without declining"
+        );
+
+        let computed = string_fn(
+            "UPPER",
+            vec![string_fn(
+                "MULT",
+                vec![
+                    decimal_column(),
+                    serde_json::json!({"type": "literal_exactnumeric", "value": 2}),
+                ],
+            )],
+        );
+        assert_eq!(
+            string_function_arg_type_guard(&computed, &col_types),
+            Some(computed.clone()),
+            "a computed argument must be left unchanged without declining"
+        );
+    }
+
+    /// Post-order: the INNER string function's argument is coerced before the outer
+    /// function's own check runs, so `UPPER(TRIM(c_decimal_a))` coerces the `TRIM`
+    /// argument and leaves the (now non-column) `TRIM` node as UPPER's argument.
+    #[test]
+    fn string_fn_guard_coerces_inner_nested_string_function() {
+        let col_types = decimal_rewrite_col_types();
+        let node = string_fn("UPPER", vec![string_fn("TRIM", vec![decimal_column()])]);
+        assert_eq!(
+            string_function_arg_type_guard(&node, &col_types),
+            Some(string_fn(
+                "UPPER",
+                vec![string_fn("TRIM", vec![trimmed_decimal("c_decimal_a")])]
+            )),
+            "the inner TRIM's DECIMAL argument must be coerced exactly once"
+        );
+    }
+
+    /// `cast_to_declared_type` casts when a declared type is present and not the
+    /// `VARCHAR(2000000)` default, and returns the expression unwrapped otherwise.
+    #[test]
+    fn cast_to_declared_type_skips_the_varchar_default_and_absent_type() {
+        assert_eq!(
+            cast_to_declared_type("SUM(x)", Some("DECIMAL(18,2)")),
+            "CAST(SUM(x) AS DECIMAL(18,2))"
+        );
+        assert_eq!(
+            cast_to_declared_type("SUM(x)", Some("VARCHAR(2000000)")),
+            "SUM(x)"
+        );
+        assert_eq!(cast_to_declared_type("SUM(x)", None), "SUM(x)");
     }
 }

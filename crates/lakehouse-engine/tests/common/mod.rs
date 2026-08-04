@@ -7,27 +7,39 @@
 #![cfg(any(
     feature = "exasol-e2e",
     feature = "cloud-e2e",
-    feature = "lakekeeper-e2e"
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
 ))]
 // Each integration-test binary compiles this module independently, so a helper
 // used by only one binary (e.g. query_row_count / SEED_ROWS_SCORE_GT_15 in
 // e2e_scan_test) reads as dead code when the other binary is compiled.
 #![allow(dead_code)]
 
-#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
+#[cfg(feature = "azure-e2e")]
+pub mod azure;
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
+))]
 pub mod e2e_harness;
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "cloud-e2e",
-    feature = "lakekeeper-e2e"
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
 ))]
 pub mod exasol_ws;
 #[cfg(feature = "exasol-e2e")]
 pub mod int96_fixtures;
-#[cfg(feature = "lakekeeper-e2e")]
+#[cfg(any(feature = "lakekeeper-e2e", feature = "azure-e2e"))]
 pub mod lakekeeper;
 #[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
-#[cfg(any(feature = "exasol-e2e", feature = "lakekeeper-e2e"))]
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e"
+))]
 pub mod seed;
 pub mod stack;

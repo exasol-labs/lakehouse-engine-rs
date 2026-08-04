@@ -1,8 +1,14 @@
 /target
 **/*.so
 
+# Test environment properties
+test.env
+
 # Serena MCP workspace cache
 .serena/
+
+# Claude local settings
+.claude/
 
 # IDEs
 .idea

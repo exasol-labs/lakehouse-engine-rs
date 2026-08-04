@@ -34,7 +34,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use futures::TryStreamExt;
 use iceberg::io::{
-    S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY,
+    ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS,
+    S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
     DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveType, Schema as IcebergSchema,
@@ -133,20 +134,44 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     Ok(events_handle)
 }
 
-/// Optional authentication for a seed catalog. `Default` (`None`) reproduces
-/// the unauthenticated, static-MinIO-credential baseline that
+/// Which object store a seed catalog writes its data files through.
+///
+/// `Default` is the static MinIO baseline every pre-Azure suite seeds against, so
+/// `SeedCatalogAuth::default()` keeps reproducing the original behavior exactly.
+#[derive(Clone, Default)]
+pub enum SeedStorage {
+    /// Static MinIO admin credentials — the baseline for the REST-fixture and
+    /// Lakekeeper MinIO suites.
+    #[default]
+    Minio,
+    /// ADLS Gen2 under a storage-account key — the Azure suite's path under
+    /// test. The container-lifecycle service principal must never appear here,
+    /// or seeding would succeed without exercising the account-key path.
+    Adls {
+        account_name: String,
+        account_key: String,
+    },
+}
+
+/// Optional authentication and storage selection for a seed catalog. `Default`
+/// reproduces the unauthenticated, static-MinIO-credential baseline that
 /// [`build_seed_catalog`] shipped before Lakekeeper support.
 ///
 /// A non-empty `token` is sent to the REST catalog as a static bearer
 /// credential. This is the only catalog-auth mode the Lakekeeper E2E suite uses:
 /// its setup obtains a bearer token from Keycloak's client-credentials grant and
 /// passes it here. (The suite does NOT drive the REST client's own OAuth2
-/// client-credentials flow for seeding, nor does it override S3 storage
-/// credentials — the storage credentials are forced static unconditionally by
-/// [`build_seed_catalog_with_auth`]; see there for why.)
+/// client-credentials flow for seeding.)
+///
+/// `storage` selects the object store. [`SeedStorage::Minio`] forces static S3
+/// credentials, overriding whatever the catalog vends (see
+/// [`build_seed_catalog_with_auth`]); [`SeedStorage::Adls`] carries its account
+/// key in the properties and overrides nothing — a `sas-enabled: false` ADLS
+/// warehouse vends no credentials to override.
 #[derive(Clone, Default)]
 pub struct SeedCatalogAuth {
     pub token: Option<String>,
+    pub storage: SeedStorage,
 }
 
 // REST-catalog auth property key (literal string, fixed by `iceberg-catalog-rest`;
@@ -204,26 +229,39 @@ impl ProvideCredential for StaticS3CredentialProvider {
 /// Build the REST-catalog property map for a seed catalog from `auth`.
 ///
 /// Pure (no I/O) so the credential/storage wiring is unit-testable without a
-/// live catalog. Storage is the static MinIO baseline; catalog auth is a static
-/// bearer `token` when supplied (non-empty), otherwise none.
+/// live catalog. Storage properties follow `auth.storage`; catalog auth is a static
+/// bearer `token` when supplied (non-empty), otherwise none. The two storage arms
+/// are mutually exclusive: an ADLS seed carries no S3 property at all, so a MinIO
+/// credential can never travel with an Azure warehouse.
 fn seed_catalog_props(
     catalog_url: &str,
     warehouse: &str,
     auth: &SeedCatalogAuth,
 ) -> HashMap<String, String> {
-    let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
-
     let mut props = HashMap::new();
     props.insert(REST_CATALOG_PROP_URI.to_string(), catalog_url.to_string());
     props.insert(
         REST_CATALOG_PROP_WAREHOUSE.to_string(),
         warehouse.to_string(),
     );
-    props.insert(S3_ENDPOINT.to_string(), endpoint);
-    props.insert(S3_REGION.to_string(), region);
-    props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
-    props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
-    props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
+
+    match &auth.storage {
+        SeedStorage::Minio => {
+            let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
+            props.insert(S3_ENDPOINT.to_string(), endpoint);
+            props.insert(S3_REGION.to_string(), region);
+            props.insert(S3_ACCESS_KEY_ID.to_string(), access_key);
+            props.insert(S3_SECRET_ACCESS_KEY.to_string(), secret_key);
+            props.insert(S3_PATH_STYLE_ACCESS.to_string(), path_style.to_string());
+        }
+        SeedStorage::Adls {
+            account_name,
+            account_key,
+        } => {
+            props.insert(ADLS_ACCOUNT_NAME.to_string(), account_name.clone());
+            props.insert(ADLS_ACCOUNT_KEY.to_string(), account_key.clone());
+        }
+    }
 
     if let Some(token) = auth.token.as_deref().filter(|v| !v.is_empty()) {
         props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
@@ -248,9 +286,9 @@ pub async fn build_seed_catalog(
 /// Build a REST catalog client for seed operations with explicit `auth`.
 ///
 /// Extends [`build_seed_catalog`] so seeding can target an OAuth2-secured
-/// Lakekeeper warehouse via a static bearer catalog-auth token.
-/// `SeedCatalogAuth::default()` reproduces the unauthenticated static-MinIO
-/// baseline exactly.
+/// Lakekeeper warehouse via a static bearer catalog-auth token, over either
+/// storage backend. `SeedCatalogAuth::default()` reproduces the unauthenticated
+/// static-MinIO baseline exactly.
 pub async fn build_seed_catalog_with_auth(
     catalog_url: &str,
     warehouse: &str,
@@ -259,31 +297,42 @@ pub async fn build_seed_catalog_with_auth(
 ) -> Result<impl Catalog> {
     let props = seed_catalog_props(catalog_url, warehouse, &auth);
 
-    // Force the STATIC S3 credentials for ALL storage I/O, overriding whatever the
-    // catalog vends per-table. Lakekeeper's `sts-enabled` (vended) warehouse
-    // returns short-lived STS session-token credentials in each table's
-    // `loadTable`/`config` response, and iceberg-catalog-rest merges that config
-    // OVER the static builder props (`RestCatalog::load_file_io`: `props.extend(
-    // config)`), so the seed WRITE path would otherwise sign with the vended
-    // session token — which MinIO rejects with `InvalidTokenId`. Installing a
-    // `CustomAwsCredentialLoader` makes opendal's S3 backend use this
-    // credential-provider chain in place of the config-derived credentials (a
-    // user-supplied chain REPLACES the default/static provider), so seeding always
-    // writes with the static admin credentials regardless of the warehouse's
-    // vended-creds flag. The static warehouse never vends creds, so its seeding
-    // behavior is unchanged (the loader returns the same `minioadmin` credentials
-    // the props already carried). This is a seed-harness-only override; the
-    // adapter's own read path handles vended credentials correctly.
-    let (_, _, access_key, secret_key, _) = seed_storage_config();
-    let credential_loader = CustomAwsCredentialLoader::new(StaticS3CredentialProvider {
-        access_key_id: access_key,
-        secret_access_key: secret_key,
-    });
+    let storage_factory: Arc<dyn StorageFactory> = match &auth.storage {
+        // Force the STATIC S3 credentials for ALL storage I/O, overriding whatever
+        // the catalog vends per-table. Lakekeeper's `sts-enabled` (vended) warehouse
+        // returns short-lived STS session-token credentials in each table's
+        // `loadTable`/`config` response, and iceberg-catalog-rest merges that config
+        // OVER the static builder props (`RestCatalog::load_file_io`: `props.extend(
+        // config)`), so the seed WRITE path would otherwise sign with the vended
+        // session token — which MinIO rejects with `InvalidTokenId`. Installing a
+        // `CustomAwsCredentialLoader` makes opendal's S3 backend use this
+        // credential-provider chain in place of the config-derived credentials (a
+        // user-supplied chain REPLACES the default/static provider), so seeding
+        // always writes with the static admin credentials regardless of the
+        // warehouse's vended-creds flag. The static warehouse never vends creds, so
+        // its seeding behavior is unchanged (the loader returns the same
+        // `minioadmin` credentials the props already carried). This is a
+        // seed-harness-only override; the adapter's own read path handles vended
+        // credentials correctly.
+        SeedStorage::Minio => {
+            let (_, _, access_key, secret_key, _) = seed_storage_config();
+            Arc::new(OpenDalStorageFactory::S3 {
+                customized_credential_load: Some(CustomAwsCredentialLoader::new(
+                    StaticS3CredentialProvider {
+                        access_key_id: access_key,
+                        secret_access_key: secret_key,
+                    },
+                )),
+            })
+        }
+        // No override needed: the Azure warehouse is `sas-enabled: false`, so
+        // Lakekeeper vends nothing here to clobber — the account-key property
+        // `seed_catalog_props` set is the only credential in play.
+        SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
+    };
 
     RestCatalogBuilder::default()
-        .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: Some(credential_loader),
-        }))
+        .with_storage_factory(storage_factory)
         .load(label, props)
         .await
         .context("connect to Iceberg REST catalog for seeding")
@@ -978,8 +1027,28 @@ pub fn order_date_days(order_key: usize) -> i32 {
     BASE_DATE + (order_key as i32 - 1)
 }
 
+/// Precision/scale of `fact_orders.O_TOTALPRICE`, the scale > 0 DECIMAL column whose
+/// stringified length differs between DataFusion's full-scale text and Exasol's
+/// trimmed form (#223 slice 2).
+pub const O_TOTALPRICE_PS: (u8, i8) = (10, 2);
+
+/// The unscaled `O_TOTALPRICE` value (scale [`O_TOTALPRICE_PS`].1 = 2) for a
+/// given order key, chosen so the untrimmed fixed-scale string and Exasol's
+/// own trimmed string diverge in length: every value ends in `"00"` (the
+/// trimmed form is always exactly 3 characters shorter, e.g. `"2912.00"` ->
+/// `"2912"`), and the integer part's digit count grows with the order key so a
+/// `LENGTH(...)` WHERE filter genuinely discriminates rows instead of
+/// splitting the whole table on one side.
+pub fn order_totalprice_unscaled(order_key: usize) -> i64 {
+    const VALUES: [i64; FACT_ORDERS_ROWS] = [
+        100, 800, 2700, 6400, 12500, 21600, 291200, 512000, 729000, 1000000,
+    ];
+    VALUES[order_key - 1]
+}
+
 /// Seed the `dim_customer` and `fact_orders` star-schema tables into the
-/// `e2e_lakehouse` namespace. Idempotent.
+/// `e2e_lakehouse` namespace, including `fact_orders.O_TOTALPRICE` (a scale > 0
+/// DECIMAL column, see [`O_TOTALPRICE_PS`]). Idempotent.
 pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> {
     let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-star").await?;
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
@@ -1009,12 +1078,22 @@ pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> 
     .await
     .context("seed dim_customer table")?;
 
+    let (tp_p, tp_s) = O_TOTALPRICE_PS;
     let fact_schema = IcebergSchema::builder()
         .with_schema_id(0)
         .with_fields(vec![
             NestedField::required(1, "O_ORDERKEY", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(2, "O_CUSTKEY", Type::Primitive(PrimitiveType::Long)).into(),
             NestedField::required(3, "O_ORDERDATE", Type::Primitive(PrimitiveType::Date)).into(),
+            NestedField::required(
+                4,
+                "O_TOTALPRICE",
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: tp_p as u32,
+                    scale: tp_s as u32,
+                }),
+            )
+            .into(),
         ])
         .build()
         .context("build fact_orders Iceberg schema")?;
@@ -1059,12 +1138,21 @@ fn make_orders_batch(first_key: usize, last_key: usize) -> RecordBatch {
     let order_keys: Vec<i64> = (first_key as i64..=last_key as i64).collect();
     let cust_keys: Vec<i64> = (first_key..=last_key).map(order_custkey).collect();
     let dates: Vec<i32> = (first_key..=last_key).map(order_date_days).collect();
+    let total_prices: Vec<i128> = (first_key..=last_key)
+        .map(|k| order_totalprice_unscaled(k) as i128)
+        .collect();
+    let (tp_p, tp_s) = O_TOTALPRICE_PS;
 
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("O_ORDERKEY", DataType::Int64, false),
         Field::new("O_CUSTKEY", DataType::Int64, false),
         Field::new("O_ORDERDATE", DataType::Date32, false),
+        Field::new("O_TOTALPRICE", DataType::Decimal128(tp_p, tp_s), false),
     ]));
+
+    let total_price_array = Decimal128Array::from(total_prices)
+        .with_precision_and_scale(tp_p, tp_s)
+        .expect("O_TOTALPRICE precision/scale is valid");
 
     RecordBatch::try_new(
         schema,
@@ -1072,6 +1160,7 @@ fn make_orders_batch(first_key: usize, last_key: usize) -> RecordBatch {
             Arc::new(Int64Array::from(order_keys)),
             Arc::new(Int64Array::from(cust_keys)),
             Arc::new(Date32Array::from(dates)),
+            Arc::new(total_price_array),
         ],
     )
     .expect("fact_orders RecordBatch construction is infallible")
@@ -2935,6 +3024,75 @@ fn make_char_pad_batch() -> RecordBatch {
         .expect("CHAR-padding probe RecordBatch construction is infallible")
 }
 
+/// Namespace and table for the non-ASCII (`ß`) identifier E2E coverage
+/// (`refactor-col-types-guard-dedup` task 7). Its OWN namespace, so this table
+/// never enters any other suite's `createVirtualSchema` table enumeration —
+/// every other E2E virtual schema is created over [`E2E_NAMESPACE`].
+pub const E2E_NONASCII_NAMESPACE: &str = "e2e_nonascii";
+/// Both the TABLE name and the COLUMN name under test are this same
+/// non-ASCII identifier, so the table and the seeder cannot drift apart.
+pub const E2E_NONASCII_TABLE: &str = "straße";
+pub const NONASCII_COL: &str = E2E_NONASCII_TABLE;
+
+/// Seeded values for the `straße` column, prefixed so a `LIKE` predicate
+/// selects a proper subset ([`NONASCII_LIKE_PATTERN`] matches the first two).
+pub const NONASCII_VALUES: [&str; 4] = ["alpha-1", "alpha-2", "beta-1", "beta-2"];
+pub const NONASCII_TOTAL_ROWS: i64 = NONASCII_VALUES.len() as i64;
+pub const NONASCII_LIKE_PATTERN: &str = "alpha%";
+pub const NONASCII_LIKE_MATCH_COUNT: i64 = 2;
+
+/// Seed the `straße` table (`id`, `straße`) into its own `e2e_nonascii`
+/// namespace. Idempotent.
+pub async fn seed_non_ascii_identifier(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-nonascii").await?;
+    let ns = NamespaceIdent::new(E2E_NONASCII_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for straße table")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, NONASCII_COL, Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build straße Iceberg schema")?;
+
+    create_and_append(
+        &catalog,
+        E2E_NONASCII_NAMESPACE,
+        E2E_NONASCII_TABLE,
+        iceberg_schema,
+        vec![make_non_ascii_identifier_batch()],
+    )
+    .await
+    .context("seed straße table")?;
+    Ok(())
+}
+
+fn make_non_ascii_identifier_batch() -> RecordBatch {
+    let ids: Vec<i64> = (1..=NONASCII_VALUES.len() as i64).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(NONASCII_COL, DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(NONASCII_VALUES.to_vec())),
+        ],
+    )
+    .expect("straße RecordBatch construction is infallible")
+}
+
 #[cfg(test)]
 mod seed_catalog_props_tests {
     use super::*;
@@ -2969,12 +3127,52 @@ mod seed_catalog_props_tests {
         assert!(get(&props, "oauth2-server-uri").is_none());
         assert!(get(&props, "scope").is_none());
         assert!(get(&props, "token").is_none());
+        // The storage arms are mutually exclusive: no ADLS property rides along on
+        // the MinIO baseline.
+        assert!(get(&props, ADLS_ACCOUNT_NAME).is_none());
+        assert!(get(&props, ADLS_ACCOUNT_KEY).is_none());
+    }
+
+    #[test]
+    fn adls_storage_carries_the_account_key_and_no_s3_property() {
+        let auth = SeedCatalogAuth {
+            token: Some("bearer-xyz".to_string()),
+            storage: SeedStorage::Adls {
+                account_name: "lhrsstatic".to_string(),
+                account_key: "a2V5".to_string(),
+            },
+        };
+        let props = seed_catalog_props("http://lk:8181/catalog", "wh-azure", &auth);
+
+        assert_eq!(get(&props, ADLS_ACCOUNT_NAME), Some("lhrsstatic"));
+        assert_eq!(get(&props, ADLS_ACCOUNT_KEY), Some("a2V5"));
+        assert_eq!(get(&props, REST_CATALOG_PROP_WAREHOUSE), Some("wh-azure"));
+        // Catalog auth is orthogonal to storage: an ADLS seed still needs its
+        // Lakekeeper bearer token.
+        assert_eq!(get(&props, "token"), Some("bearer-xyz"));
+
+        // `azdls_config_parse` discards `s3.*` properties silently, so a stray one
+        // wouldn't fail the seed — it would just leak MinIO admin credentials into
+        // an Azure run invisibly.
+        for s3_prop in [
+            S3_ENDPOINT,
+            S3_REGION,
+            S3_ACCESS_KEY_ID,
+            S3_SECRET_ACCESS_KEY,
+            S3_PATH_STYLE_ACCESS,
+        ] {
+            assert!(
+                get(&props, s3_prop).is_none(),
+                "an ADLS seed must carry no {s3_prop}"
+            );
+        }
     }
 
     #[test]
     fn static_bearer_token_is_injected_when_no_client_credentials() {
         let auth = SeedCatalogAuth {
             token: Some("bearer-xyz".to_string()),
+            ..Default::default()
         };
         let props = seed_catalog_props("http://lk:8181/catalog", "wh", &auth);
 

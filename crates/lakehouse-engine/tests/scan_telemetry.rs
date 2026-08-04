@@ -22,7 +22,9 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
-use lakehouse_engine::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
+use lakehouse_engine::scan::spec::{
+    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
@@ -133,14 +135,14 @@ fn scan_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageProps {
+            storage: StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            },
+            }),
             df_batch_size: 64,
             ..Default::default()
         },

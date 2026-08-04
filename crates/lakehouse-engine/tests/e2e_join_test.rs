@@ -29,7 +29,8 @@ use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
-    LINEITEM_ROWS, seed_events,
+    FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days,
+    order_totalprice_unscaled, seed_events,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -185,9 +186,29 @@ fn value_to_string(v: &serde_json::Value) -> String {
 
 /// Compute the expected join result INDEPENDENTLY of the join pushdown: read both
 /// tables un-joined through the VS and join them in-process. This is the ground
-/// truth both the broadcast and fallback join results must match.
+/// truth both the broadcast and fallback join results must match. Delegates to
+/// [`expected_join_rows_with_fact_where`] with this module's fixed `O_ORDERDATE`
+/// bound.
 fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    // custkey -> name
+    expected_join_rows_with_fact_where(
+        conn,
+        vs_name,
+        &format!("O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"),
+    )
+}
+
+/// Compute the expected join result for an arbitrary side-local `fact_orders`
+/// WHERE clause, INDEPENDENTLY of the join pushdown under test: apply the SAME
+/// clause through the single-table WHERE surface (an already-correct, previously
+/// verified render path unrelated to the join sites this plan wires), then join
+/// the filtered fact rows against `dim_customer` in-process. Generalizes
+/// [`expected_join_rows`]'s fixed bound to an arbitrary caller-supplied predicate,
+/// reused by the join-filter-type-coercion tests.
+fn expected_join_rows_with_fact_where(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    fact_where: &str,
+) -> Vec<(String, String)> {
     let dim_cols = conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
         vs_dim_table(vs_name)
@@ -199,9 +220,8 @@ fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)
         .map(|(k, n)| (value_to_string(k), value_to_string(n)))
         .collect();
 
-    // fact rows (custkey, orderdate) with the same WHERE filter, un-joined.
     let fact_cols = conn.query_columns(&format!(
-        "SELECT O_CUSTKEY, O_ORDERDATE FROM {} WHERE O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'",
+        "SELECT O_CUSTKEY, O_ORDERDATE FROM {} WHERE {fact_where}",
         vs_fact_table(vs_name)
     ));
     assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
@@ -893,4 +913,627 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
          same select list evaluated over the un-joined fact_lineitem table.\n\
          actual:   {actual:?}\nexpected: {expected:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Declined-filter self-apply at the join render sites (plan
+// fix-declined-filter-self-apply, tasks 2.8/2.9, #279). A side-local WHERE
+// conjunct DataFusion's dialect cannot render — `SECOND(<col>, 3)`, the same
+// 2-argument arity refusal `vs-expression`'s
+// second_with_precision_declines_for_datafusion_renders_for_exasol pins —
+// must still be applied: at the broadcast site by declining the broadcast
+// plan altogether (task 2.3), and at the N-scan site as a residual
+// outer-WHERE conjunct alongside a rendering conjunct that still reaches its
+// own leg's scan-spec filter (task 2.4). `O_ORDERDATE` is a plain DATE column
+// (no time component), so `SECOND(O_ORDERDATE, 3)` is always `0` — verified
+// live against the Docker Exasol container (`SELECT SECOND(DATE
+// '2024-01-05', 3)` = `0`) — making the declined predicate always-true over
+// the seeded data. The correctness assertion is therefore that the declined
+// filter costs no rows, not that it narrows them.
+// ---------------------------------------------------------------------------
+
+/// A below-threshold two-table inner equi-join with a single declined
+/// side-local conjunct (`SECOND(O_ORDERDATE, 3) = 0`, always true for the
+/// seeded DATE column) and no postprocessing.
+fn broadcast_declined_filter_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE SECOND(o.O_ORDERDATE, 3) = 0",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
+/// The full (unfiltered) `fact_orders ⋈ dim_customer` join, computed
+/// independently of the join pushdown — the ground truth
+/// [`broadcast_declined_filter_join_query`] must match, since its sole filter
+/// is always true over the seeded data. Same shape as [`expected_join_rows`]
+/// with the `O_ORDERDATE` WHERE bound dropped.
+fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    let dim_cols = conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    ));
+    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
+    let custkey_to_name: HashMap<String, String> = dim_cols[0]
+        .iter()
+        .zip(dim_cols[1].iter())
+        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
+        .collect();
+
+    let fact_cols = conn.query_columns(&format!(
+        "SELECT O_CUSTKEY, O_ORDERDATE FROM {}",
+        vs_fact_table(vs_name)
+    ));
+    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
+
+    let mut rows: Vec<(String, String)> = fact_cols[0]
+        .iter()
+        .zip(fact_cols[1].iter())
+        .map(|(custkey, date)| {
+            let key = value_to_string(custkey);
+            let name = custkey_to_name
+                .get(&key)
+                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
+                .clone();
+            (name, value_to_string(date))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A below-threshold two-table inner equi-join carrying a declined side-local
+/// WHERE conjunct (`SECOND(O_ORDERDATE, 3)`, a 2-argument arity refusal under
+/// the DataFusion dialect) declines the broadcast plan altogether (task 2.3)
+/// rather than silently dropping the predicate and riding the broadcast
+/// in-UDF join unfiltered: the pushed plan is the N-scan wrapper, never a
+/// broadcast common-blob join block, and the result is correct.
+#[test]
+fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = broadcast_declined_filter_join_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a declined side-local filter must decline the broadcast plan and fall \
+         back to the N-scan wrapper (LHS_T0/LHS_T1), not omit the predicate:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a declined filter must NOT ride the broadcast in-UDF join unfiltered \
+         (no common-blob join block may appear):\n{pushed}"
+    );
+    assert!(
+        pushed.contains("SECOND("),
+        "the fallback wrapper must self-apply the declined conjunct in its own \
+         outer WHERE, not just fall back and drop it:\n{pushed}"
+    );
+
+    let cols = conn.query_columns(&query);
+    let actual = columns_to_sorted_pairs(&cols);
+    let expected = expected_full_join_rows(&mut conn, VS_NAME);
+
+    assert_eq!(
+        actual.len(),
+        FACT_ORDERS_ROWS,
+        "SECOND(O_ORDERDATE, 3) is always 0 for the seeded DATE column, so the \
+         declined filter must cost no rows: expected {FACT_ORDERS_ROWS}, got {}: {actual:?}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "the N-scan fallback result must equal the independently computed \
+         unfiltered join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A below-threshold two-table inner equi-join carrying a declined side-local
+/// WHERE conjunct that is FALSE for every seeded row (`SECOND(O_ORDERDATE, 3)
+/// = 1`, since `O_ORDERDATE` is a plain DATE with no time component so
+/// `SECOND(..., 3)` is always `0`). Unlike
+/// [`e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters`], whose
+/// always-true conjunct cannot distinguish "self-applied" from "silently
+/// dropped", this always-false conjunct can: a build that dropped the
+/// declined predicate instead of self-applying it would return every row,
+/// while the correct self-apply excludes them all.
+#[test]
+fn e2e_broadcast_declined_filter_excludes_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE SECOND(o.O_ORDERDATE, 3) = 1",
+        vs_fact_table(VS_NAME),
+        vs_dim_table(VS_NAME)
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a declined side-local filter must decline the broadcast plan and fall \
+         back to the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+    );
+
+    let row_count = conn.query_row_count(&query);
+    assert_eq!(
+        row_count, 0,
+        "SECOND(O_ORDERDATE, 3) = 1 is false for every seeded DATE row, so a \
+         correctly self-applied declined conjunct must exclude every row \
+         (a build that silently dropped it instead would return all \
+         {FACT_ORDERS_ROWS}): got {row_count}"
+    );
+}
+
+/// A three-table inner equi-join carrying BOTH a rendering side-local
+/// conjunct (`O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'`, unchanged from
+/// [`join_query`]) and a declined side-local conjunct (`SECOND(O_ORDERDATE,
+/// 3) = 0`, always true), both local to the `fact_orders` side.
+fn three_table_join_with_mixed_filters_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {} c \
+         JOIN {} o ON c.C_CUSTKEY = o.O_CUSTKEY \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
+         WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' \
+         AND SECOND(o.O_ORDERDATE, 3) = 0",
+        vs_dim_table(vs_name),
+        vs_fact_table(vs_name),
+        vs_lineitem_table(vs_name)
+    )
+}
+
+/// The expected result of [`three_table_join_with_mixed_filters_query`],
+/// computed independently of the join pushdown: the same
+/// `O_ORDERDATE >= {ORDERDATE_LOWER_BOUND}` bound narrows `fact_orders`
+/// before joining against `dim_customer` and `fact_lineitem`; the declined
+/// `SECOND(...) = 0` conjunct contributes no additional narrowing (always
+/// true for the seeded DATE column), so it is not applied here.
+fn expected_three_table_join_rows_with_orderdate_filter(
+    conn: &mut ExaConn,
+    vs_name: &str,
+) -> Vec<Vec<String>> {
+    let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    )));
+    let orderkey_to_custkey = build_key_to_value_map(&conn.query_columns(&format!(
+        "SELECT O_ORDERKEY, O_CUSTKEY FROM {} WHERE O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'",
+        vs_fact_table(vs_name)
+    )));
+
+    let line_cols = conn.query_columns(&format!(
+        "SELECT L_ORDERKEY, L_LINENUMBER, L_QUANTITY FROM {}",
+        vs_lineitem_table(vs_name)
+    ));
+    assert_eq!(line_cols.len(), 3, "lineitem query must return 3 columns");
+
+    let mut rows: Vec<Vec<String>> = (0..line_cols[0].len())
+        .filter_map(|i| {
+            let order_key = value_to_string(&line_cols[0][i]);
+            let cust_key = orderkey_to_custkey.get(&order_key)?;
+            let name = custkey_to_name
+                .get(cust_key)
+                .unwrap_or_else(|| panic!("O_CUSTKEY {cust_key} has no matching customer"))
+                .clone();
+            let line_number = value_to_string(&line_cols[1][i]);
+            let quantity = value_to_string(&line_cols[2][i]);
+            Some(vec![name, line_number, quantity])
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A three-table inner-join whose WHERE carries both a rendering side-local
+/// conjunct and a declined side-local conjunct — both local to the
+/// `fact_orders` side — is served by the N-scan wrapper with the two
+/// conjuncts partitioned correctly (task 2.4): the declined conjunct
+/// (`SECOND(..., 3)`) is carried by the outer wrapper's `WHERE` in Exasol
+/// dialect (it can only appear there — DataFusion never renders it, so it
+/// cannot reach any leg's `ScanSpec.filter`), while the rendering conjunct
+/// (`O_ORDERDATE >= DATE '...'`) still reaches its own leg's DataFusion
+/// `ScanSpec.filter`, unchanged from the single-conjunct case. The result is
+/// correct.
+///
+/// Exasol canonicalizes the rendering conjunct before the adapter ever sees
+/// it — the pushdown request carries `predicate_lessequal(literal_date,
+/// column)`, i.e. `DATE '...' <= O_ORDERDATE`, not the `>=` form as written —
+/// so the leg's rendered filter is asserted in that canonical (flipped)
+/// shape, confirmed against the live EXPLAIN VIRTUAL output.
+#[test]
+fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = three_table_join_with_mixed_filters_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 3),
+        "a three-table join must emit the N-scan wrapper with three distinct \
+         LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a three-table join must NOT carry a broadcast common-blob join \
+         block:\n{pushed}"
+    );
+
+    // The declined conjunct is rendered as a verbatim Exasol function call
+    // (`SECOND(...)`) — it can appear ONLY in the outer wrapper's WHERE,
+    // never inside a leg's DataFusion-rendered `ScanSpec.filter` (that
+    // dialect refuses the 2-argument form), so this substring alone proves
+    // the declined conjunct was self-applied rather than silently dropped.
+    assert!(
+        pushed.contains("SECOND("),
+        "the declined SECOND(..., 3) conjunct must be rendered as a verbatim \
+         Exasol call in the outer wrapper's WHERE:\n{pushed}"
+    );
+    // The rendering conjunct is rendered under the DataFusion dialect
+    // (bare/unqualified, `render_df_filter_safe`) into its leg's
+    // `ScanSpec.filter` as a SQL string, itself embedded in the outer JSON
+    // scan-spec blob — hence the doubled single-quote (SQL string-literal
+    // escaping) around the DATE literal. This exact form cannot appear in
+    // Exasol's own echoed pushdown-request JSON, which encodes the DATE
+    // literal as a plain `"value" : "2024-01-05"` field, never wrapped in
+    // `DATE ''...''`.
+    assert!(
+        pushed.contains(&format!("DATE ''{ORDERDATE_LOWER_BOUND}''")),
+        "the rendering O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' conjunct \
+         must still reach its leg's scan-spec filter:\n{pushed}"
+    );
+
+    let cols = conn.query_columns(&query);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 result columns, got {}",
+        cols.len()
+    );
+    let actual = fetch_rows_as_vecs(&cols);
+    let expected = expected_three_table_join_rows_with_orderdate_filter(&mut conn, VS_NAME);
+
+    assert!(
+        !actual.is_empty(),
+        "expected at least one row (orders on/after {ORDERDATE_LOWER_BOUND}), got none"
+    );
+    assert_eq!(
+        actual, expected,
+        "the mixed rendering/declined-filter three-table join result must \
+         equal the independently computed join.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Join-filter type-coercion: `apply_type_rewrites` (the single-table WHERE
+// surface's pipeline) is now wired into BOTH join WHERE-filter sites. A `LIKE` over a non-string, non-DATE
+// column has no DataFusion coercion and used to hard-fail the scan (#215); a
+// `LIKE` over a DATE column is rewrapped in `CAST(... AS VARCHAR)` and keeps its
+// pushdown; an `INSTR`/`LOCATE` call beyond 2 arguments used to silently drop the
+// extra argument (#228); a `DECIMAL` column stringified in a WHERE filter used to
+// render the untrimmed fixed-scale text instead of Exasol's own trimmed form
+// (#223 slice 2). Every case now either renders correctly or declines cleanly and
+// self-applies (#285), never silently mis-answering or crashing.
+// ---------------------------------------------------------------------------
+
+/// A below-threshold two-table inner equi-join whose WHERE carries `LIKE` over
+/// the `DECIMAL(20,0)` `O_CUSTKEY` column. `like_subject_type_guard`
+/// has no DECIMAL coercion, so this must decline the broadcast plan and fall
+/// back to the N-scan wrapper, whose outer WHERE self-applies the LIKE.
+fn like_on_custkey_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE o.O_CUSTKEY LIKE '1%'",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
+/// The same below-threshold join, but with `LIKE` over the `DATE` `O_ORDERDATE`
+/// column. `like_subject_type_guard` rewraps the subject as
+/// `CAST(<col> AS VARCHAR)`, which DataFusion renders, so the broadcast plan
+/// survives. The `'2024-01-0%'` pattern matches Exasol's default
+/// `NLS_DATE_FORMAT` (ISO `YYYY-MM-DD`), but the test does not depend on that
+/// format being in effect: the expected rows are computed by running the SAME
+/// pattern through the single-table WHERE surface (which renders through the
+/// identical CAST-to-VARCHAR rewrite under whatever format is ambient), so actual
+/// and expected agree regardless of session format.
+fn like_on_orderdate_join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE o.O_ORDERDATE LIKE '2024-01-0%'",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
+/// `LIKE` over the `DECIMAL` `O_CUSTKEY` column declines the broadcast plan:
+/// the pushed SQL must be the N-scan wrapper, never a broadcast
+/// common-blob join block, and no leg's scan-spec may carry the declined
+/// predicate — it must be self-applied in the wrapper's own outer WHERE
+/// instead. The returned rows must equal the ground truth.
+#[test]
+fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = like_on_custkey_join_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_two_scan_wrapper(&pushed),
+        "LIKE over the DECIMAL O_CUSTKEY column must decline the broadcast \
+         plan and fall back to the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "LIKE over a DECIMAL side column must NOT ride the broadcast in-UDF \
+         join unfiltered (no common-blob join block may appear):\n{pushed}"
+    );
+    assert!(
+        !pushed.contains(r#""filter":""#),
+        "a type-declined LIKE-over-DECIMAL conjunct must not reach any leg's \
+         scan-spec filter:\n{pushed}"
+    );
+    assert!(
+        pushed.contains("LIKE"),
+        "the type-declined conjunct must still be self-applied in the \
+         wrapper's own outer WHERE, not dropped:\n{pushed}"
+    );
+
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+    let expected = expected_join_rows_with_fact_where(&mut conn, VS_NAME, "O_CUSTKEY LIKE '1%'");
+    assert!(
+        !expected.is_empty(),
+        "expected at least one row for O_CUSTKEY LIKE '1%' (order keys 1 and \
+         6 reference customer 1)"
+    );
+    assert_eq!(
+        actual, expected,
+        "the N-scan fallback result must equal the independently computed \
+         (single-table ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// `LIKE` over the `DATE` `O_ORDERDATE` column keeps the broadcast plan: the
+/// pushed SQL must still carry a broadcast common-blob join block, and
+/// the rewritten filter must carry a `CAST(...)` over `O_ORDERDATE`. The returned
+/// rows must equal the ground truth, and must be a genuine subset of the full
+/// fact table (order key 10, `2024-01-10`, does not match the pattern).
+#[test]
+fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = like_on_orderdate_join_query(VS_NAME);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "LIKE over a DATE side column must KEEP the broadcast plan (the CAST \
+         rewrite still renders for DataFusion):\n{pushed}"
+    );
+    assert!(
+        pushed.contains("CAST(") && pushed.contains("O_ORDERDATE"),
+        "the DATE LIKE subject must be rewrapped in CAST(...) before the \
+         LIKE:\n{pushed}"
+    );
+
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+    let expected =
+        expected_join_rows_with_fact_where(&mut conn, VS_NAME, "O_ORDERDATE LIKE '2024-01-0%'");
+    assert!(
+        !expected.is_empty() && expected.len() < FACT_ORDERS_ROWS,
+        "O_ORDERDATE LIKE '2024-01-0%' must genuinely narrow the \
+         {FACT_ORDERS_ROWS}-row fact table (order 10, 2024-01-10, must be \
+         excluded), got {} matching rows",
+        expected.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "the broadcast join result must equal the independently computed \
+         (single-table ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// Against `VS_NAME_LOW` (forced N-scan fallback), a side-local `LIKE` over the
+/// `DECIMAL` `O_CUSTKEY` column must be screened out of its leg and applied only
+/// in the wrapper's own outer WHERE: the per-side type screen
+/// (`type_screened_leg_filter`) must reject it from `build_side_fan_out_sql`'s
+/// leg just as it does at the broadcast site.
+#[test]
+fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = like_on_custkey_join_query(VS_NAME_LOW);
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_two_scan_wrapper(&pushed),
+        "VS_NAME_LOW must always emit the N-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+    );
+    assert!(
+        !pushed.contains(r#""filter":""#),
+        "a type-declined LIKE-over-DECIMAL side-local conjunct must not reach \
+         its leg's scan-spec filter:\n{pushed}"
+    );
+    assert!(
+        pushed.contains("LIKE"),
+        "the type-declined conjunct must still be self-applied in the \
+         wrapper's own outer WHERE, not dropped:\n{pushed}"
+    );
+
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+    let expected =
+        expected_join_rows_with_fact_where(&mut conn, VS_NAME_LOW, "O_CUSTKEY LIKE '1%'");
+    assert!(
+        !expected.is_empty(),
+        "expected at least one row for O_CUSTKEY LIKE '1%' (order keys 1 and \
+         6 reference customer 1)"
+    );
+    assert_eq!(
+        actual, expected,
+        "the N-scan result must equal the independently computed (single-table \
+         ground truth) join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A join WHERE filter carrying `INSTR(C_NAME, 'c', 3)` — a three-argument call
+/// over the VARCHAR `C_NAME` column — exercises the #228 side effect: wiring the
+/// full type-rewrite pipeline into the join sites (not just the LIKE guard) also
+/// narrows #228's exposure there, so the whole arity-3 call declines and Exasol
+/// evaluates it natively rather than a start-position-ignoring 2-argument
+/// `strpos` silently mis-answering it.
+///
+/// Every seeded `dim_customer.C_NAME` is `"customer-0N"`: `'c'` occurs only at
+/// position 1, before the start position 3, so the CORRECT native
+/// `INSTR(C_NAME, 'c', 3)` is 0 for every customer — the WHERE keeps every row
+/// (the full join, `FACT_ORDERS_ROWS` rows). A `strpos`-style rewrite that
+/// silently drops the start-position argument would instead find `'c'` at
+/// position 1 for every customer, answer `1`, and make `= 0` false for every
+/// row — returning zero rows instead.
+
+#[test]
+fn e2e_join_instr_with_start_position_returns_native_result() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE INSTR(c.C_NAME, 'c', 3) = 0",
+        vs_fact_table(VS_NAME),
+        vs_dim_table(VS_NAME)
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_two_scan_wrapper(&pushed),
+        "the 3-argument INSTR must decline the broadcast plan and fall through \
+         to the N-scan wrapper:\n{pushed}"
+    );
+    // Confirmed against live EXPLAIN VIRTUAL output: the outer wrapper's WHERE
+    // renders the verbatim Exasol 3-argument form with the literal start
+    // position, not the DataFusion-dialect `strpos` that drops it.
+    assert!(
+        pushed.contains(r#"INSTR("LHS_T1"."C_NAME", 'c', 3)"#),
+        "the outer WHERE must carry the verbatim 3-argument INSTR call with the \
+         literal start position 3:\n{pushed}"
+    );
+    assert!(
+        !pushed.contains("strpos("),
+        "the declined INSTR must never reach a leg's DataFusion-dialect render, \
+         which would drop the start-position argument:\n{pushed}"
+    );
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+    let expected = expected_full_join_rows(&mut conn, VS_NAME);
+
+    assert_eq!(
+        actual.len(),
+        FACT_ORDERS_ROWS,
+        "INSTR(C_NAME, 'c', 3) = 0 must hold for every seeded customer (no \
+         'c' at or after position 3 in 'customer-0N'), so the native result \
+         must be all {FACT_ORDERS_ROWS} rows; a start-position-ignoring strpos \
+         rewrite would instead find 'c' at position 1 and return 0 rows: got {}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "the join result under the natively-evaluated INSTR filter must equal \
+         the unfiltered join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// The trimmed decimal text Exasol renders for a seeded `fact_orders.O_TOTALPRICE`,
+/// derived from the fixture alone: [`order_totalprice_unscaled`] divided by
+/// `10 ^ O_TOTALPRICE_PS.1`, since Exasol drops an all-zero fractional part
+/// (`2912.00` -> `2912`, the `pushdown-planning-decimal-string-format` convention,
+/// #211).
+///
+/// The all-zero fractional part is a seed invariant `order_totalprice_unscaled`
+/// documents and this function ASSERTS, so a seed edit that introduced a non-zero
+/// scale digit fails here rather than silently changing what the oracle means.
+fn expected_totalprice_text(order_key: usize) -> String {
+    let divisor = 10_i64
+        .pow(u32::try_from(O_TOTALPRICE_PS.1).expect("the O_TOTALPRICE scale is non-negative"));
+    let unscaled = order_totalprice_unscaled(order_key);
+    assert_eq!(
+        unscaled % divisor,
+        0,
+        "seed invariant: every O_TOTALPRICE must have an all-zero fractional part, \
+         so its trimmed text is the integer part alone; order {order_key} \
+         (unscaled {unscaled}, scale {}) breaks it",
+        O_TOTALPRICE_PS.1
+    );
+    (unscaled / divisor).to_string()
+}
+
+/// The `YYYY-MM-DD` text Exasol returns for a seeded order's `O_ORDERDATE`,
+/// derived from [`order_date_days`] alone — no VS query involved.
+fn expected_orderdate_text(order_key: usize) -> String {
+    const SECONDS_PER_DAY: i64 = 86_400;
+    chrono::DateTime::from_timestamp(i64::from(order_date_days(order_key)) * SECONDS_PER_DAY, 0)
+        .expect("a seeded O_ORDERDATE is a representable days-since-epoch value")
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// The #223 slice-2 headline repro carried into the JOIN surfaces: a join WHERE
+/// filter stringifying `fact_orders.O_TOTALPRICE` (a scale-2 DECIMAL column,
+/// `LENGTH(O_TOTALPRICE) > 3`) must match Exasol's own trimmed-string `LENGTH`
+/// semantics at BOTH join surfaces — the broadcast plan (`VS_NAME`) and the
+/// N-scan per-leg fallback (`VS_NAME_LOW`) — not the untrimmed full-scale text a
+/// bare DataFusion CAST would produce.
+///
+/// Ground truth is computed in Rust from the seed fixture alone
+/// ([`expected_totalprice_text`] over [`order_totalprice_unscaled`], paired via
+/// [`order_custkey`] and [`expected_orderdate_text`]) — never through another VS
+/// surface, which would run the SAME `rewrite_decimal_stringifications` pass on
+/// both sides of the comparison and pass for any wrong-but-nonzero trimming.
+#[test]
+fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let where_clause = "LENGTH(O_TOTALPRICE) > 3";
+
+    let mut expected: Vec<(String, String)> = (1..=FACT_ORDERS_ROWS)
+        .filter(|&key| expected_totalprice_text(key).len() > 3)
+        .map(|key| {
+            (
+                format!("customer-{:02}", order_custkey(key)),
+                expected_orderdate_text(key),
+            )
+        })
+        .collect();
+    expected.sort();
+
+    assert_eq!(
+        expected.len(),
+        4,
+        "seed invariant: exactly 4 of the {FACT_ORDERS_ROWS} orders (keys 7-10, \
+         trimmed 2912/5120/7290/10000) may have a trimmed O_TOTALPRICE text \
+         longer than 3 characters — otherwise the filter no longer discriminates \
+         trimmed from untrimmed text and this test proves nothing: {expected:?}"
+    );
+
+    for vs_name in [VS_NAME, VS_NAME_LOW] {
+        let query = format!(
+            "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+             JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+             WHERE {where_clause}",
+            vs_fact_table(vs_name),
+            vs_dim_table(vs_name)
+        );
+        let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+        assert_eq!(
+            actual, expected,
+            "{vs_name}: the join result under a DECIMAL-stringification WHERE \
+             filter must equal the seed-derived expectation.\nactual:   \
+             {actual:?}\nexpected: {expected:?}"
+        );
+    }
 }
