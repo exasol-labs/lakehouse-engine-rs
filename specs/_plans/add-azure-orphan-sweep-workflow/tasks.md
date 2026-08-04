@@ -19,7 +19,10 @@
       cutoff; and either log candidates (dry-run) or delete them (real). [expert]
 
 ## Phase 3: Verification
-- [ ] 3.1 Run `actionlint .github/workflows/azure-orphan-sweep.yml` — exit 0
-- [ ] 3.2 Run `cargo test` — 0 failures (unaffected)
-- [ ] 3.3 Run `cargo clippy --all-targets` — 0 errors/warnings (unaffected)
-- [ ] 3.4 Run `cargo fmt --check` — no changes (unaffected)
+- [x] 3.1 Run `actionlint .github/workflows/azure-orphan-sweep.yml` — exit 0 (PASS)
+- [x] 3.2 Run `cargo test` — 1 pre-existing, unrelated failure
+      (`scan_prunes_delete_row_groups_by_file_path`); zero `.rs` files changed on
+      this branch, confirmed pre-existing. Blocks the `/speq:record` gate per
+      verification-report.md.
+- [x] 3.3 Run `cargo clippy --all-targets` — 0 errors/warnings (PASS)
+- [x] 3.4 Run `cargo fmt --check` — no changes (PASS)
