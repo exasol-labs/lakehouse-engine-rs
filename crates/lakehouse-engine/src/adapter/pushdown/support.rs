@@ -4043,6 +4043,64 @@ mod tests {
         assert_eq!(proj_types[0], "TIMESTAMP");
     }
 
+    /// A `CAST(<col> AS CHAR(20))` select-list item (`function_scalar_cast`) must
+    /// project with a `CHAR(20)` EMITS type — through the real `project_columns`
+    /// entry point (`extract_projection`), not the bare `exasol_type_from_json`
+    /// function. The declared type comes from `selectListDataTypes`, not from the
+    /// item's own rendered CAST target (which stays a bare, length-less `VARCHAR`
+    /// on the DataFusion dialect — a separate, unaffected non-goal of this fix).
+    /// The item must stay a rendered expression, never falling back to the full
+    /// base row (issue #192, facet B).
+    #[test]
+    fn project_columns_emits_char_type_for_cast_to_char_item() {
+        let cast_item = serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
+            "arguments": [{"type": "column", "name": "c_varchar"}]
+        });
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "id", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                    {"name": "c_varchar", "dataType": {"type": "varchar", "size": 2000000}},
+                ],
+            }],
+            "pushdownRequest": {
+                "selectList": [
+                    {"type": "column", "name": "id"},
+                    cast_item,
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 20, "scale": 0},
+                    {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
+                ],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types, widened) = extract_projection(&request, &pushdown_req).unwrap();
+
+        assert!(
+            !widened,
+            "a CAST-to-CHAR item must not raise the full-base-row widening signal (#196)"
+        );
+        assert_eq!(
+            proj_cols.len(),
+            2,
+            "must project exactly the two select-list items, no full-row fallback: {proj_cols:?}"
+        );
+        assert!(
+            matches!(proj_cols[1], ProjectionItem::Expr { .. }),
+            "the CAST-to-CHAR item must stay a rendered expression, not fall back to the \
+             full base row: {proj_cols:?}"
+        );
+        assert_eq!(
+            proj_types,
+            vec!["DECIMAL(20,0)".to_string(), "CHAR(20)".to_string()],
+            "the CAST-to-CHAR item must be declared CHAR(20), not VARCHAR(20): {proj_types:?}"
+        );
+    }
+
     /// An untranslatable select-list item falls back to the bare column.
     #[test]
     fn selectlist_untranslatable_item_falls_back_to_column() {
@@ -4159,6 +4217,28 @@ mod tests {
             result,
             Some(filter),
             "VARCHAR subject must be returned unchanged"
+        );
+    }
+
+    /// Scenario: LIKE on a genuine CHAR column pushes down unchanged.
+    /// `like_subject_type_guard` already classifies any `CHAR`-prefixed Exasol type
+    /// as a string subject alongside VARCHAR (`support.rs:546`), so this is a
+    /// non-regression CONTROL for the CHAR-type-declaration fix (issue #192): it
+    /// must pass unchanged both before and after that fix.
+    #[test]
+    fn like_guard_char_subject_unchanged() {
+        let filter = serde_json::json!({
+            "type": "predicate_like",
+            "expression": {"type": "column", "name": "code"},
+            "pattern": {"type": "literal_string", "value": "A%"}
+        });
+        let col_types = vec![("CODE".to_string(), "CHAR(3) ASCII".to_string())];
+
+        let result = like_subject_type_guard(&filter, &col_types);
+        assert_eq!(
+            result,
+            Some(filter),
+            "CHAR subject must be returned unchanged"
         );
     }
 

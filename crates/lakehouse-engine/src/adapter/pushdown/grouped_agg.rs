@@ -419,9 +419,11 @@ fn render_scalar_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<Stri
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
     let merged = merge_select_items(plans);
     // Exasol dialect: this SQL is spliced verbatim into the OUTER merge wrapper,
-    // which Exasol's own core engine parses — so a CAST target needs Exasol
-    // syntax (length-qualified `VARCHAR(n)`), unlike the DataFusion-side
-    // renderability check in `classify_scalar_over_aggregate`.
+    // which Exasol's own core engine parses — so a character CAST target is
+    // rendered length-qualified: `VARCHAR(n)` for a VARCHAR target, `CHAR(n)`/
+    // `CHAR(n) ASCII` for a CHAR target — unlike the DataFusion-side
+    // renderability check in `classify_scalar_over_aggregate`, which
+    // deliberately keeps bare `VARCHAR`.
     let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
     for (i, agg) in aggregates.iter().enumerate() {
         let plan = parse_agg_item(agg)?;
@@ -431,15 +433,33 @@ fn render_scalar_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<Stri
     Some(sql)
 }
 
-/// Resolve the Exasol-declared type of each group key from `selectListDataTypes`.
+/// Resolve the Exasol-declared type of each group key, from `selectListDataTypes`
+/// where the key is also projected and from the key's own `groupBy` node where it
+/// is not.
 ///
-/// Each group-key slot is located via the detection classification, which
-/// records the group-key projection's own `selectList` ordinal; the parallel
-/// `selectListDataTypes` array at that ordinal gives its declared result type.
-/// Matching by index (not by comparing rendered SQL strings) keeps the type
-/// correct even when an expression key's `groupBy` and `selectList` renderings
-/// differ in whitespace or casing. Falls back to `VARCHAR(2000000)` when the
-/// type cannot be located.
+/// Two sources, in this precedence:
+///
+/// 1. `selectListDataTypes[select_index]`, for a key that also appears in
+///    `selectList`. The slot is located via the detection classification, which
+///    records the group-key projection's own `selectList` ordinal. Matching by
+///    index (not by comparing rendered SQL strings) keeps the type correct even
+///    when an expression key's `groupBy` and `selectList` renderings differ in
+///    whitespace or casing. This source is authoritative: Exasol validates the
+///    outer wrapper SELECT positionally against `selectListDataTypes`, so the
+///    declared type of a projected key is the one Exasol type-checks.
+/// 2. `groupBy[slot]["dataType"]`, for a key with no `selectList` ordinal at all
+///    (`SELECT COUNT(*) … GROUP BY CAST(c AS CHAR(20))`). Only a node that
+///    declares its own result type carries this — a `function_scalar_cast` does;
+///    a bare `column` does not. Without it such a slot kept the "unknown width"
+///    default, and a `CHAR(n)`-declared key reached DataFusion unpadded: `'ab'`
+///    and `'ab   '` stayed two groups where Exasol returns one, with no outer
+///    `CAST("GK_i" AS CHAR(n))` on this path to surface it as a type error (#192).
+///
+/// Slot `i` corresponds to `groupBy[i]`: `detect_group_by_aggregates` renders
+/// exactly one `group_keys` entry per `groupBy` element, in order.
+///
+/// Falls back to `VARCHAR(2000000)` — the module's "unknown width" placeholder —
+/// when neither source declares a type.
 pub(super) fn group_key_exasol_types(
     pushdown_req: &Json,
     group_keys: &[String],
@@ -448,7 +468,7 @@ pub(super) fn group_key_exasol_types(
     let declared_types = pushdown_req
         .get("selectListDataTypes")
         .and_then(|v| v.as_array());
-    let mut types = vec!["VARCHAR(2000000)".to_string(); group_keys.len()];
+    let mut types: Vec<Option<String>> = vec![None; group_keys.len()];
     for item in select_items {
         if let GroupedSelectItem::GroupKey {
             group_key_slot,
@@ -459,10 +479,89 @@ pub(super) fn group_key_exasol_types(
                 .map(exasol_type_from_json)
             && let Some(slot) = types.get_mut(*group_key_slot)
         {
-            *slot = ty;
+            *slot = Some(ty);
+        }
+    }
+    let group_by = pushdown_req.get("groupBy").and_then(|v| v.as_array());
+    for (slot, resolved) in types.iter_mut().enumerate() {
+        if resolved.is_none() {
+            *resolved = group_by
+                .and_then(|nodes| nodes.get(slot))
+                .and_then(|node| node.get("dataType"))
+                .map(exasol_type_from_json);
         }
     }
     types
+        .into_iter()
+        .map(|ty| ty.unwrap_or_else(|| "VARCHAR(2000000)".to_string()))
+        .collect()
+}
+
+/// Blank-pad every `CHAR(n)`-declared group key to `n` characters, returning a
+/// DataFusion-side copy of the group-key fragments.
+///
+/// Exasol's `CAST(x AS CHAR(n))` blank-pads to the declared width, so values that
+/// differ only in trailing blanks are ONE group natively. DataFusion has no
+/// fixed-width character type and does not pad, so it would emit them as distinct
+/// partial groups and the outer merge — which re-groups on the unpadded `GK_*`
+/// staging column — would return a row per variant where Exasol returns one
+/// (issue #192). Padding the DataFusion-side key makes the staging values equal by
+/// construction, so the merge collapses them exactly as Exasol would.
+///
+/// The pad is guarded by a length test rather than applied as a bare
+/// `rpad(x, n)`: `rpad` TRUNCATES an over-length value, which would silently merge
+/// a too-wide key into a wrong group and return rows for a query Exasol answers
+/// with its 22001 truncation error. The `ELSE` branch hands an over-length value on
+/// unmodified so the outer `CAST("GK_i" AS CHAR(n))` still raises that error.
+///
+/// Only this copy is padded. The unpadded fragments remain the match keys for
+/// [`build_grouped_order_by_clause`], which resolves a pushed `ORDER BY` by
+/// rendered-SQL equality and would decline the pushdown against a padded copy.
+///
+/// This is the one DataFusion-dialect SQL fragment the adapter synthesises
+/// directly (`character_length`, `rpad`, `CASE`/`ELSE`) instead of routing
+/// through `vs-expression`'s `Dialect::DataFusion` renderer. Every other
+/// fragment reaching `ScanSpec` (`filter`, `projection`, `group_keys` before
+/// this pad) is produced by that renderer; there is no VS expression node to
+/// render here because the pad is a width-normalization the adapter invents
+/// to make Exasol's native blank-padding semantics hold on the DataFusion
+/// side, not a translation of anything in the pushdown request. The
+/// `#[tokio::test]`s `padded_group_key_merges_trailing_blank_variants_without_truncating`
+/// and `padded_case_fragment_plans_and_evaluates_in_datafusion` execute this
+/// exact fragment through a real DataFusion `SessionContext` to pin it against
+/// the planner DataFusion actually accepts.
+pub(super) fn blank_pad_char_group_keys(
+    group_keys: &[String],
+    group_key_types: &[String],
+) -> Vec<String> {
+    group_keys
+        .iter()
+        .enumerate()
+        .map(
+            |(slot, fragment)| match group_key_types.get(slot).and_then(|ty| char_width(ty)) {
+                Some(width) => format!(
+                    "CASE WHEN character_length({fragment}) < {width} \
+                     THEN rpad({fragment}, {width}) ELSE {fragment} END"
+                ),
+                None => fragment.clone(),
+            },
+        )
+        .collect()
+}
+
+/// The declared width of a `CHAR(n)` type, or `None` for any other type.
+///
+/// Reads the digits BETWEEN the parentheses: an ASCII-declared CHAR arrives as
+/// `CHAR(3) ASCII`, so trimming a trailing `)` off the whole string would find no
+/// width and silently skip padding on the #192 primary shape. The `CHAR(` prefix is
+/// anchored, so `VARCHAR(n)` — which contains `CHAR(` — never matches.
+fn char_width(declared_type: &str) -> Option<u32> {
+    declared_type
+        .strip_prefix("CHAR(")?
+        .split_once(')')?
+        .0
+        .parse()
+        .ok()
 }
 
 /// Build the grouped aggregate scan SQL.
@@ -1222,15 +1321,16 @@ mod tests {
     }
 
     /// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
-    /// CHAR/VARCHAR target must render the CAST target LENGTH-QUALIFIED
-    /// (`VARCHAR(20)`): `render_scalar_over_merge`'s output is spliced into the
-    /// OUTER merge wrapper that Exasol's own engine parses, where a bare
-    /// length-less `VARCHAR` is the exact "unexpected ')', expecting '('" parse
-    /// error this fix addresses. Guards the grouped-merge half of the
-    /// Exasol-dialect CAST split; the DataFusion-side renderability check in
+    /// CHAR target must render that target as the declared, LENGTH-QUALIFIED
+    /// `CHAR(20) ASCII`: `render_scalar_over_merge`'s output is spliced into the
+    /// OUTER merge wrapper that Exasol's own engine parses and type-checks, where
+    /// a bare length-less `VARCHAR` is the "unexpected ')', expecting '('" parse
+    /// error and a collapsed `VARCHAR(20)` is the #192 "Data type mismatch"
+    /// rejection. Guards the grouped-merge one of the three Exasol-dialect CAST
+    /// consumers; the DataFusion-side renderability check in
     /// `classify_scalar_over_aggregate` deliberately keeps bare `VARCHAR`.
     #[test]
-    fn scalar_over_merge_casts_to_length_qualified_exasol_varchar() {
+    fn scalar_over_merge_casts_to_exasol_char_target() {
         let sum_node = serde_json::json!({
             "type": "function_aggregate", "name": "SUM", "distinct": false,
             "arguments": [{"type": "column", "name": "x"}]
@@ -1244,12 +1344,53 @@ mod tests {
         let sql = render_scalar_over_merge(&node, &plans)
             .expect("CAST over a mergeable aggregate must render");
         assert!(
-            sql.contains("VARCHAR(20)"),
-            "Exasol-parsed merge wrapper needs a length-qualified CAST target: {sql}"
+            sql.contains("CHAR(20) ASCII"),
+            "Exasol-parsed merge wrapper needs the declared length-qualified CHAR \
+             CAST target: {sql}"
         );
         assert!(
             !sql.contains("AS VARCHAR)"),
             "must NOT emit a bare length-less VARCHAR (Exasol rejects it): {sql}"
+        );
+        assert!(
+            !sql.contains("VARCHAR(20)"),
+            "must NOT collapse the declared CHAR target to VARCHAR(20) (#192): {sql}"
+        );
+    }
+
+    /// A CAST-to-CHAR wrapping another CAST-to-CHAR over the same merged
+    /// aggregate must render `CHAR(20) ASCII` at BOTH levels: the Exasol-dialect
+    /// CHAR case is reached recursively through the translator, so a case that
+    /// only fired at the outermost level would leave the inner target collapsed
+    /// to `VARCHAR(20)` and reintroduce the #192 mismatch one level down.
+    #[test]
+    fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
+        let sum_node = serde_json::json!({
+            "type": "function_aggregate", "name": "SUM", "distinct": false,
+            "arguments": [{"type": "column", "name": "x"}]
+        });
+        let plans = vec![parse_agg_item(&sum_node).expect("SUM(x) must parse to a plan")];
+        let char_type = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "ASCII"});
+        let inner = serde_json::json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [sum_node],
+            "dataType": char_type,
+        });
+        let node = serde_json::json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [inner],
+            "dataType": char_type,
+        });
+        let sql = render_scalar_over_merge(&node, &plans)
+            .expect("a nested CAST over a mergeable aggregate must render");
+        assert_eq!(
+            sql.matches("CHAR(20) ASCII").count(),
+            2,
+            "both CAST levels must declare the CHAR target: {sql}"
+        );
+        assert!(
+            !sql.contains("VARCHAR(20)"),
+            "neither level may collapse the declared CHAR target to VARCHAR(20): {sql}"
         );
     }
 
@@ -1454,6 +1595,28 @@ mod tests {
             "groupBy": group_by,
             "selectList": select_list,
             "selectListDataTypes": select_list_data_types,
+        })
+    }
+
+    /// `CAST(NAME AS CHAR(size))` as a `function_scalar_cast` node. Its own
+    /// `dataType` is the group key's declared result type, which is the only place
+    /// that type appears when the key is not also in the select list.
+    fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "CHAR", "size": size, "characterSet": character_set},
+            "arguments": [{"type": "column", "name": "NAME"}],
+        })
+    }
+
+    /// `CAST(NAME AS VARCHAR(size))` — the VARCHAR control for `char_cast_key`.
+    fn varchar_cast_key(size: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "VARCHAR", "size": size},
+            "arguments": [{"type": "column", "name": "NAME"}],
         })
     }
 
@@ -3540,6 +3703,249 @@ mod tests {
         );
     }
 
+    /// An equal-length CASE group key (`CASE WHEN c_decimal_a < 0 THEN 'NEG' ELSE
+    /// 'POS' END`, the #192 primary shape) must resolve to `CHAR(3) ASCII` through
+    /// `group_key_exasol_types`, driven through the real `detect_group_by_aggregates`
+    /// entry point — not the bare `exasol_type_from_json` function. Exasol declares
+    /// this expression `CHAR(3) ASCII` (live-verified) because both branches are the
+    /// same length; the current catch-all renders it `VARCHAR(3) ASCII` instead,
+    /// which Exasol's type checker rejects with "Data type mismatch" (facet A).
+    #[test]
+    fn group_key_exasol_types_resolves_char_case_key() {
+        let case_key = serde_json::json!({
+            "type": "function_scalar_case",
+            "name": "CASE",
+            "arguments": [
+                {"type": "predicate_less",
+                 "left": {"type": "column", "name": "C_DECIMAL_A"},
+                 "right": {"type": "literal_exactnumeric", "value": 0}}
+            ],
+            "results": [
+                {"type": "literal_string", "value": "NEG"},
+                {"type": "literal_string", "value": "POS"}
+            ]
+        });
+        let req = make_group_by_request_with_types(
+            serde_json::json!([case_key.clone()]),
+            serde_json::json!([case_key, agg_item("COUNT", None, false)]),
+            serde_json::json!([
+                {"type": "CHAR", "size": 3, "characterSet": "ASCII"},
+                decimal_type(18, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req)
+            .expect("equal-length CASE group key must be detected as a grouped aggregate");
+        assert_eq!(detection.group_keys.len(), 1, "one group key");
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(
+            types,
+            vec!["CHAR(3) ASCII".to_string()],
+            "an equal-length CASE group key must resolve to CHAR(3) ASCII, not \
+             VARCHAR(3) ASCII: {types:?}"
+        );
+    }
+
+    /// CONTROL: a plain VARCHAR-declared group key (`REGION`) must keep resolving
+    /// to `VARCHAR(10)`, unaffected by the CHAR-type-declaration fix. MUST pass
+    /// both before and after that fix.
+    #[test]
+    fn group_key_exasol_types_resolves_varchar_key_unchanged() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "REGION"}]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([
+                {"type": "varchar", "size": 10},
+                decimal_type(18, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(
+            types,
+            vec!["VARCHAR(10)".to_string()],
+            "a VARCHAR-declared group key must be unaffected: {types:?}"
+        );
+    }
+
+    /// A group key that is NOT in the select list (`SELECT COUNT(*) … GROUP BY
+    /// CAST(NAME AS CHAR(20))`) carries no `selectListDataTypes` ordinal, so its
+    /// declared type is only readable from its own `groupBy` node. Without that
+    /// fallback the slot keeps the `VARCHAR(2000000)` "unknown width" default,
+    /// `blank_pad_char_group_keys` finds no CHAR width, and the key reaches
+    /// DataFusion unpadded — `'ab'` and `'ab   '` stay two groups where Exasol
+    /// returns one, with no outer `CAST("GK_0" AS CHAR(n))` on this path to
+    /// surface the divergence as a type error (#192 review finding).
+    #[test]
+    fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([char_cast_key(20, "UTF8")]),
+            serde_json::json!([agg_item("COUNT", None, false)]),
+            serde_json::json!([decimal_type(18, 0)]),
+        );
+        let detection = detect_group_by_aggregates(&req)
+            .expect("an unprojected group key must still detect as a grouped aggregate");
+        assert_eq!(detection.group_keys.len(), 1, "one group key");
+        assert!(
+            !detection
+                .select_items
+                .iter()
+                .any(|item| matches!(item, GroupedSelectItem::GroupKey { .. })),
+            "fixture precondition: the group key must NOT appear in the select list"
+        );
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(
+            types,
+            vec!["CHAR(20)".to_string()],
+            "an unprojected group key must resolve CHAR(20) from its own groupBy dataType: \
+             {types:?}"
+        );
+    }
+
+    /// CONTROL for the `groupBy` fallback: an unprojected group key whose own
+    /// `groupBy` node declares VARCHAR must resolve VARCHAR, never a CHAR width.
+    /// The fallback fires here (the node carries a `dataType`), so this pins that
+    /// it resolves the declared type rather than assuming CHAR — a VARCHAR key
+    /// blank-padded to a width would change grouping semantics for every ordinary
+    /// string GROUP BY that omits its key from the select list.
+    #[test]
+    fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([varchar_cast_key(10)]),
+            serde_json::json!([agg_item("COUNT", None, false)]),
+            serde_json::json!([decimal_type(18, 0)]),
+        );
+        let detection = detect_group_by_aggregates(&req)
+            .expect("an unprojected group key must still detect as a grouped aggregate");
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(
+            types,
+            vec!["VARCHAR(10)".to_string()],
+            "an unprojected VARCHAR-declared group key must resolve VARCHAR(10): {types:?}"
+        );
+    }
+
+    /// PRECEDENCE: when a group key is BOTH projected and carries a `dataType` on
+    /// its `groupBy` node, the `selectListDataTypes` entry wins. Exasol validates
+    /// the outer wrapper SELECT positionally against `selectListDataTypes`, so a
+    /// `groupBy`-derived type that disagreed would make the outer
+    /// `CAST("GK_0" AS …)` contradict the column type Exasol is checking.
+    #[test]
+    fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([char_cast_key(20, "UTF8")]),
+            serde_json::json!([char_cast_key(20, "UTF8"), agg_item("COUNT", None, false),]),
+            serde_json::json!([{"type": "varchar", "size": 30}, decimal_type(18, 0)]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+
+        let types = group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
+
+        assert_eq!(
+            types,
+            vec!["VARCHAR(30)".to_string()],
+            "the selectListDataTypes entry must win over the groupBy node's own dataType: \
+             {types:?}"
+        );
+    }
+
+    /// A bare string-literal select item (`'X'`, the #192 constant-projection
+    /// shape — `SELECT 'X' G, COUNT(*) ... GROUP BY 1`) declared `CHAR(1) ASCII`
+    /// must render `CAST('X' AS CHAR(1) ASCII)` through `constant_projection_sql`,
+    /// driven through the real `detect_group_by_aggregates` entry point (facet C).
+    /// Exasol declares a bare string literal `CHAR(1) ASCII` (live-verified); the
+    /// current catch-all renders `VARCHAR(1) ASCII` instead.
+    #[test]
+    fn constant_projection_casts_literal_to_char() {
+        let req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "REGION"}]),
+            serde_json::json!([
+                {"type": "literal_string", "value": "X"},
+                agg_item("COUNT", None, false),
+            ]),
+            serde_json::json!([
+                {"type": "CHAR", "size": 1, "characterSet": "ASCII"},
+                decimal_type(18, 0),
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+
+        let projection = detection
+            .select_items
+            .iter()
+            .find_map(|item| match item {
+                GroupedSelectItem::Constant { projection, .. } => Some(projection.clone()),
+                _ => None,
+            })
+            .expect("the literal_string item must classify as Constant");
+
+        assert_eq!(
+            projection, "CAST('X' AS CHAR(1) ASCII)",
+            "a CHAR(1)-declared literal must cast to CHAR(1) ASCII, not VARCHAR(1) ASCII: \
+             {projection}"
+        );
+    }
+
+    /// `MIN(CAST(<col> AS CHAR(20)))` (an expression-argument aggregate — no source
+    /// `column`, so its partial/merge type comes solely from its own declared
+    /// `selectListDataTypes` entry) must declare its partial EMITS column
+    /// `"PARTIAL_min_0" CHAR(20)` and cast its outer merge item to `CHAR(20)` — not
+    /// VARCHAR(20) — driven through the real `detect_group_by_aggregates` entry
+    /// point rather than hand-built `AggregatePlan`s.
+    #[test]
+    fn min_over_char_expression_declares_char_partial_and_merge_cast() {
+        let cast_arg = serde_json::json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "C_VARCHAR"}],
+            "dataType": {"type": "CHAR", "size": 20, "characterSet": "UTF8"}
+        });
+        let req = make_group_by_request_with_types(
+            serde_json::json!([{"type": "column", "name": "REGION"}]),
+            serde_json::json!([
+                {"type": "column", "name": "REGION"},
+                agg_item_expr("MIN", cast_arg, false),
+            ]),
+            serde_json::json!([
+                {"type": "varchar", "size": 100},
+                {"type": "CHAR", "size": 20, "characterSet": "UTF8"},
+            ]),
+        );
+        let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
+        assert_eq!(detection.plans.len(), 1, "one aggregate plan (MIN)");
+        assert_eq!(
+            detection.plan_types,
+            vec!["CHAR(20)".to_string()],
+            "the MIN plan's declared type must be CHAR(20), not VARCHAR(20): {:?}",
+            detection.plan_types
+        );
+
+        let partial_emits = partial_emits_items(&detection.plans, &[], &detection.plan_types);
+        assert_eq!(
+            partial_emits,
+            vec![r#""PARTIAL_min_0" CHAR(20)"#.to_string()],
+            "MIN over a CHAR-declared expression must declare its partial column \
+             CHAR(20), not VARCHAR(20): {partial_emits:?}"
+        );
+
+        let merge_items = cast_merge_items(&detection.plans, &detection.plan_types);
+        assert_eq!(
+            merge_items,
+            vec![r#"CAST(MIN("PARTIAL_min_0") AS CHAR(20))"#.to_string()],
+            "the merge item must cast to CHAR(20), not VARCHAR(20): {merge_items:?}"
+        );
+    }
+
     /// aggregationType missing or not "group_by" returns None.
     #[test]
     fn detect_group_by_aggregates_no_group_by_type_returns_none() {
@@ -3866,6 +4272,273 @@ mod tests {
         assert!(
             having_pos > group_by_pos,
             "HAVING must appear after GROUP BY: {sql}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CHAR-declared group-key blank padding (issue #192, facet A)
+    // -----------------------------------------------------------------------
+
+    /// A value wider than the `CHAR(20)` group keys are padded to. 25 characters,
+    /// matching the over-length row of the `char_pad_probe` seed table.
+    const OVER_LENGTH_VALUE: &str = "over-length-value-abcdefg";
+
+    /// The pad shape this fix commits to, spelled out independently of the
+    /// production formatter so a silent change of construct fails the test.
+    fn expected_pad(fragment: &str, width: u32) -> String {
+        format!(
+            "CASE WHEN character_length({fragment}) < {width} \
+             THEN rpad({fragment}, {width}) ELSE {fragment} END"
+        )
+    }
+
+    /// A `CHAR(20)`-declared group key must reach the DataFusion side wrapped in
+    /// the blank pad, so two values differing only in trailing blanks emit the
+    /// SAME `GK_0` staging value and the outer merge collapses them into one
+    /// group — exactly as Exasol's own `CAST(x AS CHAR(20))` does natively.
+    #[test]
+    fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
+        let fragment = r#"CAST("NAME" AS VARCHAR)"#.to_string();
+
+        let padded =
+            blank_pad_char_group_keys(std::slice::from_ref(&fragment), &["CHAR(20)".to_string()]);
+
+        assert_eq!(
+            padded,
+            vec![expected_pad(&fragment, 20)],
+            "a CHAR(20)-declared group key must be blank-padded to 20 characters on the \
+             DataFusion side: {padded:?}"
+        );
+    }
+
+    /// The width must be read from between the parentheses, NOT by trimming a
+    /// trailing `)` off the declared type: Exasol declares the #192 primary shape
+    /// (an equal-length CASE) `CHAR(3) ASCII`, and a suffix-intolerant parse would
+    /// silently skip padding on every ASCII-declared CHAR key.
+    #[test]
+    fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
+        let fragment = "CASE WHEN \"C_DECIMAL_A\" < 0 THEN 'NEG' ELSE 'POS' END".to_string();
+
+        let padded = blank_pad_char_group_keys(
+            std::slice::from_ref(&fragment),
+            &["CHAR(3) ASCII".to_string()],
+        );
+
+        assert_eq!(
+            padded,
+            vec![expected_pad(&fragment, 3)],
+            "a `CHAR(3) ASCII` group key must be padded to 3, not left unpadded because of \
+             the character-set suffix: {padded:?}"
+        );
+    }
+
+    /// The pad must be guarded by a length test rather than applied as a bare
+    /// `rpad(x, n)`: `rpad` TRUNCATES an over-length value, which would merge a
+    /// too-wide key into a wrong group and return rows where Exasol raises 22001.
+    /// The `ELSE` branch must therefore hand the value on byte-identical.
+    #[test]
+    fn char_pad_leaves_an_over_length_value_unmodified() {
+        let fragment = r#""NAME""#.to_string();
+
+        let padded =
+            blank_pad_char_group_keys(std::slice::from_ref(&fragment), &["CHAR(20)".to_string()])
+                .pop()
+                .expect("one padded group key");
+
+        assert!(
+            padded.starts_with(&format!("CASE WHEN character_length({fragment}) < 20 THEN")),
+            "the pad must be guarded by a shorter-than-width test, never unconditional: {padded}"
+        );
+        assert!(
+            padded.ends_with(&format!("ELSE {fragment} END")),
+            "an over-length value must pass through the ELSE branch unmodified: {padded}"
+        );
+        assert_eq!(
+            padded.matches("rpad(").count(),
+            1,
+            "rpad must appear exactly once, inside the guarded THEN branch: {padded}"
+        );
+        for truncating in ["substr", "substring", "left("] {
+            assert!(
+                !padded.contains(truncating),
+                "the pad must contain no truncating construct ({truncating}): {padded}"
+            );
+        }
+    }
+
+    /// CONTROL: a VARCHAR-declared group key must be handed on untouched. Also
+    /// guards the prefix match — `VARCHAR(10)` contains `CHAR(` and would be
+    /// wrongly padded by a substring test instead of a prefix test.
+    #[test]
+    fn varchar_declared_group_key_is_left_unpadded() {
+        let keys = vec![r#""REGION""#.to_string()];
+
+        let padded = blank_pad_char_group_keys(&keys, &["VARCHAR(10)".to_string()]);
+
+        assert_eq!(
+            padded, keys,
+            "a VARCHAR-declared group key must be left unpadded: {padded:?}"
+        );
+    }
+
+    /// Padding is decided per group-key slot: a mixed VARCHAR + CHAR multi-key
+    /// GROUP BY must pad only the CHAR slot, and at that slot's own width.
+    #[test]
+    fn multi_key_pad_applies_only_to_the_char_slot() {
+        let keys = vec![
+            r#""REGION""#.to_string(),
+            r#"CAST("NAME" AS VARCHAR)"#.to_string(),
+        ];
+
+        let padded = blank_pad_char_group_keys(
+            &keys,
+            &["VARCHAR(10)".to_string(), "CHAR(5) ASCII".to_string()],
+        );
+
+        assert_eq!(
+            padded,
+            vec![keys[0].clone(), expected_pad(&keys[1], 5)],
+            "only the CHAR-declared slot may be padded, at its own width: {padded:?}"
+        );
+    }
+
+    /// The padded fragment is spliced into three positions of one DataFusion SQL
+    /// statement, so it must PLAN and EVALUATE there — not merely look right.
+    /// Proves the whole #192 facet-A contract on the real engine: trailing-blank
+    /// variants merge into one group, an over-length value survives at full width
+    /// (so the outer Exasol cast can still raise 22001), and a NULL key stays NULL.
+    #[tokio::test]
+    async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
+        use arrow::array::{Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("V", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("ab"),
+                Some("ab   "),
+                Some("cd"),
+                Some(OVER_LENGTH_VALUE),
+                None,
+            ]))],
+        )
+        .expect("fixture batch");
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch)
+            .expect("fixture table registers");
+
+        let padded = blank_pad_char_group_keys(&[r#""V""#.to_string()], &["CHAR(20)".to_string()])
+            .pop()
+            .expect("one padded group key");
+        // Same shape `build_grouped_partial_agg_sql` emits: the identical fragment
+        // in the SELECT list and in the GROUP BY.
+        let sql =
+            format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("the padded group key must plan in DataFusion")
+            .collect()
+            .await
+            .expect("the padded group key must evaluate in DataFusion");
+
+        let mut groups: Vec<(Option<String>, i64)> = Vec::new();
+        for batch in &batches {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("group key column is Utf8");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count column is Int64");
+            for row in 0..batch.num_rows() {
+                let key = if keys.is_null(row) {
+                    None
+                } else {
+                    Some(keys.value(row).to_string())
+                };
+                groups.push((key, counts.value(row)));
+            }
+        }
+        groups.sort();
+
+        assert_eq!(
+            groups.len(),
+            4,
+            "'ab' and 'ab   ' must merge into ONE group, leaving 4 groups: {groups:?}"
+        );
+        let merged = format!("{:<20}", "ab");
+        assert_eq!(
+            groups
+                .iter()
+                .find(|(k, _)| k.as_deref() == Some(merged.as_str()))
+                .map(|(_, c)| *c),
+            Some(2),
+            "'ab' and 'ab   ' must both pad to {merged:?} and count 2: {groups:?}"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .find(|(k, _)| k.as_deref() == Some(OVER_LENGTH_VALUE))
+                .map(|(_, c)| *c),
+            Some(1),
+            "the {} -character value must survive unmodified, never truncated to 20: {groups:?}",
+            OVER_LENGTH_VALUE.len()
+        );
+        assert_eq!(
+            groups.iter().find(|(k, _)| k.is_none()).map(|(_, c)| *c),
+            Some(1),
+            "a NULL group key must stay NULL through the pad: {groups:?}"
+        );
+    }
+
+    /// The fragment can itself be a `CASE` expression (the #192 primary shape), so
+    /// the triple splice nests a `CASE` inside `character_length(...)`, inside
+    /// `rpad(...)`, and — the one that could plausibly not parse — directly after
+    /// the outer `ELSE`. Prove DataFusion parses and evaluates that nesting.
+    #[tokio::test]
+    async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("V", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![Some("ab"), Some("cd")]))],
+        )
+        .expect("fixture batch");
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", batch)
+            .expect("fixture table registers");
+
+        let case_fragment = r#"CASE WHEN "V" = 'ab' THEN 'NEG' ELSE 'POS' END"#.to_string();
+        let padded = blank_pad_char_group_keys(&[case_fragment], &["CHAR(3) ASCII".to_string()])
+            .pop()
+            .expect("one padded group key");
+        let sql =
+            format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
+
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("a padded CASE fragment must plan in DataFusion")
+            .collect()
+            .await
+            .expect("a padded CASE fragment must evaluate in DataFusion");
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total, 2,
+            "the two equal-length CASE results must stay two groups: {batches:?}"
         );
     }
 

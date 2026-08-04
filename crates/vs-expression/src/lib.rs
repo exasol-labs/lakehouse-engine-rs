@@ -410,21 +410,50 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
     match type_name.to_uppercase().as_str() {
-        "VARCHAR" | "CHAR" => match dialect {
+        "VARCHAR" => match dialect {
             // DataFusion's SQL frontend rejects VARCHAR(n) with a length (no
             // `support_varchar_with_length`); only bare VARCHAR parses there.
             Dialect::DataFusion => Ok("VARCHAR".to_string()),
-            // Exasol's parser has the OPPOSITE requirement: VARCHAR/CHAR MUST
+            // Exasol's parser has the OPPOSITE requirement: a character type MUST
             // carry a length. Render `VARCHAR(<size>)` from the width Exasol
-            // itself sent (`{"type":"VARCHAR","size":n}` /
-            // `{"type":"CHAR","size":n,...}`). If `size` is somehow absent, fall
-            // back to the project's "unknown/incompatible width" convention.
-            // Do NOT clamp to Exasol's 2,000,000 max — trust the value Exasol
-            // sent.
+            // itself sent (`{"type":"VARCHAR","size":n}`; a genuine
+            // `{"type":"CHAR","size":n,...}` has its own arm below). If `size` is
+            // somehow absent, fall back to the project's "unknown/incompatible
+            // width" convention. Do NOT clamp to Exasol's 2,000,000 max — trust
+            // the value Exasol sent.
             Dialect::Exasol => Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
                 Some(size) => format!("VARCHAR({size})"),
                 None => "VARCHAR(2000000)".to_string(),
             }),
+        },
+        "CHAR" => match dialect {
+            // Arrow has only `Utf8` — no fixed-width CHAR type — and
+            // datafusion-sql rejects a length-qualified character target, so the
+            // DataFusion side renders the same bare VARCHAR as above.
+            Dialect::DataFusion => Ok("VARCHAR".to_string()),
+            // Exasol declares a CHAR-target result column `CHAR(n)` and validates
+            // the pushdown's column types positionally against that declaration,
+            // so collapsing to `VARCHAR(n)` here is a "Data type mismatch"
+            // rejection AND drops the blank padding CHAR(n) carries (#192). The
+            // ` ASCII` suffix mirrors the charset rule the adapter seam already
+            // applies: without it an ASCII-declared CHAR merely trades a
+            // VARCHAR mismatch for a UTF8 one. As for VARCHAR, the width Exasol
+            // sent is trusted and never clamped — Exasol's own 2,000 CHAR maximum
+            // is enforced where a declaration is SYNTHESISED, not here where one
+            // is echoed back. A `size`-absent dataType (never sent by Exasol) keeps
+            // the project's `VARCHAR(2000000)` "unknown width" convention rather
+            // than inventing a CHAR width.
+            Dialect::Exasol => {
+                let is_ascii = data_type
+                    .get("characterSet")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
+                Ok(match data_type.get("size").and_then(|v| v.as_u64()) {
+                    Some(size) if is_ascii => format!("CHAR({size}) ASCII"),
+                    Some(size) => format!("CHAR({size})"),
+                    None => "VARCHAR(2000000)".to_string(),
+                })
+            }
         },
         "DECIMAL" => {
             let p = data_type
@@ -1527,13 +1556,18 @@ pub fn render_df_filter_safe(filter_expr: &Json) -> Option<String> {
 /// Render a VS expression node to an **Exasol** SQL fragment.
 ///
 /// Identical to [`render_expression`] except CAST targets are rendered in the
-/// Exasol dialect: a character CAST target is length-qualified (`VARCHAR(n)`;
-/// `CHAR(n)` also maps to `VARCHAR(n)` per the mission data-type table), because
-/// Exasol's own parser has no length-less VARCHAR type. Use this on the code
-/// paths whose rendered SQL is parsed by Exasol's core engine directly — the
-/// qualified single-table / N-scan join wrapper (`joins.rs`) and the
-/// grouped-aggregate outer-merge wrapper (`grouped_agg.rs`) — NOT for fragments
-/// embedded in a DataFusion `ScanSpec`, which must use [`render_expression`].
+/// Exasol dialect: a character CAST target is length-qualified — a `VARCHAR`
+/// target renders `VARCHAR(n)`, a `CHAR` target renders `CHAR(n)` (plus an
+/// ` ASCII` suffix when `dataType.characterSet` is ASCII case-insensitively) —
+/// because Exasol's own parser has no length-less character type. This
+/// supersedes the older "CHAR maps to VARCHAR" rule; see
+/// `renders_cast_char_as_exasol_char` and
+/// `cast_char_target_diverges_between_dialects` for the tests that guard it.
+/// Use this on the code paths whose rendered SQL is parsed by Exasol's core
+/// engine directly — the qualified single-table / N-scan join wrapper
+/// (`joins.rs`) and the grouped-aggregate outer-merge wrapper
+/// (`grouped_agg.rs`) — NOT for fragments embedded in a DataFusion
+/// `ScanSpec`, which must use [`render_expression`].
 pub fn render_expression_exasol(expr: &Json) -> Result<String, UdfError> {
     render_expression_inner(expr, Dialect::Exasol)?
         .ok_or_else(|| UdfError::User("expression node is null".into()))
@@ -2093,10 +2127,12 @@ mod tests {
     }
 
     #[test]
-    fn renders_cast_char_as_varchar() {
-        // Exasol sends CHAR as {"type":"CHAR","size":n,"characterSet":...}. This
-        // project maps CHAR to VARCHAR everywhere (see mission data-type table),
-        // so the CAST target renders as VARCHAR, consistent with that mapping.
+    fn renders_cast_char_as_datafusion_varchar() {
+        // Exasol sends CHAR as {"type":"CHAR","size":n,"characterSet":...}. The
+        // DataFusion dialect renders that target as a bare, length-less VARCHAR:
+        // Arrow has only Utf8 (no CHAR type) and datafusion-sql rejects a length
+        // on a character target. The Exasol dialect deliberately DIVERGES and
+        // renders CHAR(n) — see `renders_cast_char_as_exasol_char`.
         let expr = json!({
             "type": "function_scalar_cast",
             "name": "CAST",
@@ -2104,6 +2140,25 @@ mod tests {
             "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
         });
         assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    }
+
+    #[test]
+    fn renders_cast_char_as_exasol_char() {
+        // The Exasol-dialect twin of `renders_cast_char_as_datafusion_varchar`:
+        // Exasol declares a CHAR-target result column CHAR(n) and validates the
+        // pushdown positionally against that declaration, so the same node must
+        // render CHAR(n) — carrying the ` ASCII` suffix Exasol declared — rather
+        // than collapsing to VARCHAR(n) (#192).
+        let expr = json!({
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("X" AS CHAR(3) ASCII)"#
+        );
     }
 
     #[test]
@@ -3956,16 +4011,17 @@ mod tests {
         });
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
-            r#"CAST("X" AS VARCHAR(3))"#
+            r#"CAST("X" AS CHAR(3) ASCII)"#
         );
     }
 
-    /// Divergence guard: the SAME node must render bare `VARCHAR` in the
-    /// DataFusion dialect and length-qualified `VARCHAR(n)` in the Exasol
-    /// dialect. If a future change collapses the two dialects together, exactly
-    /// one of these assertions fails, catching the regression that reintroduces
-    /// the "unexpected ')', expecting '(' " Exasol parse error (or the
-    /// datafusion-sql "length not supported" error, depending on direction).
+    /// Divergence guard: the SAME CHAR node must render bare `VARCHAR` in the
+    /// DataFusion dialect and length-qualified `CHAR(n)` in the Exasol dialect.
+    /// If a future change collapses the two dialects together, exactly one of
+    /// these assertions fails, catching the regression that reintroduces either
+    /// the "unexpected ')', expecting '(' " Exasol parse error / the `CHAR(n)`
+    /// vs `VARCHAR(n)` "Data type mismatch" pushdown rejection (#192), or the
+    /// datafusion-sql "length not supported" error, depending on direction.
     #[test]
     fn cast_char_target_diverges_between_dialects() {
         let expr = json!({
@@ -3978,10 +4034,10 @@ mod tests {
             render_expression(&expr).unwrap(),
             r#"CAST("C_VARCHAR" AS VARCHAR)"#
         );
-        // Exasol dialect: length-qualified.
+        // Exasol dialect: the declared fixed-width CHAR, length-qualified.
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
-            r#"CAST("C_VARCHAR" AS VARCHAR(20))"#
+            r#"CAST("C_VARCHAR" AS CHAR(20) ASCII)"#
         );
     }
 
@@ -3995,6 +4051,24 @@ mod tests {
             "type": "function_scalar_cast", "name": "CAST",
             "arguments": [{"type": "column", "name": "x"}],
             "dataType": {"type": "VARCHAR"}
+        });
+        assert_eq!(
+            render_expression_exasol(&expr).unwrap(),
+            r#"CAST("X" AS VARCHAR(2000000))"#
+        );
+    }
+
+    /// The same defensive fallback for a size-less CHAR target: it keeps the
+    /// project's `VARCHAR(2000000)` "unknown/incompatible width" convention
+    /// rather than inventing a CHAR width, because Exasol caps CHAR at 2,000 and
+    /// this crate does not synthesise a width it was not sent. Unreachable from a
+    /// real Exasol dataType, which always carries `size`.
+    #[test]
+    fn renders_cast_char_exasol_dialect_without_size_falls_back_to_varchar_default() {
+        let expr = json!({
+            "type": "function_scalar_cast", "name": "CAST",
+            "arguments": [{"type": "column", "name": "x"}],
+            "dataType": {"type": "CHAR", "characterSet": "ASCII"}
         });
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
