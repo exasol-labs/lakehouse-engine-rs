@@ -211,6 +211,27 @@ fn required_vended_value(
 /// accepts only the flat `adls.sas-token`, so recovering the host here and
 /// assembling the flat SAS state is what keeps every consumer downstream unaware
 /// that a second spelling exists.
+///
+/// The host suffix is matched CASE-INSENSITIVELY, matching the scheme rule in
+/// [`resolve_vended_storage`]: RFC 3986 §3.2.2 makes a URI host
+/// case-insensitive, so a catalog that spells the account differently from the
+/// table location names the same storage account and must not read as "the
+/// catalog vended none". The exact spelling is tried FIRST, by direct lookup, so
+/// a payload carrying case-variant spellings of one host resolves
+/// deterministically rather than by hash order; only a payload with two
+/// non-empty case-variant keys and no exact match leaves the choice arbitrary,
+/// and by that same RFC both of those keys name one account.
+///
+/// The KEY LABEL is deliberately still matched exactly. Unlike the host it is
+/// not a URI component with a documented case rule but a protocol key spelling,
+/// and the S3 arm reads its keys exactly too — relaxing one arm alone would make
+/// the two disagree about what a vended key is.
+///
+/// `account_name` is derived from the host VERBATIM, not normalised. The guard
+/// it feeds compares it byte-exactly against the account parsed out of each file
+/// URI (`iceberg-storage-opendal-0.10.0/src/azdls.rs:165`), so a case-folded
+/// account name would make the guard fire on the very locations it was derived
+/// from.
 fn adls_backend_from_vended(
     vended: &HashMap<String, String>,
     anchor: &str,
@@ -227,15 +248,21 @@ fn adls_backend_from_vended(
                  expected the <account> of <account>.dfs.core.windows.net"
             ))
         })?;
-    let sas = vended
-        .keys()
-        .find(|key| key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX) == Some(host))
-        .and_then(|key| vended_config_value(vended, key))
+    let sas = vended_config_value(vended, &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
+        .or_else(|| {
+            vended
+                .keys()
+                .filter(|key| {
+                    key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX)
+                        .is_some_and(|key_host| key_host.eq_ignore_ascii_case(host))
+                })
+                .find_map(|key| vended_config_value(vended, key))
+        })
         .ok_or_else(|| {
             UdfError::User(format!(
                 "vended credentials were requested for storage host {host} (table location \
                  {anchor}), but the catalog returned none: the selected credential source carries \
-                 no non-empty {VENDED_SAS_TOKEN_KEY_PREFIX}{host} key"
+                 no non-empty {VENDED_SAS_TOKEN_KEY_PREFIX}{host} key in any casing of that host"
             ))
         })?;
 
@@ -1620,6 +1647,72 @@ mod tests {
             with_container, without_container,
             "the container segment must not change what the location resolves to"
         );
+    }
+
+    /// Scenario: the anchor host and the vended key's host suffix are matched
+    /// case-insensitively, so a location spelling the account in a different case
+    /// than the catalog's key still resolves that key's SAS.
+    ///
+    /// RFC 3986 §3.2.2 makes a URI host case-insensitive, and
+    /// [`resolve_vended_storage`] already reads the SCHEME that way — a
+    /// byte-exact host match would refuse a request the catalog did satisfy and
+    /// report it as "the catalog returned none", which is both wrong and
+    /// misdirecting.
+    ///
+    /// `account_name` stays VERBATIM from the anchor: the guard it feeds compares
+    /// it byte-exactly against the account in each file URI, so normalising it
+    /// here would fire that guard on the locations it was derived from.
+    #[test]
+    fn vended_adls_sas_host_match_is_case_insensitive() {
+        let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
+        let mixed_case_host = "MyAccount.DFS.Core.Windows.NET";
+        assert_ne!(
+            mixed_case_host, ADLS_HOST,
+            "the anchor host must differ from the vended key's host by CASE ONLY for this test to \
+             be about case at all"
+        );
+        assert!(
+            mixed_case_host.eq_ignore_ascii_case(ADLS_HOST),
+            "the anchor host must differ from the vended key's host by CASE ONLY"
+        );
+
+        let (account_name, sas) = vended_adls_sas(
+            &result,
+            &format!("abfss://mycontainer@{mixed_case_host}/db/t"),
+            false,
+        );
+
+        assert_eq!(
+            sas, VENDED_SAS,
+            "a host differing only in case names the same storage account, so the SAS the catalog \
+             vended for it must be selected"
+        );
+        assert_eq!(
+            account_name, "MyAccount",
+            "the account name must stay the anchor's own spelling: the downstream wrong-account \
+             guard compares it byte-exactly against the account in each file URI"
+        );
+    }
+
+    /// Scenario: with both an exact-case and a case-variant spelling of the
+    /// anchor's host vended at once, the exact one is selected — the choice is
+    /// deterministic rather than resolved by hash-map iteration order.
+    #[test]
+    fn vended_adls_sas_prefers_the_exact_host_spelling() {
+        let result = adls_vended_result(&[
+            (ADLS_HOST, VENDED_SAS),
+            ("MYACCOUNT.DFS.CORE.WINDOWS.NET", OTHER_HOST_SAS),
+        ]);
+        let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
+
+        for _ in 0..16 {
+            let (_, sas) = vended_adls_sas(&result, &anchor, false);
+            assert_eq!(
+                sas, VENDED_SAS,
+                "the key whose host suffix matches the anchor exactly must win every time, not \
+                 whichever spelling the map happens to yield first"
+            );
+        }
     }
 
     /// Scenario: an anchor whose storage host carries no leading label is refused.
