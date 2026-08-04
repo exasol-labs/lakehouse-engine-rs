@@ -153,10 +153,11 @@ shared-harness provisioning, and DDL-failure output redaction.
   run leaves its container behind. The `lhrs-e2e-<user>-<millis>` name keeps an
   orphan attributable to this suite, to a user, and to one run. Azure Blob
   lifecycle-management policies act on blobs, never on containers, so no lifecycle
-  rule can sweep an orphaned container — removing one requires an out-of-band
-  scheduled sweep (Azure CLI or a Function) owned outside this repository and
-  tracked as a follow-up issue (#291). The account already holds leftovers from
-  earlier spike runs, so the sweep is a real operational need, not a hypothetical.
+  rule can sweep an orphaned container. An in-repo scheduled GitHub Actions
+  workflow (see `e2e-harness/azure-orphan-container-sweep` and the superseding
+  decision `azure-orphan-sweep-in-repo-workflow`) now reclaims a stale orphan
+  instead. The account already held leftovers from earlier spike runs, so the
+  sweep answers a real operational need, not a hypothetical.
 * **A second credential arm adds no Azure-side orphan.** The container is the only
   cloud resource, and deleting it removes both warehouses' blobs. Each run does
   leave two per-run warehouse registrations rather than one, but those are Lakekeeper
