@@ -1,0 +1,122 @@
+name: Azure Orphan Container Sweep
+
+# Reclaims stale `lhrs-e2e-` Azure blob containers the `azure-e2e` suite orphans
+# when a killed run skips its `Drop` guard. See
+# specs/e2e-harness/azure-orphan-container-sweep/spec.md.
+
+on:
+  schedule:
+    # Weekly, Monday 02:00 UTC. Carries no `dry_run` input, so a scheduled run
+    # always deletes.
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview candidates without deleting them"
+        type: boolean
+        default: true
+        required: false
+
+jobs:
+  sweep:
+    name: Sweep orphaned containers
+    runs-on: ubuntu-latest
+    # No repo token needed — this workflow only calls the Azure CLI.
+    permissions: {}
+    steps:
+      - name: Sweep orphaned containers
+        env:
+          AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Fail loud if any required variable is unset or empty, naming the
+          # variable but never its value (three of the four are credentials).
+          # Mirrors the azure-e2e suite's require_var fail-loud contract.
+          missing=0
+          for var in AZURE_STORAGE_ACCOUNT_NAME AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET; do
+            if [ -z "${!var+set}" ]; then
+              echo "the azure-orphan-sweep workflow requires environment variable $var, which is not set" >&2
+              missing=1
+            elif [ -z "${!var}" ]; then
+              echo "the azure-orphan-sweep workflow requires environment variable $var, which is set but empty" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          # Authenticate with the container-lifecycle service principal. The secret
+          # reaches az only through the masked environment; it is never echoed and
+          # `set -x` is deliberately off, so no credential value can reach the log.
+          az login --service-principal \
+            -u "$AZURE_CLIENT_ID" \
+            -p "$AZURE_CLIENT_SECRET" \
+            --tenant "$AZURE_TENANT_ID"
+
+          # DRY_RUN arrives as the string 'true'/'false': a workflow_dispatch
+          # boolean input is a string, and the schedule trigger resolves it to
+          # 'false' at the expression level. Compare it as a string — the non-empty
+          # string 'false' is otherwise truthy.
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY-RUN: listing stale lhrs-e2e- containers (last_modified older than 24h); nothing will be deleted."
+          else
+            echo "Sweeping stale lhrs-e2e- containers (last_modified older than 24h)."
+          fi
+
+          # Retention floor: a container is stale only when its last_modified is
+          # strictly before 24 hours ago. Computed once, in bash — JMESPath cannot
+          # compare dates.
+          CUTOFF=$(date -u -d '24 hours ago' +%s)
+
+          # List only lhrs-e2e- containers as `name<TAB>last_modified`. The query is
+          # a positional multiselect-list, so tsv column order is guaranteed (name
+          # first, then last_modified) and `read -r name lm` binds each field
+          # unambiguously; --num-results '*' returns every match, not the default
+          # cap. Capture to a variable rather than piping into `while read` or
+          # reading a `<()` substitution so a non-zero az exit propagates under
+          # set -e (a masked az failure would silently skip the sweep), and so an
+          # empty result simply leaves the loop unexecuted.
+          containers=$(az storage container list \
+            --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
+            --auth-mode login \
+            --prefix lhrs-e2e- \
+            --query "[].[name, properties.lastModified]" \
+            -o tsv \
+            --num-results '*')
+
+          candidates=0
+          if [ -n "$containers" ]; then
+            while IFS=$'\t' read -r name lm; do
+              if [ -z "$name" ]; then
+                continue
+              fi
+              lm_epoch=$(date -u -d "$lm" +%s)
+              if [ "$lm_epoch" -lt "$CUTOFF" ]; then
+                candidates=$((candidates + 1))
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "  would delete: $name (last_modified=$lm)"
+                else
+                  echo "  deleting: $name (last_modified=$lm)"
+                  # No --fail-not-exist: a container a late Drop already reclaimed
+                  # exits 0, so the delete is idempotent. Any other non-zero exit
+                  # aborts the run red under set -e.
+                  az storage container delete \
+                    --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
+                    --auth-mode login \
+                    --name "$name"
+                fi
+              fi
+            done <<< "$containers"
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY-RUN complete: $candidates container(s) would be deleted."
+          else
+            echo "Sweep complete: $candidates container(s) deleted."
+          fi
