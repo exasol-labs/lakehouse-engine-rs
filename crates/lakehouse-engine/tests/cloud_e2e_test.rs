@@ -631,22 +631,36 @@ fn cloud_scan_reads_with_vended_credentials() {
 /// The one vended credential source that applies to `location`: the
 /// `storage_credentials` entry whose non-empty `prefix` is the longest prefix of
 /// `location`, else the flat `config` map. Mirrors the shipped resolver's selection
-/// rule; reading the response instead of calling the resolver is the point, since a
+/// rule — including comparing both sides with the URI scheme lowercased (RFC 3986
+/// §3.1) — since reading the response instead of calling the resolver is the point: a
 /// resolved backend cannot say which config key the catalog left out.
 fn vended_source_for<'a>(
     result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
 ) -> &'a HashMap<String, String> {
+    let location = lowercase_scheme(location);
     result
         .storage_credentials
         .as_ref()
         .and_then(|credentials| {
             credentials
                 .iter()
-                .filter(|entry| !entry.prefix.is_empty() && location.starts_with(&entry.prefix))
+                .filter(|entry| {
+                    !entry.prefix.is_empty()
+                        && location.starts_with(lowercase_scheme(&entry.prefix).as_str())
+                })
                 .max_by_key(|entry| entry.prefix.len())
         })
         .map_or(&result.config, |entry| &entry.config)
+}
+
+/// `uri` with its URI scheme lowercased and everything after `://` verbatim, mirroring
+/// the resolver's own scheme folding.
+fn lowercase_scheme(uri: &str) -> String {
+    match uri.split_once("://") {
+        Some((scheme, rest)) => format!("{}://{rest}", scheme.to_ascii_lowercase()),
+        None => uri.to_string(),
+    }
 }
 
 /// Whether the vended source carries a usable value for `key`, spelling absence as

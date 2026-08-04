@@ -7,6 +7,7 @@
 
 use crate::{AdlsCred, StorageBackend, StorageProps};
 use exasol_udf_sdk::error::UdfError;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Vended ADLS SAS keys are host-suffixed (`adls.sas-token.<host>`) — the iceberg Java
@@ -71,20 +72,42 @@ pub fn resolve_vended_storage(
 /// a matched entry authoritative for the whole credential set: a key the entry
 /// omits reads as absent rather than falling back to the flat map, so the two
 /// sources never mix.
+///
+/// Both sides are compared with the SCHEME lowercased, because
+/// [`resolve_vended_storage`] accepts a case-variant anchor scheme (RFC 3986 §3.1) —
+/// so a response spelling `location` and a `prefix` scheme differently would
+/// otherwise miss the entry and silently read the flat map instead.
 fn select_credential_source<'a>(
     result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
 ) -> &'a HashMap<String, String> {
+    let location = lowercase_scheme(location);
     result
         .storage_credentials
         .as_ref()
         .and_then(|credentials| {
             credentials
                 .iter()
-                .filter(|entry| !entry.prefix.is_empty() && location.starts_with(&entry.prefix))
+                .filter(|entry| {
+                    !entry.prefix.is_empty()
+                        && location.starts_with(lowercase_scheme(&entry.prefix).as_ref())
+                })
                 .max_by_key(|entry| entry.prefix.len())
         })
         .map_or(&result.config, |entry| &entry.config)
+}
+
+/// `uri` with its URI scheme lowercased and everything after `://` verbatim. Only the
+/// scheme is folded: RFC 3986 §3.1 makes it case-insensitive, while a bucket, container,
+/// or object key is case-sensitive — two S3 buckets differing only in case are two
+/// buckets.
+fn lowercase_scheme(uri: &str) -> Cow<'_, str> {
+    match uri.split_once("://") {
+        Some((scheme, rest)) if scheme.bytes().any(|byte| byte.is_ascii_uppercase()) => {
+            Cow::Owned(format!("{}://{rest}", scheme.to_ascii_lowercase()))
+        }
+        _ => Cow::Borrowed(uri),
+    }
 }
 
 /// The S3 backend the vended credential source describes, built from that source ALONE.
@@ -164,10 +187,10 @@ fn required_vended_value(
 /// pair consistent: `adls.account-name` is the downstream wrong-account guard, so an
 /// account name disagreeing with the account the SAS was minted for would disarm it.
 ///
-/// The host suffix is matched CASE-INSENSITIVELY per RFC 3986 §3.2.2, exact spelling
-/// tried first so a payload carrying case-variant spellings resolves deterministically
-/// rather than by hash order. The KEY LABEL is still matched exactly, as the S3 arm
-/// matches its keys.
+/// The host suffix is matched CASE-INSENSITIVELY per RFC 3986 §3.2.2, resolved
+/// deterministically rather than by hash order: the anchor's exact spelling wins, and
+/// among case-variant spellings the lexicographically smallest key does. The KEY LABEL
+/// is still matched exactly, as the S3 arm matches its keys.
 ///
 /// `account_name` is derived from the host VERBATIM: the guard it feeds compares it
 /// byte-exactly against the account parsed out of each file URI
@@ -192,12 +215,15 @@ fn adls_backend_from_vended(
     let sas = vended_config_value(vended, &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
         .or_else(|| {
             vended
-                .keys()
-                .filter(|key| {
-                    key.strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX)
-                        .is_some_and(|key_host| key_host.eq_ignore_ascii_case(host))
+                .iter()
+                .filter(|(key, value)| {
+                    !value.is_empty()
+                        && key
+                            .strip_prefix(VENDED_SAS_TOKEN_KEY_PREFIX)
+                            .is_some_and(|key_host| key_host.eq_ignore_ascii_case(host))
                 })
-                .find_map(|key| vended_config_value(vended, key))
+                .min_by(|(left, _), (right, _)| left.cmp(right))
+                .map(|(_, value)| value.clone())
         })
         .ok_or_else(|| {
             UdfError::User(format!(
@@ -489,6 +515,37 @@ mod tests {
             "longest matching prefix must win"
         );
         assert_eq!(merged.secret_key, "LONG_SK");
+    }
+
+    /// Scenario: a case-variant scheme still selects the matching `storage_credentials`
+    /// entry. `resolve_vended_storage` accepts `S3://` as an S3 location (RFC 3986 §3.1),
+    /// so a case-sensitive prefix match would miss the entry that governs it and silently
+    /// read the flat config instead — a source the entry is meant to be authoritative over.
+    #[test]
+    fn vended_storage_matches_a_prefix_across_a_case_variant_scheme() {
+        let result = make_load_table_result(
+            Some(vec![(
+                "s3://bucket/db",
+                vec![
+                    ("s3.access-key-id", VENDED_AK),
+                    ("s3.secret-access-key", VENDED_SK),
+                    ("client.region", VENDED_REGION),
+                ],
+            )]),
+            vec![
+                ("s3.access-key-id", STATIC_AK),
+                ("s3.secret-access-key", STATIC_SK),
+                ("client.region", VENDED_REGION),
+            ],
+        );
+
+        let merged = vended_s3(&result, "S3://bucket/db/t", false);
+
+        assert_eq!(
+            merged.access_key, VENDED_AK,
+            "an upper-cased S3:// location must still match the s3:// prefix entry"
+        );
+        assert_eq!(merged.secret_key, VENDED_SK);
     }
 
     /// Scenario: falls back to flat config when no storage_credentials prefix matches.
@@ -1573,6 +1630,47 @@ mod tests {
                 sas, VENDED_SAS,
                 "the key whose host suffix matches the anchor exactly must win every time, not \
                  whichever spelling the map happens to yield first"
+            );
+        }
+    }
+
+    /// Scenario: with NO exact spelling of the anchor's host vended and two case-variant
+    /// spellings of it to choose from, the choice is still deterministic — the
+    /// lexicographically smallest key wins, not whichever the map yields first. The
+    /// payload is rebuilt every round because a `HashMap`'s iteration order is fixed for
+    /// one instance: only a fresh map can expose a hash-order-dependent pick.
+    #[test]
+    fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
+        const SMALLEST_KEY_SAS: &str = "SMALLEST_KEY_SAS_SENTINEL";
+        const LARGER_KEY_SAS: &str = "LARGER_KEY_SAS_SENTINEL";
+        // 'M' < 'm' in ASCII, so the upper-cased account label is the smaller key.
+        let smallest_key_host = "MYACCOUNT.dfs.core.windows.net";
+        let larger_key_host = "myaccount.DFS.CORE.WINDOWS.NET";
+        let anchor_host = "MyAccount.dfs.core.windows.net";
+        for host in [smallest_key_host, larger_key_host] {
+            assert!(
+                host.eq_ignore_ascii_case(anchor_host) && host != anchor_host,
+                "each vended host must differ from the anchor's host by CASE ONLY, so neither is \
+                 the exact spelling that would decide the pick on its own"
+            );
+        }
+
+        for _ in 0..16 {
+            let result = adls_vended_result(&[
+                (smallest_key_host, SMALLEST_KEY_SAS),
+                (larger_key_host, LARGER_KEY_SAS),
+            ]);
+
+            let (_, sas) = vended_adls_sas(
+                &result,
+                &format!("abfss://mycontainer@{anchor_host}/db/t"),
+                false,
+            );
+
+            assert_eq!(
+                sas, SMALLEST_KEY_SAS,
+                "case-variant spellings of the anchor's host must resolve to the smallest key's \
+                 SAS every time, not to whichever key the map happens to yield first"
             );
         }
     }
