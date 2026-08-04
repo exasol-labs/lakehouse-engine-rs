@@ -278,14 +278,10 @@ impl WarehouseProfile {
 /// Per-run (not constant): the container is created/deleted by the owning run,
 /// and the account name and key come from the environment.
 ///
-/// Two variants are exposed via constructors: [`AdlsWarehouseProfile::static_creds`]
-/// (Lakekeeper reads the account key directly; `sas-enabled: false`) and
-/// [`AdlsWarehouseProfile::vended`] (Lakekeeper mints a short-lived SAS token per
-/// request; `sas-enabled: true`, matching Lakekeeper v0.13.1's own default). Both
-/// modes share one [`AdlsWarehouseProfile::storage_credential`]: Lakekeeper mints
-/// the vended SAS from the same account key it would otherwise hand out
-/// directly, so there is exactly one credential shape to register regardless of
-/// mode.
+/// Two variants: [`AdlsWarehouseProfile::static_creds`] (`sas-enabled: false`,
+/// Lakekeeper reads the account key directly) and [`AdlsWarehouseProfile::vended`]
+/// (`sas-enabled: true`, Lakekeeper mints a short-lived SAS per request from that
+/// same account key). Both share one [`AdlsWarehouseProfile::storage_credential`].
 pub struct AdlsWarehouseProfile {
     name: String,
     account_name: String,
@@ -295,15 +291,10 @@ pub struct AdlsWarehouseProfile {
 }
 
 impl AdlsWarehouseProfile {
-    /// Build the static-credential ADLS profile for the run that owns
-    /// `container_name`: `sas-enabled: false`, so Lakekeeper reads
-    /// `account_key` directly and the suite exercises the account-key path.
-    ///
-    /// The warehouse name is derived from the container (not supplied): the
-    /// per-run suffix stops a repeat run binding to a deleted container's
-    /// warehouse, and the `-static` tail keeps this warehouse's `key-prefix`
-    /// disjoint from any sibling sharing the container — Lakekeeper rejects an
-    /// overlapping key-prefix.
+    /// Static-credential ADLS profile for the run owning `container_name`:
+    /// `sas-enabled: false`, so Lakekeeper reads `account_key` directly. The
+    /// warehouse name derives from the container (per-run suffix, `-static` tail
+    /// to keep its `key-prefix` disjoint from a vended sibling).
     pub fn static_creds(container_name: &str, account_name: &str, account_key: &str) -> Self {
         AdlsWarehouseProfile {
             name: format!("{container_name}-static"),
@@ -314,14 +305,10 @@ impl AdlsWarehouseProfile {
         }
     }
 
-    /// Build the vended-credential ADLS profile for the run that owns
-    /// `container_name`: `sas-enabled: true` — Lakekeeper v0.13.1's own
-    /// default — so Lakekeeper mints a short-lived SAS token per request from
-    /// `account_key` instead of handing the account key out directly.
-    ///
-    /// The warehouse name is derived from the container (not supplied), same as
-    /// [`Self::static_creds`]; the `-vended` tail keeps this warehouse's
-    /// `key-prefix` disjoint from a static sibling sharing the same container.
+    /// Vended-credential ADLS profile: `sas-enabled: true` (Lakekeeper's own
+    /// default), so it mints a short-lived SAS per request instead of handing out
+    /// `account_key` directly. Warehouse name as in [`Self::static_creds`], with a
+    /// `-vended` tail.
     pub fn vended(container_name: &str, account_name: &str, account_key: &str) -> Self {
         AdlsWarehouseProfile {
             name: format!("{container_name}-vended"),
@@ -404,14 +391,10 @@ pub fn lakekeeper_create_adls_warehouse(profile: &AdlsWarehouseProfile) {
 /// create-warehouse endpoint for every storage backend.
 ///
 /// Idempotent: Lakekeeper 0.13.1 reports an already-provisioned warehouse as
-/// HTTP 400 `CreateWarehouseStorageProfileOverlap` (profile overlaps an
-/// existing warehouse's), NOT 409 — both are treated as success. The
-/// overlap-400-means-already-exists mapping is an unverified inference for
-/// warehouses that share one bucket or filesystem: a create Lakekeeper
-/// actually rejected is therefore also reported here as success. Callers
-/// that need certainty must read the warehouse back through
-/// `lakekeeper_warehouse_storage_profile`, as the ADLS suite's
-/// `create_warehouse_and_confirm` does.
+/// HTTP 400 `CreateWarehouseStorageProfileOverlap`, NOT 409 — both are treated
+/// as success. For warehouses sharing a bucket/filesystem this is an unverified
+/// inference, so callers needing certainty should read the warehouse back via
+/// `lakekeeper_warehouse_storage_profile` (see `create_warehouse_and_confirm`).
 ///
 /// Credential-safe: `storage_credential` carries an S3 secret or Azure account
 /// key, so the response body never reaches a panic message — only the
@@ -475,12 +458,10 @@ fn post_warehouse(
 /// The `warehouse` field is the Lakekeeper warehouse NAME (the value passed to
 /// `GET /v1/config?warehouse=`), not an `s3://` or `abfss://` path.
 ///
-/// Shared by both the MinIO/STS arm and the ADLS/SAS arm: when `vended` is
-/// true, the UDF requests short-lived credentials at scan time — vended S3
-/// credentials via `load_table` for MinIO, a vended SAS token for ADLS — so
-/// this function populates no static storage field for either backend. When
-/// `vended` is false the UDF reads MinIO directly, so the static S3 fields
-/// (endpoint, region, keys, path-style) are populated with the static
+/// Shared by both the MinIO/STS arm and the ADLS/SAS arm: when `vended` is true,
+/// no static storage field is populated for either backend (the UDF requests
+/// short-lived credentials at scan time instead). When `vended` is false, the
+/// static S3 fields (endpoint, region, keys, path-style) carry the static
 /// warehouse's credentials.
 pub fn lakekeeper_connection_password(
     warehouse_name: &str,
@@ -637,8 +618,7 @@ mod tests {
         assert_eq!(pw.access_key, "");
         assert_eq!(pw.secret_key, "");
         assert!(!pw.use_sigv4);
-        // No storage-backend field is set for either caller of this function
-        // (MinIO/STS or ADLS/SAS) — the vended branch is backend-neutral.
+        // The vended branch is backend-neutral: no storage field is set.
         assert_eq!(pw.account_name, None);
         assert_eq!(pw.account_key, None);
         assert_eq!(pw.session_token, None);

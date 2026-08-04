@@ -2,7 +2,7 @@
 //! **real Azure Data Lake Storage Gen2** account, catalogued by a local Lakekeeper
 //! (OpenID-secured via Keycloak), over **both credential arms**: the static arm
 //! (delegation off, account key carried in the Exasol CONNECTION) and the vended
-//! arm (delegation on, a SAS minted per `loadTable` and carried by no CONNECTION
+//! arm (delegation on, a SAS minted per `loadTable`, carried by no CONNECTION
 //! field).
 //!
 //! Azure has no working local substitute — Azurite's `dfs` endpoint is incomplete
@@ -14,31 +14,26 @@
 //! All tests share one Exasol provisioning, so they run serially
 //! (`--test-threads=1`, set by the `make test-e2e-azure` target).
 //!
-//! Three credential roles, never conflated. The harness creates and deletes its
-//! own blob container under an **Entra ID service principal** (the official Azure
-//! blob crate accepts no account key). The **account key** carries both
-//! warehouses' Lakekeeper storage credential, both arms' seed `FileIO`, and the
-//! static arm's Exasol CONNECTION — the `AdlsCred::AccountKey` path. The **vended
-//! SAS** carries the vended arm's scan and nothing else: Lakekeeper mints it from
-//! that same account key and returns it per `loadTable`, and no CONNECTION field
-//! holds it — the `AdlsCred::Sas` path.
+//! Three credential roles: the harness creates/deletes its blob container under
+//! an **Entra ID service principal** (the Azure blob crate accepts no account
+//! key). The **account key** carries both warehouses' Lakekeeper storage
+//! credential, both arms' seed `FileIO`, and the static arm's CONNECTION
+//! (`AdlsCred::AccountKey`). The **vended SAS** carries only the vended arm's
+//! scan, minted by Lakekeeper from that same key per `loadTable`
+//! (`AdlsCred::Sas`).
 //!
-//! [`setup`] holds only what's idempotent and cleanup-free: readiness waits,
-//! Lakekeeper bootstrap, shared SLC/`.so`/script provisioning. Everything with a
+//! [`setup`] holds only what's idempotent and cleanup-free. Everything with a
 //! lifecycle lives on [`AzureFixture`], held as a test-function local so `Drop`
-//! deletes the run's container at scope end — including while unwinding from a
-//! panic, which a guard parked in a `OnceLock` never would.
+//! deletes the run's container at scope end, including while unwinding from a
+//! panic.
 //!
 //! **One fixture and one container guard serve both arms**, which is why
-//! [`azure_static_and_vended_creds_end_to_end`] is one test rather than two: the
-//! guard cannot live in a `OnceLock`, so splitting the arms would mean a second
-//! live-Azure container. Sharing costs masking, and assertion order is the
-//! mitigation — every vended-arm assertion except the closing cross-arm
-//! comparison runs BEFORE the static arm's. The vended CONNECTION carries no
-//! account name and no account key, so a passing vended scan is reachable only
-//! through the vended SAS and is the strongest proof in the file; running it
-//! first stops an unrelated static-arm regression from aborting the test before
-//! that proof has been made.
+//! [`azure_static_and_vended_creds_end_to_end`] is one test rather than two — the
+//! guard can't live in a `OnceLock`, so splitting the arms would need a second
+//! live-Azure container. Assertion order is the mitigation for sharing: every
+//! vended-arm assertion except the closing cross-arm comparison runs before the
+//! static arm's, since the vended CONNECTION carries no account name/key and so
+//! is the strongest proof in the file.
 #![cfg(feature = "azure-e2e")]
 
 mod common;
@@ -74,14 +69,12 @@ use std::time::Duration;
 
 /// Virtual Schema over the static-credential (delegation-off) ADLS warehouse.
 const VS_STATIC: &str = "AZ_STATIC_LAKEHOUSE";
-/// Catalog CONNECTION for that warehouse: OAuth2 catalog fields plus the account
-/// name and key under test.
+/// Catalog CONNECTION for that warehouse: OAuth2 fields plus account name/key.
 const CONN_STATIC: &str = "AZ_STATIC_CATALOG_CREDS";
 
 /// Virtual Schema over the vended-credential (delegation-on) ADLS warehouse.
 const VS_VENDED: &str = "AZ_VENDED_LAKEHOUSE";
-/// Catalog CONNECTION for that warehouse: OAuth2 catalog fields and no storage
-/// field of any kind, so only the SAS Lakekeeper vends can reach the data.
+/// Catalog CONNECTION for that warehouse: OAuth2 fields, no storage field.
 const CONN_VENDED: &str = "AZ_VENDED_CATALOG_CREDS";
 
 /// Lakekeeper catalog base URL as reached from inside the Exasol UDF container —
@@ -130,16 +123,8 @@ fn setup() {
 
 /// One credential mode's warehouse: everything the suite needs to query it.
 ///
-/// A three-field record earns its place here on leakage rather than on depth.
-/// The flat alternative gives [`AzureFixture`] two same-typed `String` warehouse
-/// names and two same-typed `Vec<String>` path vectors, where one cross-wired
-/// pair would let the vended assertions read the static arm's data and still
-/// pass. Pairing the three per-arm values in one value makes that mistake
-/// unrepresentable.
-///
-/// `abfss_prefix()` deliberately does NOT live here: the container is shared, so
-/// the prefix is a property of the container, not of an arm — and that placement
-/// is what makes "both arms sit on the same container" assertable at all.
+/// Grouping these three fields (rather than two parallel same-typed vectors on
+/// [`AzureFixture`]) makes a cross-wired static/vended mix-up unrepresentable.
 struct AzureArm {
     /// Lakekeeper's name for this arm's warehouse, which is also its `key-prefix`.
     warehouse: String,
@@ -160,59 +145,40 @@ impl AzureArm {
 /// credential mode — and each one's seeded table, CONNECTION, and Virtual
 /// Schema.
 ///
-/// One container serves both arms: it halves the live-Azure provisioning cost of
-/// a second credential mode and keeps the only cloud resource, and the only
-/// orphan surface, at one. It buys nothing else — the arms are seeded
-/// independently into two disjoint `key-prefix`es, so they are two Iceberg
-/// tables over two sets of Parquet files, and cross-arm row equality rests on
-/// the one deterministic seed shape rather than on shared bytes.
+/// One container serves both arms, halving the live-Azure provisioning cost and
+/// orphan surface; the arms are still seeded independently into two disjoint
+/// `key-prefix`es.
 ///
 /// **Hold this as a local in the test that provisions it.** `_container`'s
-/// `Drop` deletes the container on return or panic, but only while it's still
-/// owned by the test's stack frame — never move it out or park it in a static.
-/// That constraint is why both arms live in one test function: a `OnceLock`
-/// setup shared across tests, as the MinIO suite uses, would leak the container.
+/// `Drop` deletes the container on return or panic, but only while still owned
+/// by the test's stack frame — never move it out or park it in a static (which
+/// is why both arms live in one test function rather than a shared `OnceLock`).
 struct AzureFixture {
     /// Storage account under test — the `abfss://` authority the scan reads.
     account_name: String,
     /// The run's blob container, which is also both warehouses' `filesystem`.
     container_name: String,
-    /// The vended-SAS arm. Provisioned first, so a static-arm provisioning
-    /// failure cannot leave the run with zero vended evidence.
+    /// The vended-SAS arm. Provisioned first so a static-arm failure can't hide
+    /// vended evidence.
     vended_arm: AzureArm,
     /// The static account-key arm.
     static_arm: AzureArm,
-    /// The exact password [`AzureFixture::provision`] used to create
-    /// `CONN_VENDED` — the installed artefact itself, not an equivalent value
-    /// rebuilt later. Asserting on a second call of the password helper would
-    /// only re-test that pure helper and would still pass if provisioning had
-    /// installed a static-credential password here instead.
+    /// The exact password [`AzureFixture::provision`] installed as `CONN_VENDED`
+    /// — the installed artefact itself, not an equivalent value rebuilt later.
     vended_password: CatalogConnectionPassword,
-    /// Existence-only: dropping it deletes the container, and with it both
-    /// arms' data. Declared last so it outlives every field describing it.
+    /// Existence-only: dropping it deletes the container and both arms' data.
+    /// Declared last so it outlives every field describing it.
     _container: AzureContainer,
 }
 
 impl AzureFixture {
-    /// Create the run's container, then the VENDED arm's warehouse, seed, and
-    /// Virtual Schema, then the STATIC arm's. Two independent reasons fix that
-    /// order; neither is a preference.
+    /// Create the run's container, then the vended arm's warehouse/seed/VS, then
+    /// the static arm's. Container first because Lakekeeper validates access via
+    /// a probe write/delete at warehouse-creation time. Vended before static so a
+    /// static-arm failure can't leave zero evidence about the vended path.
     ///
-    /// Container before either warehouse: Lakekeeper creates no filesystem and
-    /// validates physical access at warehouse-creation time via a probe
-    /// write/delete, so a missing container or a wrong key fails warehouse
-    /// creation immediately instead of surfacing later as a scan error.
-    ///
-    /// Vended arm before static: every failure in here panics, so arm order is
-    /// the only thing keeping a static-arm provisioning failure from leaving the
-    /// run with zero evidence about the vended path. It reduces that masking
-    /// rather than removing it — a vended-arm failure still aborts before the
-    /// static arm — which is the accepted cost of one shared fixture.
-    ///
-    /// Blocking HTTP/WebSocket calls (`exa_conn`, DDL) stay outside
-    /// `rt.block_on`: issuing one from inside a runtime context panics,
-    /// unwinding through the container guard instead of reaching a test
-    /// assertion.
+    /// Blocking HTTP/WebSocket calls stay outside `rt.block_on`: issuing one from
+    /// inside a runtime context panics, unwinding through the container guard.
     fn provision() -> Self {
         setup();
 
@@ -231,13 +197,8 @@ impl AzureFixture {
             .block_on(AzureContainer::create(&container_name))
             .unwrap_or_else(|e| panic!("create per-run Azure container '{container_name}': {e:#}"));
 
-        // Both arms seed through this one closure, which is what makes the
-        // Keycloak token necessarily fetched immediately before each write — a
-        // short token lifetime cannot go stale mid-seed if there is no way to
-        // reach the seed without minting one. Both arms also seed with the
-        // account key and no per-arm override: Lakekeeper vends its SAS under
-        // the host-suffixed `adls.sas-token.<host>` key, which cannot reach the
-        // flat `adls.account-key` property the seed's FileIO reads.
+        // Both arms seed through this closure so the short-lived Keycloak token
+        // is fetched fresh immediately before each write.
         let seed_arm = |warehouse: &str| -> Vec<String> {
             let token = lakekeeper::keycloak_client_credentials_token();
             rt.block_on(seed_events_table_with_auth(
@@ -255,11 +216,6 @@ impl AzureFixture {
             .data_file_paths
         };
 
-        // Both warehouse names derive from the container, so they carry its
-        // per-run suffix — a repeated run can't bind to a stale warehouse whose
-        // container is already gone — and their differing tails keep the two
-        // `key-prefix`es disjoint, which Lakekeeper requires of warehouses
-        // sharing a filesystem.
         let vended_warehouse = create_warehouse_and_confirm(&AdlsWarehouseProfile::vended(
             &container_name,
             &account_name,
@@ -267,9 +223,6 @@ impl AzureFixture {
         ));
         let vended_paths = seed_arm(&vended_warehouse);
         let mut conn = exa_conn();
-        // No storage field at all: the vended branch of the shared password
-        // helper returns the OAuth2 catalog fields alone, so nothing but the
-        // SAS Lakekeeper mints can reach this arm's data.
         let vended_password = lakekeeper_connection_password(&vended_warehouse, true);
         create_virtual_schema_with_password(
             &mut conn,
@@ -314,10 +267,8 @@ impl AzureFixture {
     }
 
     /// The `abfss://<container>@<account>.dfs.core.windows.net/` prefix every one
-    /// of this fixture's data files carries, on either arm.
-    ///
-    /// Container-level by design, because the container is shared: an arm's own
-    /// prefix is this one followed by that arm's warehouse name.
+    /// of this fixture's data files carries, on either arm. An arm's own prefix
+    /// is this one followed by that arm's warehouse name.
     fn abfss_prefix(&self) -> String {
         format!(
             "abfss://{}@{}.dfs.core.windows.net/",
@@ -326,23 +277,10 @@ impl AzureFixture {
     }
 }
 
-/// Create one arm's warehouse and confirm Lakekeeper registered it, returning
-/// the warehouse name.
-///
-/// The readback guards two distinct failure mechanisms:
-///
-/// (a) A create Lakekeeper rejected for overlapping an existing warehouse's
-/// storage profile — now reachable since two warehouses share one
-/// `filesystem` — leaves no warehouse registered under this name.
-/// `lakekeeper_warehouse_storage_profile` panics first, here, with its own
-/// "no warehouse named ..." error, instead of resurfacing several steps
-/// later as an opaque seed error.
-///
-/// (b) The `key-prefix` equality assertion below covers the separate case of
-/// Lakekeeper registering the warehouse under a prefix other than the one
-/// requested. It cannot report the overlap case in (a): that case panics
-/// earlier, inside `lakekeeper_warehouse_storage_profile`, before this
-/// assertion runs.
+/// Create one arm's warehouse and confirm Lakekeeper registered it under the
+/// requested `key-prefix`, returning the warehouse name. The readback also
+/// catches a create Lakekeeper silently rejected for overlapping a sibling's
+/// storage profile, surfacing it here instead of as an opaque seed error later.
 fn create_warehouse_and_confirm(profile: &AdlsWarehouseProfile) -> String {
     let warehouse = profile.name().to_string();
     lakekeeper_create_adls_warehouse(profile);
@@ -361,11 +299,7 @@ fn create_warehouse_and_confirm(profile: &AdlsWarehouseProfile) -> String {
 // End-to-end scan over both credential arms — vended assertions first.
 // ---------------------------------------------------------------------------
 
-/// Assert `arm`'s Virtual Schema exists.
-///
-/// A Virtual Schema existing is itself proof that this arm's whole chain ran: it
-/// could not have been created over a missing container, a warehouse Lakekeeper
-/// rejected, a credential the catalog refuses, or an unseeded table.
+/// Assert `arm`'s Virtual Schema exists — proof its whole provisioning chain ran.
 fn assert_vs_exists(conn: &mut ExaConn, arm: &AzureArm) {
     let cols = conn.query_columns(&format!(
         "SELECT SCHEMA_NAME FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{}'",
@@ -382,13 +316,8 @@ fn assert_vs_exists(conn: &mut ExaConn, arm: &AzureArm) {
 }
 
 /// Assert every data file `arm` seeded lives under `arm`'s own Lakekeeper
-/// `key-prefix`, and that none of them sits under `sibling`'s.
-///
-/// The container-level `abfss://` prefix is identical for both arms, so matching
-/// it proves only that storage is real Azure — never which warehouse a file
-/// belongs to. The per-arm prefix (which equals the warehouse name) proves both.
-/// That disjointness is what makes the cross-arm row comparison a comparison of
-/// two distinct file sets rather than of one arm against itself.
+/// `key-prefix`, and none sits under `sibling`'s — proving the two arms are
+/// disjoint file sets, not just both real Azure storage.
 fn assert_paths_under_own_prefix(fixture: &AzureFixture, arm: &AzureArm, sibling: &AzureArm) {
     assert!(
         !arm.data_file_paths.is_empty(),
@@ -461,9 +390,6 @@ fn assert_projection_filter_limit(conn: &mut ExaConn, arm: &AzureArm) {
 }
 
 /// The `(id, name, score)` rows of `table`, ordered by id, as comparable tuples.
-///
-/// The ordering is part of the contract, not presentation: comparing two
-/// unordered result sets for equality is not an equality check.
 fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
     let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
     assert_eq!(
@@ -488,29 +414,20 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
 }
 
 /// Both credential arms — static account key and vended SAS — end to end over
-/// one per-run container, in one test because they share one fixture: the
-/// container guard cannot live in a `OnceLock`, so splitting the arms would mean
-/// a second live-Azure container.
+/// one per-run container, in one test because they share one fixture.
 ///
 /// **The assertion order below is normative, not style.** Every vended-arm
-/// assertion except the final cross-arm comparison runs BEFORE the static arm's,
-/// because the vended CONNECTION carries no account name and no account key —
-/// which makes a passing vended scan reachable only through the SAS Lakekeeper
-/// mints, and therefore the strongest and most specific proof in this file. A
-/// static-arm query or assertion regression aborting the run after that proof
-/// has already run is harmless; the reverse order would hide a vended regression
-/// behind an unrelated static-arm failure.
+/// assertion except the final cross-arm comparison runs BEFORE the static arm's:
+/// the vended CONNECTION carries no account name/key, so a passing vended scan
+/// is the strongest proof in this file, and should abort the run before any
+/// unrelated static-arm regression can mask it.
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
     let fixture = AzureFixture::provision();
     let mut conn = exa_conn();
 
-    // 1. The vended CONNECTION's REQUIRED shape, read off the very password
-    //    `provision` installed as CONN_VENDED rather than off a re-derived
-    //    equivalent: no storage field of any kind. Not merely a delegation hint
-    //    — with nothing for scheme-driven resolution to fall back on, the
-    //    vended SAS is the only credential that can make the scan below
-    //    succeed.
+    // 1. The vended CONNECTION's required shape: no storage field of any kind,
+    //    so only the vended SAS can make the scan below succeed.
     assert!(
         fixture.vended_password.use_vended_credentials,
         "the vended ADLS CONNECTION must request access delegation"
@@ -529,8 +446,7 @@ fn azure_static_and_vended_creds_end_to_end() {
         "a vended CONNECTION must carry no static S3 storage field either"
     );
 
-    // 2. The vended warehouse as Lakekeeper itself reports it back — not as this
-    //    harness constructed it.
+    // 2. The vended warehouse as Lakekeeper itself reports it back.
     let vended_profile = lakekeeper_warehouse_storage_profile(&fixture.vended_arm.warehouse);
     assert_eq!(
         vended_profile["sas-enabled"].as_bool(),
@@ -545,21 +461,14 @@ fn azure_static_and_vended_creds_end_to_end() {
          {vended_profile}"
     );
 
-    // 3. The vended Virtual Schema exists, and its seed landed under the vended
-    //    warehouse's own key-prefix rather than the static sibling's.
+    // 3. The vended VS exists and its seed landed under its own key-prefix.
     assert_vs_exists(&mut conn, &fixture.vended_arm);
     assert_paths_under_own_prefix(&fixture, &fixture.vended_arm, &fixture.static_arm);
 
     // 4. The vended scan itself: projection, filter, LIMIT, and row counts.
     assert_projection_filter_limit(&mut conn, &fixture.vended_arm);
 
-    // 5. The scan path came from the shared harness definition, not a
-    //    duplicated local one: one schema-level script pair for the whole
-    //    binary, and BOTH Virtual Schemas created USING the adapter script from
-    //    that pair — checking only one arm would leave the other's provenance
-    //    unverified. Covering both arms is why this group sits above the static
-    //    arm's own groups rather than below them: the vended arm's provenance
-    //    must be established before any static-arm assertion can abort the run.
+    // 5. Both Virtual Schemas were created USING the one shared adapter script.
     for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
         let resp = conn.execute(&format!(
             "SELECT SCRIPT_TEXT FROM EXA_ALL_SCRIPTS \
@@ -632,11 +541,7 @@ fn azure_static_and_vended_creds_end_to_end() {
     assert_paths_under_own_prefix(&fixture, &fixture.static_arm, &fixture.vended_arm);
     assert_projection_filter_limit(&mut conn, &fixture.static_arm);
 
-    // 7. Last, because it depends on both arms having already proved themselves:
-    //    the two arms return the same rows. Ordered by id on both sides — an
-    //    unordered comparison would not be an equality check at all. This is
-    //    only a comparison of two distinct file sets because group 3 and group 6
-    //    established that the arms' key-prefixes are disjoint.
+    // 7. Both arms return the same rows, ordered by id.
     let vended_rows = projection_rows(&mut conn, &fixture.vended_arm.table());
     let static_rows = projection_rows(&mut conn, &fixture.static_arm.table());
     assert_eq!(
@@ -660,10 +565,8 @@ fn azure_static_and_vended_creds_end_to_end() {
 /// teardown thread exists to survive (driving the delete on the ambient runtime
 /// from `Drop` would re-enter "Cannot start a runtime from within a runtime").
 ///
-/// One guard covers both credential arms: the container it deletes holds the
-/// static and vended warehouses' data alike, so the second arm adds no
-/// Azure-side orphan surface. It is also why the arms cannot be split across two
-/// tests — the guard has to stay owned by the provisioning test's stack frame.
+/// One guard covers both credential arms: the container it deletes holds both
+/// warehouses' data, so the second arm adds no Azure-side orphan surface.
 ///
 /// Uses `futures::FutureExt::catch_unwind`, not `std::panic::catch_unwind`: the
 /// guard's construction is `async`, and a nested `Handle::block_on` inside a
