@@ -21,10 +21,10 @@ with far-future sentinel values into Iceberg-registered tables; this fixture rep
   data file as-is, a fixture-shape test MUST assert the committed data file is physically INT96, so a
   silent INT64 result (or an unexpected rewrite) fails loudly rather than making the scan test pass
   vacuously.
-* The fixture column is Iceberg `timestamp` WITHOUT time zone, never `timestamptz`: Exasol rejects
-  `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output type (open #118), so a `timestamptz`
-  fixture would fail the E2E emit for an unrelated reason. `timestamp` maps to a plain Exasol
-  `TIMESTAMP`, isolating this fixture to the INT96 decode path under test.
+* The fixture column is Iceberg `timestamp` WITHOUT time zone, never `timestamptz`: a `timestamptz`
+  column would add an unrelated time-zone-mapping variable (#118) to a fixture whose only job is
+  proving the INT96 decode fix. `timestamp` maps to a plain Exasol `TIMESTAMP`, isolating this
+  fixture to the INT96 decode path under test.
 * The `outputTimestampType=INT96` setting is scoped to this fixture's script so it does not change
   the positional-delete fixtures' writes.
 * The far-future value is `9999-12-31 23:59:59`: outside the Arrow nanosecond range (max 2262) so it

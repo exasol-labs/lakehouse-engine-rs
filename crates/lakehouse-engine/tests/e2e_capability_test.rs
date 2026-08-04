@@ -1166,29 +1166,24 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
-        let native = scalar_seconds(
+        // Native and projected are measured within a SINGLE statement — the
+        // outer `{expr}` against the subquery's pushed-down `{expr}` — rather
+        // than two separate round-trips, so no wall-clock time can elapse
+        // between the two measurements. A two-statement version's deviation
+        // would be `offset - elapsed_between_queries`, which can still land
+        // under the offset threshold and let a UTC-shift regression pass.
+        let deviation = scalar_seconds(
             &mut conn,
-            &format!("SELECT SECONDS_BETWEEN({expr}, TIMESTAMP '2024-01-01 00:00:00')"),
-        );
-        let projected = scalar_seconds(
-            &mut conn,
-            &format!(
-                "SELECT SECONDS_BETWEEN({expr}, TIMESTAMP '2024-01-01 00:00:00') FROM {table} WHERE id = 1"
-            ),
-        );
-        let deviation = (projected - native).abs();
-        // Scaled to the session's own UTC offset rather than a fixed tolerance:
-        // the pre-#238 defect ships the UTC instant, whose deviation from
-        // native equals the offset itself (here 3600s under EUROPE/BERLIN),
-        // far larger than ordinary clock skew between the two back-to-back
-        // queries — so this fails if the adapter ever regresses to the UTC
-        // instant, independent of how large or small the offset happens to be.
+            &format!("SELECT SECONDS_BETWEEN({expr}, (SELECT {expr} FROM {table} WHERE id = 1))"),
+        )
+        .abs();
         assert!(
-            deviation < offset_seconds.abs(),
-            "{expr}'s deviation from native ({deviation}s) must be strictly smaller \
-             than the session's UTC offset ({offset_seconds}s) — this is the sharp \
-             assertion that fails if the adapter ever ships the UTC instant instead \
-             of Exasol's own session-local value (the pre-#238 defect)"
+            deviation < 1.0,
+            "{expr}'s deviation between the native value and the VS-projected value \
+             ({deviation}s) must be near zero — this is the sharp assertion that \
+             fails if the adapter ever ships the UTC instant instead of Exasol's own \
+             session-local value (the pre-#238 defect, {offset_seconds}s under this \
+             session's zone)"
         );
     }
 }

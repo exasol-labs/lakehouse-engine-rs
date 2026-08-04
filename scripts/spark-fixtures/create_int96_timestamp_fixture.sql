@@ -26,10 +26,10 @@
 -- value carries no timezone annotation, so add_files maps it by name into the
 -- Iceberg `timestamp` WITHOUT time zone column (Spark TIMESTAMP_NTZ) declared
 -- below. That column is deliberately WITHOUT zone: a `timestamptz` column would
--- hit the still-open TIMESTAMP-WITH-LOCAL-TIME-ZONE EMITS limitation (#118),
--- which is unrelated to #143 and must be avoided here. session.timeZone is
--- pinned to UTC so the wall-clock literal round-trips deterministically through
--- INT96 (stored as a UTC instant) back to exactly 9999-12-31 23:59:59.
+-- add an unrelated time-zone-mapping variable (#118) to a fixture whose only
+-- job is proving the #143 overflow fix, so it is avoided here. session.timeZone
+-- is pinned to UTC so the wall-clock literal round-trips deterministically
+-- through INT96 (stored as a UTC instant) back to exactly 9999-12-31 23:59:59.
 --
 -- WHY s3:// (NOT s3a://): the scan UDF registers its object store under the
 -- `s3://` scheme (register_bucket_store, crates/lakehouse-engine/src/scan/mod.rs),

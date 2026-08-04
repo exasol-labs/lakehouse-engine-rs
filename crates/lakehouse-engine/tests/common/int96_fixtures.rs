@@ -25,11 +25,11 @@
 //! `timestamptz`. The INT96 overflow decode fix (`coerce_int96`, `#143`) is
 //! the behavior under test, and a naive `timestamp` column is the minimal
 //! carrier for it — `timestamptz` would add an unrelated time-zone-mapping
-//! variable to a fixture whose only job is proving the overflow fix. `#118`
-//! (closed) already established that `timestamptz` COLUMNS reach the
-//! scan-emit path fine (`types/mapping.rs` maps them to plain Exasol
-//! `TIMESTAMP`), so this fixture's `timestamp` choice is scope narrowing, not
-//! a workaround for a column-path constraint.
+//! variable to a fixture whose only job is proving the overflow fix.
+//! `timestamptz` COLUMNS already reach the scan-emit path fine (#118 —
+//! `types/mapping.rs` maps them to plain Exasol `TIMESTAMP`), so this
+//! fixture's `timestamp` choice is scope narrowing, not a workaround for a
+//! column-path constraint.
 
 /// Namespace shared with the other E2E seed tables (`seed::E2E_NAMESPACE`).
 pub const NAMESPACE: &str = "e2e_lakehouse";
