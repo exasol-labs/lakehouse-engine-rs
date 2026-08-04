@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.32.0"
+version = "0.32.1"
 edition = "2024"
 license.workspace = true
 
@@ -68,7 +68,13 @@ tracing = { version = "0.1", default-features = false }
 [dev-dependencies]
 # time: tokio::time::sleep, used by the concurrency-bound integration tests to force
 # deterministic overlap in fake delete-file reads.
-tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# net + io-util: the loopback catalog fake in `adapter/pushdown/file_resolution.rs`'s
+# unit tests binds a `tokio::net::TcpListener` (`net`) and serves one HTTP/1.1
+# response over `tokio::io::{AsyncReadExt, AsyncWriteExt}` (`io-util`). Declared here
+# rather than left to Cargo feature unification through reqwest/hyper-util, so those
+# tests do not compile by accident and break the moment that transitive choice
+# changes — the same discipline the `iceberg-storage-opendal` entry below applies.
+tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 # Test fixtures (tests/common/seed.rs, tests/tpch_loader.rs) build Arrow
 # RecordBatch + parquet WriterProperties directly with the workspace arrow/parquet
 # 58 and feed them into iceberg 0.10.0's writer stack, which also links

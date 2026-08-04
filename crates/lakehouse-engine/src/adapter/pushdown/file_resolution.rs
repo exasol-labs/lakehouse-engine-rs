@@ -206,6 +206,12 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 /// `(files, storage.clone())` — byte-identical to the no-vending behaviour on every
 /// auth mode.
 ///
+/// An empty table `location` in the `loadTable` response is rejected as a
+/// [`UdfError::User`] ABOVE the vended/static split, so both values of
+/// `use_vended_credentials` report the identical error, and every join side inherits
+/// the rejection through this same call. The REST `warehouse` is never substituted
+/// for it.
+///
 /// Every error surfaced from here on is redacted against the secret values of the
 /// EFFECTIVE storage, not the static one: the `file_io` built from it is what talks
 /// to object storage, so those are exactly the values an underlying provider error
@@ -243,22 +249,25 @@ pub async fn resolve_file_list(
     // Resolve the effective storage (vended or static). The anchor is the TABLE'S OWN
     // location: what `storage_credentials[*].prefix` is matched against, and the sole
     // input the backend variant is read from. Nothing else can stand in — the catalog
-    // REST URI names no object store, and the REST `warehouse` is a routing identifier
-    // — so an absent location is its own error on the vended branch below.
+    // REST URI names no object store, and the REST `warehouse` is a routing identifier.
+    // This guard runs above the vended/static split, on every path: a `loadTable`
+    // response with no location is malformed regardless of `use_vended_credentials`.
     let table_location = result.metadata.location();
+    if table_location.is_empty() {
+        return Err(UdfError::User(format!(
+            "the loadTable response for table '{}' carries an EMPTY table `location`; the \
+             catalog `warehouse` is a routing identifier, not a table location, and is not a \
+             valid substitute",
+            catalog_props.table
+        )));
+    }
     // Own the table root before `result.metadata` is moved into the table builder
     // below. Returned so the adapter can carry it once in the common blob and emit
-    // per-shard file paths relative to it (empty ⇒ every path stays absolute).
+    // per-shard file paths relative to it. The guard above guarantees this root is
+    // non-empty for THIS value; the empty-root-⇒-absolute-paths rule remains the
+    // wire-format totality property `reconstruct_abs_uri` rejoins on the scan side.
     let table_root = table_location.to_string();
     let effective_storage = if creds.use_vended_credentials {
-        if table_location.is_empty() {
-            return Err(UdfError::User(
-                "the loadTable response carries no table location, so the storage backend \
-                 cannot be resolved; the catalog `warehouse` is a routing identifier, not a \
-                 storage location, and is not a valid fallback"
-                    .into(),
-            ));
-        }
         resolve_vended_storage(&result, table_location, allow_http)?
     } else {
         storage.clone()
@@ -1731,6 +1740,195 @@ mod tests {
         assert!(
             !msg.contains("access_key") && !msg.contains("secret_key"),
             "error must not leak credentials: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 2.1 — an absent table
+    // location is rejected identically with and without vended credentials
+    // ---------------------------------------------------------------------------
+
+    /// The `loadTable` response body for a table whose metadata `location` is
+    /// PRESENT but EMPTY — the wire shape that reaches the absent-location guard.
+    ///
+    /// An OMITTED `location` key is a different shape with a different owner: it
+    /// fails deserialization strictly earlier, because `iceberg-0.10.0` declares
+    /// `location: String` non-`Option` with no serde default on every metadata
+    /// variant and resolves `TableMetadata` through an untagged V1/V2/V3 enum, so
+    /// an omitted key matches no variant and never reaches this guard. Only the
+    /// empty-string shape exercises it.
+    ///
+    /// The metadata is the minimal valid v2 shape (mirroring `lakehouse-catalog`'s
+    /// vended-storage fixture) with `location` emptied. It declares no snapshot, so
+    /// nothing downstream of the guard drives an object-store read.
+    fn load_table_body_with_empty_location() -> String {
+        serde_json::json!({
+            "metadata-location": "s3://bucket/db/t/metadata/v1.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "00000000-0000-0000-0000-000000000001",
+                "location": "",
+                "last-sequence-number": 0,
+                "last-updated-ms": 0,
+                "last-column-id": 0,
+                "current-schema-id": 0,
+                "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+                "default-spec-id": 0,
+                "partition-specs": [{"spec-id": 0, "fields": []}],
+                "last-partition-id": 0,
+                "sort-orders": [{"order-id": 0, "fields": []}],
+                "default-sort-order-id": 0
+            }
+        })
+        .to_string()
+    }
+
+    /// Credentials under which one `resolve_file_list` call issues EXACTLY ONE
+    /// catalog HTTP request, so a single-shot loopback server suffices.
+    ///
+    /// `use_sigv4` is what buys that: `resolve_catalog_auth` returns the SigV4
+    /// strategy without contacting the catalog, and `resolve_load_table_prefix`
+    /// derives `catalogs/{warehouse}` instead of looking up `/v1/config`, leaving
+    /// the `loadTable` GET as the only request. Signing is local, so the dummy
+    /// region and keys never leave the process. It is orthogonal to
+    /// `use_vended_credentials`, the field the test below varies.
+    fn one_request_sigv4_creds() -> ConnectionCreds {
+        ConnectionCreds {
+            warehouse: "123456789012".into(),
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "signing-access-key".into(),
+            secret_key: "signing-secret-key".into(),
+            session_token: None,
+            path_style: true,
+            use_sigv4: true,
+            use_vended_credentials: false,
+            token: None,
+            client_id: None,
+            client_secret: None,
+            oauth2_server_uri: None,
+            scope: None,
+            account_name: None,
+            account_key: None,
+            sas_token: None,
+        }
+    }
+
+    /// Drive the real `resolve_file_list` against a single-shot loopback catalog
+    /// that answers the `loadTable` GET with an empty table location.
+    ///
+    /// Each call gets its own listener because `CatalogSession::resolve` builds its
+    /// own `reqwest` client, so two calls cannot share a pooled connection.
+    async fn resolve_file_list_against_locationless_catalog(
+        creds: &ConnectionCreds,
+    ) -> Result<(), UdfError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _n = stream.read(&mut buf).await.expect("read");
+
+            let body = load_table_body_with_empty_location();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write");
+        });
+
+        let catalog_uri = format!("http://127.0.0.1:{port}");
+        let session = CatalogSession::resolve(&catalog_uri, &creds.warehouse, creds)
+            .await
+            .expect("the SigV4 path resolves a session without contacting the catalog");
+        let catalog = CatalogProps {
+            warehouse: creds.warehouse.clone(),
+            table: "db.t".into(),
+        };
+
+        let result = resolve_file_list(&session, &catalog, &sample_storage(), creds, true, None)
+            .await
+            .map(|_| ());
+
+        server
+            .await
+            .expect("the loopback catalog fake must serve its one response without panicking");
+
+        result
+    }
+
+    /// A `loadTable` response that carries no table location is rejected as a USER
+    /// error naming the absent `location`, with the IDENTICAL message whether or
+    /// not vended credentials are requested.
+    ///
+    /// The Apache Iceberg table spec marks `location` `_required_` in v1, v2, AND
+    /// v3, so a response without one is a malformed response on every path — not a
+    /// vended-path concern. One check above the vended/static split is what makes
+    /// the diagnosis independent of `use_vended_credentials`; a check inside the
+    /// vended arm lets the same malformed response fail differently depending on an
+    /// unrelated credential flag.
+    ///
+    /// `UdfError::User` specifically, never a panic: a panic inside the UDF is an
+    /// abnormal VM exit, after which the engine SIGKILLs every sibling VM of the
+    /// statement part.
+    ///
+    /// The message content is asserted, not merely the variant: any downstream
+    /// failure of this synthetic table would also be a `UdfError::User`, so a
+    /// variant-only assertion would report success for the wrong reason. The two
+    /// required substrings are single words rather than a phrase so that they pin
+    /// which facts the message states — the response and the field — without
+    /// pinning its wording or its markup.
+    #[tokio::test]
+    async fn absent_table_location_errors_on_both_vended_and_static_paths() {
+        let static_creds = one_request_sigv4_creds();
+        let mut vended_creds = one_request_sigv4_creds();
+        vended_creds.use_vended_credentials = true;
+
+        let vended_err = resolve_file_list_against_locationless_catalog(&vended_creds)
+            .await
+            .expect_err("vended path must reject a loadTable response with no table location");
+        let static_err = resolve_file_list_against_locationless_catalog(&static_creds)
+            .await
+            .expect_err("static path must reject a loadTable response with no table location");
+
+        let vended_message = match vended_err {
+            UdfError::User(m) => m,
+            other => panic!("vended path must fail as a user error, got {other:?}"),
+        };
+        let static_message = match static_err {
+            UdfError::User(m) => m,
+            other => panic!("static path must fail as a user error, got {other:?}"),
+        };
+
+        for (path, message) in [("vended", &vended_message), ("static", &static_message)] {
+            assert!(
+                message.contains("loadTable"),
+                "{path}-path error must name the response the location is absent from: {message}"
+            );
+            assert!(
+                message.contains("location"),
+                "{path}-path error must name the absent location field: {message}"
+            );
+            assert!(
+                message.contains("db.t"),
+                "{path}-path error must name the table whose loadTable response was malformed: \
+                 {message}"
+            );
+            assert!(
+                !message.contains("storage backend cannot be resolved"),
+                "{path}-path error must not frame the failure as a vended-storage-backend \
+                 resolution failure: {message}"
+            );
+        }
+        assert_eq!(
+            vended_message, static_message,
+            "both paths must surface the SAME absent-location error — the vended-credential \
+             flag must not change how a malformed catalog response is diagnosed"
         );
     }
 }
