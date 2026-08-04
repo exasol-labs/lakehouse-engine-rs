@@ -325,9 +325,11 @@ pub async fn build_seed_catalog_with_auth(
                 )),
             })
         }
-        // No override needed: the Azure warehouse is `sas-enabled: false`, so
-        // Lakekeeper vends nothing here to clobber — the account-key property
-        // `seed_catalog_props` set is the only credential in play.
+        // No override needed: Lakekeeper vends ADLS creds under the host-suffixed
+        // key `adls.sas-token.<host>`, but iceberg-rust's `load_file_io` only reads
+        // the flat `adls.sas-token`/`adls.account-key` property, so the account-key
+        // `seed_catalog_props` set is the only credential in play regardless of
+        // `sas-enabled`.
         SeedStorage::Adls { .. } => Arc::new(OpenDalStorageFactory::Azdls),
     };
 
