@@ -174,7 +174,15 @@ fn dispatch_sql(
     limit: Option<u64>,
 ) -> String {
     let pushdown_req = pd(request);
-    dispatch_sql_with_pushdown_req(request, &pushdown_req, proj_cols, proj_types, filter, limit)
+    dispatch_sql_with_pushdown_req(
+        request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        base_col_types(),
+        filter,
+        limit,
+    )
 }
 
 /// Like [`dispatch_sql`], but takes the `pushdownRequest` body explicitly
@@ -187,6 +195,7 @@ fn dispatch_sql_with_pushdown_req(
     pushdown_req: &Json,
     proj_cols: Vec<ProjectionItem>,
     proj_types: Vec<String>,
+    col_types: Vec<(String, String)>,
     filter: Option<String>,
     limit: Option<u64>,
 ) -> String {
@@ -196,7 +205,7 @@ fn dispatch_sql_with_pushdown_req(
         proj_cols,
         proj_types,
         false,
-        base_col_types(),
+        col_types,
         filter,
         None,
         limit,
@@ -425,6 +434,7 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
         &stripped_pushdown_req,
         Vec::new(),
         Vec::new(),
+        base_col_types(),
         Some(r#"("AMOUNT" > 100)"#.to_string()),
         Some(50),
     );
@@ -503,6 +513,7 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
         &raw_pushdown_req,
         Vec::new(),
         Vec::new(),
+        base_col_types(),
         None,
         None,
     );
@@ -511,6 +522,7 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
         &stripped_pushdown_req,
         Vec::new(),
         Vec::new(),
+        base_col_types(),
         None,
         None,
     );
@@ -526,6 +538,157 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
         "the wrapper must qualify every column reference to its own subquery alias \
          LHS_T0, whether or not the request carried a tableAlias: {sql_with_alias}"
     );
+}
+
+// --- All-agg-kinds fixtures (plan `refactor-pushdown-agg-dedup`, task 1.1) ---
+//
+// These two fixtures cover every `AggKind` variant and every partial-column
+// arity (1, 2, and 3 columns) in one request, so the pre-refactor column
+// contract (`PARTIAL_*` names, `EMITS` types, merge SELECT) is pinned before
+// task 1.3 rewires the five sites that encode it. The mixed arities are
+// deliberate: they exercise the plan-ordinal-versus-column-ordinal
+// distinction that is the drift risk the refactor must not disturb.
+//
+// A dedicated column universe (ID/SCORE/TS/REGION), not the shared
+// `base_col_types` REGION/NAME/AMOUNT/ID one every other golden fixture
+// above uses: SCORE must be numeric (SUM/AVG/the four statistical kinds all
+// require it), TS is a MIN/MAX target of any comparable type, and neither
+// fits the existing universe.
+
+/// The ID/SCORE/TS/REGION column universe both all-agg-kinds fixtures
+/// dispatch over: SCORE numeric (required by SUM/AVG/the statistical
+/// family), TS a MIN/MAX target, ID a COUNT target, REGION the group key.
+fn all_agg_kinds_col_types() -> Vec<(String, String)> {
+    vec![
+        ("ID".to_string(), "DECIMAL(20,0)".to_string()),
+        ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
+        ("TS".to_string(), "TIMESTAMP".to_string()),
+        ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
+    ]
+}
+
+/// Wrap a `pushdownRequest` body with the `involvedTables` block matching
+/// [`all_agg_kinds_col_types`].
+fn all_agg_kinds_request(pushdown_req: Json) -> Json {
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "EVENTS",
+            "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "SCORE", "dataType": {"type": "double"}},
+                {"name": "TS", "dataType": {"type": "timestamp"}},
+                {"name": "REGION", "dataType": {"type": "varchar", "size": 2000000}},
+            ],
+        }],
+        "pushdownRequest": pushdown_req,
+    })
+}
+
+/// The select-list items exercising all ten `AggKind` variants, in the same
+/// order the plan names them: `Count`, `CountCol`, `Sum`, `Min`, `Max`,
+/// `Avg` (arity 1 then 1 then 1 then 1 then 1 then 2), then the four
+/// statistical kinds `StddevSamp`, `StddevPop`, `VarSamp`, `VarPop` (arity 3
+/// each) — `STDDEV`/`STDDEV_POP`/`VARIANCE`/`VAR_POP` map onto them per
+/// `parse_agg_item`.
+fn all_agg_kinds_select_list() -> Vec<Json> {
+    vec![
+        agg_item("COUNT", None, false),
+        agg_item("COUNT", Some("id"), false),
+        agg_item("SUM", Some("score"), false),
+        agg_item("MIN", Some("ts"), false),
+        agg_item("MAX", Some("ts"), false),
+        agg_item("AVG", Some("score"), false),
+        agg_item("STDDEV", Some("score"), false),
+        agg_item("STDDEV_POP", Some("score"), false),
+        agg_item("VARIANCE", Some("score"), false),
+        agg_item("VAR_POP", Some("score"), false),
+    ]
+}
+
+/// The declared Exasol result type Exasol would assign each item in
+/// [`all_agg_kinds_select_list`], at the same index: `DECIMAL(18,0)` for the
+/// two COUNTs, `TIMESTAMP` for MIN/MAX(ts), `DOUBLE PRECISION` for
+/// SUM/AVG(score) and every statistical kind over a DOUBLE column.
+fn all_agg_kinds_declared_types() -> Vec<Json> {
+    vec![
+        serde_json::json!({"type": "decimal", "precision": 18, "scale": 0}),
+        serde_json::json!({"type": "decimal", "precision": 18, "scale": 0}),
+        serde_json::json!({"type": "double"}),
+        serde_json::json!({"type": "timestamp"}),
+        serde_json::json!({"type": "timestamp"}),
+        serde_json::json!({"type": "double"}),
+        serde_json::json!({"type": "double"}),
+        serde_json::json!({"type": "double"}),
+        serde_json::json!({"type": "double"}),
+        serde_json::json!({"type": "double"}),
+    ]
+}
+
+/// Single-group (ungrouped) shape: all ten `AggKind` variants, no GROUP BY.
+fn single_group_all_agg_kinds_request() -> Json {
+    all_agg_kinds_request(serde_json::json!({
+        "selectList": all_agg_kinds_select_list(),
+        "selectListDataTypes": all_agg_kinds_declared_types(),
+    }))
+}
+
+/// Grouped shape: the same ten `AggKind` variants, plus `GROUP BY region` —
+/// the region key occupies select-list ordinal 0, so the ten aggregates sit
+/// at ordinals 1..=10, one higher than in the single-group sibling above.
+/// That shift is exactly the plan-ordinal-versus-column-ordinal distinction
+/// the mixed arities are meant to exercise.
+fn grouped_all_agg_kinds_request() -> Json {
+    let mut select_list = vec![serde_json::json!({"type": "column", "name": "REGION"})];
+    select_list.extend(all_agg_kinds_select_list());
+    let mut declared_types = vec![serde_json::json!({"type": "varchar", "size": 2000000})];
+    declared_types.extend(all_agg_kinds_declared_types());
+    all_agg_kinds_request(serde_json::json!({
+        "aggregationType": "group_by",
+        "groupBy": [{"type": "column", "name": "REGION"}],
+        "selectList": select_list,
+        "selectListDataTypes": declared_types,
+    }))
+}
+
+/// Like [`dispatch_sql`], but takes `col_types` explicitly instead of the
+/// shared `base_col_types()` — the two all-agg-kinds fixtures dispatch over
+/// [`all_agg_kinds_col_types`], not the REGION/NAME/AMOUNT/ID universe every
+/// other golden fixture in this module shares.
+fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, String)>) -> String {
+    dispatch_sql_with_pushdown_req(
+        request,
+        &pd(request),
+        Vec::new(),
+        Vec::new(),
+        col_types,
+        None,
+        None,
+    )
+}
+
+/// Single-group all-agg-kinds dispatch SQL stays byte-identical to the
+/// captured pre-refactor golden — the only baseline over the `EMITS` clause
+/// and outer merge SELECT for every `AggKind` at once (plan
+/// `refactor-pushdown-agg-dedup`, task 1.1).
+#[test]
+fn single_group_all_agg_kinds_matches_golden() {
+    let actual = dispatch_sql_with_col_types(
+        &single_group_all_agg_kinds_request(),
+        all_agg_kinds_col_types(),
+    );
+    let expected = include_str!("testdata/dispatch_golden/single_group_all_agg_kinds.sql");
+    assert_eq!(actual, expected);
+}
+
+/// Grouped all-agg-kinds dispatch SQL stays byte-identical to the captured
+/// pre-refactor golden — the grouped-path sibling of
+/// `single_group_all_agg_kinds_matches_golden`.
+#[test]
+fn grouped_all_agg_kinds_matches_golden() {
+    let actual =
+        dispatch_sql_with_col_types(&grouped_all_agg_kinds_request(), all_agg_kinds_col_types());
+    let expected = include_str!("testdata/dispatch_golden/grouped_all_agg_kinds.sql");
+    assert_eq!(actual, expected);
 }
 
 // --- Cross-site fixtures (plan `fix-declined-filter-self-apply`, task 2.6) ---

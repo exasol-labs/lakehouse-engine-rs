@@ -14,7 +14,7 @@ use futures::StreamExt;
 
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::classify_scan_error;
-use crate::scan::spec::{AggKind, AggregatePlan, ScanSpec};
+use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
 
 use super::raw_scan::register_files;
 use super::sql_support::{build_alias_items, quote_ident};
@@ -256,27 +256,25 @@ fn value_to_gk_string(v: Value) -> Value {
 
 /// Build the fallback null partial row for an empty aggregate result.
 ///
-/// COUNT/CountCol -> 0 (not NULL); SUM/Min/Max/Avg parts -> NULL.
-/// Stat family: cnt -> 0, sum -> NULL, sumsq -> NULL.
+/// A counter column contributes `0` — a shard that matched no rows legitimately
+/// counted none — and a value column contributes NULL, because it has no value at
+/// all. [`PartialAggColumn::is_counter`] owns which is which, and
+/// [`crate::scan::spec::AggKind::partial_columns`] owns the row's length and order:
+/// that ordering IS the row's whole contract, since the Exasol outer wrapper
+/// addresses these values positionally.
 fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::value::Value> {
     use exasol_udf_sdk::value::Value;
-    let mut row = Vec::new();
-    for plan in aggregates {
-        match plan.kind {
-            AggKind::Count | AggKind::CountCol => row.push(Value::Int64(0)),
-            AggKind::Sum | AggKind::Min | AggKind::Max => row.push(Value::Null),
-            AggKind::Avg => {
-                row.push(Value::Null); // partial_avg_sum
-                row.push(Value::Int64(0)); // partial_avg_cnt
+    aggregates
+        .iter()
+        .flat_map(|plan| plan.kind.partial_columns())
+        .map(|col| {
+            if col.is_counter() {
+                Value::Int64(0)
+            } else {
+                Value::Null
             }
-            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
-                row.push(Value::Int64(0)); // partial_stat_cnt
-                row.push(Value::Null); // partial_stat_sum
-                row.push(Value::Null); // partial_stat_sumsq
-            }
-        }
-    }
-    row
+        })
+        .collect()
 }
 
 /// Test-only no-filter wrapper over `build_partial_agg_sql_filtered`
@@ -288,23 +286,12 @@ pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) 
 
 /// Build the partial-aggregate SQL, optionally with a WHERE clause.
 ///
-/// COLUMN CONTRACT:
-///
-/// Iterating `aggregates` in order, each plan item at index `i` contributes:
-/// - `Count`    -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
-/// - `CountCol` -> 1 column: `"PARTIAL_count_{i}"`   (DECIMAL(20,0), summable)
-/// - `Sum`      -> 1 column: `"PARTIAL_sum_{i}"`     (type from `partial_emits_items`: DOUBLE
-///   PRECISION for float columns, DECIMAL(36,s) for DECIMAL(p,s) columns)
-/// - `Min`      -> 1 column: `"PARTIAL_min_{i}"`     (type from `partial_emits_items`: the
-///   column's real Exasol type, e.g. DATE, TIMESTAMP, or DECIMAL)
-/// - `Max`      -> 1 column: `"PARTIAL_max_{i}"`     (type from `partial_emits_items`: same
-///   as Min — the column's real Exasol type)
-/// - `Avg`      -> 2 columns: `"PARTIAL_avg_sum_{i}"` (DOUBLE PRECISION) then
-///   `"PARTIAL_avg_cnt_{i}"` (DECIMAL(20,0))
-///
-/// For the exact EMITS types, defer to `partial_emits_items` in `adapter::pushdown` as the
-/// single source of truth — this DataFusion SELECT list produces the values; the EMITS clause
-/// declares the Exasol types that receive them.
+/// COLUMN CONTRACT: iterating `aggregates` in order, each plan item at index `i`
+/// contributes the columns [`crate::scan::spec::AggKind::partial_columns`] lists for
+/// its kind, named by [`partial_column_name`] at that index — the single owner of
+/// both the column count and the column name. For the Exasol type each column is
+/// received as, defer to `partial_emits_items` in `adapter::pushdown`: this
+/// DataFusion SELECT list produces the values, the EMITS clause declares the types.
 ///
 /// The scan UDF aggregate SELECT list, the EMITS clause in the fan-out SQL, and
 /// the outer merge SELECT MUST all agree on this order and column count.
@@ -362,54 +349,48 @@ fn agg_arg_sql(plan: &AggregatePlan) -> String {
 }
 
 /// Produce the SELECT list items for one aggregate plan entry at index `i`.
+///
+/// [`crate::scan::spec::AggKind::partial_columns`] owns which columns exist and in
+/// what order, and [`partial_column_name`] owns what each is called; this function
+/// owns only each column's DataFusion aggregate expression. Every argument comes
+/// from [`agg_arg_sql`], so a rendered expression argument is substituted verbatim
+/// wherever a bare column would be. The counting columns use `COUNT(<arg>)` rather
+/// than `COUNT(*)` so NULLs are excluded, matching single-node AVG and
+/// STDDEV/VARIANCE semantics.
 fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
-    match plan.kind {
-        AggKind::Count => {
-            vec![format!(r#"COUNT(*) AS "PARTIAL_count_{i}""#)]
-        }
-        AggKind::CountCol => {
-            let arg = agg_arg_sql(plan);
-            vec![format!(r#"COUNT({arg}) AS "PARTIAL_count_{i}""#)]
-        }
-        AggKind::Sum => {
-            let arg = agg_arg_sql(plan);
-            vec![format!(r#"SUM({arg}) AS "PARTIAL_sum_{i}""#)]
-        }
-        AggKind::Min => {
-            let arg = agg_arg_sql(plan);
-            vec![format!(r#"MIN({arg}) AS "PARTIAL_min_{i}""#)]
-        }
-        AggKind::Max => {
-            let arg = agg_arg_sql(plan);
-            vec![format!(r#"MAX({arg}) AS "PARTIAL_max_{i}""#)]
-        }
-        AggKind::Avg => {
-            let arg = agg_arg_sql(plan);
-            vec![
-                format!(r#"SUM({arg}) AS "PARTIAL_avg_sum_{i}""#),
-                format!(r#"COUNT({arg}) AS "PARTIAL_avg_cnt_{i}""#),
-            ]
-        }
-        // STDDEV/VARIANCE family: emit (cnt, sum, sum_sq) sufficient statistics.
-        // COUNT(col) excludes NULLs, matching single-node semantics.
-        AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
-            let col = plan.column.as_deref().unwrap_or("");
-            let qcol = quote_ident(col);
-            vec![
-                format!(r#"COUNT({qcol}) AS "PARTIAL_stat_cnt_{i}""#),
-                format!(r#"SUM({qcol}) AS "PARTIAL_stat_sum_{i}""#),
-                format!(r#"SUM({qcol} * {qcol}) AS "PARTIAL_stat_sumsq_{i}""#),
-            ]
-        }
-    }
+    plan.kind
+        .partial_columns()
+        .iter()
+        .map(|col| {
+            let expr = match col {
+                PartialAggColumn::CountStar => "COUNT(*)".to_string(),
+                PartialAggColumn::CountArg
+                | PartialAggColumn::AvgCnt
+                | PartialAggColumn::StatCnt => format!("COUNT({})", agg_arg_sql(plan)),
+                PartialAggColumn::Sum | PartialAggColumn::AvgSum | PartialAggColumn::StatSum => {
+                    format!("SUM({})", agg_arg_sql(plan))
+                }
+                PartialAggColumn::Min => format!("MIN({})", agg_arg_sql(plan)),
+                PartialAggColumn::Max => format!("MAX({})", agg_arg_sql(plan)),
+                PartialAggColumn::StatSumSq => {
+                    let arg = agg_arg_sql(plan);
+                    format!("SUM({arg} * {arg})")
+                }
+            };
+            let name = partial_column_name(*col, i);
+            format!(r#"{expr} AS "{name}""#)
+        })
+        .collect()
 }
 
 /// Convert the single-group partial-aggregate result row (row 0 of `batch`) into
 /// the ordered `Value` row emitted for this shard.
 ///
-/// Walks `aggregates` in the COLUMN CONTRACT order, consuming the exact number of
-/// batch columns each aggregate produced in [`partial_select_items`], converting
-/// each column straight through [`arrow_value_at`].
+/// Walks `aggregates` in the COLUMN CONTRACT order, consuming exactly
+/// `partial_columns().len()` batch columns per aggregate — the count read from the
+/// one owner rather than re-derived here, because [`partial_select_items`] produced
+/// the batch from that same owner and a divergence would silently shift every later
+/// aggregate's value. Each column converts straight through [`arrow_value_at`].
 fn partial_row_from_batch(
     aggregates: &[AggregatePlan],
     batch: &arrow::record_batch::RecordBatch,
@@ -417,23 +398,11 @@ fn partial_row_from_batch(
     let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
     let mut col = 0usize;
     for plan in aggregates {
-        match plan.kind {
-            AggKind::Avg => {
-                row.push(arrow_value_at(batch.column(col), 0)?);
-                row.push(arrow_value_at(batch.column(col + 1), 0)?);
-                col += 2;
-            }
-            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => {
-                row.push(arrow_value_at(batch.column(col), 0)?);
-                row.push(arrow_value_at(batch.column(col + 1), 0)?);
-                row.push(arrow_value_at(batch.column(col + 2), 0)?);
-                col += 3;
-            }
-            _ => {
-                row.push(arrow_value_at(batch.column(col), 0)?);
-                col += 1;
-            }
+        let width = plan.kind.partial_columns().len();
+        for c in col..col + width {
+            row.push(arrow_value_at(batch.column(c), 0)?);
         }
+        col += width;
     }
     Ok(row)
 }
@@ -441,6 +410,101 @@ fn partial_row_from_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::spec::AggKind;
+
+    /// One `AggregatePlan` per `AggKind` variant, in the same order as
+    /// `testdata/dispatch_golden/single_group_all_agg_kinds.sql` /
+    /// `grouped_all_agg_kinds.sql` (plan `refactor-pushdown-agg-dedup`, task
+    /// 1.1): `Count`, `CountCol`, `Sum`, `Min`, `Max`, `Avg` (arity 1 then 1
+    /// then 1 then 1 then 1 then 2), then the four statistical kinds
+    /// `StddevSamp`, `StddevPop`, `VarSamp`, `VarPop` (arity 3 each) — the
+    /// mixed arities exercise the plan-ordinal-versus-column-ordinal
+    /// distinction the refactor must not disturb.
+    fn all_agg_kinds_plans() -> Vec<AggregatePlan> {
+        vec![
+            AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::CountCol,
+                column: Some("ID".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("TS".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("TS".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Avg,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::StddevSamp,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::StddevPop,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::VarSamp,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::VarPop,
+                column: Some("SCORE".into()),
+                arg_expr: None,
+            },
+        ]
+    }
+
+    /// The scan's own single-group partial-aggregate SQL over every `AggKind`
+    /// stays byte-identical to the captured pre-refactor golden — the only
+    /// baseline over `partial_select_items`' output (plan
+    /// `refactor-pushdown-agg-dedup`, task 1.1), which no `dispatch_golden`
+    /// fixture can reach: the scan's DataFusion SELECT list is built here, at
+    /// runtime, not by `build_dispatch_sql`.
+    #[test]
+    fn partial_agg_sql_all_agg_kinds_matches_golden() {
+        let actual = build_partial_agg_sql(&all_agg_kinds_plans(), "aliased");
+        let expected = include_str!("testdata/partial_agg_golden/partial_agg_all_agg_kinds.sql");
+        assert_eq!(actual, expected);
+    }
+
+    /// The scan's own grouped partial-aggregate SQL (one group key, no
+    /// filter) over every `AggKind` stays byte-identical to the captured
+    /// pre-refactor golden — the grouped-path sibling of
+    /// `partial_agg_sql_all_agg_kinds_matches_golden`, and equally
+    /// unreachable from any `dispatch_golden` fixture.
+    #[test]
+    fn grouped_partial_agg_sql_all_agg_kinds_matches_golden() {
+        let actual = build_grouped_partial_agg_sql(
+            &[r#""REGION""#.to_string()],
+            &all_agg_kinds_plans(),
+            "aliased",
+            None,
+        );
+        let expected =
+            include_str!("testdata/partial_agg_golden/grouped_partial_agg_all_agg_kinds.sql");
+        assert_eq!(actual, expected);
+    }
 
     fn sample_plans_count_sum_min_max() -> Vec<AggregatePlan> {
         vec![

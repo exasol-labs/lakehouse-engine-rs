@@ -429,6 +429,27 @@ pub(crate) fn exasol_type_to_json(exasol_type: &str) -> Json {
     json!({"type": "varchar", "size": size})
 }
 
+/// Exasol's maximum CHAR width. A wider declaration is rejected outright:
+/// `CAST('a' AS CHAR(2001))` fails live with "specified length too long for char
+/// type - maximum is 2000". So a CHAR `size` is capped here rather than reusing
+/// VARCHAR's 2,000,000 ceiling.
+const EXASOL_CHAR_MAX_SIZE: u64 = 2000;
+
+/// The character-set suffix a CHAR/VARCHAR declaration needs, `" ASCII"` or `""`.
+///
+/// Exasol treats an unsuffixed character declaration as UTF8, so a column it
+/// declared `ASCII` must carry the suffix back or its type check reports a "Data
+/// type mismatch" (issue #136 follow-up). Shared by the CHAR and the catch-all
+/// VARCHAR arm: the rule must be identical for both, and a second copy would
+/// drift (issue #52).
+fn character_set_suffix(dt: &Json) -> &'static str {
+    let is_ascii = dt
+        .get("characterSet")
+        .and_then(|v| v.as_str())
+        .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
+    if is_ascii { " ASCII" } else { "" }
+}
+
 /// Derive an Exasol type string from the VS column dataType JSON.
 pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
     let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
@@ -462,19 +483,32 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
                 }
             }
         }
+        "char" => {
+            // A genuine CHAR must stay CHAR: Exasol validates the pushdown output
+            // column type positionally, and it declares an equal-length CASE, a bare
+            // string literal, and an explicit CAST-to-CHAR as CHAR(n) — rendering
+            // those VARCHAR(n) is rejected with "Data type mismatch" (issue #192).
+            //
+            // An absent `size` is unreachable from a real Exasol `dataType` — but if
+            // it occurred, it must NOT default to the maximum width: `CHAR(2000)`
+            // would blank-pad every value of that column to 2,000 characters, the
+            // most damaging default available. Instead fall back to the project's
+            // "unknown width" convention (`VARCHAR(2000000)`), matching
+            // `vs-expression`'s `render_cast_target` Exasol CHAR arm. The
+            // `EXASOL_CHAR_MAX_SIZE` cap applies only to a PRESENT `size`.
+            match dt.get("size").and_then(|v| v.as_u64()) {
+                Some(size) => {
+                    let capped = size.min(EXASOL_CHAR_MAX_SIZE);
+                    format!("CHAR({capped}){}", character_set_suffix(dt))
+                }
+                None => "VARCHAR(2000000)".to_string(),
+            }
+        }
         _ => {
-            // VARCHAR, CHAR, and all others.
+            // VARCHAR and all others.
             let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
             let capped = size.min(2000000);
-            let is_ascii = dt
-                .get("characterSet")
-                .and_then(|v| v.as_str())
-                .is_some_and(|cs| cs.eq_ignore_ascii_case("ASCII"));
-            if is_ascii {
-                format!("VARCHAR({capped}) ASCII")
-            } else {
-                format!("VARCHAR({capped})")
-            }
+            format!("VARCHAR({capped}){}", character_set_suffix(dt))
         }
     }
 }
@@ -1150,7 +1184,7 @@ mod tests {
     /// `exasol_type_from_json` must read the `characterSet` field back off a
     /// `{"type":"varchar", ...}` dataType JSON (Exasol's wire format for CHAR/VARCHAR
     /// select-list items, e.g. `{"type":"CHAR","size":3,"characterSet":"ASCII"}` as
-    /// confirmed by `vs-expression`'s `renders_cast_char_as_varchar` test) and append
+    /// confirmed by `vs-expression`'s `renders_cast_char_as_datafusion_varchar` test) and append
     /// `" ASCII"` when it is `"ASCII"` (case-insensitively) — otherwise a CASE/literal
     /// expression Exasol declares as `VARCHAR(n) ASCII` round-trips back through our
     /// EMITS clause as bare `VARCHAR(n)`, which Exasol's type checker treats as
@@ -1163,6 +1197,54 @@ mod tests {
 
         let no_charset = serde_json::json!({"type": "VARCHAR", "size": 4});
         assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
+    }
+
+    /// `exasol_type_from_json` must render a genuine `{"type":"CHAR", ...}` dataType
+    /// JSON as `CHAR(n)` — not fall through to the catch-all's `VARCHAR(n)` the way
+    /// pre-#192 code did. An equal-length CASE expression (e.g. `CASE WHEN ... THEN
+    /// 'NEG' ELSE 'POS' END`) round-trips back through this function as `CHAR(3)
+    /// ASCII`; rendering it `VARCHAR(3) ASCII` instead causes Exasol's type checker
+    /// to reject the pushdown with "Data type mismatch" (issue #192).
+    #[test]
+    fn exasol_type_from_json_renders_char_type() {
+        let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
+        assert_eq!(exasol_type_from_json(&ascii), "CHAR(3) ASCII");
+    }
+
+    /// The CHAR arm must mirror VARCHAR's `characterSet` handling exactly: append
+    /// `" ASCII"` only when `characterSet` is `"ASCII"` (case-insensitively), and
+    /// render a bare `CHAR(n)` (no suffix) for `"UTF8"` or when `characterSet` is
+    /// absent — e.g. `CAST(c_phone AS CHAR(20))`, which Exasol declares `CHAR(20)
+    /// UTF8` (live-verified), must round-trip as bare `CHAR(20)`.
+    #[test]
+    fn exasol_type_from_json_propagates_char_ascii_character_set() {
+        let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
+        assert_eq!(exasol_type_from_json(&utf8), "CHAR(20)");
+
+        let no_charset = serde_json::json!({"type": "CHAR", "size": 20});
+        assert_eq!(exasol_type_from_json(&no_charset), "CHAR(20)");
+    }
+
+    /// Exasol rejects a CHAR declaration above 2,000 characters
+    /// (`CAST('a' AS CHAR(2001))` fails live with "specified length too long for
+    /// char type - maximum is 2000"), so the CHAR arm must cap `size` at 2,000 —
+    /// unlike VARCHAR's 2,000,000 cap.
+    #[test]
+    fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
+        let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
+        assert_eq!(exasol_type_from_json(&oversized), "CHAR(2000)");
+    }
+
+    /// An absent `size` on a CHAR `dataType` is unreachable from a real Exasol
+    /// request, but if it occurred the CHAR arm must not silently default to
+    /// the *maximum* width (`CHAR(2000)`, which blank-pads every value to
+    /// 2,000 characters) — it must fall back to the project's "unknown width"
+    /// convention, matching `vs-expression`'s `render_cast_target` Exasol CHAR
+    /// arm.
+    #[test]
+    fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
+        let no_size = serde_json::json!({"type": "CHAR"});
+        assert_eq!(exasol_type_from_json(&no_size), "VARCHAR(2000000)");
     }
 
     /// Scenario: One classifier names the Exasol type-string families the pushdown

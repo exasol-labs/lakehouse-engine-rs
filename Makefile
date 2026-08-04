@@ -89,6 +89,25 @@ test-e2e: cross-musl-udf-build
 test-e2e-lakekeeper: cross-musl-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
+# Azure E2E tests require a live Exasol + Lakekeeper + Keycloak stack — bring
+# it up with the `docker-compose.lakekeeper.yml` + `docker-compose.lakekeeper.azure.yml`
+# overlays:
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+#     -f docker-compose.lakekeeper.azure.yml up -d --wait \
+#     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+# Also requires real Azure Blob Storage credentials. Credentials come from a
+# gitignored ./test.env (see test.env.example) when present, or from the
+# environment otherwise (e.g. CI secrets). They FAIL (not
+# skip) when unavailable — same contract as test-e2e. All tests share one VS,
+# so the binary runs serially (--test-threads=1).
+#
+# The `if [ -f ./test.env ]; ...; fi; cargo test ...` sourcing and the cargo
+# invocation MUST stay on a single recipe line: make runs each recipe line in
+# its own shell, so splitting them would discard every sourced variable before
+# cargo starts, making a missing-credential failure look like a recipe bug.
+test-e2e-azure: cross-musl-udf-build
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features azure-e2e --test e2e_azure_test -- --test-threads=1
+
 # Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
 #
 # This Exasol is the dedicated lakehouse-engine stack (the sibling stack
@@ -191,4 +210,4 @@ lint-install:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper install-slc bucketfs-upload-so fmt lint bench test-install lint-install
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint bench test-install lint-install

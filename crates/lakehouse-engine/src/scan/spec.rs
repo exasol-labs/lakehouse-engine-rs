@@ -42,6 +42,114 @@ pub enum AggKind {
     StddevSamp,
 }
 
+/// One column of the partial-aggregate COLUMN CONTRACT — the per-shard columns an
+/// [`AggKind`] decomposes into for the Exasol outer wrapper to re-aggregate.
+///
+/// [`AggKind::partial_columns`] owns which of these an aggregate contributes and in
+/// what order; [`partial_column_name`] owns what each is called. The scan renders
+/// each one's DataFusion aggregate expression and the adapter renders each one's
+/// Exasol `EMITS` type, so a variant added here is a compile error at both — the
+/// contract is extended by adding a case, never by editing a dispatch that
+/// silently defaults.
+///
+/// `CountStar` and `CountArg` are distinct despite sharing a name and an `EMITS`
+/// type: they render different DataFusion SQL (`COUNT(*)` versus `COUNT(<arg>)`),
+/// so collapsing them would force the scan back to consulting the [`AggKind`] this
+/// descriptor exists to abstract away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialAggColumn {
+    /// `COUNT(*)` — the `COUNT(*)` aggregate's only partial column.
+    CountStar,
+    /// `COUNT(<arg>)` — the `COUNT(col)` aggregate's only partial column.
+    CountArg,
+    /// `SUM(<arg>)` for a `SUM` aggregate.
+    Sum,
+    /// `MIN(<arg>)` for a `MIN` aggregate.
+    Min,
+    /// `MAX(<arg>)` for a `MAX` aggregate.
+    Max,
+    /// `AVG`'s numerator: `SUM(<arg>)`.
+    AvgSum,
+    /// `AVG`'s denominator: `COUNT(<arg>)`.
+    AvgCnt,
+    /// The statistical family's N: `COUNT(<arg>)`.
+    StatCnt,
+    /// The statistical family's Σx: `SUM(<arg>)`.
+    StatSum,
+    /// The statistical family's Σx²: `SUM(<arg> * <arg>)`.
+    StatSumSq,
+}
+
+impl PartialAggColumn {
+    /// Whether an empty shard contributes a zero rather than a NULL for this column.
+    ///
+    /// A counter column counts rows, so a shard that matched none legitimately
+    /// contributes `0`; a value column has no value at all and contributes NULL.
+    /// The distinction is expressed as a boolean rather than as an SDK `Value` so
+    /// this module stays serde-only and never learns about `exasol_udf_sdk` — the
+    /// emit site owns the `Value::Int64(0)` / `Value::Null` mapping.
+    pub fn is_counter(&self) -> bool {
+        match self {
+            Self::CountStar | Self::CountArg | Self::AvgCnt | Self::StatCnt => true,
+            Self::Sum | Self::Min | Self::Max | Self::AvgSum | Self::StatSum | Self::StatSumSq => {
+                false
+            }
+        }
+    }
+}
+
+/// The UNQUOTED partial column name for `col` at aggregate ordinal `ordinal`.
+///
+/// The sole owner of the `PARTIAL_<role>_<ordinal>` text. Three sites must agree on
+/// it byte-for-byte — the scan's `AS "PARTIAL_…"` aliases, the adapter's `EMITS`
+/// items, and the adapter's merge `SUM("PARTIAL_…")` expressions — and each applies
+/// its own quoting, so this returns the bare name and never a quoted identifier.
+///
+/// `ordinal` is the aggregate's position in the plan list, NOT the partial column's
+/// position: a multi-column aggregate's columns all carry its one plan ordinal and
+/// are told apart by their role.
+pub fn partial_column_name(col: PartialAggColumn, ordinal: usize) -> String {
+    let role = match col {
+        PartialAggColumn::CountStar | PartialAggColumn::CountArg => "count",
+        PartialAggColumn::Sum => "sum",
+        PartialAggColumn::Min => "min",
+        PartialAggColumn::Max => "max",
+        PartialAggColumn::AvgSum => "avg_sum",
+        PartialAggColumn::AvgCnt => "avg_cnt",
+        PartialAggColumn::StatCnt => "stat_cnt",
+        PartialAggColumn::StatSum => "stat_sum",
+        PartialAggColumn::StatSumSq => "stat_sumsq",
+    };
+    format!("PARTIAL_{role}_{ordinal}")
+}
+
+impl AggKind {
+    /// The ordered partial columns this aggregate decomposes into.
+    ///
+    /// The single owner of the COLUMN CONTRACT's arity and order. Five sites
+    /// depend on it — the scan's DataFusion SELECT list, its empty-shard fallback
+    /// row, and its batch-column walk, plus the adapter's `EMITS` declaration and
+    /// outer merge SELECT. Before this method each encoded the answer separately,
+    /// and a disagreement was silent: the emit paths address columns positionally,
+    /// so a site advancing by two where the SELECT list produced three shifts every
+    /// later aggregate's value for the rest of the row.
+    pub fn partial_columns(&self) -> &'static [PartialAggColumn] {
+        match self {
+            AggKind::Count => &[PartialAggColumn::CountStar],
+            AggKind::CountCol => &[PartialAggColumn::CountArg],
+            AggKind::Sum => &[PartialAggColumn::Sum],
+            AggKind::Min => &[PartialAggColumn::Min],
+            AggKind::Max => &[PartialAggColumn::Max],
+            AggKind::Avg => &[PartialAggColumn::AvgSum, PartialAggColumn::AvgCnt],
+            AggKind::VarPop | AggKind::VarSamp | AggKind::StddevPop | AggKind::StddevSamp => &[
+                PartialAggColumn::StatCnt,
+                PartialAggColumn::StatSum,
+                PartialAggColumn::StatSumSq,
+            ],
+        }
+    }
+}
+
 /// One aggregate function in a pushed-down aggregate plan.
 ///
 /// `column` is `None` for `COUNT(*)` and `Some(col_name)` for all other
@@ -1166,6 +1274,133 @@ mod tests {
         assert_eq!(
             legacy_plans[0].arg_expr, None,
             "missing arg_expr must default to None (backward-compat)"
+        );
+    }
+
+    /// Every `AggKind`'s partial column set — its arity AND its order — against
+    /// LITERAL expected values.
+    ///
+    /// The expectation is written out rather than read from `partial_columns()`,
+    /// because a test that derives its expectation from the code under test
+    /// asserts the descriptor against itself and would pass any consistent
+    /// renaming or reordering.
+    #[test]
+    fn partial_columns_arity_per_agg_kind() {
+        assert_eq!(AggKind::Count.partial_columns().len(), 1);
+        assert_eq!(
+            AggKind::Count.partial_columns(),
+            &[PartialAggColumn::CountStar]
+        );
+
+        assert_eq!(AggKind::CountCol.partial_columns().len(), 1);
+        assert_eq!(
+            AggKind::CountCol.partial_columns(),
+            &[PartialAggColumn::CountArg]
+        );
+
+        assert_eq!(AggKind::Sum.partial_columns().len(), 1);
+        assert_eq!(AggKind::Sum.partial_columns(), &[PartialAggColumn::Sum]);
+
+        assert_eq!(AggKind::Min.partial_columns().len(), 1);
+        assert_eq!(AggKind::Min.partial_columns(), &[PartialAggColumn::Min]);
+
+        assert_eq!(AggKind::Max.partial_columns().len(), 1);
+        assert_eq!(AggKind::Max.partial_columns(), &[PartialAggColumn::Max]);
+
+        assert_eq!(AggKind::Avg.partial_columns().len(), 2);
+        assert_eq!(
+            AggKind::Avg.partial_columns(),
+            &[PartialAggColumn::AvgSum, PartialAggColumn::AvgCnt]
+        );
+
+        for kind in [
+            AggKind::VarPop,
+            AggKind::VarSamp,
+            AggKind::StddevPop,
+            AggKind::StddevSamp,
+        ] {
+            assert_eq!(kind.partial_columns().len(), 3, "{kind:?}");
+            assert_eq!(
+                kind.partial_columns(),
+                &[
+                    PartialAggColumn::StatCnt,
+                    PartialAggColumn::StatSum,
+                    PartialAggColumn::StatSumSq,
+                ],
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// `is_counter()` holds for exactly the four counter columns and for none of
+    /// the six value columns — the property the emit site turns into
+    /// `Value::Int64(0)` versus `Value::Null` on an empty shard.
+    #[test]
+    fn is_counter_marks_the_four_count_columns() {
+        for col in [
+            PartialAggColumn::CountStar,
+            PartialAggColumn::CountArg,
+            PartialAggColumn::AvgCnt,
+            PartialAggColumn::StatCnt,
+        ] {
+            assert!(col.is_counter(), "{col:?} must be a counter column");
+        }
+        for col in [
+            PartialAggColumn::Sum,
+            PartialAggColumn::Min,
+            PartialAggColumn::Max,
+            PartialAggColumn::AvgSum,
+            PartialAggColumn::StatSum,
+            PartialAggColumn::StatSumSq,
+        ] {
+            assert!(!col.is_counter(), "{col:?} must NOT be a counter column");
+        }
+    }
+
+    /// The unquoted `PARTIAL_<role>_<ordinal>` name for all ten partial columns,
+    /// against literal expected strings — the single owner of every name the
+    /// scan aliases, the `EMITS` clause declares, and the merge SELECT consumes.
+    #[test]
+    fn partial_column_name_renders_role_and_ordinal() {
+        assert_eq!(
+            partial_column_name(PartialAggColumn::CountStar, 0),
+            "PARTIAL_count_0"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::CountArg, 3),
+            "PARTIAL_count_3"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::Sum, 7),
+            "PARTIAL_sum_7"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::Min, 4),
+            "PARTIAL_min_4"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::Max, 5),
+            "PARTIAL_max_5"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::AvgSum, 1),
+            "PARTIAL_avg_sum_1"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::AvgCnt, 1),
+            "PARTIAL_avg_cnt_1"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::StatCnt, 9),
+            "PARTIAL_stat_cnt_9"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::StatSum, 6),
+            "PARTIAL_stat_sum_6"
+        );
+        assert_eq!(
+            partial_column_name(PartialAggColumn::StatSumSq, 2),
+            "PARTIAL_stat_sumsq_2"
         );
     }
 
