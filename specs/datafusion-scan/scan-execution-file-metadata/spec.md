@@ -23,6 +23,21 @@ the same no-HEAD guarantee to the associated positional-delete files.
 * Building a data file's base `ParquetAccessPlan` needs its per-row-group row counts, obtained
   by reading the Parquet footer via a range GET (not a HEAD), ideally parsed once and reused.
 * See `datafusion-scan/scan-execution` for the overall scan invocation and registration flow.
+* **The empty-table-root clauses are retained as a wire-format totality property, not as a
+  reachable path.** `vs-adapter/pushdown-planning-file-resolution` now rejects a `loadTable` response carrying
+  an empty table metadata `location` before the vended/static storage split, so the adapter can
+  no longer emit a common spec whose table root is empty. This feature's three empty-table-root
+  clauses — two normative `SHALL` clauses and one descriptive Background bullet — therefore
+  describe an input the current adapter cannot produce. Those three clauses are the recorded
+  Background bullet beginning "When the common spec carries an empty table root" and the final
+  clause of each of the two scenarios reproduced below. They are retained deliberately and their
+  text is UNCHANGED: they make the path-resolution rule a total function over the wire format, so
+  a scan spec reaching the UDF with an empty root still resolves deterministically instead of
+  joining paths onto nothing. They MUST NOT be deleted or converted into an error — an empty root
+  is unreachable from a `loadTable` response, which makes the branch unreachable rather than dead,
+  and the UDF is not the component that validates a catalog response. The scan-side rejoin this
+  property governs is `reconstruct_abs_uri`
+  (`crates/lakehouse-engine/src/scan/object_store.rs:250`).
 
 ## Scenarios
 

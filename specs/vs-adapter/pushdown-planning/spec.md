@@ -1,37 +1,31 @@
 # Feature: Pushdown Planning
 
-Translates an Exasol query against the virtual schema into a pushdown plan: it resolves
-the Iceberg data-file list once, captures the requested projection, filter, LIMIT, and
-any supported aggregate, extracts the table's current Iceberg schema for field-id-based
-projection, and emits the SQL that drives the DataFusion scan. Cluster fan-out is
-separated from the scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor
-subquery (`GROUP BY shard_key`) spreads each shard's per-file list across nodes, and an
-outer ungrouped `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list
-node-locally and streams the rows. The scan-driving SQL splices the shard-invariant parts
-(projection, filter, LIMIT, logical schema, credentials, and the Iceberg table root) once
-as the scalar scan UDF's first-argument common literal and flows each shard's per-file
-subset through the distributor as the second argument. A single-shard plan short-circuits
-the distributor and calls the scalar scan directly on the file-list literal. See
+Translates an Exasol query against the virtual schema into a pushdown plan: it captures
+the requested projection, filter, LIMIT, and any supported aggregate, and emits the SQL
+that drives the DataFusion scan over the table identity, file list, byte sizes,
+delete-file references, and logical schema resolved once by
+`vs-adapter/pushdown-planning-file-resolution`. Cluster fan-out is separated from the
+scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor subquery (`GROUP BY
+shard_key`) spreads each shard's per-file list across nodes, and an outer ungrouped
+`LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list node-locally and streams
+the rows. The scan-driving SQL splices the shard-invariant parts (projection, filter,
+LIMIT, logical schema, credentials, and the Iceberg table root) once as the scalar scan
+UDF's first-argument common literal and flows each shard's per-file subset through the
+distributor as the second argument. A single-shard plan short-circuits the distributor and
+calls the scalar scan directly on the file-list literal. See
 `vs-adapter/pushdown-planning-file-encoding` for the table-root-once and relative/absolute
 path encoding rules. See `vs-adapter/pushdown-planning-nested-aggregate-fallback` for the
 guard against composed requests (e.g. an outer aggregate over an inner grouped-aggregate
-sub-select) that don't map onto the source table's own columns. This feature also extends
-the resolve-once seam to associate each data file's positional-delete files and carry them
-minimally in the per-shard argument. Single-group aggregate pushdown (capability
-advertisement, partial-aggregate scan-spec translation, wrapper merge SQL, and AVG
-sum/count decomposition) is covered separately in
+sub-select) that don't map onto the source table's own columns. Single-group aggregate
+pushdown (capability advertisement, partial-aggregate scan-spec translation, wrapper merge
+SQL, and AVG sum/count decomposition) is covered separately in
 `vs-adapter/pushdown-planning-single-group-agg`.
 
 ## Background
 
-* The data-file list, each file's byte size (from the Iceberg manifest), and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
-* The logical schema carried into the common scan-spec argument identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
 * The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
 * The outer scalar scan select is never wrapped in a `SELECT * FROM (...)` materialization boundary.
-* Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
-* The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
-* Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
 * The `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan and distributor scripts are co-deployed in the adapter script's schema, so this single source qualifies both.
 * The cluster node count that sizes the shard fan-out is read per pushdown from the adapter script's own UDF handshake via `UdfContext::node_count()`. It is NOT read from `schemaMetadataInfo.adapterNotes`. Every VS request type reaches the adapter through the same single-call script invocation, so the handshake carries the node count on a `pushdown` request exactly as it does on a `createVirtualSchema` request; the request type lives in the JSON payload, not in the handshake.
 * `node_count()` is a synchronous handshake read and MUST be captured in `dispatch` before the tokio runtime is entered, alongside `ctx.script_schema()` and the resolved CONNECTION credentials. The value is then threaded into the pushdown planning path as a plain integer, so the async planning code performs no ambient context read of its own.
@@ -45,25 +39,6 @@ sum/count decomposition) is covered separately in
 * When a query aliases a table in its `FROM` clause (`FROM customer c`), Exasol stamps a `tableAlias` on every `column` node in the pushdown request — including nodes the user wrote unqualified. The single scan relation exposes only bare column names, so an alias-qualified reference does not resolve; the single-table push therefore strips the alias before rendering (see `vs-adapter/pushdown-planning-alias-stripping`). The `crates/vs-expression` translator itself always honors a present `tableAlias` (`sql-comprehension/vs-expression-translator`); stripping is the single-table caller's responsibility.
 
 ## Scenarios
-
-### Scenario: Pushdown derives the scanned Iceberg table from the involved virtual table
-
-* *GIVEN* a virtual schema created over a namespace containing multiple Iceberg tables, whose `adapterNotes` carry the `TABLE_MAP` recorded at create time
-* *AND* a `pushdown` request whose `involvedTables[0].name` is the Exasol (uppercased, `__`-flattened) name of one of those tables
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL read `TABLE_MAP` back from `schemaMetadataInfo.adapterNotes` and look up the involved virtual table name to recover its original-cased fully-qualified Iceberg identifier
-* *AND* the adapter SHALL resolve the data-file list and build the scan-driving SQL for exactly that one Iceberg table, carrying its identifier in the per-shard `CatalogProps.table`
-* *AND* a `pushdown` request whose involved virtual table name is absent from `TABLE_MAP` SHALL fail with an error naming the unknown virtual table, never silently scanning a different or stale table
-
-### Scenario: Pushdown resolves the file list once and builds a scan-driving query
-
-* *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
-* *AND* a query that projects a subset of columns from one of those tables
-* *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
-* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
-* *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
-* *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
 
 ### Scenario: Projection is pushed into the scan-driving query
 
@@ -101,21 +76,6 @@ sum/count decomposition) is covered separately in
 * *AND* because the common spec is shared by every shard, each row-scan shard invocation SHALL observe the same limit
 * *AND* the generated SQL SHALL attach the `LIMIT` DIRECTLY to the outer ungrouped scalar scan select (over the distributor subquery, or the from-less single-shard select) as a correctness backstop, with no `SELECT * FROM (...)` wrapper
 * *AND* when the request DOES carry an `order_by`, the per-shard row limit SHALL be governed by ordered top-N (pushed only alongside the matching per-shard `ORDER BY`), never as a bare per-shard `LIMIT` ahead of a global sort
-
-### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
-
-* *GIVEN* a `TABLE_MAP` entry whose value is a multi-level Iceberg identifier such as `prod.finance.orders`
-* *WHEN* the adapter resolves that identifier to load the table from the catalog
-* *THEN* the adapter SHALL split the identifier into all namespace segments and the trailing table name, building the iceberg `TableIdent` from a multi-segment `NamespaceIdent` rather than treating only the first segment as the namespace
-* *AND* both the SigV4-signed and the unsigned catalog paths SHALL build the identifier the same way so multi-level namespaces load correctly under either path
-
-### Scenario: Positional-delete file references are carried in the per-shard files argument
-
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by MinIO, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
-* *WHEN* Exasol sends the corresponding pushdown request
-* *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
-* *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support
-* *AND* the shard-invariant common spec (logical schema, projection, filter, LIMIT, credentials, table root) SHALL be unchanged by delete support, so a delete-free table produces a byte-identical common spec to before this feature
 
 ### Scenario: Scan-driving UDF invocations are schema-qualified from the running adapter script's schema
 
