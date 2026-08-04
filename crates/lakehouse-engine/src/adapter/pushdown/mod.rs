@@ -98,10 +98,8 @@ mod dispatch_golden;
 /// `creds` — the resolved CONNECTION credentials, used to determine whether
 /// to sign catalog requests and whether to apply vended storage credentials.
 ///
-/// `allow_http` — the resolved `ALLOW_HTTP` virtual-schema property (read once in
-/// `resolve_connection_config`). Under vending it is the operator's consent gate for
-/// plaintext transport, so a catalog cannot move vended credentials onto plain
-/// `http://` or `abfs://` on its own authority.
+/// `allow_http` — the resolved `ALLOW_HTTP` property; under vending it is the
+/// operator's consent gate for plaintext transport.
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///

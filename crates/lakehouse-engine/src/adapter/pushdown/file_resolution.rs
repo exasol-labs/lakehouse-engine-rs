@@ -198,27 +198,22 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 /// The catalog load_table request is self-issued via `load_table_any_auth`, which
 /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
 /// none). Vended-credential extraction is gated SOLELY on
-/// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. That flag
-/// is the ONE decision point between two storage selectors reading disjoint
-/// inputs. When it is true, `resolve_vended_storage` builds the whole
-/// `StorageBackend` from the loadTable response and the anchor's URI scheme: it
-/// reads no CONNECTION storage field and preserves no static value, so a
-/// credential or a store address the catalog does not vend is an error here rather
-/// than a silent fall-back to the static one. When it is false, returns
-/// `(files, storage.clone())` — byte-identical to the no-vending behaviour on
-/// every auth mode.
+/// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it is
+/// true, `resolve_vended_storage` builds the whole `StorageBackend` from the loadTable
+/// response and the anchor's URI scheme, reading no CONNECTION storage field: a
+/// credential or store address the catalog does not vend is an error here rather than
+/// a silent fall-back to the static one. When it is false, returns
+/// `(files, storage.clone())` — byte-identical to the no-vending behaviour on every
+/// auth mode.
 ///
 /// Every error surfaced from here on is redacted against the secret values of the
 /// EFFECTIVE storage, not the static one: the `file_io` built from it is what talks
 /// to object storage, so those are exactly the values an underlying provider error
 /// can echo back.
 ///
-/// `allow_http` is the resolved `ALLOW_HTTP` virtual-schema property. It travels
-/// beside `creds` because both selectors read it: it is already baked into the
-/// static `storage` passed in, and the vended selector takes it as the operator's
-/// consent gate for plaintext transport. It is a virtual-schema property and not a
-/// CONNECTION field, so passing it does not reintroduce a CONNECTION-derived read
-/// on the vended path.
+/// `allow_http` is the resolved `ALLOW_HTTP` virtual-schema property — already baked
+/// into the static `storage`, and the vended selector's consent gate for plaintext
+/// transport.
 ///
 /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
 /// for Iceberg-level file pruning. Pass `None` to disable pruning (e.g. `createVirtualSchema`).
@@ -245,14 +240,11 @@ pub async fn resolve_file_list(
     // from the response metadata so plan_files() can read manifests from S3.
     let result = load_table_any_auth(session, catalog_props, creds).await?;
 
-    // Resolve the effective storage (vended or static). The anchor is the TABLE'S
-    // OWN location from the parsed metadata, which under vending carries two jobs:
-    // it is what `storage_credentials[*].prefix` is matched against, and it is the
-    // sole input the backend variant is read from. Nothing else can stand in for
-    // it: the catalog REST URI names no object store at all, and the REST
-    // `warehouse` is a routing identifier rather than a storage location — so an
-    // absent location is its own error on the vended branch below, never a
-    // substituted CONNECTION-derived string fed through the scheme matcher.
+    // Resolve the effective storage (vended or static). The anchor is the TABLE'S OWN
+    // location: what `storage_credentials[*].prefix` is matched against, and the sole
+    // input the backend variant is read from. Nothing else can stand in — the catalog
+    // REST URI names no object store, and the REST `warehouse` is a routing identifier
+    // — so an absent location is its own error on the vended branch below.
     let table_location = result.metadata.location();
     // Own the table root before `result.metadata` is moved into the table builder
     // below. Returned so the adapter can carry it once in the common blob and emit

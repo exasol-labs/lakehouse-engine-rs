@@ -161,16 +161,10 @@ impl CloudEnv {
         }
     }
 
-    /// The `ConnectionCreds` the adapter parses out of the vended CONNECTION this
-    /// suite creates, so an in-process catalog call drives Glue with exactly the
-    /// credential set that CONNECTION carries — including the static AWS keys,
-    /// which SigV4 catalog signing still needs and which scheme-driven storage
-    /// resolution now ignores.
-    ///
-    /// Derived from `catalog_connection_password_vended` rather than from the
-    /// environment a second time, so the two cannot describe different
-    /// CONNECTIONs. `sas_token` is absent because `CatalogConnectionPassword`
-    /// carries no inline-SAS field to project from.
+    /// The `ConnectionCreds` the adapter parses out of this suite's vended CONNECTION,
+    /// derived from `catalog_connection_password_vended` so the two cannot describe
+    /// different CONNECTIONs. `sas_token` is absent: `CatalogConnectionPassword` carries
+    /// no inline-SAS field to project from.
     fn vended_connection_creds(&self) -> ConnectionCreds {
         let password = self.catalog_connection_password_vended();
         ConnectionCreds {
@@ -636,13 +630,9 @@ fn cloud_scan_reads_with_vended_credentials() {
 
 /// The one vended credential source that applies to `location`: the
 /// `storage_credentials` entry whose non-empty `prefix` is the longest prefix of
-/// `location`, else the flat `config` map.
-///
-/// Mirrors the Iceberg REST selection rule the shipped resolver applies, so the
-/// keys read below are the keys a scan of this table would read. Reading the
-/// response here instead of calling the resolver is the point of the mirror: the
-/// resolver answers with a storage backend, and a backend cannot say which config
-/// key the catalog left out.
+/// `location`, else the flat `config` map. Mirrors the shipped resolver's selection
+/// rule; reading the response instead of calling the resolver is the point, since a
+/// resolved backend cannot say which config key the catalog left out.
 fn vended_source_for<'a>(
     result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
@@ -659,13 +649,9 @@ fn vended_source_for<'a>(
         .map_or(&result.config, |entry| &entry.config)
 }
 
-/// Whether the vended credential source carries a usable value for `key`, spelling
-/// absence exactly as the shipped resolver spells it: an omitted key and a key
-/// present with an empty string are both ABSENT.
-///
-/// Answers with the presence alone and never the value, so no credential value can
-/// reach an assertion message or the report line — three of the five keys this test
-/// reads are credentials.
+/// Whether the vended source carries a usable value for `key`, spelling absence as
+/// the shipped resolver does: omitted and empty are both ABSENT. Answers with the
+/// presence alone, so no credential value can reach an assertion message.
 fn vended_key_present(vended: &HashMap<String, String>, key: &str) -> bool {
     vended.get(key).is_some_and(|value| !value.is_empty())
 }
@@ -678,26 +664,20 @@ fn presence_label(present: bool) -> &'static str {
 /// AWS Glue's vended payload carries a usable S3 credential set AND a store
 /// address for the table's own location.
 ///
-/// Evidence `cloud_scan_reads_with_vended_credentials` cannot supply: that
-/// CONNECTION also carries static AWS keys from this suite's own environment, so a
-/// green scan there is compatible with Glue vending nothing at all. This test
-/// issues the access-delegated `loadTable` GET itself and reads the response's
-/// vended config keys, which no static CONNECTION value can populate. Scheme-driven
-/// resolution takes every S3 transport value from those keys alone, so a key absent
-/// here is a plan-time failure for every vended Glue virtual schema — which is why
-/// the assertion messages name the absent key rather than reporting a failed scan.
+/// Evidence `cloud_scan_reads_with_vended_credentials` cannot supply: that CONNECTION
+/// also carries static AWS keys, so a green scan there is compatible with Glue vending
+/// nothing at all. This test issues the access-delegated `loadTable` GET itself and
+/// reads the response's vended config keys, which no static CONNECTION value can
+/// populate. A key absent here is a plan-time failure for every vended Glue virtual
+/// schema, which is why the assertions name the absent key rather than a failed scan.
 ///
 /// The anchor is the table's OWN location, derived exactly as `resolve_file_list`
-/// derives it: it is both what a `storage_credentials` prefix is matched against and
-/// the sole input the backend variant is read from. There is no fallback for it —
-/// an absent location is an error in production, so this test asserts it is present
-/// rather than substituting the CONNECTION's `warehouse`.
+/// derives it; there is no fallback for it, so this test asserts it is present rather
+/// than substituting the CONNECTION's `warehouse`.
 ///
-/// `s3.session-token` is REPORTED, not required: a permanent IAM identity
-/// legitimately vends a key pair with no token. The report line is printed
-/// unconditionally, so run the suite with `--nocapture` to read it on a pass.
-///
-/// Skips when the cloud env vars are absent, like every test in this module.
+/// `s3.session-token` is REPORTED, not required — a permanent IAM identity vends a key
+/// pair with no token. Run with `--nocapture` to read the report line. Skips when the
+/// cloud env vars are absent, like every test in this module.
 #[test]
 fn cloud_glue_vends_s3_key_pair_and_store_address() {
     let env = match CloudEnv::from_env() {

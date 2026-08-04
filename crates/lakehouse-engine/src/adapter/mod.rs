@@ -184,11 +184,9 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 /// Table identity is no longer fixed at config-resolution time; callers build
 /// `CatalogProps` with the specific per-table identifier when known.
 ///
-/// The returned `bool` is the resolved `ALLOW_HTTP` virtual-schema property. It is
-/// returned rather than only consumed here because BOTH storage selectors need it:
-/// `storage_block` bakes it into the static S3 payload, and the vended selector
-/// takes it as its plaintext-transport consent gate. Reading the property in this
-/// one place is what keeps those two from disagreeing.
+/// The returned `bool` is the resolved `ALLOW_HTTP` property, read in this one place
+/// because both storage selectors need it: `storage_block` bakes it into the static
+/// S3 payload, the vended selector uses it as its plaintext-transport consent gate.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
@@ -213,9 +211,8 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
-    // `ALLOW_HTTP` is discarded here: schema enumeration resolves no data-file
-    // storage, so it reaches no vended selector. `storage_block` has already baked
-    // it into `storage` for the manifest-read path.
+    // `ALLOW_HTTP` is discarded here: schema enumeration reaches no vended selector,
+    // and `storage_block` already baked it into `storage`.
     let (catalog_uri, storage, creds, _) = resolve_connection_config(ctx, &props)?;
 
     let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)

@@ -34,11 +34,6 @@ pub(crate) fn base_creds() -> ConnectionCreds {
 
 /// Static storage with the sentinel keys `STATIC_AK_SENTINEL` / `STATIC_SK_SENTINEL`
 /// (matching the credentials-cluster test sentinels below).
-///
-/// Consumers: [`static_backend`] below, which wraps it for `namespace`.
-/// `vended`'s tests build no fixture from this: `resolve_vended_storage` takes
-/// no base storage to preserve, so its disabled-path coverage lives in
-/// `make test-e2e` instead of a local `StorageProps`.
 pub(crate) fn static_storage() -> StorageProps {
     StorageProps {
         endpoint: "https://s3.amazonaws.com".into(),
@@ -50,11 +45,8 @@ pub(crate) fn static_storage() -> StorageProps {
     }
 }
 
-/// [`static_storage`] wrapped in the `S3` backend variant — the fixture for every
-/// call site that takes `&StorageBackend` (`list_namespace_tables`) rather than
-/// `&StorageProps`.
-///
-/// Consumers: `namespace`.
+/// [`static_storage`] wrapped in the `S3` backend variant, for call sites taking
+/// `&StorageBackend` rather than `&StorageProps`.
 pub(crate) fn static_backend() -> StorageBackend {
     StorageBackend::S3(static_storage())
 }

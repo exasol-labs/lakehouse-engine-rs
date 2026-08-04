@@ -97,11 +97,10 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
 /// fallback renderer, [`build_n_scan_join_sql`], which scans each table through its
 /// own sharded fan-out and reconstructs the join in Exasol's core engine.
 ///
-/// Two hard `Err`s (a client-facing error, no native re-plan) can leave this path.
-/// [`validate_sides_share_one_backend`] rejects a join whose resolved sides do not
-/// all name one object-storage backend, ahead of both renderers AND of the
-/// empty-side shortcut. Otherwise a hard `Err` is the last resort, delegated to the
-/// fallback builder for a wrapper that genuinely cannot be built.
+/// Two hard `Err`s can leave this path: [`validate_sides_share_one_backend`] rejects
+/// a join whose sides do not all name one object-storage backend, ahead of both
+/// renderers and of the empty-side shortcut; otherwise a hard `Err` is delegated to
+/// the fallback builder for a wrapper that genuinely cannot be built.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
@@ -147,11 +146,10 @@ pub(super) async fn plan_join(
         sides.push(side);
     }
 
-    // Reject a cross-backend join HERE — before the empty-side shortcut and before
-    // either renderer — so acceptance follows the CONFIGURATION and never the data
-    // in it: a momentarily empty side must not answer "0 rows" for a join that
-    // fails as soon as that table holds files. One check ahead of every exit also
-    // leaves no renderer reachable without it.
+    // Reject a cross-backend join before the empty-side shortcut and either renderer,
+    // so acceptance follows the CONFIGURATION and never the data in it: a momentarily
+    // empty side must not answer "0 rows" for a join that fails once that table holds
+    // files.
     validate_sides_share_one_backend(&sides)?;
 
     // An inner join with any empty side is empty regardless of the plan. Emit the

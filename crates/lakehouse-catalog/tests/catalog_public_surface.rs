@@ -49,10 +49,9 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
 /// the four `extract_vended_*` readers the consolidation inlined. `build_s3_file_io` is
 /// the deleted predecessor of `StorageBackend::file_io` — its reappearance as
 /// a free function would be the same kind of surface regression.
-/// `s3_backend_from_vended` is the construct-from-vended reader that replaced
-/// the deleted `merge_vended_into_storage` for the S3 arm — it must stay
-/// exactly as demoted as the function it replaced. A `pub` on any of these
-/// five is how that demotion or deletion could be silently reversed.
+/// `s3_backend_from_vended` replaced the deleted `merge_vended_into_storage` for the
+/// S3 arm. A `pub` on any of these five is how that demotion or deletion could be
+/// silently reversed.
 #[test]
 fn demoted_and_deleted_functions_are_not_declared_public() {
     for (name, source) in CATALOG_SOURCES {
@@ -86,10 +85,8 @@ fn storage_backend_secret_values_and_file_io_are_reachable() {
     let _: iceberg::io::FileIO = backend.file_io();
 }
 
-/// Build a minimal `LoadTableResult` for `resolve_vended_storage` fixtures —
-/// the external-crate equivalent of `vended.rs`'s own `mod tests` helper of
-/// the same shape, since that one is `#[cfg(test)]`-private to the crate and
-/// unreachable from here.
+/// Minimal `LoadTableResult` fixture; `vended.rs`'s own helper of the same shape is
+/// `#[cfg(test)]`-private to that crate and unreachable from here.
 fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
     let meta_json = serde_json::json!({
         "format-version": 2,
@@ -119,19 +116,11 @@ fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
     }
 }
 
-/// Pins `resolve_vended_storage`'s arity and return type from outside the
-/// crate: exactly three positional parameters — `&LoadTableResult`, an anchor
-/// `&str`, and an `allow_http: bool` — and a `Result<StorageBackend,
-/// UdfError>` return, with no `&StorageBackend` (or any other
-/// CONNECTION-derived value) among them. A future regression that
-/// reintroduced a `base: &StorageBackend` parameter, or changed the return
-/// type, would fail to compile here rather than only in the crate's own
-/// (`#[cfg(test)]`-private) unit tests.
-///
-/// Also exercises the scheme-driven selection this arity change exists for:
-/// the anchor's OWN scheme picks the variant (here S3, for an `s3://`
-/// anchor), with nothing else in the call carrying a pre-existing backend to
-/// select from.
+/// Pins `resolve_vended_storage`'s arity and return type from OUTSIDE the crate:
+/// `(&LoadTableResult, anchor: &str, allow_http: bool) -> Result<StorageBackend,
+/// UdfError>`, with no CONNECTION-derived parameter. Reintroducing a
+/// `base: &StorageBackend` would fail to compile here rather than only in the crate's
+/// own `#[cfg(test)]`-private unit tests.
 #[test]
 fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() {
     let result = minimal_load_table_result(vec![
@@ -152,15 +141,10 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
     }
 }
 
-/// Extracts every variant name declared in `storage.rs`'s `enum
-/// StorageBackend` source — generically, by scanning the enum body rather
-/// than hardcoding `["S3", "Adls"]` — and asserts each one appears as a
-/// literal in `vended.rs`'s source text.
-///
-/// A hardcoded list would keep passing silently after a third variant is
-/// added to the enum; extracting the names from `storage.rs` itself is what
-/// makes this probe notice a new variant automatically and fail until
-/// `vended.rs`'s scheme-to-variant mapping is updated to name it too.
+/// Extracts every variant name declared in `storage.rs`'s `enum StorageBackend`
+/// source — generically, rather than hardcoding `["S3", "Adls"]` — and asserts each
+/// appears in `vended.rs`'s production source, so a third variant added to the enum
+/// fails here until `vended.rs`'s scheme-to-variant mapping names it too.
 #[test]
 fn vended_selector_source_names_every_storage_backend_variant() {
     let storage_source = CATALOG_SOURCES
@@ -201,10 +185,8 @@ fn vended_selector_source_names_every_storage_backend_variant() {
     );
     let body = &storage_source[body_start..body_end];
 
-    // Restrict the search to the PRODUCTION region of vended.rs: a variant name
-    // that appears only inside its `#[cfg(test)] mod tests` (e.g. a fixture
-    // import or an assertion string) must not satisfy this probe, or a third
-    // variant with no production scheme-mapping arm at all could still pass.
+    // Restrict to the PRODUCTION region: a variant named only inside
+    // `#[cfg(test)] mod tests` must not satisfy the probe.
     let vended_production_source = &vended_source[..vended_source
         .find("#[cfg(test)]")
         .unwrap_or(vended_source.len())];

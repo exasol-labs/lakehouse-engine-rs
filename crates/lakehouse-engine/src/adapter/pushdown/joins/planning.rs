@@ -239,13 +239,9 @@ impl ResolvedJoinSide {
     }
 }
 
-/// The forwarded, per-call-unchanging inputs to [`resolve_one_join_side`],
-/// grouped into one value the way `JoinScanTuning` (`joins/sql_builders.rs`)
-/// groups this module's other forwarded scalars. `session`, `storage`,
-/// `catalog`, `creds`, and `allow_http` all pass straight through to
-/// `resolve_file_list` unchanged across every side of a join; only
-/// `table_name`, `iceberg_ident`, and `filter_json` vary per side, so those
-/// three stay their own parameters and this struct carries the rest.
+/// The per-call-unchanging inputs to [`resolve_one_join_side`], grouped the way
+/// `JoinScanTuning` (`joins/sql_builders.rs`) groups this module's other forwarded
+/// scalars. Only `table_name`, `iceberg_ident`, and `filter_json` vary per side.
 #[derive(Clone, Copy)]
 pub(super) struct JoinSideResolution<'a> {
     pub session: &'a CatalogSession,
@@ -326,36 +322,24 @@ pub(super) fn select_broadcast_sides(
 /// Reject at plan time a join whose sides do not all resolve to the same
 /// object-storage backend.
 ///
-/// `CommonScanSpec.storage` is ONE whole-spec value, and the broadcast fan-out
-/// scans BOTH tables inside one DataFusion session under it: `join_fan_out_scan_spec`
-/// takes the fact side's `effective_storage` while the dimension's file list rides
-/// in the `JoinSpec`, and `register_side_store` then dispatches on that single
-/// backend to build a store per side's own file URIs. That collapse was
-/// variant-safe while every side took its variant from one `storage_block` output.
-/// It is not once the variant follows each side's OWN table location, which is what
-/// `resolve_vended_storage` selects it from: an `s3://` fact joined to an `abfss://`
-/// dimension would build an `AmazonS3Builder` for the dimension's Azure URL, and two
-/// `abfss://` sides on different accounts would present the fact's SAS to the
-/// dimension's account. Both fail — or read the wrong bytes — at scan time, so they
-/// are named here instead.
+/// `CommonScanSpec.storage` is ONE whole-spec value and the broadcast fan-out scans
+/// BOTH tables under it, so an `s3://` fact joined to an `abfss://` dimension would
+/// build an `AmazonS3Builder` for the dimension's Azure URL, and two `abfss://` sides
+/// on different accounts would present the fact's SAS to the dimension's account.
+/// That collapse was variant-safe only while every side took its variant from one
+/// `storage_block` output; it is not once the variant follows each side's OWN table
+/// location, which is what `resolve_vended_storage` selects it from.
 ///
-/// The check is deliberately uniform across BOTH renderers even though the N-scan
-/// fallback gives each leg its own spec and so its own storage: whether a join
-/// broadcasts depends on byte sizes against a threshold, so a per-renderer guard
-/// would make acceptance of a configuration depend on the data in it.
+/// The check is uniform across BOTH renderers even though the N-scan fallback gives
+/// each leg its own storage: whether a join broadcasts depends on byte sizes, so a
+/// per-renderer guard would make acceptance of a configuration depend on the data in
+/// it. Comparison is scoped to the backend VARIANT and, for `Adls`, `account_name` —
+/// not full backend equality, which would reject every vended join against a catalog
+/// minting per-prefix STS keys (tracked separately as `#294`). `backend_identity`
+/// derives both the compared identity and the words the error uses, so the message
+/// can never name a distinction the comparison did not make.
 ///
-/// Comparison is scoped to the backend VARIANT and, for `Adls`, the
-/// `account_name` — NOT full backend equality. The same collapse already discards a
-/// per-prefix vended CREDENTIAL difference, and rejecting on that would break every
-/// vended join against a catalog minting per-table STS keys; whether any target
-/// catalog does is unverified, so it stays a separately tracked defect (`#294`)
-/// rather than a behaviour changed blind here. One function derives both the compared identity and
-/// the words the error uses, so the message can never name a distinction the
-/// comparison did not make — and it names no credential value.
-///
-/// This is the pure, catalog-free core of side selection so it is unit-testable
-/// without a live Iceberg catalog; [`plan_join`] resolves each side and delegates
-/// here. Fewer than two sides share one backend trivially.
+/// Fewer than two sides share one backend trivially.
 pub(super) fn validate_sides_share_one_backend(sides: &[ResolvedJoinSide]) -> Result<(), UdfError> {
     let mut rest = sides.iter();
     let Some(first) = rest.next() else {
@@ -876,8 +860,6 @@ mod tests {
 
     // ---------------------------------------------------------------------------
     // One-backend join guard: `validate_sides_share_one_backend`.
-    // The pure core of the cross-backend rejection — exercised without a live
-    // Iceberg catalog, on sides built from the shared `resolved_side` fixture.
     // ---------------------------------------------------------------------------
 
     /// A SAS sentinel: every rejection message below is asserted NOT to contain it.
@@ -894,8 +876,6 @@ mod tests {
         side
     }
 
-    /// Every existing single-backend join — both sides on the one `storage_block`
-    /// or one-warehouse vended backend — passes the guard untouched.
     #[test]
     fn sides_on_one_backend_are_accepted() {
         let sides = vec![
@@ -905,8 +885,7 @@ mod tests {
         assert!(validate_sides_share_one_backend(&sides).is_ok());
     }
 
-    /// Fewer than two sides share one backend trivially — the guard is a total
-    /// function over the slice and must not index past its start.
+    /// The guard is total over the slice and must not index past its start.
     #[test]
     fn fewer_than_two_sides_are_accepted() {
         assert!(validate_sides_share_one_backend(&[]).is_ok());
@@ -915,9 +894,8 @@ mod tests {
         );
     }
 
-    /// Two sides whose backends differ in VARIANT are rejected at plan time: the
-    /// broadcast fan-out registers one store for both, so an ADLS dimension would
-    /// otherwise be read through the fact's S3 store.
+    /// The broadcast fan-out registers one store for both sides, so an ADLS dimension
+    /// would otherwise be read through the fact's S3 store.
     #[test]
     fn sides_on_different_backend_variants_are_rejected() {
         let sides = vec![
@@ -937,9 +915,7 @@ mod tests {
         );
     }
 
-    /// Two ADLS sides on DIFFERENT storage accounts are rejected: one account's SAS
-    /// does not authorize the other's, so the collapsed store would fail to read
-    /// the dimension at scan time instead of failing clearly at plan time.
+    /// One ADLS account's SAS does not authorize another's.
     #[test]
     fn adls_sides_on_different_storage_accounts_are_rejected() {
         let sides = vec![
@@ -958,10 +934,9 @@ mod tests {
         );
     }
 
-    /// The comparison is scoped to variant + ADLS account DELIBERATELY: two S3
-    /// sides carrying different credentials or endpoints still pass. Widening this
-    /// to full backend equality would reject every vended join against a catalog
-    /// that mints per-prefix credentials, which is tracked separately.
+    /// The comparison is scoped to variant + ADLS account DELIBERATELY: widening it to
+    /// full backend equality would reject every vended join against a catalog minting
+    /// per-prefix credentials (#294).
     #[test]
     fn s3_sides_differing_in_credentials_are_accepted() {
         let mut per_prefix = resolved_side("ORDERS", vec![("o1", 50_000)]);

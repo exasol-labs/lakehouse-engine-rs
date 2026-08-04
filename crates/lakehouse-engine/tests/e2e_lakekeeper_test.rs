@@ -326,20 +326,12 @@ fn lakekeeper_static_creds_projection_filter_limit() {
 /// rows identical to the static warehouse's, over a CONNECTION that carries no
 /// static storage field at all.
 ///
-/// The empty-static shape asserted below is the REQUIRED shape of a vended
-/// CONNECTION, not merely sufficient evidence of delegation. Scheme-driven vended
-/// resolution builds the storage backend from the `loadTable` response ALONE, so
-/// whenever `use_vended_credentials` is set a CONNECTION's `endpoint`, `region`,
-/// `access_key`, and `secret_key` are ignored entirely — populating them would
-/// leave live credentials on a CONNECTION that never reads them. Empty is
-/// therefore the only way a vended CONNECTION is allowed to look, and this test
-/// pins that shape rather than merely exploiting it.
-///
-/// That shape is also what makes the row set below evidence of the whole vended
-/// payload: with no static value available to substitute for anything — neither a
-/// credential nor the store address — the scan can only have reached MinIO
-/// through what the `X-Iceberg-Access-Delegation: vended-credentials` `loadTable`
-/// request vended.
+/// The empty-static shape asserted below is the REQUIRED shape of a vended CONNECTION,
+/// not merely sufficient evidence of delegation: scheme-driven resolution builds the
+/// backend from the `loadTable` response ALONE, so a static `endpoint`, `region`, or
+/// key pair would be a live credential that is never read. With nothing to substitute
+/// for either a credential or the store address, the row set below can only have come
+/// through the `X-Iceberg-Access-Delegation: vended-credentials` request.
 #[test]
 fn lakekeeper_vended_creds_projection_filter() {
     setup();

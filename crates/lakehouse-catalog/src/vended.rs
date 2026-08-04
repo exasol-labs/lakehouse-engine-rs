@@ -2,76 +2,40 @@
 //! storage from what its `loadTable` response vends for that table's own
 //! location, with no CONNECTION-supplied storage value involved.
 //!
-//! [`resolve_vended_storage`] is the whole public surface. Everything below it is
-//! a private step: the caller states the intent (resolve the effective storage
-//! for this response) and never handles the recipe — which of two credential
-//! sources applies, which backend the location's URI scheme selects, which
-//! config keys carry that backend's vended values, or how each spells absence.
+//! [`resolve_vended_storage`] is the whole public surface; everything below it is a
+//! private step.
 
 use crate::{AdlsCred, StorageBackend, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
-/// The vended ADLS SAS keys are host-suffixed — `adls.sas-token.<host>` — which
-/// is the iceberg Java `AzureProperties` convention a catalog emits, not a key
-/// the Iceberg REST spec enumerates. The reader downstream understands only the
-/// flat `adls.sas-token` spelling, so the suffix is recovered here and never
-/// travels any further.
+/// Vended ADLS SAS keys are host-suffixed (`adls.sas-token.<host>`) — the iceberg Java
+/// `AzureProperties` convention, not a key the Iceberg REST spec enumerates. The reader
+/// downstream understands only the flat `adls.sas-token`, so the suffix is recovered
+/// here and travels no further.
 const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
 
-/// Resolve the effective scan storage for a table from its `loadTable` response,
-/// the URI scheme of that table's own location, and the operator's resolved
-/// `ALLOW_HTTP` consent.
+/// Resolve the effective scan storage for a table from its `loadTable` response, the
+/// URI scheme of that table's own location, and the operator's `ALLOW_HTTP` consent.
 ///
-/// This is the VENDED half of a selector pair. It reads the catalog's response
-/// and nothing else; `storage_block` reads the CONNECTION and nothing else; one
-/// `use_vended_credentials` branch at the call site picks between them, so the
-/// two selectors run on disjoint inputs and neither can override the other.
-/// Taking no [`StorageBackend`] and no `ConnectionCreds` is the design rather
-/// than an omission: it makes "no CONNECTION storage FIELD is read under
-/// vending" a property of this signature instead of a rule an auditor has to
-/// re-verify by reading the body. `anchor` does not weaken that guarantee: the
-/// caller (`resolve_file_list`) passes the table's own location from the
-/// `loadTable` response and nothing else — an absent location is an error there,
-/// never a substituted CONNECTION `warehouse`, which is a REST routing
-/// identifier rather than a storage location — so no CONNECTION-derived string
-/// reaches the variant selection, the credential-source prefix match, or (for
-/// ADLS) the SAS host. `allow_http`
-/// does not reopen the storage-field door either — it carries one
-/// virtual-schema property resolved outside this crate, names no credential,
-/// and cannot supply one.
+/// Reads the catalog's response and nothing else: taking no [`StorageBackend`] and no
+/// `ConnectionCreds` makes "no CONNECTION storage field is read under vending" a
+/// property of this signature. The caller gates the call on `use_vended_credentials`.
 ///
-/// The backend variant comes from `anchor`'s scheme ALONE, matched
-/// case-insensitively per RFC 3986 §3.1: `s3://`/`S3://` and `s3a://`/`S3A://`
-/// resolve S3, `abfss://` and `abfs://` (in any casing) resolve ADLS, and every
-/// other scheme — including a location carrying no scheme at all — is a
-/// `UdfError::User`, because a default backend would be a guess about where the
-/// operator's data lives. The mapping is a total function over the scheme
-/// string rather than a match on [`StorageBackend`], so a third variant added
-/// to that enum still compiles here; `catalog_public_surface.rs`'s
-/// source-level variant probe is the compensating gate.
+/// The backend variant comes from `anchor`'s scheme ALONE, matched case-insensitively
+/// per RFC 3986 §3.1: `s3`/`s3a` → S3, `abfss`/`abfs` → ADLS, anything else a
+/// `UdfError::User`. The mapping is total over the scheme string rather than a match on
+/// [`StorageBackend`], so a third enum variant still compiles here —
+/// `catalog_public_surface.rs`'s source-level variant probe is the compensating gate.
 ///
-/// Whatever the response does not advertise is ABSENT: there is no static value
-/// underneath to preserve it from, so a credential or a store address the
-/// catalog does not vend is reported rather than substituted. Plaintext
-/// transport needs the operator's consent, but the two schemes below are gated
-/// for different reasons: a vended plain-`http://` endpoint really is
-/// plaintext on the wire, while an `abfs://` location is not — this engine has
-/// no plaintext Azure path and would silently read it over HTTPS instead — but
-/// naming a plaintext scheme the engine will not actually honour as plaintext
-/// is itself misleading, so honouring the location still requires the
-/// operator's explicit `ALLOW_HTTP` acknowledgement rather than a silent scheme
-/// upgrade.
+/// Anything the response does not advertise is ABSENT; there is no static value
+/// underneath to preserve it from. A vended `http://` endpoint and an `abfs://`
+/// location both require `allow_http` (the engine has no plaintext Azure path and would
+/// silently read `abfs://` over HTTPS).
 ///
-/// `anchor` must be the table's own location. It is both what
-/// `storage_credentials[*].prefix` matches against and what the variant is read
-/// from, so a catalog URI passed here is rejected as an unsupported scheme
-/// rather than silently selecting the flat `config` map.
-///
-/// Whether vending applies at all is the caller's decision, not this function's:
-/// `use_vended_credentials` gates the call rather than being a parameter,
-/// because a flag that switches a function between doing the work and returning
-/// its input is a decision the function declined to make.
+/// `anchor` must be the table's own location — also what
+/// `storage_credentials[*].prefix` matches against — so a catalog URI is rejected as an
+/// unsupported scheme rather than silently selecting the flat `config` map.
 pub fn resolve_vended_storage(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
@@ -123,22 +87,17 @@ fn select_credential_source<'a>(
         .map_or(&result.config, |entry| &entry.config)
 }
 
-/// The S3 backend the vended credential source describes, constructed from that
-/// source ALONE. The key pair is required, and so is at least one of
-/// `client.region` and `s3.endpoint`, because with no static payload underneath
-/// those two are the only values left that can place the store. Everything else
-/// is absent when the source omits it — there is nothing to preserve it from.
+/// The S3 backend the vended credential source describes, built from that source ALONE.
+/// The key pair is required, and so is at least one of `client.region` and
+/// `s3.endpoint`: with no static payload underneath, those are the only values that can
+/// place the store.
 ///
-/// `path_style` is the one value that is not resolved in isolation, because it is
-/// not an independent field to its consumer: `register_side_store` treats it as
-/// the gate on whether `endpoint` reaches `AmazonS3Builder` at all. A vended
-/// endpoint resolved beside `path_style: false` is therefore an address the scan
-/// cannot use — it would silently drop the endpoint and read a virtual-hosted AWS
-/// host derived from the region instead, which is the wrong store rather than a
-/// plan-time error. So a response that omits `s3.path-style-access`, or spells it
-/// unparseably, resolves it from whether an endpoint was vended; a value the
-/// response does state still wins, since a catalog naming virtual-hosted
-/// addressing outright is describing its own store.
+/// `path_style` defaults to whether an endpoint was vended, because
+/// `register_side_store` treats it as the gate on whether `endpoint` reaches
+/// `AmazonS3Builder` at all — a vended endpoint beside `path_style: false` would be
+/// silently dropped for a virtual-hosted host derived from the region, which is the
+/// wrong store rather than a plan-time error. A value the response does state still
+/// wins.
 fn s3_backend_from_vended(
     vended: &HashMap<String, String>,
     anchor: &str,
@@ -184,11 +143,9 @@ fn s3_backend_from_vended(
     }))
 }
 
-/// A vended value the resolved backend cannot be built without, reported when
-/// the selected source omits it or spells it empty. Reported rather than
-/// substituted: a static value read here would be a credential the operator
-/// believed was unused, and the whole point of vending is that the catalog
-/// supplies it.
+/// A vended value the resolved backend cannot be built without, reported when the
+/// selected source omits it or spells it empty rather than substituted from static
+/// config.
 fn required_vended_value(
     vended: &HashMap<String, String>,
     key: &str,
@@ -202,37 +159,20 @@ fn required_vended_value(
     })
 }
 
-/// The ADLS backend the vended credential source describes, selected by the
-/// anchor's OWN storage host. Reading the account name and the SAS from that one
-/// host is what keeps the pair internally consistent: `adls.account-name` is the
-/// downstream wrong-account guard, so an account name that disagreed with the
-/// account the SAS was minted for would disarm it or fail the manifest read.
+/// The ADLS backend the vended credential source describes, selected by the anchor's
+/// OWN storage host. Reading the account name and the SAS from that one host keeps the
+/// pair consistent: `adls.account-name` is the downstream wrong-account guard, so an
+/// account name disagreeing with the account the SAS was minted for would disarm it.
 ///
-/// The vended key spelling is host-suffixed while the iceberg ADLS reader
-/// accepts only the flat `adls.sas-token`, so recovering the host here and
-/// assembling the flat SAS state is what keeps every consumer downstream unaware
-/// that a second spelling exists.
+/// The host suffix is matched CASE-INSENSITIVELY per RFC 3986 §3.2.2, exact spelling
+/// tried first so a payload carrying case-variant spellings resolves deterministically
+/// rather than by hash order. The KEY LABEL is still matched exactly, as the S3 arm
+/// matches its keys.
 ///
-/// The host suffix is matched CASE-INSENSITIVELY, matching the scheme rule in
-/// [`resolve_vended_storage`]: RFC 3986 §3.2.2 makes a URI host
-/// case-insensitive, so a catalog that spells the account differently from the
-/// table location names the same storage account and must not read as "the
-/// catalog vended none". The exact spelling is tried FIRST, by direct lookup, so
-/// a payload carrying case-variant spellings of one host resolves
-/// deterministically rather than by hash order; only a payload with two
-/// non-empty case-variant keys and no exact match leaves the choice arbitrary,
-/// and by that same RFC both of those keys name one account.
-///
-/// The KEY LABEL is deliberately still matched exactly. Unlike the host it is
-/// not a URI component with a documented case rule but a protocol key spelling,
-/// and the S3 arm reads its keys exactly too — relaxing one arm alone would make
-/// the two disagree about what a vended key is.
-///
-/// `account_name` is derived from the host VERBATIM, not normalised. The guard
-/// it feeds compares it byte-exactly against the account parsed out of each file
-/// URI (`iceberg-storage-opendal-0.10.0/src/azdls.rs:165`), so a case-folded
-/// account name would make the guard fire on the very locations it was derived
-/// from.
+/// `account_name` is derived from the host VERBATIM: the guard it feeds compares it
+/// byte-exactly against the account parsed out of each file URI
+/// (`iceberg-storage-opendal-0.10.0/src/azdls.rs:165`), so a case-folded account name
+/// would fire the guard on the very locations it was derived from.
 fn adls_backend_from_vended(
     vended: &HashMap<String, String>,
     anchor: &str,
@@ -274,9 +214,9 @@ fn adls_backend_from_vended(
 }
 
 /// The storage host of a table location: its authority segment, read after any
-/// `<container>@` userinfo. For an ADLS location that is the
-/// `<account>.dfs.core.windows.net` the vended SAS keys are suffixed with, which
-/// is why one reading serves both the SAS selection and the account name.
+/// `<container>@` userinfo. For ADLS that is the `<account>.dfs.core.windows.net` the
+/// vended SAS keys are suffixed with, so one reading serves both the SAS selection and
+/// the account name.
 fn anchor_host(anchor: &str) -> &str {
     let after_scheme = anchor.split_once("://").map_or(anchor, |(_, rest)| rest);
     let authority = after_scheme
@@ -301,18 +241,14 @@ mod tests {
     const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
     const VENDED_REGION: &str = "eu-west-2";
     const VENDED_SAS: &str = "VENDED_SAS_SENTINEL";
-    /// A SAS minted for an account the anchor does not name — the wrong-account
-    /// value every host-selection assertion is measured against.
+    /// A SAS minted for an account the anchor does not name.
     const OTHER_HOST_SAS: &str = "OTHER_HOST_SAS_SENTINEL";
-    /// An `adls.account-key` beside the vended SAS. The vended selector has no
-    /// reader for it, so no resolved backend may ever carry it.
     const VENDED_ACCOUNT_KEY: &str = "VENDED_ACCOUNT_KEY_SENTINEL";
     const ADLS_ACCOUNT: &str = "myaccount";
     const ADLS_HOST: &str = "myaccount.dfs.core.windows.net";
     const OTHER_ADLS_HOST: &str = "otheraccount.dfs.core.windows.net";
 
-    /// Every credential value this module's fixtures carry. A refusal may name
-    /// none of them, whichever fixture drew it.
+    /// Every credential value this module's fixtures carry; no refusal may name any.
     const CREDENTIAL_SENTINELS: &[&str] = &[
         VENDED_AK,
         VENDED_SK,
@@ -394,10 +330,8 @@ mod tests {
         )
     }
 
-    /// A `LoadTableResult` whose flat config vends one host-suffixed SAS per
-    /// entry — the `adls.sas-token.<host>` shape a catalog emits for an ADLS
-    /// warehouse, spelled through the production key prefix so a change to that
-    /// constant cannot leave these fixtures asserting a stale spelling.
+    /// A `LoadTableResult` whose flat config vends one `adls.sas-token.<host>` key per
+    /// entry, spelled through the production key prefix.
     fn adls_vended_result(sas_per_host: &[(&str, &str)]) -> iceberg_catalog_rest::LoadTableResult {
         let keys: Vec<(String, &str)> = sas_per_host
             .iter()
@@ -409,8 +343,8 @@ mod tests {
         )
     }
 
-    /// The S3 payload the vended selector resolves — for the tests whose subject
-    /// is which values it reads rather than whether the request was satisfiable.
+    /// The S3 payload the vended selector resolves, for tests about which values it
+    /// reads rather than whether the request was satisfiable.
     fn vended_s3(
         result: &iceberg_catalog_rest::LoadTableResult,
         anchor: &str,
@@ -422,10 +356,9 @@ mod tests {
         )
     }
 
-    /// The message a refused vended request reports — for the tests whose subject
-    /// is the refusal. Any variant other than `UdfError::User` is itself a
-    /// failure: an unsatisfied vended request is an operator-actionable
-    /// condition, not an internal one.
+    /// The message a refused vended request reports. Any variant other than
+    /// `UdfError::User` is itself a failure: an unsatisfied vended request is
+    /// operator-actionable, not internal.
     fn vended_user_error(
         result: &iceberg_catalog_rest::LoadTableResult,
         anchor: &str,
@@ -440,10 +373,7 @@ mod tests {
         error.to_string()
     }
 
-    /// The account name and SAS the vended selector resolves for an ADLS anchor —
-    /// for the tests whose subject is which values it reads. That the SAS state is
-    /// the only state it can reach is asserted separately, by
-    /// [`vended_adls_backend_holds_the_sas_state_never_the_account_key_state`].
+    /// The account name and SAS the vended selector resolves for an ADLS anchor.
     fn vended_adls_sas(
         result: &iceberg_catalog_rest::LoadTableResult,
         anchor: &str,
@@ -469,9 +399,8 @@ mod tests {
         }
     }
 
-    /// Every refusal a vended request can draw has the same three obligations: it
-    /// names the table location it was for, it names the config key or property
-    /// that was not satisfied, and it names no credential value.
+    /// Every refusal names the table location, names the unsatisfied config key or
+    /// property, and names no credential value.
     fn assert_refused(message: &str, anchor: &str, named: &[&str]) {
         assert!(
             message.contains(anchor),
@@ -487,8 +416,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Credential-source selection: which of the two sources a loadTable response
-    // carries applies to a given table location.
+    // Credential-source selection.
     // ---------------------------------------------------------------------------
 
     /// Scenario: storage_credentials entry with the matching prefix provides vended creds.
@@ -608,20 +536,16 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // The anchor is the table's OWN location: it is both what a
-    // storage_credentials prefix matches against and what the backend variant is
-    // read from, so the catalog's own HTTPS URI is refused rather than quietly
-    // reaching the flat config map.
+    // The anchor is the table's OWN location: what a storage_credentials prefix
+    // matches against, and what the backend variant is read from.
     // ---------------------------------------------------------------------------
 
     /// Scenario: the correct anchor for longest-prefix matching is
     /// `result.metadata.location()` — an S3 table URI — not the HTTPS catalog
     /// endpoint or the metadata-file JSON path.
     ///
-    /// `make_load_table_result` sets `metadata.location = "s3://bucket/db/t"`.
-    /// A prefix `"s3://bucket/db"` matches that S3 location. An HTTPS catalog URI
-    /// matches no S3 prefix AND names no storage backend, so it is now a refusal
-    /// rather than a silent fall-back to the flat config's own credentials.
+    /// An HTTPS catalog URI matches no S3 prefix AND names no storage backend, so it is
+    /// a refusal rather than a silent fall-back to the flat config's own credentials.
     #[test]
     fn vended_storage_anchor_is_the_s3_table_location() {
         let result = make_load_table_result(
@@ -653,9 +577,7 @@ mod tests {
             "S3 table location anchor must match the storage_credentials prefix"
         );
 
-        // Passing the HTTPS catalog URI instead is refused: it matches no S3
-        // prefix and names no backend, so reaching the flat config's credentials
-        // from it would read the wrong store with the wrong keys.
+        // Passing the HTTPS catalog URI instead is refused: it names no backend.
         let https_anchor = "https://glue.us-east-1.amazonaws.com/v1/catalog";
         let message = vended_user_error(&result, https_anchor, false);
         assert!(
@@ -673,9 +595,8 @@ mod tests {
     // what the response advertises and nothing else.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: the storage the scan spec carries under vending is the vended
-    /// credential set — access key, secret key, and session token — with no
-    /// static value beside it for anything the response does advertise.
+    /// Scenario: under vending the scan spec's storage is the vended credential set —
+    /// access key, secret key, session token — with no static value beside it.
     #[test]
     fn vended_creds_are_the_sole_storage_source_in_spec() {
         let result = make_load_table_result(
@@ -705,16 +626,12 @@ mod tests {
         );
     }
 
-    /// Scenario: once vending IS requested, an empty vended key is a missing
-    /// credential rather than a licence to read the static one. The refusal names
-    /// the config key the catalog left empty and carries no credential value.
+    /// Scenario: once vending IS requested, an empty vended key is a missing credential
+    /// rather than a licence to read the static one.
     ///
-    /// The vending-DISABLED half of that rule is deliberately not asserted here.
-    /// It is not this crate's branch to reach: `resolve_vended_storage` takes no
-    /// static storage, so the decision lives entirely in the engine crate's
-    /// `use_vended_credentials` check at the call site, and the E2E suites are what
-    /// cover it. A local `StorageProps` cloned and compared against itself would
-    /// assert nothing about either.
+    /// The vending-DISABLED half is not asserted here: `resolve_vended_storage` takes no
+    /// static storage, so that decision lives in the engine crate's call site and the
+    /// E2E suites cover it.
     #[test]
     fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() {
         let result = make_load_table_result(
@@ -920,8 +837,7 @@ mod tests {
     /// region nor endpoint leaves the store address undetermined.
     #[test]
     fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() {
-        // Part A: client.region present → vended region adopted, and the two
-        // transport values the response omits are absent, not filled in.
+        // Part A: client.region adopted; the omitted transport values stay absent.
         let result_with_region = make_load_table_result(
             None,
             vec![
@@ -952,8 +868,7 @@ mod tests {
             "a path-style the response omits is absent"
         );
 
-        // Part B: neither client.region nor s3.endpoint → nothing left can place
-        // the store, and no static value may supply one.
+        // Part B: neither client.region nor s3.endpoint → nothing can place the store.
         let result_no_address = make_load_table_result(
             None,
             vec![
@@ -1040,11 +955,9 @@ mod tests {
     // value the selected source omits, spells empty, or spells unparseably.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: an empty vended `s3.access-key-id` is absent per the uniform
-    /// convention (`vended_config_value` filters empty strings), and an absent
-    /// credential under vending is a refusal — there is no static value beneath
-    /// it to read instead. The sibling non-empty vended values do not soften it:
-    /// a credential set missing one required member is not usable.
+    /// Scenario: an empty vended `s3.access-key-id` is absent per the uniform convention
+    /// (`vended_config_value` filters empty strings), and an absent credential under
+    /// vending is a refusal — sibling non-empty values do not soften it.
     #[test]
     fn resolve_vended_storage_empty_access_key_is_a_missing_credential() {
         let result = make_load_table_result(
@@ -1091,13 +1004,9 @@ mod tests {
         assert_names_no_credential_value(&message);
     }
 
-    /// Scenario: an absent or empty vended `s3.session-token` resolves to `None`
-    /// — covering both the absent-key case and the empty-string case in one
-    /// test, since both spell "no vended token" per `vended_config_value`.
-    ///
-    /// A session token is not required: a vended long-lived key pair carries
-    /// none. What it must never be is a static token the operator believed was
-    /// unused, so absent resolves to absent.
+    /// Scenario: an absent or empty vended `s3.session-token` resolves to `None` — both
+    /// spell "no vended token" per `vended_config_value`. A token is not required (a
+    /// long-lived key pair carries none), but it must never be a static one.
     #[test]
     fn resolve_vended_storage_absent_session_token_is_absent() {
         // Case 1: the key is absent from the vended config entirely.
@@ -1134,16 +1043,10 @@ mod tests {
         );
     }
 
-    /// Scenario: an unparseable `s3.path-style-access` string on a response that
-    /// vends NO endpoint resolves to `false`. `bool::from_str` is case-sensitive —
-    /// only the exact lowercase `"true"`/`"false"` parse — so a differently-cased
-    /// value such as `"TRUE"` must fail to parse and fall to the default, not be
-    /// treated as truthy.
-    ///
-    /// The default it falls to is whether an endpoint was vended, so the absence of
-    /// an endpoint here is what makes the expected value `false`: with only
-    /// `client.region` to place the store, virtual-hosted addressing is all that is
-    /// left to address it with. The endpoint-present half of the same default is
+    /// Scenario: an unparseable `s3.path-style-access` falls to the default rather than
+    /// parsing as truthy — `bool::from_str` accepts only lowercase `"true"`/`"false"`.
+    /// The default is whether an endpoint was vended, so with no endpoint here the
+    /// expected value is `false`; the endpoint-present half is
     /// [`vended_endpoint_without_path_style_stays_reachable_by_the_scan`].
     #[test]
     fn resolve_vended_storage_unparseable_path_style_without_an_endpoint_is_false() {
@@ -1171,12 +1074,10 @@ mod tests {
     }
 
     /// Scenario: a response vending an `s3.endpoint` but no `s3.path-style-access`
-    /// resolves `path_style: true`. `path_style` is what decides whether the scan
-    /// hands that endpoint to `AmazonS3Builder` at all, so resolving it `false`
-    /// beside a non-empty endpoint produces an address the scan silently discards —
-    /// it would fall back to a virtual-hosted AWS host derived from the (here
-    /// empty) region and read the wrong store. This is the shape a catalog
-    /// fronting an S3-compatible store vends.
+    /// resolves `path_style: true` — `path_style` gates whether the scan hands the
+    /// endpoint to `AmazonS3Builder`, so `false` beside a non-empty endpoint would
+    /// silently read a virtual-hosted host instead. This is the shape a catalog fronting
+    /// an S3-compatible store vends.
     #[test]
     fn vended_endpoint_without_path_style_stays_reachable_by_the_scan() {
         let result = make_load_table_result(
@@ -1202,11 +1103,8 @@ mod tests {
         );
     }
 
-    /// Scenario: an `s3.path-style-access` the response DOES state still wins over
-    /// the endpoint-coupled default. The coupling above fills in a value the
-    /// catalog left unstated; it must not overwrite one the catalog stated, or a
-    /// store that asked for virtual-hosted addressing would be addressed
-    /// path-style against its own endpoint.
+    /// Scenario: an `s3.path-style-access` the response DOES state wins over the
+    /// endpoint-coupled default, which only fills in a value the catalog left unstated.
     #[test]
     fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
         let result = make_load_table_result(
@@ -1231,10 +1129,8 @@ mod tests {
     /// NOT fall back to the flat `config` map for that key — the entry, once
     /// selected, is authoritative for the whole credential set.
     ///
-    /// The refusal IS the compliance evidence: the flat `config` map here carries
-    /// the secret_key the entry omits, so a per-key second selection would have
-    /// resolved successfully with that value. Only a single selection can turn
-    /// this fixture into a missing-credential error.
+    /// The refusal IS the evidence: the flat `config` map carries the secret_key the
+    /// entry omits, so a per-key second selection would have resolved successfully.
     #[test]
     fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config() {
         let result = make_load_table_result(
@@ -1263,13 +1159,9 @@ mod tests {
         assert_names_no_credential_value(&message);
     }
 
-    /// Scenario: `allow_http` is the operator's resolved `ALLOW_HTTP` property,
-    /// threaded in — never read from the vended result, which advertises no such
-    /// key. Confirmed by flipping the parameter across two calls with the
-    /// identical vended result and observing the resolved value track it.
-    ///
-    /// The same parameter is the plaintext consent gate: a catalog that vends an
-    /// `http://` endpoint cannot move the vended credentials onto plaintext
+    /// Scenario: `allow_http` is the operator's resolved `ALLOW_HTTP` property, never
+    /// read from the vended result. The same parameter is the plaintext consent gate: a
+    /// catalog vending an `http://` endpoint cannot move credentials onto plaintext
     /// transport on its own authority.
     #[test]
     fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
@@ -1318,17 +1210,12 @@ mod tests {
     /// re-selection that could let some keys read the matched entry and others
     /// silently read the flat `config` map instead.
     ///
-    /// The matched `storage_credentials` entry supplies only four of the six
-    /// keys (access_key, secret_key, region, endpoint); the flat `config` map
-    /// carries wrong sentinel values for all six. A single selection means the
-    /// four present keys resolve to the entry's values and the two the entry
-    /// omits resolve without ever consulting config: `session_token` to absent,
-    /// and `path_style` to the endpoint-coupled default — `true` here, because
-    /// the matched entry vends an endpoint.
-    ///
-    /// Config's `s3.path-style-access` sentinel is therefore `"false"`, the
-    /// opposite of that default: a value agreeing with it could not tell a leak
-    /// from a correct resolution, which is the whole point of a sentinel.
+    /// The matched `storage_credentials` entry supplies four of the six keys; the flat
+    /// `config` map carries wrong sentinel values for all six. A single selection means
+    /// the two keys the entry omits resolve without consulting config: `session_token` to
+    /// absent, `path_style` to the endpoint-coupled default (`true` here). Config's
+    /// `s3.path-style-access` sentinel is therefore `"false"`, the opposite of that
+    /// default, so a leak cannot pass as a correct resolution.
     #[test]
     fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
         let result = make_load_table_result(
@@ -1384,14 +1271,10 @@ mod tests {
     // input that knows which store the table's data actually lives in.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: the resolved backend variant follows the anchor's URI scheme —
-    /// `s3://` and `s3a://` resolve S3, `abfss://` and `abfs://` resolve ADLS. The
-    /// scheme is matched case-insensitively (RFC 3986 §3.1), so an upper-cased
-    /// scheme resolves the same backend as its lowercase spelling.
-    ///
-    /// The two Azure schemes are checked at the consent value each one needs:
-    /// `abfss://` is encrypted and resolves without operator consent, `abfs://` is
-    /// plaintext and resolves only with it.
+    /// Scenario: the resolved backend variant follows the anchor's URI scheme, matched
+    /// case-insensitively (RFC 3986 §3.1). The two Azure schemes are checked at the
+    /// consent value each needs: `abfss://` resolves without operator consent, `abfs://`
+    /// only with it.
     #[test]
     fn vended_backend_variant_comes_from_the_anchor_scheme() {
         let s3_result = make_load_table_result(
@@ -1440,12 +1323,9 @@ mod tests {
         );
     }
 
-    /// Scenario: an anchor that carries no scheme, or whose scheme names no
-    /// backend this engine can read, is refused.
-    ///
-    /// The catalog's own HTTPS URI is the unsupported-scheme shape a caller is
-    /// most likely to pass by mistake; the bare identifier stands for any
-    /// scheme-less string.
+    /// Scenario: an anchor with no scheme, or a scheme naming no backend this engine can
+    /// read, is refused. The catalog's own HTTPS URI is the shape a caller is most likely
+    /// to pass by mistake; the bare identifier stands for any scheme-less string.
     #[test]
     fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
         let result = vended_result_flat_config();
@@ -1500,8 +1380,7 @@ mod tests {
             &["s3.access-key-id"],
         );
 
-        // A key pair with neither region nor endpoint: nothing left can place the
-        // store, and an empty region silently misroutes an AWS store.
+        // Neither region nor endpoint: nothing left can place the store.
         let no_address = make_load_table_result(
             None,
             vec![
@@ -1523,8 +1402,7 @@ mod tests {
             &[VENDED_SAS_TOKEN_KEY_PREFIX],
         );
 
-        // An ADLS response whose only SAS was minted for a different host: a SAS
-        // is account-scoped, so the wrong account's is no more usable than none.
+        // A SAS minted for a different host: account-scoped, so as unusable as none.
         let wrong_host_sas = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
         assert_refused(
             &vended_user_error(&wrong_host_sas, &abfss_anchor, false),
@@ -1547,9 +1425,8 @@ mod tests {
             &["ALLOW_HTTP", "http://minio:9000/"],
         );
 
-        // A plaintext abfs:// location without the operator's consent, refused
-        // even though this payload WOULD satisfy the same anchor over abfss://:
-        // the consent gate is on the transport, not on the credential set.
+        // A plaintext abfs:// location without consent, refused even though this payload
+        // WOULD satisfy the same anchor over abfss://: the gate is on the transport.
         let satisfiable_sas = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
         assert_refused(
             &vended_user_error(&satisfiable_sas, &abfs_anchor, false),
@@ -1558,14 +1435,10 @@ mod tests {
         );
     }
 
-    /// Scenario: the missing-SAS refusal still names the storage host after the
-    /// error text has passed through [`crate::redact_error_text`] on its way out.
-    ///
-    /// The refusal has to name a host to be actionable, and it also has to name
-    /// the absent `adls.sas-token.<host>` key — but redaction treats that key as a
-    /// credential label and truncates everything after it up to the next space,
-    /// host included. Naming the host earlier in the message is what survives, so
-    /// this pins that placement rather than the wording around it.
+    /// Scenario: the missing-SAS refusal still names the storage host after
+    /// [`crate::redact_error_text`]. Redaction treats `adls.sas-token.<host>` as a
+    /// credential label and truncates everything after it up to the next space, host
+    /// included, so this pins that the host is also named earlier in the message.
     #[test]
     fn adls_missing_sas_refusal_names_the_host_after_redaction() {
         let result = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
@@ -1592,13 +1465,10 @@ mod tests {
     // agree with it.
     // ---------------------------------------------------------------------------
 
-    /// Scenario: with several `adls.sas-token.<host>` keys vended at once, the SAS
-    /// the anchor's OWN storage host names is the one selected, and the account
-    /// name is read from that same host so the two cannot disagree.
-    ///
-    /// A disagreeing pair is not cosmetic: `adls.account-name` is the downstream
-    /// wrong-account guard on the manifest read, so an account name taken from
-    /// anywhere but the host the SAS was minted for would disarm it.
+    /// Scenario: with several `adls.sas-token.<host>` keys vended at once, the SAS the
+    /// anchor's OWN host names is selected, and the account name is read from that same
+    /// host so the two cannot disagree — `adls.account-name` is the downstream
+    /// wrong-account guard, which a disagreeing pair would disarm.
     #[test]
     fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
         let result = adls_vended_result(&[
@@ -1649,18 +1519,11 @@ mod tests {
     }
 
     /// Scenario: the anchor host and the vended key's host suffix are matched
-    /// case-insensitively, so a location spelling the account in a different case
-    /// than the catalog's key still resolves that key's SAS.
-    ///
-    /// RFC 3986 §3.2.2 makes a URI host case-insensitive, and
-    /// [`resolve_vended_storage`] already reads the SCHEME that way — a
-    /// byte-exact host match would refuse a request the catalog did satisfy and
-    /// report it as "the catalog returned none", which is both wrong and
-    /// misdirecting.
-    ///
-    /// `account_name` stays VERBATIM from the anchor: the guard it feeds compares
-    /// it byte-exactly against the account in each file URI, so normalising it
-    /// here would fire that guard on the locations it was derived from.
+    /// case-insensitively (RFC 3986 §3.2.2), so a location spelling the account in a
+    /// different case still resolves that key's SAS. `account_name` stays VERBATIM from
+    /// the anchor: the guard it feeds compares it byte-exactly against the account in
+    /// each file URI, so normalising it here would fire that guard on the locations it
+    /// was derived from.
     #[test]
     fn vended_adls_sas_host_match_is_case_insensitive() {
         let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
@@ -1714,13 +1577,10 @@ mod tests {
         }
     }
 
-    /// Scenario: an anchor whose storage host carries no leading label is refused.
-    /// There is no account name to read from it, and substituting a guess would
-    /// disarm the downstream wrong-account guard instead of failing cleanly.
-    ///
-    /// Both ways a location can arrive without one: an empty authority behind a
-    /// `<container>@` segment, and a host whose first dot-separated label is
-    /// empty.
+    /// Scenario: an anchor whose storage host carries no leading label is refused — there
+    /// is no account name to read from it. Both ways a location can arrive without one:
+    /// an empty authority behind a `<container>@` segment, and a host whose first
+    /// dot-separated label is empty.
     #[test]
     fn vended_adls_account_name_requires_a_labelled_host() {
         let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
@@ -1734,13 +1594,10 @@ mod tests {
         }
     }
 
-    /// Scenario: the resolved ADLS backend holds the SAS state and never the
-    /// account-key state, even when the response vends an `adls.account-key`
-    /// beside the SAS.
-    ///
-    /// This pins the vended path's reach over `AdlsCred` rather than the
-    /// response's contents: the selector has no reader for an account key, so one
-    /// of the enum's two states is unreachable under vending.
+    /// Scenario: the resolved ADLS backend holds the SAS state and never the account-key
+    /// state, even when the response vends an `adls.account-key` beside the SAS — the
+    /// selector has no reader for an account key, so that state is unreachable under
+    /// vending.
     #[test]
     fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
         let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");
