@@ -689,7 +689,9 @@ fn presence_label(present: bool) -> &'static str {
 ///
 /// The anchor is the table's OWN location, derived exactly as `resolve_file_list`
 /// derives it: it is both what a `storage_credentials` prefix is matched against and
-/// the sole input the backend variant is read from.
+/// the sole input the backend variant is read from. There is no fallback for it —
+/// an absent location is an error in production, so this test asserts it is present
+/// rather than substituting the CONNECTION's `warehouse`.
 ///
 /// `s3.session-token` is REPORTED, not required: a permanent IAM identity
 /// legitimately vends a key pair with no token. The report line is printed
@@ -732,12 +734,14 @@ fn cloud_glue_vends_s3_key_pair_and_store_address() {
             .unwrap_or_else(|e| panic!("the access-delegated loadTable GET must succeed: {e}"))
     });
 
-    let table_location = result.metadata.location();
-    let anchor = if table_location.is_empty() {
-        catalog.warehouse.as_str()
-    } else {
-        table_location
-    };
+    let anchor = result.metadata.location();
+    assert!(
+        !anchor.is_empty(),
+        "Glue's loadTable response carries no table `location`: the Iceberg spec marks it \
+         required in v1-v3, and `resolve_file_list` errors on an absent one rather than \
+         substituting the catalog `warehouse`, so a scan of this table resolves no backend \
+         at all and the S3 keys below have no anchor to be selected by"
+    );
     assert!(
         anchor.starts_with("s3://") || anchor.starts_with("s3a://"),
         "Glue's table location {anchor} names no s3 scheme: the backend variant is read from \

@@ -248,28 +248,26 @@ pub async fn resolve_file_list(
     // Resolve the effective storage (vended or static). The anchor is the TABLE'S
     // OWN location from the parsed metadata, which under vending carries two jobs:
     // it is what `storage_credentials[*].prefix` is matched against, and it is the
-    // sole input the backend variant is read from. Fall back to the warehouse when
-    // the metadata carries no location. The catalog REST URI names no object store
-    // at all, so passing it here would resolve no backend — do NOT use it.
-    //
-    // `resolve_vended_storage`'s "no CONNECTION storage field" guarantee does not
-    // cover this fallback: `catalog_props.warehouse` is parsed straight from the
-    // CONNECTION password, so on a table whose metadata carries no location, this
-    // substitution makes THIS site the one place a CONNECTION-derived string
-    // chooses the vended backend variant, the credential-source prefix match, and
-    // (for ADLS) the SAS host.
+    // sole input the backend variant is read from. Nothing else can stand in for
+    // it: the catalog REST URI names no object store at all, and the REST
+    // `warehouse` is a routing identifier rather than a storage location — so an
+    // absent location is its own error on the vended branch below, never a
+    // substituted CONNECTION-derived string fed through the scheme matcher.
     let table_location = result.metadata.location();
     // Own the table root before `result.metadata` is moved into the table builder
     // below. Returned so the adapter can carry it once in the common blob and emit
     // per-shard file paths relative to it (empty ⇒ every path stays absolute).
     let table_root = table_location.to_string();
-    let anchor: &str = if !table_location.is_empty() {
-        table_location
-    } else {
-        &catalog_props.warehouse
-    };
     let effective_storage = if creds.use_vended_credentials {
-        resolve_vended_storage(&result, anchor, allow_http)?
+        if table_location.is_empty() {
+            return Err(UdfError::User(
+                "the loadTable response carries no table location, so the storage backend \
+                 cannot be resolved; the catalog `warehouse` is a routing identifier, not a \
+                 storage location, and is not a valid fallback"
+                    .into(),
+            ));
+        }
+        resolve_vended_storage(&result, table_location, allow_http)?
     } else {
         storage.clone()
     };

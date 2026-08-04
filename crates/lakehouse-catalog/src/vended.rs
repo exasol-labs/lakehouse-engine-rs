@@ -30,12 +30,13 @@ const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
 /// Taking no [`StorageBackend`] and no `ConnectionCreds` is the design rather
 /// than an omission: it makes "no CONNECTION storage FIELD is read under
 /// vending" a property of this signature instead of a rule an auditor has to
-/// re-verify by reading the body. That guarantee covers storage fields only —
-/// `anchor` itself is caller-supplied and is not guaranteed CONNECTION-free:
-/// when a table's metadata carries no location, the caller
-/// (`resolve_file_list`) substitutes the CONNECTION's `warehouse`, and on that
-/// fallback path a CONNECTION-derived string chooses the backend variant, the
-/// credential-source prefix match, and (for ADLS) the SAS host. `allow_http`
+/// re-verify by reading the body. `anchor` does not weaken that guarantee: the
+/// caller (`resolve_file_list`) passes the table's own location from the
+/// `loadTable` response and nothing else — an absent location is an error there,
+/// never a substituted CONNECTION `warehouse`, which is a REST routing
+/// identifier rather than a storage location — so no CONNECTION-derived string
+/// reaches the variant selection, the credential-source prefix match, or (for
+/// ADLS) the SAS host. `allow_http`
 /// does not reopen the storage-field door either — it carries one
 /// virtual-schema property resolved outside this crate, names no credential,
 /// and cannot supply one.
@@ -1439,14 +1440,12 @@ mod tests {
         );
     }
 
-    /// Scenario: an anchor whose scheme names no backend this engine can read is
-    /// refused, and a scheme-less warehouse fallback is one of them.
+    /// Scenario: an anchor that carries no scheme, or whose scheme names no
+    /// backend this engine can read, is refused.
     ///
-    /// `file_resolution.rs` substitutes `catalog_props.warehouse` for an empty
-    /// table location, and a Glue warehouse is a bare AWS account id carrying no
-    /// scheme at all — so a scheme-less anchor is a shape this function really
-    /// receives rather than a hypothetical. The catalog's own HTTPS URI is the
-    /// other, and it is the one a caller is most likely to pass by mistake.
+    /// The catalog's own HTTPS URI is the unsupported-scheme shape a caller is
+    /// most likely to pass by mistake; the bare identifier stands for any
+    /// scheme-less string.
     #[test]
     fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
         let result = vended_result_flat_config();
