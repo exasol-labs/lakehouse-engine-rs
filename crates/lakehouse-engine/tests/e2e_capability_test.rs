@@ -4382,6 +4382,16 @@ fn char_declared_pushdown_shapes_match_native() {
         "expected BIG/LOW to each cover 10 rows: {case_groups:?}"
     );
 
+    // Prove the pushdown was actually taken and carries the CHAR(3) declaration
+    // — otherwise this test could still pass if the adapter declined the
+    // pushdown and Exasol computed the CASE key natively.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("CHAR(3)") && !pushed_sql.contains("VARCHAR(3)"),
+        "expected the pushed SQL for the equal-length CASE GROUP BY key to \
+         declare CHAR(3) (not VARCHAR(3)), got: {pushed_sql}"
+    );
+
     // Shape B: CAST(name AS CHAR(20)) as a plain SELECT-list projection —
     // must be space-padded to exactly 20 characters.
     let sql = format!(
@@ -4406,6 +4416,16 @@ fn char_declared_pushdown_shapes_match_native() {
         "CAST(name AS CHAR(20)) must be \"event-01\" plus 12 trailing spaces, got {padded:?}"
     );
 
+    // Prove the pushdown was actually taken and carries the CHAR(20)
+    // declaration — otherwise this test could still pass if the adapter
+    // declined the pushdown and Exasol computed the CAST natively.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("CHAR(20)") && !pushed_sql.contains("VARCHAR(20)"),
+        "expected the pushed SQL for CAST(name AS CHAR(20)) to declare CHAR(20) \
+         (not VARCHAR(20)), got: {pushed_sql}"
+    );
+
     // Shape C: a bare string literal used as a GROUP BY key.
     let sql = format!("SELECT 'X' g, COUNT(*) c FROM {} GROUP BY 1", vs_table());
     let cols = conn.query_columns(&sql);
@@ -4424,6 +4444,16 @@ fn char_declared_pushdown_shapes_match_native() {
         parse_int(&cols[1][0]),
         20,
         "expected all 20 rows folded into the single literal group: {cols:?}"
+    );
+
+    // Prove the pushdown was actually taken and carries the CHAR(1)
+    // declaration — otherwise this test could still pass if the adapter
+    // declined the pushdown and Exasol folded the literal group natively.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("CHAR(1)") && !pushed_sql.contains("VARCHAR(1)"),
+        "expected the pushed SQL for the bare literal GROUP BY key to declare \
+         CHAR(1) (not VARCHAR(1)), got: {pushed_sql}"
     );
 
     // VARCHAR control: GROUP BY a genuine VARCHAR column — behavior unchanged.
@@ -4462,6 +4492,19 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
         "SELECT CAST({CHAR_PAD_COL} AS CHAR(30)) g, COUNT(*) c FROM {} GROUP BY 1",
         vs_char_pad_table()
     );
+
+    // Prove the pushdown was actually taken and carries the CHAR(30)
+    // declaration — otherwise native Exasol would perform the same blank-pad
+    // merge if the adapter simply declined the pushdown, and the group-count
+    // assertions below could not tell the two apart.
+    let pushed_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed_sql.contains("CHAR(30)") && !pushed_sql.contains("VARCHAR(30)"),
+        "expected the pushed SQL to declare the group key CHAR(30) (not \
+         VARCHAR(30)), proving the blank-pad merge behavior was actually \
+         pushed down: {pushed_sql}"
+    );
+
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (g, c): {cols:?}");
     assert_eq!(

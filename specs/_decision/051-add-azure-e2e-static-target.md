@@ -80,7 +80,7 @@ implementation.
 
 **ID:** azure-e2e-orphan-sweep-out-of-band
 **Plan:** `add-azure-e2e-static-target`
-**Status:** Accepted
+**Status:** Superseded by azure-orphan-sweep-in-repo-workflow
 
 ### Context
 

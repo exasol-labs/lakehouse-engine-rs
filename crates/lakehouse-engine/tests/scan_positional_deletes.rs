@@ -1355,23 +1355,20 @@ fn file_needle(abs_url: &str) -> String {
         .to_string()
 }
 
-/// Write a local positional-delete Parquet like [`write_delete_parquet`], but
-/// with explicit control over the max row-group row count and whether column
-/// statistics are written at all. The row-group pruning tests (task 6) need
-/// this to force multiple, disjoint row groups — one per referenced data
-/// file, exploiting Iceberg's required `(file_path, pos)` sort to keep each
-/// file's rows contiguous within one group — and, for the
-/// absent-statistics fallback, to omit `file_path` min/max entirely.
-/// `statistics_enabled = true` also fixes the statistics truncation length at
-/// the real Parquet default (64 bytes) so a long shared `file_path` prefix
-/// exercises genuine writer-side truncation rather than depending on whatever
-/// default the crate happens to ship.
+/// Like [`write_delete_parquet`], but with control over row-group size,
+/// whether statistics are written, and the statistics truncation length.
+///
+/// Pass `None` for `truncate_length` unless the test targets the truncated-
+/// statistics fallback: arrow-rs truncates min/max to 64 bytes by default,
+/// but real Iceberg writers (parquet-java) don't truncate, so `None` matches
+/// real-world data.
 fn write_delete_parquet_shaped(
     dir: &Path,
     relative: &str,
     entries: &[(&str, i64)],
     row_group_size: usize,
     statistics_enabled: bool,
+    truncate_length: Option<usize>,
 ) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -1394,7 +1391,7 @@ fn write_delete_parquet_shaped(
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(row_group_size))
         .set_statistics_enabled(stats_level)
-        .set_statistics_truncate_length(Some(64))
+        .set_statistics_truncate_length(truncate_length)
         .build();
     let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).expect("arrow writer");
     let paths: Vec<&str> = entries.iter().map(|(p, _)| *p).collect();
@@ -1460,6 +1457,7 @@ fn scan_prunes_delete_row_groups_by_file_path() {
         &entry_refs,
         ROWS_PER_FILE,
         true,
+        None,
     );
     let shared_delete = delete_ref(&delete_url);
     let needle = file_needle(&delete_url);
@@ -1587,6 +1585,7 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
         &entry_refs,
         ROWS_PER_FILE,
         true,
+        Some(64),
     );
 
     // Only f_b (the MIDDLE file) is assigned; its own row group's truncated
@@ -1639,6 +1638,7 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
         &entry_refs,
         ROWS_PER_FILE,
         false,
+        None,
     );
     let delete_total_size = local_file_size(&delete_url);
     let needle = file_needle(&delete_url);

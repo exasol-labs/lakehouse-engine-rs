@@ -26,8 +26,8 @@ pub(super) use sql_builders::{
 };
 
 use planning::{
-    involved_table_columns, join_requires_exasol_postprocessing, resolve_one_join_side,
-    select_broadcast_sides,
+    JoinSideResolution, involved_table_columns, join_requires_exasol_postprocessing,
+    resolve_one_join_side, select_broadcast_sides, validate_sides_share_one_backend,
 };
 use rendering::side_local_filter;
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
@@ -95,9 +95,12 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
 /// fall-through, never an error). Every other inner join — N ≥ 3, above threshold,
 /// non-equi, overlapping columns, or needing postprocessing — takes the SOLE
 /// fallback renderer, [`build_n_scan_join_sql`], which scans each table through its
-/// own sharded fan-out and reconstructs the join in Exasol's core engine. A hard
-/// `Err` (a client-facing error, no native re-plan) is the last resort, delegated to
-/// the builder for a wrapper that genuinely cannot be built.
+/// own sharded fan-out and reconstructs the join in Exasol's core engine.
+///
+/// Two hard `Err`s can leave this path: [`validate_sides_share_one_backend`] rejects
+/// a join whose sides do not all name one object-storage backend, ahead of both
+/// renderers and of the empty-side shortcut; otherwise a hard `Err` is delegated to
+/// the fallback builder for a wrapper that genuinely cannot be built.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
@@ -107,6 +110,7 @@ pub(super) async fn plan_join(
     storage: &StorageBackend,
     catalog: &CatalogProps,
     creds: &ConnectionCreds,
+    allow_http: bool,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
     parallelism_factor: usize,
@@ -122,21 +126,31 @@ pub(super) async fn plan_join(
     // shard), each pruned by its own side-local WHERE conjuncts for Iceberg manifest
     // pruning — attributed by `tableName`, so a shared-column-name case stays correct.
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
+    let inputs = JoinSideResolution {
+        session,
+        storage,
+        catalog,
+        creds,
+        allow_http,
+    };
     let mut sides = Vec::with_capacity(join.tables.len());
     for leaf in &join.tables {
         let side_filter = filter.and_then(|f| side_local_filter(f, &leaf.table_name));
         let side = resolve_one_join_side(
             &leaf.table_name,
             &leaf.iceberg_ident,
-            session,
-            storage,
-            catalog,
-            creds,
+            &inputs,
             side_filter.as_ref(),
         )
         .await?;
         sides.push(side);
     }
+
+    // Reject a cross-backend join before the empty-side shortcut and either renderer,
+    // so acceptance follows the CONFIGURATION and never the data in it: a momentarily
+    // empty side must not answer "0 rows" for a join that fails once that table holds
+    // files.
+    validate_sides_share_one_backend(&sides)?;
 
     // An inner join with any empty side is empty regardless of the plan. Emit the
     // shape-correct empty result over the combined N-table column universe (stable

@@ -33,7 +33,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 | JSON field | Required | Meaning |
 |---|---|---|
-| `warehouse` | yes | Iceberg warehouse location: an `s3://…` path normally, an AWS account id under Glue, or a warehouse **name** under Lakekeeper |
+| `warehouse` | yes | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/MinIO stack below uses) is still only an identifier |
 | `endpoint` | yes, unless `use_sigv4` or vended credentials | S3 endpoint URL |
 | `region` | yes, unless `use_sigv4` or vended credentials | S3 region |
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
