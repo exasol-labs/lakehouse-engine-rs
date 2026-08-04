@@ -1829,8 +1829,9 @@ mod tests {
         result
     }
 
-    /// A `loadTable` response with no table location is rejected as a `UdfError::User`,
-    /// with the identical message whether or not vended credentials are requested.
+    /// A `loadTable` response with an empty table `location` is rejected as a
+    /// `UdfError::User`, with the identical message whether or not vended credentials
+    /// are requested.
     #[tokio::test]
     async fn absent_table_location_errors_on_both_vended_and_static_paths() {
         let static_creds = one_request_sigv4_creds();
@@ -1839,10 +1840,10 @@ mod tests {
 
         let vended_err = resolve_file_list_against_locationless_catalog(&vended_creds)
             .await
-            .expect_err("vended path must reject a loadTable response with no table location");
+            .expect_err("vended path must reject a loadTable response with an empty location");
         let static_err = resolve_file_list_against_locationless_catalog(&static_creds)
             .await
-            .expect_err("static path must reject a loadTable response with no table location");
+            .expect_err("static path must reject a loadTable response with an empty location");
 
         let vended_message = match vended_err {
             UdfError::User(m) => m,
