@@ -40,6 +40,7 @@ async fn accepts_shared_session_for_file_resolution(
     catalog_props: &CatalogProps,
     storage: &StorageBackend,
     creds: &ConnectionCreds,
+    allow_http: bool,
     filter_json: Option<&Json>,
 ) -> Result<
     (
@@ -51,7 +52,15 @@ async fn accepts_shared_session_for_file_resolution(
     ),
     UdfError,
 > {
-    resolve_file_list(session, catalog_props, storage, creds, filter_json).await
+    resolve_file_list(
+        session,
+        catalog_props,
+        storage,
+        creds,
+        allow_http,
+        filter_json,
+    )
+    .await
 }
 
 /// Never invoked, for the same reason as `accepts_shared_session_for_file_resolution`
