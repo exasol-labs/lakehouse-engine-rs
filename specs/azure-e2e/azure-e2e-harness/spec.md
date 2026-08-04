@@ -4,7 +4,7 @@ Verifies `abfss://` reads through the lakehouse VS against a real Azure Data Lak
 Storage Gen2 account, over both credential paths: the static path (Lakekeeper
 delegation off, account key carried in the Exasol CONNECTION) and the vended path
 (Lakekeeper delegation on, a SAS minted per `loadTable` and carried by no
-CONNECTION field). See `e2e-harness/azure-e2e-harness-operations` for the suite's
+CONNECTION field). See `azure-e2e/azure-e2e-harness-operations` for the suite's
 operational-contract scenarios — credential-variable and stack-availability
 failure modes, container naming, the Make target, the gitignored credential file,
 shared-harness provisioning, and DDL-failure output redaction.
@@ -154,7 +154,7 @@ shared-harness provisioning, and DDL-failure output redaction.
   orphan attributable to this suite, to a user, and to one run. Azure Blob
   lifecycle-management policies act on blobs, never on containers, so no lifecycle
   rule can sweep an orphaned container. An in-repo scheduled GitHub Actions
-  workflow (see `e2e-harness/azure-orphan-container-sweep` and the superseding
+  workflow (see `azure-e2e/azure-orphan-container-sweep` and the superseding
   decision `azure-orphan-sweep-in-repo-workflow`) now reclaims a stale orphan
   instead. The account already held leftovers from earlier spike runs, so the
   sweep answers a real operational need, not a hypothetical.

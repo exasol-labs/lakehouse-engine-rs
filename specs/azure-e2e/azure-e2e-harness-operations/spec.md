@@ -4,7 +4,7 @@ Operational-contract scenarios for the Azure E2E suite: container-name legality,
 fail-loud behavior when a credential variable or the local stack is missing, the
 Make target's rebuild-and-serialize behavior, the gitignored local credential
 file, shared-harness scan-path provisioning, and output redaction on a
-credential-bearing DDL failure. Split out of `e2e-harness/azure-e2e-harness` to
+credential-bearing DDL failure. Split out of `azure-e2e/azure-e2e-harness` to
 keep that feature's credential-path proof scenarios (provisioning, the two
 credential-mode scans, and container-guard teardown) separate from this suite's
 tooling and failure-mode contract.
@@ -12,10 +12,10 @@ tooling and failure-mode contract.
 ## Background
 
 * Every scenario here belongs to the same `azure-e2e` cargo feature and the same
-  `make test-e2e-azure` target as `e2e-harness/azure-e2e-harness`, and shares its
+  `make test-e2e-azure` target as `azure-e2e/azure-e2e-harness`, and shares its
   fail-loud-never-skip discipline for a missing credential variable or an
   unreachable local stack.
-* See `e2e-harness/azure-e2e-harness` for the full environmental context: the five
+* See `azure-e2e/azure-e2e-harness` for the full environmental context: the five
   credential variables and their two roles, the HNS storage-account requirement,
   the service-principal role scope, and the CI scheduling and required-status-check
   contract.
