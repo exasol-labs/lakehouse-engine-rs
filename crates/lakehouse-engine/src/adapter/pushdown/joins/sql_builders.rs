@@ -3282,6 +3282,58 @@ mod tests {
         );
     }
 
+    /// Issue #218: a projected `literal_timestamputc` constant renders as
+    /// `CAST(CONVERT_TZ(…, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME
+    /// ZONE)` — the Exasol-dialect rendering `vs-expression`'s own arm produces
+    /// (see that crate's `literal_timestamp_utc`/`literal_timestamputc` arms),
+    /// converting the UTC-normalized wire value into the CALLER's session zone
+    /// and re-declaring it TSTZ so the wrapper's positional type check passes.
+    /// This wrapper adds no rendering logic of its own for this item; it only
+    /// carries the already-correct rendering through into the outer SELECT.
+    #[test]
+    fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zone() {
+        let request = serde_json::json!({
+            "involvedTables": [{"name": "T", "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]}],
+        });
+        let pushdown_req = serde_json::json!({
+            "selectList": [
+                {"type": "literal_timestamputc", "value": "2024-03-01 09:00:00"},
+            ],
+            "selectListDataTypes": [
+                {"type": "timestamp", "withLocalTimeZone": true},
+            ],
+        });
+        let col_types = vec![("ID".to_string(), "DECIMAL(20,0)".to_string())];
+        let base = CommonScanSpec {
+            storage: sample_storage(),
+            ..Default::default()
+        };
+        let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
+
+        let resp = qualified_single_table_fallback_pushdown(
+            &request,
+            &pushdown_req,
+            &base,
+            None,
+            &shards,
+            &col_types,
+            SCAN_UDF_NAME,
+            DISTRIBUTE_FILES_UDF_NAME,
+            None,
+        )
+        .expect("a TSTZ-declared literal must render via the qualified wrapper");
+        let sql = resp["sql"].as_str().expect("sql field");
+        assert!(
+            sql.contains(
+                "CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 09:00:00', 'UTC', SESSIONTIMEZONE) \
+                 AS TIMESTAMP WITH LOCAL TIME ZONE)"
+            ),
+            "the projected TSTZ literal must be converted into the caller's session \
+             zone and re-declared TSTZ: {sql}"
+        );
+    }
+
     /// The fixed single-table `T` fixture the declined-predicate wrapper tests share:
     /// `ID` plus the `C_TS` column the declined predicate reads.
     fn declined_filter_request() -> Json {
@@ -3398,6 +3450,47 @@ mod tests {
             !sql.contains(r#""filter""#),
             "the fan-out scan spec must carry no filter — the declined predicate is \
              applied exactly once, in the wrapper: {sql}"
+        );
+    }
+
+    /// A `literal_timestamputc` predicate self-applied in the declined-WHERE
+    /// path against `C_TS` (this project's plain-`TIMESTAMP`-mapped Iceberg
+    /// column, per `007-fix-timestamptz-mapping`) renders the literal via
+    /// `CAST(CONVERT_TZ(…) AS TIMESTAMP WITH LOCAL TIME ZONE)`, NOT a bare
+    /// `TIMESTAMP` literal compared naively against `C_TS`. Verified live
+    /// (Exasol 2025.2.1, `SESSIONTIMEZONE = EUROPE/BERLIN`): a bare comparison
+    /// of the UTC-normalized wire value against a naive column disagrees with
+    /// Exasol's own `TIMESTAMP > TIMESTAMP WITH LOCAL TIME ZONE` coercion rule
+    /// (which reads the naive side as session-local) — `TIMESTAMP
+    /// '09:30:00' > TIMESTAMP '09:00:00'` is `TRUE` while Exasol's native
+    /// `TIMESTAMP '09:30:00' > CAST(TIMESTAMP '10:00:00' AS TSTZ)` is `FALSE`.
+    /// Rendering the literal as a genuine TSTZ expression makes Exasol apply
+    /// that SAME coercion rule to `C_TS`, reproducing the native result.
+    #[test]
+    fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
+        let declined = serde_json::json!({
+            "type": "predicate_greater",
+            "left": {"type": "column", "name": "C_TS", "tableName": "T"},
+            "right": {"type": "literal_timestamputc", "value": "2024-03-01 09:00:00"},
+        });
+        assert!(
+            render_expression_exasol_safe(&declined).is_some(),
+            "fixture precondition: the predicate must render for Exasol"
+        );
+        let pushdown_req = serde_json::json!({
+            "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
+        });
+
+        let sql = declined_filter_wrapper_sql(&pushdown_req, Some(&declined))
+            .expect("the predicate must self-apply");
+
+        assert!(
+            sql.contains(
+                r#"WHERE ("LHS_T0"."C_TS" > CAST(CONVERT_TZ(TIMESTAMP '2024-03-01 09:00:00', 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME ZONE))"#
+            ),
+            "the self-applied predicate must compare against a genuine TSTZ \
+             expression, so Exasol applies its own TIMESTAMP-vs-TSTZ coercion \
+             rule to C_TS exactly as it would natively: {sql}"
         );
     }
 

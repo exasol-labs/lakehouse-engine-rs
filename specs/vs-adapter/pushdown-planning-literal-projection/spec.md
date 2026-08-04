@@ -18,6 +18,16 @@ hidden-sort-key-column rule instead of the full-base-row fallback.
   projects literal select-list items and declines to the full base row; it touches no
   manifest, schema-resolution, field-id, or type-mapping surface, so no normative Iceberg
   requirement applies and there is no deviation to fix or track.
+* **This feature's own "decline scenario" was corrected while implementing `#218`
+  (`fix-pushdown-tstz-literal-emits`).** It previously stated that a
+  `TIMESTAMP WITH LOCAL TIME ZONE`-declared constant "hits the full-base-row fallback and
+  Exasol post-processes the select list" — describing the full base row as a
+  correct-but-unaccelerated backstop. Verified false on the live E2E container: Exasol
+  validates the pushdown response POSITIONALLY against the request's `selectList` and rejects
+  a column-count mismatch with SQL state `04000`, so the query FAILS outright rather than
+  falling back to a slower but correct path. `vs-adapter/pushdown-planning-capability-extensions`
+  fixes the actual routing — the qualified single-table wrapper, not the full base row — and
+  this feature's scenario now reflects that fix rather than the disproven premise.
 
 ## Scenarios
 
@@ -28,11 +38,11 @@ hidden-sort-key-column rule instead of the full-base-row fallback.
 * *THEN* the adapter SHALL render each literal select-list item through the `crates/vs-expression` translator into a POSITIONAL `Expr` projection item — one projection item per select-list item, typed from the parallel top-level `selectListDataTypes` array — exactly as the `function_scalar` select-list branch already does, and MUST NOT trigger the full-base-row fallback that emits every base column and yields the column-count mismatch Exasol rejects ("Expected number of columns is 1 but pushdown query has N", issues #190 and #205)
 * *AND* the emitted scan's column arity SHALL equal the query's select-list arity, so two structurally identical literal items — such as the two `1` items in `SELECT 1, name, 1` — SHALL each occupy their own projected position and MUST NOT be collapsed into one
 * *AND* each projected literal SHALL be evaluated once per scanned source row, so `SELECT <literal> FROM t` returns one constant-valued row per source table row, and the synthesized `literal_null` item behind a LIMIT barrier SHALL emit one single-column row per admitted row so the outer `COUNT(*)` counts exactly the rows the inner LIMIT admits (issue #205)
-* *AND* a literal the translator cannot render, or one whose declared EMITS type is not a valid Exasol UDF EMITS output type (see the decline scenario below), SHALL fall back to projecting the underlying columns and let Exasol evaluate the select list, the same correctness backstop the scalar select-list path uses
+* *AND* a literal the translator cannot render, or one whose declared EMITS type is not a valid Exasol UDF EMITS output type, SHALL route the request to the qualified single-table wrapper (see the decline scenario below) rather than fall back to the full base row — an invalid pushdown response for a delegated select list, not a correctness backstop
 
-### Scenario: Projected constant whose declared EMITS type Exasol rejects declines to the full base row
+### Scenario: Projected constant whose declared EMITS type Exasol rejects routes to the qualified wrapper
 
-* *GIVEN* a row-scan `pushdown` request whose select list contains a rendered literal or scalar item whose declared result type in `selectListDataTypes` is `TIMESTAMP WITH LOCAL TIME ZONE` (e.g. a `literal_timestamp_utc` constant, which the translator renders successfully but whose declared type Exasol rejects as a UDF EMITS output type, sqlCode 22002)
+* *GIVEN* a row-scan `pushdown` request whose select list contains a rendered literal or scalar item whose declared result type in `selectListDataTypes` is `TIMESTAMP WITH LOCAL TIME ZONE` (e.g. a `literal_timestamputc`/`literal_timestamp_utc` constant, which the translator renders successfully but whose declared type Exasol rejects as a UDF EMITS output type, sqlCode 22002)
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL push a rendered select-list item as a positional `Expr` ONLY when its declared EMITS type is a valid Exasol UDF EMITS output type, so an item declared `TIMESTAMP WITH LOCAL TIME ZONE` SHALL decline to the full-base-row fallback — the same path an untranslatable CAST takes — rather than emit an EMITS clause that fails at scan time
-* *AND* projected `TIMESTAMP WITH LOCAL TIME ZONE` constants SHALL remain unsupported — they hit the full-base-row fallback and Exasol post-processes the select list — an accurately-scoped tracked exception, `(#218)`
+* *THEN* the adapter SHALL push a rendered select-list item as a positional `Expr` ONLY when its declared EMITS type is a valid Exasol UDF EMITS output type, so an item declared `TIMESTAMP WITH LOCAL TIME ZONE` SHALL route the whole request to the qualified single-table wrapper instead — the same routing `vs-adapter/pushdown-planning-capability-extensions` specifies in full, which this feature cross-references rather than restates
+* *AND* projected `TIMESTAMP WITH LOCAL TIME ZONE` constants SHALL NOT "remain unsupported" as a permanent tracked exception: `(#218)` is a real fix, not a documented gap — the value Exasol computes natively is reproduced via the qualified wrapper's `CAST(CONVERT_TZ(…) AS TIMESTAMP WITH LOCAL TIME ZONE)` rendering, and the full-base-row response this scenario previously described is an INVALID pushdown response Exasol rejects with SQL state `04000`, not a correct-but-unaccelerated fallback
