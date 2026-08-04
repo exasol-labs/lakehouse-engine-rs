@@ -7,7 +7,8 @@
 //!
 //! Required environment variables (all absent → test skips, no network call):
 //!   GLUE_CATALOG_URI     — Glue Iceberg REST endpoint (catalog CONNECTION address)
-//!   GLUE_WAREHOUSE       — S3 URI of the Iceberg warehouse (e.g. s3://my-bucket/path/)
+//!   GLUE_WAREHOUSE       — Glue catalog routing id: your AWS account id (e.g. 123456789012),
+//!                          NOT an S3 URI or storage location
 //!   GLUE_TABLE           — Fully-qualified table name (e.g. my_db.my_table)
 //!   AWS_REGION           — AWS region (e.g. us-east-1)
 //!   AWS_ACCESS_KEY_ID    — AWS static access key ID
@@ -791,7 +792,8 @@ fn cloud_glue_vends_s3_key_pair_and_store_address() {
 ///
 /// Required env vars:
 ///   CATALOG_AUTH_URI          — Iceberg REST catalog endpoint requiring auth
-///   CATALOG_AUTH_WAREHOUSE    — S3 URI of the Iceberg warehouse
+///   CATALOG_AUTH_WAREHOUSE    — catalog routing identifier (a bare warehouse name or account
+///                               id), NOT an S3 URI or storage location
 ///   CATALOG_AUTH_TABLE        — Fully-qualified table name (e.g. my_db.my_table)
 ///   EXASOL_HOST               — Exasol hostname/IP
 ///   LH_EXASOL_PASSWORD        — Exasol password
