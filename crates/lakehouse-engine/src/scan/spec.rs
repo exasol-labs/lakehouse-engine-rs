@@ -448,8 +448,13 @@ pub enum JoinType {
 /// VS join-condition renderer), spliced into the scan's inner equi-join VERBATIM —
 /// the same treatment [`ProjectionItem::Expr`] and `filter` receive.
 ///
-/// Credentials never appear here: the dimension side is referenced by file list,
-/// not materialized, and storage credentials live once in [`StorageProps`].
+/// The dimension side is read through its OWN [`StorageBackend`], never the fact
+/// side's: a vended credential is scoped to the table it was resolved for, so
+/// reusing the fact side's `common.storage` for the dimension side's files serves
+/// a credential that was never granted access to them. Requiring this field (no
+/// default) is what makes that true at every construction site — a join block
+/// built without its own storage fails to deserialize rather than silently
+/// borrowing the fact side's grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinSpec {
     /// The dimension Iceberg table's root location, used to reconstruct absolute
@@ -480,6 +485,10 @@ pub struct JoinSpec {
 
     /// Rendered DataFusion SQL join condition, spliced into the equi-join verbatim.
     pub condition: String,
+
+    /// The dimension side's own resolved [`StorageBackend`], distinct from
+    /// `common.storage` (the fact side's). Required — see the struct doc.
+    pub storage: StorageBackend,
 }
 
 /// The Iceberg delete mechanism a [`DeleteFileRef`] belongs to.
@@ -769,6 +778,25 @@ impl CommonScanSpec {
             )
         })
     }
+
+    /// EVERY secret value that must be stripped from an error this scan surfaces:
+    /// the fact side's credentials unioned with the join's dimension-side
+    /// credentials.
+    ///
+    /// The SINGLE owner of that union rule. Each side is read through its own
+    /// [`StorageBackend`], but an error can be raised by code holding one side's
+    /// store — or a router over both — which structurally cannot assemble a set
+    /// covering a side it never sees. So the union lives here, beside the only two
+    /// fields that carry a credential, and every redaction site reads it from here
+    /// rather than rebuilding it. A second, independently maintained copy is how a
+    /// dimension-side credential leaks through a fact-side-only redaction set.
+    pub fn all_secret_values(&self) -> Vec<&str> {
+        let mut secrets = self.storage.secret_values();
+        if let Some(join) = &self.join {
+            secrets.extend(join.storage.secret_values());
+        }
+        secrets
+    }
 }
 
 impl Default for CommonScanSpec {
@@ -951,9 +979,68 @@ impl ScanSpec {
     }
 }
 
+/// Reconstruct the absolute file URI for a per-shard `(path, _)` entry.
+///
+/// An entry that already contains a scheme (`"://"`) is absolute and returned
+/// unchanged. Otherwise it is relative to `table_root` and joined onto it with
+/// exactly one `/` separator (a trailing `/` on the root and a leading `/` on the
+/// entry are both trimmed first, so the separator is neither doubled nor dropped).
+pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
+    if entry_path.contains("://") {
+        return entry_path.to_string();
+    }
+    let root = table_root.strip_suffix('/').unwrap_or(table_root);
+    let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
+    format!("{root}/{rel}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 4.1: a `://`-bearing entry is absolute and passes through unchanged.
+    #[test]
+    fn reconstruct_absolute_entry_passes_through() {
+        assert_eq!(
+            reconstruct_abs_uri(
+                "s3://bucket/db/table/data/f.parquet",
+                "s3://bucket/db/table"
+            ),
+            "s3://bucket/db/table/data/f.parquet"
+        );
+        // Passthrough holds even against an empty root.
+        assert_eq!(
+            reconstruct_abs_uri("s3://other/x.parquet", ""),
+            "s3://other/x.parquet"
+        );
+    }
+
+    /// 4.1: a relative entry joins onto the root with exactly one separator,
+    /// regardless of a trailing `/` on the root or a leading `/` on the entry.
+    #[test]
+    fn reconstruct_relative_entry_normalizes_single_separator() {
+        let expected = "s3://bucket/db/table/data/f.parquet";
+        // Neither side carries the separator.
+        assert_eq!(
+            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table"),
+            expected
+        );
+        // Trailing slash on the root only.
+        assert_eq!(
+            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table/"),
+            expected
+        );
+        // Leading slash on the entry only.
+        assert_eq!(
+            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table"),
+            expected
+        );
+        // Both sides carry the separator — still not doubled.
+        assert_eq!(
+            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table/"),
+            expected
+        );
+    }
 
     fn sample_spec() -> ScanSpec {
         ScanSpec {
@@ -2223,6 +2310,17 @@ mod tests {
     #[test]
     fn join_block_round_trips_through_split_and_merge() {
         let mut spec = sample_spec();
+        // Deliberately DISTINCT from `sample_spec()`'s `common.storage`
+        // (access_key "minioadmin") — proves the dimension side's own backend
+        // round-trips independently of the fact side's, not by coincidence.
+        let dim_storage = StorageBackend::S3(StorageProps {
+            endpoint: "http://minio:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "dimkey".into(),
+            secret_key: "dimsecret".into(),
+            allow_http: true,
+            ..Default::default()
+        });
         spec.common.join = Some(JoinSpec {
             table_root: "s3://warehouse/db/dim".into(),
             files: vec![
@@ -2239,6 +2337,7 @@ mod tests {
             name_mapping: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"F_KEY\" = \"D_KEY\"".into(),
+            storage: dim_storage.clone(),
         });
 
         // The serialized JSON carries the join block; join_type is a lowercase tag.
@@ -2292,6 +2391,12 @@ mod tests {
         assert_eq!(jb.condition, "\"F_KEY\" = \"D_KEY\"");
         assert_eq!(jb.logical_schema.len(), 1);
         assert_eq!(jb.logical_schema[0].name, "d_key");
+
+        // The dimension side's own backend survives the round-trip intact, and
+        // remains distinct from the fact side's `common.storage` — the wire-format
+        // guarantee this whole plan depends on.
+        assert_eq!(jb.storage, dim_storage);
+        assert_ne!(jb.storage, reconstituted.common.storage);
 
         // The struct-level split/merge is equivalent to the JSON round-trip.
         let via_struct = ScanSpec::from_parts(spec.to_common(), spec.files.clone());

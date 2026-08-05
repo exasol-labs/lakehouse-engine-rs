@@ -631,6 +631,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
+        storage: test_storage(),
     };
 
     let spec = ScanSpec {

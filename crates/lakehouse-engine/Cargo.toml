@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.32.1"
+version = "0.32.2"
 edition = "2024"
 license.workspace = true
 
@@ -32,6 +32,9 @@ datafusion = { workspace = true }
 object_store = { workspace = true, features = ["azure"] }
 # Implements object_store's #[async_trait] ObjectStore for the spec-size HEAD wrapper.
 async-trait = "0.1"
+# Names the Bytes in object_store's own `ObjectStore::get_ranges` signature, which the
+# routing store implements explicitly; object_store re-exports no alias for it.
+bytes = "1"
 
 # Unions delete positions into a RoaringTreemap for the vendored build_deletes_row_selection.
 roaring = { workspace = true }
@@ -81,6 +84,5 @@ native-tls          = "0.2"
 rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 base64              = "0.22"
 rand                = "0.8"
-bytes               = "1"
 futures             = { workspace = true }
 anyhow              = { workspace = true }

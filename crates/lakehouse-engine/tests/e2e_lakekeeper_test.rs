@@ -40,21 +40,31 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
-    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, install_slc,
-    parse_int, upload_so,
+    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, expected_join_rows,
+    explain_virtual_sql, fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper,
+    install_slc, join_query, parse_int, upload_so,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
     self, WAREHOUSE_STATIC, WAREHOUSE_VENDED, WarehouseProfile, lakekeeper_connection_password,
 };
 use common::seed::{
-    E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth,
-    seed_events_table_with_auth,
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15,
+    SEED_TOTAL_ROWS, SeedCatalogAuth, seed_events_table_with_auth, seed_star_schema_with_auth,
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
     wait_for_exasol, wait_for_minio, wait_for_url,
 };
+
+use futures::TryStreamExt;
+use lakehouse_catalog::{
+    CatalogProps, CatalogSession, ConnectionCreds, StorageBackend, load_table_any_auth,
+    redact_secret_values,
+};
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -130,11 +140,20 @@ fn setup() {
                 ..Default::default()
             };
             rt.block_on(async {
-                seed_events_table_with_auth(&host_catalog, warehouse, auth)
+                seed_events_table_with_auth(&host_catalog, warehouse, auth.clone())
                     .await
                     .unwrap_or_else(|e| {
                         panic!("seed events into Lakekeeper warehouse '{warehouse}': {e:#}")
                     });
+                if warehouse == WAREHOUSE_VENDED {
+                    seed_star_schema_with_auth(&host_catalog, warehouse, auth)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "seed star schema into Lakekeeper warehouse '{warehouse}': {e:#}"
+                            )
+                        });
+                }
             });
         }
 
@@ -592,5 +611,292 @@ fn lakekeeper_credentials_never_appear_in_output() {
             && !panic_msg.contains(SENTINEL_ACCESS_KEY)
             && !panic_msg.contains(SENTINEL_SECRET_KEY),
         "redacting execute() failure must not leak any credential value: {panic_msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Vended-credential scope probe (issue #294 gate).
+// ---------------------------------------------------------------------------
+
+/// What one table's access-delegated `loadTable` response vends: the S3 identity
+/// the shipped resolver's selection rule picks for that table's own location.
+///
+/// Deliberately not `Debug` and never formatted as a whole — three of its fields
+/// are live credentials.
+struct VendedProbe {
+    table: &'static str,
+    location: String,
+    bucket: String,
+    key_prefix: String,
+    region: String,
+    access_key: String,
+    secret_key: String,
+    session_token: Option<String>,
+}
+
+impl VendedProbe {
+    /// Every value of this probe that must never reach test output.
+    fn secrets(&self) -> Vec<&str> {
+        let mut secrets = vec![self.access_key.as_str(), self.secret_key.as_str()];
+        secrets.extend(self.session_token.as_deref());
+        secrets
+    }
+}
+
+/// Split an `s3://bucket/key…` (or `s3a://…`) URI into its bucket and key parts.
+fn split_s3_uri(uri: &str) -> (String, String) {
+    let rest = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3a://"))
+        .unwrap_or_else(|| panic!("expected an s3/s3a URI, got: {uri}"));
+    let (bucket, key) = rest
+        .split_once('/')
+        .unwrap_or_else(|| panic!("expected a <bucket>/<key> URI form, got: {uri}"));
+    (bucket.to_string(), key.to_string())
+}
+
+/// Issue the access-delegated `loadTable` GET for one table and read the
+/// credential source the adapter would select for that table's location.
+async fn probe_vended_credential(
+    session: &CatalogSession,
+    creds: &ConnectionCreds,
+    table: &'static str,
+) -> VendedProbe {
+    let catalog = CatalogProps {
+        warehouse: WAREHOUSE_VENDED.to_string(),
+        table: format!("{E2E_NAMESPACE}.{table}"),
+    };
+    let result = load_table_any_auth(session, &catalog, creds)
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the access-delegated loadTable GET for {table} must succeed: {e}")
+        });
+
+    let location = result.metadata.location().to_string();
+    assert!(
+        !location.is_empty(),
+        "Lakekeeper's loadTable response for {table} carries no table `location`: the credential \
+         entry is selected BY that location, so the probe has no anchor to select with"
+    );
+    let (bucket, key_prefix) = split_s3_uri(&location);
+    let backend = lakehouse_catalog::resolve_vended_storage(&result, &location, true)
+        .unwrap_or_else(|e| panic!("resolve_vended_storage for {table} ({location}) failed: {e}"));
+    let StorageBackend::S3(props) = backend else {
+        panic!("this fixture is MinIO (s3://): {table} ({location}) vended a non-S3 backend");
+    };
+
+    assert!(
+        !props.access_key.is_empty() && !props.secret_key.is_empty(),
+        "the credential source Lakekeeper vended for {table} ({location}) carries no usable s3 \
+         key pair, so it cannot be signed with and the cross-table probe would prove nothing"
+    );
+
+    VendedProbe {
+        table,
+        location,
+        bucket,
+        key_prefix,
+        region: props.region,
+        access_key: props.access_key,
+        secret_key: props.secret_key,
+        session_token: props.session_token,
+    }
+}
+
+/// An S3 client signing as `probe`'s vended identity, against `bucket`.
+///
+/// The endpoint is the HOST-mapped MinIO URL rather than the `s3.endpoint`
+/// Lakekeeper vends: that one names MinIO's Docker-network address, which the
+/// test process cannot reach. Only the network address differs — the identity
+/// under test is the vended one.
+fn s3_client_as(probe: &VendedProbe, bucket: &str) -> AmazonS3 {
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_access_key_id(&probe.access_key)
+        .with_secret_access_key(&probe.secret_key)
+        .with_endpoint(stack::minio_url())
+        .with_allow_http(true)
+        .with_virtual_hosted_style_request(false);
+    if !probe.region.is_empty() {
+        builder = builder.with_region(&probe.region);
+    }
+    if let Some(token) = &probe.session_token {
+        builder = builder.with_token(token);
+    }
+    builder
+        .build()
+        .unwrap_or_else(|e| panic!("configure a MinIO S3 client for bucket {bucket}: {e}"))
+}
+
+/// The first `.parquet` object under `key_prefix`. Iceberg writes data files as
+/// `.parquet` and metadata as `.json`/`.avro`, so the suffix alone selects a data
+/// file.
+async fn first_parquet_under(
+    store: &AmazonS3,
+    key_prefix: &str,
+    secrets: &[&str],
+) -> ObjectStorePath {
+    let prefix = ObjectStorePath::from(key_prefix);
+    let mut listing = store.list(Some(&prefix));
+    while let Some(meta) = listing.try_next().await.unwrap_or_else(|e| {
+        panic!(
+            "listing {key_prefix} with the table's OWN vended credential failed: {}",
+            redact_secret_values(&e.to_string(), secrets)
+        )
+    }) {
+        if meta.location.as_ref().ends_with(".parquet") {
+            return meta.location;
+        }
+    }
+    panic!("no .parquet data file under {key_prefix}: the star-schema seed must have written one")
+}
+
+/// Whether the two star-schema tables' vended credentials differ in SCOPE — not
+/// merely in value — observed rather than assumed.
+///
+/// The broadcast-join fix carries a per-side vended backend. Whether DISCARDING
+/// the dimension side's backend is a read ERROR or merely cosmetic depends on a
+/// fact about this fixture that no documentation settles: Lakekeeper's vended
+/// MinIO user holds a BUCKET-scoped IAM policy, and whether Lakekeeper further
+/// narrows each STS session with an inline per-table-prefix policy is unverified.
+///
+/// So this test observes, in the defect's own direction: it reads the credential
+/// source each table's access-delegated `loadTable` vends, records the `prefix`
+/// that source was selected by, and then reads ONE `dim_customer` data file with
+/// `fact_orders`' vended identity — exactly what a join that keeps only the fact
+/// side's credential does. A DENIED read is what makes per-side credential
+/// carriage load-bearing; an ALLOWED read fails the suite, because it means this
+/// fixture cannot reproduce issue #294 as a read error and a green join test
+/// would conceal that.
+///
+/// Reading `dim_customer`'s file with `dim_customer`'s OWN credential first is
+/// the control: without it a denial could be a wrong key or an unreachable
+/// endpoint rather than a scope boundary.
+///
+/// No credential value reaches the report or any failure message — presence,
+/// equality, and prefixes only, with provider error text scrubbed.
+#[test]
+fn lakekeeper_vended_credentials_are_scoped_per_table() {
+    setup();
+
+    let creds = lakekeeper::lakekeeper_host_connection_creds(WAREHOUSE_VENDED, true);
+    assert!(
+        creds.use_vended_credentials,
+        "the probe CONNECTION must request access delegation: without that flag the loadTable \
+         GET carries no X-Iceberg-Access-Delegation header and its response evidences nothing"
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for the vended-credential scope probe");
+
+    rt.block_on(async {
+        let session =
+            CatalogSession::resolve(&lakekeeper_catalog_url_host(), WAREHOUSE_VENDED, &creds)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("CatalogSession::resolve against Lakekeeper must succeed: {e}")
+                });
+
+        let fact = probe_vended_credential(&session, &creds, E2E_FACT_TABLE).await;
+        let dim = probe_vended_credential(&session, &creds, E2E_DIM_TABLE).await;
+        let secrets = [fact.secrets(), dim.secrets()].concat();
+
+        // Printed before the reads below so the observed state survives in the
+        // log even when the control read fails.
+        println!(
+            "lakekeeper_vended_credentials_are_scoped_per_table:\n  \
+             {} location={}\n  \
+             {} location={}\n  \
+             same vended access key: {}\n  \
+             session token vended: {} / {}",
+            fact.table,
+            fact.location,
+            dim.table,
+            dim.location,
+            fact.access_key == dim.access_key,
+            fact.session_token.is_some(),
+            dim.session_token.is_some(),
+        );
+
+        let dim_store = s3_client_as(&dim, &dim.bucket);
+        let victim = first_parquet_under(&dim_store, &dim.key_prefix, &secrets).await;
+
+        dim_store.get(&victim).await.unwrap_or_else(|e| {
+            panic!(
+                "control read of {victim} with dim_customer's OWN vended credential failed, so a \
+                 denial below could not be told apart from a broken probe: {}",
+                redact_secret_values(&e.to_string(), &secrets)
+            )
+        });
+
+        // The defect's own direction: the dimension side's file, read with the
+        // fact side's credential. Bytes are drained so a lazily-surfaced denial
+        // cannot read as success.
+        let cross = match s3_client_as(&fact, &dim.bucket).get(&victim).await {
+            Ok(result) => result.bytes().await.map(|bytes| bytes.len()),
+            Err(e) => Err(e),
+        };
+        match &cross {
+            Ok(len) => {
+                println!("  cross-table read (fact_orders creds -> {victim}): ALLOWED, {len} bytes")
+            }
+            Err(e) => println!(
+                "  cross-table read (fact_orders creds -> {victim}): DENIED, {}",
+                redact_secret_values(&e.to_string(), &secrets)
+            ),
+        }
+
+        assert!(
+            cross.is_err(),
+            "ALLOWED: fact_orders' vended credential read dim_customer's data file {victim}. The \
+             two sides' vended credentials differ in VALUE but not in SCOPE, so this fixture \
+             CANNOT reproduce issue #294 as a read error — a broadcast join that discards the \
+             dimension side's credential still returns correct rows here, and a green join test \
+             would prove only carriage, never necessity."
+        );
+    });
+}
+
+/// The broadcast join over the VENDED-credential warehouse returns the correct
+/// result: identical (as a sorted multiset) to the join computed independently
+/// from the two tables read un-joined through the same VS.
+///
+/// Reproduces issue #294 (plan `fix-broadcast-join-per-side-storage-credentials`,
+/// task 1.4): `lakekeeper_vended_credentials_are_scoped_per_table` established
+/// that this fixture DENIES a cross-table vended read, so a broadcast join that
+/// discards the dimension side's own credential and reads with the fact side's
+/// is EXPECTED to fail here with a read/credential error — that failure IS the
+/// reproduction. It must start failing this fixture's own warehouse until the
+/// per-side storage-credential fix (tasks 2-4) lands.
+#[test]
+fn lakekeeper_vended_broadcast_join_result_correct() {
+    setup();
+    let mut conn = exa_conn().unbounded_result_sets();
+
+    let pushed_sql = explain_virtual_sql(&mut conn, &join_query(VS_VENDED));
+    assert!(
+        has_broadcast_join_block(&pushed_sql),
+        "expected a broadcast join block in the pushed SQL: {pushed_sql}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed_sql),
+        "expected NO two-scan unaccelerated fallback wrapper in the pushed SQL: {pushed_sql}"
+    );
+
+    let actual = fetch_join_rows(&mut conn, VS_VENDED);
+    let expected = expected_join_rows(&mut conn, VS_VENDED);
+
+    assert_eq!(
+        actual.len(),
+        6,
+        "expected 6 joined rows (orders 5..=10), got {}: {actual:?}",
+        actual.len()
+    );
+    assert_eq!(
+        actual, expected,
+        "broadcast join result over the vended-credential warehouse must equal the \
+         independently computed join.\nactual:   {actual:?}\nexpected: {expected:?}"
     );
 }

@@ -30,18 +30,17 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
 };
 use parquet::arrow::ArrowWriter;
 
-/// A fake `UdfContext` serving one input row and capturing every `emit_batch` as a
-/// decoded `RecordBatch`. The raw/join streaming path must use `emit_batch`, never
-/// row-by-row `emit`, so `emit` is a trap.
 struct FakeCtx {
     served: bool,
+    args: Vec<Value>,
     emitted: Vec<RecordBatch>,
 }
 
@@ -49,6 +48,21 @@ impl FakeCtx {
     fn new() -> Self {
         Self {
             served: false,
+            args: Vec::new(),
+            emitted: Vec::new(),
+        }
+    }
+
+    /// A context serving the TWO production scan-UDF input arguments for `spec` —
+    /// the shard-invariant common blob and this shard's files JSON — so a test can
+    /// drive `run_scan`, the entry point that builds the real object stores.
+    fn with_spec_args(spec: &ScanSpec) -> Self {
+        Self {
+            served: false,
+            args: vec![
+                Value::String(spec.to_common_json()),
+                Value::String(ScanSpec::files_json(&spec.files)),
+            ],
             emitted: Vec::new(),
         }
     }
@@ -56,10 +70,12 @@ impl FakeCtx {
 
 impl UdfContext for FakeCtx {
     fn num_columns(&self) -> usize {
-        0
+        self.args.len()
     }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx has no input columns".into()))
+    fn get(&self, col: usize) -> Result<&Value, UdfError> {
+        self.args
+            .get(col)
+            .ok_or_else(|| UdfError::User(format!("FakeCtx has no input column {col}")))
     }
     fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
         Err(UdfError::User("join path must use emit_batch".into()))
@@ -163,15 +179,30 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
-fn storage() -> StorageBackend {
+/// An S3 backend reaching `endpoint` and carrying `secret` as its secret key —
+/// the two fields a test tells one side's store, and one side's redaction set,
+/// from the other's by. Path-style (the `StorageProps` default) is what makes a
+/// bespoke `endpoint` reachable at all.
+fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
     StorageBackend::S3(StorageProps {
-        endpoint: "http://localhost:9000".into(),
+        endpoint: endpoint.into(),
         region: "us-east-1".into(),
         access_key: "test-access-key".into(),
-        secret_key: "TOPSECRETVALUE".into(),
+        secret_key: secret.into(),
         allow_http: true,
         ..Default::default()
     })
+}
+
+fn storage() -> StorageBackend {
+    s3_backend("http://localhost:9000", "TOPSECRETVALUE")
+}
+
+/// The dimension side's backend — deliberately DISTINCT from `storage()`'s
+/// `secret_key`, so every test built through `join_spec` runs credential-divergent:
+/// the fact side and the dimension side never share a secret.
+fn dim_storage() -> StorageBackend {
+    s3_backend("http://localhost:9000", "DIMSECRETVALUE")
 }
 
 /// A join `ScanSpec`: `fact_files` is the sharded fact side (`files`); `dim_files`
@@ -196,6 +227,7 @@ fn join_spec(
                 name_mapping: Vec::new(),
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+                storage: dim_storage(),
             }),
             storage: storage(),
             ..Default::default()
@@ -276,11 +308,16 @@ fn join_spec_reconstitutes_two_file_lists() {
 
 /// Scenario: Scan registers both tables and executes the inner equi-join.
 ///
-/// Orders (fact) inner-joined to customer (dimension) on custkey. The order whose
-/// custkey has no matching customer (999) is dropped; every matched order pairs
-/// with its customer name.
+/// Each side is registered against its OWN backend — the fact side under
+/// `storage()`, the dimension side under `dim_storage()` (via `join_spec`) — and
+/// the join still executes correctly. Orders (fact) inner-joined to customer
+/// (dimension) on custkey. The order whose custkey has no matching customer (999)
+/// is dropped; every matched order pairs with its customer name. Per-side
+/// registration narrows WHICH backend guards each side's read; it never changes
+/// WHICH ROWS come back — that correctness is what the row assertions below still
+/// characterize.
 #[test]
-fn join_executes_inner_equi() {
+fn join_registers_each_side_against_its_own_backend() {
     let dir = std::env::temp_dir().join(format!("lh_join_inner_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let orders = write_orders(&dir);
@@ -472,9 +509,19 @@ fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
 ///
 /// A nonexistent dimension file surfaces through the secret-redacting
 /// `classify_scan_error` path: the error names the read failure and NEVER contains
-/// a storage credential value.
+/// EITHER side's storage credential value (`storage()`'s `TOPSECRETVALUE` for the
+/// fact side, `dim_storage()`'s `DIMSECRETVALUE` for the dimension side).
+///
+/// This test does NOT positively demonstrate that a credential was redacted out of
+/// a message that would otherwise contain it: `run_join_scan_with_session` here
+/// runs over a plain local-file session (no S3 store is ever registered), so
+/// neither literal could appear in the error text regardless of redaction. What it
+/// pins is that a MISSING file on the dimension side still routes through the
+/// classifier at all. The falsifiable proof that the dimension side's credential is
+/// genuinely stripped from a message that would otherwise carry it lives in
+/// [`a_dimension_side_read_failure_redacts_the_dimension_sides_credential`].
 #[test]
-fn join_unreadable_file_errors_without_secrets() {
+fn unreadable_join_file_error_redacts_both_sides_credentials() {
     let dir = std::env::temp_dir().join(format!("lh_join_err_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let orders = write_orders(&dir);
@@ -505,8 +552,135 @@ fn join_unreadable_file_errors_without_secrets() {
     );
     assert!(
         !text.contains("TOPSECRETVALUE"),
-        "error must not leak the secret_key value: {text}"
+        "error must not leak the fact side's secret_key value: {text}"
+    );
+    assert!(
+        !text.contains("DIMSECRETVALUE"),
+        "error must not leak the dimension side's secret_key value: {text}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A loopback endpoint refusing every request with a 403 whose XML body echoes
+/// `message`, and the URL to reach it at.
+///
+/// Modelled on `object_store.rs`'s `RecordingEndpoint`, but the refusal BODY is
+/// what matters here: `object_store` folds a non-2xx response body into the error
+/// it surfaces, so an endpoint quoting a credential in its refusal — the real shape
+/// of an S3 `SignatureDoesNotMatch` — is what makes value-based redaction
+/// observable rather than vacuous. A 4xx is never retried, so each read reaches the
+/// endpoint exactly once and fails fast.
+fn refusing_endpoint(message: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
+    let url = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("bound endpoint has an address")
+    );
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>"
+    );
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut request_head = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request_head);
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    url
+}
+
+fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id,
+        name: name.into(),
+        arrow_type: arrow_type.into(),
+        nullable: false,
+        initial_default: None,
+    }
+}
+
+/// Scenario: A dimension-side read failure never surfaces the dimension side's
+/// credential — the FALSIFIABLE counterpart to
+/// [`unreadable_join_file_error_redacts_both_sides_credentials`].
+///
+/// Both sides share one bucket (the same-warehouse norm, so one DataFusion registry
+/// key serves two credentials through the prefix router) but reach DIFFERENT
+/// loopback endpoints, each refusing with an XML body that quotes ITS OWN secret
+/// key next to a plain marker. The dimension side is the hash-join build side, so
+/// its read is the first to touch an endpoint and the one that fails.
+///
+/// The marker assertion is what makes this test discriminate: it proves the
+/// dimension endpoint's refusal body genuinely reached the surfaced message, hence
+/// that the secret sitting beside it WOULD have leaked had the redaction set not
+/// covered the dimension side. A redaction set built from the fact side's
+/// `common.storage` alone fails this test.
+///
+/// Both sides carry a `logical_schema` so neither registration infers a schema:
+/// inference reads through `register_file_list`, which redacts per-side, and would
+/// mask the union rule under test.
+#[test]
+fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
+    const DIM_MARKER: &str = "dimension-side-refusal";
+    const FACT_MARKER: &str = "fact-side-refusal";
+
+    let fact_endpoint = refusing_endpoint(&format!("{FACT_MARKER} TOPSECRETVALUE"));
+    let dim_endpoint = refusing_endpoint(&format!("{DIM_MARKER} DIMSECRETVALUE"));
+
+    let spec = ScanSpec {
+        common: CommonScanSpec {
+            projection: vec!["O_ORDERKEY".into(), "C_NAME".into()],
+            logical_schema: vec![
+                logical_field(1, "o_orderkey", "int64"),
+                logical_field(2, "o_custkey", "int64"),
+            ],
+            join: Some(JoinSpec {
+                table_root: "s3://test-bucket/db/dim".into(),
+                files: vec![FileEntry::new("data/dim-0.parquet", 4096)],
+                logical_schema: vec![
+                    logical_field(1, "c_custkey", "int64"),
+                    logical_field(2, "c_name", "utf8"),
+                ],
+                name_mapping: Vec::new(),
+                join_type: JoinType::Inner,
+                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+                storage: s3_backend(&dim_endpoint, "DIMSECRETVALUE"),
+            }),
+            storage: s3_backend(&fact_endpoint, "TOPSECRETVALUE"),
+            ..Default::default()
+        },
+        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
+    };
+
+    let mut ctx = FakeCtx::with_spec_args(&spec);
+    let err = lakehouse_engine::scan::run_scan(&mut ctx)
+        .expect_err("both sides' endpoints refuse every read, so the scan must fail");
+    let text = err.to_string();
+
+    assert!(
+        text.contains("could not be read"),
+        "error must route through the storage-read classifier: {text}"
+    );
+    assert!(
+        text.contains(DIM_MARKER),
+        "the DIMENSION endpoint's refusal body must be the one that reached the error \
+         (otherwise the secret assertions below are vacuous): {text}"
+    );
+    assert!(
+        !text.contains("DIMSECRETVALUE"),
+        "error must not leak the dimension side's secret_key value: {text}"
+    );
+    assert!(
+        !text.contains("TOPSECRETVALUE"),
+        "error must not leak the fact side's secret_key value: {text}"
+    );
 }

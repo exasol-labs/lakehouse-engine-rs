@@ -1151,6 +1151,12 @@ fn write_keyed_parquet(
 /// its own size-3 pool, admit both its reads at once, and the shared counter would
 /// peak at 4 (2 + 2) — exceeding N. That divergence (3 for the shared handle, 4
 /// for a per-provider handle) is exactly what pins the shared-`Arc` wiring.
+///
+/// The two sides' delete positions are also DELIBERATELY DISJOINT (fact: 0,1;
+/// dimension: 2,3) so the dimension side's own delete is falsifiable through the
+/// join's row count alone — a per-side credential/routing regression that read the
+/// dimension's delete file through the wrong store (or dropped it) would surface
+/// as an extra row, not just a different connection-count peak.
 #[test]
 fn scan_delete_reads_bounded_across_join_sides() {
     const BUDGET: usize = 3;
@@ -1187,7 +1193,10 @@ fn scan_delete_reads_bounded_across_join_sides() {
     let mut dim_deletes = Vec::new();
     for i in 0..2 {
         let name = format!("dim_del_{i}.parquet");
-        let url = write_delete_parquet(&dir, &name, &[(&customer_url, i as i64)]);
+        // Positions 2,3 — DISTINCT from the fact side's 0,1 — so the dimension
+        // side's own delete has an effect on the join output that the fact
+        // side's delete cannot also produce (see the row-count assertion below).
+        let url = write_delete_parquet(&dir, &name, &[(&customer_url, (2 + i) as i64)]);
         dim_deletes.push(delete_ref(&url));
         needles.push(name);
     }
@@ -1213,6 +1222,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
+        storage: dummy_storage(),
     });
 
     let (store, peak) = tracking_store_with_probe(needles);
@@ -1246,12 +1256,20 @@ fn scan_delete_reads_bounded_across_join_sides() {
          {BUDGET} (up to 4) would mean each provider built its own size-{BUDGET} semaphore"
     );
 
-    // Post-delete correctness: each side drops keys 0 and 1; the inner join over
-    // the surviving keys 2..8 yields 6 rows.
+    // Post-delete correctness: the fact side drops keys 0 and 1 (positions 0,1);
+    // the dimension side drops keys 2 and 3 (positions 2,3) — a different range,
+    // read through the dimension side's OWN routed store, not the fact side's.
+    // That makes the dimension-side delete falsifiable on its own: were it never
+    // applied, the dimension side would still offer keys 2 and 3, and the inner
+    // join would additionally match them against the fact side's surviving keys
+    // 2..8, yielding 6 rows instead of 4. Fact surviving {2,3,4,5,6,7} ∩
+    // dimension surviving {0,1,4,5,6,7} = {4,5,6,7} -> 4 rows.
     assert_eq!(
         total_rows(&rows),
-        6,
-        "inner join over post-delete rows (keys 2..8 on both sides) yields 6 rows"
+        4,
+        "inner join over post-delete rows (fact keys 2..8, dimension keys 0,1,4..8) \
+         yields 4 rows — this would be 6 if the dimension side's own delete file \
+         were never applied"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

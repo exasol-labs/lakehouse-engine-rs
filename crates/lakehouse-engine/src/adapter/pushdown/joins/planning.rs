@@ -334,8 +334,15 @@ pub(super) fn select_broadcast_sides(
 /// each leg its own storage: whether a join broadcasts depends on byte sizes, so a
 /// per-renderer guard would make acceptance of a configuration depend on the data in
 /// it. Comparison is scoped to the backend VARIANT and, for `Adls`, `account_name` —
-/// not full backend equality, which would reject every vended join against a catalog
-/// minting per-prefix STS keys (tracked separately as `#294`). `backend_identity`
+/// not full backend equality. The variant and ADLS-account scoping are KEPT
+/// deliberately: those two differences are unserveable regardless of how the join is
+/// read — an `AmazonS3Builder` cannot address an `abfss://` URI, and two ADLS sides
+/// on different storage accounts are unserveable per the `validate_sides_share_one_store`
+/// guard even once each side is read through its own store. A plain credential
+/// difference within one variant is no longer in that category: each side's join
+/// scan now carries and is read through its OWN `StorageBackend` (this plan's fix —
+/// see `JoinSpec::storage` and `build_broadcast_join_sql`), so rejecting it here would
+/// reject a configuration the read path already serves correctly. `backend_identity`
 /// derives both the compared identity and the words the error uses, so the message
 /// can never name a distinction the comparison did not make.
 ///
@@ -509,12 +516,14 @@ pub(super) fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sql_builders::{RenderedJoinPushdown, build_broadcast_join_sql};
     use super::super::tests::{
         equi_condition, join_request, nq3_join_request, resolved_side, three_table_join_request,
+        two_scan_tuning,
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
-    use crate::scan::spec::{AdlsCred, StorageProps};
+    use crate::scan::spec::{AdlsCred, ProjectionItem, StorageProps};
 
     // ---------------------------------------------------------------------------
     // Join detection: `detect_join` shape classification.
@@ -936,19 +945,59 @@ mod tests {
 
     /// The comparison is scoped to variant + ADLS account DELIBERATELY: widening it to
     /// full backend equality would reject every vended join against a catalog minting
-    /// per-prefix credentials (#294).
+    /// per-prefix credentials. Both sides now carry their credential difference all the
+    /// way through — `build_broadcast_join_sql` rides the fact side's backend in
+    /// `common.storage` and the dimension side's in `join.storage` — so this asserts
+    /// the two SQL-facing values, not just that validation returns `Ok`.
     #[test]
-    fn s3_sides_differing_in_credentials_are_accepted() {
-        let mut per_prefix = resolved_side("ORDERS", vec![("o1", 50_000)]);
-        per_prefix.effective_storage = StorageBackend::S3(StorageProps {
+    fn s3_sides_differing_only_in_credentials_carry_both_backends() {
+        let fact = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
+        let mut dimension = resolved_side("ORDERS", vec![("o1", 50_000)]);
+        dimension.effective_storage = StorageBackend::S3(StorageProps {
             endpoint: "https://s3.eu-central-1.amazonaws.com".into(),
             region: "eu-central-1".into(),
             access_key: "OTHER_PREFIX_AK".into(),
             secret_key: "OTHER_PREFIX_SK".into(),
             ..Default::default()
         });
-        let sides = vec![resolved_side("CUSTOMER", vec![("c1", 1_000)]), per_prefix];
+        let sides = vec![fact.clone(), dimension.clone()];
 
         assert!(validate_sides_share_one_backend(&sides).is_ok());
+
+        let join_sides = JoinSides {
+            fact,
+            dimension,
+            broadcast_eligible: true,
+        };
+        let rendered = RenderedJoinPushdown {
+            condition: "(\"CUSTOMER_KEY\" = \"ORDERS_KEY\")".to_string(),
+            filter: None,
+            projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
+            projection_types: vec!["DECIMAL(20,0)".to_string()],
+        };
+        let sql = build_broadcast_join_sql(
+            &join_sides,
+            &rendered,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        );
+        let common: serde_json::Value =
+            serde_json::from_str(common_arg_literal(&sql)).expect("common blob is valid JSON");
+
+        assert_eq!(
+            common["storage"],
+            serde_json::to_value(&join_sides.fact.effective_storage).unwrap(),
+            "common.storage must carry the FACT side's own backend"
+        );
+        assert_eq!(
+            common["join"]["storage"],
+            serde_json::to_value(&join_sides.dimension.effective_storage).unwrap(),
+            "join.storage must carry the DIMENSION side's own backend"
+        );
+        assert_ne!(
+            common["storage"], common["join"]["storage"],
+            "the two sides' credentials must differ — that is the point of this test"
+        );
     }
 }

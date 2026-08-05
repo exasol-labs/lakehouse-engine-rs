@@ -1051,8 +1051,14 @@ pub fn order_totalprice_unscaled(order_key: usize) -> i64 {
 /// Seed the `dim_customer` and `fact_orders` star-schema tables into the
 /// `e2e_lakehouse` namespace, including `fact_orders.O_TOTALPRICE` (a scale > 0
 /// DECIMAL column, see [`O_TOTALPRICE_PS`]). Idempotent.
-pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> {
-    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-star").await?;
+pub async fn seed_star_schema_with_auth(
+    catalog_url: &str,
+    warehouse: &str,
+    auth: SeedCatalogAuth,
+) -> Result<()> {
+    let catalog =
+        build_seed_catalog_with_auth(catalog_url, warehouse, "lakehouse-e2e-seed-star", auth)
+            .await?;
     let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
     if !catalog
         .namespace_exists(&ns)
@@ -1113,6 +1119,14 @@ pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> 
     .await
     .context("seed fact_orders table")?;
     Ok(())
+}
+
+/// Seed the star-schema tables using the unauthenticated static-MinIO baseline.
+///
+/// Thin wrapper over [`seed_star_schema_with_auth`] with no catalog auth — the
+/// existing call site uses this unchanged.
+pub async fn seed_star_schema(catalog_url: &str, warehouse: &str) -> Result<()> {
+    seed_star_schema_with_auth(catalog_url, warehouse, SeedCatalogAuth::default()).await
 }
 
 fn make_customer_batch(first_key: usize, last_key: usize) -> RecordBatch {

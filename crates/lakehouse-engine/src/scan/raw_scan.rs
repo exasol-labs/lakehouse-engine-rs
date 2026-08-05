@@ -18,7 +18,8 @@ use tokio::sync::Semaphore;
 
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::spec::{
-    FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, render_order_by_clause,
+    FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
+    render_order_by_clause,
 };
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::needs_json_fallback;
@@ -26,7 +27,7 @@ use crate::types::mapping::needs_json_fallback;
 use super::field_id_projection::{
     FieldIdResolution, build_logical_arrow_schema, reconstruct_initial_defaults,
 };
-use super::object_store::{reconstruct_abs_uri, validate_uniform_object_store_files};
+use super::object_store::validate_uniform_object_store_files;
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Stream the raw-row scan over an already-built session and emit phase telemetry.

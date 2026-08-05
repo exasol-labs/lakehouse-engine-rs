@@ -34,16 +34,18 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// The bounded dimension side is placed on the LEFT of the join and join reordering
 /// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
 /// the hash-join build side regardless of table statistics. Read/deserialization
-/// errors for EITHER side route through [`classify_scan_error`], so no credential
-/// value can leak. Exposed so a host integration test can drive this exact path over
-/// local Parquet (no S3 store).
+/// errors for EITHER side route through [`classify_scan_error`] against the UNION of
+/// both sides' secret values ([`crate::scan::spec::CommonScanSpec::all_secret_values`]) — a fact-side-only
+/// set would leak the dimension side's own credential, since `join.storage` holds a
+/// genuinely different one. Exposed so a host integration test can drive this exact
+/// path over local Parquet (no S3 store).
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.common.storage.secret_values();
+    let secrets = spec.common.all_secret_values();
     register_join_tables(session_ctx, spec).await?;
     let sql = build_join_sql(session_ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
     let df = session_ctx
@@ -78,10 +80,14 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         ));
     }
 
-    // Both sides share the one storage backend (StorageBackend); the
-    // dimension side carries its own table_root, file list, logical schema, and
-    // per-file positional deletes, which register_file_list applies to the
-    // dimension registration exactly as it does for the fact side.
+    // Each side carries its OWN storage backend (StorageBackend) alongside its own
+    // table_root, file list, logical schema, and per-file positional deletes, all
+    // of which register_file_list applies to the dimension registration exactly as
+    // it does for the fact side. A vended credential is scoped to the table it was
+    // resolved for, so the dimension side is registered against join.storage and
+    // never common.storage: that is what makes its reads — data files and delete
+    // files alike — redact against ITS own secret values rather than the fact
+    // side's.
     //
     // ONE shared delete-read semaphore for this invocation, cloned into BOTH
     // sides' registration: DataFusion plans a broadcast join's two scan leaves
@@ -106,7 +112,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.table_root,
         &join.logical_schema,
         &join.name_mapping,
-        &spec.common.storage,
+        &join.storage,
         delete_read_limiter,
     )
     .await?;
