@@ -62,7 +62,7 @@ spec argument, serialized once for the whole fan-out.
 <!-- DELTA:NEW -->
 ### Scenario: A metadata-cache eviction that re-fetches a footer is observable
 
-* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so an entry populated during access-plan construction is evicted before the Parquet opener reads it
+* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so a footer that access-plan construction fetched is not available from that cache when the Parquet opener reads it — because the entry was evicted, or because it exceeded the cache limit and was never admitted
 * *WHEN* the opener fetches that data file's footer a second time within the same scan invocation
 * *THEN* the UDF SHALL count that second footer fetch as a metadata-cache re-fetch, per scan invocation
 * *AND* the UDF SHALL surface the accumulated re-fetch count on its debug diagnostic channel, so an operator running the scan at debug level observes the double-fetch directly instead of inferring it from object-store request volume
