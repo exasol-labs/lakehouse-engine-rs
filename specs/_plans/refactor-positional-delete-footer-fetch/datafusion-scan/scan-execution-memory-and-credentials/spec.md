@@ -38,7 +38,11 @@ spec argument, serialized once for the whole fan-out.
   evicted before the opener reads them and every footer is fetched twice. Restricting the
   access-plan fetch to the row-group metadata — no page index — is what keeps each entry small
   enough for that not to bite at realistic shard sizes; the verifiable property, not the
-  mechanism, is what this feature requires.
+  mechanism, is what this feature requires. Because the entry size scales with a data file's
+  `columns × row_groups`, no fixed shard-file count is safe for every table, so the feature
+  requires BOTH halves of issue #165's item 3: reuse measured at a shard scale whose cached
+  footers approach the limit, and an eviction that does happen anyway made observable rather
+  than silent.
 <!-- /DELTA:NEW -->
 
 ## Scenarios
@@ -54,3 +58,14 @@ spec argument, serialized once for the whole fan-out.
 * *AND* if no shared reader is installed, the UDF MAY accept one additional footer range GET per delete-carrying data file, but MUST NOT issue a HEAD request in either case
 * *AND* the configured batch size and Parquet row-group / page pruning SHALL apply unchanged whether or not a shared reader is installed
 <!-- /DELTA:CHANGED -->
+
+<!-- DELTA:NEW -->
+### Scenario: A metadata-cache eviction that re-fetches a footer is observable
+
+* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so an entry populated during access-plan construction is evicted before the Parquet opener reads it
+* *WHEN* the opener fetches that data file's footer a second time within the same scan invocation
+* *THEN* the UDF SHALL count that second footer fetch as a metadata-cache re-fetch, per scan invocation
+* *AND* the UDF SHALL surface the accumulated re-fetch count on its debug diagnostic channel, so an operator running the scan at debug level observes the double-fetch directly instead of inferring it from object-store request volume
+* *AND* a scan whose footers all stay cached SHALL report a re-fetch count of ZERO, so the signal distinguishes eviction from normal operation rather than firing on every delete-carrying scan
+* *AND* the observable MUST stay inert otherwise: at the production default debug level it MUST NOT emit output, it MUST NOT alter the scan's result rows, it MUST NOT fail the scan (an eviction is a cost signal, not an error), and its record MUST NOT contain a storage credential
+<!-- /DELTA:NEW -->
