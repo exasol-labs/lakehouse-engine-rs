@@ -14,7 +14,7 @@ use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::needs_json_fallback;
 
-use super::raw_scan::{delete_read_limiter, register_file_list};
+use super::raw_scan::{delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Registered table name for the sharded fact (large) side of a broadcast join.
@@ -87,7 +87,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
     // sides' registration: DataFusion plans a broadcast join's two scan leaves
     // concurrently, so a per-side semaphore would allow up to 2N concurrent
     // delete reads instead of the intended N.
-    let delete_read_limiter = delete_read_limiter(spec);
+    let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
         JOIN_FACT_TABLE,
@@ -96,7 +96,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.storage,
-        Arc::clone(&delete_read_limiter),
+        Arc::clone(&delete_path_read_limiter),
     )
     .await?;
     register_file_list(
@@ -107,7 +107,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.logical_schema,
         &join.name_mapping,
         &spec.common.storage,
-        delete_read_limiter,
+        delete_path_read_limiter,
     )
     .await?;
     Ok(())

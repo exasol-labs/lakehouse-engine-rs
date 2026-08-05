@@ -251,7 +251,14 @@ async fn run_scan_dispatch(
     // the default `info` level stays silent.
     let mut timers = diagnostics::PhaseTimers::start();
 
-    if spec.common.join.is_some() {
+    // Footer re-fetch observable (task 1.7b): reset the process-global record of
+    // access-plan-cached footer paths at the start of every invocation. A pooled
+    // UDF process serves many invocations in sequence off the same fixed
+    // per-node VM (see CLAUDE.md § UDF parallelization); without this reset a
+    // later invocation would report an earlier invocation's recorded paths.
+    diagnostics::reset_access_plan_cached_footers();
+
+    let result = if spec.common.join.is_some() {
         // A join spec drives the two-table broadcast inner equi-join path: register
         // the sharded fact side and the full dimension side in one session, join
         // node-locally, and stream joined batches. Takes precedence over the
@@ -264,7 +271,22 @@ async fn run_scan_dispatch(
         run_partial_aggregate(ctx, session_ctx, spec).await
     } else {
         run_raw_scan_with_session(ctx, session_ctx, spec, &mut timers).await
+    };
+
+    if result.is_ok() {
+        // A pushed LIMIT can end the stream before the opener opens every
+        // assigned file, and a join whose build side is empty never polls the
+        // probe side — either leaves an access-plan-cached footer at `hits == 0`
+        // without anything having been re-fetched. Only this site knows the
+        // shape, so it decides how the counter may read `hits == 0`.
+        let coverage = if spec.common.limit.is_none() && spec.common.join.is_none() {
+            diagnostics::OpenerCoverage::EveryAssignedFile
+        } else {
+            diagnostics::OpenerCoverage::MayStopEarly
+        };
+        emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
     }
+    result
 }
 
 /// Emit the per-VM phase-telemetry record, gated on the debug level.
@@ -280,6 +302,56 @@ fn emit_phase_telemetry(ctx: &dyn UdfContext, timers: &diagnostics::PhaseTimers)
     let record = diagnostics::telemetry_record(timers);
     udf_log!(ctx, debug, "{}", record);
     diagnostics::write_telemetry_file(&record);
+}
+
+/// Report a positional-delete footer re-fetch, gated on the debug level and
+/// on the count being non-zero (task 1.7b).
+///
+/// Reads the session's [`FileMetadataCache`] entry snapshot — the same cache
+/// `PositionalDeleteScanTable::partitioned_files` reaches through
+/// `state.runtime_env()` — and passes it to
+/// [`diagnostics::footer_refetch_count`]. When that count is non-zero, emits
+/// ONE `udf_log!` debug line naming the count, so an operator capturing
+/// `SCRIPT_OUTPUT_ADDRESS` at debug level sees a metadata-cache eviction that
+/// cost the opener a second footer fetch. The line carries the count only,
+/// never a recorded path, so no credential a path's URI can carry ever reaches
+/// it.
+///
+/// Inert at the production default `info` level: the leading
+/// [`diagnostics::telemetry_enabled`] check — the same gate
+/// [`emit_phase_telemetry`] uses — returns before the cache is ever snapshotted,
+/// so a production scan pays no `list_entries()` traversal. At `debug`, a
+/// fully-cached scan still writes nothing once snapshotted, since the count is
+/// zero.
+///
+/// `coverage` tells the counter whether this scan shape guarantees the opener
+/// opens every assigned file; a cached footer the opener never opened is not a
+/// re-fetch, and only the caller knows the shape (see
+/// [`diagnostics::footer_refetch_count`]).
+///
+/// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
+fn emit_footer_refetch_diagnostic(
+    ctx: &dyn UdfContext,
+    session_ctx: &SessionContext,
+    coverage: diagnostics::OpenerCoverage,
+) {
+    if !diagnostics::telemetry_enabled(ctx.debug_level()) {
+        return;
+    }
+    let entries = session_ctx
+        .runtime_env()
+        .cache_manager
+        .get_file_metadata_cache()
+        .list_entries();
+    let count = diagnostics::footer_refetch_count(&entries, coverage);
+    if count > 0 {
+        udf_log!(
+            ctx,
+            debug,
+            "positional-delete footer re-fetch: {count} footer(s) cached during access-plan \
+             construction were not retained by the metadata cache before the opener read them"
+        );
+    }
 }
 
 #[cfg(test)]

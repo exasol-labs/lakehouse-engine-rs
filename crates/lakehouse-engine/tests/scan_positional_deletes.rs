@@ -20,17 +20,22 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::datasource::physical_plan::ParquetSource;
+use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionContext;
+use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType, ScanSpec,
-    StorageBackend, StorageProps,
+    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType,
+    LogicalField, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
+    build_join_physical_plan, build_raw_scan_physical_plan, register_files,
     run_join_scan_with_session, run_raw_scan_with_session, session_config_for_spec,
 };
 use object_store::local::LocalFileSystem;
@@ -215,6 +220,62 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
             limit,
             storage: dummy_storage(),
             df_batch_size: 64,
+            ..Default::default()
+        },
+        files,
+    }
+}
+
+/// Build a `Vec<LogicalField>` from `(name, arrow_type_tag)` pairs, assigning
+/// Iceberg field-ids sequentially from 1 in the given order. The single seam
+/// every non-empty `logical_schema` in this file is built through, so a
+/// differently-shaped keyed-column schema (e.g. `o_key`/`o_data` on a join's
+/// fact side) can be built through the exact same construction as the
+/// `id`/`name` shape `scan_spec_with_logical_schema` uses.
+fn logical_fields(fields: &[(&str, &str)]) -> Vec<LogicalField> {
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, arrow_type))| LogicalField {
+            field_id: (i + 1) as i32,
+            name: (*name).to_string(),
+            arrow_type: (*arrow_type).to_string(),
+            nullable: false,
+            initial_default: None,
+        })
+        .collect()
+}
+
+/// Like [`scan_spec`], but with a populated `common.logical_schema`: `id`
+/// (field-id 1, `int64`) and `name` (field-id 2, `utf8`), both non-nullable —
+/// matching `write_data_parquet`'s fixture schema and this helper's own
+/// `["ID", "NAME"]` projection (lowercase logical names against an uppercase
+/// projection, exactly as `scan_name_mapping.rs`'s helper already does).
+///
+/// Every new request-count assertion in this file MUST build its spec through
+/// this helper, never through `scan_spec` (decision-log [8]). An empty
+/// `logical_schema` sends `register_file_list` down the
+/// `ParquetFormat::infer_schema` branch (`crates/lakehouse-engine/src/scan/raw_scan.rs:203-216`),
+/// which fetches the FIRST assigned file's Parquet footer BEFORE Phase B runs
+/// and which `TrackingStore::get_opts` records — so with a delete-free file
+/// first the per-file zero-GET assertion would fail, and with a
+/// delete-carrying file first the fetched-once assertion would fail, because
+/// the inference entry carries `LocalFileSystem`'s real `last_modified` while
+/// `object_meta_for` builds `Utc.timestamp_nanos(0)`, `CachedFileMetadataEntry
+/// ::is_valid_for` misses, and Phase B re-fetches.
+fn scan_spec_with_logical_schema(
+    files: Vec<FileEntry>,
+    filter: Option<String>,
+    limit: Option<u64>,
+) -> ScanSpec {
+    ScanSpec {
+        common: CommonScanSpec {
+            projection: vec!["ID".into(), "NAME".into()],
+            filter,
+            limit,
+            storage: dummy_storage(),
+            df_batch_size: 64,
+            logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
             ..Default::default()
         },
         files,
@@ -656,24 +717,28 @@ struct TrackingStore {
     inner: Arc<dyn ObjectStore>,
     gets: Arc<std::sync::Mutex<Vec<ObjectStorePath>>>,
     calls: Arc<AtomicUsize>,
-    /// Present only for the delete-read concurrency-bound tests
-    /// (`scan_delete_reads_*`); `None` for the plain tracking uses. When set, a
-    /// non-HEAD `get_opts` whose location matches a delete-file needle is counted
-    /// as an in-flight delete read (peak recorded) and delayed a fixed interval to
-    /// force deterministic overlap. Data-file reads never match a needle, so they
-    /// are neither counted nor delayed.
+    /// Present for both the delete-read AND footer-fetch concurrency-bound
+    /// tests (`scan_delete_reads_*`, `scan_footer_fetches_*`); `None` for the
+    /// plain tracking uses. When set, a non-HEAD `get_opts` whose location
+    /// matches a probed needle (a delete file's or a data file's bare filename,
+    /// depending on which the test supplies) is counted as an in-flight probed
+    /// read (peak recorded) and delayed a fixed interval to force deterministic
+    /// overlap. A read matching no needle is neither counted nor delayed.
     concurrency: Option<ConcurrencyProbe>,
 }
 
-/// Instrumentation for the delete-read concurrency-bound tests: an atomic
-/// peak-concurrency counter over delete-file reads plus a fixed artificial delay
-/// that forces genuine overlap without real I/O timing.
+/// Instrumentation shared by the delete-read AND footer-fetch concurrency-bound
+/// tests: an atomic peak-concurrency counter over probed reads (delete-file
+/// bodies, or data-file footers for the footer-fetch tests) plus a fixed
+/// artificial delay that forces genuine overlap without real I/O timing.
 #[derive(Debug)]
 struct ConcurrencyProbe {
-    /// Bare filenames identifying the delete files to instrument. A non-HEAD
-    /// `get_opts` whose object-store path contains any of these is a delete read.
-    delete_needles: Vec<String>,
-    /// Delete reads currently inside a delayed `get_opts`.
+    /// Bare filenames identifying the reads to instrument — delete files for
+    /// the delete-read bound tests, data files for the footer-fetch bound
+    /// tests. A non-HEAD `get_opts` whose object-store path contains any of
+    /// these is a probed read.
+    needles: Vec<String>,
+    /// Probed reads currently inside a delayed `get_opts`.
     in_flight: Arc<AtomicUsize>,
     /// Maximum value `in_flight` ever reached — the observed peak concurrency.
     peak: Arc<AtomicUsize>,
@@ -683,11 +748,9 @@ struct ConcurrencyProbe {
 }
 
 impl ConcurrencyProbe {
-    fn is_delete_read(&self, location: &ObjectStorePath) -> bool {
+    fn is_probed_read(&self, location: &ObjectStorePath) -> bool {
         let path = location.as_ref();
-        self.delete_needles
-            .iter()
-            .any(|n| path.contains(n.as_str()))
+        self.needles.iter().any(|n| path.contains(n.as_str()))
     }
 }
 
@@ -738,17 +801,22 @@ impl ObjectStore for TrackingStore {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.gets.lock().unwrap().push(location.clone());
         }
-        // Concurrency instrumentation (delete-read bound tests only): record the
-        // peak number of overlapping delete-file reads and hold each one "in
-        // flight" for a fixed interval. Gated to non-HEAD reads of delete files so
-        // data-file reads are neither counted nor delayed. The permit that bounds
-        // this concurrency is held by the production code across the whole
-        // `read_delete_file_positions` call, whose `get_opts` are sequential — so
-        // the count observed here is exactly the number of delete reads holding a
-        // semaphore permit, and can never exceed the budget.
+        // Concurrency instrumentation: record the peak number of overlapping
+        // PROBED reads and hold each one "in flight" for a fixed interval. Gated
+        // to non-HEAD reads matching a needle (see `ConcurrencyProbe::needles`) so
+        // unrelated reads are neither counted nor delayed. When the needles name
+        // DELETE files, the permit that bounds this concurrency is held by the
+        // production code across the whole `read_delete_file_positions` call,
+        // whose `get_opts` are sequential — so the count observed here is exactly
+        // the number of delete reads holding a semaphore permit, and can never
+        // exceed the budget. When the needles name DATA files instead (the
+        // footer-fetch bound tests), that guarantee holds ONLY for a driver that
+        // constructs the physical plan and never executes it: an executed scan's
+        // opener re-reads those same data files at execute time while holding no
+        // permit, which would inflate this monotonic peak past the budget.
         if !options.head
             && let Some(probe) = &self.concurrency
-            && probe.is_delete_read(location)
+            && probe.is_probed_read(location)
         {
             let now = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             probe.peak.fetch_max(now, Ordering::SeqCst);
@@ -972,18 +1040,17 @@ const DELETE_READ_DELAY: Duration = Duration::from_millis(50);
 const DELETE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build a [`TrackingStore`] over a plain `LocalFileSystem` instrumented with a
-/// peak-concurrency probe over the given delete-file names. Returns the store and
-/// a handle to its peak-concurrency counter.
-fn tracking_store_with_probe(
-    delete_needles: Vec<String>,
-) -> (Arc<TrackingStore>, Arc<AtomicUsize>) {
+/// peak-concurrency probe over the given bare filenames — delete files for the
+/// `scan_delete_reads_*` tests, data files for the `scan_footer_fetches_*`
+/// tests. Returns the store and a handle to its peak-concurrency counter.
+fn tracking_store_with_probe(needles: Vec<String>) -> (Arc<TrackingStore>, Arc<AtomicUsize>) {
     let peak = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(TrackingStore {
         inner: Arc::new(LocalFileSystem::new()),
         gets: Arc::new(std::sync::Mutex::new(Vec::new())),
         calls: Arc::new(AtomicUsize::new(0)),
         concurrency: Some(ConcurrencyProbe {
-            delete_needles,
+            needles,
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak: Arc::clone(&peak),
             delay: DELETE_READ_DELAY,
@@ -1671,6 +1738,395 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
         total_rows(&rows),
         0,
         "all of f2's rows must be deleted despite absent statistics"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Recurse the physical plan, collecting every leaf node (no children) as an
+/// owned `Arc<dyn ExecutionPlan>`. Mirrors `scan_agg_projection_pruning.rs`'s
+/// `collect_leaf_scans`, which collects labels/schemas instead of the node
+/// itself; this variant returns the node so its `DataSourceExec` can be
+/// downcast to inspect the `FileScanConfig` it built.
+fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
+    let children = plan.children();
+    if children.is_empty() {
+        out.push(Arc::clone(plan));
+    } else {
+        for child in children {
+            collect_leaf_execs(child, out);
+        }
+    }
+}
+
+/// The raw scan plan's single leaf, downcast to its `FileScanConfig` (the
+/// Parquet `DataSourceExec` the production provider builds). Asserts there is
+/// exactly one leaf and that it is Parquet-backed, so a caller can inspect
+/// `file_groups` directly.
+fn leaf_file_scan_config(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> datafusion::datasource::physical_plan::FileScanConfig {
+    let mut leaves = Vec::new();
+    collect_leaf_execs(plan, &mut leaves);
+    assert_eq!(leaves.len(), 1, "raw scan plan must have exactly one leaf");
+    let (file_scan_config, _parquet_source) = leaves[0]
+        .downcast_ref::<DataSourceExec>()
+        .expect("leaf must be a DataSourceExec")
+        .downcast_to_file_source::<ParquetSource>()
+        .expect("leaf must be backed by a ParquetSource");
+    file_scan_config.clone()
+}
+
+/// Scenario (connection-concurrency bound, PLAN CONSTRUCTION ONLY): with a
+/// footer-fetch budget of N and MORE than N delete-carrying data files to
+/// fetch footers for, the concurrent footer fetches peak at EXACTLY N — the
+/// shared instance-level semaphore Phase B now shares with Phase A admits N at
+/// a time and no more.
+///
+/// PLAN CONSTRUCTION ONLY: `build_raw_scan_physical_plan` is awaited and
+/// `peak` is read IMMEDIATELY afterward; the returned plan is NEVER executed.
+/// The needles here are DATA-file names, not delete-file names (unlike
+/// `scan_delete_reads_bounded_by_connection_budget`), so executing the plan
+/// would let the opener's execute-time column reads of those same files —
+/// which hold no semaphore permit — latch into the same monotonic `fetch_max`
+/// peak and turn the assertion into an order-dependent flake.
+///
+/// File order is asserted from the PLAN itself (`leaf_file_scan_config`'s
+/// `file_groups`), not from execution.
+#[test]
+fn scan_footer_fetches_bounded_by_connection_budget() {
+    const BUDGET: usize = 3;
+    const DATA_FILES: usize = 6; // strictly greater than BUDGET
+
+    let dir = temp_dir("footer_bounded_budget");
+
+    let mut entries = Vec::with_capacity(DATA_FILES);
+    let mut needles = Vec::with_capacity(DATA_FILES);
+    let mut data_urls = Vec::with_capacity(DATA_FILES);
+    for i in 0..DATA_FILES {
+        let data_name = format!("data_{i}.parquet");
+        let data_url = write_data_parquet(&dir, &data_name, &(0..10).collect::<Vec<_>>(), 4);
+        let delete_url = write_delete_parquet(&dir, &format!("del_{i}.parquet"), &[(&data_url, 0)]);
+        entries.push(FileEntry::with_deletes(
+            data_url.clone(),
+            local_file_size(&data_url),
+            vec![delete_ref(&delete_url)],
+        ));
+        needles.push(file_needle(&data_url));
+        data_urls.push(data_url);
+    }
+
+    let mut spec = scan_spec_with_logical_schema(entries, None, None);
+    spec.common.s3_max_connections = BUDGET;
+
+    let (store, peak) = tracking_store_with_probe(needles.clone());
+
+    let plan = block_on(async {
+        let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        ctx.runtime_env()
+            .register_object_store(&Url::parse(&data_urls[0]).expect("register url"), store);
+        register_files(&ctx, "scan_target", &spec)
+            .await
+            .expect("register_files must succeed");
+        tokio::time::timeout(
+            DELETE_READ_TIMEOUT,
+            build_raw_scan_physical_plan(&ctx, &spec),
+        )
+        .await
+        .expect("plan construction must finish within the timeout, not hang")
+        .expect("physical plan must build")
+    });
+
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        BUDGET,
+        "concurrent footer fetches must peak at EXACTLY the connection budget ({BUDGET}): \
+         a lower peak means the fan-out never ran, a higher peak means the bound leaked"
+    );
+
+    let file_scan_config = leaf_file_scan_config(&plan);
+    assert_eq!(
+        file_scan_config.file_groups.len(),
+        1,
+        "a single-shard raw scan must produce exactly one file group"
+    );
+    let group_locations: Vec<String> = file_scan_config.file_groups[0]
+        .iter()
+        .map(|f| f.object_meta.location.as_ref().to_string())
+        .collect();
+    assert_eq!(
+        group_locations.len(),
+        DATA_FILES,
+        "the file group must list every assigned data file"
+    );
+    for (i, needle) in needles.iter().enumerate() {
+        assert!(
+            group_locations[i].contains(needle.as_str()),
+            "file group entry {i} must be {needle} (spec order), got {}: {group_locations:?}",
+            group_locations[i]
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (file-metadata, PLAN CONSTRUCTION ONLY): a shard mixing
+/// delete-carrying and delete-free data files fetches a footer ONLY for the
+/// delete-carrying ones, and exactly once each — a delete-free file costs no
+/// footer fetch of its own, proving Phase B's fan-out (task 1.6) does not
+/// widen I/O beyond the entries that actually need an access plan.
+///
+/// PLAN CONSTRUCTION ONLY, for the same reason as
+/// `scan_footer_fetches_bounded_by_connection_budget`: the plan is built and
+/// never executed, so the opener's execute-time reads of these same files
+/// never contaminate the `get_opts` counts read immediately afterward.
+#[test]
+fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
+    let dir = temp_dir("mixed_shard_footers");
+
+    // Interleaved order: delete-free, delete-carrying, delete-free, delete-carrying.
+    let free_a = write_data_parquet(&dir, "free_a.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let carrying_b =
+        write_data_parquet(&dir, "carrying_b.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let del_b = write_delete_parquet(&dir, "del_b.parquet", &[(&carrying_b, 0)]);
+    let free_c = write_data_parquet(&dir, "free_c.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let carrying_d =
+        write_data_parquet(&dir, "carrying_d.parquet", &(0..10).collect::<Vec<_>>(), 4);
+    let del_d = write_delete_parquet(&dir, "del_d.parquet", &[(&carrying_d, 0)]);
+
+    let entries = vec![
+        FileEntry::new(free_a.clone(), local_file_size(&free_a)),
+        FileEntry::with_deletes(
+            carrying_b.clone(),
+            local_file_size(&carrying_b),
+            vec![delete_ref(&del_b)],
+        ),
+        FileEntry::new(free_c.clone(), local_file_size(&free_c)),
+        FileEntry::with_deletes(
+            carrying_d.clone(),
+            local_file_size(&carrying_d),
+            vec![delete_ref(&del_d)],
+        ),
+    ];
+    let spec_order = [
+        file_needle(&free_a),
+        file_needle(&carrying_b),
+        file_needle(&free_c),
+        file_needle(&carrying_d),
+    ];
+    let delete_carrying_needles = [file_needle(&carrying_b), file_needle(&carrying_d)];
+    let delete_free_needles = [file_needle(&free_a), file_needle(&free_c)];
+
+    let spec = scan_spec_with_logical_schema(entries, None, None);
+
+    let gets = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(TrackingStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        gets: Arc::clone(&gets),
+        calls: Arc::new(AtomicUsize::new(0)),
+        concurrency: None,
+    });
+
+    let plan = block_on(async {
+        let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+        ctx.runtime_env()
+            .register_object_store(&Url::parse(&free_a).expect("register url"), store);
+        register_files(&ctx, "scan_target", &spec)
+            .await
+            .expect("register_files must succeed");
+        build_raw_scan_physical_plan(&ctx, &spec)
+            .await
+            .expect("physical plan must build")
+    });
+
+    for needle in &delete_free_needles {
+        assert_eq!(
+            count_gets_matching(&gets, needle.as_str()),
+            0,
+            "a delete-free file must cost no footer fetch of its own: {needle}"
+        );
+    }
+    for needle in &delete_carrying_needles {
+        assert_eq!(
+            count_gets_matching(&gets, needle.as_str()),
+            1,
+            "a delete-carrying file's footer must be fetched exactly once: {needle}"
+        );
+    }
+
+    let file_scan_config = leaf_file_scan_config(&plan);
+    assert_eq!(
+        file_scan_config.file_groups.len(),
+        1,
+        "a single-shard raw scan must produce exactly one file group"
+    );
+    let group = &file_scan_config.file_groups[0];
+    assert_eq!(
+        group.iter().count(),
+        spec_order.len(),
+        "the file group must list every assigned file"
+    );
+    for (i, (partitioned, needle)) in group.iter().zip(spec_order.iter()).enumerate() {
+        let location = partitioned.object_meta.location.as_ref();
+        assert!(
+            location.contains(needle.as_str()),
+            "file group entry {i} must be {needle} (spec order), got {location}"
+        );
+        let has_access_plan = partitioned.extension::<ParquetAccessPlan>().is_some();
+        let expect_access_plan = delete_carrying_needles.contains(needle);
+        assert_eq!(
+            has_access_plan, expect_access_plan,
+            "file group entry {i} ({needle}) access-plan presence must match its delete-carrying status"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (shared limiter across join sides, PLAN CONSTRUCTION ONLY — the
+/// regression guard the single-provider footer tests cannot give): a broadcast
+/// join whose fact AND dimension sides BOTH carry positional deletes on every
+/// assigned data file, so BOTH sides run a Phase B footer fan-out.
+/// `register_join_tables` builds ONE `Arc<Semaphore>` sized `s3_max_connections`
+/// and clones it into both sides; with `planning_concurrency` pinned to 2
+/// DataFusion plans the two scan leaves concurrently, so both sides' footer
+/// fetches contend for the SAME budget.
+///
+/// The peak reaches EXACTLY N only when the two sides genuinely overlap and draw
+/// from one shared pool: here N=3 with 2 delete-carrying data files per side, so
+/// N is reached only by 2 fact footers + 1 dimension footer in flight together.
+/// A per-provider — or Phase-B-private — semaphore would give each side its own
+/// size-3 pool, admit both its footers at once, and peak at 4. That divergence
+/// (3 for one shared handle, 4 for two) is the whole point of this test, and no
+/// single-provider test can observe it.
+///
+/// A peak of 2 would mean the two leaves were planned sequentially rather than
+/// concurrently, collapsing the overlap to one in-flight footer fetch per side
+/// at a time; a peak of 4 would mean each side drew from its own per-provider
+/// semaphore instead of the one shared handle.
+///
+/// PLAN CONSTRUCTION ONLY: [`build_join_physical_plan`] registers both sides and
+/// returns the physical plan WITHOUT executing it, and `peak` is read
+/// immediately after it returns. `run_join_scan_with_session` MUST NOT be used
+/// here. The needles below are DATA-file names, not the delete-file names
+/// `scan_delete_reads_bounded_across_join_sides` uses, and the opener never
+/// reads a delete file — so an executed join would count and delay the opener's
+/// execute-time column reads of those same four data files, which hold no
+/// semaphore permit, into this same monotonic `fetch_max` peak, latching any
+/// execute-time overlap above N permanently and turning `assert_eq!` into an
+/// order-dependent flake.
+///
+/// Needling only the DATA files also keeps Phase A's delete-file reads
+/// undelayed, so the peak this test pins is built purely from Phase B windows.
+///
+/// BOTH sides carry a non-empty `logical_schema`, built through the same
+/// [`logical_fields`] seam as the single-provider tests but with the column
+/// names `write_keyed_parquet` actually writes (decision-log [8] applies to a
+/// join's peak assertion exactly as it does to a single provider's): an empty
+/// `logical_schema` sends `register_file_list` down the
+/// `ParquetFormat::infer_schema` branch, whose GET against the first assigned —
+/// and therefore needled — DATA file is a DELAYED read taken outside the
+/// semaphore, contaminating the very peak asserted here.
+///
+/// Post-delete row-set equality is deliberately NOT asserted here;
+/// `scan_delete_reads_bounded_across_join_sides` already covers it, executing
+/// against its own store with no data-file needles.
+#[test]
+fn scan_footer_fetches_bounded_across_join_sides() {
+    const BUDGET: usize = 3;
+    const FILES_PER_SIDE: usize = 2; // 2 + 2 = 4 footers, strictly greater than BUDGET
+
+    let dir = temp_dir("join_footer_shared_budget");
+
+    // Fact (orders) and dimension (customer) sides with disjoint column names,
+    // as the VS disjoint-column guarantee the join path relies on requires.
+    // EVERY data file carries its own one-position delete file, so both sides
+    // fetch a footer per assigned file during access-plan construction.
+    let mut needles = Vec::with_capacity(2 * FILES_PER_SIDE);
+    let mut fact_entries = Vec::with_capacity(FILES_PER_SIDE);
+    let mut dim_entries = Vec::with_capacity(FILES_PER_SIDE);
+    let mut first_data_url = None;
+    for i in 0..FILES_PER_SIDE {
+        let keys: Vec<i64> = ((i as i64) * 8..(i as i64) * 8 + 8).collect();
+        let orders_url = write_keyed_parquet(
+            &dir,
+            &format!("orders_{i}.parquet"),
+            "o_key",
+            "o_data",
+            &keys,
+            4,
+        );
+        let customer_url = write_keyed_parquet(
+            &dir,
+            &format!("customer_{i}.parquet"),
+            "c_key",
+            "c_data",
+            &keys,
+            4,
+        );
+        let fact_delete_url =
+            write_delete_parquet(&dir, &format!("fact_del_{i}.parquet"), &[(&orders_url, 0)]);
+        let dim_delete_url =
+            write_delete_parquet(&dir, &format!("dim_del_{i}.parquet"), &[(&customer_url, 0)]);
+
+        needles.push(file_needle(&orders_url));
+        needles.push(file_needle(&customer_url));
+        first_data_url.get_or_insert_with(|| orders_url.clone());
+        fact_entries.push(FileEntry::with_deletes(
+            orders_url.clone(),
+            local_file_size(&orders_url),
+            vec![delete_ref(&fact_delete_url)],
+        ));
+        dim_entries.push(FileEntry::with_deletes(
+            customer_url.clone(),
+            local_file_size(&customer_url),
+            vec![delete_ref(&dim_delete_url)],
+        ));
+    }
+    let register_url = first_data_url.expect("at least one data file per side");
+
+    let mut spec = scan_spec_with_logical_schema(fact_entries, None, None);
+    spec.common.projection = vec!["O_KEY".into(), "C_DATA".into()];
+    spec.common.logical_schema = logical_fields(&[("o_key", "int64"), ("o_data", "utf8")]);
+    spec.common.s3_max_connections = BUDGET;
+    spec.common.join = Some(JoinSpec {
+        table_root: String::new(),
+        files: dim_entries,
+        logical_schema: logical_fields(&[("c_key", "int64"), ("c_data", "utf8")]),
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        condition: "\"C_KEY\" = \"O_KEY\"".into(),
+    });
+
+    let (store, peak) = tracking_store_with_probe(needles);
+
+    block_on(async {
+        let mut config = session_config_for_spec(&spec);
+        // Pin concurrent planning of the two scan leaves regardless of core
+        // count, so both sides' Phase B fan-out runs against the one shared
+        // budget — a single-core runner must not serialize the leaves and pass
+        // vacuously.
+        config.options_mut().execution.planning_concurrency = 2;
+        let session = SessionContext::new_with_config(config);
+        session
+            .runtime_env()
+            .register_object_store(&Url::parse(&register_url).expect("register url"), store);
+        tokio::time::timeout(
+            DELETE_READ_TIMEOUT,
+            build_join_physical_plan(&session, &spec),
+        )
+        .await
+        .expect("join plan construction must finish within the timeout, not hang")
+        .expect("join physical plan must build");
+    });
+
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        BUDGET,
+        "data-file footer fetches across BOTH join sides must peak at EXACTLY the shared budget \
+         ({BUDGET}): a peak of {BUDGET} proves one shared limiter caps both sides' Phase B, a \
+         lower peak means the fan-out never ran, and a peak above {BUDGET} (up to 4) would mean \
+         each provider built its own size-{BUDGET} semaphore"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
