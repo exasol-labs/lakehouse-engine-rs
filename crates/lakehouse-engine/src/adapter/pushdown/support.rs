@@ -3965,17 +3965,23 @@ mod tests {
         );
     }
 
-    /// A literal declared `TIMESTAMP WITH LOCAL TIME ZONE` renders successfully
-    /// (via `render_expression_safe`) but declines to the full-base-row fallback
-    /// because Exasol rejects that type as a UDF EMITS output (sqlCode 22002) —
-    /// mirrors `selectlist_untranslatable_cast_falls_back_to_full_row`.
+    /// A literal declared `TIMESTAMP WITH LOCAL TIME ZONE`, under the pre-existing
+    /// synthetic node name `literal_timestamp_utc` (which DOES render via
+    /// `render_expression_safe`, unlike the real wire name below), widens to the
+    /// full base row because Exasol rejects that declared type as a UDF EMITS
+    /// output (sqlCode 22002) — this isolates the EMITS-type-gate reason from
+    /// the "translator declined" reason the next test covers, mirroring
+    /// `selectlist_untranslatable_cast_falls_back_to_full_row`. The widened
+    /// projection routes to the qualified wrapper (`mod.rs`'s
+    /// `RequestShape::RowScan` arm), not literally "falls back to the full
+    /// base row" as an end state — `#218`.
     #[test]
-    fn selectlist_tstz_literal_falls_back_to_full_row() {
+    fn selectlist_tstz_literal_widens_via_emits_type_gate() {
         let literal = serde_json::json!({
             "type": "literal_timestamp_utc",
             "value": "2024-03-01 10:00:00"
         });
-        // Confirm the literal actually renders — the decline must be due to the
+        // Confirm the literal actually renders — the widening must be due to the
         // EMITS-type gate, not a render failure.
         assert!(
             render_expression_safe(&literal).is_some(),
@@ -3994,15 +4000,67 @@ mod tests {
             }
         });
         let pushdown_req = request["pushdownRequest"].clone();
-        let (proj_cols, proj_types, _widened) =
-            extract_projection(&request, &pushdown_req).unwrap();
+        let (proj_cols, proj_types, widened) = extract_projection(&request, &pushdown_req).unwrap();
+        assert!(
+            widened,
+            "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen the projection \
+             so the RowScan dispatcher routes it to the qualified wrapper"
+        );
         assert_eq!(
             proj_cols,
             vec![
                 ProjectionItem::Column("ID".into()),
                 ProjectionItem::Column("NAME".into()),
             ],
-            "a TIMESTAMP WITH LOCAL TIME ZONE literal must fall back to the full base row: {proj_cols:?}"
+            "a TIMESTAMP WITH LOCAL TIME ZONE literal must widen to the full base row: {proj_cols:?}"
+        );
+        assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
+    }
+
+    /// The REAL wire name `literal_timestamputc` (#242) also widens the
+    /// projection, so it reaches the same qualified-wrapper routing as the
+    /// synthetic name above — this is the mechanism actual live traffic
+    /// exercises. The reason differs (the DataFusion dialect deliberately
+    /// declines this wire name, so `render_expression_safe` returns `None` and
+    /// `project_columns` widens via its "translator declined" arm, not the
+    /// EMITS-type gate) but the observable routing outcome must be identical.
+    #[test]
+    fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
+        let literal = serde_json::json!({
+            "type": "literal_timestamputc",
+            "value": "2024-03-01 10:00:00"
+        });
+        assert!(
+            render_expression_safe(&literal).is_none(),
+            "the DataFusion dialect must keep declining the real wire name (#242): \
+             a render here would silently start pushing TSTZ predicates into the \
+             scan filter"
+        );
+        let request = serde_json::json!({
+            "involvedTables": [{
+                "columns": [
+                    {"name": "ID", "dataType": {"type": "DECIMAL", "precision": 10, "scale": 0}},
+                    {"name": "NAME", "dataType": {"type": "VARCHAR", "size": 100}},
+                ]
+            }],
+            "pushdownRequest": {
+                "selectList": [literal],
+                "selectListDataTypes": [{"type": "TIMESTAMP", "withLocalTimeZone": true}],
+            }
+        });
+        let pushdown_req = request["pushdownRequest"].clone();
+        let (proj_cols, proj_types, widened) = extract_projection(&request, &pushdown_req).unwrap();
+        assert!(
+            widened,
+            "the real-wire-name TSTZ literal must widen the projection so the \
+             RowScan dispatcher routes it to the qualified wrapper"
+        );
+        assert_eq!(
+            proj_cols,
+            vec![
+                ProjectionItem::Column("ID".into()),
+                ProjectionItem::Column("NAME".into()),
+            ]
         );
         assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
     }

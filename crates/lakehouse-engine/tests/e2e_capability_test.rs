@@ -1124,6 +1124,151 @@ fn e2e_all_files_pruned_literal_projection_empty_shape() {
     );
 }
 
+/// Execute `sql` and parse its first column, first row as `f64` —
+/// `SECONDS_BETWEEN` returns a fractional-seconds `DECIMAL`, not an integer.
+fn scalar_seconds(conn: &mut ExaConn, sql: &str) -> f64 {
+    let cols = conn.query_columns(sql);
+    parse_numeric(&cols[0][0])
+}
+
+/// Sets the session's time zone explicitly, so the value assertions below
+/// (#218/#238) have a deterministic, non-UTC zone to check against.
+fn pin_session_time_zone(conn: &mut ExaConn) {
+    conn.execute("ALTER SESSION SET TIME_ZONE = 'EUROPE/BERLIN'");
+}
+
+/// The pinned session's UTC offset in seconds. A fixed local wall-clock
+/// anchor, interpreted in `SESSIONTIMEZONE` and converted to UTC: the
+/// difference is exactly the session's UTC offset at that instant, without
+/// conflating `SESSIONTIMEZONE` (the caller's zone) with `DBTIMEZONE` (the
+/// database's own zone, a separate setting `SYSTIMESTAMP` uses instead).
+fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
+    scalar_seconds(
+        conn,
+        "SELECT SECONDS_BETWEEN(TIMESTAMP '2024-01-01 00:00:00', \
+         CONVERT_TZ(TIMESTAMP '2024-01-01 00:00:00', SESSIONTIMEZONE, 'UTC'))",
+    )
+}
+
+/// Issue #238 (and the identically-caused #239, filter side — not exercised
+/// here): `CURRENT_TIMESTAMP`/`SYSTIMESTAMP` no longer reach the adapter at
+/// all — the `fix-vs-expression-dialect` plan withdrew their capabilities
+/// entirely (`specs/_decision/037-fix-vs-expression-dialect.md`), so Exasol
+/// evaluates its own clock instead of delegating. This is a regression guard
+/// for that already-shipped fix, not new adapter behavior: it pins that a
+/// projected `CURRENT_TIMESTAMP`/`SYSTIMESTAMP` succeeds and matches Exasol's
+/// own native value, rather than the pre-#238 UTC-shifted wrong answer.
+#[test]
+fn e2e_now_family_projection_matches_native_session_local_value() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+    pin_session_time_zone(&mut conn);
+    let offset_seconds = session_utc_offset_seconds(&mut conn);
+    assert!(
+        offset_seconds != 0.0,
+        "fixture precondition: the session's UTC offset must be non-zero, or the \
+         assertion below passes regardless of whether #238 is fixed"
+    );
+
+    for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
+        // Native and projected are measured within a SINGLE statement — the
+        // outer `{expr}` against the subquery's pushed-down `{expr}` — rather
+        // than two separate round-trips, so no wall-clock time can elapse
+        // between the two measurements. A two-statement version's deviation
+        // would be `offset - elapsed_between_queries`, which can still land
+        // under the offset threshold and let a UTC-shift regression pass.
+        let deviation = scalar_seconds(
+            &mut conn,
+            &format!("SELECT SECONDS_BETWEEN({expr}, (SELECT {expr} FROM {table} WHERE id = 1))"),
+        )
+        .abs();
+        assert!(
+            deviation < 1.0,
+            "{expr}'s deviation between the native value and the VS-projected value \
+             ({deviation}s) must be near zero — this is the sharp assertion that \
+             fails if the adapter ever ships the UTC instant instead of Exasol's own \
+             session-local value (the pre-#238 defect, {offset_seconds}s under this \
+             session's zone)"
+        );
+    }
+}
+
+/// Issue #218: a projected `TIMESTAMP WITH LOCAL TIME ZONE` constant — a
+/// `literal_timestamputc` node once Exasol constant-folds the CAST — must
+/// push down and return the EXACT session-local value Exasol computes
+/// natively, not fail with SQL state `04000` (the pre-fix full-base-row
+/// column-count mismatch) and not the pre-fix UTC wall clock. Also covers the
+/// zero-file (all-pruned) path, which must route identically rather than hit
+/// the same `04000` before the dispatcher ever runs.
+#[test]
+fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let table = vs_table();
+    pin_session_time_zone(&mut conn);
+
+    let projection = "CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)";
+
+    // Resolved-file path: exact value match against the same expression
+    // evaluated natively (not hardcoded), so the assertion stays valid if the
+    // fixture's pinned zone ever changes.
+    let native = conn
+        .query_columns(&format!("SELECT {projection}"))
+        .into_iter()
+        .next()
+        .and_then(|col| col.into_iter().next())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("expected a string TSTZ value from the native query"));
+    let projected_sql = format!("SELECT {projection} FROM {table} WHERE id = 1");
+    let projected = conn
+        .query_columns(&projected_sql)
+        .into_iter()
+        .next()
+        .and_then(|col| col.into_iter().next())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| panic!("expected a string TSTZ value from the VS query"));
+    assert_eq!(
+        projected, native,
+        "the projected TSTZ literal must equal Exasol's own native value for the \
+         same expression in the same session"
+    );
+
+    // The pushed wrapper renders the item in the Exasol dialect over a qualified
+    // (`AS "LHS_T0"`) scan, not a narrowed positional `_LH_PROJ_0` EMITS column.
+    let pushed = explain_virtual_sql(&mut conn, &projected_sql);
+    assert!(
+        pushed.contains(r#"AS "LHS_T0""#),
+        "expected the qualified single-table wrapper in the pushed SQL: {pushed}"
+    );
+    assert!(
+        !pushed.contains("_LH_PROJ_0"),
+        "must not be a narrowed positional EMITS projection: {pushed}"
+    );
+
+    // Zero-file path: the same query under an all-pruning predicate must
+    // succeed with zero rows, never SQL state 04000 — the defect class this
+    // guards is a COLUMN-COUNT mismatch, so assert numColumns too, not only
+    // numRows (mirrors `e2e_all_files_pruned_literal_projection_empty_shape`).
+    let resp = conn.execute(&format!("SELECT {projection} FROM {table} WHERE id > 1000"));
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let num_columns = result_set["numColumns"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numColumns in resultSet: {resp}"));
+    assert_eq!(
+        num_columns, 1,
+        "expected 1 column (the projected TSTZ literal) even with all files pruned: {resp}"
+    );
+    let num_rows = result_set["numRows"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("expected numRows in resultSet: {resp}"));
+    assert_eq!(
+        num_rows, 0,
+        "an all-pruning predicate over the projected TSTZ literal must succeed \
+         with zero rows, never fail with 04000: {resp}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8.7  HAVING clause pushdown
 // ---------------------------------------------------------------------------
