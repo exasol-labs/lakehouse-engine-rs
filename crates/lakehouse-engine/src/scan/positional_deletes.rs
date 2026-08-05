@@ -26,6 +26,7 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
+use crate::scan::diagnostics;
 use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageBackend};
 use crate::scan::{
     FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
@@ -52,7 +53,7 @@ use futures::future::try_join_all;
 use object_store::{ObjectMeta, ObjectStore};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
@@ -490,8 +491,17 @@ fn build_access_plan(
 /// The physical plan is produced through [`ParquetFormat::create_physical_plan`]
 /// — the same seam `ListingTable` uses — which applies the session's Parquet
 /// options and installs a `CachedParquetFileReaderFactory` backed by the session
-/// [`FileMetadataCache`]; access-plan construction reads through that SAME cache,
-/// so a delete-carrying file's footer parses once (task 2.5).
+/// [`FileMetadataCache`]; access-plan construction reads through that SAME cache
+/// with the SAME metadata size hint, so a delete-carrying file's footer parses
+/// ONCE for both access-plan construction and the scan. The hint has exactly one
+/// owner — [`ParquetFormat::metadata_size_hint`] on the `format` this provider
+/// already holds — read back rather than duplicated as a second constant, so the
+/// two readers cannot disagree on request shape. The once-per-footer property
+/// holds on the production path only because access-plan construction is the
+/// FIRST reader of the footer: the adapter always supplies a non-empty
+/// `logical_schema`, which keeps `register_file_list` off the
+/// `ParquetFormat::infer_schema` fallback that would otherwise populate the
+/// cache first, under a request shape the hinted fetch does not match.
 ///
 /// [`FileScanConfig`]: datafusion::datasource::physical_plan::FileScanConfig
 /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
@@ -505,13 +515,14 @@ pub(crate) struct PositionalDeleteScanTable {
     table_root: String,
     secrets: Vec<String>,
     format: Arc<ParquetFormat>,
-    /// Shared instance-level bound on concurrent delete-file reads, sized
-    /// `s3_max_connections` and constructed once per scan invocation. Every
-    /// provider registered for the same invocation (including both sides of a
-    /// broadcast join) holds a clone of the SAME `Arc`, so the whole instance
-    /// stays within one N-permit budget rather than each provider getting its
-    /// own N.
-    delete_read_limiter: Arc<Semaphore>,
+    /// Shared instance-level bound on every object-store read the delete path
+    /// issues while preparing a scan — Phase A delete-file bodies and Phase B
+    /// data-file footers alike, one permit per read — sized `s3_max_connections`
+    /// and constructed once per scan invocation. Every provider registered for
+    /// the same invocation (including both sides of a broadcast join) holds a
+    /// clone of the SAME `Arc`, so the whole instance stays within one
+    /// N-permit budget rather than each provider getting its own N.
+    delete_path_read_limiter: Arc<Semaphore>,
 }
 
 impl PositionalDeleteScanTable {
@@ -527,8 +538,10 @@ impl PositionalDeleteScanTable {
     /// logical schema, and empty when the table has neither. It is carried
     /// through unchanged to the [`FieldIdExprAdapterFactory`] installed in
     /// [`Self::scan`] for name-mapping resolution and the absent-with-default
-    /// fill respectively. `delete_read_limiter` is the shared instance-level
-    /// semaphore bounding concurrent delete-file reads (sized
+    /// fill respectively. `delete_path_read_limiter` is the shared
+    /// instance-level semaphore bounding every object-store read the delete
+    /// path issues while preparing a scan — Phase A delete-file bodies and
+    /// Phase B data-file footers alike, one permit per read — sized
     /// `s3_max_connections`, constructed once per scan invocation and shared
     /// across every registered provider — see the struct-level doc comment).
     #[allow(clippy::too_many_arguments)]
@@ -540,7 +553,7 @@ impl PositionalDeleteScanTable {
         files: Vec<FileEntry>,
         table_root: String,
         storage: &StorageBackend,
-        delete_read_limiter: Arc<Semaphore>,
+        delete_path_read_limiter: Arc<Semaphore>,
     ) -> Self {
         let secrets = storage
             .secret_values()
@@ -556,12 +569,12 @@ impl PositionalDeleteScanTable {
             table_root,
             secrets,
             format: Arc::new(int96_coerced_parquet_format()),
-            delete_read_limiter,
+            delete_path_read_limiter,
         }
     }
 
     /// Phase A: read each of the shard's UNIQUE positional-delete files exactly
-    /// once, concurrently within the shared [`Self::delete_read_limiter`] budget,
+    /// once, concurrently within the shared [`Self::delete_path_read_limiter`] budget,
     /// and merge the surviving positions into a
     /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file
     /// absolute path each delete row targets.
@@ -604,7 +617,7 @@ impl PositionalDeleteScanTable {
         let assigned_ref = &assigned;
         let reads = unique_deletes.into_values().map(|delete| {
             let store = Arc::clone(store);
-            let limiter = Arc::clone(&self.delete_read_limiter);
+            let limiter = Arc::clone(&self.delete_path_read_limiter);
             let secrets = self.secrets.as_slice();
             let table_root = self.table_root.as_str();
             async move {
@@ -632,13 +645,26 @@ impl PositionalDeleteScanTable {
     /// `ParquetAccessPlan` (task 2.4) to each delete-carrying file.
     ///
     /// Phase A ([`Self::collect_delete_positions`]) performs all delete-file
-    /// I/O up front. Phase B (this loop) is delete-file-I/O-free: for each data
-    /// file it looks up the merged position set and, when non-empty, fetches the
-    /// data file's Parquet footer through the shared session [`FileMetadataCache`]
-    /// — the same cache the opener's `CachedParquetFileReaderFactory` reads, so
-    /// the footer parses ONCE for both access-plan construction and the scan, and
-    /// no object-store HEAD is issued — then builds the base [`ParquetAccessPlan`]
-    /// via [`build_access_plan`].
+    /// I/O up front. Phase B (this method) is a bounded-concurrent,
+    /// order-preserving fan-out (`try_join_all` over ALL assigned files,
+    /// preserving input order in the returned `Vec<PartitionedFile>`) that
+    /// performs no DELETE-file I/O of its own: a delete-free entry takes no
+    /// permit from the shared `delete_path_read_limiter` and issues no read. A
+    /// delete-carrying entry instead fetches ITS OWN data file's Parquet footer
+    /// — one object-store round-trip, under one permit from that same shared
+    /// limiter — through the shared session [`FileMetadataCache`], the same
+    /// cache the opener's `CachedParquetFileReaderFactory` reads. The fetch
+    /// supplies the metadata size hint [`ParquetFormat::metadata_size_hint`]
+    /// already governs for the opener, collapsing it to ONE hinted range GET,
+    /// and explicitly skips the page index, since [`build_access_plan`] reads
+    /// only each row group's row count and never the page index. The footer
+    /// therefore parses ONCE for both access-plan construction and the scan,
+    /// and no object-store HEAD is issued — then builds the base
+    /// [`ParquetAccessPlan`] via [`build_access_plan`]. Every footer fetched
+    /// here is also recorded via
+    /// [`diagnostics::record_access_plan_cached_footer`], so a metadata-cache
+    /// eviction that costs the opener a second fetch is observable rather than
+    /// silent (task 1.7b).
     ///
     /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
     async fn partitioned_files(
@@ -658,18 +684,38 @@ impl PositionalDeleteScanTable {
 
         let delete_positions = self.collect_delete_positions(&store).await?;
 
-        let mut files = Vec::with_capacity(self.files.len());
-        for entry in &self.files {
-            let abs = reconstruct_abs_uri(&entry.path, &self.table_root);
-            let meta = object_meta_for(&abs, entry.size)?;
-            let mut partitioned = PartitionedFile::from(meta.clone());
+        let size_hint = self.format.metadata_size_hint();
+        let delete_positions_ref = &delete_positions;
+        let builds = self.files.iter().map(|entry| {
+            let store = Arc::clone(&store);
+            let metadata_cache = Arc::clone(&metadata_cache);
+            let limiter = Arc::clone(&self.delete_path_read_limiter);
+            let secrets = self.secrets.as_slice();
+            let table_root = self.table_root.as_str();
+            async move {
+                let abs = reconstruct_abs_uri(&entry.path, table_root);
+                let meta = object_meta_for(&abs, entry.size)?;
+                let partitioned = PartitionedFile::from(meta.clone());
 
-            if let Some(deletes) = delete_positions.get(abs.as_str())
-                && !deletes.is_empty()
-            {
+                let Some(deletes) = delete_positions_ref
+                    .get(abs.as_str())
+                    .filter(|positions| !positions.is_empty())
+                else {
+                    return Ok(partitioned);
+                };
+
+                let permit = limiter.acquire_owned().await.map_err(|e| {
+                    UdfError::User(redact(
+                        format!(
+                            "delete_path_read_limiter permit unavailable for data-file footer fetch of {abs}: {e}"
+                        ),
+                        secrets,
+                    ))
+                })?;
                 let parquet_metadata = DFParquetMetadata::new(store.as_ref(), &meta)
-                    .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
-                    .with_metadata_size_hint(None)
+                    .with_file_metadata_cache(Some(metadata_cache))
+                    .with_metadata_size_hint(size_hint)
+                    .with_page_index_policy(Some(PageIndexPolicy::Skip))
                     .fetch_metadata()
                     .await
                     .map_err(|e| {
@@ -677,16 +723,17 @@ impl PositionalDeleteScanTable {
                             format!(
                                 "failed to read data-file metadata for delete application: {e}"
                             ),
-                            &self.secrets,
+                            secrets,
                         ))
                     })?;
-                let access_plan = build_access_plan(parquet_metadata.row_groups(), deletes);
-                partitioned = partitioned.with_extension(access_plan);
-            }
+                diagnostics::record_access_plan_cached_footer(&meta.location);
+                drop(permit);
 
-            files.push(partitioned);
-        }
-        Ok(files)
+                let access_plan = build_access_plan(parquet_metadata.row_groups(), deletes);
+                Ok(partitioned.with_extension(access_plan))
+            }
+        });
+        try_join_all(builds).await
     }
 }
 
