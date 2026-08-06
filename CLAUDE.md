@@ -23,6 +23,40 @@ Project mission in: @specs/mission.md
   `initial_instructions` before the first code read/grep/edit — don't default to
   built-in tools out of habit.
 
+## Unit test layout
+
+- Unit tests MUST live in `<module>_tests.rs` beside `<module>.rs`, declared as the last item of
+  `<module>.rs`:
+  ```rust
+  #[cfg(test)]
+  #[path = "<module>_tests.rs"]
+  mod tests;
+  ```
+  For a crate root (`lib.rs`), use the bare `tests.rs` sibling instead (no `lib_` prefix makes sense).
+  For a directory's `mod.rs`, name the sibling after the directory (`<dirname>_tests.rs`), since
+  `mod_tests.rs` is meaningless.
+- The file name MUST match `[0-9a-zA-Z_-]+[_-]tests.rs` (or bare `tests.rs`). `cargo llvm-cov`
+  excludes exactly that pattern from every report; any other name silently re-inflates the coverage
+  percentage.
+- The test module remains a child module of its parent, so `use super::*;` still reaches the
+  parent's private items and its imports.
+- Shared test-only helper modules (`test_support`, golden baselines) MUST also match the pattern —
+  rename the physical file via `#[path = "..."]` while keeping the `mod` identifier unchanged (e.g.
+  `#[path = "test_support_tests.rs"] mod test_support;`), so existing `super::test_support::...`
+  call sites across sibling `*_tests.rs` files don't need to change.
+- Exception: `scan_surface_probe.rs` and `adapter/pushdown_surface_probe.rs` are intentionally left
+  un-renamed — they are compile-time public-surface probes, not test suites, and a `_tests.rs` name
+  would misdescribe them. They still count as production LOC until `cargo-llvm-cov` is wired up
+  (separate follow-up, out of scope for #308); add them to `--ignore-filename-regex` /
+  `sonar.coverage.exclusions` at that point instead of renaming.
+- A single `*_tests.rs` file may hold multiple `#[cfg(test)] mod ...` blocks when a source file has
+  more than one test module (e.g. `scan/diagnostics_tests.rs` holds `phase_telemetry_tests`,
+  `debug_checkpoint_tests`, and `tests` as siblings under one wrapper `mod` in the parent) — the
+  whole file is excluded by its filename regardless of what's inside it.
+- A `#[cfg(test)]` helper that sits outside any test module, directly in a production file, moves
+  into the sibling test file only if nothing outside that module reaches it; leave it in place (and
+  accept the residue) if it's reached from elsewhere (e.g. re-exported for a surface probe).
+
 ## PR title convention
 
 PR titles MUST follow Conventional Commits format: `<type>(<scope>): <description>` (scope is

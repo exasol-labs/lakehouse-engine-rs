@@ -39,7 +39,10 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("session.rs", include_str!("../src/session.rs")),
     ("sigv4.rs", include_str!("../src/sigv4.rs")),
     ("storage.rs", include_str!("../src/storage.rs")),
-    ("test_support.rs", include_str!("../src/test_support.rs")),
+    (
+        "test_support_tests.rs",
+        include_str!("../src/test_support_tests.rs"),
+    ),
     ("vended.rs", include_str!("../src/vended.rs")),
 ];
 
