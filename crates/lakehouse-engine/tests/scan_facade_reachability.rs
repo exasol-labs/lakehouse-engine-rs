@@ -2,7 +2,7 @@
 //! from an external-crate vantage.
 //!
 //! This is a pure `use` list with no behavior. Unlike
-//! `src/scan_surface_probe.rs` (in-crate vantage, sees all 13
+//! `src/scan_surface_probe_tests.rs` (in-crate vantage, sees all 13
 //! always-available `pub`/`pub(crate)` items plus the one `#[cfg(test)]`-gated
 //! `pub` item), this file lives in the `tests/` crate and so can only see
 //! items that are actually `pub` AND reachable outside the defining crate's

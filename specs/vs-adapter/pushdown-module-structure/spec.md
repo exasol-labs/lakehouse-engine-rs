@@ -101,7 +101,7 @@ Decomposes the virtual-schema pushdown-planning code into single-responsibility 
 
 ### Scenario: The pushdown façade releases exactly the three items the catalog extraction relocates
 
-* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes — `src/adapter/pushdown_surface_probe.rs` naming 25 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 15 externally-`pub` items — both citing a baseline file that `/speq:record` archived into the gitignored `specs/_recorded/` tree and that therefore no longer exists
+* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes — `src/adapter/pushdown_surface_probe_tests.rs` naming 25 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 15 externally-`pub` items — both citing a baseline file that `/speq:record` archived into the gitignored `specs/_recorded/` tree and that therefore no longer exists
 * *WHEN* the catalog access layer moves into the `lakehouse-catalog` crate and the vended mechanism functions are demoted
 * *THEN* EXACTLY THREE items SHALL leave the façade and no other item SHALL be added, removed, narrowed, or widened: `extract_vended_keys` and `merge_vended_into_storage` leave because they become crate-private in `lakehouse-catalog`, and `list_namespace_tables` leaves because it relocates to `lakehouse_catalog::list_namespace_tables`
 * *AND* the in-crate probe SHALL name 22 items and the external probe SHALL name 12, and both MUST compile, so any further narrowing is a build failure rather than a silent gap

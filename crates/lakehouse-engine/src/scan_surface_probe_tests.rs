@@ -2,7 +2,7 @@
 //!
 //! This is a pure `use` list with no behavior. It exists at a vantage point
 //! OUTSIDE `scan`'s private submodules — a sibling file at the crate root,
-//! mirroring `adapter/pushdown_surface_probe.rs`'s placement one level above
+//! mirroring `adapter/pushdown_surface_probe_tests.rs`'s placement one level above
 //! `adapter::pushdown`'s own submodules — so that it only sees items at
 //! their declared visibility, not the elevated visibility a `mod tests`
 //! nested inside `raw_scan`/`join_scan`/`partial_agg`/`object_store`/
@@ -22,9 +22,8 @@ use crate::scan::{
     register_files, run_join_scan_with_session, run_raw_scan_with_session,
 };
 
-// `build_partial_agg_sql` is re-exported flat only under `#[cfg(test)]`
-// (it backs the scan crate's own unit tests, never an external consumer),
-// so reaching it here needs the same gate — otherwise a non-test build of
-// this probe would fail to compile.
-#[cfg(test)]
+// `build_partial_agg_sql` is re-exported flat only under `#[cfg(test)]` (it
+// backs the scan crate's own unit tests, never an external consumer). This
+// whole file is test-only via its `#[cfg(test)] mod scan_surface_probe;`
+// declaration in `lib.rs`, so no further gate is needed to reach it.
 use crate::scan::build_partial_agg_sql;

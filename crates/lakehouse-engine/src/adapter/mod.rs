@@ -7,6 +7,7 @@ pub mod connection;
 pub mod iceberg_predicate;
 pub mod pushdown;
 #[cfg(test)]
+#[path = "pushdown_surface_probe_tests.rs"]
 mod pushdown_surface_probe;
 pub mod sharding;
 pub mod tables;

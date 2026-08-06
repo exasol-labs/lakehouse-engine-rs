@@ -2,7 +2,7 @@
 //! from an external-crate vantage.
 //!
 //! This is a pure `use` list with no behavior. Unlike
-//! `src/adapter/pushdown_surface_probe.rs`, which shares the crate and so also
+//! `src/adapter/pushdown_surface_probe_tests.rs`, which shares the crate and so also
 //! sees `pub(crate)` items, this file lives in the `tests/` crate and can only
 //! see items that are genuinely `pub`. Its 12 items are therefore a subset of
 //! that probe's 22.
