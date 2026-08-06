@@ -23,6 +23,34 @@ Project mission in: @specs/mission.md
   `initial_instructions` before the first code read/grep/edit — don't default to
   built-in tools out of habit.
 
+## Unit test layout
+
+- **No test code in a production source file.** Unit tests MUST live in a sibling file named after
+  the module's own file, declared with the module's other `mod` declarations or as the last item of
+  that module:
+  ```rust
+  #[cfg(test)]
+  #[path = "<module>_tests.rs"]
+  mod tests;
+  ```
+  `foo.rs` → `foo_tests.rs`, `lib.rs` → `lib_tests.rs`, `foo/mod.rs` → `foo/foo_tests.rs`
+  (`mod_tests.rs` would be meaningless). `#[path]` resolves relative to the declaring file's own
+  directory.
+- The file name MUST match `[0-9a-zA-Z_-]+[_-]tests.rs`. `cargo llvm-cov` excludes exactly that
+  pattern from every report; any other name silently re-inflates the coverage percentage.
+- The test module remains a child module of its parent, so `use super::*;` still reaches the
+  parent's private items and its imports.
+- A test-only helper belongs in the sibling `_tests.rs` file, not in the production module — add it
+  there as `impl super::TypeName { ... }` or a plain free fn, **not** gated by `#[cfg(test)]`, since
+  the whole file is already test-only. A helper shared across several sibling `_tests.rs` files gets
+  its own file, named to match the pattern and declared with `#[path]` so the `mod` identifier keeps
+  its honest name: `#[path = "test_support_tests.rs"] mod test_support;`. Compile-time surface
+  probes are test-only code and follow the same rule
+  (`#[path = "scan_surface_probe_tests.rs"] mod scan_surface_probe;`).
+- The only `#[cfg(test)]` that may remain in a production module is a re-export widening visibility
+  for tests (`#[cfg(test)] pub use ...`) — it has to sit in the module owning the item. Test *code*
+  never stays behind.
+
 ## PR title convention
 
 PR titles MUST follow Conventional Commits format: `<type>(<scope>): <description>` (scope is

@@ -26,8 +26,9 @@ use lakehouse_catalog::{
     redact_secret_values, resolve_vended_storage,
 };
 
-/// Every `.rs` source file under `crates/lakehouse-catalog/src/`, embedded at
-/// compile time via `include_str!`. Paths are relative to this test file:
+/// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
+/// (`*_tests.rs` siblings hold no production surface), embedded at compile time
+/// via `include_str!`. Paths are relative to this test file:
 /// `crates/lakehouse-catalog/tests` -> `crates/lakehouse-catalog/src`.
 const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("auth.rs", include_str!("../src/auth.rs")),
@@ -39,7 +40,6 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("session.rs", include_str!("../src/session.rs")),
     ("sigv4.rs", include_str!("../src/sigv4.rs")),
     ("storage.rs", include_str!("../src/storage.rs")),
-    ("test_support.rs", include_str!("../src/test_support.rs")),
     ("vended.rs", include_str!("../src/vended.rs")),
 ];
 

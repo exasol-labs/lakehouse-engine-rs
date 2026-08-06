@@ -15,6 +15,7 @@ mod storage;
 mod vended;
 
 #[cfg(test)]
+#[path = "test_support_tests.rs"]
 mod test_support;
 
 pub use creds::{CatalogProps, ConnectionCreds, StorageProps};
