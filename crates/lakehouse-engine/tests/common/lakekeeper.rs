@@ -19,6 +19,8 @@
 
 use std::time::Duration;
 
+use lakehouse_catalog::ConnectionCreds;
+
 use super::stack::{self, CatalogConnectionPassword, wait_for_url};
 
 // ---------------------------------------------------------------------------
@@ -487,6 +489,37 @@ pub fn lakekeeper_connection_password(
         secret_key: STATIC_SECRET_KEY.to_string(),
         path_style: true,
         ..base
+    }
+}
+
+/// The `ConnectionCreds` a HOST-side test parses out of a Lakekeeper CONNECTION,
+/// projected from [`lakekeeper_connection_password`] so the two can never describe
+/// different CONNECTIONs.
+///
+/// Exactly one field is deliberately not the UDF's: `oauth2_server_uri` is the
+/// host-mapped Keycloak token endpoint, because the UDF-internal Docker-network URL
+/// the CONNECTION carries is unreachable from the test process. `sas_token` is
+/// absent — `CatalogConnectionPassword` carries no inline-SAS field to project from.
+pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> ConnectionCreds {
+    let password = lakekeeper_connection_password(warehouse_name, vended);
+    ConnectionCreds {
+        warehouse: password.warehouse,
+        endpoint: password.endpoint,
+        region: password.region,
+        access_key: password.access_key,
+        secret_key: password.secret_key,
+        session_token: password.session_token,
+        path_style: password.path_style,
+        use_sigv4: password.use_sigv4,
+        use_vended_credentials: password.use_vended_credentials,
+        token: password.token,
+        client_id: password.client_id,
+        client_secret: password.client_secret,
+        oauth2_server_uri: Some(keycloak_token_endpoint_host()),
+        scope: password.scope,
+        account_name: password.account_name,
+        account_key: password.account_key,
+        sas_token: None,
     }
 }
 

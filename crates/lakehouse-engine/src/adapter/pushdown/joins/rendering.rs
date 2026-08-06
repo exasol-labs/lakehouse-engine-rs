@@ -1582,13 +1582,12 @@ mod tests {
         );
     }
 
-    /// The broadcast path renders `rendered.filter` exactly as before, PRESERVING
-    /// Exasol's native `tableAlias` qualifier (the in-UDF `build_join_sql` join
-    /// resolves it) — the two-scan fan-out's bare-alias stripping (used only by
-    /// [`build_side_fan_out_sql`]) must NOT leak into, nor alter, the broadcast
-    /// rendering.
+    /// The broadcast path strips Exasol's native `tableAlias` qualifier before
+    /// rendering `rendered.filter`: `build_join_sql` wraps each side in an
+    /// UNALIASED derived sub-SELECT, so a preserved alias would not resolve
+    /// against it (`No field named "O"."O_ORDERDATE"`).
     #[test]
-    fn render_broadcast_join_preserves_native_table_alias_unchanged() {
+    fn render_broadcast_join_strips_native_table_alias_from_filter() {
         let mut request = join_request(Json::Null, equi_condition());
         // Give every join column node Exasol's native tableAlias, as the live cluster does.
         request["pushdownRequest"]["filter"] = serde_json::json!({
@@ -1602,9 +1601,56 @@ mod tests {
             .expect("disjoint join renders");
         let filter = rendered.filter.expect("filter renders");
         assert!(
-            filter.contains(r#""O"."O_ORDERDATE""#),
-            "broadcast rendering must preserve Exasol's native tableAlias (unchanged): {filter}"
+            filter.contains(r#""O_ORDERDATE""#),
+            "the filter must still reference the column: {filter}"
         );
+        assert!(
+            !filter.contains(r#""O"."O_ORDERDATE""#),
+            "broadcast rendering must strip Exasol's native tableAlias (bare, unqualified): {filter}"
+        );
+    }
+
+    /// An equi-condition whose two column nodes both carry Exasol's native
+    /// `tableAlias` — the exact shape of the live defect — renders bare, matching
+    /// the unaliased shape `build_join_sql`'s derived sub-SELECTs expose.
+    #[test]
+    fn render_broadcast_join_strips_native_table_alias_from_condition() {
+        let condition = serde_json::json!({
+            "type": "predicate_equal",
+            "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER", "tableAlias": "C"},
+            "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
+        });
+        let request = join_request(Json::Null, condition);
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
+            .expect("disjoint, renderable join")
+            .expect("a disjoint join must render, not decline");
+        assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
+    }
+
+    /// A select-list scalar expression over an aliased column renders its
+    /// `ProjectionItem::Expr` bare, not alias-qualified — `extract_join_projection`
+    /// also renders via `render_expression_safe`, so it needs the same stripping.
+    #[test]
+    fn render_broadcast_join_strips_native_table_alias_from_projection() {
+        let mut request = join_request(Json::Null, equi_condition());
+        request["pushdownRequest"]["selectList"] = serde_json::json!([
+            {"type": "function_scalar", "name": "MULT", "arguments": [
+                {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS", "tableAlias": "O"},
+                {"type": "literal_exactnumeric", "value": 2}
+            ]}
+        ]);
+        let detected = detected_join(&request);
+        let rendered = render_broadcast_join(&request, &pd(&request), &detected)
+            .expect("renders")
+            .expect("disjoint join renders");
+        assert_eq!(rendered.projection.len(), 1, "{:?}", rendered.projection);
+        match &rendered.projection[0] {
+            ProjectionItem::Expr { expr } => {
+                assert_eq!(expr, r#"("O_CUSTKEY" * 2)"#);
+            }
+            other => panic!("expected an Expr projection item, got {other:?}"),
+        }
     }
 
     /// End-to-end fallback wiring: the unified wrapper prunes each leg (side-local

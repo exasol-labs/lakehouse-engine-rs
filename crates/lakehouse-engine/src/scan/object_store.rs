@@ -1,7 +1,8 @@
-//! Object-store construction and DataFusion session-context wiring: registers the
-//! object store each scan side reads its files through — dispatching on the scan
-//! spec's `StorageBackend` and wrapping each store in the spec-sized HEAD
-//! decorator — and constructs the memory-pool-sized `SessionContext`.
+//! Object-store construction and DataFusion session-context wiring: builds the
+//! object store each scan side reads its files through — dispatching on THAT
+//! side's `StorageBackend` and wrapping each store in the spec-sized HEAD
+//! decorator over THAT side's files — registers one store per DataFusion registry
+//! key, and constructs the memory-pool-sized `SessionContext`.
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -25,7 +26,8 @@ use url::{Position, Url};
 
 use super::session_config_for_spec;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
-use crate::scan::spec::{AdlsCred, FileEntry, ScanSpec, StorageBackend};
+use crate::scan::spec::{AdlsCred, FileEntry, ScanSpec, StorageBackend, reconstruct_abs_uri};
+use crate::scan::store_router::{PrefixRoutingObjectStore, RoutedSide, ScanSide};
 
 /// Build a DataFusion `SessionContext` with an object store registered per scan side.
 ///
@@ -52,114 +54,133 @@ pub(super) fn build_session_context(
 
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
 
-    // Register the object store for the sharded fact side, wrapped so that
-    // per-file HEAD requests are answered from the caller-supplied sizes in the
-    // spec instead of issuing an object-store HEAD over the network.
-    //
-    // ONE whole-spec size index covering `spec.files` AND `join.files` is built
-    // here and handed to BOTH registrations below, because a store registered for
-    // one side answers the HEADs of every side that resolves to it. Narrowing it
-    // to the side being registered would leave the dimension files unindexed in
-    // the shared-bucket case, where only the fact store is ever registered.
-    let sizes = build_spec_size_index(spec)?;
-    let registration = StoreRegistration {
-        backend: &spec.common.storage,
-        connection_budget: spec.common.s3_max_connections,
-        sizes: &sizes,
-    };
-    register_side_store(
-        &ctx,
-        &registration,
-        ScanSide {
-            files: &spec.files,
-            table_root: &spec.common.table_root,
-        },
-    )?;
+    let sides = present_sides(spec);
 
-    // A broadcast join's dimension side may live in a different bucket than the
-    // sharded fact side. Register a store for it too (same credentials, same size
-    // index) so DataFusion can resolve its object store; when it coincides with
-    // the fact side — the common same-warehouse case — the registry already holds
-    // that store key, so the registration is skipped and the fact store serves
-    // both sides.
-    if let Some(join) = &spec.common.join
-        && !join.files.is_empty()
-    {
-        register_side_store(
-            &ctx,
-            &registration,
-            ScanSide {
-                files: &join.files,
-                table_root: &join.table_root,
-            },
-        )?;
+    // The redaction set is EVERY side's secrets, not those of the side whose store
+    // is being built: each store ends up behind a router that can raise an error
+    // while either side's credential is in scope. `build_side_store` sees one side
+    // and structurally cannot assemble the union, so it is read from its single
+    // owner on the spec and passed down.
+    let all_secrets = spec.common.all_secret_values();
+
+    // Each side gets its OWN inner store: built from its OWN backend, and sized
+    // from its OWN files, so neither one side's credential nor its size index can
+    // serve the other side's paths. When both sides resolve to one DataFusion
+    // registry key — the same-warehouse Databricks norm — the router is what lets
+    // that single key still serve two credentials.
+    //
+    // A join spec routes EVERY group, including a group holding one side (the two
+    // sides in different buckets): one code path, no credential or bucket
+    // comparison that could be wrong. A spec with no dimension side registers its
+    // one store directly, as it always has — it has one credential, so there is
+    // nothing to route and no reason to give a raw scan a new way to fail.
+    let has_dimension_side = sides.len() > 1;
+    for (store_url, group) in group_sides_by_store_url(&sides)? {
+        let store: Arc<dyn ObjectStore> = if has_dimension_side {
+            let mut routed = Vec::with_capacity(group.len());
+            for side in group {
+                let inner = build_side_store(side, spec.common.s3_max_connections, &all_secrets)?;
+                routed.push(RoutedSide::new(side, inner)?);
+            }
+            Arc::new(PrefixRoutingObjectStore::new(routed))
+        } else {
+            build_side_store(group[0], spec.common.s3_max_connections, &all_secrets)?
+        };
+        ctx.runtime_env().register_object_store(&store_url, store);
     }
 
     Ok(ctx)
 }
 
-/// One side of a scan (the fact side or a join's dimension side): its own file
-/// list and table root.
-struct ScanSide<'a> {
-    files: &'a [FileEntry],
-    table_root: &'a str,
+/// The sides this spec registers a store for, FACT SIDE FIRST — the order
+/// [`PrefixRoutingObjectStore`] reads as its tie-break when one path is eligible
+/// for both sides, so the ordering here is a contract and not a formatting
+/// choice.
+///
+/// A join block with an EMPTY file list contributes no side: it names no path to
+/// route, no file to size, and no URI to derive a store key from.
+fn present_sides(spec: &ScanSpec) -> Vec<ScanSide<'_>> {
+    let mut sides = vec![ScanSide {
+        label: "fact",
+        files: &spec.files,
+        table_root: &spec.common.table_root,
+        backend: &spec.common.storage,
+    }];
+    if let Some(join) = &spec.common.join
+        && !join.files.is_empty()
+    {
+        sides.push(ScanSide {
+            label: "dimension",
+            files: &join.files,
+            table_root: &join.table_root,
+            backend: &join.storage,
+        });
+    }
+    sides
 }
 
-/// Whole-spec values shared identically by every side's registration call.
-struct StoreRegistration<'a> {
-    backend: &'a StorageBackend,
-    connection_budget: usize,
-    sizes: &'a HashMap<ObjectStorePath, u64>,
+/// Group `sides` by the object-store URL each resolves to — the sides that must
+/// share ONE registered store, because DataFusion serves one store per registry
+/// key. Order is preserved both across groups and within a group, so the fact
+/// side stays first in whichever group holds it.
+///
+/// Grouping on [`side_store_url`] is FINER than DataFusion's registry key, which
+/// drops the userinfo an `abfss://` URI carries its container in. Two sides that
+/// differ only there would group apart yet register under one key, the second
+/// silently replacing the first — which is sound here only because
+/// [`validate_sides_share_one_store`] has already refused such a spec.
+fn group_sides_by_store_url<'s, 'f>(
+    sides: &'s [ScanSide<'f>],
+) -> Result<Vec<(Url, Vec<&'s ScanSide<'f>>)>, UdfError> {
+    let mut groups: Vec<(Url, Vec<&ScanSide<'_>>)> = Vec::new();
+    for side in sides {
+        let store_url = side_store_url(side.files, side.table_root)?;
+        match groups.iter_mut().find(|(url, _)| *url == store_url) {
+            Some((_, group)) => group.push(side),
+            None => groups.push((store_url, vec![side])),
+        }
+    }
+    Ok(groups)
 }
 
-/// Register the object store one side of a scan reads its files through, keyed by
-/// the store URL that side's own file list resolves to, and answer whether that
-/// registration was new: `Some(url)` = registered under `url`, `None` = the
-/// registry already held that key and nothing was (re-)registered.
+/// Build the object store ONE side of a scan reads its files through: its own
+/// backend's credential, wrapped in the spec-sized HEAD decorator over its OWN
+/// files, so neither that credential nor that size index can serve another side's
+/// paths.
 ///
 /// Dispatches on the storage backend because CONSTRUCTING the store is a
 /// backend-specific decision. The store URL is not: [`side_store_url`] derives it
 /// once for every backend, and each arm only reads out of it the part its builder
 /// needs — the host as an S3 bucket name, the whole URL for Azure.
 ///
-/// The `None` case is what makes a broadcast join's two sides safe to register
-/// unconditionally: sides sharing one bucket collapse onto one store as an
-/// artifact of the registry key, with no bucket comparison at the call site.
-/// `StoreRegistration::sizes` is therefore the WHOLE spec's size index and not
-/// the side's — the one store that survives that collapse must answer the sized
-/// HEADs of both sides — which is why it sits with the whole-spec values rather
-/// than beside the per-side file list in [`ScanSide`].
-fn register_side_store(
-    ctx: &SessionContext,
-    registration: &StoreRegistration<'_>,
-    side: ScanSide<'_>,
-) -> Result<Option<Url>, UdfError> {
-    match registration.backend {
+/// Registering the result is the CALLER's, because sides resolving to one
+/// DataFusion registry key must share one registered store and only the caller
+/// knows which sides those are. `all_secrets` arrives from the caller for the same
+/// reason: it is EVERY present side's secret values, and a function holding one
+/// side's backend cannot redact an error against a side it never sees.
+fn build_side_store(
+    side: &ScanSide<'_>,
+    connection_budget: usize,
+    all_secrets: &[&str],
+) -> Result<Arc<dyn ObjectStore>, UdfError> {
+    let sizes = side_size_index(side.files, side.table_root)?;
+    let store_url = side_store_url(side.files, side.table_root)?;
+    match side.backend {
         StorageBackend::S3(storage) => {
-            let store_url = side_store_url(side.files, side.table_root)?;
-            let bucket = store_url
-                .host_str()
-                .ok_or_else(|| UdfError::User(format!("file URI has no bucket/host: {store_url}")))?
-                .to_string();
-            if ctx
-                .runtime_env()
-                .object_store_registry
-                .get_store(&store_url)
-                .is_ok()
-            {
-                return Ok(None);
-            }
+            let bucket = store_url.host_str().ok_or_else(|| {
+                UdfError::User(format!("file URI has no bucket/host: {store_url}"))
+            })?;
 
             // `with_client_options` REPLACES the builder's whole `ClientOptions` (it does
             // not merge), so it must run before `with_allow_http`, which layers onto
             // whatever `ClientOptions` is already set. Reversing this order silently
             // drops `allow_http`, breaking plain-HTTP endpoints like MinIO.
             let mut builder = AmazonS3Builder::new()
-                .with_bucket_name(&bucket)
+                .with_bucket_name(bucket)
                 .with_region(&storage.region)
                 .with_access_key_id(&storage.access_key)
                 .with_secret_access_key(&storage.secret_key)
-                .with_client_options(client_options_for(registration.connection_budget))
+                .with_client_options(client_options_for(connection_budget))
                 .with_allow_http(storage.allow_http);
 
             // Path-style stores (MinIO and other S3-compatibles) need the explicit endpoint
@@ -177,52 +198,33 @@ fn register_side_store(
                 builder = builder.with_token(token);
             }
 
-            let secrets = storage.secret_values();
             let s3 = builder.build().map_err(|e| {
                 // Do not echo the error directly — it might contain credential fragments.
                 UdfError::User(format!(
                     "failed to configure S3 object store: {}",
-                    redact_error_text(&e.to_string(), &secrets)
+                    redact_error_text(&e.to_string(), all_secrets)
                 ))
             })?;
 
-            let sized_store = SpecSizedObjectStore::new(Arc::new(s3), registration.sizes.clone());
-            ctx.runtime_env()
-                .register_object_store(&store_url, Arc::new(sized_store));
-            Ok(Some(store_url))
+            Ok(Arc::new(SpecSizedObjectStore::new(Arc::new(s3), sizes)))
         }
         StorageBackend::Adls { cred, .. } => {
-            let store_url = side_store_url(side.files, side.table_root)?;
-            if ctx
-                .runtime_env()
-                .object_store_registry
-                .get_store(&store_url)
-                .is_ok()
-            {
-                return Ok(None);
-            }
-
             let builder = MicrosoftAzureBuilder::new()
                 .with_url(store_url.as_str())
-                .with_client_options(client_options_for(registration.connection_budget));
+                .with_client_options(client_options_for(connection_budget));
             let builder = match cred {
                 AdlsCred::AccountKey(key) => builder.with_access_key(key),
                 AdlsCred::Sas(sas) => builder.with_config(AzureConfigKey::SasKey, sas),
             };
 
-            let secrets = registration.backend.secret_values();
             let azure = builder.build().map_err(|e| {
                 UdfError::User(format!(
                     "failed to configure Azure object store: {}",
-                    redact_error_text(&e.to_string(), &secrets)
+                    redact_error_text(&e.to_string(), all_secrets)
                 ))
             })?;
 
-            let sized_store =
-                SpecSizedObjectStore::new(Arc::new(azure), registration.sizes.clone());
-            ctx.runtime_env()
-                .register_object_store(&store_url, Arc::new(sized_store));
-            Ok(Some(store_url))
+            Ok(Arc::new(SpecSizedObjectStore::new(Arc::new(azure), sizes)))
         }
     }
 }
@@ -241,37 +243,23 @@ fn client_options_for(budget: usize) -> ClientOptions {
     ClientOptions::new().with_pool_max_idle_per_host(budget.max(1))
 }
 
-/// Reconstruct the absolute file URI for a per-shard `(path, _)` entry.
+/// Build ONE side's map of caller-known file sizes, keyed by the object-store
+/// [`Path`] the store observes in `head` — i.e. the `ListingTableUrl` prefix
+/// DataFusion passes for an exact-file (non-collection) URL. Keying by that prefix
+/// is what lets [`SpecSizedObjectStore`] satisfy each per-file metadata lookup from
+/// the spec without a network round-trip.
 ///
-/// An entry that already contains a scheme (`"://"`) is absolute and returned
-/// unchanged. Otherwise it is relative to `table_root` and joined onto it with
-/// exactly one `/` separator (a trailing `/` on the root and a leading `/` on the
-/// entry are both trimmed first, so the separator is neither doubled nor dropped).
-pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String {
-    if entry_path.contains("://") {
-        return entry_path.to_string();
-    }
-    let root = table_root.strip_suffix('/').unwrap_or(table_root);
-    let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
-    format!("{root}/{rel}")
-}
-
-/// Build the map of caller-known file sizes keyed by the object-store [`Path`]
-/// the store observes in `head` — i.e. the `ListingTableUrl` prefix DataFusion
-/// passes for an exact-file (non-collection) URL. Keying by that prefix is what
-/// lets [`SpecSizedObjectStore`] satisfy each per-file metadata lookup from the
-/// spec without a network round-trip.
+/// Scoped to one side and never to the whole spec: each side's store answers only
+/// its own side's metadata lookups, so an index carrying another side's files
+/// would let one side's credentialed store answer a `head` it must never see.
 ///
 /// [`Path`]: object_store::path::Path
-fn build_spec_size_index(spec: &ScanSpec) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
-    let mut sizes = HashMap::with_capacity(spec.files.len());
-    index_file_sizes(&mut sizes, &spec.files, &spec.common.table_root)?;
-    // A broadcast join carries the dimension side's full file list; its per-file
-    // sizes are indexed too so DataFusion answers the dimension HEADs from the spec
-    // (no network round-trip), exactly as it does for the sharded fact side.
-    if let Some(join) = &spec.common.join {
-        index_file_sizes(&mut sizes, &join.files, &join.table_root)?;
-    }
+fn side_size_index(
+    files: &[FileEntry],
+    table_root: &str,
+) -> Result<HashMap<ObjectStorePath, u64>, UdfError> {
+    let mut sizes = HashMap::with_capacity(files.len());
+    index_file_sizes(&mut sizes, files, table_root)?;
     Ok(sizes)
 }
 
@@ -423,22 +411,35 @@ fn side_store_url(files: &[FileEntry], table_root: &str) -> Result<Url, UdfError
 /// while needing DIFFERENT ones.
 ///
 /// DataFusion keys its object-store registry by scheme, host and port only
-/// (`get_url_key`, `datafusion-execution-54.1.0/src/object_store.rs:268-274`),
-/// dropping the userinfo [`side_store_url`] keeps. On `abfss://` that userinfo IS
-/// the container, and the container is the scope of the store actually built, so
-/// two sides in different containers of one storage account share a registry key
-/// but need two stores: whichever registered first would serve both, silently
-/// reading one side's files out of the other side's container.
+/// (`get_url_key`, `datafusion-execution-54.1.0/src/object_store.rs:268-274`,
+/// whose own test asserts `s3://username:password@host:123` keys as
+/// `s3://host:123`, `:330-332`), dropping the userinfo [`side_store_url`] keeps.
+/// On `abfss://` that userinfo IS the container, and the container is the scope of
+/// the store actually built, so two sides in different containers of one storage
+/// account share a registry key but need two stores: whichever registered first
+/// would serve both, silently reading one side's files out of the other side's
+/// container.
 ///
-/// The key formula is DataFusion's and cannot be changed here, so the only safe
-/// reading of such a spec is to refuse it. Stated over the two derived URLs and
-/// not over any backend, so it also holds for a future backend whose store scope
-/// is finer than its registry key — and it can never fire for S3, whose URIs
-/// carry no userinfo.
+/// Prefix routing does NOT subsume this guard. [`PrefixRoutingObjectStore`] tells
+/// two sides apart by the `object_store::Path` its trait methods receive, but that
+/// path is container-RELATIVE while the store it routes to is container-SCOPED —
+/// so two tables sitting at the same relative path in two containers of one
+/// account yield IDENTICAL paths, which no path-based router can distinguish.
+/// Routing is what lets ONE registry key serve TWO credentials; it is not what
+/// tells two containers apart.
 ///
-/// Only an empty DIMENSION side is ignored: `build_session_context` skips it
-/// before registration (`!join.files.is_empty()`), so it can neither collide nor
-/// be derived from. An empty FACT side is NOT ignored — it still reaches
+/// What WOULD subsume this guard is a userinfo-retaining registry key, and
+/// `object_store` 0.13.2 ships exactly that (`registry.rs:220-223` keys from
+/// position 0 over a path-segment prefix tree) — DataFusion 54.1.0 uses it
+/// nowhere. Since the key formula is DataFusion's and cannot be changed here, the
+/// only safe reading of such a spec is to refuse it. Stated over the two derived
+/// URLs and not over any backend, so it also holds for a future backend whose
+/// store scope is finer than its registry key — and it can never fire for S3,
+/// whose URIs carry no userinfo.
+///
+/// Only an empty DIMENSION side is ignored: [`present_sides`] drops it before any
+/// store is built (`!join.files.is_empty()`), so it can neither collide nor be
+/// derived from. An empty FACT side is NOT ignored — it still reaches
 /// [`side_store_url`] and fails there with "scan spec has no files", exactly as it
 /// would without this check.
 fn validate_sides_share_one_store(spec: &ScanSpec) -> Result<(), UdfError> {
@@ -527,7 +528,7 @@ pub(super) fn validate_uniform_object_store_files(
 mod tests {
     use super::*;
     use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
-    use crate::scan::spec::{JoinSpec, JoinType};
+    use crate::scan::spec::{JoinSpec, JoinType, StorageProps};
     use crate::scan::test_support::minimal_spec;
     use ::object_store::ClientConfigKey;
     use datafusion::execution::memory_pool::MemoryLimit;
@@ -545,23 +546,15 @@ mod tests {
             .is_ok()
     }
 
-    /// Register one side through the seam under test, always with the WHOLE-spec
-    /// size index — the same thing `build_session_context` passes to every call.
-    fn register_side(
-        ctx: &SessionContext,
-        spec: &ScanSpec,
-        files: &[FileEntry],
-        table_root: &str,
-    ) -> Result<Option<Url>, UdfError> {
-        let sizes = build_spec_size_index(spec).expect("size index must build");
-        register_side_store(
-            ctx,
-            &StoreRegistration {
-                backend: &spec.common.storage,
-                connection_budget: spec.common.s3_max_connections,
-                sizes: &sizes,
-            },
-            ScanSide { files, table_root },
+    /// Build the FACT side's store through the seam under test, with the same
+    /// whole-spec connection budget and union redaction set `build_session_context`
+    /// passes to every side.
+    fn build_fact_side(spec: &ScanSpec) -> Result<Arc<dyn ObjectStore>, UdfError> {
+        let sides = present_sides(spec);
+        build_side_store(
+            &sides[0],
+            spec.common.s3_max_connections,
+            &spec.common.all_secret_values(),
         )
     }
 
@@ -585,8 +578,77 @@ mod tests {
             name_mapping: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"F_KEY\" = \"D_KEY\"".into(),
+            storage: spec.common.storage.clone(),
         });
         spec
+    }
+
+    /// An S3 backend reaching `endpoint`, carrying `secret` as its secret key — the
+    /// two externally observable fields a test tells one side's store from the
+    /// other's by. Path-style (the `StorageProps` default) is what makes `endpoint`
+    /// reachable at all: the S3 arm applies it only for path-style stores.
+    fn s3_backend(endpoint: &str, secret: &str) -> StorageBackend {
+        StorageBackend::S3(StorageProps {
+            endpoint: endpoint.into(),
+            region: "us-east-1".into(),
+            access_key: "testkey".into(),
+            secret_key: secret.into(),
+            allow_http: true,
+            ..Default::default()
+        })
+    }
+
+    /// A loopback endpoint recording the requests it receives, so WHICH endpoint a
+    /// read reached is observable. Every request is answered with a refusal: the
+    /// read is expected to fail — only its destination is under test.
+    struct RecordingEndpoint {
+        url: String,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl RecordingEndpoint {
+        async fn bind() -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            // A 4xx is not retried by object_store, so each read reaches the
+            // endpoint exactly once and fails fast.
+            const REFUSAL: &[u8] =
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("the loopback endpoint must bind");
+            let url = format!(
+                "http://{}",
+                listener
+                    .local_addr()
+                    .expect("bound endpoint has an address")
+            );
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+            let recorded = Arc::clone(&requests);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut head = vec![0u8; 4096];
+                    let read = stream.read(&mut head).await.unwrap_or(0);
+                    recorded
+                        .lock()
+                        .expect("the recorder must not be poisoned")
+                        .push(String::from_utf8_lossy(&head[..read]).into_owned());
+                    let _ = stream.write_all(REFUSAL).await;
+                }
+            });
+
+            Self { url, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("the recorder must not be poisoned")
+                .clone()
+        }
     }
 
     /// A positive memory limit causes the DataFusion pool to be sized at fraction × (limit − overhead).
@@ -673,43 +735,65 @@ mod tests {
         );
     }
 
-    /// The store built for a side inherits the spec's connection budget, and the
-    /// build succeeds without leaking any credential value into an error.
-    /// Exercised as a unit test against the private `register_side_store` seam
-    /// directly (rather than an integration test) so that function does not need
-    /// to be `pub` — it is otherwise only ever called from `build_session_context`.
+    /// EVERY side's store is built with the WHOLE-spec connection budget, never an
+    /// `N / side_count` share of it.
+    ///
+    /// A built `AmazonS3` does not expose its pool configuration back out, so what
+    /// is pinned is the budget each side's call RECEIVES — read from the spec, never
+    /// a literal — together with `client_options_carry_connection_budget`'s mapping
+    /// of that value onto `PoolMaxIdlePerHost`. Exercised against the private
+    /// `build_side_store` seam directly so that function need not be `pub`.
     #[test]
-    fn build_s3_store_applies_spec_connection_budget() {
-        let mut spec = minimal_spec();
-        spec.common.s3_max_connections = 16;
-        let ctx = SessionContext::new();
+    fn each_side_store_gets_the_full_connection_budget() {
+        // Non-default: the shared fixture convention is 8.
+        const BUDGET: usize = 16;
 
-        assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("store must build with a connection budget"),
-            Some(bucket_url("test-bucket")),
-            "a non-default connection budget must still register the side's store"
+        let mut spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", 64)],
         );
+        spec.common.s3_max_connections = BUDGET;
+
+        let sides = present_sides(&spec);
+        assert_eq!(sides.len(), 2, "a join spec must present both sides");
+        let all_secrets = spec.common.all_secret_values();
+
+        for side in &sides {
+            let budget = spec.common.s3_max_connections;
+            let described = build_side_store(side, budget, &all_secrets)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "the {} side's store must build with the whole-spec budget: {e}",
+                        side.label
+                    )
+                })
+                .to_string();
+
+            assert!(
+                described.starts_with("SpecSizedObjectStore(AmazonS3("),
+                "the {} side must get its own sized S3 store: {described}",
+                side.label
+            );
+            assert_eq!(
+                client_options_for(budget).get_config_value(&ClientConfigKey::PoolMaxIdlePerHost),
+                Some(BUDGET.to_string()),
+                "the {} side must receive the whole-spec budget of {BUDGET}, not a per-side share",
+                side.label
+            );
+        }
     }
 
-    /// Two sides resolving to distinct buckets each get their own store, reported
-    /// by the URL each was registered under and both resolvable from the registry.
+    /// Two sides resolving to distinct buckets each get their OWN registered store:
+    /// the two buckets yield two DataFusion registry keys, so neither registration
+    /// overwrites the other and each side keeps its own credential.
     #[test]
-    fn register_side_store_registers_one_store_per_distinct_side() {
-        let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
-        let spec = spec_with_join("s3://dim-bucket/db/dim", dim_files.clone());
-        let ctx = SessionContext::new();
+    fn join_sides_in_two_buckets_register_two_stores() {
+        let spec = spec_with_join(
+            "s3://dim-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", 64)],
+        );
 
-        assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("fact side must register"),
-            Some(bucket_url("test-bucket"))
-        );
-        assert_eq!(
-            register_side(&ctx, &spec, &dim_files, "s3://dim-bucket/db/dim")
-                .expect("dimension side must register"),
-            Some(bucket_url("dim-bucket"))
-        );
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
 
         for bucket in ["test-bucket", "dim-bucket"] {
             assert!(
@@ -719,50 +803,26 @@ mod tests {
         }
     }
 
-    /// `register_side_store`'s S3 arm never inspects the file URI's scheme — it reads
-    /// only the URL host as the bucket name — so an `s3a://` side registers a store
-    /// exactly like an `s3://` one, keyed under its own `s3a://` registry URL.
+    /// The S3 arm never inspects the file URI's scheme — it reads only the URL host
+    /// as the bucket name — so an `s3a://` side registers a store exactly like an
+    /// `s3://` one, keyed under its own `s3a://` registry URL.
     #[test]
-    fn register_side_store_registers_an_s3a_scheme_side() {
+    fn an_s3a_scheme_side_registers_a_store_under_its_own_key() {
         let mut spec = minimal_spec();
         spec.files = vec![FileEntry::new(
             "s3a://test-bucket/data/part-0.parquet",
             1024,
         )];
-        let ctx = SessionContext::new();
         let expected = Url::parse("s3a://test-bucket").expect("URL must parse");
 
-        assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("an s3a:// scheme side must register a store"),
-            Some(expected.clone())
-        );
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
         assert!(
             ctx.runtime_env()
                 .object_store_registry
                 .get_store(&expected)
                 .is_ok(),
             "the s3a:// side's store must be resolvable under its own registered key"
-        );
-    }
-
-    /// A dimension side resolving to the fact side's bucket registers no second
-    /// store: the registry already holds that key, so the call reports `None` and
-    /// the already-registered fact store serves both sides. The skip is an
-    /// artifact of the key, never a bucket comparison at the call site.
-    #[test]
-    fn join_dimension_side_sharing_the_fact_bucket_is_not_registered_twice() {
-        let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
-        let spec = spec_with_join("s3://test-bucket/db/dim", dim_files.clone());
-        let ctx = SessionContext::new();
-        register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-            .expect("fact side must register");
-
-        assert_eq!(
-            register_side(&ctx, &spec, &dim_files, "s3://test-bucket/db/dim")
-                .expect("a shared-bucket dimension side must not fail"),
-            None,
-            "a dimension side in the fact bucket must not be registered twice"
         );
     }
 
@@ -799,6 +859,7 @@ mod tests {
             name_mapping: Vec::new(),
             join_type: JoinType::Inner,
             condition: "\"F_KEY\" = \"D_KEY\"".into(),
+            storage: spec.common.storage.clone(),
         });
         spec
     }
@@ -811,25 +872,25 @@ mod tests {
     /// asymmetry is exactly the collision `validate_sides_share_one_store` exists
     /// to reject.
     #[test]
-    fn register_side_store_returns_the_container_qualified_url_but_the_registry_key_drops_the_container()
-     {
+    fn an_azure_side_registers_under_a_container_qualified_url_the_registry_key_drops() {
         let spec = adls_spec(
             "abfss://container@acct.dfs.core.windows.net/db/table",
             AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
         );
-        let ctx = SessionContext::new();
-        let expected =
+        let registered =
             Url::parse("abfss://container@acct.dfs.core.windows.net").expect("URL must parse");
-
         assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("an Azure side must register"),
-            Some(expected.clone())
+            side_store_url(&spec.files, &spec.common.table_root).expect("store URL must derive"),
+            registered,
+            "the URL a side is registered under must keep its container"
         );
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
         assert!(
             ctx.runtime_env()
                 .object_store_registry
-                .get_store(&expected)
+                .get_store(&registered)
                 .is_ok(),
             "the container-qualified store must be resolvable"
         );
@@ -847,50 +908,97 @@ mod tests {
         );
     }
 
-    /// A second side rooted in the SAME container of the same account shares the
-    /// first side's registry key: the registration is skipped and reports `None`,
-    /// exactly the S3 shared-bucket contract.
+    /// Two sides rooted in the SAME container of the same account share one registry
+    /// key, so ONE store is registered for both — the router holding an inner store
+    /// per side, exactly the S3 shared-bucket contract.
     #[test]
-    fn register_side_store_skips_a_second_side_in_the_same_container() {
+    fn azure_sides_in_one_container_share_one_routing_store() {
         let spec = adls_spec_with_join(
             "abfss://container@acct.dfs.core.windows.net/db/fact",
             "abfss://container@acct.dfs.core.windows.net/db/dim",
             AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
         );
-        let ctx = SessionContext::new();
-        register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-            .expect("fact side must register");
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
 
-        let join = spec.common.join.as_ref().expect("spec carries a join");
-        assert_eq!(
-            register_side(&ctx, &spec, &join.files, &join.table_root)
-                .expect("a same-container dimension side must not fail"),
-            None,
-            "a dimension side in the same container must not be registered twice"
+        let described = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(
+                &Url::parse("abfss://container@acct.dfs.core.windows.net").expect("URL must parse"),
+            )
+            .expect("the container's store must be registered")
+            .to_string();
+
+        assert!(
+            described.starts_with("PrefixRoutingObjectStore("),
+            "both sides of the container must be served by one routing store: {described}"
         );
+        for side in ["fact=", "dimension="] {
+            assert!(
+                described.contains(side),
+                "the router must hold an inner store for {side}: {described}"
+            );
+        }
     }
 
     /// Two sides in different storage ACCOUNTS differ at the registry-key level
-    /// (the host), so both register their own store under their own URL.
+    /// (the host), so each registers its own store under its own URL.
     #[test]
-    fn register_side_store_registers_both_sides_in_different_accounts() {
+    fn azure_sides_in_different_accounts_register_two_stores() {
         let spec = adls_spec_with_join(
             "abfss://facts@acct1.dfs.core.windows.net/db/fact",
             "abfss://dims@acct2.dfs.core.windows.net/db/dim",
             AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()),
         );
-        let ctx = SessionContext::new();
 
-        assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("fact side must register"),
-            Some(Url::parse("abfss://facts@acct1.dfs.core.windows.net").expect("URL must parse"))
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
+        for account in [
+            "abfss://facts@acct1.dfs.core.windows.net",
+            "abfss://dims@acct2.dfs.core.windows.net",
+        ] {
+            assert!(
+                ctx.runtime_env()
+                    .object_store_registry
+                    .get_store(&Url::parse(account).expect("URL must parse"))
+                    .is_ok(),
+                "each account's side must register its own store: {account}"
+            );
+        }
+    }
+
+    /// A join across two BACKENDS — an `s3://` fact side and an `abfss://` dimension
+    /// side — registers one store per side. The scheme alone makes the two registry
+    /// keys differ, and [`build_side_store`] dispatches on each side's OWN backend, so
+    /// the Azure side is never addressed through an `AmazonS3Builder`.
+    ///
+    /// This is the evidence that a cross-backend join is SERVEABLE, and therefore why
+    /// no plan-time guard refuses one: a join's sides are compared nowhere, because
+    /// each is read through its own store.
+    #[test]
+    fn sides_on_different_backends_each_register_their_own_store() {
+        const DIM_ROOT: &str = "abfss://dims@acct.dfs.core.windows.net/db/dim";
+        let mut spec = spec_with_join(DIM_ROOT, vec![FileEntry::new("data/dim-0.parquet", 64)]);
+        spec.common
+            .join
+            .as_mut()
+            .expect("spec_with_join sets a join block")
+            .storage = adls_backend(AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()));
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
+        assert!(
+            store_registered(&ctx, "test-bucket"),
+            "the S3 fact side must register under its own bucket key"
         );
-        let join = spec.common.join.as_ref().expect("spec carries a join");
-        assert_eq!(
-            register_side(&ctx, &spec, &join.files, &join.table_root)
-                .expect("dimension side in a different account must register"),
-            Some(Url::parse("abfss://dims@acct2.dfs.core.windows.net").expect("URL must parse"))
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(
+                    &Url::parse("abfss://dims@acct.dfs.core.windows.net").expect("URL must parse")
+                )
+                .is_ok(),
+            "the Azure dimension side must register under its own account key"
         );
     }
 
@@ -899,20 +1007,16 @@ mod tests {
     /// `"az" | "abfs" | "abfss"` identically), so an `abfs://` side must register a
     /// store the same way.
     #[test]
-    fn register_side_store_registers_an_abfs_scheme_side() {
+    fn an_abfs_scheme_side_registers_a_store_under_its_own_key() {
         let spec = adls_spec(
             "abfs://container@acct.dfs.core.windows.net/db/table",
             AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
         );
-        let ctx = SessionContext::new();
         let expected =
             Url::parse("abfs://container@acct.dfs.core.windows.net").expect("URL must parse");
 
-        assert_eq!(
-            register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-                .expect("an abfs:// scheme side must register a store"),
-            Some(expected.clone())
-        );
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
         assert!(
             ctx.runtime_env()
                 .object_store_registry
@@ -928,16 +1032,16 @@ mod tests {
     /// silently to some other account — and the surfaced error must carry no
     /// credential value, redacted by the same value-then-label pass as the S3 arm.
     #[test]
-    fn register_side_store_surfaces_an_unrecognised_azure_host_redacted() {
+    fn an_unrecognised_azure_host_is_rejected_redacted() {
         let secret = "static-account-key";
         let spec = adls_spec(
             "abfss://container@sovereign.example.com/db/table",
             AdlsCred::AccountKey(secret.into()),
         );
-        let ctx = SessionContext::new();
 
-        let err = register_side(&ctx, &spec, &spec.files, &spec.common.table_root)
-            .expect_err("an unrecognised Azure host suffix must be rejected");
+        let err =
+            build_fact_side(&spec).expect_err("an unrecognised Azure host suffix must be rejected");
+
         let UdfError::User(msg) = err else {
             panic!("an unrecognised host is caller input, not an internal fault");
         };
@@ -968,14 +1072,47 @@ mod tests {
         );
     }
 
-    /// The size index handed to every registration is the WHOLE spec's. In the
-    /// shared-bucket case only the fact store is registered, and that ONE store
-    /// must answer a DIMENSION file's HEAD from the spec — a per-side size map
-    /// would silently push those HEADs onto the network.
+    /// A join spec whose two sides resolve to ONE bucket registers ONE store under
+    /// that bucket's key, and that store is the router holding an inner store per
+    /// side. Routing is the only shape that can serve two credentials through a
+    /// registry key DataFusion derives from scheme, host and port alone.
+    #[test]
+    fn a_shared_bucket_join_registers_one_routing_store_over_both_sides() {
+        let spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", 64)],
+        );
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
+        let described = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url("test-bucket"))
+            .expect("the shared bucket's store must be registered")
+            .to_string();
+
+        assert!(
+            described.starts_with("PrefixRoutingObjectStore("),
+            "the shared bucket's one store must be the router: {described}"
+        );
+        for side in ["fact=", "dimension="] {
+            assert!(
+                described.contains(side),
+                "the router must hold an inner store for {side}: {described}"
+            );
+        }
+    }
+
+    /// Each side of a shared-bucket join is sized from its OWN index, reached
+    /// through the one registered routing store: a HEAD for either side's file is
+    /// answered from the spec, by that side's store. Were a side's index to hold
+    /// only the other side's files, its HEAD would fall through to the (unreachable)
+    /// endpoint instead of being answered locally.
     #[tokio::test]
-    async fn shared_bucket_join_store_answers_both_sides_sizes_from_the_spec() {
+    async fn shared_bucket_join_answers_each_sides_head_from_that_sides_index() {
         use ::object_store::ObjectStoreExt;
         const DIM_SIZE: u64 = 4242;
+        const FACT_SIZE: u64 = 1024;
 
         let spec = spec_with_join(
             "s3://test-bucket/db/dim",
@@ -988,65 +1125,241 @@ mod tests {
             .get_store(&bucket_url("test-bucket"))
             .expect("the shared-bucket store must be registered");
 
-        // Bounded so a fall-through to the (unreachable) endpoint fails fast and
-        // legibly instead of exhausting the object-store retry budget; a HEAD
-        // served from the index does no I/O and never waits.
-        let meta = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            store.head(&ObjectStorePath::from("db/dim/data/dim-0.parquet")),
-        )
-        .await
-        .expect("the dimension HEAD must be answered from the spec, not over the network")
-        .expect("head of an indexed dimension file must succeed");
+        for (path, expected) in [
+            ("data/part-0.parquet", FACT_SIZE),
+            ("db/dim/data/dim-0.parquet", DIM_SIZE),
+        ] {
+            // Bounded so a fall-through to the (unreachable) endpoint fails fast and
+            // legibly instead of exhausting the object-store retry budget; a HEAD
+            // served from the index does no I/O and never waits.
+            let meta = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.head(&ObjectStorePath::from(path)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the HEAD of {path} must be answered from the spec, not over the network")
+            })
+            .unwrap_or_else(|e| panic!("head of the indexed file {path} must succeed: {e}"));
 
-        assert_eq!(
-            meta.size, DIM_SIZE,
-            "the fact-side store must answer the dimension file's size from the whole-spec index"
-        );
+            assert_eq!(
+                meta.size, expected,
+                "the routed store must answer {path}'s size from its own side's index"
+            );
+        }
     }
 
-    /// 4.1: a `://`-bearing entry is absolute and passes through unchanged.
+    /// Each side's size index holds EXACTLY its own files. A whole-spec index — the
+    /// pre-fix shape — would let one side's credentialed store answer a HEAD for a
+    /// path only the other side is authorized to read.
     #[test]
-    fn reconstruct_absolute_entry_passes_through() {
-        assert_eq!(
-            reconstruct_abs_uri(
-                "s3://bucket/db/table/data/f.parquet",
-                "s3://bucket/db/table"
+    fn each_side_size_index_holds_only_its_own_files() {
+        let mut spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![
+                FileEntry::new("data/dim-0.parquet", 11),
+                FileEntry::new("data/dim-1.parquet", 22),
+            ],
+        );
+        spec.common.table_root = "s3://test-bucket/db/fact".into();
+        spec.files = vec![
+            FileEntry::new("data/fact-0.parquet", 33),
+            FileEntry::new("data/fact-1.parquet", 44),
+        ];
+
+        let sides = present_sides(&spec);
+        assert_eq!(sides.len(), 2, "a join spec must present both sides");
+
+        for (side, expected) in sides.iter().zip([
+            HashMap::from([
+                (ObjectStorePath::from("db/fact/data/fact-0.parquet"), 33_u64),
+                (ObjectStorePath::from("db/fact/data/fact-1.parquet"), 44_u64),
+            ]),
+            HashMap::from([
+                (ObjectStorePath::from("db/dim/data/dim-0.parquet"), 11_u64),
+                (ObjectStorePath::from("db/dim/data/dim-1.parquet"), 22_u64),
+            ]),
+        ]) {
+            let index = side_size_index(side.files, side.table_root)
+                .unwrap_or_else(|e| panic!("the {} side's index must build: {e}", side.label));
+            assert_eq!(
+                index, expected,
+                "the {} side's index must hold exactly its own files, and no other side's",
+                side.label
+            );
+        }
+    }
+
+    /// A spec with NO join block registers the plain spec-sized store — one
+    /// credential to serve, so nothing to route — over an index of its own files,
+    /// each of whose HEADs is answered from the spec without I/O.
+    #[tokio::test]
+    async fn a_spec_without_a_join_registers_one_sized_store_over_its_own_files() {
+        use ::object_store::ObjectStoreExt;
+
+        let mut spec = minimal_spec();
+        spec.files = vec![
+            FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024),
+            FileEntry::new("s3://test-bucket/data/part-1.parquet", 2048),
+        ];
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+        let store = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url("test-bucket"))
+            .expect("the one side's store must be registered");
+
+        let described = store.to_string();
+        assert!(
+            described.starts_with("SpecSizedObjectStore(AmazonS3("),
+            "a spec with no join block must register its sized store directly, unrouted: \
+             {described}"
+        );
+
+        for (path, expected) in [("data/part-0.parquet", 1024), ("data/part-1.parquet", 2048)] {
+            // Bounded so a fall-through to the (unreachable) endpoint fails fast
+            // instead of exhausting the object-store retry budget.
+            let meta = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.head(&ObjectStorePath::from(path)),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the HEAD of {path} must be answered from the spec, not over the network")
+            })
+            .unwrap_or_else(|e| panic!("head of the indexed file {path} must succeed: {e}"));
+
+            assert_eq!(
+                meta.size, expected,
+                "the sized store must answer {path}'s size from its own index"
+            );
+        }
+    }
+
+    /// A path NEITHER side owns is refused, naming the path and both sides while
+    /// carrying no credential value from either. The refusal is the router's
+    /// `object_store::Error` — the only error type an `ObjectStore` read can return
+    /// — and reaches the caller wrapped by DataFusion.
+    #[tokio::test]
+    async fn an_unroutable_path_is_refused_naming_no_credential() {
+        use ::object_store::ObjectStoreExt;
+
+        const FACT_SECRET: &str = "FACTSIDESECRETVALUE";
+        const DIM_SECRET: &str = "DIMSIDESECRETVALUE";
+        const UNROUTABLE: &str = "elsewhere/x.parquet";
+
+        let mut spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", 64)],
+        );
+        spec.common.storage = s3_backend("http://localhost:9000", FACT_SECRET);
+        spec.common
+            .join
+            .as_mut()
+            .expect("the spec carries a join block")
+            .storage = s3_backend("http://localhost:9000", DIM_SECRET);
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+        let store = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url("test-bucket"))
+            .expect("the shared bucket's store must be registered");
+
+        let error = store
+            .get(&ObjectStorePath::from(UNROUTABLE))
+            .await
+            .expect_err("a path neither side owns must be refused, never routed to a side");
+
+        let message = error.to_string();
+        for named in [UNROUTABLE, "fact", "dimension", "db/dim"] {
+            assert!(
+                message.contains(named),
+                "the refusal must name '{named}': {message}"
+            );
+        }
+        for secret in [FACT_SECRET, DIM_SECRET] {
+            assert!(
+                !message.contains(secret),
+                "the refusal must not leak either side's credential: {message}"
+            );
+        }
+    }
+
+    /// Each side's inner store is built from THAT side's OWN storage backend — the
+    /// falsifiable provenance gate: the defect built the dimension side's store from
+    /// `common.storage`, the FACT side's credential.
+    ///
+    /// Two same-bucket sides pointing at DIFFERENT endpoints share one DataFusion
+    /// registry key, so the endpoint a read actually REACHES is the only observable
+    /// provenance — `AmazonS3`'s `Display` prints its bucket alone, which both sides
+    /// share. A data read is what reaches an endpoint at all: a HEAD is answered
+    /// from the size index without I/O.
+    #[tokio::test]
+    async fn each_side_inner_store_is_built_from_its_own_backend() {
+        use ::object_store::ObjectStoreExt;
+
+        let fact_endpoint = RecordingEndpoint::bind().await;
+        let dimension_endpoint = RecordingEndpoint::bind().await;
+
+        let mut spec = spec_with_join(
+            "s3://test-bucket/db/dim",
+            vec![FileEntry::new("data/dim-0.parquet", 64)],
+        );
+        spec.common.storage = s3_backend(&fact_endpoint.url, "FACTSIDESECRETVALUE");
+        spec.common
+            .join
+            .as_mut()
+            .expect("the spec carries a join block")
+            .storage = s3_backend(&dimension_endpoint.url, "DIMSIDESECRETVALUE");
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+        let store = ctx
+            .runtime_env()
+            .object_store_registry
+            .get_store(&bucket_url("test-bucket"))
+            .expect("the shared bucket's one store must be registered");
+
+        for (label, path, own, other) in [
+            (
+                "fact",
+                "data/part-0.parquet",
+                &fact_endpoint,
+                &dimension_endpoint,
             ),
-            "s3://bucket/db/table/data/f.parquet"
-        );
-        // Passthrough holds even against an empty root.
-        assert_eq!(
-            reconstruct_abs_uri("s3://other/x.parquet", ""),
-            "s3://other/x.parquet"
-        );
-    }
+            (
+                "dimension",
+                "db/dim/data/dim-0.parquet",
+                &dimension_endpoint,
+                &fact_endpoint,
+            ),
+        ] {
+            let other_before = other.requests().len();
 
-    /// 4.1: a relative entry joins onto the root with exactly one separator,
-    /// regardless of a trailing `/` on the root or a leading `/` on the entry.
-    #[test]
-    fn reconstruct_relative_entry_normalizes_single_separator() {
-        let expected = "s3://bucket/db/table/data/f.parquet";
-        // Neither side carries the separator.
-        assert_eq!(
-            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table"),
-            expected
-        );
-        // Trailing slash on the root only.
-        assert_eq!(
-            reconstruct_abs_uri("data/f.parquet", "s3://bucket/db/table/"),
-            expected
-        );
-        // Leading slash on the entry only.
-        assert_eq!(
-            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table"),
-            expected
-        );
-        // Both sides carry the separator — still not doubled.
-        assert_eq!(
-            reconstruct_abs_uri("/data/f.parquet", "s3://bucket/db/table/"),
-            expected
-        );
+            // Bounded: a store built with neither endpoint would retry a refused
+            // connection for minutes rather than fail legibly.
+            let _refused = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                store.get(&ObjectStorePath::from(path)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the {label} side's read must reach an endpoint, not hang"));
+
+            assert!(
+                own.requests().iter().any(|request| request.contains(path)),
+                "the {label} side's read must reach the {label} side's OWN endpoint; \
+                 it received {:?}",
+                own.requests()
+            );
+            assert_eq!(
+                other.requests().len(),
+                other_before,
+                "the {label} side's read must NOT reach the other side's endpoint; \
+                 it received {:?}",
+                other.requests()
+            );
+        }
     }
 
     /// 4.2: the size index is keyed by the object-store `Path` DataFusion passes
@@ -1061,7 +1374,8 @@ mod tests {
             FileEntry::new("data/rel.parquet", 111),
             FileEntry::new("s3://bucket/db/table/data/abs.parquet", 222),
         ];
-        let index = build_spec_size_index(&spec).expect("index must build");
+        let index =
+            side_size_index(&spec.files, &spec.common.table_root).expect("index must build");
 
         let rel_key = ObjectStorePath::from("db/table/data/rel.parquet");
         let abs_key = ObjectStorePath::from("db/table/data/abs.parquet");
@@ -1088,7 +1402,8 @@ mod tests {
             AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
         );
         spec.files = vec![FileEntry::new("file.parquet", 999)];
-        let index = build_spec_size_index(&spec).expect("index must build");
+        let index =
+            side_size_index(&spec.files, &spec.common.table_root).expect("index must build");
 
         let key = ObjectStorePath::from("path/to/file.parquet");
         assert_eq!(

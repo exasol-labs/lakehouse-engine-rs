@@ -28,9 +28,8 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
-    FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days,
-    order_totalprice_unscaled, seed_events,
+    E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS,
+    O_TOTALPRICE_PS, order_custkey, order_date_days, order_totalprice_unscaled, seed_events,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -49,11 +48,6 @@ const VS_NAME: &str = "MY_LAKEHOUSE_JOIN";
 /// Virtual schema forced ABOVE the broadcast threshold (`JOIN_BROADCAST_MAX_BYTES
 /// = '1'`): every dimension candidate exceeds 1 byte → unaccelerated two-scan.
 const VS_NAME_LOW: &str = "MY_LAKEHOUSE_JOIN_LOW";
-
-/// WHERE-clause lower bound applied to `O_ORDERDATE` in the join queries. Chosen
-/// to straddle both fact-side data files (orders 1..=5 vs 6..=10), so the
-/// broadcast fan-out's per-shard join results must merge across a shard boundary.
-const ORDERDATE_LOWER_BOUND: &str = "2024-01-05";
 
 // ---------------------------------------------------------------------------
 // One-time setup (idempotent; identical stack to e2e_capability_test.rs, plus a
@@ -98,148 +92,12 @@ fn setup_e2e() {
 // Query helpers
 // ---------------------------------------------------------------------------
 
-fn vs_dim_table(vs_name: &str) -> String {
-    format!("{vs_name}.{}", E2E_DIM_TABLE.to_uppercase())
-}
-
-fn vs_fact_table(vs_name: &str) -> String {
-    format!("{vs_name}.{}", E2E_FACT_TABLE.to_uppercase())
-}
-
 fn vs_lineitem_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
 fn vs_supplier_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
-}
-
-/// The `SELECT C_NAME, O_ORDERDATE FROM fact JOIN dim ...` query for one VS.
-fn join_query(vs_name: &str) -> String {
-    format!(
-        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
-         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
-         WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'",
-        vs_fact_table(vs_name),
-        vs_dim_table(vs_name)
-    )
-}
-
-/// Whether the pushed SQL carries a broadcast join: the fact-side ScanSpec's
-/// common blob embeds a `"join"` block (dimension file list + condition), joined
-/// node-locally in one DataFusion session. The lowercase compact `"join":{` token
-/// is unique to the generated ScanSpec JSON — Exasol's pretty-printed echoed
-/// request uses `"type" : "join"` / `"join_type"`, and the capability list uses
-/// uppercase `"JOIN"`, so neither collides.
-fn has_broadcast_join_block(pushed_sql: &str) -> bool {
-    pushed_sql.contains("\"join\":{")
-}
-
-/// Whether the pushed SQL is the deterministic two-table unaccelerated fallback:
-/// each side its own sharded fan-out, wrapped in an Exasol-executed `INNER JOIN`
-/// with the unified renderer's `LHS_T0`/`LHS_T1` aliases (the two-table case is
-/// simply N = 2 of the single N-scan wrapper; see `has_n_scan_wrapper`). These
-/// aliases appear only in this generated wrapper, never in a native retry or the
-/// broadcast path.
-fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
-    has_n_scan_wrapper(pushed_sql, 2)
-}
-
-/// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
-/// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
-/// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
-/// aliases (`build_n_scan_alias_map`) are unique to the N-scan wrapper's
-/// generated SQL — never present in a native retry or a broadcast join.
-fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
-    (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))
-        && !pushed_sql.contains(&format!(r#"AS "LHS_T{n}""#))
-}
-
-/// Fetch the join result as a sorted `Vec<(C_NAME, O_ORDERDATE)>` for
-/// order-independent multiset comparison.
-fn fetch_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    let cols = conn.query_columns(&join_query(vs_name));
-    columns_to_sorted_pairs(&cols)
-}
-
-fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, String)> {
-    assert_eq!(
-        cols.len(),
-        2,
-        "expected 2 result columns, got {}",
-        cols.len()
-    );
-    let mut rows: Vec<(String, String)> = cols[0]
-        .iter()
-        .zip(cols[1].iter())
-        .map(|(name, date)| (value_to_string(name), value_to_string(date)))
-        .collect();
-    rows.sort();
-    rows
-}
-
-fn value_to_string(v: &serde_json::Value) -> String {
-    v.as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| v.to_string())
-}
-
-/// Compute the expected join result INDEPENDENTLY of the join pushdown: read both
-/// tables un-joined through the VS and join them in-process. This is the ground
-/// truth both the broadcast and fallback join results must match. Delegates to
-/// [`expected_join_rows_with_fact_where`] with this module's fixed `O_ORDERDATE`
-/// bound.
-fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
-    expected_join_rows_with_fact_where(
-        conn,
-        vs_name,
-        &format!("O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"),
-    )
-}
-
-/// Compute the expected join result for an arbitrary side-local `fact_orders`
-/// WHERE clause, INDEPENDENTLY of the join pushdown under test: apply the SAME
-/// clause through the single-table WHERE surface (an already-correct, previously
-/// verified render path unrelated to the join sites this plan wires), then join
-/// the filtered fact rows against `dim_customer` in-process. Generalizes
-/// [`expected_join_rows`]'s fixed bound to an arbitrary caller-supplied predicate,
-/// reused by the join-filter-type-coercion tests.
-fn expected_join_rows_with_fact_where(
-    conn: &mut ExaConn,
-    vs_name: &str,
-    fact_where: &str,
-) -> Vec<(String, String)> {
-    let dim_cols = conn.query_columns(&format!(
-        "SELECT C_CUSTKEY, C_NAME FROM {}",
-        vs_dim_table(vs_name)
-    ));
-    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
-    let custkey_to_name: HashMap<String, String> = dim_cols[0]
-        .iter()
-        .zip(dim_cols[1].iter())
-        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
-        .collect();
-
-    let fact_cols = conn.query_columns(&format!(
-        "SELECT O_CUSTKEY, O_ORDERDATE FROM {} WHERE {fact_where}",
-        vs_fact_table(vs_name)
-    ));
-    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
-
-    let mut rows: Vec<(String, String)> = fact_cols[0]
-        .iter()
-        .zip(fact_cols[1].iter())
-        .map(|(custkey, date)| {
-            let key = value_to_string(custkey);
-            let name = custkey_to_name
-                .get(&key)
-                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
-                .clone();
-            (name, value_to_string(date))
-        })
-        .collect();
-    rows.sort();
-    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +110,12 @@ fn expected_join_rows_with_fact_where(
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
-    let mut conn = exa_conn();
+    // Same connection settings as `e2e_broadcast_join_result_correct` below, so the
+    // two tests pin ONE plan: the default 10000-row cap reaches the adapter as a
+    // pushdown `limit`, and `join_requires_exasol_postprocessing` treats any limit
+    // as a broadcast disqualifier — a capped shape assertion and an uncapped
+    // correctness assertion could otherwise describe different plans.
+    let mut conn = exa_conn().unbounded_result_sets();
 
     let pushed = explain_virtual_sql(&mut conn, &join_query(VS_NAME));
     assert!(
@@ -273,7 +136,7 @@ fn e2e_broadcast_join_pushdown_shape() {
 #[test]
 fn e2e_broadcast_join_result_correct() {
     setup_e2e();
-    let mut conn = exa_conn();
+    let mut conn = exa_conn().unbounded_result_sets();
 
     let actual = fetch_join_rows(&mut conn, VS_NAME);
     let expected = expected_join_rows(&mut conn, VS_NAME);
@@ -327,7 +190,7 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
 #[test]
 fn e2e_above_threshold_result_matches_broadcast() {
     setup_e2e();
-    let mut conn = exa_conn();
+    let mut conn = exa_conn().unbounded_result_sets();
 
     let broadcast = fetch_join_rows(&mut conn, VS_NAME);
     let fallback = fetch_join_rows(&mut conn, VS_NAME_LOW);
@@ -1308,7 +1171,7 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     setup_e2e();
-    let mut conn = exa_conn();
+    let mut conn = exa_conn().unbounded_result_sets();
 
     let query = like_on_orderdate_join_query(VS_NAME);
     let pushed = explain_virtual_sql(&mut conn, &query);
@@ -1496,7 +1359,7 @@ fn expected_orderdate_text(order_key: usize) -> String {
 #[test]
 fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     setup_e2e();
-    let mut conn = exa_conn();
+    let mut conn = exa_conn().unbounded_result_sets();
     let where_clause = "LENGTH(O_TOTALPRICE) > 3";
 
     let mut expected: Vec<(String, String)> = (1..=FACT_ORDERS_ROWS)

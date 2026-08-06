@@ -67,8 +67,13 @@ pub(crate) struct RenderedJoinPushdown {
 /// name — building the union first, or over a guard that had failed, could pick
 /// either side's type for what would then be an ambiguous shared name.
 ///
-/// Rendering is side-agnostic: the translator emits bare column names, so the
-/// result does not depend on which side is later selected as fact vs dimension.
+/// Rendering is made side-agnostic HERE: the condition, filter, and select list all
+/// carry Exasol's native `tableAlias` for an aliased join query, but `build_join_sql`
+/// wraps each side in an unaliased derived sub-SELECT, so an alias-qualified
+/// reference would not resolve (`No field named "O"."O_ORDERDATE"`). This function
+/// therefore strips `tableAlias` before every render call to GUARANTEE bare column
+/// names reach the translator — safe only because the guard immediately above has
+/// already proven the two sides share no column name, so a bare name is unambiguous.
 pub(crate) fn render_broadcast_join(
     request: &Json,
     pushdown_req: &Json,
@@ -80,22 +85,24 @@ pub(crate) fn render_broadcast_join(
         return Ok(None);
     }
 
+    let bare_condition = strip_table_alias(&join.conditions[0]);
     // Uses `render_expression_safe`, not the filter renderer, so a boolean is
     // returned verbatim rather than suppressed as trivially true.
-    let condition = match render_expression_safe(&join.conditions[0]) {
+    let condition = match render_expression_safe(&bare_condition) {
         Some(condition) => condition,
         None => return Ok(None),
     };
 
     let col_types = join_col_types(request, join);
-    let filter_json = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let (filter, declined) = classify_where_filter(filter_json, &col_types);
+    let bare_pushdown_req = strip_table_alias(pushdown_req);
+    let bare_filter_json = bare_pushdown_req.get("filter").filter(|f| !f.is_null());
+    let (filter, declined) = classify_where_filter(bare_filter_json, &col_types);
     if declined.is_some() {
         return Ok(None);
     }
 
     let (projection, projection_types, widened) =
-        extract_join_projection(request, pushdown_req, join)?;
+        extract_join_projection(request, &bare_pushdown_req, join)?;
     // The derived projection is the full two-table base row, not one item per
     // select-list item, so a broadcast fan-out would emit the wrong column shape.
     // Decline to the unified N-scan fallback, which re-renders the select list
@@ -549,10 +556,13 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 /// Assemble the shard-invariant [`ScanSpec`] both join fan-out builders emit: an
 /// empty `files` (the shards travel separately), no limit / order / aggregate /
 /// group, and the six DataFusion + S3 tuning knobs copied from `tuning`. `primary`
-/// is the side the spec scans (its `table_root`, `logical_schema`, `name_mapping`,
-/// and effective `storage`); `projection`, `filter`, `emit_exa_types`, and `join`
-/// are the only per-path differences (the N-scan leg passes `join: None`, the
-/// broadcast path passes the dimension-side join block).
+/// is the side the spec scans, and `common.storage` carries ONLY that scanned
+/// side's own effective `storage` (`table_root`, `logical_schema`, `name_mapping`
+/// likewise come from `primary`); `projection`, `filter`, `emit_exa_types`, and
+/// `join` are the only per-path differences (the N-scan leg passes `join: None`;
+/// the broadcast path passes the dimension-side join block, which carries the
+/// dimension's own effective storage in `join.storage` rather than riding in
+/// `primary`'s).
 fn join_fan_out_scan_spec(
     primary: &ResolvedJoinSide,
     projection: Vec<ProjectionItem>,
@@ -663,11 +673,11 @@ pub(super) fn build_side_fan_out_sql(
 /// subset node-locally, with no cross-shard exchange. Reuses [`build_scan_driving_sql`]
 /// unchanged — the join block travels transparently inside the common blob.
 ///
-/// One `StorageBackend` serves both registered tables inside the single DataFusion
-/// session; the fact side's effective storage is used. When vended credentials are
-/// disabled (the common MinIO case) both sides' effective storage is identical, so
-/// this is exact; with per-prefix vended STS creds both tables must be readable with
-/// the fact side's grant (both live under one warehouse for the broadcast target).
+/// Each side carries its own effective `StorageBackend`: the fact side's rides in
+/// `common.storage` (as on every other scan path); the dimension side's rides in
+/// `join.storage`, set below from `dimension.effective_storage`. A vended
+/// credential is scoped to the table it was resolved for, so the two sides' file
+/// lists must never be read through one shared storage value.
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
@@ -687,6 +697,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
+        storage: dimension.effective_storage.clone(),
     };
 
     let spec = join_fan_out_scan_spec(
@@ -1035,6 +1046,7 @@ mod tests {
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
+    use crate::scan::spec::{StorageBackend, StorageProps};
     use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
     /// The Q1-shape three-table inner-join pushdown request:
@@ -2640,7 +2652,18 @@ mod tests {
     #[test]
     fn golden_broadcast_join_sql_unchanged() {
         let fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
-        let dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
+        let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
+        // Distinct from the fact side's `sample_storage()` — the point of this
+        // golden is to prove the two sides' backends are genuinely different, not
+        // coincidentally equal.
+        dimension.effective_storage = StorageBackend::S3(StorageProps {
+            endpoint: "http://minio-dim:9000".into(),
+            region: "us-east-2".into(),
+            access_key: "dimadmin".into(),
+            secret_key: "dimadmin".into(),
+            allow_http: true,
+            ..Default::default()
+        });
         let sides = JoinSides {
             fact,
             dimension,
@@ -2659,7 +2682,61 @@ mod tests {
             build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
         assert_eq!(
             actual,
-            r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")"},"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
+            r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"s3":{"endpoint":"http://minio-dim:9000","region":"us-east-2","access_key":"dimadmin","secret_key":"dimadmin","allow_http":true,"path_style":true}}},"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
+        );
+    }
+
+    /// `build_broadcast_join_sql` must carry the FACT side's own backend in
+    /// `common.storage` and the DIMENSION side's own backend in `join.storage` —
+    /// never the other way around. Swapping `fact.effective_storage.clone()` and
+    /// `dimension.effective_storage.clone()` at the two assignment sites in
+    /// `build_broadcast_join_sql` would fail this test (wrong side's credential in
+    /// each slot), not merely re-baseline a golden string.
+    #[test]
+    fn broadcast_carries_each_sides_own_storage() {
+        let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
+        fact.effective_storage = StorageBackend::S3(StorageProps {
+            endpoint: "http://minio-fact:9000".into(),
+            region: "us-east-1".into(),
+            access_key: "factadmin".into(),
+            secret_key: "factadmin".into(),
+            allow_http: true,
+            ..Default::default()
+        });
+        let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
+        dimension.effective_storage = StorageBackend::S3(StorageProps {
+            endpoint: "http://minio-dim:9000".into(),
+            region: "us-east-2".into(),
+            access_key: "dimadmin".into(),
+            secret_key: "dimadmin".into(),
+            allow_http: true,
+            ..Default::default()
+        });
+        let sides = JoinSides {
+            fact: fact.clone(),
+            dimension: dimension.clone(),
+            broadcast_eligible: true,
+        };
+        let rendered = RenderedJoinPushdown {
+            condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
+            filter: None,
+            projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
+            projection_types: vec!["DECIMAL(20,0)".to_string()],
+        };
+        let sql =
+            build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
+        let common: serde_json::Value =
+            serde_json::from_str(common_arg_literal(&sql)).expect("common blob is valid JSON");
+
+        assert_eq!(
+            common["storage"],
+            serde_json::to_value(&fact.effective_storage).unwrap(),
+            "common.storage must be the FACT side's own backend"
+        );
+        assert_eq!(
+            common["join"]["storage"],
+            serde_json::to_value(&dimension.effective_storage).unwrap(),
+            "join.storage must be the DIMENSION side's own backend"
         );
     }
 

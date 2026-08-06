@@ -18,6 +18,7 @@ use tungstenite::{Message, WebSocket, client_tls_with_config};
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     redact_sql: bool,
+    result_set_max_rows: u32,
 }
 
 impl ExaConn {
@@ -85,7 +86,11 @@ impl ExaConn {
             Some("ok"),
             "Exasol authentication failed: {resp}"
         );
-        ExaConn { ws, redact_sql }
+        ExaConn {
+            ws,
+            redact_sql,
+            result_set_max_rows: 10000,
+        }
     }
 
     /// Execute SQL; panics on error. Returns the raw JSON response.
@@ -93,7 +98,7 @@ impl ExaConn {
         let cmd = json!({
             "command": "execute",
             "sqlText": sql,
-            "attributes": {"resultSetMaxRows": 10000}
+            "attributes": {"resultSetMaxRows": self.result_set_max_rows}
         });
         self.ws
             .send(Message::Text(cmd.to_string().into()))
@@ -122,12 +127,21 @@ impl ExaConn {
         let cmd = json!({
             "command": "execute",
             "sqlText": sql,
-            "attributes": {"resultSetMaxRows": 10000}
+            "attributes": {"resultSetMaxRows": self.result_set_max_rows}
         });
         self.ws
             .send(Message::Text(cmd.to_string().into()))
             .expect("send execute");
         Self::read_json(&mut self.ws)
+    }
+
+    /// `0` is Exasol's own documented default meaning "no limit" (WebSocket API v3:
+    /// `resultSetMaxRows`, "0 (default) means no limit"). Used only by tests that must
+    /// observe row-fetch-time behavior the default 10000-row cap would otherwise mask
+    /// (e.g. forcing every join onto the unaccelerated fallback via a pushdown `limit`).
+    pub fn unbounded_result_sets(mut self) -> Self {
+        self.result_set_max_rows = 0;
+        self
     }
 
     /// Execute SQL and return first column of first row as i64.

@@ -10,6 +10,7 @@
 //! when the local stack is unavailable, per project rules.
 
 use super::exasol_ws::ExaConn;
+use super::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
@@ -21,6 +22,7 @@ use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::resolve_file_list;
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -378,4 +380,157 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         .await
         .unwrap_or_else(|e| panic!("resolve_file_list({table}) must succeed: {e}"));
     files
+}
+
+// ---------------------------------------------------------------------------
+// Two-table broadcast-join helpers, promoted from `e2e_join_test.rs` — shared
+// by that suite and any other binary exercising the fact/dim broadcast join
+// (e.g. `e2e_lakekeeper_test.rs`'s vended-credential reproduction).
+// ---------------------------------------------------------------------------
+
+/// WHERE-clause lower bound applied to `O_ORDERDATE` in the join queries. Chosen
+/// to straddle both fact-side data files (orders 1..=5 vs 6..=10), so the
+/// broadcast fan-out's per-shard join results must merge across a shard boundary.
+pub const ORDERDATE_LOWER_BOUND: &str = "2024-01-05";
+
+/// The dimension table's fully qualified, uppercase Exasol name under `vs_name`.
+pub fn vs_dim_table(vs_name: &str) -> String {
+    format!("{vs_name}.{}", E2E_DIM_TABLE.to_uppercase())
+}
+
+/// The fact table's fully qualified, uppercase Exasol name under `vs_name`.
+pub fn vs_fact_table(vs_name: &str) -> String {
+    format!("{vs_name}.{}", E2E_FACT_TABLE.to_uppercase())
+}
+
+/// The `SELECT C_NAME, O_ORDERDATE FROM fact JOIN dim ...` query for one VS.
+pub fn join_query(vs_name: &str) -> String {
+    format!(
+        "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
+         JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY \
+         WHERE o.O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'",
+        vs_fact_table(vs_name),
+        vs_dim_table(vs_name)
+    )
+}
+
+/// Whether the pushed SQL carries a broadcast join: the fact-side ScanSpec's
+/// common blob embeds a `"join"` block (dimension file list + condition), joined
+/// node-locally in one DataFusion session. The lowercase compact `"join":{` token
+/// is unique to the generated ScanSpec JSON — Exasol's pretty-printed echoed
+/// request uses `"type" : "join"` / `"join_type"`, and the capability list uses
+/// uppercase `"JOIN"`, so neither collides.
+pub fn has_broadcast_join_block(pushed_sql: &str) -> bool {
+    pushed_sql.contains("\"join\":{")
+}
+
+/// Whether the pushed SQL is the deterministic two-table unaccelerated fallback:
+/// each side its own sharded fan-out, wrapped in an Exasol-executed `INNER JOIN`
+/// with the unified renderer's `LHS_T0`/`LHS_T1` aliases (the two-table case is
+/// simply N = 2 of the single N-scan wrapper; see `has_n_scan_wrapper`). These
+/// aliases appear only in this generated wrapper, never in a native retry or the
+/// broadcast path.
+pub fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
+    has_n_scan_wrapper(pushed_sql, 2)
+}
+
+/// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
+/// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
+/// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
+/// aliases (`build_n_scan_alias_map`) are unique to the N-scan wrapper's
+/// generated SQL — never present in a native retry or a broadcast join.
+pub fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
+    (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))
+        && !pushed_sql.contains(&format!(r#"AS "LHS_T{n}""#))
+}
+
+/// Fetch the join result as a sorted `Vec<(C_NAME, O_ORDERDATE)>` for
+/// order-independent multiset comparison.
+pub fn fetch_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    let cols = conn.query_columns(&join_query(vs_name));
+    columns_to_sorted_pairs(&cols)
+}
+
+/// Zip exactly two result columns into row pairs, sorted for order-independent
+/// multiset comparison. Panics if `cols` does not carry exactly 2 columns.
+pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, String)> {
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 result columns, got {}",
+        cols.len()
+    );
+    let mut rows: Vec<(String, String)> = cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(name, date)| (value_to_string(name), value_to_string(date)))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A JSON string yields its unquoted contents; any other JSON value yields its
+/// `to_string()` form.
+pub fn value_to_string(v: &serde_json::Value) -> String {
+    v.as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| v.to_string())
+}
+
+/// Compute the expected join result INDEPENDENTLY of the join pushdown: read both
+/// tables un-joined through the VS and join them in-process. This is the ground
+/// truth both the broadcast and fallback join results must match. Delegates to
+/// [`expected_join_rows_with_fact_where`] with this module's fixed `O_ORDERDATE`
+/// bound.
+pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
+    expected_join_rows_with_fact_where(
+        conn,
+        vs_name,
+        &format!("O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'"),
+    )
+}
+
+/// Compute the expected join result for an arbitrary side-local `fact_orders`
+/// WHERE clause, INDEPENDENTLY of the join pushdown under test: apply the SAME
+/// clause through the single-table WHERE surface (an already-correct, previously
+/// verified render path unrelated to the join sites this plan wires), then join
+/// the filtered fact rows against `dim_customer` in-process. Generalizes
+/// [`expected_join_rows`]'s fixed bound to an arbitrary caller-supplied predicate,
+/// reused by the join-filter-type-coercion tests.
+pub fn expected_join_rows_with_fact_where(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    fact_where: &str,
+) -> Vec<(String, String)> {
+    let dim_cols = conn.query_columns(&format!(
+        "SELECT C_CUSTKEY, C_NAME FROM {}",
+        vs_dim_table(vs_name)
+    ));
+    assert_eq!(dim_cols.len(), 2, "dim query must return 2 columns");
+    let custkey_to_name: HashMap<String, String> = dim_cols[0]
+        .iter()
+        .zip(dim_cols[1].iter())
+        .map(|(k, n)| (value_to_string(k), value_to_string(n)))
+        .collect();
+
+    let fact_cols = conn.query_columns(&format!(
+        "SELECT O_CUSTKEY, O_ORDERDATE FROM {} WHERE {fact_where}",
+        vs_fact_table(vs_name)
+    ));
+    assert_eq!(fact_cols.len(), 2, "fact query must return 2 columns");
+
+    let mut rows: Vec<(String, String)> = fact_cols[0]
+        .iter()
+        .zip(fact_cols[1].iter())
+        .map(|(custkey, date)| {
+            let key = value_to_string(custkey);
+            let name = custkey_to_name
+                .get(&key)
+                .unwrap_or_else(|| panic!("fact O_CUSTKEY {key} has no matching customer"))
+                .clone();
+            (name, value_to_string(date))
+        })
+        .collect();
+    rows.sort();
+    rows
 }

@@ -27,7 +27,9 @@ pub use sql_support::build_alias_items;
 
 mod object_store;
 use object_store::build_session_context;
-pub(crate) use object_store::reconstruct_abs_uri;
+pub(crate) use spec::reconstruct_abs_uri;
+
+mod store_router;
 
 mod raw_scan;
 pub use raw_scan::{
