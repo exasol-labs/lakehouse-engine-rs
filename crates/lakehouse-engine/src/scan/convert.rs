@@ -1,5 +1,3 @@
-#[cfg(test)]
-use arrow::array::RecordBatch;
 /// Arrow RecordBatch → SDK Value row conversion.
 ///
 /// Implements the full datafusion-scan/type-mapping table including null + JSON

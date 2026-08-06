@@ -478,10 +478,6 @@ impl PhaseTimers {
     }
 }
 
-#[cfg(test)]
-#[path = "diagnostics_tests.rs"]
-mod test_modules;
-
 /// Format the single per-VM phase-telemetry record.
 ///
 /// One greppable line (`LHTELEM` tag) carrying the pid (so per-shard timings are
@@ -517,3 +513,7 @@ pub fn write_telemetry_file(record: &str) {
     line.push('\n');
     append_record(&telemetry_file_path(), &line);
 }
+
+#[cfg(test)]
+#[path = "diagnostics_tests.rs"]
+mod tests;

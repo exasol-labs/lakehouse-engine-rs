@@ -1,7 +1,6 @@
 /// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>).
 ///
 /// Row order matches the batch order; columns match the batch schema order.
-#[cfg(test)]
 fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Value>> {
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();
@@ -20,7 +19,8 @@ use super::*;
 use arrow::array::{
     BinaryArray, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder,
     Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder, ListBuilder,
-    StringBuilder, StructArray, UInt8Builder, UInt16Builder, UInt32Builder, UInt64Builder,
+    RecordBatch, StringBuilder, StructArray, UInt8Builder, UInt16Builder, UInt32Builder,
+    UInt64Builder,
 };
 use arrow::datatypes::{Field, Schema};
 use std::sync::Arc;

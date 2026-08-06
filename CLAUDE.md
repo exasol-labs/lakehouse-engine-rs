@@ -26,7 +26,8 @@ Project mission in: @specs/mission.md
 ## Unit test layout
 
 - **No test code in a production source file.** Unit tests MUST live in a sibling file named after
-  the module's own file, declared as the last item of that module:
+  the module's own file, declared with the module's other `mod` declarations or as the last item of
+  that module:
   ```rust
   #[cfg(test)]
   #[path = "<module>_tests.rs"]

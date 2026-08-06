@@ -277,13 +277,6 @@ fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::va
         .collect()
 }
 
-/// Test-only no-filter wrapper over `build_partial_agg_sql_filtered`
-/// (`filter = None`); used by the partial-aggregate SQL-builder unit tests.
-#[cfg(test)]
-pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
-    build_partial_agg_sql_filtered(aggregates, aliased_table, None)
-}
-
 /// Build the partial-aggregate SQL, optionally with a WHERE clause.
 ///
 /// COLUMN CONTRACT: iterating `aggregates` in order, each plan item at index `i`
@@ -410,3 +403,7 @@ fn partial_row_from_batch(
 #[cfg(test)]
 #[path = "partial_agg_tests.rs"]
 mod tests;
+
+/// Widens the test-only no-filter SQL wrapper to `crate::scan::`.
+#[cfg(test)]
+pub use tests::build_partial_agg_sql;

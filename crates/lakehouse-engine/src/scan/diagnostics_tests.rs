@@ -1,4 +1,3 @@
-#[cfg(test)]
 mod phase_telemetry_tests {
     use super::super::*;
     use std::thread::sleep;
@@ -117,7 +116,6 @@ mod phase_telemetry_tests {
     }
 }
 
-#[cfg(test)]
 mod debug_checkpoint_tests {
     use super::super::*;
 
@@ -222,8 +220,7 @@ mod debug_checkpoint_tests {
     }
 }
 
-#[cfg(test)]
-mod tests {
+mod panic_hook_tests {
     use super::super::*;
     use std::sync::Mutex;
 

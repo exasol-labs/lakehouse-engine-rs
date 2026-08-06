@@ -1,6 +1,13 @@
 use super::*;
 use crate::scan::spec::AggKind;
 
+/// Test-only no-filter wrapper over `build_partial_agg_sql_filtered`
+/// (`filter = None`); also reached by `grouped_agg_tests` and
+/// `scan_surface_probe` via `crate::scan::`.
+pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
+    build_partial_agg_sql_filtered(aggregates, aliased_table, None)
+}
+
 /// One `AggregatePlan` per `AggKind` variant, in the same order as
 /// `testdata/dispatch_golden/single_group_all_agg_kinds.sql` /
 /// `grouped_all_agg_kinds.sql` (plan `refactor-pushdown-agg-dedup`, task

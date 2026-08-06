@@ -49,4 +49,4 @@ Decomposes the DataFusion scan-execution code in `scan/mod.rs` into single-respo
 * *WHEN* the test suite compiles
 * *THEN* each functional submodule MUST contain a `#[cfg(test)] mod tests` covering only that submodule's own items
 * *AND* no single central scan test module SHALL remain in `scan/mod.rs` beyond the entry-and-dispatch tests for the items `mod.rs` retains
-* *AND* a test helper shared across submodules MUST live in one shared `scan/test_support.rs` module rather than being duplicated
+* *AND* a test helper shared across submodules MUST live in one shared `scan/test_support_tests.rs` module rather than being duplicated
