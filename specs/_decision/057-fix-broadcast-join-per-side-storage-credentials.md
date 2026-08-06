@@ -100,13 +100,13 @@ Keep the scan-time guard that refuses a spec whose sides collapse onto one DataF
 
 ### Consequences
 
-The ADLS different-container case keeps its own plan-time and scan-time guards, unchanged by the prefix-routing decorator.
+The ADLS different-container case keeps this scan-time guard, unchanged by the prefix-routing decorator. It is now the ONLY guard over that case — see `join-backend-guard-deleted-store-url-collision-is-the-rule`, which deletes the plan-time backend comparison that never covered it anyway.
 
 ## ADR: Per-side scheme selection needs a plan-time join guard scoped to variant and account, not full backend equality
 
 **ID:** join-backend-guard-scoped-to-variant-and-credential-served
 **Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
+**Status:** Superseded by join-backend-guard-deleted-store-url-collision-is-the-rule
 **Supersedes:** join-backend-guard-scoped-to-variant-and-account
 
 ### Context
@@ -180,3 +180,41 @@ Investigating the credential-defect reproduction (issue #294) surfaced a second,
 ### Consequences
 
 A broadcast join now resolves correctly for aliased SQL (the common real-world case), with no wire-format change and no change to `build_join_sql` or `register_join_tables`. `render_broadcast_join`'s and `vs-adapter/pushdown-planning-join`'s recorded claims that broadcast rendering is "side-agnostic bare-name" become true by construction rather than describing an unstated assumption that Exasol never sends `tableAlias`.
+
+## ADR: Delete the plan-time backend guard; the store-URL collision is the only rule, and the scan owns it
+
+**ID:** join-backend-guard-deleted-store-url-collision-is-the-rule
+**Plan:** fix-broadcast-join-per-side-storage-credentials
+**Status:** Accepted
+**Supersedes:** join-backend-guard-scoped-to-variant-and-credential-served
+
+### Context
+
+Code review of this plan's PR (#306) checked the superseded ADR's two grounds against the implemented tree and found both false, and the guard's scope inverted with respect to what the scan can actually serve.
+
+`build_side_store` dispatches on EACH side's own backend and `group_sides_by_store_url` registers one store per derived store URL, so:
+
+* a variant difference is SERVED — an `s3://` fact and an `abfss://` dimension differ in scheme, hence in DataFusion registry key, and each side's store is built by its own arm. No `AmazonS3Builder` is ever handed an `abfss://` URI.
+* an ADLS storage-ACCOUNT difference is SERVED — two accounts are two hosts, hence two registry keys. This plan's own `azure_sides_in_different_accounts_register_two_stores` asserts exactly that, and `validate_sides_share_one_store` accepts the same shape (`sides in different storage accounts must be accepted`).
+* the ADLS same-account/different-CONTAINER case is NOT serveable, and `backend_identity` compares `account_name`, so the guard ADMITTED it.
+
+The guard therefore rejected two configurations the read path serves and admitted the one it cannot — the opposite of its stated purpose. A user joining two Iceberg tables in different ADLS storage accounts got a hard `Err` from `plan_join` ahead of both renderers, though broadcast and fallback would both have read correctly.
+
+### Decision
+
+Delete `validate_sides_share_one_backend` and `backend_identity`. No plan-time comparison of the sides' storage backends remains. The scan-time `validate_sides_share_one_store` precondition is the sole owner of the one real rule: two sides collapsing onto ONE DataFusion registry key while needing DIFFERENT stores.
+
+### Options Considered
+
+| Option | Verdict |
+|--------|---------|
+| Delete the guard; let `validate_sides_share_one_store` own the rule | ✓ Chosen — the collapse is a property of the DERIVED store URLs, which is what that guard is already stated over; every case the deleted guard rejected is served, and the one unserveable case still fails with a clean `UdfError::User` naming both store URLs. No shape can return wrong rows either way |
+| Re-scope the plan-time guard to compare derived store URLs instead of backend identity | ✗ Rejected — would re-derive DataFusion's registry-key formula in the adapter layer, a second home for a rule the scan already owns, and would still hard-error a container-collision join that the N-scan fallback serves correctly |
+| Keep the guard, widen or narrow its backend comparison | ✗ Rejected — backend identity is not what the scan's addressing depends on, so no scoping of it can be right |
+| Make the collision a broadcast DISQUALIFIER (fall through to the N-scan fallback) | ✗ Rejected for this plan — best user-facing behaviour and would make the container case work, but it needs plan-time store-URL derivation plus new eligibility and spec requirements; out of scope for a review fixup, recorded here as the known improvement |
+
+### Consequences
+
+A cross-backend join and a two-storage-account ADLS join are planned and executed normally. Two ADLS containers of one storage account fail at scan time (`build_session_context`'s first check) instead of at plan time, with the message naming both derived store URLs; the N-scan fallback serves that shape, so which plan is chosen decides whether it errors — accepted deliberately, because the alternative refuses a query the fallback reads correctly. The superseded ADR's "acceptance must follow the configuration, never the data in it" property is given up for exactly that reason.
+
+Making the container collision a broadcast disqualifier — so every configuration works — would restore that property AND serve the case; it needs its own tracked work.

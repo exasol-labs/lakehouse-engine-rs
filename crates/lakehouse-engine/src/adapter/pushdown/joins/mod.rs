@@ -27,7 +27,7 @@ pub(super) use sql_builders::{
 
 use planning::{
     JoinSideResolution, involved_table_columns, join_requires_exasol_postprocessing,
-    resolve_one_join_side, select_broadcast_sides, validate_sides_share_one_backend,
+    resolve_one_join_side, select_broadcast_sides,
 };
 use rendering::side_local_filter;
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
@@ -97,10 +97,18 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
 /// fallback renderer, [`build_n_scan_join_sql`], which scans each table through its
 /// own sharded fan-out and reconstructs the join in Exasol's core engine.
 ///
-/// Two hard `Err`s can leave this path: [`validate_sides_share_one_backend`] rejects
-/// a join whose sides do not all name one object-storage backend, ahead of both
-/// renderers and of the empty-side shortcut; otherwise a hard `Err` is delegated to
-/// the fallback builder for a wrapper that genuinely cannot be built.
+/// No plan-time check compares the sides' storage backends: each side is READ through
+/// its own store, built from its own backend, so a join across two variants or two ADLS
+/// accounts resolves to two distinct DataFusion registry keys and is served (see
+/// `build_side_store`, `crates/lakehouse-engine/src/scan/object_store.rs`). The one
+/// shape the scan genuinely
+/// cannot serve — two sides collapsing onto ONE registry key while needing different
+/// stores, i.e. two containers of one ADLS storage account — is owned by the scan's own
+/// `validate_sides_share_one_store` precondition, which is stated over the derived store
+/// URLs the collapse is a property of; a plan-time copy would have to re-derive
+/// DataFusion's key formula here to say the same thing. A hard `Err` therefore leaves
+/// this path only when it is delegated to the fallback builder for a wrapper that
+/// genuinely cannot be built.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn plan_join(
     request: &Json,
@@ -145,12 +153,6 @@ pub(super) async fn plan_join(
         .await?;
         sides.push(side);
     }
-
-    // Reject a cross-backend join before the empty-side shortcut and either renderer,
-    // so acceptance follows the CONFIGURATION and never the data in it: a momentarily
-    // empty side must not answer "0 rows" for a join that fails once that table holds
-    // files.
-    validate_sides_share_one_backend(&sides)?;
 
     // An inner join with any empty side is empty regardless of the plan. Emit the
     // shape-correct empty result over the combined N-table column universe (stable

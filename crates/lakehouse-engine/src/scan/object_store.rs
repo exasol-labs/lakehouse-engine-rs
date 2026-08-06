@@ -967,6 +967,41 @@ mod tests {
         }
     }
 
+    /// A join across two BACKENDS — an `s3://` fact side and an `abfss://` dimension
+    /// side — registers one store per side. The scheme alone makes the two registry
+    /// keys differ, and [`build_side_store`] dispatches on each side's OWN backend, so
+    /// the Azure side is never addressed through an `AmazonS3Builder`.
+    ///
+    /// This is the evidence that a cross-backend join is SERVEABLE, and therefore why
+    /// no plan-time guard refuses one: a join's sides are compared nowhere, because
+    /// each is read through its own store.
+    #[test]
+    fn sides_on_different_backends_each_register_their_own_store() {
+        const DIM_ROOT: &str = "abfss://dims@acct.dfs.core.windows.net/db/dim";
+        let mut spec = spec_with_join(DIM_ROOT, vec![FileEntry::new("data/dim-0.parquet", 64)]);
+        spec.common
+            .join
+            .as_mut()
+            .expect("spec_with_join sets a join block")
+            .storage = adls_backend(AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()));
+
+        let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
+        assert!(
+            store_registered(&ctx, "test-bucket"),
+            "the S3 fact side must register under its own bucket key"
+        );
+        assert!(
+            ctx.runtime_env()
+                .object_store_registry
+                .get_store(
+                    &Url::parse("abfss://dims@acct.dfs.core.windows.net").expect("URL must parse")
+                )
+                .is_ok(),
+            "the Azure dimension side must register under its own account key"
+        );
+    }
+
     /// `MicrosoftAzureBuilder::with_url` recognises `abfs` as a host-suffix-matched
     /// scheme exactly like `abfss` (`object_store`'s `azure::builder::parse_url` matches
     /// `"az" | "abfs" | "abfss"` identically), so an `abfs://` side must register a

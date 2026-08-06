@@ -319,65 +319,6 @@ pub(super) fn select_broadcast_sides(
     }
 }
 
-/// Reject at plan time a join whose sides do not all resolve to the same
-/// object-storage backend.
-///
-/// `CommonScanSpec.storage` is ONE whole-spec value and the broadcast fan-out scans
-/// BOTH tables under it, so an `s3://` fact joined to an `abfss://` dimension would
-/// build an `AmazonS3Builder` for the dimension's Azure URL, and two `abfss://` sides
-/// on different accounts would present the fact's SAS to the dimension's account.
-/// That collapse was variant-safe only while every side took its variant from one
-/// `storage_block` output; it is not once the variant follows each side's OWN table
-/// location, which is what `resolve_vended_storage` selects it from.
-///
-/// The check is uniform across BOTH renderers even though the N-scan fallback gives
-/// each leg its own storage: whether a join broadcasts depends on byte sizes, so a
-/// per-renderer guard would make acceptance of a configuration depend on the data in
-/// it. Comparison is scoped to the backend VARIANT and, for `Adls`, `account_name` —
-/// not full backend equality. The variant and ADLS-account scoping are KEPT
-/// deliberately: those two differences are unserveable regardless of how the join is
-/// read — an `AmazonS3Builder` cannot address an `abfss://` URI, and two ADLS sides
-/// on different storage accounts are unserveable per the `validate_sides_share_one_store`
-/// guard even once each side is read through its own store. A plain credential
-/// difference within one variant is no longer in that category: each side's join
-/// scan now carries and is read through its OWN `StorageBackend` (this plan's fix —
-/// see `JoinSpec::storage` and `build_broadcast_join_sql`), so rejecting it here would
-/// reject a configuration the read path already serves correctly. `backend_identity`
-/// derives both the compared identity and the words the error uses, so the message
-/// can never name a distinction the comparison did not make.
-///
-/// Fewer than two sides share one backend trivially.
-pub(super) fn validate_sides_share_one_backend(sides: &[ResolvedJoinSide]) -> Result<(), UdfError> {
-    let mut rest = sides.iter();
-    let Some(first) = rest.next() else {
-        return Ok(());
-    };
-    let expected = backend_identity(&first.effective_storage);
-
-    for side in rest {
-        let found = backend_identity(&side.effective_storage);
-        if found != expected {
-            return Err(UdfError::User(format!(
-                "a pushed-down join reads every side through ONE object-storage backend, but this \
-                 join's sides resolve to two: table '{}' resolves to {expected}, table '{}' \
-                 resolves to {found}. Both tables must live in the same object-storage backend \
-                 (and, for ADLS, the same storage account) to be joined by this adapter",
-                first.table_name, side.table_name,
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn backend_identity(storage: &StorageBackend) -> String {
-    match storage {
-        StorageBackend::S3(_) => "s3".to_string(),
-        StorageBackend::Adls { account_name, .. } => {
-            format!("adls storage account '{account_name}'")
-        }
-    }
-}
-
 /// Resolve ONE join side's file list, logical schema, table root, and effective
 /// storage from the Iceberg catalog, reusing the single-table `resolve_file_list`
 /// path unchanged.
@@ -516,14 +457,11 @@ pub(super) fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::sql_builders::{RenderedJoinPushdown, build_broadcast_join_sql};
     use super::super::tests::{
         equi_condition, join_request, nq3_join_request, resolved_side, three_table_join_request,
-        two_scan_tuning,
     };
     use super::*;
     use crate::adapter::pushdown::test_support::*;
-    use crate::scan::spec::{AdlsCred, ProjectionItem, StorageProps};
 
     // ---------------------------------------------------------------------------
     // Join detection: `detect_join` shape classification.
@@ -865,139 +803,5 @@ mod tests {
         assert_eq!(sides.dimension.table_name, "SELF_A");
         assert_eq!(sides.fact.table_name, "SELF_B");
         assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
-    }
-
-    // ---------------------------------------------------------------------------
-    // One-backend join guard: `validate_sides_share_one_backend`.
-    // ---------------------------------------------------------------------------
-
-    /// A SAS sentinel: every rejection message below is asserted NOT to contain it.
-    const ADLS_SAS: &str = "sv=2024-01-01&sig=SAS_SENTINEL_VALUE";
-
-    /// An `Adls` side on a named storage account. Built from `resolved_side` so
-    /// `effective_storage` is the ONLY field differing from an S3 side.
-    fn adls_side(table_name: &str, account_name: &str) -> ResolvedJoinSide {
-        let mut side = resolved_side(table_name, vec![("f", 10)]);
-        side.effective_storage = StorageBackend::Adls {
-            account_name: account_name.to_string(),
-            cred: AdlsCred::Sas(ADLS_SAS.to_string()),
-        };
-        side
-    }
-
-    #[test]
-    fn sides_on_one_backend_are_accepted() {
-        let sides = vec![
-            resolved_side("CUSTOMER", vec![("c1", 1_000)]),
-            resolved_side("ORDERS", vec![("o1", 50_000)]),
-        ];
-        assert!(validate_sides_share_one_backend(&sides).is_ok());
-    }
-
-    /// The guard is total over the slice and must not index past its start.
-    #[test]
-    fn fewer_than_two_sides_are_accepted() {
-        assert!(validate_sides_share_one_backend(&[]).is_ok());
-        assert!(
-            validate_sides_share_one_backend(&[resolved_side("CUSTOMER", vec![("c1", 1)])]).is_ok()
-        );
-    }
-
-    /// The broadcast fan-out registers one store for both sides, so an ADLS dimension
-    /// would otherwise be read through the fact's S3 store.
-    #[test]
-    fn sides_on_different_backend_variants_are_rejected() {
-        let sides = vec![
-            resolved_side("LINEITEM", vec![("l1", 90_000)]),
-            adls_side("PART", "azfacts"),
-        ];
-
-        let err = validate_sides_share_one_backend(&sides)
-            .expect_err("an s3:// side joined to an abfss:// side must be rejected");
-        let msg = err.to_string();
-
-        assert!(msg.contains("LINEITEM") && msg.contains("PART"), "{msg}");
-        assert!(msg.contains("s3") && msg.contains("adls"), "{msg}");
-        assert!(
-            !msg.contains(ADLS_SAS),
-            "the rejection must name no credential value: {msg}"
-        );
-    }
-
-    /// One ADLS account's SAS does not authorize another's.
-    #[test]
-    fn adls_sides_on_different_storage_accounts_are_rejected() {
-        let sides = vec![
-            adls_side("LINEITEM", "azfacts"),
-            adls_side("PART", "azdims"),
-        ];
-
-        let err = validate_sides_share_one_backend(&sides)
-            .expect_err("two ADLS accounts in one join must be rejected");
-        let msg = err.to_string();
-
-        assert!(msg.contains("azfacts") && msg.contains("azdims"), "{msg}");
-        assert!(
-            !msg.contains(ADLS_SAS),
-            "the rejection must name no credential value: {msg}"
-        );
-    }
-
-    /// The comparison is scoped to variant + ADLS account DELIBERATELY: widening it to
-    /// full backend equality would reject every vended join against a catalog minting
-    /// per-prefix credentials. Both sides now carry their credential difference all the
-    /// way through — `build_broadcast_join_sql` rides the fact side's backend in
-    /// `common.storage` and the dimension side's in `join.storage` — so this asserts
-    /// the two SQL-facing values, not just that validation returns `Ok`.
-    #[test]
-    fn s3_sides_differing_only_in_credentials_carry_both_backends() {
-        let fact = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
-        let mut dimension = resolved_side("ORDERS", vec![("o1", 50_000)]);
-        dimension.effective_storage = StorageBackend::S3(StorageProps {
-            endpoint: "https://s3.eu-central-1.amazonaws.com".into(),
-            region: "eu-central-1".into(),
-            access_key: "OTHER_PREFIX_AK".into(),
-            secret_key: "OTHER_PREFIX_SK".into(),
-            ..Default::default()
-        });
-        let sides = vec![fact.clone(), dimension.clone()];
-
-        assert!(validate_sides_share_one_backend(&sides).is_ok());
-
-        let join_sides = JoinSides {
-            fact,
-            dimension,
-            broadcast_eligible: true,
-        };
-        let rendered = RenderedJoinPushdown {
-            condition: "(\"CUSTOMER_KEY\" = \"ORDERS_KEY\")".to_string(),
-            filter: None,
-            projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
-            projection_types: vec!["DECIMAL(20,0)".to_string()],
-        };
-        let sql = build_broadcast_join_sql(
-            &join_sides,
-            &rendered,
-            &two_scan_tuning(),
-            "SCAN",
-            "DISTRIBUTE",
-        );
-        let common: serde_json::Value =
-            serde_json::from_str(common_arg_literal(&sql)).expect("common blob is valid JSON");
-
-        assert_eq!(
-            common["storage"],
-            serde_json::to_value(&join_sides.fact.effective_storage).unwrap(),
-            "common.storage must carry the FACT side's own backend"
-        );
-        assert_eq!(
-            common["join"]["storage"],
-            serde_json::to_value(&join_sides.dimension.effective_storage).unwrap(),
-            "join.storage must carry the DIMENSION side's own backend"
-        );
-        assert_ne!(
-            common["storage"], common["join"]["storage"],
-            "the two sides' credentials must differ — that is the point of this test"
-        );
     }
 }

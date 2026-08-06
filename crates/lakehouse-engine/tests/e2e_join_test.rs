@@ -110,7 +110,12 @@ fn vs_supplier_table(vs_name: &str) -> String {
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
-    let mut conn = exa_conn();
+    // Same connection settings as `e2e_broadcast_join_result_correct` below, so the
+    // two tests pin ONE plan: the default 10000-row cap reaches the adapter as a
+    // pushdown `limit`, and `join_requires_exasol_postprocessing` treats any limit
+    // as a broadcast disqualifier — a capped shape assertion and an uncapped
+    // correctness assertion could otherwise describe different plans.
+    let mut conn = exa_conn().unbounded_result_sets();
 
     let pushed = explain_virtual_sql(&mut conn, &join_query(VS_NAME));
     assert!(

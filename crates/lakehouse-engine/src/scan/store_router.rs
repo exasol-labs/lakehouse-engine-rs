@@ -148,8 +148,11 @@ impl PrefixRoutingObjectStore {
     }
 
     /// Route a two-path operation, which ONE side must own entirely: both paths are
-    /// touched under a single credential, so a pair spanning two sides has no
-    /// credential covering it.
+    /// touched through a single inner store, and routing is per side, so a pair
+    /// spanning two sides has no store covering it. The refusal is about cross-side
+    /// path OWNERSHIP, not credential inequality — this router is installed for every
+    /// join, including the common same-warehouse case where both sides' backends are
+    /// byte-identical, and it must not claim a difference it never compared.
     fn route_pair(
         &self,
         operation: &str,
@@ -163,7 +166,8 @@ impl PrefixRoutingObjectStore {
                 store: STORE_NAME,
                 source: format!(
                     "cannot {operation} '{from}' to '{to}': the two paths are owned by different \
-                     join sides ('{}' and '{}'), whose storage credentials differ",
+                     join sides ('{}' and '{}'), and each side is served by its OWN store, so no \
+                     one store covers both paths",
                     self.sides[source].label, self.sides[destination].label
                 )
                 .into(),

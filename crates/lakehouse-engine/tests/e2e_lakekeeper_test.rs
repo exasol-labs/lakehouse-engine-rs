@@ -823,7 +823,15 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
         let dim_store = s3_client_as(&dim, &dim.bucket);
         let victim = first_parquet_under(&dim_store, &dim.key_prefix, &secrets).await;
 
-        dim_store.get(&victim).await.unwrap_or_else(|e| {
+        // Bytes are drained for the same reason the cross read below drains them: a
+        // body-level failure must not leave the control green while the cross read
+        // fails for a reason other than credential scope, which would silently break
+        // the denial-vs-broken-probe discrimination this test is built on.
+        match dim_store.get(&victim).await {
+            Ok(result) => result.bytes().await.map(|bytes| bytes.len()),
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| {
             panic!(
                 "control read of {victim} with dim_customer's OWN vended credential failed, so a \
                  denial below could not be told apart from a broken probe: {}",
