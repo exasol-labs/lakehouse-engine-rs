@@ -52,6 +52,30 @@ spec argument, serialized once for the whole fan-out.
 * **Layering is routing OUTSIDE, spec-sized `head` INSIDE.** The routing decorator wraps one spec-sized store per side, not the other way round, so every operation is routed BEFORE the sized-`head` shortcut can answer it. Sizing outside the router would answer an unroutable `head` from the index and defer the routing failure to the later range read, where it would surface as a credential-shaped access denial instead of the plan defect it is.
 * **The single-table (non-join) path is untouched.** A spec with no join block registers exactly one spec-sized store over exactly one backend, with an index over exactly its own files — the same shape as before, now narrowed from "the whole spec" to "the only side there is".
 * **Redaction is the union of the sides in scope.** An error raised while building or using a routed store can be produced while either side's credential is in scope, so the redaction set for such a message is every side's `secret_values()`, not the fact side's alone.
+* **The per-side store split leaves footer-cache reuse intact, because the cache is keyed by path, not by store.** The session's `FileMetadataCache` is shared across both registered sides; the store split changes only WHICH store issues a given side's footer fetch, not which cache entry that fetch populates or reads. Two sides of a join therefore contend for one bounded cache, so a join's effective per-side footer budget is smaller than a single-table scan's — the eviction observable below is what makes that visible rather than silent.
+* Cache reuse hinges on an `ObjectMeta` identity that is currently implicit. DataFusion's
+  `FileMetadataCache` keys entries by object-store PATH, but admits a stored entry only when the
+  requesting `ObjectMeta`'s byte size AND its `last_modified` timestamp both equal the stored
+  entry's. Access-plan construction and the opener agree today only because the access plan
+  builds one `ObjectMeta` (from the spec-supplied size and a fixed epoch timestamp) and clones
+  that SAME value onto the file's `PartitionedFile`. A re-derived or re-timestamped `ObjectMeta`
+  on either side would miss on every lookup, silently restore the duplicate footer fetch, and —
+  because the miss path overwrites the entry under the same path key — make the two sides thrash
+  the cache entry rather than share it. Issue
+  [#165](https://github.com/exasol-labs/lakehouse-engine-rs/issues/165).
+* The cache is bounded and evicts, so reuse is a shard-scale property rather than a
+  single-file one. DataFusion's default `FileMetadataCache` holds 50 MiB
+  (`DEFAULT_METADATA_CACHE_LIMIT`) and evicts least-recently-used entries once a `put` exceeds
+  that; an entry larger than the whole limit is silently never cached at all. If a shard's
+  delete-carrying footers exceed the limit, entries populated during access-plan construction are
+  evicted before the opener reads them and every footer is fetched twice. Restricting the
+  access-plan fetch to the row-group metadata — no page index — is what keeps each entry small
+  enough for that not to bite at realistic shard sizes; the verifiable property, not the
+  mechanism, is what this feature requires. Because the entry size scales with a data file's
+  `columns × row_groups`, no fixed shard-file count is safe for every table, so the feature
+  requires BOTH halves of issue #165's item 3: reuse measured at a shard scale whose cached
+  footers approach the limit, and an eviction that does happen anyway made observable rather
+  than silent.
 
 ## Scenarios
 
@@ -122,5 +146,16 @@ spec argument, serialized once for the whole fan-out.
 * *GIVEN* a data file that carries positional deletes, whose Parquet footer is needed both to build the base `ParquetAccessPlan` and by the Parquet opener
 * *WHEN* the scan UDF configures the `ParquetSource` for its assigned files
 * *THEN* the UDF SHOULD install a `ParquetFileReaderFactory` (or an equivalent cached metadata reader) so the data file's footer metadata parsed for access-plan construction is reused by the opener rather than parsed a second time
+* *AND* the `ObjectMeta` the UDF fetches the footer with SHALL be the SAME value it attaches to that file's `PartitionedFile`, because the metadata cache admits a stored entry only when the requesting `ObjectMeta`'s byte size and last-modified timestamp both match the stored entry's
+* *AND* the reuse SHALL hold at SHARD SCALE, not only for one file: a shard of K delete-carrying data files SHALL issue the same total number of object-store requests against its data files as a shard of the same K data files with no deletes attached, so no footer cached during access-plan construction is evicted before the opener reads it
 * *AND* if no shared reader is installed, the UDF MAY accept one additional footer range GET per delete-carrying data file, but MUST NOT issue a HEAD request in either case
 * *AND* the configured batch size and Parquet row-group / page pruning SHALL apply unchanged whether or not a shared reader is installed
+
+### Scenario: A metadata-cache eviction that re-fetches a footer is observable
+
+* *GIVEN* a scan whose delete-carrying data files' parsed footers do not all fit in the session metadata cache, so a footer that access-plan construction fetched is not available from that cache when the Parquet opener reads it — because the entry was evicted, or because it exceeded the cache limit and was never admitted
+* *WHEN* the opener fetches that data file's footer a second time within the same scan invocation
+* *THEN* the UDF SHALL count that second footer fetch as a metadata-cache re-fetch, per scan invocation
+* *AND* the UDF SHALL surface the accumulated re-fetch count on its debug diagnostic channel, so an operator running the scan at debug level observes the double-fetch directly instead of inferring it from object-store request volume
+* *AND* a scan whose footers all stay cached SHALL report a re-fetch count of ZERO, so the signal distinguishes eviction from normal operation rather than firing on every delete-carrying scan
+* *AND* the observable MUST stay inert otherwise: at the production default debug level it MUST NOT emit output, it MUST NOT alter the scan's result rows, it MUST NOT fail the scan (an eviction is a cost signal, not an error), and its record MUST NOT contain a storage credential

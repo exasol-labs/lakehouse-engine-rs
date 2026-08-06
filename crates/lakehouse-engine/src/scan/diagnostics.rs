@@ -15,7 +15,10 @@
 // unchanged. It is intentionally minimal and clearly marked so it can be kept
 // as an observability feature or removed cleanly.
 
+use datafusion::execution::cache::cache_manager::FileMetadataCacheEntry;
+use object_store::path::Path;
 use std::backtrace::Backtrace;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::panic::PanicHookInfo;
@@ -95,6 +98,111 @@ fn debug_writer() -> &'static Mutex<Option<File>> {
 /// Record the cumulative rows-emitted counter (called by the per-batch hook).
 pub fn debug_set_rows(total: u64) {
     DEBUG_ROWS.store(total, Ordering::Relaxed);
+}
+
+// ============================================================================
+// Footer re-fetch observable (task 1.7b): make a metadata-cache eviction that
+// re-fetches a positional-delete data file's Parquet footer visible instead of
+// silent (issue #165 proposed-change item 3).
+//
+// `PositionalDeleteScanTable::partitioned_files` records, via
+// `record_access_plan_cached_footer`, every data-file path whose footer it
+// fetched and cached while building the base access plan. At scan completion
+// the report site (`scan/mod.rs`) reads the session `FileMetadataCache`'s
+// `list_entries()` snapshot and passes it to `footer_refetch_count`, which
+// counts a recorded path as a re-fetch when the opener's own lookup did not
+// find it (absent from the map — evicted, or never admitted because the entry
+// exceeded the whole cache limit) or — only where the scan shape guarantees the
+// opener opens every assigned file — found it but never read it back
+// (`hits == 0`, which `put` resets to on every re-insert). `footer_refetch_count`
+// documents why a pushed LIMIT or a join makes that second reading ambiguous.
+//
+// `reset_access_plan_cached_footers` MUST run at the start of every scan
+// invocation (`run_scan_dispatch`), because a pooled UDF process serves many
+// invocations off the same fixed per-node VM in sequence; without the reset, a
+// later invocation would report an earlier invocation's recorded paths.
+// ============================================================================
+
+/// Process-global record of the data-file footer paths access-plan
+/// construction cached this scan invocation, guarded the same way
+/// [`debug_writer`] guards its file handle: a `Mutex`, lazily created behind a
+/// `OnceLock` since `HashSet::new()` is not itself a `const fn`.
+fn access_plan_cached_footers() -> &'static Mutex<HashSet<Path>> {
+    static PATHS: OnceLock<Mutex<HashSet<Path>>> = OnceLock::new();
+    PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that `path`'s Parquet footer was fetched and cached during
+/// access-plan construction. Called once per delete-carrying data file,
+/// immediately after the `fetch_metadata()` call that cached its entry — the
+/// only site that knows which footers it cached.
+pub fn record_access_plan_cached_footer(path: &Path) {
+    if let Ok(mut paths) = access_plan_cached_footers().lock() {
+        paths.insert(path.clone());
+    }
+}
+
+/// Clear the recorded set. MUST be called at the start of every scan
+/// invocation so a later invocation on the same pooled UDF process never
+/// reports an earlier invocation's recorded paths.
+pub fn reset_access_plan_cached_footers() {
+    if let Ok(mut paths) = access_plan_cached_footers().lock() {
+        paths.clear();
+    }
+}
+
+/// Whether the scan shape guarantees the Parquet opener reaches every file
+/// access-plan construction cached a footer for — the condition that decides
+/// whether a cached entry's `hits == 0` is readable as a re-fetch at all (see
+/// [`footer_refetch_count`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenerCoverage {
+    /// The opener opens every assigned file: no pushed LIMIT can end the stream
+    /// early and no join can leave one side unpolled.
+    EveryAssignedFile,
+    /// The stream can finish before the opener reaches every assigned file.
+    MayStopEarly,
+}
+
+/// Count how many of the recorded access-plan-cached footers the Parquet opener
+/// had to fetch again, given `entries` (`FileMetadataCache::list_entries()`) and
+/// how much of the file list the scan shape guarantees the opener reaches.
+///
+/// A recorded path ABSENT from the map is always a re-fetch: its entry was
+/// evicted, or never admitted because it exceeded the whole cache limit, so the
+/// opener's own lookup necessarily fetched the footer a second time.
+///
+/// A recorded path PRESENT with `hits == 0` is ambiguous, and `coverage`
+/// resolves it. `put` counts no hit (`datafusion-execution-54.1.0/src/cache/
+/// file_metadata_cache.rs:75`), so `hits == 0` is BOTH the state of an entry the
+/// opener looked up, missed, and re-`put`, AND the state of an entry
+/// access-plan construction cached for a file the opener never opened at all —
+/// and the opener does not always reach every assigned file. A pushed LIMIT ends
+/// the stream as soon as the remaining row budget reaches zero, before the later
+/// files of the group are opened (`datafusion-datasource-54.1.0/src/file_stream/
+/// scan_state.rs:166-186`, which returns `ScanAndReturn::Done` at that point),
+/// and an inner join whose build side comes back empty never polls the probe
+/// side. Under [`OpenerCoverage::MayStopEarly`] `hits == 0` is therefore NOT
+/// counted: an unopened footer was fetched once, not twice, and nothing was
+/// lost. Only under [`OpenerCoverage::EveryAssignedFile`] does `hits == 0` mean
+/// the opener looked and missed.
+///
+/// A path the opener genuinely read back carries `hits >= 1`, so a scan whose
+/// footers all stayed cached reports zero under either coverage.
+pub fn footer_refetch_count(
+    entries: &HashMap<Path, FileMetadataCacheEntry>,
+    coverage: OpenerCoverage,
+) -> u64 {
+    let Ok(paths) = access_plan_cached_footers().lock() else {
+        return 0;
+    };
+    paths
+        .iter()
+        .filter(|path| match entries.get(*path) {
+            Some(entry) => entry.hits == 0 && coverage == OpenerCoverage::EveryAssignedFile,
+            None => true,
+        })
+        .count() as u64
 }
 
 /// Current resident set size (RSS) in bytes, read from `/proc/self/statm`.

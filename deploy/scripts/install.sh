@@ -367,7 +367,9 @@ Both modes:
   --target <saas|bucketfs>  assert the auto-detected target; fails on disagreement
   --schema <name>           deployment schema (default: LHVS)
   --lakehouse-version <v>   pin the engine version (default: latest release)
-  --slc-version <v>         pin the SLC version (default: latest release)
+  --slc-version <v>         pin the SLC version (default: the version pinned by the resolved
+                            engine release's own exasol-udf-sdk dependency, NOT
+                            language-container-rs's own latest release)
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
   --help                    show this help
@@ -654,6 +656,40 @@ version_to_tag() {
   esac
 }
 
+# Fetches the engine's root Cargo.toml AT the resolved engine release tag and extracts the
+# exasol-udf-sdk version it pins there -- the SLC version that release actually requires. This
+# repo keeps the SLC and its exasol-udf-sdk dependency in exact lockstep (same version number both
+# places; see CLAUDE.md and the Makefile's install-slc SLC_VERSION default), so the pin IS the
+# right default SLC version -- language-container-rs's own "latest" release is NOT: the two repos
+# release independently, so SLC can ship ahead of any engine release that has picked it up yet.
+# That exact drift (language-container-rs v0.21.1 with no matching engine release) broke this
+# default before this fix; see #305.
+resolve_engine_pinned_slc_version() {
+  local tag="$1"
+  local toml line sdk_version=""
+  if ! toml="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
+      -H "Accept: application/vnd.github.raw" \
+      "https://api.github.com/repos/$ENGINE_REPO/contents/Cargo.toml?ref=$tag" </dev/null 2>&1)"; then
+    err "could not fetch Cargo.toml for $ENGINE_REPO release '$tag' via the GitHub REST API. Pass --slc-version to skip this lookup."
+    return 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      exasol-udf-sdk*)
+        local re='version[[:space:]]*=[[:space:]]*"([^"]+)"'
+        [[ "$line" =~ $re ]] && sdk_version="${BASH_REMATCH[1]}"
+        break
+        ;;
+    esac
+  done <<< "$toml"
+  if [[ -z "$sdk_version" ]]; then
+    err "could not find an exasol-udf-sdk version pin in $ENGINE_REPO release '$tag''s Cargo.toml. Pass --slc-version explicitly."
+    return 1
+  fi
+  printf '%s\n' "$sdk_version"
+  return 0
+}
+
 resolve_versions() {
   set_github_auth_args
   if [[ -n "$ARG_LAKEHOUSE_VERSION" ]]; then
@@ -674,15 +710,13 @@ resolve_versions() {
   if [[ -n "$ARG_SLC_VERSION" ]]; then
     RESOLVED_SLC_TAG="$(version_to_tag "$ARG_SLC_VERSION")"
   else
-    local sj
-    if ! sj="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" "https://api.github.com/repos/$SLC_REPO/releases/latest" </dev/null 2>&1)"; then
-      err "could not resolve the latest $SLC_REPO release via the GitHub REST API."
+    # DEFAULT: the SLC version this resolved engine release was built and fingerprinted against --
+    # NOT language-container-rs's own latest release. See resolve_engine_pinned_slc_version above.
+    local sdk_version
+    if ! sdk_version="$(resolve_engine_pinned_slc_version "$RESOLVED_ENGINE_TAG")"; then
       return 1
     fi
-    if ! RESOLVED_SLC_TAG="$(extract_json_string_field "$sj" "tag_name")"; then
-      err "could not parse a tag_name from the latest $SLC_REPO release response."
-      return 1
-    fi
+    RESOLVED_SLC_TAG="$(version_to_tag "$sdk_version")"
   fi
   RESOLVED_SLC_VERSION="$(normalize_version "$RESOLVED_SLC_TAG")"
 

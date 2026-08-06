@@ -57,15 +57,18 @@ pub async fn run_raw_scan_with_session(
     Ok(())
 }
 
-/// One shared instance-level bound on concurrent delete-file reads, sized from
-/// THIS invocation's connection-concurrency budget (never at process scope — it
-/// depends on the per-call `s3_max_connections`).
+/// One shared instance-level bound on every object-store read the delete path
+/// issues while preparing a scan — Phase A delete-file bodies and Phase B
+/// data-file footers alike, one permit per read — sized from THIS invocation's
+/// connection-concurrency budget (never at process scope — it depends on the
+/// per-call `s3_max_connections`) and shared across every provider registered
+/// for one invocation.
 ///
 /// Clamped to at least 1: `s3_max_connections` is normally clamped upstream, but
 /// a syntactically valid `ScanSpec` JSON (e.g. hand-crafted or malformed) can
 /// still carry an explicit `0`, and `Semaphore::new(0)` would deadlock every
-/// delete-file read rather than degrade gracefully.
-pub(super) fn delete_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
+/// read rather than degrade gracefully.
+pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
     Arc::new(Semaphore::new(spec.common.s3_max_connections.max(1)))
 }
 
@@ -118,7 +121,7 @@ pub async fn register_files(
     table_name: &str,
     spec: &ScanSpec,
 ) -> Result<(), UdfError> {
-    let delete_read_limiter = delete_read_limiter(spec);
+    let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
         table_name,
@@ -127,7 +130,7 @@ pub async fn register_files(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.storage,
-        delete_read_limiter,
+        delete_path_read_limiter,
     )
     .await
 }
@@ -155,12 +158,13 @@ pub async fn register_files(
 /// table with merge-on-read deletes joins on post-delete rows on both sides,
 /// never silently reintroducing deleted rows through the join path.
 ///
-/// `delete_read_limiter` is the shared instance-level semaphore bounding
-/// concurrent delete-file reads for this scan invocation; callers construct it
-/// ONCE per invocation and pass the SAME `Arc` to every `register_file_list`
-/// call for that invocation (including both sides of a join), so the whole
-/// instance stays within one N-permit budget rather than each side getting
-/// its own.
+/// `delete_path_read_limiter` is the shared instance-level semaphore bounding
+/// every object-store read the delete path issues while preparing this scan —
+/// Phase A delete-file bodies and Phase B data-file footers alike, one permit
+/// per read — for this scan invocation; callers construct it ONCE per
+/// invocation and pass the SAME `Arc` to every `register_file_list` call for
+/// that invocation (including both sides of a join), so the whole instance
+/// stays within one N-permit budget rather than each side getting its own.
 ///
 /// [`PositionalDeleteScanTable`]: crate::scan::positional_deletes::PositionalDeleteScanTable
 #[allow(clippy::too_many_arguments)]
@@ -172,7 +176,7 @@ pub(super) async fn register_file_list(
     logical_schema: &[crate::scan::spec::LogicalField],
     name_mapping: &[NameMappingEntry],
     storage: &crate::scan::spec::StorageBackend,
-    delete_read_limiter: Arc<Semaphore>,
+    delete_path_read_limiter: Arc<Semaphore>,
 ) -> Result<(), UdfError> {
     let first = files.first().ok_or_else(|| {
         UdfError::User(format!(
@@ -235,7 +239,7 @@ pub(super) async fn register_file_list(
         files.to_vec(),
         table_root.to_string(),
         storage,
-        delete_read_limiter,
+        delete_path_read_limiter,
     );
 
     ctx.register_table(table_name, Arc::new(table))
@@ -441,10 +445,10 @@ mod tests {
     /// A malformed/hand-crafted `ScanSpec` with `s3_max_connections: 0` must not
     /// deadlock every delete-file read via `Semaphore::new(0)`.
     #[test]
-    fn delete_read_limiter_clamps_zero_connections_to_one() {
+    fn delete_path_read_limiter_clamps_zero_connections_to_one() {
         let mut spec = minimal_spec();
         spec.common.s3_max_connections = 0;
-        assert_eq!(delete_read_limiter(&spec).available_permits(), 1);
+        assert_eq!(delete_path_read_limiter(&spec).available_permits(), 1);
     }
 
     /// Scenario: scan without a logical schema falls back to first-file inference.

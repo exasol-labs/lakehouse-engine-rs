@@ -50,6 +50,32 @@ CPU thread/partition budget of `datafusion-scan/scan-execution-threading`.
 * **Dividing the budget across the sides was rejected.** `budget / side_count` would silently halve fact-side fetch parallelism on EVERY broadcast join, making a tuning knob's effective value depend on whether the query happens to be a join — a data-dependent performance regression, in exchange for bounding a resource that is not the bottleneck.
 * **What doubles is warm idle sockets, not concurrency.** The knob maps to `object_store` 0.13.2's `pool_max_idle_per_host`, which bounds how many established connections the pool keeps warm and reusable; `object_store` 0.13.2 exposes no hard in-flight ceiling. The bound this delta widens is therefore a socket / file-descriptor bound, not a request-rate bound.
 * **A join whose sides live in different buckets already held 2N before this delta**, because two buckets already yielded two registered stores with two clients. This delta makes the shared-bucket join match that shape rather than introducing a new one.
+* **The per-side store split does NOT split the delete-path semaphore.** The size-N limiter below is instance-level and shared across both sides' registrations, so the delete path's in-flight bound stays N even though the HTTP connection pools are now per side. What is per side is the credential a read goes out under, not how many reads may be in flight.
+* The positional-delete pipeline issues object-store reads in TWO phases, and BOTH now draw
+  from the one size-N limiter. Phase A (`collect_delete_positions`) reads each unique
+  positional-delete file's body once. Phase B (`partitioned_files`) fetches each
+  DELETE-CARRYING DATA FILE's Parquet footer to obtain the per-row-group row counts the base
+  `ParquetAccessPlan` needs. Phase B previously awaited those footer fetches one at a time in a
+  `for` loop, so a shard with K delete-carrying data files paid K serialized round-trips while a
+  delete-free scan of the same files had its footers fetched concurrently by DataFusion's own
+  opener. Issue [#165](https://github.com/exasol-labs/lakehouse-engine-rs/issues/165).
+* One semaphore, two phases, one field. The limiter is named `delete_path_read_limiter`
+  (`crates/lakehouse-engine/src/scan/positional_deletes.rs`), renamed from `delete_read_limiter`
+  because it no longer bounds only reads OF delete files: it bounds every object-store read the
+  delete path issues while preparing a delete-carrying scan. Adding a second size-N semaphore for
+  Phase B would double the instance's in-flight bound to 2N and break the guarantee this feature
+  already records for Phase A.
+* Deadlock freedom rests on one property, not on phase ordering alone: every fan-out task
+  acquires EXACTLY ONE permit, holds it across EXACTLY ONE object-store read, and releases it on
+  completion. No task holds a permit while awaiting another permit, and no task awaits another
+  task. Phase A also fully completes and drops its permits before Phase B's fan-out is
+  constructed within a single `partitioned_files` call, but that ordering is a consequence of the
+  code shape, not the safety argument — the no-hold-and-wait property is what makes contention
+  between phases, and between the two concurrently-planned sides of a broadcast join, queue
+  rather than deadlock.
+* What the budget does NOT bound is unchanged: the Parquet opener's own data-file reads at
+  execution time are bounded by the object store's HTTP client, which the same N configures. The
+  semaphore is an application-level admission gate over the delete path's preparation reads only.
 
 ## Scenarios
 
@@ -100,10 +126,12 @@ CPU thread/partition budget of `datafusion-scan/scan-execution-threading`.
 * *THEN* the resolved connection-concurrency budget SHALL travel in the shard-invariant common spec argument, serialized EXACTLY ONCE for the whole fan-out, and MUST NOT be repeated in any per-shard argument
 * *AND* the `ScanSpec` reconstituted for every shard SHALL carry the same connection-concurrency budget
 
-### Scenario: The connection budget also bounds positional-delete file reads
+### Scenario: The connection budget also bounds the positional-delete path's object-store reads
 
 * *GIVEN* a scan spec whose `s3_max_connections` field is a positive integer N and whose assigned data files carry associated Parquet positional-delete files
-* *WHEN* the scan UDF applies positional deletes across every scan table it registers for the query — a single table, or both the fact and dimension sides of a broadcast join, which DataFusion may plan concurrently
-* *THEN* a single fan-out limiter of size N — one semaphore constructed once per scan invocation and shared by every registered scan table — SHALL bound the delete-file reads, so across all delete-read fan-outs active in one scan invocation AT MOST N delete-file object-store reads are in flight at any instant
-* *AND* two independent size-N limiters (one per provider) SHALL NOT be used, because concurrently planned join-side scan leaves would then allow up to 2N in-flight delete reads, breaking the instance-level bound
-* *AND* this delete-read bound SHALL be an application-level concurrency limit, distinct from the HTTP client idle-pool size that the same N configures on the object store
+* *WHEN* the scan UDF prepares positional deletes across every scan table it registers for the query — a single table, or both the fact and dimension sides of a broadcast join, which DataFusion may plan concurrently
+* *THEN* a single fan-out limiter of size N — one semaphore constructed once per scan invocation and shared by every registered scan table — SHALL bound BOTH the Phase A delete-file body reads AND the Phase B data-file Parquet footer fetches that build the delete-carrying files' base access plans, so across every such fan-out active in one scan invocation AT MOST N of those object-store reads are in flight at any instant
+* *AND* a SECOND size-N limiter SHALL NOT be introduced along either axis — not one per provider, because concurrently planned join-side scan leaves would then allow up to 2N in-flight reads, and not one per phase, because a Phase-B-private semaphore would let a single provider run N delete-file reads and N footer fetches at once; either breaks the instance-level bound
+* *AND* every task in either fan-out SHALL acquire exactly ONE permit, hold it across exactly ONE object-store read, and release it on completion, holding no permit while awaiting another — so contention between the two phases, and between the two sides of a broadcast join, queues rather than deadlocks
+* *AND* a data file carrying NO deletes SHALL NOT acquire a permit, because it issues no Phase B footer fetch
+* *AND* this bound SHALL be an application-level concurrency limit, distinct from the HTTP client idle-pool size that the same N configures on the object store

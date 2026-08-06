@@ -14,7 +14,7 @@ use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::needs_json_fallback;
 
-use super::raw_scan::{delete_read_limiter, register_file_list};
+use super::raw_scan::{delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Registered table name for the sharded fact (large) side of a broadcast join.
@@ -89,11 +89,15 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
     // files alike — redact against ITS own secret values rather than the fact
     // side's.
     //
-    // ONE shared delete-read semaphore for this invocation, cloned into BOTH
+    // ONE shared delete-path read semaphore for this invocation, cloned into BOTH
     // sides' registration: DataFusion plans a broadcast join's two scan leaves
     // concurrently, so a per-side semaphore would allow up to 2N concurrent
-    // delete reads instead of the intended N.
-    let delete_read_limiter = delete_read_limiter(spec);
+    // delete-path reads (Phase A delete-file bodies and Phase B data-file footers
+    // alike) instead of the intended N. This is deliberately NOT per side, unlike
+    // the object store above: the semaphore bounds in-flight reads for the whole
+    // instance, whereas each side needs its own store to read through its own
+    // credential.
+    let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
         JOIN_FACT_TABLE,
@@ -102,7 +106,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.storage,
-        Arc::clone(&delete_read_limiter),
+        Arc::clone(&delete_path_read_limiter),
     )
     .await?;
     register_file_list(
@@ -113,7 +117,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.logical_schema,
         &join.name_mapping,
         &join.storage,
-        delete_read_limiter,
+        delete_path_read_limiter,
     )
     .await?;
     Ok(())

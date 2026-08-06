@@ -230,6 +230,27 @@ else
       fi
       printf '{\n  "assets": [\n    {\n      "id": 555,\n      "name": "%s"\n    }\n  ]\n}\n' "$asset_name"
       exit 0 ;;
+    */contents/Cargo.toml*)
+      # GET /repos/<repo>/contents/Cargo.toml?ref=<tag> (Accept: vnd.github.raw) -> raw file text.
+      if [[ "${CURL_CARGO_TOML_FAIL:-0}" == "1" ]]; then
+        echo "curl: (22) The requested URL returned error: 404" >&2
+        exit 22
+      fi
+      if [[ "${GH_CARGO_TOML_MISSING_PIN:-0}" == "1" ]]; then
+        printf '[workspace.dependencies]\niceberg = "0.10.0"\n'
+        exit 0
+      fi
+      # Includes a decoy comment mentioning "exasol-udf-sdk" ahead of the real pin, and another
+      # package's "= \"...\"" line in between, exactly like the real root Cargo.toml -- a version
+      # extractor that isn't anchored to the start of the exasol-udf-sdk line (e.g. a greedy
+      # multi-line regex) would latch onto the decoy or the other package's version instead.
+      cat <<TOML
+[workspace.dependencies]
+# internally, the same tree as datafusion/exasol-udf-sdk below -- the workspace
+iceberg = "0.10.0"
+exasol-udf-sdk = { version = "${GH_ENGINE_SDK_VERSION:-0.21.0}", features = ["emit-arrow"] }
+TOML
+      exit 0 ;;
     */releases/assets/*)
       # GET /repos/<repo>/releases/assets/<id> (Accept: octet-stream) -> writes bytes to -o path.
       # GH_ASSET_TARBALL delivers a REAL fixture archive instead, which the BucketFS target needs
@@ -640,23 +661,27 @@ test_version_resolution_default_and_override() {
   reset_env
   local out
   out="$(
-    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_SLC_TAG="v4.5.6"
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_ENGINE_SDK_VERSION="4.5.6"
     source "$INSTALLER"
     ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
     resolve_versions
   )"
   assert_contains "default: resolves latest engine tag" "$out" "1.2.3"
-  assert_contains "default: resolves latest SLC tag" "$out" "4.5.6"
+  assert_contains "default: resolves SLC version from the engine release's Cargo.toml pin" "$out" "4.5.6"
   assert_contains "default: prints engine version line" "$out" "Resolved lakehouse-engine version"
   assert_contains "default: prints SLC version line" "$out" "Resolved language-container (SLC) version"
   local log; log="$(log_content)"
-  assert_contains "default: curl hits the releases/latest endpoint" "$log" "releases/latest"
+  assert_contains "default: curl hits the engine releases/latest endpoint" "$log" "releases/latest"
+  assert_contains "default: curl fetches the engine's Cargo.toml at the resolved tag" \
+    "$log" "contents/Cargo.toml?ref=v1.2.3"
   assert_contains "default: curl sends the Bearer token header" "$log" "Authorization: Bearer STUBGHTOKEN123"
+  assert_not_contains "default: never queries language-container-rs's own latest release" \
+    "$log" "language-container-rs/releases/latest"
 
   reset_env
   out="$(
-    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_SLC_TAG="v4.5.6"
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_ENGINE_SDK_VERSION="4.5.6"
     source "$INSTALLER"
     ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION="9.9.9"; ARG_SLC_VERSION="8.8.8"
@@ -665,9 +690,63 @@ test_version_resolution_default_and_override() {
   assert_contains "override: uses engine override" "$out" "9.9.9"
   assert_contains "override: uses SLC override" "$out" "8.8.8"
   assert_not_contains "override: ignores latest engine tag" "$out" "1.2.3"
-  assert_not_contains "override: ignores latest SLC tag" "$out" "4.5.6"
+  assert_not_contains "override: ignores engine release's Cargo.toml SLC pin" "$out" "4.5.6"
   log="$(log_content)"
   assert_not_contains "override: skips the releases/latest fetch entirely" "$log" "releases/latest"
+  assert_not_contains "override: skips the Cargo.toml pin lookup entirely" "$log" "contents/Cargo.toml"
+}
+
+test_slc_version_defaults_to_engine_pin_not_slc_latest() {
+  echo "== test_slc_version_defaults_to_engine_pin_not_slc_latest =="
+  # Regression test for #305: language-container-rs published v0.21.1 with no matching
+  # lakehouse-engine-rs release, and the installer's old default (query language-container-rs's
+  # own "latest" release) resolved v0.21.1 as the SLC version even though the latest ENGINE
+  # release was still built and fingerprinted against v0.21.0 -- a guaranteed fingerprint
+  # mismatch. The default must track the engine release's own exasol-udf-sdk pin instead, even
+  # when the two repos' "latest" releases disagree.
+  reset_env
+  local out
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG \
+      GH_ENGINE_TAG="v0.32.1" GH_ENGINE_SDK_VERSION="0.21.0" GH_SLC_TAG="v0.21.1"
+    source "$INSTALLER"
+    ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
+    resolve_versions
+  )"
+  assert_contains "drift: resolves the engine release's own SDK pin as the SLC version" "$out" "0.21.0"
+  assert_not_contains "drift: does not resolve language-container-rs's independently-newer latest release" \
+    "$out" "0.21.1"
+  local log; log="$(log_content)"
+  assert_not_contains "drift: never queries language-container-rs's own latest release" \
+    "$log" "language-container-rs/releases/latest"
+}
+
+test_slc_version_pin_lookup_failure_modes() {
+  echo "== test_slc_version_pin_lookup_failure_modes =="
+  reset_env
+  local out rc
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" CURL_CARGO_TOML_FAIL=1
+    source "$INSTALLER"
+    ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
+    resolve_versions 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "fetch failure: resolve_versions fails" "$rc"
+  assert_contains "fetch failure: error names Cargo.toml" "$out" "Cargo.toml"
+  assert_contains "fetch failure: error suggests --slc-version as the escape hatch" "$out" "--slc-version"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_CARGO_TOML_MISSING_PIN=1
+    source "$INSTALLER"
+    ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
+    resolve_versions 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "missing pin: resolve_versions fails" "$rc"
+  assert_contains "missing pin: error names exasol-udf-sdk" "$out" "exasol-udf-sdk"
+  assert_contains "missing pin: error suggests --slc-version as the escape hatch" "$out" "--slc-version"
 }
 
 test_script_languages_append_preserves_existing() {
@@ -1627,6 +1706,8 @@ main() {
   test_resolve_target_layout_saas_values
   test_missing_required_ids_fail_fast
   test_version_resolution_default_and_override
+  test_slc_version_defaults_to_engine_pin_not_slc_latest
+  test_slc_version_pin_lookup_failure_modes
   test_script_languages_append_preserves_existing
   test_script_languages_replace_rust_idempotent
   test_empty_script_languages_read_hard_fails
