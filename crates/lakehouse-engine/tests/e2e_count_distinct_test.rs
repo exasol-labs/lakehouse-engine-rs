@@ -307,6 +307,50 @@ fn high_cardinality_count_distinct_completes() {
     );
 }
 
+/// The harness reads a handle-backed result set to completion, not just its first
+/// `fetch` response.
+///
+/// Task 1.6 measured the packing against the live stack rather than computing it:
+/// an uncapped raw scan of `high_card_probe` (`HIGH_CARD_ROWS` rows of ~100-byte
+/// `token` values, ~3 MB) returns ALL 30,000 rows in ONE response at the harness's
+/// default 64 MiB `numBytes` budget, so no fixture that exists today makes the
+/// harness issue a second `fetch` and a short read is unobservable at that budget
+/// (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`). This
+/// test therefore forces the chunking by reading the same scan at a 64 KiB budget,
+/// where ~100-byte rows pack a few hundred to a response and 30,000 rows span tens
+/// of them. How many rows the server packs into one response is the server's
+/// business, so the invariant asserted is "more than one response", never an exact
+/// count.
+#[test]
+fn harness_reads_high_cardinality_result_set_to_completion() {
+    const CHUNKED_FETCH_NUM_BYTES: u64 = 65_536;
+
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!("SELECT {HIGH_CARD_COL} FROM {}", high_card_table());
+    let resp = conn.execute(&sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+
+    let (cols, responses) =
+        conn.fetch_result_columns_with_num_bytes(result_set, CHUNKED_FETCH_NUM_BYTES);
+
+    let rows = cols.first().map_or(0, |col| col.len());
+    assert_eq!(
+        rows, HIGH_CARD_ROWS,
+        "reading {HIGH_CARD_COL} at a {CHUNKED_FETCH_NUM_BYTES}-byte per-response \
+         budget must yield every one of the {HIGH_CARD_ROWS} seeded rows, got \
+         {rows} across {responses} fetch response(s) — a short read means the \
+         harness stopped at the first response instead of reading to completion"
+    );
+    assert!(
+        responses >= 2,
+        "a {CHUNKED_FETCH_NUM_BYTES}-byte per-response budget must split \
+         {HIGH_CARD_ROWS} ~100-byte rows across more than one fetch response, so \
+         that the read loop is genuinely exercised, got {responses}"
+    );
+}
+
 /// A single query combining multiple `COUNT(DISTINCT ...)` columns AND a
 /// `SUM(LENGTH(...))`-shaped expression aggregate — the TPC-H Q9b shape
 /// (see `bench/run.sh`'s "Q9b wide projection" query) — is a Case 3 request

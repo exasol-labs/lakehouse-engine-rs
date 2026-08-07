@@ -881,7 +881,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
 #[test]
 fn lakekeeper_vended_broadcast_join_result_correct() {
     setup();
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
 
     let pushed_sql = explain_virtual_sql(&mut conn, &join_query(VS_VENDED));
     assert!(

@@ -53,3 +53,51 @@ The table has 12 rows and one column for each Arrow/Exasol type pairing. Use it 
 | `c_bool` | Boolean | BOOLEAN |
 | `c_price` | Float64 | DOUBLE PRECISION |
 | `c_qty` | Int64 | DECIMAL(20,0) |
+
+### Declared row cap versus pushdown `limit` (measured)
+
+`e2e_capture_pushdown` reads an optional `CAPTURE_RESULT_SET_MAX_ROWS` env var: unset
+means the capture connection declares no cap (`resultSetMaxRows: 0`); set to `n` means it
+calls `capped_result_sets(n)` before running the capture. `scripts/capture-pushdown-payload.sh`
+needs no flag for this — it inherits whatever `CAPTURE_RESULT_SET_MAX_ROWS` is set in the
+environment it runs in. Set it, then diff two captures of the same statement to reproduce
+the comparison below for a new shape.
+
+**A declared `resultSetMaxRows` cap DOES reach the adapter as a pushdown `limit` on a real
+query execution, for every statement shape tested — but `EXPLAIN VIRTUAL` can never show
+it.** `EXPLAIN VIRTUAL` and a real query execution are two different exchanges with the
+adapter: `resultSetMaxRows` is an attribute of whichever statement is actually sent, and the
+`EXPLAIN VIRTUAL` wrapper is a different statement from the one the cap is declared against —
+so its echoed `pushdownRequest` structurally cannot carry a limit that only the real
+statement's own request gained. This was confirmed by capturing the adapter's raw incoming
+request directly — bypassing `EXPLAIN VIRTUAL` entirely — for all 7 statement shapes below,
+against `docker.io/exasol/docker-db:2025.2.1` (WebSocket protocol v3):
+
+| Shape | Declared cap reaches a REAL request as a `limit`? | Adapter behavior |
+|---|---|---|
+| bare projection | Yes | Applied safely: a per-shard limit plus an outer `LIMIT` wrapper |
+| projection + filter | Yes | Applied safely: a per-shard limit plus an outer `LIMIT` wrapper |
+| single-group aggregate | Yes | Correctly withheld from beneath the aggregate — outer `LIMIT` only, so the aggregate value itself stays correct |
+| `GROUP BY` aggregate | Yes | Correctly withheld from beneath the aggregate — outer `LIMIT` only |
+| `COUNT(DISTINCT)` | Yes | Correctly withheld from beneath the per-shard `DISTINCT` row-scan — outer `LIMIT` only |
+| `ORDER BY … LIMIT` | Yes, on top of the statement's own SQL `LIMIT` | Applied safely alongside the existing top-N pushdown |
+| broadcast-eligible inner equi-join | Yes | **Disqualifies broadcast pushdown.** `join_requires_exasol_postprocessing` (`crates/lakehouse-engine/src/adapter/pushdown/joins/planning.rs`) treats ANY pushdown `limit` as work Exasol must run over the materialized join, so the adapter falls back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan instead |
+
+An earlier version of this table, built by diffing `EXPLAIN VIRTUAL` output only, concluded
+the opposite — that no shape converts a declared cap into a pushdown `limit`. That conclusion
+was an artifact of the tool, not a fact about the adapter: `EXPLAIN VIRTUAL`'s echoed
+`pushdownRequest` reflects the wrapper statement it runs as, never the statement whose cap is
+under test, so it was structurally incapable of showing this regardless of which shape was
+captured.
+
+**If you are debugging a capped connection's join plan with
+`scripts/capture-pushdown-payload.sh`, its output will show a broadcast plan regardless of
+the declared cap — it does NOT tell you what a real capped query does to that join.** Confirm
+limit-sensitive join behavior only against a real execution or a direct capture of the
+adapter's incoming request, never against `EXPLAIN VIRTUAL` alone.
+
+See `ExaConn::capped_result_sets`'s doc comment
+(`crates/lakehouse-engine/tests/common/exasol_ws.rs`) for the calling convention this
+table backs, and the `fix-e2e-harness-undeclared-limit` plan's `injection-surface.md` for
+the exact statements, the real-execution capture method, the original (superseded)
+`EXPLAIN VIRTUAL`-based matrix, and every control.
