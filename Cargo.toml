@@ -25,8 +25,12 @@ license = "MIT"
 # nothing and poisons the cache permanently. Prefer declaring features on the
 # member crate — member manifests ARE hashed. If you change one here and CI
 # starts recompiling every run, bust the cache by hand: bump the `shared-key`
-# suffix (`workspace-rlib` → `workspace-rlib2`) on ALL FOUR rust-cache steps in
-# ci.yml at once — a partial bump leaves the readers permanently cold (#133).
+# suffix (e.g. `workspace-rlib` → `workspace-rlib2`) on EVERY rust-cache step of
+# a namespace at once — a partial bump leaves that namespace's readers
+# permanently cold (#133). Two namespaces exist since #313 split the writer:
+#   workspace-rlib — ci.yml's `build-host` (writer) + `lint`, and
+#                    .github/actions/e2e-setup/action.yml (not in ci.yml)
+#   llvm-cov       — ci.yml's `unit-tests`, a required status check
 [workspace.dependencies]
 
 # Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
