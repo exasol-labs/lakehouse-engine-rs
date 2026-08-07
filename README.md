@@ -6,6 +6,8 @@
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![CI](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/exasol-labs/lakehouse-engine-rs/actions/workflows/ci.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_lakehouse-engine-rs&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=exasol-labs_lakehouse-engine-rs)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=exasol-labs_lakehouse-engine-rs&metric=coverage)](https://sonarcloud.io/summary/new_code?id=exasol-labs_lakehouse-engine-rs)
 [![spec|driven](https://img.shields.io/badge/spec-driven-blueviolet.svg)](specs/)
 [![Exasol|database](https://img.shields.io/badge/Exasol-database-blue.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)

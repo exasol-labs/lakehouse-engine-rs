@@ -119,9 +119,51 @@ jobs:
           name: lakehouse-engine-so
           path: target/release/liblakehouse_engine.so
 
-  # ── fan-out: lint / unit-tests / licenses, all at t=0 ────────────────────
+  # ── fan-out: build-host / lint / unit-tests / licenses, all at t=0 ───────
   # Nothing here waits on build-so (different toolchain: host vs the
-  # rust:1.94-bookworm container); `unit-tests` doubles as the cache writer.
+  # rust:1.94-bookworm container). `build-host` writes the `workspace-rlib`
+  # cache that `lint` and the three e2e jobs read; `unit-tests` writes the
+  # separate `llvm-cov` namespace (see both jobs' cache steps).
+  #
+  # SOLE writer of the `workspace-rlib` cache, for `lint` and the three e2e
+  # jobs. `unit-tests` can no longer be: `cargo llvm-cov` builds into
+  # target/llvm-cov-target and cleans every workspace member on every run.
+  #
+  # No `needs` anywhere in this fan-out, so readers restore BEFORE this job's
+  # post-step saves — it serves the NEXT main run, exactly as `unit-tests`
+  # did.
+  #
+  # MUST stay `cargo test`-shaped: clippy would save an .rmeta-only dep tree
+  # and every reader needing codegen would rebuild. `--no-run` because
+  # `unit-tests` is the test gate.
+  build-host:
+    name: Build Host Workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+      # Required: this job is a rust-cache writer (#133 — see `lint`).
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
+      # rust-cache, not actions/cache: it PRUNES target/ before saving.
+      # Profile edits are keyed via .cargo/config.toml (see that file).
+      # save-if gates writes to main against the repo's 10 GB quota.
+      - name: Cache cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: workspace-rlib
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compile workspace test targets
+        run: cargo test --workspace --no-run
+
   lint:
     name: Check & Lint
     runs-on: ubuntu-latest
@@ -157,10 +199,10 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # Read-only restore of the cache `unit-tests` writes; save-if:false so
+      # Read-only restore of the cache `build-host` writes; save-if:false so
       # readers never race to save their own copy. Keep the inputs identical
-      # across all four rust-cache steps — a divergence leaves readers
-      # permanently cold (#133).
+      # across every workspace-rlib rust-cache step — a divergence leaves
+      # readers permanently cold (#133).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -173,13 +215,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The test gate, and the only job that executes the suite. Produces the
+  # lcov report the `sonar` job uploads.
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Backstop, not a budget: the cold cost is dominated by the
+    # UNinstrumented dependency tree (~12 min, #133) — cargo-llvm-cov
+    # instruments workspace members only.
+    timeout-minutes: 45
     steps:
-      # Reclaim disk before restoring the shared cache + compiling the test
-      # binaries, matching build-so/lint/e2e (avoids the ENOSPC that killed this
-      # job).
       - name: Free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
@@ -187,36 +232,109 @@ jobs:
 
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+        with:
+          components: llvm-tools-preview
 
-      # Stabilizes the rust-cache key against the runner image's preinstalled
-      # Rust drifting between writer/reader jobs — see the `lint` job's
-      # matching step for the full rationale (#133).
+      # `components:` above is not reliable on this toolchain snapshot — same
+      # workaround the `lint` job carries for rustfmt/clippy.
+      - name: Ensure llvm-tools-preview available on 1.94
+        run: rustup component add llvm-tools-preview --toolchain 1.94
+
+      # Still a rust-cache writer, just in another namespace (#133 — see `lint`).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # SOLE WRITER of the shared cache. rust-cache (not raw actions/cache)
-      # because it PRUNES target/ before saving — only dependency builds are
-      # kept, so the cache doesn't balloon with the full DataFusion/Arrow/
-      # Iceberg debug tree. `cargo test` emits .rlib, a superset of what clippy
-      # (.rmeta) and the E2E jobs need, so this writer serves every reader.
+      # SOLE writer of the llvm-cov namespace. The DISTINCT shared-key is the
+      # only thing separating this tree from workspace-rlib: the coverage
+      # environment lives on cargo-llvm-cov's child process and never reaches
+      # the key, which rust-cache hashes from its OWN env at restore time.
       #
-      # What keys this cache against profile edits is .cargo/config.toml, NOT
-      # anything here — see the comment in that file. The old manual "bump the
-      # -rlib suffix" workaround is gone with it.
+      # rust-cache, not actions/cache: it hashes every toolchain's `rustc -vV`
+      # into the key (a hand-rolled Cargo.lock key would hit exactly on a
+      # toolchain bump, reject every artifact, and skip the save — poisoned
+      # with no prefix-rotation escape); it recurses into the nested
+      # target/llvm-cov-target when pruning, so the tree can't grow
+      # monotonically; and it caches ~/.cargo/registry + git.
       #
-      # save-if gates writes to main: PR branches would otherwise each mint a
-      # branch-scoped duplicate against the repo's 10 GB cache quota.
-      - name: Cache cargo & build artifacts
+      # cache-on-failure: this writer IS the test gate, so without it a red
+      # test discards a dependency build that compiled fine and the next PR
+      # pays a cold instrumented build inside a required check.
+      - name: Cache cargo & instrumented build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: workspace-rlib
+          shared-key: llvm-cov
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: "true"
 
-      # exasol-e2e, cloud-e2e, lakekeeper-e2e and azure-e2e are all opt-in
-      # features, off by default, so this compiles none of them and never touches
-      # a live stack or a cloud account.
-      - name: Run unit tests
-        run: cargo test --workspace
+      # Version-pinned like cargo-deny/cargo-about, and load-bearing: the "no
+      # lcov post-processing needed" conclusion rests on 0.8.7's DEFAULT
+      # --ignore-filename-regex set, which already excludes *_tests.rs.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: cargo-llvm-cov@0.8.7
+
+      # Keep flag-identical to the Makefile's `coverage` target; this step is
+      # the authority. exasol-e2e, cloud-e2e, lakekeeper-e2e and azure-e2e are
+      # opt-in features, off by default, so this compiles none of them and
+      # never touches a live stack or a cloud account.
+      #
+      # Doctests are NOT run (`--doctests` is unstable); zero cost today since
+      # no crate has an executable doc test.
+      - name: Run unit tests with coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
+
+      # No `if: always()`: cargo llvm-cov exits non-zero and writes no report
+      # when a test fails, so an always-run upload would add a second red step
+      # burying the real one. `--ignore-run-fail` is not the fix — it exits 0
+      # on test failure and would silently disable the gate.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: lcov-unit
+          path: lcov-unit.info
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── coverage + static analysis to SonarQube Cloud ────────────────────────
+  # Deliberately NOT in `release`'s or the e2e jobs' `needs`, so a Sonar
+  # outage cannot block the release path.
+  #
+  # RUNNER COUPLING: cargo-llvm-cov emits ABSOLUTE `SF:` paths, so coverage
+  # resolves across the job boundary only because `unit-tests` and this job
+  # are both bare ubuntu-latest runners with an identical $GITHUB_WORKSPACE.
+  # Moving `unit-tests` into a container or onto a self-hosted runner makes
+  # Sonar report 0% coverage with only a warning; the fix would be
+  # `sed -i "s|$GITHUB_WORKSPACE/||g" lcov-unit.info` before upload.
+  sonar:
+    name: Sonar Analysis
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    # Fork PRs receive no repository secrets, so an unguarded scan fails on an
+    # empty token. merge_group is skipped too: it would analyse a throwaway
+    # gh-readonly-queue/* branch and put a third-party service inside the
+    # merge path (sonar.qualitygate.wait=true). Revisit only if
+    # `Sonar Analysis` becomes a required check.
+    if: >-
+      github.event_name != 'merge_group' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      # fetch-depth: 0 — shallow clones degrade Sonar's blame-based issue
+      # assignment.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v8
+        with:
+          name: lcov-unit
+
+      - name: SonarQube Cloud scan
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
   licenses:
     name: License Check
