@@ -15,6 +15,12 @@ use std::net::TcpStream;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, client_tls_with_config};
 
+/// Per-`fetch` byte budget used by `fetch_result_columns`. Exasol treats `numBytes`
+/// as a soft budget and always returns whole rows, so this bounds a response's size
+/// without bounding the result set: the read loop issues as many `fetch` calls as
+/// the advertised row count requires.
+const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
+
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     redact_sql: bool,
@@ -89,7 +95,7 @@ impl ExaConn {
         ExaConn {
             ws,
             redact_sql,
-            result_set_max_rows: 10000,
+            result_set_max_rows: 0,
         }
     }
 
@@ -135,12 +141,14 @@ impl ExaConn {
         Self::read_json(&mut self.ws)
     }
 
-    /// `0` is Exasol's own documented default meaning "no limit" (WebSocket API v3:
-    /// `resultSetMaxRows`, "0 (default) means no limit"). Used only by tests that must
-    /// observe row-fetch-time behavior the default 10000-row cap would otherwise mask
-    /// (e.g. forcing every join onto the unaccelerated fallback via a pushdown `limit`).
-    pub fn unbounded_result_sets(mut self) -> Self {
-        self.result_set_max_rows = 0;
+    /// Declares a row cap that truncates the delivered result set at the statement level. On
+    /// Exasol 2025.2.1, a declared cap does not reach the adapter or change the pushdown
+    /// request/scan spec — see `docs/debugging-pushdown.md`'s measured shape matrix. Declare a
+    /// cap for a test whose assertion is about result-set truncation at row-delivery time, or for
+    /// `e2e_capture_pushdown`'s `CAPTURE_RESULT_SET_MAX_ROWS` capped-versus-uncapped comparison; a
+    /// test asserting pushdown or plan shape needs no cap, since a declared cap changes neither.
+    pub fn capped_result_sets(mut self, max_rows: u32) -> Self {
+        self.result_set_max_rows = max_rows;
         self
     }
 
@@ -175,45 +183,135 @@ impl ExaConn {
         self.fetch_result_columns(result_set)
     }
 
-    /// Fetch all data from a result set (inline or via handle).
+    /// Fetch all data from a result set (inline or via handle), column-major.
     pub fn fetch_result_columns(&mut self, result_set: &Value) -> Vec<Vec<Value>> {
-        if let Some(data) = result_set["data"].as_array() {
-            return data
-                .iter()
-                .map(|col| col.as_array().cloned().unwrap_or_default())
-                .collect();
-        }
+        self.fetch_result_columns_with_num_bytes(result_set, DEFAULT_FETCH_NUM_BYTES)
+            .0
+    }
+
+    /// Fetch a result set to completion with an explicit per-response byte budget,
+    /// returning the columns and how many `fetch` responses were consumed (an inline
+    /// result set consumes none).
+    ///
+    /// A `fetch` returns only as many rows as fit the budget, so one response is not
+    /// the result set. Every way of reading short — a truncated read, a response that
+    /// carries no rows while rows remain, a response whose payload is missing or
+    /// changes shape mid-read — panics naming the outstanding count, because a short
+    /// read that returns quietly makes an E2E assertion pass against a prefix.
+    pub fn fetch_result_columns_with_num_bytes(
+        &mut self,
+        result_set: &Value,
+        num_bytes: u64,
+    ) -> (Vec<Vec<Value>>, usize) {
+        let advertised = result_set["numRows"].as_u64();
+        let mut cols: Vec<Vec<Value>> = result_set["data"]
+            .as_array()
+            .map(|data| {
+                data.iter()
+                    .map(|col| col.as_array().cloned().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut rows_read = cols.first().map_or(0, |col| col.len() as u64);
+
         let handle = match result_set["resultSetHandle"].as_u64() {
             Some(h) => h,
-            None => return vec![],
+            None => {
+                if let Some(advertised) = advertised {
+                    assert!(
+                        advertised == 0 || !cols.is_empty(),
+                        "inline result set advertised {advertised} rows but carried no columns"
+                    );
+                    for (index, col) in cols.iter().enumerate() {
+                        assert_eq!(
+                            col.len() as u64,
+                            advertised,
+                            "column {index} of the inline result set carries {} of the \
+                             {advertised} rows it advertised",
+                            col.len()
+                        );
+                    }
+                }
+                return (cols, 0);
+            }
         };
-        let num_rows = result_set["numRows"].as_u64().unwrap_or(0);
-        if num_rows == 0 {
-            let close = json!({"command":"closeResultSet","resultSetHandles":[handle]});
-            self.ws.send(Message::Text(close.to_string().into())).ok();
-            let _ = Self::read_json(&mut self.ws);
-            return vec![];
+        let num_rows = advertised.unwrap_or(0);
+
+        let mut responses = 0usize;
+        while rows_read < num_rows {
+            let resp = self.fetch_rows(handle, rows_read, num_bytes);
+            responses += 1;
+
+            let rows_in_response = resp["responseData"]["numRows"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "fetch at startPosition {rows_read} of result set {handle} \
+                     returned no responseData.numRows: {resp}"
+                )
+            });
+            if rows_in_response == 0 {
+                panic!(
+                    "fetch at startPosition {rows_read} of result set {handle} returned \
+                     0 rows with {} of {num_rows} rows still outstanding",
+                    num_rows - rows_read
+                );
+            }
+
+            let data = resp["responseData"]["data"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "fetch at startPosition {rows_read} of result set {handle} returned \
+                     no responseData.data array: {resp}"
+                )
+            });
+            if cols.is_empty() {
+                cols = vec![Vec::new(); data.len()];
+            }
+            assert_eq!(
+                data.len(),
+                cols.len(),
+                "fetch response {responses} of result set {handle} changed the column \
+                 count mid-read"
+            );
+            for (col, chunk) in cols.iter_mut().zip(data) {
+                col.extend(chunk.as_array().cloned().unwrap_or_default());
+            }
+
+            rows_read += rows_in_response;
         }
+        self.close_result_set(handle);
+
+        assert!(
+            num_rows == 0 || !cols.is_empty(),
+            "result set {handle} advertised {num_rows} rows but its {responses} fetch \
+             response(s) carried no columns"
+        );
+        for (index, col) in cols.iter().enumerate() {
+            assert_eq!(
+                col.len() as u64,
+                num_rows,
+                "column {index} of result set {handle} accumulated the wrong row count \
+                 across {responses} fetch response(s)"
+            );
+        }
+        (cols, responses)
+    }
+
+    fn fetch_rows(&mut self, handle: u64, start_position: u64, num_bytes: u64) -> Value {
         let fetch = json!({
             "command": "fetch",
             "resultSetHandle": handle,
-            "startPosition": 0,
-            "numBytes": 67108864
+            "startPosition": start_position,
+            "numBytes": num_bytes
         });
         self.ws
             .send(Message::Text(fetch.to_string().into()))
             .expect("send fetch");
-        let fetch_resp = Self::read_json(&mut self.ws);
+        Self::read_json(&mut self.ws)
+    }
+
+    fn close_result_set(&mut self, handle: u64) {
         let close = json!({"command":"closeResultSet","resultSetHandles":[handle]});
         self.ws.send(Message::Text(close.to_string().into())).ok();
         let _ = Self::read_json(&mut self.ws);
-        fetch_resp["data"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|col| col.as_array().cloned().unwrap_or_default())
-            .collect()
     }
 
     fn read_json(ws: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Value {

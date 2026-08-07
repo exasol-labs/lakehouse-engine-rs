@@ -53,3 +53,46 @@ The table has 12 rows and one column for each Arrow/Exasol type pairing. Use it 
 | `c_bool` | Boolean | BOOLEAN |
 | `c_price` | Float64 | DOUBLE PRECISION |
 | `c_qty` | Int64 | DECIMAL(20,0) |
+
+### Declared row cap versus pushdown `limit` (measured)
+
+`e2e_capture_pushdown` reads an optional `CAPTURE_RESULT_SET_MAX_ROWS` env var: unset
+means the capture connection declares no cap (`resultSetMaxRows: 0`); set to `n` means it
+calls `capped_result_sets(n)` before running the capture. `scripts/capture-pushdown-payload.sh`
+needs no flag for this — it inherits whatever `CAPTURE_RESULT_SET_MAX_ROWS` is set in the
+environment it runs in. Set it, then diff two captures of the same statement to reproduce
+the comparison below for a new shape.
+
+Measured against `docker.io/exasol/docker-db:2025.2.1` (WebSocket protocol v3): **no
+statement shape converts a declared `resultSetMaxRows` cap into an adapter-visible
+pushdown `limit`.** A declared cap truncates the delivered result set at the statement
+level only — the `pushdownRequest`, the full adapter exchange, and the generated scan
+SQL/scan-spec JSON were byte-identical between a capped and an uncapped capture of every
+shape tested:
+
+| Shape | Declared cap produced a `limit`? |
+|---|---|
+| bare projection | No |
+| projection + filter | No |
+| single-group aggregate | No |
+| `GROUP BY` aggregate | No |
+| `COUNT(DISTINCT)` | No |
+| `ORDER BY … LIMIT` | No — only the statement's own SQL `LIMIT` reaches the scan spec; the declared cap adds nothing on top of it |
+| broadcast-eligible inner equi-join | Was never shown to reach the adapter as a pushdown `limit` or to suppress broadcast eligibility — the broadcast block was still emitted and no `LHS_T0` fallback wrapper appeared, at declared caps of `5` and `10000` |
+
+Controls rule out the two ways this could be an artifact of the measurement itself: a cap
+of `5` against a 12-row table returned exactly 5 rows (the cap is delivered and honored —
+this is not a capture that silently no-ops), and a cap of `5` against a `COUNT(*)`/`SUM`
+aggregate and a `COUNT(DISTINCT)` still returned the correct uncapped values — a `limit`
+actually reaching a per-shard scan spec would have corrupted both.
+
+The capture observes the adapter exchange only through `EXPLAIN VIRTUAL`, where
+`resultSetMaxRows` is an attribute of the `EXPLAIN VIRTUAL` wrapper statement rather than of
+the inner statement it explains — so these result-value controls bound the row-scan and
+aggregate shapes above, but do not, by the echo alone, bound whether a cap reaching a
+directly-executed statement could still suppress broadcast eligibility for the join shape.
+
+See `ExaConn::capped_result_sets`'s doc comment
+(`crates/lakehouse-engine/tests/common/exasol_ws.rs`) for the calling convention this
+table backs, and the `fix-e2e-harness-undeclared-limit` plan's `injection-surface.md` for
+the exact statements, full diff method, and every control.

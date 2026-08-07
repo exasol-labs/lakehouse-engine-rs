@@ -11,8 +11,10 @@
 //! and, separately, for real (showing the actual runtime error/result).
 //!
 //! Usage: see `scripts/capture-pushdown-payload.sh` / `docs/debugging-pushdown.md`.
-//! Driven entirely by the `CAPTURE_SQL` env var so future issues on this stack
-//! (#211, #212, #210, #209) can reuse it without editing this file.
+//! Driven by env vars so future issues on this stack (#211, #212, #210, #209) can
+//! reuse it without editing this file: required `CAPTURE_SQL` names the statement to
+//! capture, and optional `CAPTURE_RESULT_SET_MAX_ROWS` declares a row cap on the
+//! capture connection (unset means no declared cap).
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -47,7 +49,15 @@ fn capture_pushdown_payload() {
     install_slc();
     upload_so();
 
-    let mut conn = exa_conn();
+    let conn = exa_conn();
+    let mut conn = match std::env::var("CAPTURE_RESULT_SET_MAX_ROWS") {
+        Ok(n) => conn
+            .capped_result_sets(n.parse().unwrap_or_else(|_| {
+                panic!("CAPTURE_RESULT_SET_MAX_ROWS must be a u32, got {n:?}")
+            })),
+        Err(std::env::VarError::NotPresent) => conn,
+        Err(err) => panic!("CAPTURE_RESULT_SET_MAX_ROWS: {err}"),
+    };
     create_schema_and_scripts(&mut conn);
     create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
 

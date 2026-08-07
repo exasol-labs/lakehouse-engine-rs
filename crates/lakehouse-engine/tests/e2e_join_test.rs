@@ -110,12 +110,7 @@ fn vs_supplier_table(vs_name: &str) -> String {
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
-    // Same connection settings as `e2e_broadcast_join_result_correct` below, so the
-    // two tests pin ONE plan: the default 10000-row cap reaches the adapter as a
-    // pushdown `limit`, and `join_requires_exasol_postprocessing` treats any limit
-    // as a broadcast disqualifier — a capped shape assertion and an uncapped
-    // correctness assertion could otherwise describe different plans.
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
 
     let pushed = explain_virtual_sql(&mut conn, &join_query(VS_NAME));
     assert!(
@@ -136,7 +131,7 @@ fn e2e_broadcast_join_pushdown_shape() {
 #[test]
 fn e2e_broadcast_join_result_correct() {
     setup_e2e();
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
 
     let actual = fetch_join_rows(&mut conn, VS_NAME);
     let expected = expected_join_rows(&mut conn, VS_NAME);
@@ -190,7 +185,7 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
 #[test]
 fn e2e_above_threshold_result_matches_broadcast() {
     setup_e2e();
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
 
     let broadcast = fetch_join_rows(&mut conn, VS_NAME);
     let fallback = fetch_join_rows(&mut conn, VS_NAME_LOW);
@@ -1171,7 +1166,7 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     setup_e2e();
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
 
     let query = like_on_orderdate_join_query(VS_NAME);
     let pushed = explain_virtual_sql(&mut conn, &query);
@@ -1359,7 +1354,7 @@ fn expected_orderdate_text(order_key: usize) -> String {
 #[test]
 fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     setup_e2e();
-    let mut conn = exa_conn().unbounded_result_sets();
+    let mut conn = exa_conn();
     let where_clause = "LENGTH(O_TOTALPRICE) > 3";
 
     let mut expected: Vec<(String, String)> = (1..=FACT_ORDERS_ROWS)
