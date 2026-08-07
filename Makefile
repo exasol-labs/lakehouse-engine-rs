@@ -189,6 +189,18 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
+# Local reproduction of CI's coverage gate. MUST stay flag-identical to the
+# `cargo llvm-cov` step in ci.yml's unit-tests job, which is the authority — a
+# target that drifts reports a number the Quality Gate does not. Deliberately
+# NOT a prerequisite of `test`: llvm-cov relinks every workspace target on each
+# run, and link time dominates this workspace (.cargo/config.toml).
+#
+# Prereqs (CI installs both):
+#   cargo install cargo-llvm-cov --version 0.8.7
+#   rustup component add llvm-tools-preview
+coverage:
+	cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
+
 # Pure-bash unit tests for deploy/scripts/install.sh. Stubs exapump and curl on
 # a temp PATH — no live Exasol, no network. CI's install-script job runs this;
 # install-script-e2e (docker-based, real Exasol) is separate and lives only in
@@ -210,4 +222,4 @@ lint-install:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint bench test-install lint-install
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install
