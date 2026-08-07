@@ -1,0 +1,42 @@
+name: Cache GC
+
+# Each cache family gains one revision per `main` run, against a 10 GB repo
+# quota that CI already sits close to. A one-shot prune is a one-shot fix to a
+# standing condition; this keeps it pruned.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  gc:
+    name: Prune Actions caches
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # Group on the family PREFIX, not a fixed segment count: `docker-cargo`'s
+      # third segment is the hash, so segment-based grouping makes every
+      # revision a group of one and prunes nothing from the largest family.
+      #
+      # Keep TWO revisions, not one: rust-cache's restore-keys prefix stops at
+      # the environment hash, so an env-hash change is a total miss with no
+      # fallback — and workspace-rlib has been observed flipping between two
+      # env-hash values on main.
+      - name: Keep the newest two entries per cache family
+        run: |
+          for prefix in docker-cargo v0-rust-workspace-rlib v0-rust-llvm-cov; do
+            gh cache list --repo "$GITHUB_REPOSITORY" --limit 100 --json id,key,createdAt \
+              | jq -r --arg p "$prefix" \
+                  '[.[] | select(.key | startswith($p))]
+                   | sort_by(.createdAt) | reverse | .[2:] | .[].id' \
+              | xargs -r -n1 gh cache delete --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Report remaining usage
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --limit 100
+          gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage"
