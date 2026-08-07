@@ -247,9 +247,16 @@ reason and MUST be removed rather than reworded.
 | Scenario | Test Type | Test Location | Test Name |
 |---|---|---|---|
 | Harness statements carry no row cap the test did not declare | Integration | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `undeclared_cap_pushes_no_limit` |
-| A declared row cap truncates the delivered result set, not the pushdown request (RENAMED at task 5.3 against task 1.2's measurement — the original scenario asserted a pushdown `limit` that no shape produces) | Integration | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `declared_cap_truncates_delivered_result_set_not_pushdown_request` |
+| A declared row cap truncates the returned row count (RENAMED a second time — see decision-log.md's second correction entry: a live capture of the REAL adapter request, not `EXPLAIN VIRTUAL`, showed a declared cap DOES reach the adapter as a pushdown `limit`; this scenario now asserts only the delivered row count, which is what the test can actually observe) | Integration | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `declared_cap_truncates_returned_row_count` |
 | Harness returns every row of a result set larger than one fetch response | Integration | `crates/lakehouse-engine/tests/e2e_count_distinct_test.rs` | `harness_reads_high_cardinality_result_set_to_completion` |
 | A two-table broadcast join over a vended-credential warehouse returns correct rows (CHANGED — the connection no longer opts out) | Integration | `crates/lakehouse-engine/tests/e2e_lakekeeper_test.rs` | `lakekeeper_vended_broadcast_join_result_correct` |
+
+The new join regression test `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan`
+(`crates/lakehouse-engine/tests/e2e_join_test.rs`) is not added as its own Scenario Coverage row: it
+proves the join-disqualification mechanism itself (any pushed `limit`, via a SQL `LIMIT` that
+`EXPLAIN VIRTUAL` can show directly) rather than backing a new normative scenario in either spec
+delta above — it is closer to the second-correction regression evidence recorded in
+`decision-log.md` and `verification-report.md` than to a Phase 5 scenario.
 
 The fetch-completeness test lives in `e2e_count_distinct_test` because that binary already seeds
 `high_card_probe` (30,000 rows of ~100-byte tokens); seeding it a second time in a new binary would

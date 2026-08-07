@@ -241,21 +241,26 @@ steps 2 and 3 like any other test.
       through a connection that declares no cap, assert via `explain_virtual_sql` that the generated
       scan spec carries no `limit`, and assert the statement returns every seeded row rather than a
       prefix. Must fail, not skip, when the stack is unavailable.
-- [x] 5.3 Write `declared_cap_truncates_delivered_result_set_not_pushdown_request` (**RENAMED and
-      REASSERTED** — the task originally read "Write `declared_cap_reaches_adapter_as_pushdown_limit`
-      … assert the capped scan spec carries `limit` `n`", which task 1.2's measurement disproves:
-      no statement shape converts a declared cap into a pushdown `limit` on Exasol 2025.2.1, so the
-      original assertion asserted a falsehood. Verified again here before rewriting — the literal
-      assertion was run against the live stack and failed, with the capped connection's scan spec
-      carrying no `limit`. See `injection-surface.md` § Consequences item 4 and `decision-log.md`;
-      the same correction was already applied to the `exasol_ws.rs` doc comments (task 1.5) and the
-      lakekeeper spec delta (task 3.5)). Run the identical statement through a
-      `capped_result_sets(n)` connection and a no-cap connection, assert the two pushed plans are
-      identical and neither carries a `limit`, and assert the capped connection delivers exactly `n`
-      rows against the fixture's full count — the cap's measured effect is result-set truncation, not
-      pushdown. The `e2e-harness/e2e-harness` spec delta's Background bullet and this scenario were
-      corrected to match. This test is what keeps the Phase 1 measurement from decaying into a
-      comment. `[expert]`
+- [x] 5.3 Write `declared_cap_truncates_returned_row_count` (**RENAMED TWICE.** First rename: the
+      task originally read "Write `declared_cap_reaches_adapter_as_pushdown_limit` … assert the
+      capped scan spec carries `limit` `n`", which task 1.2's `EXPLAIN VIRTUAL`-based measurement
+      appeared to disprove, so it was renamed to `declared_cap_truncates_delivered_result_set_not_pushdown_request`
+      and rewritten to assert the two `EXPLAIN VIRTUAL` plans are identical. Second correction (see
+      `decision-log.md`'s second correction entry): a live capture of the REAL adapter request
+      (bypassing `EXPLAIN VIRTUAL` entirely) showed a declared cap DOES reach the adapter as a
+      pushdown `limit` on a real execution — `EXPLAIN VIRTUAL` simply cannot observe it, since it is
+      a separate exchange. The task-1.2-based "identical plans" assertion was therefore also
+      unsound (it proved only that `EXPLAIN VIRTUAL` looks the same, not that the real request is
+      the same), so the test was renamed again to `declared_cap_truncates_returned_row_count` and
+      narrowed to assert only what it can actually observe: a capped connection returns exactly `n`
+      rows, an uncapped one returns the fixture's full count, with no claim about the pushdown
+      request either connection generates. See `injection-surface.md`'s real-execution-path capture
+      section and `decision-log.md`'s second correction entry; the same correction was applied to
+      the `exasol_ws.rs` doc comments, `e2e_join_test.rs`'s comment, and both spec deltas.) Run the
+      identical statement through a `capped_result_sets(n)` connection and a no-cap connection and
+      assert the delivered row counts. The `e2e-harness/e2e-harness` spec delta's Background bullet
+      and this scenario were corrected to match. This test is what keeps the Phase 1 measurement
+      from decaying into a comment. `[expert]`
 - [x] 5.4 Run the full checklist from `plan.md`: `make cross-musl-udf-build`, `cargo test`,
       `cargo clippy --all-targets`, `cargo fmt`, `make test-e2e`, `make test-e2e-lakekeeper`. Report
       exit codes, not output tails.
@@ -303,7 +308,10 @@ steps 2 and 3 like any other test.
       `panic!("CAPTURE_RESULT_SET_MAX_ROWS must be a u32, got {n:?}")`.
 - [x] 6.6 In `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs`, delete the
       `capped_plan_unescaped` binding in
-      `declared_cap_truncates_delivered_result_set_not_pushdown_request` and assert
+      `declared_cap_truncates_delivered_result_set_not_pushdown_request` (this test was later
+      renamed again to `declared_cap_truncates_returned_row_count` and restructured to drop the
+      `capped_plan`/scan-spec comparison entirely — see task 5.3's note and Phase 7 below; this
+      task's own fix was superseded by that restructure, not undone by it) and assert
       `!capped_plan.contains("\"limit\"")` directly on the raw plan, matching
       `undeclared_cap_pushes_no_limit`'s convention. Keep the assertion's failure message.
 - [x] 6.7 In `docs/debugging-pushdown.md`, reword the `broadcast-eligible inner equi-join` table row
@@ -313,3 +321,48 @@ steps 2 and 3 like any other test.
       observation boundary: the capture observes the adapter exchange through `EXPLAIN VIRTUAL`,
       where `resultSetMaxRows` applies to the wrapper statement, so result-value controls bound the
       row-scan/aggregate shapes but not the join shape via the echo alone.
+
+## Phase 7: Second Correction
+
+> The Phase 6 hedge ("was never shown to reach the adapter... or to suppress broadcast
+> eligibility") was itself still wrong — it was based entirely on `EXPLAIN VIRTUAL` captures,
+> which cannot observe a limit that only a REAL execution's pushdown request carries.
+> Directly capturing the adapter's raw incoming request during a real query execution (not
+> `EXPLAIN VIRTUAL`) — cross-checked against a domain expert's challenge — confirmed a
+> declared cap DOES reach the adapter as a pushdown `limit`, for every shape tested,
+> including the broadcast-eligible join, where it disqualifies broadcast pushdown via
+> `join_requires_exasol_postprocessing`. This phase records the fixes that correction
+> required. No production code changed; `join_requires_exasol_postprocessing` and the rest of
+> the adapter are pre-existing, unchanged behavior (decision `[9]`) — only the plan's own
+> artifacts were mis-describing it.
+
+- [x] 7.1 Restore and correct the `e2e_join_test.rs` comment above
+      `e2e_broadcast_join_pushdown_shape`/`e2e_broadcast_join_result_correct` (the block Phase 3
+      deleted as "stale") to state the corrected mechanism: these two tests must stay on an
+      uncapped connection because a declared cap DOES reach the adapter as a pushdown `limit` on a
+      real execution and would disqualify broadcast pushdown, not because the mechanism is inert.
+- [x] 7.2 Add `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` to
+      `crates/lakehouse-engine/tests/e2e_join_test.rs`: a SQL `LIMIT` on the otherwise
+      broadcast-eligible join — the fully `EXPLAIN VIRTUAL`-observable form of the same
+      `join_requires_exasol_postprocessing` disqualification a declared `resultSetMaxRows` cap
+      triggers less visibly — proves the two-scan (`LHS_T0`/`LHS_T1`) fallback is reachable and
+      correctly selected.
+- [x] 7.3 Rename `declared_cap_truncates_delivered_result_set_not_pushdown_request` to
+      `declared_cap_truncates_returned_row_count` in `e2e_harness_row_cap_test.rs`, remove the
+      `capped_plan`/`uncapped_plan` `EXPLAIN VIRTUAL`-equality assertions (task 1.2's premise for
+      them no longer holds), and keep only the row-count assertions the test can actually support.
+- [x] 7.4 Correct `ExaConn::capped_result_sets`'s doc comment in
+      `crates/lakehouse-engine/tests/common/exasol_ws.rs` to state the corrected mechanism (cap
+      reaches the adapter as a pushdown `limit` on a real execution; `EXPLAIN VIRTUAL` cannot show
+      it; the adapter applies it safely for raw scans, withholds it correctly from beneath
+      aggregates, and lets it disqualify broadcast-join pushdown).
+- [x] 7.5 Correct the docs/specs/decision-log side to cite 7.1-7.4 as already-landed code:
+      `docs/debugging-pushdown.md`'s measured shape matrix; both spec deltas'
+      (`e2e-harness/e2e-harness`, `e2e-harness/lakekeeper-e2e-harness`) Background bullets and the
+      `e2e-harness/e2e-harness` scenario name/body; `plan.md`'s Scenario Coverage table; this
+      `tasks.md` file (this phase, plus the 5.3/6.6 name-reference updates above); an addendum note
+      on `review-findings.md`'s now-superseded "Verified clean" claim and its stale test-name
+      reference; `verification-report.md`'s Notes section and Test Results table; a new
+      `decision-log.md` entry documenting this second correction over the first; and a new
+      `injection-surface.md` section recording the real-execution-path capture method and evidence,
+      marking the earlier `EXPLAIN VIRTUAL`-based section superseded without deleting it.

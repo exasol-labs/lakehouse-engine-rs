@@ -104,6 +104,17 @@ fn vs_supplier_table(vs_name: &str) -> String {
 // 5.4  Broadcast join: single scan-UDF-driving shape + correct result
 // ---------------------------------------------------------------------------
 
+// Both tests below run on `exa_conn()`'s default connection, which declares NO row
+// cap — load-bearing, not incidental. On a REAL query execution a declared
+// `resultSetMaxRows` cap arrives at the adapter as a pushdown `limit` (confirmed by
+// capturing the adapter's incoming request directly; `EXPLAIN VIRTUAL` is a separate
+// exchange that never carries it, so it cannot observe this), and
+// `join_requires_exasol_postprocessing` disqualifies the broadcast plan whenever ANY
+// limit is present. Declaring a cap here would silently move both the shape and the
+// correctness assertion onto the two-scan fallback path.
+// `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` below proves that
+// disqualification directly, via a SQL `LIMIT` that `EXPLAIN VIRTUAL` does show.
+
 /// EXPLAIN VIRTUAL of a broadcast-eligible inner equi-join shows the SINGLE
 /// scan-UDF-driving broadcast fan-out (matching the plan's first Manual Testing
 /// row): one `LAKEHOUSE_SCAN` invocation, NOT the two-scan Exasol-joined shape.
@@ -148,6 +159,44 @@ fn e2e_broadcast_join_result_correct() {
         actual, expected,
         "broadcast join result must equal the independently computed join.\n\
          actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Any pushed limit disqualifies broadcast
+// ---------------------------------------------------------------------------
+
+/// An explicit SQL `LIMIT` on the otherwise broadcast-eligible join of
+/// `e2e_broadcast_join_pushdown_shape` disqualifies the broadcast plan:
+/// `join_requires_exasol_postprocessing` treats ANY pushdown limit as work Exasol
+/// must run over the materialized join, so the adapter emits the two-scan
+/// `LHS_T0`/`LHS_T1` fallback instead. A SQL `LIMIT` is the fully observable form
+/// of that mechanism — a declared `resultSetMaxRows` cap reaches the adapter as
+/// the same pushdown `limit` on a real execution, but only direct request capture
+/// can see that (`EXPLAIN VIRTUAL` never carries it), which is why the two tests
+/// above must not declare a cap.
+#[test]
+fn e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    const LIMIT_ROWS: usize = 3;
+    let query = format!("{} LIMIT {LIMIT_ROWS}", join_query(VS_NAME));
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        pushed.contains("\"numElements\""),
+        "the SQL LIMIT must reach the adapter as a pushdown limit, else this test \
+         proves nothing about limit-driven disqualification:\n{pushed}"
+    );
+    assert!(
+        has_two_scan_wrapper(&pushed),
+        "an explicit LIMIT must disqualify the broadcast plan and fall back to the \
+         two-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a limited join must NOT carry a broadcast common-blob join block:\n{pushed}"
     );
 }
 

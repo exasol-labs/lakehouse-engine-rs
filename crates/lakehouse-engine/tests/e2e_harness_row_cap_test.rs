@@ -59,10 +59,10 @@ fn typed_table() -> String {
 
 /// A bare projection carrying no SQL `LIMIT`, issued through a connection that
 /// declares no cap, pushes no `limit` into the generated scan spec and returns
-/// every seeded row rather than a prefix. Confirmed by task 1.2's live capture
-/// (shape 1, bare projection): the uncapped connection's scan spec is
-/// byte-identical to a capped one and carries no `limit` key
-/// (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`).
+/// every seeded row rather than a prefix — the harness default this plan
+/// establishes. Says nothing about a *declared* cap, which does reach the
+/// adapter as a pushdown `limit`; see
+/// `declared_cap_truncates_returned_row_count` below.
 #[test]
 fn undeclared_cap_pushes_no_limit() {
     setup_e2e();
@@ -85,17 +85,23 @@ fn undeclared_cap_pushes_no_limit() {
     );
 }
 
-/// A declared row cap truncates the delivered result set and leaves the adapter
-/// exchange untouched: the identical statement issued through a capped and an
-/// uncapped connection generates a byte-identical pushed plan, and only the
-/// delivered row count differs. Pinned in this shape — rather than as a pushed
-/// `limit` — because task 1.2 diffed both variants of all seven statement shapes
-/// against the live stack and found none that converts a declared cap into a
-/// pushdown `limit`, with controls c1/c3/c6 ruling out the cap simply not
-/// arriving (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`,
-/// and `docs/debugging-pushdown.md` for the permanent shape matrix).
+/// A declared row cap truncates the delivered result set: the same bare
+/// projection returns exactly the capped row count through a capped connection
+/// and the fixture's full row count through an uncapped one.
+///
+/// Scoped deliberately to the DELIVERED row count. A declared cap is not inert on
+/// the adapter exchange — on a real query execution it reaches the adapter as a
+/// pushdown `limit`, which among other things disqualifies broadcast-join
+/// pushdown via `join_requires_exasol_postprocessing`. That effect is invisible
+/// here because `EXPLAIN VIRTUAL` is a separate exchange that never carries a
+/// cap-derived limit, so no assertion in this file could observe it. The proof
+/// lives elsewhere: direct capture of the adapter's incoming request
+/// (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`) for the
+/// limit itself, and `e2e_join_test`'s
+/// `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` for the
+/// plan-shape consequence any pushed limit carries.
 #[test]
-fn declared_cap_truncates_delivered_result_set_not_pushdown_request() {
+fn declared_cap_truncates_returned_row_count() {
     setup_e2e();
 
     const CAP_ROWS: u32 = 5;
@@ -104,26 +110,6 @@ fn declared_cap_truncates_delivered_result_set_not_pushdown_request() {
     let sql = format!("SELECT {TYPED_COL_VARCHAR} FROM {}", typed_table());
     let mut capped = exa_conn().capped_result_sets(CAP_ROWS);
     let mut uncapped = exa_conn();
-
-    let capped_plan = explain_virtual_sql(&mut capped, &sql);
-    let uncapped_plan = explain_virtual_sql(&mut uncapped, &sql);
-
-    assert!(
-        uncapped_plan.contains("LAKEHOUSE_SCAN"),
-        "the two plans being compared must be generated scan plans, not empty \
-         or error output, got:\n{uncapped_plan}"
-    );
-    assert!(
-        !capped_plan.contains("\"limit\""),
-        "a declared cap of {CAP_ROWS} must reach neither the pushdown request \
-         nor the generated scan spec as a 'limit', got:\n{capped_plan}"
-    );
-    assert_eq!(
-        capped_plan, uncapped_plan,
-        "a declared cap must leave the whole adapter exchange untouched — the \
-         capped and uncapped plans for the same statement must not differ in \
-         any field"
-    );
 
     let capped_rows = capped.query_row_count(&sql);
     let uncapped_rows = uncapped.query_row_count(&sql);

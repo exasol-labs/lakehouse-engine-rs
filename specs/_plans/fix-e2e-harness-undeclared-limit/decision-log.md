@@ -354,3 +354,79 @@ Those entries stay as history; where they conflict with this one, this one wins.
 - **Evidence:** `specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md` §
   "Capped-versus-uncapped pushdown shape matrix" and § "Consequences for downstream tasks".
 - **Promotes to ADR:** no
+
+### [task 1.2, second correction] The `[task 1.2]` correction above was itself wrong — a declared cap DOES reach the adapter as a pushdown `limit` on a real execution
+
+**This entry supersedes the `[task 1.2]` entry immediately above.** That entry is preserved
+unedited, per this project's paper-trail convention — the correction below states what future
+readers should trust instead, it does not retroactively rewrite what was previously recorded.
+
+- **Finding:** The `[task 1.2]` correction concluded, from 20 `EXPLAIN VIRTUAL` captures across
+  all seven statement shapes, that "no shape converts a declared cap into a pushdown `limit`." A
+  domain expert challenged that conclusion during this correction round: `EXPLAIN VIRTUAL` and a
+  real query execution are two different exchanges with the adapter, and `resultSetMaxRows` is an
+  attribute of whichever statement is actually sent to the server. An `EXPLAIN VIRTUAL` wrapper
+  statement is never the statement a declared cap is targeting, so its echoed `pushdownRequest`
+  cannot carry a limit that only the real statement's own request gained — regardless of which
+  shape is captured, and regardless of the cap's value. The `[task 1.2]` measurement therefore
+  established only that `EXPLAIN VIRTUAL` looks identical under a cap, which is a fact about the
+  tool, not a fact about the adapter.
+  A second measurement, directly capturing the adapter's raw incoming request during a REAL query
+  execution (temporary instrumentation at the adapter's request-receipt point, reverted after use —
+  bypassing `EXPLAIN VIRTUAL` entirely), for all seven statement shapes from the original
+  measurement, found the opposite of the `[task 1.2]` conclusion: a capped connection's real
+  request gains `"limit": {"numElements": n}` where an identical uncapped request has none. See
+  `injection-surface.md`'s new "Real-execution-path pushdown-limit capture" section for the exact
+  diff evidence, method, and per-shape results.
+  The adapter's handling of that limit, once present, is exactly what a careful reading of the
+  adapter's own pushdown code predicts and what `#312`/`#307` context already implied: applied
+  safely for a raw scan (a per-shard limit plus an outer `LIMIT` wrapper), correctly withheld from
+  beneath an aggregate (outer `LIMIT` only, so the aggregate value stays correct), and, for a
+  broadcast-eligible inner equi-join, disqualifying broadcast pushdown — `ANY` limit in the
+  pushdown request trips `join_requires_exasol_postprocessing`
+  (`crates/lakehouse-engine/src/adapter/pushdown/joins/planning.rs`), falling back to the
+  unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan.
+- **Direction change:** Every artifact the `[task 1.2]` correction touched was corrected a second
+  time to state the now-confirmed mechanism instead of the `EXPLAIN VIRTUAL`-based non-finding:
+  - `crates/lakehouse-engine/tests/common/exasol_ws.rs`'s `capped_result_sets` doc comment now
+    states the confirmed mechanism and the per-shape adapter behavior, with the `EXPLAIN VIRTUAL`
+    blind spot named explicitly.
+  - `crates/lakehouse-engine/tests/e2e_join_test.rs`'s comment above
+    `e2e_broadcast_join_pushdown_shape`/`e2e_broadcast_join_result_correct` — deleted by task 3.3 as
+    "stale" under the `[task 1.2]` premise, then restored and rewritten to state why those two
+    tests must stay uncapped under the confirmed mechanism.
+  - A new regression test, `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan`
+    (`e2e_join_test.rs`), proves the disqualification directly via a SQL `LIMIT` — the fully
+    `EXPLAIN VIRTUAL`-observable form of the same check a declared `resultSetMaxRows` cap triggers
+    less visibly.
+  - `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs`'s
+    `declared_cap_truncates_delivered_result_set_not_pushdown_request` — itself a rename introduced
+    by the `[task 1.2]` correction — is renamed again to `declared_cap_truncates_returned_row_count`
+    and narrowed to assert only the delivered row count; its `EXPLAIN VIRTUAL`-plan-equality
+    assertion is deleted, since that assertion's only evidentiary value rested on the disproven
+    premise that `EXPLAIN VIRTUAL` equality means adapter-request equality.
+  - `docs/debugging-pushdown.md`'s shape matrix is rewritten to state the confirmed mechanism, the
+    `EXPLAIN VIRTUAL` blind spot, and an explicit operator warning: a join-plan capture via
+    `scripts/capture-pushdown-payload.sh` will show a broadcast plan regardless of a declared cap,
+    and does not reflect what a real capped query does to that join.
+  - Both spec deltas (`e2e-harness/e2e-harness`, `e2e-harness/lakekeeper-e2e-harness`) had their
+    Background bullets corrected to state the confirmed mechanism; the `e2e-harness/e2e-harness`
+    scenario was renamed to match the test rename above.
+  - `specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md` gained a new section
+    documenting the real-execution-path capture, marking the earlier `EXPLAIN VIRTUAL`-based
+    "Capped-versus-uncapped pushdown shape matrix" section superseded without deleting it — the
+    same non-destructive convention this entry follows.
+- **What is unaffected:** everything decision `[1]`/`[2]`/`[4]` established stays correct on its
+  own terms — an explicit, visible `capped_result_sets(n)` call is still clearer than a silent
+  default regardless of which mechanism motivated the inversion, and the fetch-completeness fix is
+  still a real defect fix independent of this correction. Decision `[9]`'s scope boundary also
+  stays intact: `join_requires_exasol_postprocessing` is pre-existing, unchanged production code —
+  this plan does not touch it, it only corrects how this plan's own artifacts describe it. Phase
+  4's "zero newly-failing tests" verdict is unaffected for a different reason than `[task 1.2]`
+  assumed: it was always scoped to what the *default flip* changes for tests that declare no cap,
+  and no in-scope test's own connection declares one either way, so nothing about what a *declared*
+  cap does changes that verdict.
+- **Evidence:** `specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md` § "Real-execution-path
+  pushdown-limit capture" (new section: capture method, provenance, and the exact request diff for
+  all seven shapes).
+- **Promotes to ADR:** no

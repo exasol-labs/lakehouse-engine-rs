@@ -17,6 +17,30 @@ measurement and with each other. `undeclared_cap_pushes_no_limit`'s `contains("\
 was checked against the existing convention (`e2e_scan_test.rs:1171`, `:3666` match the same
 unescaped form on raw `explain_virtual_sql` output), so it is a real assertion, not a vacuous one.
 
+## Addendum (second correction, post-dates this review)
+
+This review's "Verified clean" summary above states that the mid-implementation correction of the
+pushdown-`limit` premise — the corrected `capped_result_sets` doc comment,
+`declared_cap_truncates_delivered_result_set_not_pushdown_request`, and the `e2e-harness/e2e-harness`
+Background bullet and scenario — "all agree with `injection-surface.md`'s measurement and with each
+other." That was accurate at the time this review ran: everything it checked was internally
+consistent. It is **no longer accurate as a statement of the underlying fact**, not merely stale —
+a direct capture of the REAL adapter request (not `EXPLAIN VIRTUAL`, which this review's cited
+measurement relied on exclusively) subsequently confirmed a declared cap DOES reach the adapter as
+a pushdown `limit`, including for the broadcast-join shape. See `decision-log.md`'s second
+correction entry for the full evidence and what changed as a result: `capped_result_sets`'s doc
+comment, the `e2e_join_test.rs` comment, `declared_cap_truncates_delivered_result_set_not_pushdown_request`
+(renamed again, to `declared_cap_truncates_returned_row_count`), and both spec deltas were all
+corrected a second time.
+
+This entry is left in place rather than edited, per this project's paper-trail convention — the
+finding it records (internal consistency at review time) is still true; only the premise it was
+checked against has since changed. The test name in the SHRINKABLE finding below
+(`crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs`, "Unexplained backslash-stripping
+before the `limit` check") also refers to the pre-second-correction test name and the
+`capped_plan`/scan-spec comparison it made, both of which no longer exist in that form — that
+finding's own fix was applied, then superseded by the later restructure, not left unresolved.
+
 ## Standard fixes
 
 ### crates/lakehouse-engine/tests/common/exasol_ws.rs

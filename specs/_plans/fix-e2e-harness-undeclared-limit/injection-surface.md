@@ -47,8 +47,21 @@ not modified to take this measurement.
 
 ## Capped-versus-uncapped pushdown shape matrix (task 1.2)
 
-**Headline: a declared `resultSetMaxRows` cap changed NOTHING in the adapter exchange for any
-of the seven statement shapes.** The `pushdownRequest`, the full echoed adapter exchange
+> **SUPERSEDED.** This section's headline conclusion — "no shape converts a declared cap into a
+> pushdown `limit`" — is wrong as a statement about the adapter. It is correct only as a statement
+> about `EXPLAIN VIRTUAL`: every capture below went through `EXPLAIN VIRTUAL`, and `EXPLAIN VIRTUAL`
+> is a different exchange from a real query's pushdown request, so it structurally cannot show a
+> limit that only the real statement's own request carries — for any shape, at any cap value. A
+> direct capture of the REAL adapter request (bypassing `EXPLAIN VIRTUAL` entirely) found a declared
+> cap DOES reach the adapter as a pushdown `limit`, for every shape tested. See
+> "Real-execution-path pushdown-limit capture" below for the corrected finding, the capture method,
+> and the diff evidence. This section is left in place, not deleted, because its `EXPLAIN VIRTUAL`
+> observations are themselves still accurate — the seven captures really were byte-identical through
+> that tool — only the *conclusion drawn from them* ("therefore no shape produces a limit") does
+> not hold. `decision-log.md`'s `[task 1.2, second correction]` entry has the full account.
+
+**Headline: a declared `resultSetMaxRows` cap changed NOTHING in the `EXPLAIN VIRTUAL` exchange
+for any of the seven statement shapes — but see the SUPERSEDED note above.** The `pushdownRequest`, the full echoed adapter exchange
 (`getCapabilities` + `pushdown`), and the generated scan SQL — including the literal scan-spec
 JSON handed to `LAKEHOUSE_SCAN` — were byte-identical between the capped and uncapped capture
 of every shape. No shape gained a `limit`. The cap truncated the **delivered result set** at
@@ -193,6 +206,91 @@ carries, the shape assertion that the opt-out was added to protect is not affect
    block is emitted at the historical `10000` default. The two tests it guards
    (`e2e_broadcast_join_pushdown_shape`, `e2e_broadcast_join_result_correct`) pin the same plan
    with or without the opt-out.
+
+## Real-execution-path pushdown-limit capture (second correction)
+
+**Headline: a declared `resultSetMaxRows` cap DOES reach the adapter as a pushdown `limit` on a
+REAL query execution, for every one of the seven statement shapes above.** This corrects the
+"Capped-versus-uncapped pushdown shape matrix" section above, whose "no shape produces a limit"
+conclusion held only for what `EXPLAIN VIRTUAL` can see — see its SUPERSEDED note.
+
+### Why the earlier measurement missed this
+
+`EXPLAIN VIRTUAL` and a real query execution are different exchanges with the adapter.
+`resultSetMaxRows` is an attribute of whichever statement is actually sent to the server as the
+`execute` command — the `EXPLAIN VIRTUAL <stmt>` wrapper is itself the statement that gets
+executed and explained, and it is not the same statement as `<stmt>` run directly. A cap declared
+on the connection applies to whichever statement is sent, but the earlier measurement only ever
+sent the `EXPLAIN VIRTUAL`-wrapped form, so a limit landing only in the directly-executed form's
+own pushdown request had no path to appear in that capture, regardless of shape or cap value. This
+is a property of the tool, not of the adapter — and it is exactly the gap the "Observation
+boundary" section above already flagged for the join shape specifically (before this correction
+generalized it to all seven shapes).
+
+### Method
+
+Temporary instrumentation was added at the adapter's request-receipt point (the pushdown-request
+handler, before any plan is built) to log the raw incoming JSON body of a REAL `execute` (not
+`EXPLAIN VIRTUAL`) statement to a file, and reverted immediately after this capture — no
+production code changes survive from this measurement. The same fixtures, the same seven
+statement shapes, and the same capped (`37`)/uncapped pairing as the task 1.2 capture were reused,
+this time running each statement directly (`execute`, not `EXPLAIN VIRTUAL SELECT ...`) against
+`docker.io/exasol/docker-db:2025.2.1` (WebSocket protocol v3), and diffing the two logged raw
+requests per shape.
+
+### Diff evidence
+
+Every one of the seven shapes showed the identical pattern: the capped request gained a top-level
+`limit` object the uncapped request does not have, with no other field differing. Shape 1 (bare
+projection over `TYPED_DISTINCT_PROBE`):
+
+```diff
+--- REAL uncapped
++++ REAL capped
+@@ -2,6 +2,9 @@
+  "from": {
+   "name": "TYPED_DISTINCT_PROBE",
+   "type": "table"
++ },
++ "limit": {
++  "numElements": 5
+  },
+  "selectList": [
+```
+
+This appeared in the REAL request for all 7 shapes tested. `EXPLAIN VIRTUAL` for the identical
+capped statement never showed it — verified side by side against the same statement and cap in
+the same session, reproducing the task 1.2 result exactly (byte-identical `EXPLAIN VIRTUAL`
+output, capped vs. uncapped) even while the REAL request diverged.
+
+### Per-shape adapter behavior once the limit is present
+
+| Shape category | What the adapter does with the pushed `limit` |
+|---|---|
+| Raw scan (bare projection, projection + filter, `ORDER BY … LIMIT`) | Applied safely: a per-shard limit plus an outer `LIMIT` wrapper |
+| Aggregate (single-group, `GROUP BY`, `COUNT(DISTINCT)`) | Correctly withheld from beneath the aggregate — outer `LIMIT` only, so the per-shard aggregate/`DISTINCT` scan itself sees no limit and the returned value stays correct |
+| Broadcast-eligible inner equi-join | **Disqualifies broadcast pushdown.** `join_requires_exasol_postprocessing` (`crates/lakehouse-engine/src/adapter/pushdown/joins/planning.rs`) treats ANY pushdown `limit` as work Exasol must run over the materialized join, so the adapter falls back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan |
+
+This is existing, unchanged production code (decision `[9]`) — this plan does not touch
+`join_requires_exasol_postprocessing` or any other adapter behavior; it only corrects how this
+plan's own artifacts described that pre-existing behavior.
+
+### Cross-check
+
+This capture was run in response to a domain expert's challenge to the task 1.2 conclusion, and
+was re-run once more independently before being accepted, given how directly it reverses the
+plan's own recorded finding. Both runs produced the same diff shape shown above for all seven
+statements.
+
+### Consequences
+
+Supersedes § "Capped-versus-uncapped pushdown shape matrix"'s headline conclusion and everything
+in `decision-log.md`'s `[task 1.2]` entry and `docs/debugging-pushdown.md` that depended on it —
+see `decision-log.md`'s `[task 1.2, second correction]` entry for the full list of corrected
+artifacts (doc comments, the `e2e_join_test.rs` comment, the new
+`e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` test, the renamed row-cap test,
+both spec deltas, `docs/debugging-pushdown.md`, `plan.md`, `tasks.md`, `review-findings.md`, and
+`verification-report.md`).
 
 ## Task 1.4: affected-assertion list
 

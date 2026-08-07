@@ -141,12 +141,21 @@ impl ExaConn {
         Self::read_json(&mut self.ws)
     }
 
-    /// Declares a row cap that truncates the delivered result set at the statement level. On
-    /// Exasol 2025.2.1, a declared cap does not reach the adapter or change the pushdown
-    /// request/scan spec — see `docs/debugging-pushdown.md`'s measured shape matrix. Declare a
-    /// cap for a test whose assertion is about result-set truncation at row-delivery time, or for
-    /// `e2e_capture_pushdown`'s `CAPTURE_RESULT_SET_MAX_ROWS` capped-versus-uncapped comparison; a
-    /// test asserting pushdown or plan shape needs no cap, since a declared cap changes neither.
+    /// Declares a row cap that truncates the delivered result set at the statement level.
+    ///
+    /// NOT inert on the adapter exchange: on a real query execution a declared cap reaches the
+    /// adapter as a pushdown `limit` (confirmed by directly capturing the adapter's incoming
+    /// request — `EXPLAIN VIRTUAL` is a separate exchange that never carries a cap-derived limit,
+    /// so it cannot observe this; a blind spot in the capture tooling, not in the adapter). A
+    /// pushed limit can change the chosen plan: `join_requires_exasol_postprocessing`
+    /// disqualifies broadcast-join pushdown whenever any limit is present. The adapter does
+    /// withhold it from underneath an aggregate (outer `LIMIT` only, no scan-spec limit), so
+    /// aggregate values stay correct under a cap.
+    ///
+    /// Declare a cap only for a test whose assertion is about result-set truncation at
+    /// row-delivery time, or for `e2e_capture_pushdown`'s `CAPTURE_RESULT_SET_MAX_ROWS`
+    /// capped-versus-uncapped comparison. A test asserting pushdown or plan shape must NOT
+    /// declare one — it would silently alter the plan under test.
     pub fn capped_result_sets(mut self, max_rows: u32) -> Self {
         self.result_set_max_rows = max_rows;
         self

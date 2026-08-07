@@ -4,7 +4,7 @@
 
 | Result | Details |
 |--------|---------|
-| **PASS** | All 38 plan tasks + 7 code-review fixes landed; every checklist command is green; a mid-implementation live measurement disproved the plan's original core premise (a declared row cap reaches the adapter as a pushdown `limit`) and every affected artifact (doc comments, one regression test, one spec-delta scenario) was corrected to state the measured truth, recorded in `decision-log.md`. |
+| **PASS** | All 38 plan tasks + 7 code-review fixes + a second correction round (Phase 7, 5 tasks) landed; every checklist command is green. A mid-implementation `EXPLAIN VIRTUAL`-based measurement appeared to disprove the plan's original premise (a declared row cap reaches the adapter as a pushdown `limit`); a later direct capture of the REAL adapter request found that premise was correct all along — `EXPLAIN VIRTUAL` simply cannot observe it. Every affected artifact was corrected a second time to state the now-confirmed mechanism, recorded in `decision-log.md`'s second correction entry. |
 | Code review | 7 findings — 7 fixed (6 standard, 1 expert) |
 
 | Check | Status |
@@ -23,7 +23,7 @@
 | Type | Run | Passed | Ignored |
 |------|-----|--------|---------|
 | Unit (`cargo test`, host) | 1081 | 1081 | 2 |
-| E2E — `make test-e2e` (9 binaries incl. new `e2e_harness_row_cap_test`) | 240 | 240 | 0 |
+| E2E — `make test-e2e` (9 binaries incl. new `e2e_harness_row_cap_test`) | 241 | 241 | 0 |
 | E2E — `make test-e2e-lakekeeper` | 23 | 23 | 0 |
 | E2E — `azure-e2e` / `cloud-e2e` gates | compile-checked only (clippy + check, exit 0 each) | — | — |
 
@@ -63,41 +63,68 @@ cargo fmt --check → exit 0, no changes
 | Domain | Feature | Scenario | Test Location | Test Name | Passes |
 |--------|---------|----------|---------------|-----------|--------|
 | e2e-harness | e2e-harness | Harness statements carry no row cap the test did not declare | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `undeclared_cap_pushes_no_limit` | Pass |
-| e2e-harness | e2e-harness | A declared row cap truncates the delivered result set, not the pushdown request (renamed — see Notes) | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `declared_cap_truncates_delivered_result_set_not_pushdown_request` | Pass |
+| e2e-harness | e2e-harness | A declared row cap truncates the returned row count (renamed twice — see Notes) | `crates/lakehouse-engine/tests/e2e_harness_row_cap_test.rs` | `declared_cap_truncates_returned_row_count` | Pass |
 | e2e-harness | e2e-harness | Harness returns every row of a result set larger than one fetch response | `crates/lakehouse-engine/tests/e2e_count_distinct_test.rs` | `harness_reads_high_cardinality_result_set_to_completion` | Pass |
 | e2e-harness | lakekeeper-e2e-harness | A two-table broadcast join over a vended-credential warehouse returns correct rows (CHANGED — connection no longer opts out) | `crates/lakehouse-engine/tests/e2e_lakekeeper_test.rs` | `lakekeeper_vended_broadcast_join_result_correct` | Pass |
 
 ## Notes
 
-**Core premise correction (the most important finding of this implementation run).** The plan's
-Context/Design sections asserted that Exasol converts a declared `resultSetMaxRows` cap into a
-`pushdownRequest` `limit`. Live measurement (task 1.2: 20 captures across all 7 statement shapes,
-plus 6 correctness controls) found this false on Exasol 2025.2.1 — a cap only truncates the
-*delivered* result set; the adapter never sees it. This was verified, not assumed, per this
-project's own verification-discipline rule. Consequences, all applied:
+**Core premise correction, corrected a second time (the most important finding across this
+implementation run and its follow-up correction round).** The plan's Context/Design sections
+asserted that Exasol converts a declared `resultSetMaxRows` cap into a `pushdownRequest` `limit`.
+A mid-implementation measurement (task 1.2: 20 `EXPLAIN VIRTUAL` captures across all 7 statement
+shapes, plus 6 correctness controls) appeared to find this false on Exasol 2025.2.1 — every
+`EXPLAIN VIRTUAL` capture came back byte-identical between a capped and uncapped connection. That
+conclusion was itself wrong, and the error was in the tool, not the mechanism: `EXPLAIN VIRTUAL`
+and a real query execution are different exchanges with the adapter, and `resultSetMaxRows` is an
+attribute of whichever statement is actually sent — an `EXPLAIN VIRTUAL` wrapper is never the
+statement a declared cap targets, so its echo was structurally incapable of showing this, for any
+shape, regardless of the cap's value. A domain expert's challenge to the first correction prompted
+a second measurement: directly capturing the adapter's raw incoming request during a REAL query
+execution (bypassing `EXPLAIN VIRTUAL` entirely) for all 7 shapes. That capture found a declared
+cap DOES reach the adapter as a pushdown `limit` on every shape — applied safely for raw scans
+(per-shard limit plus an outer `LIMIT`), correctly withheld from beneath aggregates (outer `LIMIT`
+only), and, for the broadcast-eligible join, disqualifying broadcast pushdown via
+`join_requires_exasol_postprocessing` (existing, unchanged production code — this plan does not
+touch it). This was verified against a live capture both times, per this project's own
+verification-discipline rule; the first verification's tool had a blind spot the second one closed.
+Consequences of the second correction, all applied:
 
 - `plan.md`'s Scenario Coverage row and `tasks.md` task 5.3 originally specified
-  `declared_cap_reaches_adapter_as_pushdown_limit`, asserting the capped scan spec carries `limit
-  n`. That would have asserted a falsehood. The test was rewritten as
-  `declared_cap_truncates_delivered_result_set_not_pushdown_request`, proven RED against the literal
-  original assertion (scan spec genuinely carries no `limit` under a cap) before being written GREEN
-  against the measured behavior.
-- Two doc comments (`ExaConn::capped_result_sets`, `ExaConn::unbounded_result_sets`) and two spec
-  deltas (`e2e-harness/e2e-harness`, `e2e-harness/lakekeeper-e2e-harness`) were corrected to state the
-  measured mechanism instead of the original claim.
-- `docs/debugging-pushdown.md` records the permanent, operator-facing shape matrix, including an
-  explicit hedge on the broadcast-join shape (Exasol's `EXPLAIN VIRTUAL` echo cannot fully exclude a
-  limit reaching only a directly-executed join statement; result-value controls bound the other six
-  shapes but not this one via the echo alone).
-- `decision-log.md` records the correction's full rationale and evidence trail; `injection-surface.md`
-  preserves the original claim and the measurement that disproved it, so the paper trail survives
-  `/speq:record`'s archive.
-- Phase 4's predicted blast radius (originally: any pushdown-shape assertion) collapsed to the
-  truncation axis only. All 11 per-binary checks (4.1–4.11) came back with **zero newly-failing
-  tests** — no GitHub issues were filed and no `capped_result_sets(n)` opt-ins were needed anywhere,
-  since no fixture in the whole suite exceeds the old 10,000-row cap except `high_card_probe`, which
-  is only reached through a cap-invariant `COUNT(DISTINCT)` (existing test) and the new
-  chunked-fetch regression test (task 2.1).
+  `declared_cap_reaches_adapter_as_pushdown_limit`. The first (wrong) correction renamed it to
+  `declared_cap_truncates_delivered_result_set_not_pushdown_request`, asserting the two `EXPLAIN
+  VIRTUAL` plans were identical. The second correction renamed it again to
+  `declared_cap_truncates_returned_row_count` and dropped the `EXPLAIN VIRTUAL`-equality assertion
+  entirely — the test now asserts only the delivered row count (`n` for a capped connection, the
+  full fixture count for an uncapped one), which is what it can actually observe; no assertion in
+  this file claims anything about the pushdown request.
+- A new regression test, `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan`
+  (`crates/lakehouse-engine/tests/e2e_join_test.rs`), proves the join-disqualification mechanism
+  directly via a SQL `LIMIT` — the fully `EXPLAIN VIRTUAL`-observable form of the same
+  `join_requires_exasol_postprocessing` check a declared `resultSetMaxRows` cap triggers less
+  visibly. The comment above `e2e_broadcast_join_pushdown_shape`/`e2e_broadcast_join_result_correct`
+  explaining why those two tests must stay uncapped was restored and corrected to state the
+  confirmed mechanism, replacing the version Phase 3 had deleted as "stale."
+- Two doc comments (`ExaConn::capped_result_sets` in `exasol_ws.rs`, and the `e2e_join_test.rs`
+  comment above) and two spec deltas (`e2e-harness/e2e-harness`, `e2e-harness/lakekeeper-e2e-harness`)
+  were corrected a second time to state the now-confirmed mechanism.
+- `docs/debugging-pushdown.md` was rewritten: the shape matrix now states that a declared cap DOES
+  reach a real request as a `limit`, for every shape, and that `EXPLAIN VIRTUAL` can never show
+  this because it is a separate exchange — explicitly warning an operator that
+  `scripts/capture-pushdown-payload.sh` (which uses `EXPLAIN VIRTUAL`) will show a broadcast join
+  plan regardless of a declared cap.
+- `decision-log.md` records both corrections' full rationale and evidence trail as separate,
+  explicitly-superseding entries — neither the original claim nor the first (wrong) correction was
+  deleted. `injection-surface.md` likewise adds the real-execution-path capture as a new section
+  that marks the earlier `EXPLAIN VIRTUAL`-based matrix superseded without removing it, so the full
+  paper trail survives `/speq:record`'s archive.
+- Phase 4's predicted blast radius is unaffected by the second correction: it was scoped to what the
+  *default flip* (10000 → 0) changes about existing tests' own connections, none of which declare a
+  cap, so none of them are affected by what a *declared* cap does. All 11 per-binary checks
+  (4.1–4.11) still came back with **zero newly-failing tests** — no GitHub issues were filed and no
+  `capped_result_sets(n)` opt-ins were needed anywhere, since no fixture in the whole suite exceeds
+  the old 10,000-row cap except `high_card_probe`, which is only reached through a cap-invariant
+  `COUNT(DISTINCT)` (existing test) and the new chunked-fetch regression test (task 2.1).
 
 **A second, independent defect surfaced during Phase 2 (task 2.2).** The pre-existing
 `fetch_result_columns` read `fetch` responses at the wrong JSON path (`data` instead of nested under
@@ -122,7 +149,12 @@ local E2E suites, exit 0.
   services does not retrofit an already-running `exasol` container.
 
 **Out of scope, confirmed unaffected:** #307 (a pushed `limit`/`orderBy` suppressing broadcast-join
-pushdown) — this plan does not change `join_requires_exasol_postprocessing`; the broadcast-join test
-pair was confirmed green under the flip (task 4.3), consistent with the disproven-premise finding.
+pushdown) — this plan does not change `join_requires_exasol_postprocessing`; it is existing,
+unchanged production code, per decision `[9]`. The broadcast-join test pair was confirmed green
+under the default flip (task 4.3) because neither test declares a cap either way — the flip
+(10000 → 0) changes nothing about a connection that already sends no cap. This is independent of,
+and unaffected by, the second correction's finding that a *declared* cap does reach the adapter as
+a pushdown `limit` and would disqualify broadcast pushdown if one were declared — which is exactly
+why these two tests, and the lakekeeper suite's broadcast join test, must keep declaring none.
 
 Ready for `/speq:record fix-e2e-harness-undeclared-limit`.
