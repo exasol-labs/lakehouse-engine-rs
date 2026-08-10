@@ -134,9 +134,10 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
 /// The dimension side is placed on the LEFT so it is the hash-join build side (see
 /// [`run_join_scan_with_session`]). Output column order follows `spec.common.projection`
 /// (positionally aligned with `emit_exa_types`); an empty projection expands to
-/// every column, dimension columns first. `LIMIT`, when present, is applied here
-/// exactly as the single-table scan applies it — the VS does not currently push a
-/// LIMIT alongside a join, but the path handles it identically for consistency.
+/// every column, dimension columns first. The row cap comes from
+/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit)
+/// and is applied HERE — after the join and its
+/// `WHERE` — never to either side's registered scan; see that field's doc.
 async fn build_join_sql(
     ctx: &SessionContext,
     fact_table: &str,
@@ -202,7 +203,7 @@ async fn build_join_sql(
         sql.push_str(filter);
     }
 
-    if let Some(limit) = spec.common.limit {
+    if let Some(limit) = join.post_join_limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
 

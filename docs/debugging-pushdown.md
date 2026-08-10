@@ -81,7 +81,7 @@ against `docker.io/exasol/docker-db:2025.2.1` (WebSocket protocol v3):
 | `GROUP BY` aggregate | Yes | Correctly withheld from beneath the aggregate — outer `LIMIT` only |
 | `COUNT(DISTINCT)` | Yes | Correctly withheld from beneath the per-shard `DISTINCT` row-scan — outer `LIMIT` only |
 | `ORDER BY … LIMIT` | Yes, on top of the statement's own SQL `LIMIT` | Applied safely alongside the existing top-N pushdown |
-| broadcast-eligible inner equi-join | Yes | **Disqualifies broadcast pushdown.** `join_requires_exasol_postprocessing` (`crates/lakehouse-engine/src/adapter/pushdown/joins/planning.rs`) treats ANY pushdown `limit` as work Exasol must run over the materialized join, so the adapter falls back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan instead |
+| broadcast-eligible inner equi-join | Yes | **Applied safely; the join stays broadcast.** A bare `LIMIT` becomes a per-shard post-join cap (`JoinSpec::post_join_limit`, `crates/lakehouse-engine/src/scan/spec.rs`) plus an outer `LIMIT` wrapper; a bare-column `ORDER BY` rides an outer wrapper over the broadcast fan-out. Only the surviving forcing conditions — aggregate, `GROUP BY`, group-by-aggregation, `HAVING` — fall back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) plan |
 
 An earlier version of this table, built by diffing `EXPLAIN VIRTUAL` output only, concluded
 the opposite — that no shape converts a declared cap into a pushdown `limit`. That conclusion
@@ -91,10 +91,13 @@ under test, so it was structurally incapable of showing this regardless of which
 captured.
 
 **If you are debugging a capped connection's join plan with
-`scripts/capture-pushdown-payload.sh`, its output will show a broadcast plan regardless of
-the declared cap — it does NOT tell you what a real capped query does to that join.** Confirm
-limit-sensitive join behavior only against a real execution or a direct capture of the
-adapter's incoming request, never against `EXPLAIN VIRTUAL` alone.
+`scripts/capture-pushdown-payload.sh`, its `EXPLAIN VIRTUAL` output never carries the declared
+cap, so it cannot show the per-shard post-join `LIMIT` a real capped query applies to a
+broadcast join.** The broadcast-vs-two-scan plan shape no longer flips on the cap — a bare
+`LIMIT` now stays broadcast — so the captured broadcast shape is accurate, but it omits the
+` LIMIT n` and the per-shard cap. Confirm cap-sensitive join behavior only against a real
+execution or a direct capture of the adapter's incoming request, never against
+`EXPLAIN VIRTUAL` alone.
 
 See `ExaConn::capped_result_sets`'s doc comment
 (`crates/lakehouse-engine/tests/common/exasol_ws.rs`) for the calling convention this

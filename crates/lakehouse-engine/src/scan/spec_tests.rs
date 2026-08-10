@@ -1338,6 +1338,7 @@ fn join_block_round_trips_through_split_and_merge() {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        post_join_limit: None,
         storage: dim_storage.clone(),
     });
 
@@ -1402,6 +1403,42 @@ fn join_block_round_trips_through_split_and_merge() {
     // The struct-level split/merge is equivalent to the JSON round-trip.
     let via_struct = ScanSpec::from_parts(spec.to_common(), spec.files.clone());
     assert_eq!(via_struct, spec);
+}
+
+/// `post_join_limit` is additive-optional: a join block serialized without it —
+/// every one written before the field existed — loads as `None`, and a cap that
+/// IS set survives the common/per-shard split the UDF actually receives.
+#[test]
+fn join_spec_omitting_post_join_limit_deserializes_to_none() {
+    let mut spec = sample_spec();
+    let storage = spec.common.storage.clone();
+    spec.common.join = Some(JoinSpec {
+        table_root: "s3://warehouse/db/dim".into(),
+        files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        post_join_limit: None,
+        storage,
+    });
+
+    let uncapped = serde_json::to_value(spec.common.join.as_ref().unwrap()).unwrap();
+    assert!(
+        uncapped.get("post_join_limit").is_none(),
+        "an absent cap must emit no key at all: {uncapped}"
+    );
+    let back: JoinSpec = serde_json::from_value(uncapped).unwrap();
+    assert_eq!(back.post_join_limit, None);
+
+    spec.common.join.as_mut().unwrap().post_join_limit = Some(7);
+    let round_tripped = ScanSpec::from_parts_json(&spec.to_common_json(), "[]")
+        .expect("the common blob must reconstitute");
+    assert_eq!(
+        round_tripped.common.join.unwrap().post_join_limit,
+        Some(7),
+        "a set cap must survive the common/per-shard split"
+    );
 }
 
 /// The two-argument UDF wire (shard-invariant common blob + per-shard files

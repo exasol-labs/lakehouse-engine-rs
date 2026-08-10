@@ -25,9 +25,10 @@ pub(super) use sql_builders::{
     build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
 
+pub(super) use planning::JoinWindowPlan;
 use planning::{
-    JoinSideResolution, involved_table_columns, join_requires_exasol_postprocessing,
-    resolve_one_join_side, select_broadcast_sides,
+    JoinSideResolution, classify_join_window, involved_table_columns, resolve_one_join_side,
+    select_broadcast_sides,
 };
 use rendering::side_local_filter;
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
@@ -88,9 +89,9 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
 ///
 /// Broadcast is an OPTIMIZATION selected inside this one path — never a second
 /// implementation. It is taken only for a two-table (N = 2) equi-join whose smaller
-/// side fits `join_broadcast_max_bytes`, whose request needs no Exasol
-/// postprocessing (the in-UDF join renders only projection + filter + condition),
-/// and whose bare-name broadcast render succeeds (disjoint column names + renderable
+/// side fits `join_broadcast_max_bytes`, whose request carries no aggregation and no
+/// window the broadcast path cannot serve (`classify_join_window`), and whose
+/// bare-name broadcast render succeeds (disjoint column names + renderable
 /// condition — `render_broadcast_join` returns `Ok(None)` otherwise, a clean
 /// fall-through, never an error). Every other inner join — N ≥ 3, above threshold,
 /// non-equi, overlapping columns, or needing postprocessing — takes the SOLE
@@ -180,25 +181,30 @@ pub(super) async fn plan_join(
     };
 
     // Broadcast eligibility is a PROPERTY of the request, computed here: exactly two
-    // involved tables, a `predicate_equal` condition, and no Exasol postprocessing.
-    // When it holds, size the two sides (smaller = dimension) and take the broadcast
-    // fan-out iff the dimension fits the threshold AND the bare-name render succeeds.
-    // Any miss falls through to the N-scan fallback below — never an error.
+    // involved tables, a `predicate_equal` condition, and a window the broadcast path
+    // can serve. The window is classified BEFORE the sizing and the render, so a
+    // request Exasol must post-process never reaches `render_broadcast_join` — whose
+    // `Err` arm on absent column metadata stays unreachable from here. When
+    // eligibility holds, size the two sides (smaller = dimension) and take the
+    // broadcast fan-out iff the dimension fits the threshold AND the bare-name render
+    // succeeds. Any miss falls through to the N-scan fallback below — never an error.
     let is_equi =
         join.conditions[0].get("type").and_then(|t| t.as_str()) == Some("predicate_equal");
-    if join.tables.len() == 2 && is_equi && !join_requires_exasol_postprocessing(pushdown_req) {
+    let window = classify_join_window(pushdown_req);
+    if join.tables.len() == 2 && is_equi && !matches!(window, JoinWindowPlan::ExasolPostProcessed) {
         let candidate =
             select_broadcast_sides(sides[0].clone(), sides[1].clone(), join_broadcast_max_bytes);
         if candidate.broadcast_eligible
             && let Some(rendered) = render_broadcast_join(request, pushdown_req, join)?
-        {
-            let sql = build_broadcast_join_sql(
+            && let Some(sql) = build_broadcast_join_sql(
                 &candidate,
                 &rendered,
+                window,
                 &tuning,
                 &udf_name,
                 &distribute_udf_name,
-            );
+            )
+        {
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
     }

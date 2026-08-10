@@ -11,9 +11,10 @@ use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
     extract_offset, quote_ident, render_limit_offset, shard_count, strip_table_alias,
 };
-use super::super::topn::parse_sort_flags;
+use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::planning::{
-    DetectedJoin, JoinSides, ResolvedJoinSide, disjoint_schema_guard, involved_table_columns,
+    DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, disjoint_schema_guard,
+    involved_table_columns,
 };
 use super::rendering::{
     column_tables, conjoin_filters, cross_side_residual_filter, declined_only,
@@ -563,6 +564,10 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 /// the broadcast path passes the dimension-side join block, which carries the
 /// dimension's own effective storage in `join.storage` rather than riding in
 /// `primary`'s).
+///
+/// `common.limit` is set to `None` here UNCONDITIONALLY — this helper never puts a
+/// row cap on that field. A post-join cap instead rides inside the `join` block the
+/// caller hands in, as [`JoinSpec::post_join_limit`].
 fn join_fan_out_scan_spec(
     primary: &ResolvedJoinSide,
     projection: Vec<ProjectionItem>,
@@ -663,7 +668,19 @@ pub(super) fn build_side_fan_out_sql(
     )
 }
 
-/// Build the broadcast fan-out scan-driving SQL.
+fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bool {
+    let ParsedSortKey::Column(key) = key else {
+        return false;
+    };
+    projection
+        .iter()
+        .any(|item| matches!(item, ProjectionItem::Column(name) if *name == key.column))
+}
+
+/// Build the broadcast fan-out scan-driving SQL, or `None` when the request's
+/// window leaves the broadcast contract and the caller must fall through to the
+/// N-scan wrapper — the same clean fall-through [`render_broadcast_join`]'s
+/// `Ok(None)` already uses, never an error.
 ///
 /// The fact (larger) side is sharded into G byte-balanced work units exactly as the
 /// single-table path does; the dimension (smaller) side's FULL file list, table
@@ -678,13 +695,44 @@ pub(super) fn build_side_fan_out_sql(
 /// `join.storage`, set below from `dimension.effective_storage`. A vended
 /// credential is scoped to the table it was resolved for, so the two sides' file
 /// lists must never be read through one shared storage value.
+///
+/// `window` decides where the request's row window lands, and it lands only ever
+/// AFTER the node-local join — never on a side's scanned input, for the reason
+/// stated once in [`JoinSpec::post_join_limit`]. An unordered cap composes per
+/// shard, so it rides in the join block AND on the outer merge; an ordered window
+/// is global, so it rides on an outer wrapper with every shard left unbounded.
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
+    window: JoinWindowPlan,
     tuning: &JoinScanTuning,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Option<String> {
+    let (shard_cap, ordering) = match window {
+        JoinWindowPlan::Unbounded => (None, None),
+        JoinWindowPlan::BareLimit(n) => (Some(n), None),
+        JoinWindowPlan::Ordered {
+            keys,
+            limit,
+            offset,
+        } => {
+            // The projection-membership downgrade the classifier structurally cannot
+            // make: no projection exists yet at classification time, and the
+            // wrapper's ORDER BY binds against the fan-out's EMITTED columns — this
+            // path appends no hidden ones, so an unprojected key has nothing to bind
+            // to.
+            if !keys
+                .iter()
+                .all(|key| binds_to_projection(key, &rendered.projection))
+            {
+                return None;
+            }
+            (None, Some((keys, limit, offset)))
+        }
+        JoinWindowPlan::ExasolPostProcessed => return None,
+    };
+
     let fact = &sides.fact;
     let dimension = &sides.dimension;
 
@@ -697,6 +745,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
+        post_join_limit: shard_cap,
         storage: dimension.effective_storage.clone(),
     };
 
@@ -709,18 +758,40 @@ pub(in super::super) fn build_broadcast_join_sql(
         tuning,
     );
 
-    build_scan_driving_sql(
+    let fan_out = build_scan_driving_sql(
         &spec,
         &shards,
         &rendered.projection,
         &rendered.projection_types,
-        None,
+        shard_cap,
         None,
         &[],
         &[],
         udf_name,
         distribute_udf_name,
-    )
+    );
+
+    let Some((keys, limit, offset)) = ordering else {
+        return Some(fan_out);
+    };
+    let wrapped = wrap_declined_order_by(
+        &fan_out,
+        &rendered.projection,
+        rendered.projection.len(),
+        &keys,
+        limit,
+        offset,
+    );
+    // The wrapper returns its input UNCHANGED when no key rendered an ordering. No
+    // upstream `ensure_every_sort_key_renders` supplies that precondition here, and
+    // emitting the bare fan-out would answer an advertised ORDER_BY_COLUMN with
+    // silently unordered rows — so fail loudly, and fall back rather than answer
+    // wrongly in release.
+    debug_assert_ne!(
+        wrapped, fan_out,
+        "an Ordered window must render an ORDER BY"
+    );
+    (wrapped != fan_out).then_some(wrapped)
 }
 
 /// The N-scan wrapper's `GROUP BY` clause (without the keyword), table-qualified.

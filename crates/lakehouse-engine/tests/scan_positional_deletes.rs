@@ -1289,6 +1289,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
+        post_join_limit: None,
         storage: dummy_storage(),
     });
 
@@ -2114,6 +2115,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
+        post_join_limit: None,
         storage: dummy_storage(),
     });
 

@@ -486,6 +486,21 @@ pub struct JoinSpec {
     /// Rendered DataFusion SQL join condition, spliced into the equi-join verbatim.
     pub condition: String,
 
+    /// Row cap applied AFTER the node-local join and its `WHERE`, never to either
+    /// side's scanned input. This asymmetry is the whole point of the field: a cap
+    /// on a side's scan drops rows the join or the filter would have kept, so the
+    /// shard answers with fewer rows than the query has. `None` = no cap.
+    ///
+    /// It lives here rather than on [`CommonScanSpec::limit`] because that field
+    /// caps the SCAN — the wrong stage for a join — and because a spec carrying no
+    /// join block has no post-join stage at all, so there is no field on which such
+    /// a cap could exist. Only an UNORDERED cap is ever pushed: any `n` rows answer
+    /// an unordered `LIMIT n`, so each shard may truncate its own joined output at
+    /// `n` and the merge truncate again at `n`. An ordered window is global and
+    /// rides on the adapter's outer wrapper instead, leaving every shard unbounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_join_limit: Option<u64>,
+
     /// The dimension side's own resolved [`StorageBackend`], distinct from
     /// `common.storage` (the fact side's). Required — see the struct doc.
     pub storage: StorageBackend,
@@ -675,7 +690,9 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
 
-    /// Row limit. None means no LIMIT pushdown.
+    /// Row limit. `None` means no LIMIT pushdown. Not consulted on the join path: a
+    /// join spec's fan-out helper always sets this to `None`, and the join path's
+    /// row cap is [`JoinSpec::post_join_limit`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
 

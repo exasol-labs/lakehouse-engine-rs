@@ -91,15 +91,17 @@ fn undeclared_cap_pushes_no_limit() {
 ///
 /// Scoped deliberately to the DELIVERED row count. A declared cap is not inert on
 /// the adapter exchange — on a real query execution it reaches the adapter as a
-/// pushdown `limit`, which among other things disqualifies broadcast-join
-/// pushdown via `join_requires_exasol_postprocessing`. That effect is invisible
-/// here because `EXPLAIN VIRTUAL` is a separate exchange that never carries a
-/// cap-derived limit, so no assertion in this file could observe it. The proof
-/// lives elsewhere: direct capture of the adapter's incoming request
+/// pushdown `limit`. That effect is invisible here because `EXPLAIN VIRTUAL` is a
+/// separate exchange that never carries a cap-derived limit, so no assertion in
+/// this file could observe it. The proof lives elsewhere: direct capture of the
+/// adapter's incoming request
 /// (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`) for the
-/// limit itself, and `e2e_join_test`'s
-/// `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` for the
-/// plan-shape consequence any pushed limit carries.
+/// limit itself.
+///
+/// A pushed limit is no longer itself a plan-shape consequence: a bare `LIMIT`
+/// stays broadcast-eligible, and only a join request's OTHER forcing conditions
+/// (aggregate, GROUP BY, ORDER BY, HAVING) fall back to the N-scan wrapper — see
+/// `JoinSpec::post_join_limit`.
 #[test]
 fn declared_cap_truncates_returned_row_count() {
     setup_e2e();

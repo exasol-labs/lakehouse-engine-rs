@@ -430,12 +430,12 @@ pub(super) fn extend_projection_with_sort_keys(
 ///
 /// Two guards:
 /// - NO key renders an ordering → `sql` is returned UNCHANGED, because wrapping would
-///   emit an invalid bare `ORDER BY `. Reachable ONLY for an absent or empty
-///   `orderBy`, i.e. an empty `keys`: a NON-EMPTY `orderBy` carrying an
-///   [`ParsedSortKey::Unrenderable`] element never reaches here at all, because
-///   [`ensure_every_sort_key_renders`] declines it upstream (#198). The test stays on
-///   the RENDERED list rather than `keys.len()` so this remains a structural
-///   guarantee and not an assumption about the caller's ordering of the two.
+///   emit an invalid bare `ORDER BY `. Every caller MUST guarantee at least one key
+///   renders: the row-scan caller does so via [`ensure_every_sort_key_renders`]; the
+///   broadcast caller does so via `classify_join_window`'s bare-column gate plus the
+///   construction site's projection-membership downgrade. A caller that violates this
+///   contract gets the unchanged input back, which the broadcast caller checks for
+///   (its `debug_assert_ne!`) rather than silently answering unordered rows.
 /// - `visible_count == 0` → falls back to `SELECT *`, since `SELECT  FROM (…)` is not
 ///   valid SQL. An empty row-scan projection is itself already impossible, so this is
 ///   a structural guard, not a reachable code path.

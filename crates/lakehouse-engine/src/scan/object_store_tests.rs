@@ -50,6 +50,7 @@ fn spec_with_join(dim_root: &str, dim_files: Vec<FileEntry>) -> ScanSpec {
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        post_join_limit: None,
         storage: spec.common.storage.clone(),
     });
     spec
@@ -331,6 +332,7 @@ fn adls_spec_with_join(fact_root: &str, dim_root: &str, cred: AdlsCred) -> ScanS
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        post_join_limit: None,
         storage: spec.common.storage.clone(),
     });
     spec
