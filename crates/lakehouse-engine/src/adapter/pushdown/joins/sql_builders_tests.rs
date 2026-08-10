@@ -1,15 +1,13 @@
 use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
 use super::super::ineligible_join_decline;
-use super::super::planning::{
-    IneligibleJoinReason, JoinShape, detect_join, join_requires_exasol_postprocessing,
-};
+use super::super::planning::{IneligibleJoinReason, JoinShape, classify_join_window, detect_join};
 use super::super::tests::{
     detected_join, equi_condition, join_request, nq3_join_request, resolved_side,
     three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
-use crate::scan::spec::{StorageBackend, StorageProps};
+use crate::scan::spec::{SortKey, StorageBackend, StorageProps};
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
 /// The Q1-shape three-table inner-join pushdown request:
@@ -144,7 +142,7 @@ fn join_outside_contract_declined_safely() {
 /// is not a valid UDF EMITS output (`TIMESTAMP WITH LOCAL TIME ZONE`, sqlCode
 /// 22002). The request carries no aggregate/GROUP BY/ORDER BY/LIMIT/HAVING, so it
 /// genuinely reaches broadcast eligibility live rather than being skipped by
-/// `join_requires_exasol_postprocessing`. The same request with an EMITS-valid
+/// `classify_join_window`. The same request with an EMITS-valid
 /// declared type renders, so the decline is caused by the widening alone.
 #[test]
 fn broadcast_join_declines_widened_projection() {
@@ -154,10 +152,10 @@ fn broadcast_join_declines_widened_projection() {
             {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]},
     ]);
     let pushdown_req = pd(&request);
-    assert!(
-        !join_requires_exasol_postprocessing(&pushdown_req),
-        "the fixture must reach broadcast eligibility, not be skipped upstream"
-    );
+    assert!(matches!(
+        classify_join_window(&pushdown_req),
+        JoinWindowPlan::Unbounded
+    ));
     let detected = detected_join(&request);
 
     // Control: an EMITS-valid declared type does not widen, so broadcast renders.
@@ -1291,10 +1289,10 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
             {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
     ]);
 
-    assert!(
-        join_requires_exasol_postprocessing(&pd(&request)),
-        "an aggregate select list must force the Exasol-executed fallback path"
-    );
+    assert!(matches!(
+        classify_join_window(&pd(&request)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
 
     let detected = detected_join(&request);
     let sides = vec![
@@ -1477,12 +1475,13 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
          "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}},
         {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
     ]);
-    request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10});
+    request["pushdownRequest"]["having"] =
+        serde_json::json!({"type": "literal_bool", "value": true});
 
-    assert!(
-        join_requires_exasol_postprocessing(&pd(&request)),
-        "a LIMIT must force the Exasol-executed N-scan wrapper path"
-    );
+    assert!(matches!(
+        classify_join_window(&pd(&request)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
 
     let detected = detected_join(&request);
     let sides = vec![
@@ -1516,12 +1515,20 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
 #[test]
 fn order_by_over_join_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
+    request["pushdownRequest"]["selectList"] = serde_json::json!([
+        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+    ]);
     request["pushdownRequest"]["orderBy"] = serde_json::json!([
         {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
          "isAscending": true, "nullsLast": false},
     ]);
 
-    assert!(join_requires_exasol_postprocessing(&pd(&request)));
+    // Unprojected key: classifies `Ordered`, but downgrades to the fallback at
+    // construction (see `broadcast_ordered_unprojected_key_downgrades_to_the_fallback`).
+    assert!(matches!(
+        classify_join_window(&pd(&request)),
+        JoinWindowPlan::Ordered { .. }
+    ));
 
     let detected = detected_join(&request);
     let sides = vec![
@@ -1559,7 +1566,10 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
          "isAscending": false, "nullsLast": true},
     ]);
 
-    assert!(join_requires_exasol_postprocessing(&pd(&request)));
+    assert!(matches!(
+        classify_join_window(&pd(&request)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
 
     let detected = detected_join(&request);
     let sides = vec![
@@ -1583,26 +1593,106 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
     );
 }
 
-/// `join_requires_exasol_postprocessing` fires for every clause the broadcast
-/// in-UDF join cannot serve, and is false for a plain projection+filter join.
+/// `classify_join_window` serves the plain, bare-limit, and bare-column-ordered
+/// shapes structurally, and falls through to `ExasolPostProcessed` for every
+/// clause the broadcast in-UDF join cannot render: an OFFSET without an
+/// ORDER BY, an expression sort key, an aggregate select item, a GROUP BY, a
+/// group-by aggregation, and a HAVING.
 #[test]
-fn post_processing_predicate_covers_every_forcing_clause() {
+fn join_window_classification_covers_every_forcing_and_served_shape() {
     let plain = join_request(Json::Null, equi_condition());
-    assert!(!join_requires_exasol_postprocessing(&pd(&plain)));
+    assert!(matches!(
+        classify_join_window(&pd(&plain)),
+        JoinWindowPlan::Unbounded
+    ));
 
     let mut limited = join_request(Json::Null, equi_condition());
     limited["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10});
-    assert!(join_requires_exasol_postprocessing(&pd(&limited)));
+    assert!(matches!(
+        classify_join_window(&pd(&limited)),
+        JoinWindowPlan::BareLimit(10)
+    ));
+
+    let mut offset_without_order = join_request(Json::Null, equi_condition());
+    offset_without_order["pushdownRequest"]["limit"] =
+        serde_json::json!({"numElements": 10, "offset": 5});
+    assert!(matches!(
+        classify_join_window(&pd(&offset_without_order)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
+
+    let mut ordered = join_request(Json::Null, equi_condition());
+    ordered["pushdownRequest"]["orderBy"] = serde_json::json!([
+        {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+         "isAscending": true, "nullsLast": false},
+    ]);
+    assert!(matches!(
+        classify_join_window(&pd(&ordered)),
+        JoinWindowPlan::Ordered { .. }
+    ));
+
+    let mut ordered_by_expression = join_request(Json::Null, equi_condition());
+    ordered_by_expression["pushdownRequest"]["orderBy"] = serde_json::json!([
+        {"expression": {"type": "function_scalar", "name": "UPPER", "arguments": [
+            {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}]},
+         "isAscending": false, "nullsLast": true},
+    ]);
+    assert!(matches!(
+        classify_join_window(&pd(&ordered_by_expression)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
+
+    let mut aggregate_item = join_request(Json::Null, equi_condition());
+    aggregate_item["pushdownRequest"]["selectList"] =
+        serde_json::json!([{"type": "function_aggregate", "name": "COUNT", "arguments": []}]);
+    assert!(matches!(
+        classify_join_window(&pd(&aggregate_item)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
 
     let mut grouped = join_request(Json::Null, equi_condition());
     grouped["pushdownRequest"]["groupBy"] =
         serde_json::json!([{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}]);
-    assert!(join_requires_exasol_postprocessing(&pd(&grouped)));
+    assert!(matches!(
+        classify_join_window(&pd(&grouped)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
+
+    let mut group_by_aggregation = join_request(Json::Null, equi_condition());
+    group_by_aggregation["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+    assert!(matches!(
+        classify_join_window(&pd(&group_by_aggregation)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
 
     let mut having = join_request(Json::Null, equi_condition());
     having["pushdownRequest"]["having"] =
         serde_json::json!({"type": "literal_bool", "value": true});
-    assert!(join_requires_exasol_postprocessing(&pd(&having)));
+    assert!(matches!(
+        classify_join_window(&pd(&having)),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
+}
+
+/// The window is classified from the request BEFORE the broadcast render runs.
+/// That ordering is what keeps `render_broadcast_join`'s hard `Err` on a request
+/// carrying no column metadata unreachable from `plan_join`: the same request
+/// classifies `ExasolPostProcessed` and routes straight to the N-scan fallback.
+#[test]
+fn aggregate_over_join_classifies_before_the_render_that_would_error() {
+    let mut request = join_request(Json::Null, equi_condition());
+    for table in request["involvedTables"].as_array_mut().unwrap() {
+        table["columns"] = serde_json::json!([]);
+    }
+    request["pushdownRequest"]["selectList"] =
+        serde_json::json!([{"type": "function_aggregate", "name": "COUNT", "arguments": []}]);
+    let pushdown_req = pd(&request);
+
+    assert!(matches!(
+        classify_join_window(&pushdown_req),
+        JoinWindowPlan::ExasolPostProcessed
+    ));
+    assert!(render_broadcast_join(&request, &pushdown_req, &detected_join(&request)).is_err());
 }
 
 // -----------------------------------------------------------------------
@@ -1640,8 +1730,15 @@ fn golden_broadcast_join_sql_unchanged() {
         ],
         projection_types: vec!["DECIMAL(20,0)".to_string(), "DATE".to_string()],
     };
-    let actual =
-        build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
+    let actual = build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
         r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"s3":{"endpoint":"http://minio-dim:9000","region":"us-east-2","access_key":"dimadmin","secret_key":"dimadmin","allow_http":true,"path_style":true}}},"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
@@ -1685,7 +1782,15 @@ fn broadcast_carries_each_sides_own_storage() {
         projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
     };
-    let sql = build_broadcast_join_sql(&sides, &rendered, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
+    let sql = build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("an unbounded broadcast join must build");
     let common: serde_json::Value =
         serde_json::from_str(common_arg_literal(&sql)).expect("common blob is valid JSON");
 
@@ -1698,6 +1803,239 @@ fn broadcast_carries_each_sides_own_storage() {
         common["join"]["storage"],
         serde_json::to_value(&dimension.effective_storage).unwrap(),
         "join.storage must be the DIMENSION side's own backend"
+    );
+}
+
+/// The one-file-per-side broadcast fixture the window tests share: LINEITEM (fact)
+/// ⋈ ORDERS (dimension), projecting `L_ORDERKEY` alone. A single fact file means a
+/// single shard, so the fan-out is the from-less scalar call — any ` FROM (` in a
+/// result is therefore the ordering wrapper's and nothing else.
+fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
+    let sides = JoinSides {
+        fact: resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
+        dimension: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
+        broadcast_eligible: true,
+    };
+    let rendered = RenderedJoinPushdown {
+        condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
+        filter: None,
+        projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
+        projection_types: vec!["DECIMAL(20,0)".to_string()],
+    };
+    build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        window,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+}
+
+fn broadcast_common_blob(sql: &str) -> Json {
+    serde_json::from_str(common_arg_literal(sql)).expect("common blob is valid JSON")
+}
+
+fn ascending_key(column: &str) -> ParsedSortKey {
+    ParsedSortKey::Column(SortKey {
+        column: column.to_string(),
+        ascending: true,
+        nulls_last: true,
+    })
+}
+
+/// Every ordered-window test asserts this: an ordered window is global, so nothing
+/// may truncate or sort a shard's own output before the wrapper does.
+fn assert_shards_carry_no_window(sql: &str) {
+    let common = broadcast_common_blob(sql);
+    assert!(
+        common.get("limit").is_none(),
+        "an ordered shard must stay uncapped: {common}"
+    );
+    assert!(
+        common.get("order_by").is_none(),
+        "an ordered shard must stay unsorted: {common}"
+    );
+    assert!(
+        common["join"].get("post_join_limit").is_none(),
+        "an ordered shard must carry no post-join cap: {common}"
+    );
+}
+
+/// A bare `LIMIT n` composes per shard: the cap rides in the join block (applied
+/// AFTER the node-local join) and again on the outer merge, and NOTHING else about
+/// the plan changes — in particular no `common.limit`, which caps the fact side's
+/// SCAN and would drop rows the join would have kept.
+#[test]
+fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
+    let unbounded =
+        broadcast_window_sql(JoinWindowPlan::Unbounded).expect("an unbounded join must build");
+    let capped =
+        broadcast_window_sql(JoinWindowPlan::BareLimit(7)).expect("a bare-limit join must build");
+
+    let common = broadcast_common_blob(&capped);
+    assert_eq!(common["join"]["post_join_limit"], serde_json::json!(7));
+    assert!(
+        common.get("limit").is_none(),
+        "a post-join cap must never become a scan-side limit: {common}"
+    );
+
+    assert!(
+        !unbounded.contains(" FROM ("),
+        "an unordered broadcast plan wraps nothing: {unbounded}"
+    );
+    assert!(
+        !capped.contains(" FROM ("),
+        "a bare-limit broadcast plan wraps nothing: {capped}"
+    );
+
+    let condition = r#""condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")""#;
+    assert_eq!(
+        capped,
+        format!(
+            "{} LIMIT 7",
+            unbounded.replace(condition, &format!("{condition},\"post_join_limit\":7"))
+        ),
+        "a bare cap must change the plan by exactly the join-block key and the merge LIMIT"
+    );
+}
+
+/// An ordered window cannot compose per shard, so the shards stay unbounded and
+/// unsorted and the whole window rides on ONE outer wrapper over the merged fan-out.
+#[test]
+fn broadcast_ordered_wraps_fan_out_and_leaves_shards_unbounded() {
+    let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
+        keys: vec![ascending_key("L_ORDERKEY")],
+        limit: Some(5),
+        offset: 0,
+    })
+    .expect("a projected bare-column ordering stays broadcast-eligible");
+
+    assert!(
+        sql.starts_with(r#"SELECT "L_ORDERKEY" FROM (SELECT SCAN("#),
+        "the wrapper names only the visible columns over the fan-out: {sql}"
+    );
+    assert_shards_carry_no_window(&sql);
+}
+
+/// A bare `ORDER BY` renders the wrapper's ordering and nothing after it.
+#[test]
+fn broadcast_ordered_without_limit_wraps_fan_out_with_no_window() {
+    let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
+        keys: vec![ascending_key("L_ORDERKEY")],
+        limit: None,
+        offset: 0,
+    })
+    .expect("a projected bare-column ordering stays broadcast-eligible");
+
+    assert!(
+        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST"#),
+        "an ORDER BY without a window must end at the ordering: {sql}"
+    );
+    assert_shards_carry_no_window(&sql);
+}
+
+/// The window follows the sort on the wrapper, and reaches no shard: a per-shard
+/// `OFFSET` would skip each shard's OWN first rows.
+#[test]
+fn broadcast_ordered_renders_limit_and_offset_on_the_wrapper_only() {
+    let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
+        keys: vec![ascending_key("L_ORDERKEY")],
+        limit: Some(5),
+        offset: 3,
+    })
+    .expect("a projected bare-column ordering stays broadcast-eligible");
+
+    assert!(
+        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST LIMIT 5 OFFSET 3"#),
+        "the window must render on the wrapper, after the ordering: {sql}"
+    );
+    assert_shards_carry_no_window(&sql);
+}
+
+/// The projection-membership downgrade the classifier structurally cannot make:
+/// the wrapper's `ORDER BY` binds against the fan-out's EMITTED columns, so a key
+/// the projection does not carry has nothing to bind to.
+#[test]
+fn broadcast_ordered_unprojected_key_downgrades_to_the_fallback() {
+    assert!(
+        broadcast_window_sql(JoinWindowPlan::Ordered {
+            keys: vec![ascending_key("O_ORDERDATE")],
+            limit: Some(5),
+            offset: 0,
+        })
+        .is_none(),
+        "an ORDER BY key outside the projection must fall through to the N-scan wrapper"
+    );
+}
+
+/// An `Ordered` plan that renders no `ORDER BY` disagrees with its own variant.
+/// Emitting the unwrapped fan-out would return silently unordered rows under an
+/// advertised `ORDER_BY_COLUMN`, so it is a programming error, not a downgrade.
+#[test]
+#[should_panic(expected = "must render an ORDER BY")]
+fn broadcast_ordered_plan_rendering_no_order_by_is_a_programming_error() {
+    let _ = broadcast_window_sql(JoinWindowPlan::Ordered {
+        keys: Vec::new(),
+        limit: Some(5),
+        offset: 0,
+    });
+}
+
+/// A fallback leg carries NO window and NO join block, for a request that carries a
+/// limit, an offset AND an `orderBy`. The absent join block is what makes a
+/// post-join cap unexpressible on a leg at all: the leg scans one table, so it has
+/// no post-join stage to cap, and the whole window is the outer wrapper's to apply
+/// over the reconstructed join.
+#[test]
+fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
+    let mut request = join_request(Json::Null, equi_condition());
+    request["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 10, "offset": 4});
+    request["pushdownRequest"]["orderBy"] = serde_json::json!([{
+        "type": "order_by_element",
+        "expression": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        "isAscending": true,
+        "nullsLast": false,
+    }]);
+    let sides = vec![
+        resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
+        resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]),
+    ];
+    let sql = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("the two-table unified fallback must build");
+
+    // The UDF argument literals alternate common blob, files; every other one is a
+    // leg's common blob.
+    let legs: Vec<Json> = sql
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .step_by(2)
+        .map(|blob| serde_json::from_str(blob).expect("each leg's common blob is valid JSON"))
+        .collect();
+    assert_eq!(legs.len(), 2, "one common blob per leg: {sql}");
+    for leg in &legs {
+        assert!(leg.get("limit").is_none(), "a leg is never capped: {leg}");
+        assert!(
+            leg.get("order_by").is_none(),
+            "a leg is never sorted: {leg}"
+        );
+        assert!(
+            leg.get("join").is_none(),
+            "a leg carries no join block, so no post-join cap can exist on it: {leg}"
+        );
+    }
+    assert!(
+        sql.ends_with(" LIMIT 10 OFFSET 4"),
+        "the window belongs to the outer wrapper: {sql}"
     );
 }
 

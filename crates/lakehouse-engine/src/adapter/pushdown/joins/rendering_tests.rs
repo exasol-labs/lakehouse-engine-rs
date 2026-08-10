@@ -1,5 +1,5 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinSides, disjoint_schema_guard};
+use super::super::planning::{JoinSides, JoinWindowPlan, disjoint_schema_guard};
 use super::super::sql_builders::{
     JoinScanTuning, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
     build_side_fan_out_sql, render_broadcast_join,
@@ -1095,7 +1095,15 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_broadcast_join_sql(&sides, &rendered, &tuning, "SCAN", "DISTRIBUTE");
+    let sql = build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &tuning,
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("an unbounded broadcast join must build");
 
     assert!(
         !sql.contains("SELECT * FROM ("),

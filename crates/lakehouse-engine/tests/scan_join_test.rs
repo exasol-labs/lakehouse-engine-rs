@@ -179,6 +179,36 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
+/// Write a fact fixture whose FIRST two rows match no dimension row (custkey 999)
+/// and whose remaining three rows each match a distinct customer. Distinguishes a
+/// post-join cap (applied to the JOINED output) from a pre-join cap (applied to the
+/// fact scan before the join runs): with `post_join_limit = 2`, a post-join cap
+/// truncates the 3 matching joined rows to 2, while a pre-join cap would instead
+/// truncate the fact scan to its first 2 (unmatched) rows and emit zero.
+fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int64, false),
+        Field::new("o_custkey", DataType::Int64, false),
+        Field::new("o_totalprice", DataType::Float64, false),
+    ]));
+    let path = dir.join("orders_leading_unmatched.parquet");
+    let file = std::fs::File::create(&path).expect("create orders parquet");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])),
+            // Rows 1-2: custkey 999 matches no customer. Rows 3-5: match 10/20/30.
+            Arc::new(Int64Array::from(vec![999i64, 999, 10, 20, 30])),
+            Arc::new(Float64Array::from(vec![100.0, 200.0, 300.0, 400.0, 500.0])),
+        ],
+    )
+    .expect("orders batch");
+    writer.write(&batch).expect("write orders");
+    writer.close().expect("close orders");
+    sized(file_url(&path))
+}
+
 /// An S3 backend reaching `endpoint` and carrying `secret` as its secret key —
 /// the two fields a test tells one side's store, and one side's redaction set,
 /// from the other's by. Path-style (the `StorageProps` default) is what makes a
@@ -219,7 +249,6 @@ fn join_spec(
         common: CommonScanSpec {
             projection: projection.into_iter().map(Into::into).collect(),
             filter: filter.map(Into::into),
-            limit,
             join: Some(JoinSpec {
                 table_root: String::new(),
                 files: dim_files.into_iter().map(FileEntry::from).collect(),
@@ -227,6 +256,7 @@ fn join_spec(
                 name_mapping: Vec::new(),
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+                post_join_limit: limit,
                 storage: dim_storage(),
             }),
             storage: storage(),
@@ -433,6 +463,63 @@ fn join_projection_filter_limit_streamed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Scenario: LIMIT bounds the JOINED output, never the scanned input.
+///
+/// The fact fixture's FIRST two rows match no dimension row; its remaining three
+/// rows each match a distinct customer. With `post_join_limit = 2`, the correct
+/// (post-join) cap truncates the 3 matching joined rows to exactly 2. A pre-join
+/// cap would instead truncate the fact scan to its first 2 rows — both unmatched —
+/// and emit zero. The physical plan additionally carries no `fetch` below the
+/// `HashJoinExec` on either input, confirming DataFusion did not turn the rendered
+/// post-join `LIMIT` into a cap on either side's scan.
+#[test]
+fn join_limit_bounds_joined_output_not_scanned_input() {
+    let dir = std::env::temp_dir().join(format!("lh_join_limit_bound_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders_leading_unmatched(&dir);
+    let customer = write_customer(&dir);
+
+    let spec = join_spec(
+        vec![orders],
+        vec![customer],
+        vec!["O_ORDERKEY", "C_NAME"],
+        None,
+        Some(2),
+    );
+
+    let batches = run_join(&spec);
+    assert_eq!(
+        total_rows(&batches),
+        2,
+        "a post-join cap truncates the 3 matching joined rows to 2; a pre-join cap \
+         would instead truncate the fact scan to its first 2 (unmatched) rows and \
+         emit zero"
+    );
+
+    let plan = block_on(async {
+        let session = SessionContext::new_with_config(session_config_for_spec(&spec));
+        build_join_physical_plan(&session, &spec)
+            .await
+            .expect("physical plan must build")
+    });
+    let hash_join = find_hash_join(&plan).expect("plan must contain a HashJoinExec");
+    let hj_any: &dyn Any = hash_join.as_ref();
+    let hj = hj_any
+        .downcast_ref::<HashJoinExec>()
+        .expect("downcast HashJoinExec");
+
+    assert!(
+        has_no_fetch_below(hj.left()),
+        "the post-join cap must not appear as a fetch on the dimension input"
+    );
+    assert!(
+        has_no_fetch_below(hj.right()),
+        "the post-join cap must not appear as a fetch on the fact input"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scenario: The bounded dimension side is the hash-join build side.
 ///
 /// The physical plan's `HashJoinExec` builds its hash table from the LEFT child.
@@ -503,6 +590,13 @@ fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
         }
     }
     None
+}
+
+/// True if no node in `plan`'s subtree carries a `fetch` (a `LIMIT`/`TopK` window,
+/// or a limit pushed down into a scan). Used to confirm a post-join `LIMIT` never
+/// turns into a cap on either join input.
+fn has_no_fetch_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.fetch().is_none() && plan.children().into_iter().all(has_no_fetch_below)
 }
 
 /// Scenario: Scan reports a clear error when an assigned join file is unreadable.
@@ -653,6 +747,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                 name_mapping: Vec::new(),
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+                post_join_limit: None,
                 storage: s3_backend(&dim_endpoint, "DIMSECRETVALUE"),
             }),
             storage: s3_backend(&fact_endpoint, "TOPSECRETVALUE"),

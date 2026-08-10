@@ -100,20 +100,50 @@ fn vs_supplier_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
 }
 
+/// Fetch a 2-column `(C_NAME, O_ORDERDATE)` join query's rows in the exact order
+/// Exasol returned them — unlike `fetch_join_rows`/`columns_to_sorted_pairs`, which
+/// sort for order-independent multiset comparison, an `ORDER BY` test needs the
+/// query's own row order preserved to assert against.
+fn fetch_join_rows_in_query_order(conn: &mut ExaConn, query_sql: &str) -> Vec<(String, String)> {
+    let cols = conn.query_columns(query_sql);
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 result columns, got {}: {cols:?}",
+        cols.len()
+    );
+    cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(name, date)| (value_to_string(name), value_to_string(date)))
+        .collect()
+}
+
+/// Ground truth for `ORDER BY O_ORDERDATE DESC` over the join: the same rows
+/// `expected_join_rows` computes independently of the join pushdown, re-ordered by
+/// `O_ORDERDATE` descending. Dates are one calendar day apart per order key in this
+/// fixture (`seed::order_date_days`), so there are no ties to break and a plain
+/// string sort on the ISO `YYYY-MM-DD` text matches chronological order.
+fn expected_join_rows_by_orderdate_desc(
+    conn: &mut ExaConn,
+    vs_name: &str,
+) -> Vec<(String, String)> {
+    let mut rows = expected_join_rows(conn, vs_name);
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    rows
+}
+
 // ---------------------------------------------------------------------------
 // 5.4  Broadcast join: single scan-UDF-driving shape + correct result
 // ---------------------------------------------------------------------------
 
 // Both tests below run on `exa_conn()`'s default connection, which declares NO row
-// cap — load-bearing, not incidental. On a REAL query execution a declared
-// `resultSetMaxRows` cap arrives at the adapter as a pushdown `limit` (confirmed by
-// capturing the adapter's incoming request directly; `EXPLAIN VIRTUAL` is a separate
-// exchange that never carries it, so it cannot observe this), and
-// `join_requires_exasol_postprocessing` disqualifies the broadcast plan whenever ANY
-// limit is present. Declaring a cap here would silently move both the shape and the
-// correctness assertion onto the two-scan fallback path.
-// `e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan` below proves that
-// disqualification directly, via a SQL `LIMIT` that `EXPLAIN VIRTUAL` does show.
+// cap (`exasol_ws.rs:98`, `result_set_max_rows: 0` — uncapped since #314). That is
+// no longer load-bearing the way it once was: a bare SQL `LIMIT` no longer
+// disqualifies the broadcast plan, so a declared cap would not silently move either
+// the shape or the correctness assertion below onto the two-scan fallback path.
+// `e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates` below pins that a
+// bare `LIMIT` now stays broadcast.
 
 /// EXPLAIN VIRTUAL of a broadcast-eligible inner equi-join shows the SINGLE
 /// scan-UDF-driving broadcast fan-out (matching the plan's first Manual Testing
@@ -163,20 +193,19 @@ fn e2e_broadcast_join_result_correct() {
 }
 
 // ---------------------------------------------------------------------------
-// Any pushed limit disqualifies broadcast
+// A bare LIMIT or a bare-column ORDER BY over a broadcast-eligible join now
+// STAYS broadcast (issue #307): the classifier forces the two-scan fallback
+// only for the genuinely Exasol-postprocessed shapes below it.
 // ---------------------------------------------------------------------------
 
-/// An explicit SQL `LIMIT` on the otherwise broadcast-eligible join of
-/// `e2e_broadcast_join_pushdown_shape` disqualifies the broadcast plan:
-/// `join_requires_exasol_postprocessing` treats ANY pushdown limit as work Exasol
-/// must run over the materialized join, so the adapter emits the two-scan
-/// `LHS_T0`/`LHS_T1` fallback instead. A SQL `LIMIT` is the fully observable form
-/// of that mechanism — a declared `resultSetMaxRows` cap reaches the adapter as
-/// the same pushdown `limit` on a real execution, but only direct request capture
-/// can see that (`EXPLAIN VIRTUAL` never carries it), which is why the two tests
-/// above must not declare a cap.
+/// A bare SQL `LIMIT` over the otherwise broadcast-eligible join of
+/// `e2e_broadcast_join_pushdown_shape` no longer disqualifies the broadcast plan:
+/// each fact shard caps its own joined output at `n` before the outer merge
+/// truncates to `n` again, so EXPLAIN VIRTUAL still shows the single scan-UDF
+/// broadcast fan-out, and the query returns exactly `n` rows, each one of the
+/// unbounded join's rows.
 #[test]
-fn e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan() {
+fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -187,16 +216,187 @@ fn e2e_broadcast_declined_by_explicit_limit_falls_back_to_n_scan() {
     assert!(
         pushed.contains("\"numElements\""),
         "the SQL LIMIT must reach the adapter as a pushdown limit, else this test \
-         proves nothing about limit-driven disqualification:\n{pushed}"
+         proves nothing about the bare-LIMIT broadcast shape:\n{pushed}"
     );
     assert!(
+        has_broadcast_join_block(&pushed),
+        "a bare LIMIT must still drive the broadcast fan-out (one scan UDF, \
+         common-blob join block):\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a bare LIMIT must NOT force the two-scan Exasol-joined fallback \
+         (LHS_T0/LHS_T1):\n{pushed}"
+    );
+
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+    let unbounded = expected_join_rows(&mut conn, VS_NAME);
+    assert_eq!(
+        actual.len(),
+        LIMIT_ROWS,
+        "LIMIT {LIMIT_ROWS} must truncate to exactly {LIMIT_ROWS} rows: {actual:?}"
+    );
+    for row in &actual {
+        assert!(
+            unbounded.contains(row),
+            "truncated row {row:?} must be one of the unbounded join's rows: \
+             {unbounded:?}"
+        );
+    }
+}
+
+/// An `ORDER BY … LIMIT` over the same join is served by an outer wrapper over
+/// the broadcast fan-out: EXPLAIN VIRTUAL still shows the broadcast join block,
+/// and the result is the exact top-N rows of the join ordered by `O_ORDERDATE`
+/// descending — computed independently, without the window, as the
+/// single-node-equivalent ground truth.
+#[test]
+fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    const TOP_N: usize = 3;
+    let query = format!(
+        "{} ORDER BY o.O_ORDERDATE DESC LIMIT {TOP_N}",
+        join_query(VS_NAME)
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "ORDER BY ... LIMIT must still drive the broadcast fan-out (one scan \
+         UDF, common-blob join block):\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "ORDER BY ... LIMIT must NOT force the two-scan Exasol-joined fallback \
+         (LHS_T0/LHS_T1):\n{pushed}"
+    );
+
+    let actual = fetch_join_rows_in_query_order(&mut conn, &query);
+    let expected: Vec<(String, String)> = expected_join_rows_by_orderdate_desc(&mut conn, VS_NAME)
+        .into_iter()
+        .take(TOP_N)
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "ORDER BY O_ORDERDATE DESC LIMIT {TOP_N} must return the exact top-{TOP_N} \
+         rows of the unwindowed ordered join.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// Two more ordered shapes stay broadcast: a bare `ORDER BY` with NO `LIMIT`
+/// (the full join, ordered), and `ORDER BY … LIMIT … OFFSET` (an exact offset
+/// window). The offset arm is the one shape where Exasol's grammar rule tying
+/// `OFFSET` to a preceding `ORDER BY` is load-bearing — the `OFFSET` this query
+/// carries is only legal SQL because the `ORDER BY` precedes it — so it is run
+/// against the live database rather than inspected as a SQL string only.
+#[test]
+fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let unlimited_query = format!("{} ORDER BY o.O_ORDERDATE DESC", join_query(VS_NAME));
+    let pushed = explain_virtual_sql(&mut conn, &unlimited_query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "a bare ORDER BY (no LIMIT) must still drive the broadcast fan-out:\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a bare ORDER BY (no LIMIT) must NOT force the two-scan fallback:\n{pushed}"
+    );
+
+    let actual_unlimited = fetch_join_rows_in_query_order(&mut conn, &unlimited_query);
+    let expected_ordered = expected_join_rows_by_orderdate_desc(&mut conn, VS_NAME);
+    assert_eq!(
+        actual_unlimited, expected_ordered,
+        "a bare ORDER BY (no LIMIT) must return the full join, ordered by \
+         O_ORDERDATE DESC.\nactual:   {actual_unlimited:?}\nexpected: {expected_ordered:?}"
+    );
+
+    const WINDOW_LIMIT: usize = 5;
+    const WINDOW_OFFSET: usize = 3;
+    let windowed_query = format!(
+        "{} ORDER BY o.O_ORDERDATE DESC LIMIT {WINDOW_LIMIT} OFFSET {WINDOW_OFFSET}",
+        join_query(VS_NAME)
+    );
+    let pushed = explain_virtual_sql(&mut conn, &windowed_query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "ORDER BY ... LIMIT ... OFFSET ... must still drive the broadcast \
+         fan-out:\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "ORDER BY ... LIMIT ... OFFSET ... must NOT force the two-scan \
+         fallback:\n{pushed}"
+    );
+
+    let actual_windowed = fetch_join_rows_in_query_order(&mut conn, &windowed_query);
+    let expected_windowed: Vec<(String, String)> = expected_ordered
+        .into_iter()
+        .skip(WINDOW_OFFSET)
+        .take(WINDOW_LIMIT)
+        .collect();
+    assert!(
+        !expected_windowed.is_empty(),
+        "the offset window must be non-empty, else this test proves nothing \
+         about the exact window"
+    );
+    assert_eq!(
+        actual_windowed, expected_windowed,
+        "ORDER BY O_ORDERDATE DESC LIMIT {WINDOW_LIMIT} OFFSET {WINDOW_OFFSET} must \
+         return the exact offset window of the unwindowed ordered join.\n\
+         actual:   {actual_windowed:?}\nexpected: {expected_windowed:?}"
+    );
+}
+
+/// Two shapes still fall back to the two-scan wrapper. An aggregate over the
+/// join is unrelated to this plan's classification change (already pinned by
+/// `e2e_aggregate_over_join_uses_two_scan_wrapper`; reasserted here alongside
+/// the offset arm as one "still falls back" group). A `LIMIT … OFFSET` with NO
+/// `ORDER BY` never reaches the adapter at all: Exasol's grammar rejects an
+/// `OFFSET` with no preceding `ORDER BY` (`sqlCode 42000`, "OFFSET not allowed
+/// in LIMIT without ORDER BY") before the query is ever parsed into a pushdown
+/// request — the offset-implies-ordering invariant this plan's ordered arm
+/// relies on. It can therefore never become broadcast-eligible, exactly as the
+/// pre-existing two-scan-only aggregate arm never did.
+#[test]
+fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let offset_without_order_by = format!("{} LIMIT 3 OFFSET 2", join_query(VS_NAME));
+    let resp = conn.try_execute(&offset_without_order_by);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "LIMIT ... OFFSET ... with no ORDER BY must be rejected by Exasol itself \
+         (the adapter is never consulted), got: {resp}"
+    );
+    assert_eq!(
+        resp["exception"]["sqlCode"].as_str(),
+        Some("42000"),
+        "expected sqlCode 42000, got: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("OFFSET") && msg.contains("ORDER BY"),
+        "expected Exasol's 'OFFSET not allowed in LIMIT without ORDER BY' \
+         message, got: {msg}"
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &aggregate_join_query(VS_NAME));
+    assert!(
         has_two_scan_wrapper(&pushed),
-        "an explicit LIMIT must disqualify the broadcast plan and fall back to the \
-         two-scan wrapper (LHS_T0/LHS_T1):\n{pushed}"
+        "an aggregate over a join must still fall back to the two-scan wrapper \
+         (LHS_T0/LHS_T1):\n{pushed}"
     );
     assert!(
         !has_broadcast_join_block(&pushed),
-        "a limited join must NOT carry a broadcast common-blob join block:\n{pushed}"
+        "an aggregate over a join must NOT carry a broadcast common-blob join \
+         block:\n{pushed}"
     );
 }
 

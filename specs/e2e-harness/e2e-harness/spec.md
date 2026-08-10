@@ -21,17 +21,7 @@ scenarios.
 * The provisioning helpers (SLC install, `.so` upload, script and Virtual Schema creation)
   are defined once in a shared `common/e2e_harness` module and reused by every E2E binary;
   per-binary variation is passed as explicit parameters.
-* The harness sends Exasol's own `resultSetMaxRows` default (`0`, no limit) unless a call
-  site declares a cap. A declared cap is NOT merely a result-delivery choice: on a real query
-  execution it reaches the adapter as a `pushdownRequest` `limit`, for every statement shape
-  measured. `EXPLAIN VIRTUAL` can never show this — it is a separate exchange from a real
-  query's pushdown request, so its echo cannot carry a limit only the real statement gained.
-  This is exactly why the harness's default matters for join tests specifically: a
-  broadcast-eligible inner equi-join disqualifies broadcast pushdown under ANY pushed limit
-  (`join_requires_exasol_postprocessing`), so a capped connection silently moves a join test
-  onto the unaccelerated two-scan fallback with no `EXPLAIN VIRTUAL`-visible sign that it
-  happened. The measured shape matrix, the per-shape adapter behavior, and the
-  `EXPLAIN VIRTUAL` blind spot are recorded in `docs/debugging-pushdown.md`.
+* The harness sends Exasol's own `resultSetMaxRows` default (`0`, no limit) unless a call site declares a cap, and that uncapped default is kept so a plan-shape test is never silently perturbed by an undeclared row cap. A declared cap is NOT merely a result-delivery choice: on a real query execution it reaches the adapter as a `pushdownRequest` `limit`, for every statement shape measured. `EXPLAIN VIRTUAL` can never show this — it is a separate exchange from a real statement's pushdown request, so its echo cannot carry a limit only the real statement gained. Since issue #307 a pushed `limit` no longer disqualifies broadcast: a bare `LIMIT` and a bare-projected-column `ORDER BY` over a broadcast-eligible inner equi-join both stay on the broadcast path. Only the four surviving forcing conditions — an aggregate select item, a non-empty `GROUP BY`, `aggregationType = "group_by"`, or a non-null `HAVING` — plus a `limit` offset with no `orderBy` and an unrenderable or unprojected sort key still move a join onto the unaccelerated two-scan fallback (`vs-adapter/pushdown-planning-join`), with no `EXPLAIN VIRTUAL`-visible sign that it happened. The measured shape matrix, the per-shape adapter behavior, and the `EXPLAIN VIRTUAL` blind spot are recorded in `docs/debugging-pushdown.md`.
 * The harness reads a result set to completion. A result set larger than one `fetch`
   response is retrieved across successive fetches, never truncated to the first response.
 

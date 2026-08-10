@@ -701,7 +701,9 @@ fn grouped_all_agg_kinds_matches_golden() {
 // filterless request and for a request whose filter renders cleanly — the
 // only two cases the fix is required to leave unchanged.
 
-use super::joins::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
+use super::joins::{
+    JoinScanTuning, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
+};
 
 /// A minimal CUSTOMER ⋈ ORDERS inner equi-join pushdown request (disjoint
 /// column names, a broadcast-eligible shape), with an optional WHERE filter —
@@ -844,10 +846,12 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,
+        JoinWindowPlan::Unbounded,
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-    );
+    )
+    .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
@@ -914,10 +918,12 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let broadcast_sql = build_broadcast_join_sql(
         &sides,
         &rendered,
+        JoinWindowPlan::Unbounded,
         &join_scan_tuning(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
-    );
+    )
+    .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
         include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")

@@ -4,7 +4,8 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::super::file_resolution::resolve_file_list;
-use super::super::support::{column_types, extract_limit, order_by_present};
+use super::super::support::{column_types, extract_limit, extract_offset};
+use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use lakehouse_catalog::CatalogSession;
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
@@ -422,14 +423,11 @@ pub(super) fn disjoint_schema_guard(left: &[(String, String)], right: &[(String,
     !right.iter().any(|(n, _)| left_names.contains(n.as_str()))
 }
 
-/// Whether a join pushdown request carries work Exasol must execute over the
-/// materialized two-scan join rather than inside the broadcast in-UDF join: an
-/// aggregate (single-group or grouped), a GROUP BY, an ORDER BY, a LIMIT, or a
-/// HAVING. The broadcast path renders only projection + filter + join condition, so
-/// any of these routes the join to the qualified two-scan fallback (which renders
-/// them as ordinary Exasol SQL over the join), reproducing pre-`JOIN`-capability
-/// behavior exactly.
-pub(super) fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
+/// Whether a join pushdown request carries an aggregation Exasol must execute over
+/// the materialized two-scan join: an aggregate select item, a GROUP BY, a group-by
+/// aggregation, or a HAVING. The broadcast in-UDF join renders only projection,
+/// filter, and join condition, so none of these can ride along with it.
+fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
     let has_aggregate_item = pushdown_req
         .get("selectList")
         .and_then(|v| v.as_array())
@@ -447,12 +445,81 @@ pub(super) fn join_requires_exasol_postprocessing(pushdown_req: &Json) -> bool {
         .get("having")
         .filter(|h| !h.is_null())
         .is_some();
-    has_aggregate_item
-        || has_group_by
-        || is_group_by_aggregation
-        || has_having
-        || order_by_present(pushdown_req)
-        || extract_limit(pushdown_req).is_some()
+    has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
+}
+
+/// What a join pushdown request's window clauses oblige the broadcast path to
+/// render, and the single decision on whether that path may be taken at all.
+///
+/// [`Self::ExasolPostProcessed`] is a fall-through to the qualified two-scan
+/// fallback, which renders every one of these clauses as ordinary Exasol SQL over
+/// the materialized join — never an error.
+#[derive(Debug)]
+pub(in super::super) enum JoinWindowPlan {
+    /// No `limit` and no `orderBy`: the broadcast fan-out is the whole answer.
+    Unbounded,
+    /// A `limit` with no ordering, so the cap composes per shard: each shard may
+    /// truncate its own joined output at `n` and the merge truncate again at `n`.
+    BareLimit(u64),
+    /// A bare-column ordering, served by an outer wrapper over the merged fan-out.
+    /// The window rides on that wrapper, never per shard: a per-shard `OFFSET`
+    /// would skip each shard's OWN first rows.
+    Ordered {
+        keys: Vec<ParsedSortKey>,
+        limit: Option<u64>,
+        offset: u64,
+    },
+    /// Exasol executes the request's remaining work over the two-scan join.
+    ExasolPostProcessed,
+}
+
+/// Classify what the broadcast join path would have to render for `pushdown_req`,
+/// from the REQUEST alone.
+///
+/// Whether the rendered projection can bind an `Ordered` key is deliberately NOT
+/// decided here: no projection exists yet at classification time, and rendering one
+/// first would reverse `plan_join`'s short-circuit — an aggregate-carrying join
+/// would then reach a render that can hard-`Err` on absent column metadata. The
+/// construction site owns that one downgrade instead.
+pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
+    if carries_aggregation_clause(pushdown_req) {
+        return JoinWindowPlan::ExasolPostProcessed;
+    }
+    let limit = extract_limit(pushdown_req);
+    let offset = extract_offset(pushdown_req);
+    let Some(order_by) = pushdown_req
+        .get("orderBy")
+        .and_then(|v| v.as_array())
+        .filter(|elements| !elements.is_empty())
+    else {
+        // Without an ordering there is no wrapper to carry an OFFSET — Exasol's
+        // grammar rejects one without an ORDER BY, and a per-shard offset does not
+        // compose — so only a bare cap survives here.
+        if offset != 0 {
+            return JoinWindowPlan::ExasolPostProcessed;
+        }
+        return match limit {
+            Some(n) => JoinWindowPlan::BareLimit(n),
+            None => JoinWindowPlan::Unbounded,
+        };
+    };
+
+    let mut keys = Vec::with_capacity(order_by.len());
+    for element in order_by {
+        // The wrapper binds its ORDER BY against the fan-out's emitted columns and
+        // this path appends no hidden ones, so only a flagged bare column is
+        // servable; an expression, an aggregate, or a missing direction / NULL
+        // placement flag falls back rather than guessing an order.
+        let Some(key) = parse_sort_key_element(element) else {
+            return JoinWindowPlan::ExasolPostProcessed;
+        };
+        keys.push(ParsedSortKey::Column(key));
+    }
+    JoinWindowPlan::Ordered {
+        keys,
+        limit,
+        offset,
+    }
 }
 
 #[cfg(test)]

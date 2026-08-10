@@ -144,13 +144,11 @@ impl ExaConn {
     /// Declares a row cap that truncates the delivered result set at the statement level.
     ///
     /// NOT inert on the adapter exchange: on a real query execution a declared cap reaches the
-    /// adapter as a pushdown `limit` (confirmed by directly capturing the adapter's incoming
-    /// request — `EXPLAIN VIRTUAL` is a separate exchange that never carries a cap-derived limit,
-    /// so it cannot observe this; a blind spot in the capture tooling, not in the adapter). A
-    /// pushed limit can change the chosen plan: `join_requires_exasol_postprocessing`
-    /// disqualifies broadcast-join pushdown whenever any limit is present. The adapter does
-    /// withhold it from underneath an aggregate (outer `LIMIT` only, no scan-spec limit), so
-    /// aggregate values stay correct under a cap.
+    /// adapter as a pushdown `limit` (confirmed live by #314 — directly capturing the adapter's
+    /// incoming request; `EXPLAIN VIRTUAL` is a separate exchange that never carries a
+    /// cap-derived limit, so it cannot observe this — a blind spot in the capture tooling, not
+    /// in the adapter). The adapter still withholds it from underneath an aggregate (outer
+    /// `LIMIT` only, no scan-spec limit), so aggregate values stay correct under a cap.
     ///
     /// Declare a cap only for a test whose assertion is about result-set truncation at
     /// row-delivery time, or for `e2e_capture_pushdown`'s `CAPTURE_RESULT_SET_MAX_ROWS`
