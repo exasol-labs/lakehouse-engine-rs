@@ -391,7 +391,7 @@ pub(super) async fn resolve_one_join_side(
 /// is forbidden by `walk_column_nodes`' doc comment and by
 /// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
 /// column-collecting walk" scenario. The two sides agree not by construction but by
-/// premise — `resolve_table_schema` Unicode-uppercases every name it declares, so no
+/// premise — `build_listing_virtual_tables` (`adapter/mod.rs`) Unicode-uppercases every name it declares, so no
 /// LOWERCASE name reaches either side. Non-ASCII letters can still reach both sides
 /// (e.g. `über` uppercases to `ÜBER`, not to an ASCII form); the folds still agree
 /// there because `to_ascii_uppercase` only touches ASCII `a`-`z`, none of which

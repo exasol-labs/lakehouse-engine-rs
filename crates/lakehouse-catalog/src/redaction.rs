@@ -33,6 +33,9 @@ pub fn redact_credentials(s: &str) -> String {
         "access_key",
         "secret_key",
         "session_token",
+        // Unity Catalog vended GCP token + OAuth M2M client secret
+        "oauth_token",
+        "client_secret",
         // Iceberg REST vended credential config keys
         "s3.access-key-id",
         "s3.secret-access-key",

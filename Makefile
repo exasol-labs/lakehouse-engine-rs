@@ -222,4 +222,31 @@ lint-install:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install
+# Native Unity Catalog + Delta fixture harness (spike #325 — gates #318-#322).
+# Brings up MinIO + Unity Catalog OSS via the docker-compose.unity.yml overlay,
+# then seeds the vendored Delta fixtures (deletion vector + column mapping) onto
+# MinIO and registers them in Unity Catalog. FAILS (not skips) if the stack or
+# seed cannot come up. `exasol` is included so the UDF can reach the
+# `unitycatalog` service name over the docker network (extra_hosts loop in the
+# overlay).
+#   Read path proven by the spike: UC resolve -> UC vend static creds ->
+#   delta-kernel-rs reads from MinIO with a CLIENT-SIDE endpoint override
+#   (UC OSS has no S3-endpoint config, upstream #43). See SPIKE_UC_DELTA_HARNESS.md.
+unity-up:
+	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
+	  minio exasol unitycatalog
+	docker compose -f docker-compose.yml up -d minio-init
+	./scripts/unity/seed.sh
+
+unity-down:
+	docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
+
+# Native Unity Catalog E2E — brings up the #325 harness then runs the UC
+# createVirtualSchema listing suite. Mirrors test-e2e: the .so is rebuilt if
+# stale, and the suite FAILS (not skips) when the stack is unavailable. All
+# tests share one VS, so the binary runs serially (--test-threads=1).
+test-e2e-unity: cross-musl-udf-build
+	$(MAKE) unity-up
+	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
+
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity

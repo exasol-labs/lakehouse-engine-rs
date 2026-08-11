@@ -173,6 +173,27 @@ impl StorageBackend {
     }
 }
 
+/// The storage-backend KIND a vended table location's URI scheme selects — the
+/// single scheme-to-variant-kind classification both vended selectors share. It
+/// names ONLY which kind the scheme selects and constructs no [`StorageBackend`],
+/// so each vended selector builds its own variant from its own credential family.
+pub(crate) enum VendedBackendKind {
+    S3,
+    Adls,
+}
+
+/// Classify a vended table location's (already-lowercased) URI scheme into the
+/// storage-backend kind it selects, or `None` when the scheme names no supported
+/// backend: `s3`/`s3a` select S3 and `abfs`/`abfss` select ADLS, in this one home
+/// rather than duplicated across the vended selectors.
+pub(crate) fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> {
+    match scheme {
+        "s3" | "s3a" => Some(VendedBackendKind::S3),
+        "abfs" | "abfss" => Some(VendedBackendKind::Adls),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;

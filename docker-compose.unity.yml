@@ -1,0 +1,90 @@
+# Unity Catalog (native) + Delta E2E overlay — layered ON TOP of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
+#     minio exasol unitycatalog
+#   ./scripts/unity/seed.sh          # upload Delta fixtures + register them in UC
+#
+# Adds a native Unity Catalog OSS server (the SECOND catalog kind in the
+# `native-unity-catalog-delta` milestone) backed by the base stack's MinIO,
+# serving Delta Lake tables (the SECOND table format). It REUSES the base
+# `minio` and `exasol` services; the only base service this overlay overrides
+# is `exasol`, and only to extend its /etc/hosts loop so the UDF can resolve
+# the new `unitycatalog` service name (same mechanism as the Lakekeeper overlay).
+#
+# --- What this stack exposes (consumed by the seed script + the future Rust
+#     harness — keep in sync with scripts/unity/seed.sh and tests/common) -------
+#   UC server (UDF-side) ...... http://unitycatalog:8080
+#   UC server (host-side) ..... http://localhost:${LH_UNITY_PORT:-18080}
+#   Auth ...................... DISABLED (UC OSS default; no token needed locally)
+#   REST base ................. /api/2.1/unity-catalog
+#   Catalog / schema .......... unity / delta_e2e            (created by seed.sh)
+#   MinIO warehouse bucket .... warehouse                    (created by base minio-init)
+#   Credential vending ........ static MinIO keys for s3://warehouse (server.properties)
+#
+# CREDENTIAL-VENDING CAVEAT (spike #325 / SPIKE_UC_DELTA_HARNESS.md):
+#   UC OSS 0.5.x has NO S3 endpoint-override config (upstream issue #43), so the
+#   `temporary-table-credentials` response carries the vended access-key/secret
+#   but NOT the MinIO endpoint. The CLIENT (our engine's ObjectStore) must inject
+#   the MinIO endpoint itself — exactly the per-side storage-routing seam already
+#   built for issue #294. The vended keys here are the static MinIO admin keys.
+#
+# Host port is env-overridable (matching the base file's convention):
+#   Unity Catalog 8080 -> ${LH_UNITY_PORT:-18080}
+
+services:
+  unitycatalog:
+    # Pinned rationale mirrors the base iceberg-rest pin: an unpinned tag on a
+    # core E2E dependency is a silent-CI-break risk. 0.5.0 is the current UC OSS
+    # server line. NOTE: the image is large (~5.7 GB, bundles a JDK); the CI
+    # e2e-setup free-disk step already accounts for heavy images.
+    image: "${LH_UNITY_IMAGE:-unitycatalog/unitycatalog:latest}"
+    depends_on:
+      minio:
+        condition: service_healthy
+    # The server reads etc/conf/server.properties on boot. The image's workdir is
+    # /home/unitycatalog (NOT /opt/unitycatalog as some docs state — verified by
+    # the spike), and it ships NO server.properties by default, so this mount is
+    # what turns on S3 credential vending for the `warehouse` bucket.
+    volumes:
+      - ./scripts/unity/server.properties:/home/unitycatalog/etc/conf/server.properties:ro
+    # Alpine/busybox image: no curl, but wget is present. A 2xx on the catalogs
+    # endpoint proves the REST server is actually serving, not merely that the
+    # port is open.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O /dev/null http://localhost:8080/api/2.1/unity-catalog/catalogs || exit 1",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+    ports:
+      - "${LH_UNITY_PORT:-18080}:8080"
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.50
+
+  # OVERRIDE of the base `exasol` service — extends it, does not replace it.
+  # Exasol's exaconf rewrites /etc/hosts on startup, so the static-host loop in
+  # the entrypoint is the only channel by which the in-UDF DataFusion/catalog
+  # client resolves a docker-network service name. The base entrypoint injects
+  # minio + iceberg-rest; this overlay's UDF must also reach `unitycatalog`, so
+  # the loop is re-declared here to inject all three (each checked independently).
+  exasol:
+    extra_hosts:
+      - "unitycatalog:10.84.0.50"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        ( while true; do
+            if [ -f /etc/hosts ]; then
+              grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 minio\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])unitycatalog([[:space:]]|$)' /etc/hosts || printf '10.84.0.50 unitycatalog\n' >> /etc/hosts
+            fi
+            sleep 2
+          done ) &
+        exec "$(ls /opt/exasol/cos-*/docker/entrypoint.sh | head -1)" init-sc

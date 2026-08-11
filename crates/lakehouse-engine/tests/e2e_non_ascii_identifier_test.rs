@@ -1,6 +1,6 @@
 //! Permanent E2E coverage for a non-ASCII (`ß`) Iceberg table and column name,
 //! added by `refactor-col-types-guard-dedup` task 7 after a live capture (task 3)
-//! showed `resolve_table_schema` uppercases `straße` to `STRASSE` (Rust's full-Unicode
+//! showed `build_listing_virtual_tables` uppercases `straße` to `STRASSE` (Rust's full-Unicode
 //! `to_uppercase` expands `ß` to `SS`) before Exasol ever sees the name — so the
 //! real-world risk worth guarding is "does a non-ASCII-named table/column work at
 //! all", not a fold-divergence the same capture proved unreachable (see task 4).

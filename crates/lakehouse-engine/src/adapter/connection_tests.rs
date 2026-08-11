@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::catalog_kind::CatalogKind;
 use exasol_udf_sdk::connect_back::ConnectionObject;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
@@ -66,7 +67,7 @@ fn minimal_password() -> String {
 #[test]
 fn read_connection_parses_uri_and_creds() {
     let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 
     assert_eq!(resolved.uri, "http://catalog.example.com");
     assert_eq!(resolved.creds.warehouse, "wh");
@@ -89,14 +90,14 @@ fn read_connection_parses_uri_and_creds() {
 fn missing_connection_name_errors() {
     let ctx = StubCtx::no_conn();
 
-    let err_none = read_connection(&ctx, None).unwrap_err();
+    let err_none = read_connection(&ctx, None, CatalogKind::IcebergRest).unwrap_err();
     assert!(
         err_none
             .to_string()
             .contains("CATALOG_CONNECTION is required")
     );
 
-    let err_empty = read_connection(&ctx, Some("")).unwrap_err();
+    let err_empty = read_connection(&ctx, Some(""), CatalogKind::IcebergRest).unwrap_err();
     assert!(
         err_empty
             .to_string()
@@ -116,7 +117,7 @@ fn missing_connection_name_errors() {
 fn malformed_password_no_leak() {
     let bad_password = "not-json-at-all SECRET_VALUE_HERE";
     let ctx = StubCtx::with_conn("http://catalog.example.com", bad_password);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
 
     // Error must say it's not a valid JSON object
     assert!(err.to_string().contains("not a valid JSON object"));
@@ -130,7 +131,7 @@ fn json_array_password_no_leak() {
     // Valid JSON but not an object (array) — should also be rejected
     let array_password = r#"["SECRET_IN_ARRAY", "OTHER_VAL"]"#;
     let ctx = StubCtx::with_conn("http://catalog.example.com", array_password);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
 
     assert!(err.to_string().contains("not a valid JSON object"));
     assert!(!err.to_string().contains("SECRET_IN_ARRAY"));
@@ -150,7 +151,7 @@ fn missing_warehouse_rejected_s3_not_required() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &no_warehouse);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
 
     let msg = err.to_string();
     assert!(
@@ -174,7 +175,7 @@ fn warehouse_only_password_accepted_s3_optional() {
     // fields default to empty (orthogonality + over-strictness fix).
     let partial = serde_json::json!({ "warehouse": "wh" }).to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &partial);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     assert_eq!(creds.warehouse, "wh");
@@ -191,7 +192,7 @@ fn legacy_full_static_s3_password_still_accepted() {
     // Backward-compat guard: a legacy full static-S3 password (warehouse + the
     // four S3 fields) validates and parses identically to before.
     let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     assert_eq!(creds.warehouse, "wh");
@@ -212,7 +213,7 @@ fn legacy_full_static_s3_password_still_accepted() {
 fn optional_fields_default() {
     let warehouse_only = serde_json::json!({ "warehouse": "wh" }).to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &warehouse_only);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     // The four S3 fields default to empty when not supplied.
@@ -257,7 +258,7 @@ fn optional_fields_set_when_supplied() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     assert_eq!(creds.session_token.as_deref(), Some("STS_TOKEN"));
@@ -273,7 +274,7 @@ fn optional_fields_set_when_supplied() {
 #[test]
 fn storage_block_maps_creds_to_storage_props() {
     let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let StorageBackend::S3(storage) = storage_block(&resolved.creds, false) else {
         panic!("S3 creds must select the S3 backend")
     };
@@ -306,7 +307,7 @@ fn account_key_creds_select_the_adls_backend() {
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
 
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 
     assert_eq!(resolved.creds.account_name.as_deref(), Some("myaccount"));
     assert_eq!(
@@ -335,7 +336,7 @@ fn sas_token_creds_select_the_adls_backend() {
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
 
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 
     assert_eq!(resolved.creds.sas_token.as_deref(), Some(AZURE_SAS));
     assert_eq!(resolved.creds.account_key, None);
@@ -375,7 +376,7 @@ fn azure_creds_require_account_name_and_exactly_one_credential() {
     for (password, expected_defect) in shapes {
         let ctx = StubCtx::with_conn("http://catalog.example.com", &password.to_string());
 
-        let err = read_connection(&ctx, Some("MY_CONN"))
+        let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
             .expect_err("a malformed Azure credential set must be rejected")
             .to_string();
 
@@ -403,7 +404,7 @@ fn mixed_azure_and_s3_credential_fields_are_rejected() {
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
 
-    let err = read_connection(&ctx, Some("MY_CONN"))
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect_err("a CONNECTION mixing Azure and S3 credential fields must be rejected")
         .to_string();
 
@@ -433,7 +434,7 @@ fn absent_optional_fields_default_and_still_select_s3() {
         .to_string();
         let ctx = StubCtx::with_conn("http://catalog.example.com", &password);
 
-        let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+        let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 
         assert_eq!(resolved.creds.account_name, None);
         assert_eq!(resolved.creds.account_key, None);
@@ -464,7 +465,7 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &s3_password);
-    let resolved = read_connection(&ctx, Some("MY_CONN"))
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect("a single S3 credential set together with vending must be accepted");
     assert!(resolved.creds.use_vended_credentials);
     assert_eq!(resolved.creds.secret_key, S3_SECRET);
@@ -477,7 +478,7 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &azure_password);
-    let resolved = read_connection(&ctx, Some("MY_CONN"))
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect("a single Azure credential set together with vending must be accepted");
     assert!(resolved.creds.use_vended_credentials);
     assert_eq!(
@@ -496,7 +497,7 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &mixed_password);
-    let err = read_connection(&ctx, Some("MY_CONN"))
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect_err("mixed Azure and S3 credential fields must still be rejected under vending")
         .to_string();
     assert!(
@@ -516,7 +517,7 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &sigv4_password);
-    let err = read_connection(&ctx, Some("MY_CONN"))
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect_err("a missing access_key under SigV4 must still be rejected under vending")
         .to_string();
     assert!(err.contains("access_key"), "must name missing field: {err}");
@@ -556,7 +557,7 @@ fn storage_block_falls_through_to_s3_for_an_unvalidated_azure_shape() {
 #[test]
 fn catalog_block_maps_creds_to_catalog_props() {
     let ctx = StubCtx::with_conn("http://catalog.example.com", &minimal_password());
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let catalog = catalog_block(&resolved.creds, "db.my_table");
 
     assert_eq!(resolved.uri, "http://catalog.example.com");
@@ -744,7 +745,7 @@ fn s3_fields_optional_when_not_sigv4() {
     // No S3 fields, no auth fields — just warehouse.
     let pw = serde_json::json!({ "warehouse": "wh" }).to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     assert_eq!(creds.warehouse, "wh");
@@ -761,7 +762,7 @@ fn s3_fields_optional_when_not_sigv4() {
     })
     .to_string();
     let ctx2 = StubCtx::with_conn("http://catalog.example.com", &pw_with_token);
-    read_connection(&ctx2, Some("MY_CONN")).unwrap();
+    read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 }
 
 /// When SigV4 is enabled, access_key, secret_key, and region are required.
@@ -790,7 +791,7 @@ fn sigv4_requires_access_secret_region() {
         "region": "us-east-1"
     }));
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("access_key"), "must name missing field: {msg}");
     assert!(
@@ -805,7 +806,7 @@ fn sigv4_requires_access_secret_region() {
         "region": "us-east-1"
     }));
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("secret_key"), "must name missing field: {msg}");
     assert!(
@@ -820,7 +821,7 @@ fn sigv4_requires_access_secret_region() {
         "secret_key": "s3cr3t-VALUE"
     }));
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("region"), "must name missing field: {msg}");
     assert!(
@@ -840,7 +841,7 @@ fn sigv4_requires_access_secret_region() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("region"),
@@ -860,7 +861,7 @@ fn sigv4_requires_access_secret_region() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    read_connection(&ctx, Some("MY_CONN"))
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect("endpoint is optional under SigV4; must not be rejected");
 }
 
@@ -876,7 +877,7 @@ fn token_exposed_on_creds() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     // Token is exposed on the struct.
@@ -912,7 +913,7 @@ fn oauth_client_creds_exposed_on_creds() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let resolved = read_connection(&ctx, Some("MY_CONN")).unwrap();
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds = &resolved.creds;
 
     assert_eq!(creds.client_id.as_deref(), Some("my-client-id"));
@@ -943,7 +944,7 @@ fn oauth_client_creds_exposed_on_creds() {
     })
     .to_string();
     let ctx2 = StubCtx::with_conn("http://catalog.example.com", &pw2);
-    let resolved2 = read_connection(&ctx2, Some("MY_CONN")).unwrap();
+    let resolved2 = read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
     let creds2 = &resolved2.creds;
 
     assert_eq!(
@@ -966,7 +967,7 @@ fn incomplete_oauth_rejected_no_leak() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("client_secret"),
@@ -982,7 +983,7 @@ fn incomplete_oauth_rejected_no_leak() {
     })
     .to_string();
     let ctx2 = StubCtx::with_conn("http://catalog.example.com", &pw2);
-    let err2 = read_connection(&ctx2, Some("MY_CONN")).unwrap_err();
+    let err2 = read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg2 = err2.to_string();
     assert!(
         msg2.contains("client_id"),
@@ -1012,7 +1013,7 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
     })
     .to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &pw_sigv4_token);
-    let err = read_connection(&ctx, Some("MY_CONN")).unwrap_err();
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("sigv4"),
@@ -1040,7 +1041,7 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
     })
     .to_string();
     let ctx2 = StubCtx::with_conn("http://catalog.example.com", &pw_sigv4_oauth);
-    let err2 = read_connection(&ctx2, Some("MY_CONN")).unwrap_err();
+    let err2 = read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
     let msg2 = err2.to_string();
     assert!(
         msg2.to_lowercase().contains("sigv4"),
@@ -1055,4 +1056,160 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
         !msg2.contains("s3cr3t-VALUE"),
         "must not leak secret_key: {msg2}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: unity_kind_validation_skips_warehouse_and_rejects_sigv4
+// ---------------------------------------------------------------------------
+
+/// Under the Unity Catalog kind `warehouse` is not required and enabling AWS
+/// SigV4 signing is rejected as not a Unity Catalog authentication mode.
+#[test]
+fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
+    // No warehouse, yet a valid Unity CONNECTION: accepted under the Unity kind.
+    let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &no_warehouse);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
+        .expect("a Unity Catalog CONNECTION without warehouse must be accepted");
+    assert_eq!(
+        resolved.creds.warehouse, "",
+        "warehouse stays empty and is not required under the Unity kind"
+    );
+
+    // SigV4 is rejected even when its own required fields are absent: the error
+    // must name the Unity-mode conflict, not the generic missing-field message.
+    let sigv4 = serde_json::json!({
+        "use_sigv4": true,
+        "secret_key": "SUPERSECRET"
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &sigv4);
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
+        .expect_err("SigV4 signing must be rejected under the Unity kind");
+    let msg = err.to_string();
+    assert!(msg.contains("SigV4"), "must name SigV4 signing: {msg}");
+    assert!(
+        msg.contains("Unity Catalog"),
+        "must state SigV4 is not a Unity Catalog authentication mode: {msg}"
+    );
+    assert!(
+        !msg.contains("access_key"),
+        "must be the Unity-mode rejection, not the generic SigV4 missing-field error: {msg}"
+    );
+    assert!(
+        !msg.contains("SUPERSECRET"),
+        "must not leak any supplied credential value: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: iceberg_kind_validation_still_requires_warehouse
+// ---------------------------------------------------------------------------
+
+/// Under the default Iceberg REST kind the missing-`warehouse` error is
+/// byte-identical to the pre-feature message.
+#[test]
+fn iceberg_kind_validation_still_requires_warehouse() {
+    let no_warehouse = serde_json::json!({
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1"
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &no_warehouse);
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect_err("Iceberg REST still requires warehouse");
+    assert_eq!(
+        err.to_string(),
+        "CONNECTION 'MY_CONN' password is missing required field: warehouse"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: validation_is_parameterized_by_catalog_kind
+// ---------------------------------------------------------------------------
+
+/// The identical CONNECTION validates differently by kind: the warehouse
+/// requirement and the SigV4 rule both flip on the `CatalogKind` argument.
+#[test]
+fn validation_is_parameterized_by_catalog_kind() {
+    // No warehouse: rejected under Iceberg REST, accepted under Unity Catalog.
+    let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &no_warehouse);
+    assert!(
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).is_err(),
+        "missing warehouse is rejected under Iceberg REST"
+    );
+    assert!(
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative).is_ok(),
+        "missing warehouse is accepted under Unity Catalog"
+    );
+
+    // A well-formed SigV4 set: accepted under Iceberg REST, rejected under Unity.
+    let sigv4 = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1"
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &sigv4);
+    assert!(
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).is_ok(),
+        "a complete SigV4 set is accepted under Iceberg REST"
+    );
+    assert!(
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative).is_err(),
+        "SigV4 is rejected under Unity Catalog"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: unity_connection_reuses_existing_auth_fields
+// ---------------------------------------------------------------------------
+
+/// A Unity CONNECTION carries auth through the SAME fields Iceberg REST uses —
+/// no new credential field — and a no-auth Unity CONNECTION is accepted.
+#[test]
+fn unity_connection_reuses_existing_auth_fields() {
+    // OAuth client credentials via the existing fields, no warehouse.
+    let oauth = serde_json::json!({
+        "client_id": "my-client-id",
+        "client_secret": "my-client-secret",
+        "oauth2_server_uri": "https://auth.example.com/token",
+        "scope": "catalog:read"
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &oauth);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
+        .expect("a Unity CONNECTION with OAuth client credentials must be accepted");
+    let creds = &resolved.creds;
+    assert_eq!(creds.client_id.as_deref(), Some("my-client-id"));
+    assert_eq!(creds.client_secret.as_deref(), Some("my-client-secret"));
+    assert_eq!(
+        creds.oauth2_server_uri.as_deref(),
+        Some("https://auth.example.com/token")
+    );
+    assert_eq!(creds.scope.as_deref(), Some("catalog:read"));
+    let debug = format!("{creds:?}");
+    assert!(
+        !debug.contains("my-client-secret"),
+        "client_secret must not leak through Debug: {debug}"
+    );
+
+    // A static bearer token via the existing `token` field, no warehouse.
+    let bearer = serde_json::json!({ "token": "my-secret-token" }).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &bearer);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
+        .expect("a Unity CONNECTION with a bearer token must be accepted");
+    assert_eq!(resolved.creds.token.as_deref(), Some("my-secret-token"));
+
+    // OSS Unity Catalog runs with authentication disabled: none supplied.
+    let no_auth = serde_json::json!({}).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &no_auth);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::UnityCatalogNative)
+        .expect("a Unity CONNECTION with no auth fields must be accepted");
+    assert_eq!(resolved.creds.token, None);
+    assert_eq!(resolved.creds.client_id, None);
+    assert_eq!(resolved.creds.client_secret, None);
 }

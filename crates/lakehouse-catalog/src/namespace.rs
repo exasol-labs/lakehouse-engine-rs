@@ -45,7 +45,10 @@ pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), Ud
 ///
 /// The configured namespace is passed as split segments (e.g. `["prod","finance"]`).
 /// Credentials NEVER appear in returned errors.
-pub async fn list_namespace_tables(
+///
+/// Crate-private: `IcebergRestCatalogClient::list_tables` is its only caller — the
+/// engine reaches enumeration through the `CatalogClient` trait, not this function.
+pub(crate) async fn list_namespace_tables(
     catalog_uri: &str,
     configured_ns: &[String],
     storage: &StorageBackend,

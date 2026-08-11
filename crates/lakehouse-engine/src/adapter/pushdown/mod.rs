@@ -32,8 +32,8 @@ pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 use lakehouse_catalog::{CatalogSession, parse_table_ident};
 
 mod file_resolution;
+pub use file_resolution::resolve_file_list;
 use file_resolution::{empty_result_sql, encode_initial_default, relativize_shards_to_root};
-pub use file_resolution::{resolve_file_list, resolve_table_schema};
 
 mod topn;
 use topn::{detect_topn, parse_order_by_keys};

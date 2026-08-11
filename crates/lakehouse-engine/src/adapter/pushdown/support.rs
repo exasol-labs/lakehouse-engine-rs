@@ -676,8 +676,8 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
 /// scan. `involved_table_columns` applies that same Unicode fold to its own keys, so this
 /// lookup's fold matches both builders' output for any column name — not a claim that the
 /// two builders' lists are the same vector, which they are not (they differ by table
-/// selection). Separately, `resolve_table_schema` Unicode-uppercases names before declaring
-/// them, so no LOWERCASE name ever reaches this lookup — a premise guarded by
+/// selection). Separately, `build_listing_virtual_tables` (`adapter/mod.rs`) Unicode-uppercases names
+/// before declaring them, so no LOWERCASE name ever reaches this lookup — a premise guarded by
 /// `non_ascii_table_and_column_stay_queryable`. Non-ASCII letters can still reach it (e.g.
 /// `über` uppercases to `ÜBER`, not to an ASCII form); `to_uppercase` is idempotent, so the
 /// name is already a fixed point regardless of whether it happens to be ASCII. `None` means

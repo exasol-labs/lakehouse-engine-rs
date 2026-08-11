@@ -1,6 +1,7 @@
 use super::*;
 use arrow::datatypes::DataType;
 use iceberg::spec::{PrimitiveType, Type};
+use lakehouse_catalog::ColumnSourceType;
 
 /// Scenario: Compatible Arrow types map to their Exasol type
 #[test]
@@ -751,4 +752,93 @@ fn classify_exa_type_matches_pushdown_guard_predicates() {
 
     assert_eq!(classify_exa_type("TIMESTAMP"), ExaTypeClass::Other);
     assert_eq!(classify_exa_type("DOUBLE PRECISION"), ExaTypeClass::Other);
+}
+
+/// Scenario: Both an Iceberg-sourced and a Unity-sourced column map through the
+/// single `ColumnSourceType` match
+#[test]
+fn column_source_type_maps_to_exasol_in_one_home() {
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Iceberg(Type::Primitive(
+            PrimitiveType::Long
+        ))),
+        "DECIMAL(20,0)"
+    );
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "LONG".to_string(),
+            precision: 0,
+            scale: 0,
+        }),
+        "DECIMAL(20,0)"
+    );
+}
+
+/// Scenario: Unity Catalog Spark column types map to Exasol types
+#[test]
+fn unity_spark_types_map_to_exasol() {
+    let cases = [
+        ("BOOLEAN", 0, 0, "BOOLEAN"),
+        ("BYTE", 0, 0, "DECIMAL(3,0)"),
+        ("SHORT", 0, 0, "DECIMAL(5,0)"),
+        ("INT", 0, 0, "DECIMAL(10,0)"),
+        ("LONG", 0, 0, "DECIMAL(20,0)"),
+        ("FLOAT", 0, 0, "DOUBLE PRECISION"),
+        ("DOUBLE", 0, 0, "DOUBLE PRECISION"),
+        ("STRING", 0, 0, "VARCHAR(2000000)"),
+        ("DATE", 0, 0, "DATE"),
+        ("TIMESTAMP", 0, 0, "TIMESTAMP"),
+        ("TIMESTAMP_NTZ", 0, 0, "TIMESTAMP"),
+        ("DECIMAL", 10, 2, "DECIMAL(10,2)"),
+        ("DECIMAL", 36, 36, "DECIMAL(36,36)"),
+    ];
+    for (type_name, precision, scale, expected) in cases {
+        let source = ColumnSourceType::Unity {
+            type_name: type_name.to_string(),
+            precision,
+            scale,
+        };
+        assert_eq!(
+            column_source_type_to_exasol(&source),
+            expected,
+            "type_name={type_name} precision={precision} scale={scale}"
+        );
+    }
+}
+
+/// Scenario: An incompatible Unity Catalog column type and an out-of-range
+/// DECIMAL both fall back to VARCHAR
+#[test]
+fn incompatible_unity_types_declared_varchar() {
+    for type_name in ["ARRAY", "MAP", "STRUCT", "BINARY", "INTERVAL", "VARIANT"] {
+        let source = ColumnSourceType::Unity {
+            type_name: type_name.to_string(),
+            precision: 0,
+            scale: 0,
+        };
+        assert_eq!(
+            column_source_type_to_exasol(&source),
+            "VARCHAR(2000000)",
+            "type_name={type_name}"
+        );
+    }
+
+    // precision > 36
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "DECIMAL".to_string(),
+            precision: 38,
+            scale: 10,
+        }),
+        "VARCHAR(2000000)"
+    );
+    // scale > 36
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "DECIMAL".to_string(),
+            precision: 18,
+            scale: 37,
+        }),
+        "VARCHAR(2000000)"
+    );
 }

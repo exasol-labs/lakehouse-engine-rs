@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.32.5"
+version = "0.33.0"
 edition = "2024"
 license.workspace = true
 
@@ -16,6 +16,9 @@ cloud-e2e = []
 lakekeeper-e2e = []
 # Requires the Azure (ADLS Gen2) static-credential stack; same FAIL contract as exasol-e2e.
 azure-e2e = []
+# Requires a live Exasol + MinIO + Unity Catalog OSS stack (docker-compose.unity.yml,
+# `make unity-up`); same FAIL contract as exasol-e2e.
+unity-e2e = []
 
 [dependencies]
 exasol-udf-sdk    = { version = "0.21.0", features = ["emit-arrow"] }

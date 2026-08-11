@@ -4958,8 +4958,8 @@ fn string_fn_guard_resolves_case_mismatched_column_name() {
 /// that no builder in this codebase produces.
 ///
 /// `STRAßE` is a CONSTRUCTED literal, not a name Exasol delivers: this crate
-/// uppercases every Iceberg field name itself before declaring it
-/// (`resolve_table_schema`, `file_resolution.rs:640`) and the full-Unicode fold maps
+/// uppercases every field name itself before declaring it
+/// (`build_listing_virtual_tables`, `adapter/mod.rs`) and the full-Unicode fold maps
 /// `ß` to `SS`, so a real `straße` column reaches this lookup as `STRASSE`. The
 /// `ascii_folded` list below is likewise constructed, used here solely because Rust's
 /// two folds disagree on `STRAßE`, which is what makes the miss assertion falsifiable.
