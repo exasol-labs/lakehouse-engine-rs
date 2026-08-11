@@ -222,4 +222,25 @@ lint-install:
 bench: cross-musl-udf-build
 	./bench/run.sh
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install
+# Native Unity Catalog + Delta fixture harness (spike #325 — gates #318-#322).
+# Brings up MinIO + Unity Catalog OSS via the docker-compose.unity.yml overlay,
+# then seeds the vendored Delta fixtures (deletion vector + column mapping) onto
+# MinIO and registers them in Unity Catalog. FAILS (not skips) if the stack or
+# seed cannot come up. `exasol` is included so the UDF can later reach the
+# `unitycatalog` service name over the docker network (extra_hosts loop in the
+# overlay). The per-step cargo E2E target (`test-e2e-unity`) is added by #318
+# once the native UC client + Delta scan path exists; this target is the
+# fixture-harness entry point those tests build on.
+#   Read path proven by the spike: UC resolve -> UC vend static creds ->
+#   delta-kernel-rs reads from MinIO with a CLIENT-SIDE endpoint override
+#   (UC OSS has no S3-endpoint config, upstream #43). See SPIKE_UC_DELTA_HARNESS.md.
+unity-up:
+	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
+	  minio exasol unitycatalog
+	docker compose -f docker-compose.yml up -d minio-init
+	./scripts/unity/seed.sh
+
+unity-down:
+	docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
+
+.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down
