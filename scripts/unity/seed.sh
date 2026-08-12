@@ -3,8 +3,10 @@
 #   1. upload every vendored Delta fixture table to MinIO (bucket `warehouse`)
 #   2. register them in Unity Catalog as EXTERNAL Delta tables
 #
-# Idempotent: safe to re-run. Fail-loud: any step that fails aborts non-zero
-# (the E2E contract is FAIL, not skip, when the fixture cannot be provisioned).
+# Convergent: re-running replaces every table registration from the manifest, so a
+# manifest/fixture change never leaves a stale registration behind. Fail-loud: any
+# step that fails aborts non-zero (the E2E contract is FAIL, not skip, when the
+# fixture cannot be provisioned).
 #
 # Fixtures are prebuilt delta-kernel-rs test tables (see fixtures/PROVENANCE.md)
 # because delta-rs cannot WRITE deletion vectors or column mapping — the two
@@ -123,12 +125,43 @@ def post(path, body):
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
 
+def delete(path):
+    req=urllib.request.Request(BASE+path, method="DELETE")
+    try:
+        with urllib.request.urlopen(req) as r: return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+def error_code(txt):
+    try: return json.loads(txt).get("error_code","")
+    except (ValueError, AttributeError): return ""
+
+# Catalog and schema carry no per-fixture payload, so an existing one is a correct
+# end state. Accept the typed already-exists error_code, not a substring of an
+# arbitrary body. Unity Catalog OSS v0.5.0 returns HTTP 400 with error_code
+# CATALOG_ALREADY_EXISTS / SCHEMA_ALREADY_EXISTS on re-create (verified live against
+# the pinned image — it is 400, not 409, so match the code, not the status).
 def ensure(label, path, body):
     code, txt = post(path, body)
-    if code==200 or "already exists" in txt:
+    if code==200 or error_code(txt).endswith("_ALREADY_EXISTS"):
         print(f"  ok: {label} ({code})")
     else:
         raise SystemExit(f"ERROR seeding {label} -> HTTP {code}: {txt}")
+
+# A table registration carries the full per-fixture payload (table_type,
+# data_source_format, storage_location, columns[]), so an existing one can be stale
+# after a manifest/fixture change. Delete then create: the registration is metadata
+# only (the fixture files in the bucket are untouched), so a re-create is cheap and
+# always converges. DELETE returns 200 (removed) or 404 TABLE_NOT_FOUND (absent);
+# both are acceptable, anything else aborts.
+def replace_table(label, name, body):
+    dcode, dtxt = delete(f"/tables/{CAT}.{SCH}.{name}")
+    if dcode not in (200, 404):
+        raise SystemExit(f"ERROR clearing {label} -> HTTP {dcode}: {dtxt}")
+    code, txt = post("/tables", body)
+    if code!=200:
+        raise SystemExit(f"ERROR seeding {label} -> HTTP {code}: {txt}")
+    print(f"  ok: {label} ({code})")
 
 # UC does not persist its default `unity` sample catalog across a container
 # recreate, so create it explicitly rather than assuming it exists (spike).
@@ -139,7 +172,7 @@ for name, fixture_dir, cols in TABLES:
             "data_source_format":"DELTA",
             "storage_location":f"s3://warehouse/{PFX}/{fixture_dir}",
             "columns":[col(i,c,t,p) for i,(c,t,p) in enumerate(cols)]}
-    ensure(f"table {name}", "/tables", body)
+    replace_table(f"table {name}", name, body)
 
 # List what we registered.
 with urllib.request.urlopen(f"{BASE}/tables?catalog_name={CAT}&schema_name={SCH}") as r:
