@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 
 /// A client serving fixed metadata whose identifiers are built from the
 /// namespace segments it was handed, so a test can observe what the trait passed
-/// through. Stands in for both catalog kinds: it returns one Iceberg-sourced
-/// table and one Unity-sourced view.
+/// through. Stands in for both catalog kinds: it lists one Iceberg-sourced and
+/// one Unity-sourced base table, plus one skipped entry per `SkipReason`
+/// variant. Every listed shape is one a production client can produce — no
+/// client puts a non-`Table` entry in `tables`.
 struct FixedCatalogClient;
 
 impl FixedCatalogClient {
@@ -34,14 +36,14 @@ impl FixedCatalogClient {
         }
     }
 
-    fn unity_view(namespace: Vec<String>) -> CatalogTable {
+    fn unity_delta_table(namespace: Vec<String>) -> CatalogTable {
         CatalogTable {
             ident: CatalogTableIdent {
                 namespace,
-                name: "orders_summary".to_string(),
+                name: "payments".to_string(),
             },
-            table_type: CatalogTableType::View,
-            storage_location: None,
+            table_type: CatalogTableType::Table,
+            storage_location: Some("s3://warehouse/payments".to_string()),
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
                 source_type: ColumnSourceType::Unity {
@@ -66,12 +68,26 @@ impl CatalogClient for FixedCatalogClient {
             Ok(CatalogListing {
                 tables: vec![
                     Self::iceberg_table(namespace.clone()),
-                    Self::unity_view(namespace.clone()),
+                    Self::unity_delta_table(namespace.clone()),
                 ],
-                skipped: vec![CatalogTableIdent {
-                    namespace,
-                    name: "not_a_table".to_string(),
-                }],
+                skipped: vec![
+                    SkippedTable {
+                        ident: CatalogTableIdent {
+                            namespace: namespace.clone(),
+                            name: "not_a_table".to_string(),
+                        },
+                        reason: SkipReason::NotLoadableIcebergTable,
+                    },
+                    SkippedTable {
+                        ident: CatalogTableIdent {
+                            namespace,
+                            name: "orders_summary".to_string(),
+                        },
+                        reason: SkipReason::NotDeltaBaseTable {
+                            detail: "table_type=VIEW".to_string(),
+                        },
+                    },
+                ],
             })
         })
     }
@@ -94,7 +110,7 @@ fn boxed_client() -> Box<dyn CatalogClient> {
 }
 
 #[tokio::test]
-async fn boxed_client_lists_neutral_tables_and_skipped_identifiers() {
+async fn boxed_client_lists_neutral_tables_and_skipped_entries_with_reasons() {
     let client = boxed_client();
 
     let listing = client
@@ -108,14 +124,28 @@ async fn boxed_client_lists_neutral_tables_and_skipped_identifiers() {
             .iter()
             .map(|table| table.ident.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["orders", "orders_summary"]
+        vec!["orders", "payments"]
     );
     assert_eq!(
         listing.skipped,
-        vec![CatalogTableIdent {
-            namespace: vec!["prod".to_string()],
-            name: "not_a_table".to_string(),
-        }]
+        vec![
+            SkippedTable {
+                ident: CatalogTableIdent {
+                    namespace: vec!["prod".to_string()],
+                    name: "not_a_table".to_string(),
+                },
+                reason: SkipReason::NotLoadableIcebergTable,
+            },
+            SkippedTable {
+                ident: CatalogTableIdent {
+                    namespace: vec!["prod".to_string()],
+                    name: "orders_summary".to_string(),
+                },
+                reason: SkipReason::NotDeltaBaseTable {
+                    detail: "table_type=VIEW".to_string(),
+                },
+            },
+        ]
     );
 }
 
@@ -196,29 +226,6 @@ async fn a_unity_decimal_column_carries_its_precision_and_scale() {
         } => assert_eq!((type_name.as_str(), *precision, *scale), ("DECIMAL", 10, 2)),
         ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
     }
-}
-
-#[tokio::test]
-async fn a_listed_view_carries_columns_and_no_storage_location() {
-    let listing = boxed_client()
-        .list_tables(&["prod".to_string()])
-        .await
-        .expect("listing failed");
-
-    let view = listing
-        .tables
-        .iter()
-        .find(|table| table.table_type == CatalogTableType::View)
-        .expect("no view listed");
-
-    assert_eq!(view.storage_location, None);
-    assert_eq!(
-        view.columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["total"]
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -487,9 +494,12 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
     assert_eq!(
         listing.skipped,
-        vec![CatalogTableIdent {
-            namespace: vec!["prod".to_string()],
-            name: "hive_events".to_string(),
+        vec![SkippedTable {
+            ident: CatalogTableIdent {
+                namespace: vec!["prod".to_string()],
+                name: "hive_events".to_string(),
+            },
+            reason: SkipReason::NotLoadableIcebergTable,
         }],
         "the 404 table is reported skipped, verbatim"
     );

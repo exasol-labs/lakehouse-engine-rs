@@ -1655,7 +1655,10 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
                 },
             ],
         }],
-        skipped: vec![cat_ident(&["prod", "finance"], "hive_events")],
+        skipped: vec![SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }],
     };
 
     let (tables_json, table_map, skipped) =
@@ -1688,7 +1691,33 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     // A skipped identifier passes through verbatim for the handler to warn on.
     assert_eq!(
         skipped,
-        vec![cat_ident(&["prod", "finance"], "hive_events")]
+        vec![SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }]
+    );
+}
+
+/// The Iceberg wording is a recorded byte-identical invariant, and the
+/// Delta-base wording carries the client's own neutral detail verbatim — so both
+/// rendered lines are pinned here rather than left to an uncaptured log call.
+#[test]
+fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
+    assert_eq!(
+        skip_warning(&SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }),
+        "createVirtualSchema: skipping non-Iceberg table 'prod.finance.hive_events' (catalog reported it is not a loadable Iceberg table)"
+    );
+    assert_eq!(
+        skip_warning(&SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "orders_summary"),
+            reason: SkipReason::NotDeltaBaseTable {
+                detail: "table_type=VIEW".to_string(),
+            },
+        }),
+        "createVirtualSchema: skipping non-Delta-base entry 'prod.finance.orders_summary' (table_type=VIEW)"
     );
 }
 

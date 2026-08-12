@@ -201,12 +201,7 @@ fn string_col(name: &str) -> Json {
 }
 
 fn table_entry(name: &str, columns: Vec<Json>) -> Json {
-    json!({
-        "name": name,
-        "table_type": "MANAGED",
-        "storage_location": format!("s3://warehouse/{name}"),
-        "columns": columns,
-    })
+    table_entry_typed(name, "MANAGED", columns)
 }
 
 /// A VIEW list entry: columns but no `storage_location` and a null
@@ -216,6 +211,39 @@ fn view_entry(name: &str, columns: Vec<Json>) -> Json {
         "name": name,
         "table_type": "VIEW",
         "data_source_format": Json::Null,
+        "columns": columns,
+    })
+}
+
+/// A MANAGED or EXTERNAL Delta base table list entry — the wire shape of both a
+/// plain base table and a shallow clone, since Unity Catalog carries no separate
+/// clone marker.
+fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
+    json!({
+        "name": name,
+        "table_type": table_type,
+        "storage_location": format!("s3://warehouse/{name}"),
+        "data_source_format": "DELTA",
+        "columns": columns,
+    })
+}
+
+/// A MANAGED base table list entry whose `data_source_format` is not `DELTA`.
+fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
+    json!({
+        "name": name,
+        "table_type": "MANAGED",
+        "storage_location": format!("s3://warehouse/{name}"),
+        "data_source_format": "ICEBERG",
+        "columns": columns,
+    })
+}
+
+/// A list entry whose `table_type` is neither a base table nor a VIEW.
+fn other_type_entry(name: &str, columns: Vec<Json>) -> Json {
+    json!({
+        "name": name,
+        "table_type": "STREAMING_TABLE",
         "columns": columns,
     })
 }
@@ -358,10 +386,45 @@ fn listing_issues_no_per_table_get_table_call() {
     );
 }
 
-/// A VIEW entry — columns but no storage location and a null data source format —
-/// is returned as a virtual table with its columns mapped, not dropped or errored.
 #[test]
-fn lists_view_with_columns_and_no_storage_location() {
+fn lists_managed_external_and_shallow_clone_delta_tables() {
+    let mock = MockUnityCatalog::start(|req| {
+        if req.is_get_table_call() {
+            return unexpected_get_table();
+        }
+        let entries = vec![
+            table_entry_typed("orders", "MANAGED", vec![long_col("id")]),
+            table_entry_typed("customers", "EXTERNAL", vec![long_col("id")]),
+            table_entry_typed("orders_clone", "MANAGED", vec![long_col("id")]),
+        ];
+        (200, tables_page(entries, None))
+    });
+
+    let response = create_vs_over(&mock).expect("Unity createVirtualSchema must succeed");
+
+    let names: Vec<&str> = response_tables(&response)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names.len(),
+        3,
+        "MANAGED, EXTERNAL, and shallow-clone-shaped Delta tables are all listed"
+    );
+    assert!(names.contains(&"ORDERS"));
+    assert!(names.contains(&"CUSTOMERS"));
+    assert!(names.contains(&"ORDERS_CLONE"));
+
+    let map = table_map(&response);
+    assert!(map.contains_key("ORDERS"));
+    assert!(map.contains_key("CUSTOMERS"));
+    assert!(map.contains_key("ORDERS_CLONE"));
+
+    assert_eq!(mock.get_table_call_count(), 0);
+}
+
+#[test]
+fn excludes_view_non_delta_and_other_type_entries() {
     let mock = MockUnityCatalog::start(|req| {
         if req.is_get_table_call() {
             return unexpected_get_table();
@@ -372,27 +435,63 @@ fn lists_view_with_columns_and_no_storage_location() {
                 "orders_summary",
                 vec![long_col("order_id"), string_col("region")],
             ),
+            non_delta_table_entry("orders_raw", vec![long_col("order_id")]),
+            other_type_entry("orders_stream", vec![long_col("order_id")]),
         ];
         (200, tables_page(entries, None))
     });
 
-    let response = create_vs_over(&mock).expect("a view entry must not fail enumeration");
+    let response = create_vs_over(&mock).expect("exclusions must not fail enumeration");
 
-    assert_eq!(
-        response_tables(&response).len(),
-        2,
-        "the view is listed, not dropped"
+    let names: Vec<&str> = response_tables(&response)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 1, "only the Delta base table is listed");
+    assert!(names.contains(&"ORDERS"));
+
+    let map = table_map(&response);
+    assert!(map.contains_key("ORDERS"));
+    assert!(
+        !map.contains_key("ORDERS_SUMMARY"),
+        "the view is excluded from TABLE_MAP"
+    );
+    assert!(
+        !map.contains_key("ORDERS_RAW"),
+        "the non-Delta-format table is excluded from TABLE_MAP"
+    );
+    assert!(
+        !map.contains_key("ORDERS_STREAM"),
+        "the other-table_type entry is excluded from TABLE_MAP"
     );
 
-    let view = table_named(&response, "ORDERS_SUMMARY");
-    let columns = view["columns"].as_array().unwrap();
-    assert_eq!(columns.len(), 2, "the view's columns are mapped");
-    assert_eq!(columns[0]["name"], "ORDER_ID");
-    assert_eq!(columns[0]["dataType"], long_data_type());
-    assert_eq!(columns[1]["name"], "REGION");
-    assert_eq!(columns[1]["dataType"], string_data_type());
+    assert_eq!(mock.get_table_call_count(), 0);
+}
 
-    // A view has no storage_location; the listing path needs none and issues no get-table.
+#[test]
+fn excluding_every_entry_yields_an_empty_but_successful_schema() {
+    let mock = MockUnityCatalog::start(|req| {
+        if req.is_get_table_call() {
+            return unexpected_get_table();
+        }
+        let entries = vec![
+            view_entry("orders_summary", vec![long_col("order_id")]),
+            non_delta_table_entry("orders_raw", vec![long_col("order_id")]),
+        ];
+        (200, tables_page(entries, None))
+    });
+
+    let response =
+        create_vs_over(&mock).expect("an all-excluded namespace must not fail enumeration");
+
+    assert!(
+        response_tables(&response).is_empty(),
+        "no entry survives the Delta-base filter"
+    );
+    assert!(
+        table_map(&response).is_empty(),
+        "TABLE_MAP carries no entry for an all-excluded namespace"
+    );
     assert_eq!(mock.get_table_call_count(), 0);
 }
 

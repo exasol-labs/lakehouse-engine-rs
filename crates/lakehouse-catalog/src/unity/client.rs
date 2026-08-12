@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use crate::redaction::redact_error_text;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
-    CatalogTableType, ColumnSourceType, ConnectionCreds,
+    CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable,
 };
 
 use super::auth::{UnityAuth, resolve_unity_auth};
@@ -206,22 +206,21 @@ impl CatalogClient for UnityCatalogSession {
         Box::pin(async move {
             let (catalog, schema) = unity_namespace(&namespace)?;
             let infos = self.list_table_infos(catalog, schema).await?;
-            let tables = infos
-                .into_iter()
-                .map(|info| {
-                    let ident = CatalogTableIdent {
-                        namespace: namespace.clone(),
-                        name: info.name.clone(),
-                    };
-                    neutral_table(ident, info)
-                })
-                .collect();
-            // Every listed Unity Catalog entry is returned with its columns; none
-            // is dropped as unloadable, so the skipped set is always empty.
-            Ok(CatalogListing {
-                tables,
-                skipped: Vec::new(),
-            })
+            let mut tables = Vec::new();
+            let mut skipped = Vec::new();
+            for info in infos {
+                let ident = CatalogTableIdent {
+                    namespace: namespace.clone(),
+                    name: info.name.clone(),
+                };
+                let skip_reason =
+                    delta_base_skip_reason(&info.table_type, info.data_source_format.as_deref());
+                match skip_reason {
+                    Some(reason) => skipped.push(SkippedTable { ident, reason }),
+                    None => tables.push(neutral_table(ident, info)),
+                }
+            }
+            Ok(CatalogListing { tables, skipped })
         })
     }
 
@@ -296,6 +295,37 @@ fn neutral_table_type(raw: &str) -> CatalogTableType {
     }
 }
 
+/// The only `data_source_format` the listing admits, compared case-sensitively
+/// against the uppercase vocabulary Unity Catalog emits.
+const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
+
+/// How a missing or null `data_source_format` is named in a skip reason.
+const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
+
+/// Why a listed entry is not a Delta base table, or `None` when it is one: an
+/// entry is admitted iff its neutral type is a base table AND its
+/// `data_source_format` is exactly `DELTA`. A disqualifying type is reported
+/// ahead of the format, so a view — which carries no format — is reported by its
+/// `table_type`. Takes the raw wire `table_type` rather than the already-lossy
+/// neutral kind, so the returned detail names the offending wire value verbatim
+/// and this module keeps a single home for Unity's `table_type` vocabulary.
+fn delta_base_skip_reason(
+    raw_table_type: &str,
+    data_source_format: Option<&str>,
+) -> Option<SkipReason> {
+    let detail = match neutral_table_type(raw_table_type) {
+        CatalogTableType::Table if data_source_format == Some(DELTA_DATA_SOURCE_FORMAT) => {
+            return None;
+        }
+        CatalogTableType::Table => format!(
+            "data_source_format={}",
+            data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+        ),
+        _ => format!("table_type={raw_table_type}"),
+    };
+    Some(SkipReason::NotDeltaBaseTable { detail })
+}
+
 /// A paginated Unity Catalog list response: its entries and the token for the
 /// next page, so [`UnityCatalogSession::collect_pages`] follows every page through
 /// one shape.
@@ -325,15 +355,16 @@ impl PagedResponse for TablesPage {
 
 /// One Unity Catalog table entry. `storage_location` and `data_source_format` are
 /// modeled as absent-tolerant because a VIEW carries neither, so a VIEW list entry
-/// deserializes without failing. Wire fields this plan does not consume
-/// (`data_source_format`, `table_id`, `full_name`) are left out; serde ignores
-/// them.
+/// deserializes without failing. Wire fields this client does not consume
+/// (`table_id`, `full_name`) are left out; serde ignores them.
 #[derive(Deserialize)]
 struct TableInfo {
     name: String,
     table_type: String,
     #[serde(default)]
     storage_location: Option<String>,
+    #[serde(default)]
+    data_source_format: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnInfo>,
 }

@@ -26,7 +26,8 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use lakehouse_catalog::{
-    CatalogClient, CatalogListing, CatalogTableIdent, IcebergRestCatalogClient, UnityCatalogSession,
+    CatalogClient, CatalogListing, CatalogTableIdent, IcebergRestCatalogClient, SkipReason,
+    SkippedTable, UnityCatalogSession,
 };
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
@@ -279,17 +280,11 @@ fn handle_create_virtual_schema(
         .block_on(async { client.list_tables(&configured_ns).await })
         .map_err(|e| redact_error(&storage, e))?;
 
-    let (tables_json, table_map, skipped_idents) =
-        build_listing_virtual_tables(&configured_ns, &listing)
-            .map_err(|e| redact_error(&storage, e))?;
+    let (tables_json, table_map, skipped) = build_listing_virtual_tables(&configured_ns, &listing)
+        .map_err(|e| redact_error(&storage, e))?;
 
-    for ident in &skipped_idents {
-        udf_log!(
-            ctx,
-            warn,
-            "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
-            catalog_identifier_string(ident)
-        );
+    for entry in &skipped {
+        udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
     // Build adapterNotes including TABLE_MAP (merge, not clobber).
@@ -314,6 +309,23 @@ fn handle_create_virtual_schema(
     });
 
     Ok(build_schema_response(request, schema_metadata))
+}
+
+/// The operator-facing warning for one entry the catalog client declined to
+/// list. The wording is chosen from the entry's neutral reason and never from
+/// the catalog kind, which this side of the pipeline never learns.
+fn skip_warning(entry: &SkippedTable) -> String {
+    match &entry.reason {
+        SkipReason::NotLoadableIcebergTable => format!(
+            "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
+            catalog_identifier_string(&entry.ident)
+        ),
+        SkipReason::NotDeltaBaseTable { detail } => format!(
+            "createVirtualSchema: skipping non-Delta-base entry '{}' ({})",
+            catalog_identifier_string(&entry.ident),
+            detail
+        ),
+    }
 }
 
 /// Assemble the createVirtualSchema / refresh / setProperties response.
@@ -544,9 +556,10 @@ fn build_table_map(
     Ok(table_map)
 }
 
-/// The createVirtualSchema table list, `TABLE_MAP`, and the identifiers the
-/// catalog reported as not loadable (skipped), which the handler warns on.
-type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<CatalogTableIdent>);
+/// The createVirtualSchema table list, `TABLE_MAP`, and the entries the catalog
+/// listed but excluded (skipped), each carrying the neutral reason the handler
+/// renders its warning from.
+type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<SkippedTable>);
 
 /// The SINGLE site that matches a [`CatalogKind`]: it selects and constructs the
 /// matching [`CatalogClient`] and is the only place the two kinds diverge. Every
@@ -573,7 +586,8 @@ fn construct_catalog_client(
 /// the one shared fold home, and maps each column's source-tagged type to an Exasol
 /// type via [`column_source_type_to_exasol`]. `TABLE_MAP` and the `__`-collision
 /// check are built from the listed identifiers via [`build_table_map`], and the
-/// catalog's skipped identifiers pass through for the handler to warn on.
+/// catalog's skipped entries pass through, each with its neutral skip reason,
+/// for the handler to warn on.
 ///
 /// The full-Unicode `to_uppercase` fold is a deliberate Exasol-target trade-off:
 /// `ß` expands to `SS`, so a column `straße` is declared as `STRASSE` and two

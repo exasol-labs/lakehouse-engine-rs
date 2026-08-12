@@ -66,13 +66,36 @@ pub struct CatalogTable {
     pub columns: Vec<CatalogColumn>,
 }
 
+/// Why a listed entry is not reported as a virtual table.
+///
+/// Carries no `CatalogKind` value: the client that decides to skip owns the
+/// reason, and consumers render wording by matching the reason alone, so no
+/// second `CatalogKind` match site is reintroduced downstream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipReason {
+    /// The Iceberg REST catalog listed the identifier, but `loadTable` reported
+    /// it is not a loadable Iceberg table — the entry is skipped rather than
+    /// failing the whole enumeration.
+    NotLoadableIcebergTable,
+    /// `detail` is the disqualifier fragment naming the offending value verbatim,
+    /// such as `table_type=VIEW` or `data_source_format=ICEBERG`.
+    NotDeltaBaseTable { detail: String },
+}
+
+/// One entry the catalog listed that the enumeration excluded, with its reason.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedTable {
+    pub ident: CatalogTableIdent,
+    pub reason: SkipReason,
+}
+
 /// The outcome of enumerating one namespace: the tables that resolved, plus the
-/// identifiers the catalog reported as not loadable, which are skipped rather
-/// than failing the whole enumeration.
+/// entries that were excluded and why, which are skipped rather than failing the
+/// whole enumeration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogListing {
     pub tables: Vec<CatalogTable>,
-    pub skipped: Vec<CatalogTableIdent>,
+    pub skipped: Vec<SkippedTable>,
 }
 
 /// Enumerating a namespace and loading one table's metadata, for any catalog
@@ -148,7 +171,10 @@ impl IcebergRestCatalogClient {
             let ident = neutral_ident(table_ident);
             match self.load_on_session(&session, &ident).await {
                 Ok(table) => tables.push(table),
-                Err(err) if is_not_loadable_iceberg_table(&err) => skipped.push(ident),
+                Err(err) if is_not_loadable_iceberg_table(&err) => skipped.push(SkippedTable {
+                    ident,
+                    reason: SkipReason::NotLoadableIcebergTable,
+                }),
                 Err(err) => return Err(err),
             }
         }

@@ -24,9 +24,9 @@ use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
     CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    IcebergRestCatalogClient, StorageBackend, StorageProps, TemporaryTableCredentials,
-    UnityCatalogSession, load_table_any_auth, parse_table_ident, redact_credentials,
-    redact_secret_values, resolve_uc_vended_storage, resolve_vended_storage,
+    IcebergRestCatalogClient, SkipReason, SkippedTable, StorageBackend, StorageProps,
+    TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth, parse_table_ident,
+    redact_credentials, redact_secret_values, resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 /// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
@@ -166,7 +166,10 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
     };
     let listing = CatalogListing {
         tables: vec![table],
-        skipped: vec![ident],
+        skipped: vec![SkippedTable {
+            ident,
+            reason: SkipReason::NotLoadableIcebergTable,
+        }],
     };
     assert_eq!(listing.tables.len(), 1);
     assert_eq!(listing.skipped.len(), 1);
