@@ -3,6 +3,7 @@
 ///
 /// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
 pub mod capabilities;
+pub mod catalog_kind;
 pub mod connection;
 pub mod iceberg_predicate;
 pub mod pushdown;
@@ -13,17 +14,21 @@ pub mod sharding;
 pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
+use crate::adapter::catalog_kind::{CatalogKind, resolve_catalog_kind};
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
-use crate::adapter::pushdown::{handle_pushdown, resolve_table_schema};
-use crate::adapter::tables::{flatten_table_name, iceberg_identifier_string};
+use crate::adapter::pushdown::handle_pushdown;
+use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
-use crate::types::mapping::exasol_type_to_json;
+use crate::types::mapping::{column_source_type_to_exasol, exasol_type_to_json};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
-use lakehouse_catalog::{CatalogSession, list_namespace_tables};
+use lakehouse_catalog::{
+    CatalogClient, CatalogListing, CatalogTableIdent, IcebergRestCatalogClient, SkipReason,
+    SkippedTable, UnityCatalogSession,
+};
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 
@@ -150,7 +155,20 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // the schema that qualifies the scan/distributor/merge UDF names in the
             // generated pushdown SQL.
             let props = get_properties(request);
-            let (catalog_uri, storage, creds, allow_http) = resolve_connection_config(ctx, &props)?;
+
+            // Unity Catalog scan execution is not built yet (#319/#320): refuse
+            // before any catalog client, credential, or file resolution, so a
+            // Unity Catalog pushdown issues no catalog request at all rather than
+            // being silently routed through the Iceberg REST file-resolution path,
+            // which cannot read a Delta table.
+            if resolve_catalog_kind(&props)? == CatalogKind::UnityCatalogNative {
+                return Err(UdfError::User(
+                    "Unity Catalog scan execution is not yet supported".into(),
+                ));
+            }
+
+            let (catalog_uri, storage, creds, allow_http, _) =
+                resolve_connection_config(ctx, &props)?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
 
@@ -188,16 +206,19 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 /// The returned `bool` is the resolved `ALLOW_HTTP` property, read in this one place
 /// because both storage selectors need it: `storage_block` bakes it into the static
 /// S3 payload, the vended selector uses it as its plaintext-transport consent gate.
+/// The resolved `CatalogKind` is also returned so the create path reuses this single
+/// parse instead of resolving `CATALOG_KIND` a second time for client construction.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageBackend, ConnectionCreds, bool), UdfError> {
-    let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION))?;
+) -> Result<(String, StorageBackend, ConnectionCreds, bool, CatalogKind), UdfError> {
+    let kind = catalog_kind::resolve_catalog_kind(props)?;
+    let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION), kind)?;
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let storage = storage_block(&resolved.creds, allow_http);
-    Ok((resolved.uri, storage, resolved.creds, allow_http))
+    Ok((resolved.uri, storage, resolved.creds, allow_http, kind))
 }
 
 fn handle_create_virtual_schema(
@@ -213,8 +234,9 @@ fn handle_create_virtual_schema(
         get_properties(request)
     };
     // `ALLOW_HTTP` is discarded here: schema enumeration reaches no vended selector,
-    // and `storage_block` already baked it into `storage`.
-    let (catalog_uri, storage, creds, _) = resolve_connection_config(ctx, &props)?;
+    // and `storage_block` already baked it into `storage`. `kind` is the single
+    // `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
+    let (catalog_uri, storage, creds, _, kind) = resolve_connection_config(ctx, &props)?;
 
     let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
         .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
@@ -251,23 +273,18 @@ fn handle_create_virtual_schema(
         .build()
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
-    let table_idents = rt
-        .block_on(async {
-            list_namespace_tables(&catalog_uri, &configured_ns, &storage, &creds).await
-        })
+    // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
+    // identical for both kinds and never asks which catalog it holds.
+    let client = construct_catalog_client(kind, catalog_uri, storage.clone(), creds);
+    let listing = rt
+        .block_on(async { client.list_tables(&configured_ns).await })
         .map_err(|e| redact_error(&storage, e))?;
 
-    let (tables_json, table_map, skipped_idents) =
-        resolve_namespace_virtual_tables(&rt, &catalog_uri, &creds, &configured_ns, &table_idents)
-            .map_err(|e| redact_error(&storage, e))?;
+    let (tables_json, table_map, skipped) = build_listing_virtual_tables(&configured_ns, &listing)
+        .map_err(|e| redact_error(&storage, e))?;
 
-    for ident in &skipped_idents {
-        udf_log!(
-            ctx,
-            warn,
-            "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
-            iceberg_identifier_string(ident)
-        );
+    for entry in &skipped {
+        udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
     // Build adapterNotes including TABLE_MAP (merge, not clobber).
@@ -294,52 +311,21 @@ fn handle_create_virtual_schema(
     Ok(build_schema_response(request, schema_metadata))
 }
 
-/// Resolve every enumerated table's schema into its `createVirtualSchema` entry.
-///
-/// Owns the catalog session for the whole enumeration, so the schema loop's OAuth2
-/// grant and `/v1/config` lookup each run once for the namespace instead of once per
-/// table — sound because a session is scoped to one `(catalog_uri, warehouse)` tuple
-/// and every table here shares both, varying only `CatalogProps.table`.
-///
-/// An EMPTY namespace builds NO session and therefore makes no catalog contact at
-/// all. That input is reachable (a namespace with no tables) and it is what the
-/// pre-hoist per-table loop cost for it: hoisting the build unconditionally would
-/// charge an empty enumeration an OAuth2 grant it never needed and would fail a
-/// request that used to succeed with an empty table list. With at least one table the
-/// build happens before the loop, so a grant failure surfaces once for the whole
-/// request rather than at whichever table happened to be resolved first.
-///
-/// `list_namespace_tables` keeps its own independent auth path and is deliberately
-/// NOT folded onto this session, so on the OAuth2 client-credentials mode its
-/// `RestCatalog` grant remains and such a request still performs two grants in total,
-/// not one.
-///
-/// Errors propagate unredacted — no `ctx` and no `StorageBackend` reach here, so the
-/// caller applies the same `redact_error` the old inline loop applied per-table, once
-/// over the whole enumeration result, preserving the no-credential-leak guarantee.
-fn resolve_namespace_virtual_tables(
-    rt: &tokio::runtime::Runtime,
-    catalog_uri: &str,
-    creds: &ConnectionCreds,
-    configured_ns: &[String],
-    table_idents: &[iceberg::TableIdent],
-) -> Result<VirtualTables, UdfError> {
-    if table_idents.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Vec::new()));
+/// The operator-facing warning for one entry the catalog client declined to
+/// list. The wording is chosen from the entry's neutral reason and never from
+/// the catalog kind, which this side of the pipeline never learns.
+fn skip_warning(entry: &SkippedTable) -> String {
+    match &entry.reason {
+        SkipReason::NotLoadableIcebergTable => format!(
+            "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
+            catalog_identifier_string(&entry.ident)
+        ),
+        SkipReason::NotDeltaBaseTable { detail } => format!(
+            "createVirtualSchema: skipping non-Delta-base entry '{}' ({})",
+            catalog_identifier_string(&entry.ident),
+            detail
+        ),
     }
-
-    let session =
-        rt.block_on(async { CatalogSession::resolve(catalog_uri, &creds.warehouse, creds).await })?;
-
-    build_virtual_tables(
-        configured_ns,
-        table_idents,
-        |ident: &iceberg::TableIdent| {
-            let iceberg_id = iceberg_identifier_string(ident);
-            let per_table_catalog = catalog_block(creds, &iceberg_id);
-            rt.block_on(async { resolve_table_schema(&session, &per_table_catalog, creds).await })
-        },
-    )
 }
 
 /// Assemble the createVirtualSchema / refresh / setProperties response.
@@ -545,79 +531,83 @@ fn read_table_map(request: &Json) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Flatten each `TableIdent` to an Exasol name, detect `__` collisions, and
-/// return the `(exasol_name, iceberg_identifier_string)` pairs.
+/// Flatten each identifier to an Exasol name, detect `__` collisions, and
+/// return the `(exasol_name, catalog_identifier_string)` pairs.
 ///
 /// Returns an error naming the colliding Exasol table name when two distinct
 /// identifiers flatten to the same Exasol name.
 fn build_table_map(
     configured_ns: &[String],
-    idents: &[iceberg::TableIdent],
+    idents: &[CatalogTableIdent],
 ) -> Result<Vec<(String, String)>, UdfError> {
     let mut seen: HashMap<String, String> = HashMap::new();
     let mut table_map: Vec<(String, String)> = Vec::with_capacity(idents.len());
     for ident in idents {
         let exasol_name = flatten_table_name(configured_ns, ident);
-        let iceberg_id = iceberg_identifier_string(ident);
+        let catalog_id = catalog_identifier_string(ident);
         if let Some(existing) = seen.get(&exasol_name) {
             return Err(UdfError::User(format!(
-                "table name collision: '{exasol_name}' maps to both '{existing}' and '{iceberg_id}'"
+                "table name collision: '{exasol_name}' maps to both '{existing}' and '{catalog_id}'"
             )));
         }
-        seen.insert(exasol_name.clone(), iceberg_id.clone());
-        table_map.push((exasol_name, iceberg_id));
+        seen.insert(exasol_name.clone(), catalog_id.clone());
+        table_map.push((exasol_name, catalog_id));
     }
     Ok(table_map)
 }
 
-/// Enumerate a namespace's tables into the createVirtualSchema table list and
-/// `TABLE_MAP`, skipping non-Iceberg tables (catalog HTTP 404) rather than
-/// aborting the whole schema.
-///
-/// Pure and `ctx`-free so it is unit-testable with an injected `resolver`: for
-/// each identifier the resolver yields the table's `(column, exasol_type)`
-/// schema, and its outcome decides the identifier's fate —
-/// - `Ok(fields)` → keep: emit the table entry and count it a survivor.
-/// - `Err` classified by [`is_table_not_found`] (HTTP 404) → skip: record the
-///   identifier in `skipped_idents` for the handler to warn on; no table entry,
-///   no `TABLE_MAP` entry.
-/// - any other `Err` → abort: propagate it unchanged so genuine catalog faults
-///   still fail loudly. The error is returned raw; the caller applies
-///   `redact_error` before it leaves the handler, preserving the
-///   no-credential-leak guarantee.
-///
-/// `TABLE_MAP` and the `__`-collision check are built from the surviving
-/// identifiers ONLY (via [`build_table_map`]), so a skipped table can never be
-/// advertised as an unqueryable virtual table and a collision between two
-/// survivors still aborts.
-type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<iceberg::TableIdent>);
+/// The createVirtualSchema table list, `TABLE_MAP`, and the entries the catalog
+/// listed but excluded (skipped), each carrying the neutral reason the handler
+/// renders its warning from.
+type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<SkippedTable>);
 
-fn build_virtual_tables(
+/// The SINGLE site that matches a [`CatalogKind`]: it selects and constructs the
+/// matching [`CatalogClient`] and is the only place the two kinds diverge. Every
+/// listing operation after it runs one shared pipeline that never re-matches the
+/// kind — a third kind is a build failure here, not a silently-missed branch.
+fn construct_catalog_client(
+    kind: CatalogKind,
+    catalog_uri: String,
+    storage: StorageBackend,
+    creds: ConnectionCreds,
+) -> Box<dyn CatalogClient> {
+    match kind {
+        CatalogKind::IcebergRest => {
+            Box::new(IcebergRestCatalogClient::new(catalog_uri, storage, creds))
+        }
+        CatalogKind::UnityCatalogNative => Box::new(UnityCatalogSession::new(&catalog_uri, creds)),
+    }
+}
+
+/// The shared createVirtualSchema listing pipeline, identical for both catalog
+/// kinds: it reads catalog-neutral metadata and never asks which catalog produced
+/// it. For each listed table it flattens the identifier to an Exasol name, folds
+/// every column name into Exasol's canonical (uppercase) identifier casing through
+/// the one shared fold home, and maps each column's source-tagged type to an Exasol
+/// type via [`column_source_type_to_exasol`]. `TABLE_MAP` and the `__`-collision
+/// check are built from the listed identifiers via [`build_table_map`], and the
+/// catalog's skipped entries pass through, each with its neutral skip reason,
+/// for the handler to warn on.
+///
+/// The full-Unicode `to_uppercase` fold is a deliberate Exasol-target trade-off:
+/// `ß` expands to `SS`, so a column `straße` is declared as `STRASSE` and two
+/// columns differing only in that expansion collapse to one name with no check.
+fn build_listing_virtual_tables(
     configured_ns: &[String],
-    idents: &[iceberg::TableIdent],
-    resolver: impl Fn(&iceberg::TableIdent) -> Result<Vec<(String, String)>, UdfError>,
+    listing: &CatalogListing,
 ) -> Result<VirtualTables, UdfError> {
-    let mut tables_json: Vec<Json> = Vec::with_capacity(idents.len());
-    let mut survivors: Vec<iceberg::TableIdent> = Vec::with_capacity(idents.len());
-    let mut skipped_idents: Vec<iceberg::TableIdent> = Vec::new();
+    let mut tables_json: Vec<Json> = Vec::with_capacity(listing.tables.len());
+    let mut survivors: Vec<CatalogTableIdent> = Vec::with_capacity(listing.tables.len());
 
-    for ident in idents {
-        let fields = match resolver(ident) {
-            Ok(fields) => fields,
-            Err(err) if is_table_not_found(&err) => {
-                skipped_idents.push(ident.clone());
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-
-        let exasol_name = flatten_table_name(configured_ns, ident);
-        let columns: Vec<Json> = fields
+    for table in &listing.tables {
+        let exasol_name = flatten_table_name(configured_ns, &table.ident);
+        let columns: Vec<Json> = table
+            .columns
             .iter()
-            .map(|(name, ty)| {
+            .map(|col| {
                 json!({
-                    "name": name,
-                    "dataType": exasol_type_to_json(ty),
+                    "name": col.name.to_uppercase(),
+                    "dataType": exasol_type_to_json(&column_source_type_to_exasol(&col.source_type)),
                 })
             })
             .collect();
@@ -625,11 +615,11 @@ fn build_virtual_tables(
             "name": exasol_name,
             "columns": columns,
         }));
-        survivors.push(ident.clone());
+        survivors.push(table.ident.clone());
     }
 
     let table_map = build_table_map(configured_ns, &survivors)?;
-    Ok((tables_json, table_map, skipped_idents))
+    Ok((tables_json, table_map, listing.skipped.clone()))
 }
 
 /// Resolve the Iceberg identifier for the pushdown's involved virtual table.
@@ -981,33 +971,6 @@ fn available_parallelism_or_0() -> u32 {
         .unwrap_or(0)
 }
 
-/// Returns `true` iff `err` is the catalog's "table not found" (HTTP 404)
-/// signal — the deterministic prefix the single catalog error site
-/// (`authed_get_json`'s non-success branch in `lakehouse_catalog`'s
-/// `iceberg_io`) emits as
-/// `format!("catalog returned HTTP {}: {}", status.as_u16(), redact(&body))`.
-///
-/// A 404 marks a namespace entry that is absent or not an Iceberg table (AWS
-/// Glue returns 404 `NoSuchIcebergTableException` for a Hive table), so such a
-/// table is skipped from the virtual schema. Every other outcome — a non-404
-/// HTTP status, or a transport/parse failure — returns `false` so enumeration
-/// aborts loudly, preserving the unreachable-catalog contract.
-///
-/// Matching is `starts_with` (not `contains`) against the full pinned prefix
-/// `catalog returned HTTP 404: `, including the `": "` separator that always
-/// follows the status code in the emitted message: a non-404 response whose
-/// redacted body merely contains the substring `404` must not false-match, and
-/// the trailing separator ensures a differently-formatted reuse of `HTTP 404`
-/// elsewhere cannot accidentally satisfy this prefix. Only `UdfError::User` can
-/// carry this message; the other `UdfError` variants are never produced by the
-/// catalog error site, so they classify as `false`. `redact_error` preserves
-/// this prefix — it strips only secret/credential substrings from the message
-/// body, never the leading literal — so classification is unaffected by the
-/// redaction the caller applies before propagating the error.
-fn is_table_not_found(err: &UdfError) -> bool {
-    matches!(err, UdfError::User(msg) if msg.starts_with("catalog returned HTTP 404: "))
-}
-
 /// Redact credential values from a UdfError message.
 ///
 /// Strips the literal secret values held in `storage` (value-based) and then
@@ -1030,3 +993,11 @@ fn redact_error(storage: &StorageBackend, e: UdfError) -> UdfError {
 #[cfg(test)]
 #[path = "adapter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "catalog_client_tests.rs"]
+mod catalog_client_tests;
+
+#[cfg(test)]
+#[path = "unity_schema_tests.rs"]
+mod unity_schema_tests;

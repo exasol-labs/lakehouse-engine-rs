@@ -21,6 +21,7 @@ CONNECTION and specified by the sibling feature `connection-credentials-catalog-
 * **The Azure-and-S3 mixed-fields rejection still applies under vending, deliberately.** A CONNECTION supplying both credential sets declares two incompatible intents, and that stays an error even though vending would read neither set. Relaxing the guard because the values happen to be unused would trade a loud, cheap error for a class of misconfiguration nobody can observe.
 * **A vended-only Azure CONNECTION supplies NO Azure field, so no Azure guard fires.** Such a CONNECTION carries `warehouse`, its catalog-auth fields, and `use_vended_credentials = true` and nothing else. `validate_creds` accepts it, `storage_block` produces an S3 backend with every field empty, and the vended resolution never reads that backend — the table location's `abfss://` scheme selects the ADLS backend instead. This is why the vended path cannot be reached from `storage_block`'s output and had to become its own selector.
 * **The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** Those three sign the catalog `load_table` request before any credential is vended, so they are catalog-authentication inputs. What this delta separates is their second, previously conflated use: they no longer reach the scan's storage once vending is requested.
+* This delta (plan `add-native-unity-catalog-client`, issue #318) parameterizes credential validation by the resolved `CatalogKind`, so the `warehouse`-required rule applies under the Iceberg REST kind only. The catalog kind arrives as an explicit input rather than from the CONNECTION password JSON. Every guarantee below is BEHAVIORAL, not code-level: validation is refactored to take the kind as a parameter, and the Iceberg REST listing path it feeds is refactored behind the shared `CatalogClient` trait, so the promise is that a connection resolved under the default kind is accepted or rejected identically and produces byte-identical error text — not that the code producing it is untouched.
 
 The connection name is supplied as the VS property `CATALOG_CONNECTION`. The adapter
 resolves it with `ctx.connection(name)`. The resolved `ConnectionObject.address` is the
@@ -140,3 +141,20 @@ catalog `load_table` request, ahead of any credential vending); `endpoint` stays
 * *AND* the adapter SHALL still apply the existing guard rejecting a CONNECTION that supplies BOTH Azure and static S3 storage fields, because that input declares two incompatible intents whether or not either is read
 * *AND* the adapter SHALL still require `access_key`, `secret_key`, and `region` when `use_sigv4` is true, because those sign the catalog `load_table` request rather than reaching object storage
 * *AND* no supplied credential value SHALL appear in any error message, returned SQL, or log line
+
+### Scenario: Credential validation is parameterized by the resolved catalog kind
+
+* *GIVEN* the mode-aware credential contract whose rule 1 makes `warehouse` the only unconditionally-required field
+* *WHEN* the adapter resolves a CONNECTION under a resolved `CatalogKind` — `IcebergRest` by default, `UnityCatalogNative` when `CATALOG_KIND` selects it
+* *THEN* the credential validation SHALL take the resolved `CatalogKind` as an input, and the `warehouse`-required rule SHALL apply under `CatalogKind::IcebergRest` ONLY, because a native Unity Catalog is addressed by `catalog.schema.table` and carries no Iceberg warehouse identifier
+* *AND* under `CatalogKind::IcebergRest` every rule of this feature — the `warehouse` requirement, the Azure/S3 mutual exclusion, the Azure-shape rules, the SigV4-versus-catalog-auth exclusion, the SigV4 required-fields rule, and the OAuth2 completeness rule — SHALL apply with BEHAVIOR UNCHANGED, so a connection resolved under the default kind produces byte-identical acceptance and byte-identical errors to before this delta, even though the validation entry point itself gains the `CatalogKind` parameter
+* *AND* the `CatalogKind` SHALL arrive as an explicit validation input rather than being read from the CONNECTION password JSON, because the catalog kind is a virtual-schema property and not a credential field
+* *AND* no supplied credential value SHALL appear in any error message, returned SQL, or log line under either kind
+
+### Scenario: A Unity Catalog CONNECTION reuses the existing auth fields without a new credential field
+
+* *GIVEN* a CONNECTION resolved under `CatalogKind::UnityCatalogNative` whose JSON password supplies at most one of a non-empty `token` and a `client_id`/`client_secret` pair, and may supply `oauth2_server_uri` and `scope`
+* *WHEN* the adapter resolves the connection
+* *THEN* the adapter SHALL expose the resolved `token`, `client_id`, `client_secret`, `oauth2_server_uri`, and `scope` on the credentials through the SAME parsing this feature already applies, adding no new CONNECTION password field for Unity Catalog authentication
+* *AND* the adapter SHALL accept a Unity Catalog CONNECTION that supplies none of those auth fields, because OSS Unity Catalog runs with authentication disabled
+* *AND* the resolved `token` and `client_secret` values MUST NOT appear in any error message, returned SQL, or log line

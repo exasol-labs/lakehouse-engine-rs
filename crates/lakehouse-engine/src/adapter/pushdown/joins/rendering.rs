@@ -424,7 +424,7 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// The `names.contains(name)` narrowing below is a CROSS-FOLD string match: `full_cols`
 /// arrives from [`involved_table_columns`] folded by `support::column_types`' Unicode
 /// `to_uppercase`, while `names` is folded by `collect_side_column_names`' ASCII-only
-/// `to_ascii_uppercase`. The two agree only by premise — `resolve_table_schema`
+/// `to_ascii_uppercase`. The two agree only by premise — `build_listing_virtual_tables` (`adapter/mod.rs`)
 /// Unicode-uppercases every name it declares, so no LOWERCASE name reaches either side
 /// (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`). Non-ASCII
 /// letters can still reach both sides (e.g. `über` uppercases to `ÜBER`, not to an

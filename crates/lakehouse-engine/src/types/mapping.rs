@@ -15,6 +15,7 @@
 //! representation, never a wire operation; reading/writing the request or response
 //! itself is the adapter layer's job.
 use arrow::datatypes::{DataType, TimeUnit};
+use lakehouse_catalog::ColumnSourceType;
 use serde_json::{Value as Json, json};
 
 /// The Exasol SQL type string for a given Arrow data type.
@@ -352,6 +353,45 @@ pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type) -> String {
     match ty {
         Type::Primitive(pt) => iceberg_primitive_to_exasol(pt),
         // List, Struct, Map → JSON string fallback
+        _ => "VARCHAR(2000000)".to_string(),
+    }
+}
+
+/// Map a column's source-tagged type descriptor to an Exasol type string.
+///
+/// The single home both catalog kinds go through: [`ColumnSourceType`] is not
+/// `#[non_exhaustive]`, so adding a third source becomes a compile error here
+/// rather than a silently-unmapped type elsewhere.
+pub(crate) fn column_source_type_to_exasol(source_type: &ColumnSourceType) -> String {
+    match source_type {
+        ColumnSourceType::Iceberg(ty) => iceberg_type_to_exasol(ty),
+        ColumnSourceType::Unity {
+            type_name,
+            precision,
+            scale,
+        } => unity_type_name_to_exasol(type_name, *precision, *scale),
+    }
+}
+
+/// Map a Unity Catalog Spark scalar type name to an Exasol type string, per the
+/// project's Arrow-to-Exasol convention. `precision`/`scale` only apply to
+/// `DECIMAL` and are ignored otherwise. Any type without a clean scalar Exasol
+/// equivalent, and an out-of-range `DECIMAL(p,s)`, fall back to VARCHAR(2000000)
+/// via JSON rather than failing enumeration.
+fn unity_type_name_to_exasol(type_name: &str, precision: u32, scale: u32) -> String {
+    match type_name {
+        "BOOLEAN" => "BOOLEAN".to_string(),
+        "BYTE" => "DECIMAL(3,0)".to_string(),
+        "SHORT" => "DECIMAL(5,0)".to_string(),
+        "INT" => "DECIMAL(10,0)".to_string(),
+        "LONG" => "DECIMAL(20,0)".to_string(),
+        "FLOAT" | "DOUBLE" => "DOUBLE PRECISION".to_string(),
+        "STRING" => "VARCHAR(2000000)".to_string(),
+        "DATE" => "DATE".to_string(),
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => "TIMESTAMP".to_string(),
+        "DECIMAL" if precision <= 36 && scale <= 36 => format!("DECIMAL({precision},{scale})"),
+        // Out-of-range DECIMAL, and every incompatible Spark type (ARRAY, MAP,
+        // STRUCT, BINARY, INTERVAL, VARIANT, ...): VARCHAR via JSON fallback.
         _ => "VARCHAR(2000000)".to_string(),
     }
 }

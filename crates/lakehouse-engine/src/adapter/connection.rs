@@ -7,6 +7,7 @@ use crate::scan::spec::{AdlsCred, CatalogProps, StorageBackend, StorageProps};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 
+use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
 
 /// The only unconditionally-required field in the CONNECTION password JSON.
@@ -40,7 +41,11 @@ pub struct Resolved {
 /// Resolve a named Exasol CONNECTION into a catalog URI and credentials.
 ///
 /// Credential-safe: the password value is never embedded in any returned error.
-pub fn read_connection(ctx: &dyn UdfContext, name: Option<&str>) -> Result<Resolved, UdfError> {
+pub fn read_connection(
+    ctx: &dyn UdfContext,
+    name: Option<&str>,
+    kind: CatalogKind,
+) -> Result<Resolved, UdfError> {
     let name = match name {
         Some(n) if !n.is_empty() => n,
         _ => {
@@ -73,16 +78,26 @@ pub fn read_connection(ctx: &dyn UdfContext, name: Option<&str>) -> Result<Resol
     }
 
     let creds = parse_creds(&json);
-    validate_creds(name, &creds)?;
+    validate_creds(name, &creds, kind)?;
     Ok(Resolved { uri, creds })
 }
 
-/// Validate parsed credentials against the mode-aware credential contract.
+/// Validate parsed credentials against the mode-aware credential contract,
+/// parameterized by the resolved [`CatalogKind`].
 ///
 /// Credential-safe: only field names — never values — appear in any error.
 ///
+/// Under `CatalogKind::UnityCatalogNative` the kind first rejects `use_sigv4`
+/// (the native Unity Catalog API authenticates with a bearer token or Databricks
+/// OAuth, not a signed AWS request) and then applies rules 2-6 below; rule 1's
+/// `warehouse` requirement does not apply. Rejecting `use_sigv4` ahead of rules
+/// 4-5 keeps the operator from seeing a generic missing-SigV4-field error for a
+/// signing mode that does not apply to Unity Catalog.
+///
 /// Rules, in precedence order:
-/// 1. `warehouse` is the only unconditionally-required field.
+/// 1. `warehouse` is required under `CatalogKind::IcebergRest` — the only
+///    unconditionally-required field under that kind; a native Unity Catalog is
+///    addressed by `catalog.schema.table` and carries no warehouse identifier.
 /// 2. Azure and static S3 storage credentials cannot both be supplied. An
 ///    undeclared precedence between two credential sets would resolve an
 ///    ambiguous credentials input silently, which is the misconfiguration the
@@ -108,45 +123,89 @@ pub fn read_connection(ctx: &dyn UdfContext, name: Option<&str>) -> Result<Resol
 /// check it against. `use_sigv4` together with Azure fields needs no rule of its
 /// own: rule 2 rejects it when the SigV4 fields are supplied, and rule 5 rejects
 /// it when they are not.
-fn validate_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    if creds.warehouse.is_empty() {
+///
+/// Each rule-group is delegated to a focused helper; this function fixes only
+/// their precedence order (`?` short-circuits on the first defect).
+fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
+    validate_kind_preconditions(name, creds, kind)?;
+    validate_azure_storage_creds(name, creds)?;
+    validate_sigv4_creds(name, creds)?;
+    validate_oauth2_creds(name, creds)?;
+    Ok(())
+}
+
+/// Rule 1 (`IcebergRest`) and the native Unity Catalog SigV4 rejection: the
+/// per-kind preconditions that run ahead of the kind-agnostic rules 2-6.
+fn validate_kind_preconditions(
+    name: &str,
+    creds: &ConnectionCreds,
+    kind: CatalogKind,
+) -> Result<(), UdfError> {
+    match kind {
+        CatalogKind::IcebergRest => {
+            if creds.warehouse.is_empty() {
+                return Err(UdfError::User(format!(
+                    "CONNECTION '{name}' password is missing required field: {REQUIRED_KEY}"
+                )));
+            }
+        }
+        CatalogKind::UnityCatalogNative => {
+            if creds.use_sigv4 {
+                return Err(UdfError::User(format!(
+                    "CONNECTION '{name}' enables SigV4 signing, but AWS SigV4 signing is not a \
+                     Unity Catalog authentication mode; a native Unity Catalog authenticates \
+                     with a bearer token or Databricks OAuth"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rules 2 and 3: Azure and S3 storage credentials are mutually exclusive, and a
+/// CONNECTION supplying any Azure field must supply `account_name` plus exactly
+/// one of `account_key` and `sas_token`.
+fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    let azure_fields = supplied_azure_fields(creds);
+    if azure_fields.is_empty() {
+        return Ok(());
+    }
+
+    let s3_fields = supplied_s3_fields(creds);
+    if !s3_fields.is_empty() {
         return Err(UdfError::User(format!(
-            "CONNECTION '{name}' password is missing required field: {REQUIRED_KEY}"
+            "CONNECTION '{name}' supplies Azure storage credential field(s) {} together \
+             with S3 storage credential field(s) {}; Azure and S3 storage credentials \
+             cannot both be supplied on one CONNECTION",
+            azure_fields.join(", "),
+            s3_fields.join(", ")
         )));
     }
 
-    let azure_fields = supplied_azure_fields(creds);
-    if !azure_fields.is_empty() {
-        let s3_fields = supplied_s3_fields(creds);
-        if !s3_fields.is_empty() {
-            return Err(UdfError::User(format!(
-                "CONNECTION '{name}' supplies Azure storage credential field(s) {} together \
-                 with S3 storage credential field(s) {}; Azure and S3 storage credentials \
-                 cannot both be supplied on one CONNECTION",
-                azure_fields.join(", "),
-                s3_fields.join(", ")
-            )));
-        }
-
-        let mut defects: Vec<&str> = Vec::new();
-        if creds.account_name.is_none() {
-            defects.push("account_name is missing");
-        }
-        match (creds.account_key.is_some(), creds.sas_token.is_some()) {
-            (true, true) => defects.push("account_key and sas_token are both present"),
-            (false, false) => defects.push("neither account_key nor sas_token is present"),
-            (true, false) | (false, true) => {}
-        }
-        if !defects.is_empty() {
-            return Err(UdfError::User(format!(
-                "CONNECTION '{name}' supplies Azure storage credential field(s) {}; an Azure \
-                 CONNECTION requires account_name and exactly one of account_key and sas_token: {}",
-                azure_fields.join(", "),
-                defects.join("; ")
-            )));
-        }
+    let mut defects: Vec<&str> = Vec::new();
+    if creds.account_name.is_none() {
+        defects.push("account_name is missing");
     }
+    match (creds.account_key.is_some(), creds.sas_token.is_some()) {
+        (true, true) => defects.push("account_key and sas_token are both present"),
+        (false, false) => defects.push("neither account_key nor sas_token is present"),
+        (true, false) | (false, true) => {}
+    }
+    if !defects.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies Azure storage credential field(s) {}; an Azure \
+             CONNECTION requires account_name and exactly one of account_key and sas_token: {}",
+            azure_fields.join(", "),
+            defects.join("; ")
+        )));
+    }
+    Ok(())
+}
 
+/// Rules 4 and 5: SigV4 signing is mutually exclusive with catalog token/OAuth
+/// authentication, and when enabled requires `access_key`, `secret_key`, and
+/// `region`.
+fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     if creds.use_sigv4 && creds.has_catalog_auth() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' enables SigV4 signing together with catalog \
@@ -173,24 +232,23 @@ fn validate_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
             )));
         }
     }
-
-    match (creds.client_id.is_some(), creds.client_secret.is_some()) {
-        (true, false) => {
-            return Err(UdfError::User(format!(
-                "CONNECTION '{name}' OAuth2 client credentials require both \
-                 client_id and client_secret; missing field: client_secret"
-            )));
-        }
-        (false, true) => {
-            return Err(UdfError::User(format!(
-                "CONNECTION '{name}' OAuth2 client credentials require both \
-                 client_id and client_secret; missing field: client_id"
-            )));
-        }
-        _ => {}
-    }
-
     Ok(())
+}
+
+/// Rule 6: OAuth2 client credentials require both `client_id` and
+/// `client_secret`, or neither.
+fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    match (creds.client_id.is_some(), creds.client_secret.is_some()) {
+        (true, false) => Err(UdfError::User(format!(
+            "CONNECTION '{name}' OAuth2 client credentials require both \
+             client_id and client_secret; missing field: client_secret"
+        ))),
+        (false, true) => Err(UdfError::User(format!(
+            "CONNECTION '{name}' OAuth2 client credentials require both \
+             client_id and client_secret; missing field: client_id"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The Azure storage-credential field names this CONNECTION supplies. An empty

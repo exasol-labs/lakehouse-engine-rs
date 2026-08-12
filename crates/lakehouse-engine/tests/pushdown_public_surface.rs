@@ -4,8 +4,8 @@
 //! This is a pure `use` list with no behavior. Unlike
 //! `src/adapter/pushdown_surface_probe_tests.rs`, which shares the crate and so also
 //! sees `pub(crate)` items, this file lives in the `tests/` crate and can only
-//! see items that are genuinely `pub`. Its 12 items are therefore a subset of
-//! that probe's 22.
+//! see items that are genuinely `pub`. Its 11 items are therefore a subset of
+//! that probe's 21.
 //!
 //! The `use` list below IS the baseline for the externally-`pub` half of the
 //! façade. There is no separate baseline file to consult, so there is nothing
@@ -19,6 +19,6 @@
 use lakehouse_engine::adapter::pushdown::{
     GroupedAggregateDetection, GroupedSelectItem, build_fan_out_inner,
     build_grouped_aggregate_scan_sql, build_scan_driving_sql, detect_aggregates,
-    detect_group_by_aggregates, handle_pushdown, resolve_file_list, resolve_table_schema,
-    shard_count, validate_agg_col_types,
+    detect_group_by_aggregates, handle_pushdown, resolve_file_list, shard_count,
+    validate_agg_col_types,
 };

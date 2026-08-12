@@ -5,6 +5,7 @@
 //! [`resolve_vended_storage`] is the whole public surface; everything below it is a
 //! private step.
 
+use crate::storage::{VendedBackendKind, classify_vended_scheme};
 use crate::{AdlsCred, StorageBackend, StorageProps};
 use exasol_udf_sdk::error::UdfError;
 use std::borrow::Cow;
@@ -46,18 +47,19 @@ pub fn resolve_vended_storage(
         .split_once("://")
         .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase());
     let vended = select_credential_source(result, anchor);
-    match scheme.as_str() {
-        "s3" | "s3a" => s3_backend_from_vended(vended, anchor, allow_http),
-        "abfss" => adls_backend_from_vended(vended, anchor),
-        "abfs" if allow_http => adls_backend_from_vended(vended, anchor),
-        "abfs" => Err(UdfError::User(format!(
+    match classify_vended_scheme(&scheme) {
+        Some(VendedBackendKind::S3) => s3_backend_from_vended(vended, anchor, allow_http),
+        Some(VendedBackendKind::Adls) if scheme != "abfs" || allow_http => {
+            adls_backend_from_vended(vended, anchor)
+        }
+        Some(VendedBackendKind::Adls) => Err(UdfError::User(format!(
             "vended credentials were requested for the plaintext table location {anchor}, but the \
              ALLOW_HTTP virtual-schema property is false: abfs:// names plaintext transport, and \
              this engine has no plaintext Azure path — it would silently read the location over \
              HTTPS instead, so honouring it requires the operator's explicit ALLOW_HTTP \
              acknowledgement rather than a silent scheme upgrade"
         ))),
-        _ => Err(UdfError::User(format!(
+        None => Err(UdfError::User(format!(
             "vended credentials were requested, but the table location {anchor} names no storage \
              backend this engine can read: expected an s3://, s3a://, abfss://, or abfs:// scheme"
         ))),

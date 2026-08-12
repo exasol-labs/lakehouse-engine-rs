@@ -1,18 +1,18 @@
 /// Shared table-identity helpers used by both createVirtualSchema and pushdown.
 ///
 /// These are the single source of truth for:
-/// - Flattening an Iceberg `TableIdent` to an Exasol table name (`__`-joined, uppercased).
+/// - Flattening a catalog table identifier to an Exasol table name (`__`-joined, uppercased).
 /// - Producing the original-cased, dot-joined fully-qualified identifier string stored in
 ///   `TABLE_MAP` and later parsed by `parse_table_ident`.
 ///
 /// Both functions must agree so the round-trip `flatten → store → look up → parse` is
 /// deterministic regardless of namespace depth.
-use iceberg::TableIdent;
+use lakehouse_catalog::CatalogTableIdent;
 
-/// Produce the Exasol table name for a discovered Iceberg table.
+/// Produce the Exasol table name for a discovered catalog table.
 ///
 /// Takes the configured namespace as its dot-split segments (e.g. `["prod","finance"]`) and
-/// an Iceberg `TableIdent` discovered by recursing from that namespace.
+/// a catalog table identifier discovered by recursing from that namespace.
 ///
 /// The result is the namespace segments of `ident` BELOW the configured namespace, plus the
 /// table name, all joined with `__` and uppercased.
@@ -26,8 +26,8 @@ use iceberg::TableIdent;
 /// Invariant: `ident`'s namespace always starts with the configured namespace segments
 /// (it was discovered by recursing from there). If the prefix does not match (should not
 /// happen in normal operation), the full namespace is used without stripping.
-pub fn flatten_table_name(configured_ns: &[String], ident: &TableIdent) -> String {
-    let ident_ns: &[String] = ident.namespace.as_ref();
+pub fn flatten_table_name(configured_ns: &[String], ident: &CatalogTableIdent) -> String {
+    let ident_ns: &[String] = &ident.namespace;
 
     // Strip the configured namespace prefix from ident's namespace.
     let sub_ns = if ident_ns.starts_with(configured_ns) {
@@ -42,14 +42,14 @@ pub fn flatten_table_name(configured_ns: &[String], ident: &TableIdent) -> Strin
     parts.join("__").to_uppercase()
 }
 
-/// Produce the original-cased, dot-joined fully-qualified Iceberg identifier string.
+/// Produce the original-cased, dot-joined fully-qualified catalog identifier string.
 ///
 /// This is the value stored in `TABLE_MAP` and later parsed back by `parse_table_ident`.
 /// All namespace segments plus the table name are joined with `.`, preserving original casing.
 ///
 /// Example: namespace `["prod","finance","eu"]`, table `orders` → `"prod.finance.eu.orders"`
-pub fn iceberg_identifier_string(ident: &TableIdent) -> String {
-    let ns: &[String] = ident.namespace.as_ref();
+pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
+    let ns: &[String] = &ident.namespace;
     let mut parts: Vec<&str> = ns.iter().map(|s| s.as_str()).collect();
     parts.push(&ident.name);
     parts.join(".")

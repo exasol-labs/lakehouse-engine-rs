@@ -229,3 +229,33 @@ fn redact_credentials_does_not_panic_on_length_changing_unicode_casefold() {
         "sig= value must be redacted: {safe}"
     );
 }
+
+/// Scenario: Unity Catalog vended-credential field names and the OAuth M2M
+/// client secret are redacted the same way the Iceberg vended labels are.
+#[test]
+fn redact_credentials_strips_unity_vended_and_oauth_secrets() {
+    let msg = concat!(
+        "access_key_id=UC_AKID_VALUE ",
+        "secret_access_key=UC_SECRET_VALUE ",
+        "session_token=UC_SESSION_VALUE ",
+        "sas_token=UC_SAS_VALUE ",
+        "gcp_oauth_token=UC_GCP_TOKEN_VALUE ",
+        "client_secret=UC_CLIENT_SECRET_VALUE ",
+        "catalog=unity"
+    );
+    let safe = redact_credentials(msg);
+    for secret in [
+        "UC_AKID_VALUE",
+        "UC_SECRET_VALUE",
+        "UC_SESSION_VALUE",
+        "UC_SAS_VALUE",
+        "UC_GCP_TOKEN_VALUE",
+        "UC_CLIENT_SECRET_VALUE",
+    ] {
+        assert!(!safe.contains(secret), "secret must be redacted: {safe}");
+    }
+    assert!(
+        safe.contains("catalog=unity"),
+        "non-secret context must be preserved: {safe}"
+    );
+}

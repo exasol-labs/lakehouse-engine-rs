@@ -588,50 +588,6 @@ async fn plan_files_from_table(
         .collect())
 }
 
-/// Resolve one Iceberg table's schema for `createVirtualSchema` on the
-/// [`CatalogSession`] the caller already built.
-///
-/// Returns (field_name, exasol_type_string) pairs. The table metadata is loaded
-/// via the unified `load_table_any_auth` (SigV4 | bearer | OAuth2-bearer | none).
-/// Schema resolution only reads `table.metadata().current_schema()` — no S3
-/// manifest access is needed, so vended credentials do not affect this path.
-///
-/// Takes the session by shared reference and holds no means to build one, so a
-/// per-table OAuth2 grant is structurally inexpressible: `adapter/mod.rs` builds
-/// ONE session ahead of the table-enumeration loop and every table's schema
-/// resolves on it, and a grant failure surfaces there — once, before the loop —
-/// rather than at whichever table happened to be resolved first. There is no
-/// `catalog_uri` parameter because the session already carries it and a second
-/// copy could disagree with it.
-///
-/// `catalog_props.table` names the table; `load_table_any_auth` parses that
-/// identifier before it issues any HTTP, so a malformed identifier still returns
-/// the parse error without a `loadTable` GET.
-pub async fn resolve_table_schema(
-    session: &CatalogSession,
-    catalog_props: &CatalogProps,
-    creds: &ConnectionCreds,
-) -> Result<Vec<(String, String)>, UdfError> {
-    let result = load_table_any_auth(session, catalog_props, creds).await?;
-    let table_metadata = result.metadata;
-
-    let schema = table_metadata.current_schema();
-    let fields = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| {
-            let exasol_ty = crate::types::mapping::iceberg_type_to_exasol(&f.field_type);
-            // Declare columns in Exasol's canonical (uppercase) identifier casing
-            // so unquoted user SQL (`SELECT id` → `ID`) resolves. The scan maps
-            // projection names back to the Parquet field casing case-insensitively.
-            (f.name.to_uppercase(), exasol_ty)
-        })
-        .collect();
-
-    Ok(fields)
-}
-
 /// Build the shape-correct empty-result response for a fully-pruned file list.
 ///
 /// Routing goes through the SAME shared [`classify_request_shape`] the non-empty

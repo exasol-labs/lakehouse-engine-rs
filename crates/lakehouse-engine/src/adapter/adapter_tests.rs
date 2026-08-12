@@ -1,75 +1,5 @@
 use super::*;
 
-/// `is_table_not_found` skips ONLY the code-authored HTTP 404 prefix.
-///
-/// 404 → `true` (the sole skippable status: absent / non-Iceberg table).
-/// Every other HTTP status and any transport/parse failure → `false`, so
-/// enumeration aborts loudly on genuine catalog faults. The `starts_with`
-/// discipline is pinned: a non-404 error whose body merely *contains* "404"
-/// must NOT match, and non-`User` variants classify as `false`.
-#[test]
-fn is_table_not_found_true_only_for_404() {
-    // The exact shape the catalog error site emits for a Hive/absent table.
-    assert!(
-            is_table_not_found(&UdfError::User(
-                "catalog returned HTTP 404: NoSuchIcebergTableException: Input table is not an iceberg table"
-                    .into()
-            )),
-            "HTTP 404 is the skippable not-an-Iceberg-table signal"
-        );
-
-    // Every other HTTP status must abort, not skip.
-    for status in ["401", "403", "500", "503"] {
-        assert!(
-            !is_table_not_found(&UdfError::User(format!(
-                "catalog returned HTTP {status}: some body"
-            ))),
-            "HTTP {status} must NOT be classified as table-not-found"
-        );
-    }
-
-    // A non-404 response whose redacted body merely CONTAINS "404" must not
-    // false-match — this is why the classifier uses starts_with, not contains.
-    assert!(
-        !is_table_not_found(&UdfError::User(
-            "catalog returned HTTP 500: upstream said error 404 in its body".into()
-        )),
-        "a 404 substring inside a non-404 error body must not false-match"
-    );
-
-    // The prefix must include the ": " separator that always follows the
-    // status code — a message that merely starts with the digits "404"
-    // but lacks the separator (e.g. a differently-formatted reuse of
-    // "HTTP 404" elsewhere) must not false-match.
-    assert!(
-        !is_table_not_found(&UdfError::User(
-            "catalog returned HTTP 404 Not Found".into()
-        )),
-        "the prefix match requires the ': ' separator, not just the status digits"
-    );
-
-    // Transport/parse failures (the other error sites in authed_get_json)
-    // carry different prefixes and must abort.
-    assert!(
-        !is_table_not_found(&UdfError::User(
-            "catalog request failed: connection refused".into()
-        )),
-        "a transport error must abort, not skip"
-    );
-    assert!(
-        !is_table_not_found(&UdfError::User(
-            "failed to parse catalog response: expected value".into()
-        )),
-        "a parse error must abort, not skip"
-    );
-
-    // Non-`User` variants are never produced by the catalog error site.
-    assert!(
-        !is_table_not_found(&UdfError::ConnectBack("catalog returned HTTP 404".into())),
-        "only UdfError::User carries the catalog status prefix"
-    );
-}
-
 #[test]
 fn dispatch_get_capabilities() {
     let req = serde_json::json!({"type": "getCapabilities"});
@@ -276,6 +206,54 @@ impl UdfContext for NoopCtx {
     fn next(&mut self) -> Result<bool, UdfError> {
         Ok(false)
     }
+}
+
+// Proves the Unity Catalog pushdown refusal runs before any credential or
+// catalog resolution: connection() panics if the dispatch ever reaches it,
+// so a refusal that let the request fall through to resolve_connection_config
+// first would fail loudly here instead of just returning a different error.
+struct PanicOnConnectionCtx;
+impl UdfContext for PanicOnConnectionCtx {
+    fn num_columns(&self) -> usize {
+        0
+    }
+    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
+        Err(UdfError::Type("none".into()))
+    }
+    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<bool, UdfError> {
+        Ok(false)
+    }
+    fn connection(
+        &self,
+        _name: &str,
+    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
+        panic!("connection() must not be called for a Unity Catalog pushdown refusal");
+    }
+}
+
+/// A pushdown request under `CATALOG_KIND: UNITY_CATALOG` is refused with a
+/// clear "not yet supported" error before any catalog client is constructed,
+/// credentials are resolved, or files are resolved through the Iceberg path.
+#[test]
+fn unity_kind_pushdown_is_refused_not_iceberg_routed() {
+    let req = serde_json::json!({
+        "type": "pushdown",
+        "properties": {
+            "CATALOG_KIND": "UNITY_CATALOG",
+        },
+    });
+
+    let err = dispatch(&mut PanicOnConnectionCtx, &req)
+        .expect_err("a Unity Catalog pushdown must be refused, not executed");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("Unity Catalog") && message.contains("not yet supported"),
+        "expected a clear 'Unity Catalog scan execution is not yet supported' refusal, got: {message}"
+    );
 }
 
 // Like `NoopCtx` but with a configurable `node_count()`, so tests can drive
@@ -1537,6 +1515,13 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
+fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
+    CatalogTableIdent {
+        namespace: ns.iter().map(|s| s.to_string()).collect(),
+        name: name.to_string(),
+    }
+}
+
 /// Multi-level namespace flattening is deterministic and collision detection
 /// returns a clear error naming the colliding Exasol table name.
 ///
@@ -1548,18 +1533,10 @@ fn pushdown_known_involved_table_resolves_identifier() {
 /// ns `prod.finance.eu` table `orders` both flatten to `EU__ORDERS`.
 #[test]
 fn flatten_multilevel_namespace_and_detect_collision() {
-    use iceberg::{NamespaceIdent, TableIdent};
-
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
 
-    let direct = TableIdent::new(
-        NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
-        "orders".into(),
-    );
-    let descendant = TableIdent::new(
-        NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()]).unwrap(),
-        "orders".into(),
-    );
+    let direct = cat_ident(&["prod", "finance"], "orders");
+    let descendant = cat_ident(&["prod", "finance", "eu"], "orders");
 
     let result = build_table_map(&configured_ns, &[direct, descendant]).unwrap();
     assert_eq!(result.len(), 2);
@@ -1577,14 +1554,8 @@ fn flatten_multilevel_namespace_and_detect_collision() {
 
     // Collision: ns `prod.finance` table `eu__orders` clashes with
     // ns `prod.finance.eu` table `orders` — both flatten to `EU__ORDERS`.
-    let collider_a = TableIdent::new(
-        NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
-        "eu__orders".into(),
-    );
-    let collider_b = TableIdent::new(
-        NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()]).unwrap(),
-        "orders".into(),
-    );
+    let collider_a = cat_ident(&["prod", "finance"], "eu__orders");
+    let collider_b = cat_ident(&["prod", "finance", "eu"], "orders");
     let err = build_table_map(&configured_ns, &[collider_a, collider_b]).unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -1597,231 +1568,16 @@ fn flatten_multilevel_namespace_and_detect_collision() {
     );
 }
 
-// -----------------------------------------------------------------------
-// build_virtual_tables — mixed Iceberg / non-Iceberg enumeration
-// -----------------------------------------------------------------------
-
-fn ns_ident(ns: Vec<&str>, table: &str) -> iceberg::TableIdent {
-    use iceberg::{NamespaceIdent, TableIdent};
-    TableIdent::new(
-        NamespaceIdent::from_vec(ns.into_iter().map(|s| s.to_string()).collect()).unwrap(),
-        table.to_string(),
-    )
-}
-
-/// Injected resolver: an Iceberg table returns a one-column schema; a table
-/// whose name contains `hive` returns the exact code-authored HTTP 404 prefix
-/// the classifier keys on (the Glue "not an Iceberg table" signal).
-fn iceberg_or_404_resolver(ident: &iceberg::TableIdent) -> Result<Vec<(String, String)>, UdfError> {
-    if ident.name.contains("hive") {
-        Err(UdfError::User(
-                "catalog returned HTTP 404: NoSuchIcebergTableException: Input table is not an iceberg table"
-                    .into(),
-            ))
-    } else {
-        Ok(vec![("ID".to_string(), "DECIMAL(20, 0)".to_string())])
-    }
-}
-
-/// Every table in the namespace is Iceberg → all kept, nothing skipped.
-#[test]
-fn build_virtual_tables_keeps_all_when_every_table_is_iceberg() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        ns_ident(vec!["prod", "finance"], "orders"),
-        ns_ident(vec!["prod", "finance"], "customers"),
-    ];
-
-    let (tables_json, table_map, skipped) =
-        build_virtual_tables(&configured_ns, &idents, iceberg_or_404_resolver).unwrap();
-
-    assert_eq!(tables_json.len(), 2);
-    assert_eq!(table_map.len(), 2);
-    assert!(
-        skipped.is_empty(),
-        "no table is skipped when all are Iceberg"
-    );
-    assert_eq!(
-        table_map[0],
-        ("ORDERS".to_string(), "prod.finance.orders".to_string())
-    );
-}
-
-/// A non-Iceberg (HTTP 404) table is skipped, not aborted: the surviving
-/// Iceberg tables are kept, the skipped name is excluded from TABLE_MAP, and
-/// the skipped identifier is returned so the handler can warn on it.
-#[test]
-fn build_virtual_tables_skips_non_iceberg_table_and_warns() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        ns_ident(vec!["prod", "finance"], "orders"),
-        ns_ident(vec!["prod", "finance"], "hive_events"),
-        ns_ident(vec!["prod", "finance"], "customers"),
-    ];
-
-    let (tables_json, table_map, skipped) =
-        build_virtual_tables(&configured_ns, &idents, iceberg_or_404_resolver).unwrap();
-
-    let survivor_names: Vec<&str> = tables_json
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        survivor_names,
-        vec!["ORDERS", "CUSTOMERS"],
-        "only the Iceberg tables are emitted, in listing order"
-    );
-
-    // TABLE_MAP is built from survivors only — the skipped name is absent.
-    let mapped: Vec<&str> = table_map.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(mapped, vec!["ORDERS", "CUSTOMERS"]);
-    assert!(
-        !mapped.contains(&"HIVE_EVENTS"),
-        "a skipped table must never appear in TABLE_MAP"
-    );
-
-    // The skipped identifier is returned verbatim for the handler's warning.
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(
-        iceberg_identifier_string(&skipped[0]),
-        "prod.finance.hive_events"
-    );
-}
-
-/// A namespace whose every table is non-Iceberg yields an empty schema — the
-/// call still SUCCEEDS (an all-Hive namespace is not a catalog fault).
-#[test]
-fn build_virtual_tables_all_non_iceberg_yields_empty_schema() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        ns_ident(vec!["prod", "finance"], "hive_a"),
-        ns_ident(vec!["prod", "finance"], "hive_b"),
-    ];
-
-    let (tables_json, table_map, skipped) =
-        build_virtual_tables(&configured_ns, &idents, iceberg_or_404_resolver).unwrap();
-
-    assert!(tables_json.is_empty(), "no Iceberg table → empty tables");
-    assert!(table_map.is_empty(), "no survivor → empty TABLE_MAP");
-    assert_eq!(skipped.len(), 2, "every non-Iceberg table is skipped");
-}
-
-/// A namespace the catalog reports as holding NO table costs zero catalog
-/// contact: there is nothing to resolve, so no session is built.
-///
-/// Driven against an unreachable `catalog_uri` with OAuth2 client-credentials —
-/// the mode whose session build issues a token grant — so an unguarded build
-/// could only fail. The call must still succeed with an empty table list, which
-/// is the boundary an unconditionally hoisted session build silently changed:
-/// one grant instead of none, and a request that used to return an empty schema
-/// now failing on the grant.
-#[test]
-fn create_virtual_schema_over_empty_namespace_contacts_no_catalog_session() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime");
-    let creds = ConnectionCreds {
-        warehouse: "warehouse".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: Some("oauth-client-id-sentinel".into()),
-        client_secret: Some("oauth-client-secret-sentinel".into()),
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-    };
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-
-    let (tables_json, table_map, skipped) =
-        resolve_namespace_virtual_tables(&rt, "http://127.0.0.1:1", &creds, &configured_ns, &[])
-            .expect("an empty namespace must resolve without contacting the catalog");
-
-    assert!(
-        tables_json.is_empty(),
-        "an empty namespace advertises no virtual table"
-    );
-    assert!(table_map.is_empty(), "no table → empty TABLE_MAP");
-    assert!(skipped.is_empty(), "no table → nothing skipped");
-}
-
-/// A non-404 per-table failure (transport / non-404 HTTP) aborts the whole
-/// enumeration — genuine catalog faults must still fail loudly.
-#[test]
-fn build_virtual_tables_aborts_on_non_404_error() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        ns_ident(vec!["prod", "finance"], "orders"),
-        ns_ident(vec!["prod", "finance"], "boom"),
-    ];
-
-    let resolver = |ident: &iceberg::TableIdent| -> Result<Vec<(String, String)>, UdfError> {
-        if ident.name == "boom" {
-            Err(UdfError::User(
-                "catalog returned HTTP 503: service unavailable".into(),
-            ))
-        } else {
-            Ok(vec![("ID".to_string(), "DECIMAL(20, 0)".to_string())])
-        }
-    };
-
-    let err = build_virtual_tables(&configured_ns, &idents, resolver).unwrap_err();
-    assert!(
-        err.to_string().contains("503"),
-        "a non-404 per-table failure must abort and propagate: {err}"
-    );
-}
-
-/// Collision detection still fires over the surviving set even when a skipped
-/// (non-Iceberg) table sits between two survivors that flatten to one name.
-#[test]
-fn build_virtual_tables_survivors_keep_collision_detection() {
-    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
-    let idents = vec![
-        ns_ident(vec!["prod", "finance"], "eu__orders"),
-        ns_ident(vec!["prod", "finance"], "hive_events"),
-        ns_ident(vec!["prod", "finance", "eu"], "orders"),
-    ];
-
-    let err = build_virtual_tables(&configured_ns, &idents, iceberg_or_404_resolver).unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("collision"),
-        "a survivor collision must still abort: {msg}"
-    );
-    assert!(
-        msg.contains("EU__ORDERS"),
-        "the error must name the colliding Exasol table: {msg}"
-    );
-}
-
 /// Build a table_map, write it through build_adapter_notes, parse the
 /// adapterNotes JSON string, and assert:
 /// - TABLE_MAP contains the expected Exasol-name → Iceberg-identifier entries.
 /// - A pre-existing note (CLUSTER_NODES) is still present after the merge.
 #[test]
 fn create_vs_records_table_map_in_adapter_notes() {
-    use iceberg::{NamespaceIdent, TableIdent};
-
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
     let idents = vec![
-        TableIdent::new(
-            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into()]).unwrap(),
-            "orders".into(),
-        ),
-        TableIdent::new(
-            NamespaceIdent::from_vec(vec!["prod".into(), "finance".into(), "eu".into()]).unwrap(),
-            "orders".into(),
-        ),
+        cat_ident(&["prod", "finance"], "orders"),
+        cat_ident(&["prod", "finance", "eu"], "orders"),
     ];
     let table_map = build_table_map(&configured_ns, &idents).unwrap();
 
@@ -1870,6 +1626,98 @@ fn create_vs_records_table_map_in_adapter_notes() {
         parsed["CLUSTER_NODES"].as_str(),
         Some("3"),
         "pre-existing CLUSTER_NODES must be preserved (merge, not clobber)"
+    );
+}
+
+/// The Iceberg listing output — table names, declared column names and types,
+/// `TABLE_MAP`, and skipped identifiers — stays byte-identical behind the shared
+/// `CatalogClient` trait, including the full-Unicode `to_uppercase` fold that
+/// turns `straße` into `STRASSE`.
+#[test]
+fn iceberg_listing_is_behavior_identical_behind_the_trait() {
+    use iceberg::spec::{PrimitiveType, Type};
+    use lakehouse_catalog::{CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType};
+
+    let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+    let listing = CatalogListing {
+        tables: vec![CatalogTable {
+            ident: cat_ident(&["prod", "finance", "eu"], "orders"),
+            table_type: CatalogTableType::Table,
+            storage_location: Some("s3://warehouse/orders".to_string()),
+            columns: vec![
+                CatalogColumn {
+                    name: "order_id".to_string(),
+                    source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+                },
+                CatalogColumn {
+                    name: "straße".to_string(),
+                    source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::String)),
+                },
+            ],
+        }],
+        skipped: vec![SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }],
+    };
+
+    let (tables_json, table_map, skipped) =
+        build_listing_virtual_tables(&configured_ns, &listing).unwrap();
+
+    assert_eq!(tables_json.len(), 1);
+    assert_eq!(tables_json[0]["name"], "EU__ORDERS");
+
+    let columns = tables_json[0]["columns"].as_array().unwrap();
+    assert_eq!(columns[0]["name"], "ORDER_ID");
+    assert_eq!(
+        columns[0]["dataType"],
+        json!({"type": "decimal", "precision": 20, "scale": 0})
+    );
+    // Full-Unicode fold: `ß` expands to `SS`, so `straße` declares as `STRASSE`.
+    assert_eq!(columns[1]["name"], "STRASSE");
+    assert_eq!(
+        columns[1]["dataType"],
+        json!({"type": "varchar", "size": 2000000})
+    );
+
+    assert_eq!(
+        table_map,
+        vec![(
+            "EU__ORDERS".to_string(),
+            "prod.finance.eu.orders".to_string()
+        )]
+    );
+
+    // A skipped identifier passes through verbatim for the handler to warn on.
+    assert_eq!(
+        skipped,
+        vec![SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }]
+    );
+}
+
+/// The Iceberg wording is a recorded byte-identical invariant, and the
+/// Delta-base wording carries the client's own neutral detail verbatim — so both
+/// rendered lines are pinned here rather than left to an uncaptured log call.
+#[test]
+fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
+    assert_eq!(
+        skip_warning(&SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "hive_events"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }),
+        "createVirtualSchema: skipping non-Iceberg table 'prod.finance.hive_events' (catalog reported it is not a loadable Iceberg table)"
+    );
+    assert_eq!(
+        skip_warning(&SkippedTable {
+            ident: cat_ident(&["prod", "finance"], "orders_summary"),
+            reason: SkipReason::NotDeltaBaseTable {
+                detail: "table_type=VIEW".to_string(),
+            },
+        }),
+        "createVirtualSchema: skipping non-Delta-base entry 'prod.finance.orders_summary' (table_type=VIEW)"
     );
 }
 

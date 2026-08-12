@@ -1,11 +1,11 @@
 use super::*;
-use iceberg::{NamespaceIdent, TableIdent};
+use lakehouse_catalog::CatalogTableIdent;
 
-fn make_ident(ns: Vec<&str>, table: &str) -> TableIdent {
-    TableIdent::new(
-        NamespaceIdent::from_vec(ns.into_iter().map(|s| s.to_string()).collect()).unwrap(),
-        table.to_string(),
-    )
+fn make_ident(ns: Vec<&str>, table: &str) -> CatalogTableIdent {
+    CatalogTableIdent {
+        namespace: ns.into_iter().map(|s| s.to_string()).collect(),
+        name: table.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,28 +84,28 @@ fn flatten_uppercases_mixed_case_input() {
 }
 
 // ---------------------------------------------------------------------------
-// iceberg_identifier_string — preserves original casing
+// catalog_identifier_string — preserves original casing
 // ---------------------------------------------------------------------------
 
 /// Simple single-level namespace: identifier string is "ns.table".
 #[test]
 fn identifier_string_single_level() {
     let ident = make_ident(vec!["prod"], "orders");
-    assert_eq!(iceberg_identifier_string(&ident), "prod.orders");
+    assert_eq!(catalog_identifier_string(&ident), "prod.orders");
 }
 
 /// Multi-level namespace: all segments + table joined with `.`.
 #[test]
 fn identifier_string_multilevel() {
     let ident = make_ident(vec!["prod", "finance", "eu"], "orders");
-    assert_eq!(iceberg_identifier_string(&ident), "prod.finance.eu.orders");
+    assert_eq!(catalog_identifier_string(&ident), "prod.finance.eu.orders");
 }
 
 /// Identifier string preserves original lowercase casing (Iceberg names are case-sensitive).
 #[test]
 fn identifier_string_preserves_lowercase_casing() {
     let ident = make_ident(vec!["prod", "finance"], "orders");
-    let s = iceberg_identifier_string(&ident);
+    let s = catalog_identifier_string(&ident);
     // Must be exactly the original casing, not uppercased.
     assert_eq!(s, "prod.finance.orders");
     assert!(
@@ -118,5 +118,5 @@ fn identifier_string_preserves_lowercase_casing() {
 #[test]
 fn identifier_string_preserves_mixed_case() {
     let ident = make_ident(vec!["Prod", "Finance"], "Orders");
-    assert_eq!(iceberg_identifier_string(&ident), "Prod.Finance.Orders");
+    assert_eq!(catalog_identifier_string(&ident), "Prod.Finance.Orders");
 }

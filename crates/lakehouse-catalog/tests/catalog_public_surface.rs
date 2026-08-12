@@ -1,16 +1,17 @@
 //! Compile-time reachability probe for `lakehouse-catalog`'s public surface,
 //! from an external-crate vantage.
 //!
-//! This is a pure `use` list with no behavior. It lives in the `tests/` crate
-//! so it only sees items that are actually `pub` (and re-exported at the
-//! crate root) — not the elevated visibility a descendant `mod tests` would
-//! see. Every module in `src/` (`creds`, `iceberg_io`, `namespace`,
-//! `redaction`, `session`, `storage`, `vended`, plus `auth` and `sigv4`) is
-//! private (`mod`, not `pub mod`); the only externally reachable items are the
-//! ones `src/lib.rs` re-exports with `pub use`. If any of the items below is
-//! narrowed below `pub` or its re-export is removed, this file fails to
-//! compile — turning an effective visibility regression into a build failure
-//! rather than a silent gap that only a `pub use` text diff would miss.
+//! This is a `use` list plus minimal behavioral pins with almost no logic. It
+//! lives in the `tests/` crate so it only sees items that are actually `pub`
+//! (and re-exported at the crate root) — not the elevated visibility a
+//! descendant `mod tests` would see. Every module in `src/` (`auth`, `client`,
+//! `creds`, `iceberg_io`, `namespace`, `redaction`, `session`, `sigv4`,
+//! `storage`, `unity`, `vended`) is private (`mod`, not `pub mod`); the only
+//! externally reachable items are the ones `src/lib.rs` re-exports with
+//! `pub use`. If any of the items below is narrowed below `pub` or its
+//! re-export is removed, this file fails to compile — turning an effective
+//! visibility regression into a build failure rather than a silent gap that
+//! only a `pub use` text diff would miss.
 //!
 //! Covers the Verification > Scenario Coverage row "The crate exposes the
 //! concept-level API and hides every mechanism step"
@@ -21,9 +22,11 @@ use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use lakehouse_catalog::{
-    AdlsCred, CatalogProps, CatalogSession, ConnectionCreds, StorageBackend, StorageProps,
-    list_namespace_tables, load_table_any_auth, parse_table_ident, redact_credentials,
-    redact_secret_values, resolve_vended_storage,
+    AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
+    CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
+    IcebergRestCatalogClient, SkipReason, SkippedTable, StorageBackend, StorageProps,
+    TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth, parse_table_ident,
+    redact_credentials, redact_secret_values, resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 /// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
@@ -32,6 +35,7 @@ use lakehouse_catalog::{
 /// `crates/lakehouse-catalog/tests` -> `crates/lakehouse-catalog/src`.
 const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("auth.rs", include_str!("../src/auth.rs")),
+    ("client.rs", include_str!("../src/client.rs")),
     ("creds.rs", include_str!("../src/creds.rs")),
     ("iceberg_io.rs", include_str!("../src/iceberg_io.rs")),
     ("lib.rs", include_str!("../src/lib.rs")),
@@ -41,7 +45,40 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("sigv4.rs", include_str!("../src/sigv4.rs")),
     ("storage.rs", include_str!("../src/storage.rs")),
     ("vended.rs", include_str!("../src/vended.rs")),
+    ("unity/mod.rs", include_str!("../src/unity/mod.rs")),
+    ("unity/auth.rs", include_str!("../src/unity/auth.rs")),
+    ("unity/client.rs", include_str!("../src/unity/client.rs")),
+    ("unity/vended.rs", include_str!("../src/unity/vended.rs")),
 ];
+
+fn source(name: &str) -> &'static str {
+    CATALOG_SOURCES
+        .iter()
+        .find_map(|(file, src)| (*file == name).then_some(*src))
+        .unwrap_or_else(|| panic!("{name} must be present in CATALOG_SOURCES"))
+}
+
+fn connection_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "warehouse".into(),
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+        token: None,
+        client_id: None,
+        client_secret: None,
+        oauth2_server_uri: None,
+        scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
+    }
+}
 
 /// `resolve_vended_storage` is the crate's only vended entry point. Selecting
 /// the credential source and merging it into the storage props are two
@@ -83,6 +120,124 @@ fn storage_backend_secret_values_and_file_io_are_reachable() {
     let backend = StorageBackend::S3(StorageProps::default());
     let _: Vec<&str> = backend.secret_values();
     let _: iceberg::io::FileIO = backend.file_io();
+}
+
+/// The Iceberg REST client and the Unity Catalog session are both usable as
+/// `Box<dyn CatalogClient>`: the trait is dyn-compatible and each type
+/// implements it, so the engine's single construction site can hold either
+/// behind one boxed trait object.
+#[test]
+fn both_clients_are_catalog_client_trait_objects() {
+    let iceberg: Box<dyn CatalogClient> = Box::new(IcebergRestCatalogClient::new(
+        "http://catalog".into(),
+        StorageBackend::S3(StorageProps::default()),
+        connection_creds(),
+    ));
+    let unity: Box<dyn CatalogClient> =
+        Box::new(UnityCatalogSession::new("http://unity", connection_creds()));
+
+    let clients: Vec<Box<dyn CatalogClient>> = vec![iceberg, unity];
+    assert_eq!(clients.len(), 2);
+}
+
+/// The shared trait and its catalog-neutral metadata types are constructible
+/// from outside the crate, while the Unity Catalog wire types stay hidden —
+/// never re-exported and never `pub`-declared — so the engine consumes only the
+/// neutral shape.
+#[test]
+fn catalog_client_trait_and_neutral_types_are_reachable() {
+    let ident = CatalogTableIdent {
+        namespace: vec!["ns".into()],
+        name: "t".into(),
+    };
+    let column = CatalogColumn {
+        name: "c".into(),
+        source_type: ColumnSourceType::Unity {
+            type_name: "int".into(),
+            precision: 0,
+            scale: 0,
+        },
+    };
+    let table = CatalogTable {
+        ident: ident.clone(),
+        table_type: CatalogTableType::Table,
+        storage_location: None,
+        columns: vec![column],
+    };
+    let listing = CatalogListing {
+        tables: vec![table],
+        skipped: vec![SkippedTable {
+            ident,
+            reason: SkipReason::NotLoadableIcebergTable,
+        }],
+    };
+    assert_eq!(listing.tables.len(), 1);
+    assert_eq!(listing.skipped.len(), 1);
+
+    let unity_client = source("unity/client.rs");
+    let unity_mod = source("unity/mod.rs");
+    let lib = source("lib.rs");
+    for wire in [
+        "CatalogsPage",
+        "SchemasPage",
+        "TablesPage",
+        "CatalogInfo",
+        "SchemaInfo",
+        "TableInfo",
+        "ColumnInfo",
+    ] {
+        assert!(
+            !unity_client.contains(&format!("pub struct {wire}")),
+            "unity/client.rs must not declare the Unity wire type `{wire}` public"
+        );
+        assert!(
+            !unity_mod.contains(wire),
+            "unity/mod.rs must not re-export the Unity wire type `{wire}`"
+        );
+        assert!(
+            !lib.contains(wire),
+            "lib.rs must not re-export the Unity wire type `{wire}`"
+        );
+    }
+}
+
+/// `list_namespace_tables` was demoted `pub` -> `pub(crate)` now that
+/// `IcebergRestCatalogClient::list_tables` is its only caller, and its `lib.rs`
+/// re-export was removed. Naming it in the `use` list above would already fail
+/// to compile; this pins the demotion at the source so a re-widening to `pub`
+/// or a re-added re-export fails here too.
+#[test]
+fn list_namespace_tables_is_no_longer_public() {
+    let namespace = source("namespace.rs");
+    assert!(
+        !namespace.contains("pub fn list_namespace_tables")
+            && !namespace.contains("pub async fn list_namespace_tables"),
+        "namespace.rs must not declare `list_namespace_tables` public — the CatalogClient \
+         trait is its only caller"
+    );
+    assert!(
+        namespace.contains("pub(crate) async fn list_namespace_tables"),
+        "list_namespace_tables must remain crate-private"
+    );
+    assert!(
+        !source("lib.rs").contains("list_namespace_tables"),
+        "lib.rs must not re-export `list_namespace_tables`"
+    );
+}
+
+/// The native Unity Catalog public items — the session, the temporary-table-
+/// credentials response type, and the vended selector — are reachable from
+/// outside the crate through the `unity` re-export.
+#[test]
+fn unity_catalog_public_items_are_reachable() {
+    let _session = UnityCatalogSession::new("http://unity", connection_creds());
+    let vended = TemporaryTableCredentials {
+        aws_temp_credentials: None,
+        azure_user_delegation_sas: None,
+        gcp_oauth_token: None,
+    };
+    let _resolved: Result<StorageBackend, UdfError> =
+        resolve_uc_vended_storage(&vended, "s3://bucket/db/t", true);
 }
 
 /// Minimal `LoadTableResult` fixture; `vended.rs`'s own helper of the same shape is
@@ -141,20 +296,34 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
     }
 }
 
-/// Extracts every variant name declared in `storage.rs`'s `enum StorageBackend`
-/// source — generically, rather than hardcoding `["S3", "Adls"]` — and asserts each
-/// appears in `vended.rs`'s production source, so a third variant added to the enum
-/// fails here until `vended.rs`'s scheme-to-variant mapping names it too.
+/// Pins `resolve_uc_vended_storage`'s arity and return type from OUTSIDE the
+/// crate: `(&TemporaryTableCredentials, storage_location: &str, allow_http: bool)
+/// -> Result<StorageBackend, UdfError>`, carrying no `warehouse`, `region`, or
+/// existing `StorageBackend` — the three vended selectors' input disjointness is
+/// enforced by this signature. A response with no usable S3 credential for an
+/// `s3://` location is a clear error, not a fabricated backend.
 #[test]
-fn vended_selector_source_names_every_storage_backend_variant() {
-    let storage_source = CATALOG_SOURCES
-        .iter()
-        .find_map(|(name, source)| (*name == "storage.rs").then_some(*source))
-        .expect("storage.rs must be present in CATALOG_SOURCES");
-    let vended_source = CATALOG_SOURCES
-        .iter()
-        .find_map(|(name, source)| (*name == "vended.rs").then_some(*source))
-        .expect("vended.rs must be present in CATALOG_SOURCES");
+fn resolve_uc_vended_storage_signature_takes_no_connection_value() {
+    let vended = TemporaryTableCredentials {
+        aws_temp_credentials: None,
+        azure_user_delegation_sas: None,
+        gcp_oauth_token: None,
+    };
+
+    let resolved: Result<StorageBackend, UdfError> =
+        resolve_uc_vended_storage(&vended, "s3://bucket/db/t", true);
+
+    assert!(
+        resolved.is_err(),
+        "an s3:// location with no vended aws credential must surface a clear error"
+    );
+}
+
+/// Every variant name declared in `storage.rs`'s `enum StorageBackend` source,
+/// extracted generically rather than hardcoding `["S3", "Adls"]`, so a third
+/// variant added to the enum propagates into every selector probe below.
+fn storage_backend_variant_names() -> Vec<&'static str> {
+    let storage_source = source("storage.rs");
 
     let enum_start = storage_source
         .find("enum StorageBackend")
@@ -185,12 +354,6 @@ fn vended_selector_source_names_every_storage_backend_variant() {
     );
     let body = &storage_source[body_start..body_end];
 
-    // Restrict to the PRODUCTION region: a variant named only inside
-    // `#[cfg(test)] mod tests` must not satisfy the probe.
-    let vended_production_source = &vended_source[..vended_source
-        .find("#[cfg(test)]")
-        .unwrap_or(vended_source.len())];
-
     let variant_names: Vec<&str> = body
         .lines()
         .map(|line| line.split("///").next().unwrap_or(line).trim())
@@ -211,14 +374,40 @@ fn vended_selector_source_names_every_storage_backend_variant() {
         "extracted no variant names from `enum StorageBackend`'s body — the probe's own \
          parsing is broken, not just failing to find a match"
     );
+    variant_names
+}
 
-    for variant in variant_names {
+/// Asserts a vended selector's PRODUCTION source names every `StorageBackend`
+/// variant in its scheme-to-variant mapping — a variant named only inside a
+/// `#[cfg(test)]` module must not satisfy the probe — so a third variant fails
+/// here until the selector maps it too.
+fn assert_source_names_every_storage_backend_variant(vended_source: &str) {
+    let production = &vended_source[..vended_source
+        .find("#[cfg(test)]")
+        .unwrap_or(vended_source.len())];
+
+    for variant in storage_backend_variant_names() {
         let qualified = format!("StorageBackend::{variant}");
         assert!(
-            vended_production_source.contains(&qualified),
-            "vended.rs's PRODUCTION source must name `{qualified}` somewhere (its \
-             scheme-to-variant mapping), but that literal does not appear outside \
-             `#[cfg(test)] mod tests`"
+            production.contains(&qualified),
+            "the vended selector's PRODUCTION source must name `{qualified}` somewhere \
+             (its scheme-to-variant mapping), but that literal does not appear outside \
+             `#[cfg(test)]`"
         );
     }
+}
+
+/// The Iceberg vended selector (`vended.rs`) names every `StorageBackend`
+/// variant in its scheme-to-variant mapping.
+#[test]
+fn vended_selector_source_names_every_storage_backend_variant() {
+    assert_source_names_every_storage_backend_variant(source("vended.rs"));
+}
+
+/// The Unity Catalog vended selector (`unity/vended.rs`) — the third
+/// backend-selection site — names every `StorageBackend` variant, so the
+/// single-home and every-variant guarantees both hold as the enum grows.
+#[test]
+fn uc_vended_selector_source_names_every_storage_backend_variant() {
+    assert_source_names_every_storage_backend_variant(source("unity/vended.rs"));
 }

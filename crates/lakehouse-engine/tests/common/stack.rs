@@ -3,7 +3,8 @@
     feature = "exasol-e2e",
     feature = "cloud-e2e",
     feature = "lakekeeper-e2e",
-    feature = "azure-e2e"
+    feature = "azure-e2e",
+    feature = "unity-e2e"
 ))]
 
 use std::time::{Duration, Instant};
@@ -264,7 +265,8 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
-    feature = "azure-e2e"
+    feature = "azure-e2e",
+    feature = "unity-e2e"
 ))]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
     // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
@@ -392,7 +394,8 @@ pub fn build_create_connection_sql(
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
-    feature = "azure-e2e"
+    feature = "azure-e2e",
+    feature = "unity-e2e"
 ))]
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
