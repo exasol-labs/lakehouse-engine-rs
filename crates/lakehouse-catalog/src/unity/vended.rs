@@ -4,20 +4,23 @@
 //! `resolve_uc_vended_storage` is a THIRD backend-selection site beside the two
 //! the Storage Backend Enum defines, reading a DISJOINT input — the Unity Catalog
 //! temporary-table-credentials response, distinct from the Iceberg REST
-//! `loadTable` response. It shares only the scheme-to-variant-kind classification
-//! with the Iceberg vended selector; each selector constructs its OWN
-//! `StorageBackend` variant from its own credential family, so the single-home
-//! rule and the probe's requirement that every variant name appear in this
-//! selector's own source are both satisfiable. It is admitted and unit-tested but
-//! wired into no selector dispatch here — Delta scan execution reaches it in
-//! #319/#320.
+//! `loadTable` response. This module reads that wire shape ONLY — it reduces the
+//! response to the neutral `VendedS3`/SAS values and hands them to the shared
+//! policy and construction in `storage`, which is what applies the consent gates
+//! and builds the `StorageBackend` variant, so neither selector names a variant
+//! itself; the probe instead requires every `VendedBackendKind` to be dispatched
+//! from this selector's own source. It is admitted and unit-tested but wired into
+//! no selector dispatch here — Delta scan execution reaches it in #319/#320.
 //!
 //! Vended secret values NEVER appear in any returned error or Debug output.
 
 use serde::Deserialize;
 
-use crate::storage::{VendedBackendKind, classify_vended_scheme};
-use crate::{AdlsCred, StorageBackend, StorageProps};
+use crate::StorageBackend;
+use crate::storage::{
+    StaticStoreAddress, VendedBackendKind, VendedS3, adls_backend, classify_vended_scheme,
+    s3_backend, scheme_of,
+};
 use exasol_udf_sdk::error::UdfError;
 
 /// The Unity Catalog temporary-table-credentials response: exactly one credential
@@ -96,24 +99,33 @@ impl std::fmt::Debug for GcpOauthToken {
 }
 
 /// Resolve the storage backend a Unity Catalog table's vended credentials
-/// describe, from the vended response, the table's storage location, and the
-/// operator's `ALLOW_HTTP` consent.
+/// describe, from the vended response, the table's storage location, the
+/// operator's `ALLOW_HTTP` consent, and the CONNECTION's store address.
 ///
 /// The backend variant comes from the storage location's URI scheme ALONE —
 /// through the one scheme-to-variant-kind home the Iceberg vended selector also
 /// uses — and never from a CONNECTION-derived value; its signature carries no
-/// `warehouse`, `region`, or existing `StorageBackend`, so the three selectors'
-/// input disjointness is enforced by the signature. Vended secret values never
-/// appear in the returned error.
+/// `warehouse`, no credential, and no existing `StorageBackend`, so the three
+/// selectors' input disjointness is enforced by the signature. Credentials come
+/// from the vended response ALONE; only the store address — `endpoint`/`region` —
+/// may cross over from the CONNECTION, independently per field, through
+/// `address`. Vended secret values never appear in the returned error.
 pub fn resolve_uc_vended_storage(
     vended: &TemporaryTableCredentials,
     storage_location: &str,
     allow_http: bool,
+    address: &StaticStoreAddress,
 ) -> Result<StorageBackend, UdfError> {
     let scheme = scheme_of(storage_location);
     match classify_vended_scheme(&scheme) {
-        Some(VendedBackendKind::S3) => s3_from_vended(vended, storage_location, allow_http),
-        Some(VendedBackendKind::Adls) => adls_from_vended(vended, storage_location),
+        Some(VendedBackendKind::S3) => {
+            let vended_s3 = uc_vended_s3(vended, storage_location)?;
+            s3_backend(vended_s3, storage_location, allow_http, address)
+        }
+        Some(VendedBackendKind::Adls) => {
+            let sas = uc_vended_sas(vended, storage_location)?;
+            adls_backend(sas, storage_location, allow_http)
+        }
         None => Err(UdfError::User(format!(
             "the Unity Catalog vended table location {storage_location} names no storage backend \
              this engine can read: expected an s3://, s3a://, abfss://, or abfs:// scheme"
@@ -121,23 +133,12 @@ pub fn resolve_uc_vended_storage(
     }
 }
 
-/// The URI scheme of `location`, lowercased per RFC 3986 §3.1, or empty when the
-/// location carries none.
-fn scheme_of(location: &str) -> String {
-    location
-        .split_once("://")
-        .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase())
-}
-
-/// The S3 backend the vended `aws_temp_credentials` describe. No CONNECTION
-/// `endpoint`/`region` is read: the endpoint stays empty unless the response vends
-/// one, and a vended plaintext `http` endpoint is honored only under `ALLOW_HTTP`,
-/// matching the Iceberg vended selector's plaintext consent gate.
-fn s3_from_vended(
-    vended: &TemporaryTableCredentials,
-    location: &str,
-    allow_http: bool,
-) -> Result<StorageBackend, UdfError> {
+/// The neutral S3 credential and address values the vended `aws_temp_credentials`
+/// describe, before the shared plaintext-transport and address-resolution policy
+/// in `storage::s3_backend` runs. Unity's wire shape carries no `region` and no
+/// explicit path-style-access field, so both are left unset for the shared
+/// derivation to resolve.
+fn uc_vended_s3(vended: &TemporaryTableCredentials, location: &str) -> Result<VendedS3, UdfError> {
     let aws = vended
         .aws_temp_credentials
         .as_ref()
@@ -149,81 +150,33 @@ fn s3_from_vended(
                  response carried no aws_temp_credentials"
             ))
         })?;
-    let endpoint = aws
-        .endpoint
-        .as_deref()
-        .filter(|endpoint| !endpoint.is_empty());
-    if !allow_http
-        && let Some(endpoint) = endpoint
-        && endpoint
-            .split_once("://")
-            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
-    {
-        return Err(UdfError::User(format!(
-            "the Unity Catalog vended the plaintext endpoint {endpoint} for table location \
-             {location}, but the ALLOW_HTTP virtual-schema property is false: a catalog cannot move \
-             vended credentials onto plaintext transport without the operator's consent"
-        )));
-    }
-    Ok(StorageBackend::S3(StorageProps {
-        endpoint: endpoint.unwrap_or_default().to_string(),
-        region: String::new(),
+    Ok(VendedS3 {
         access_key: aws.access_key_id.clone(),
         secret_key: aws.secret_access_key.clone(),
         session_token: aws.session_token.clone().filter(|token| !token.is_empty()),
-        allow_http,
-        path_style: endpoint.is_some(),
-    }))
+        region: None,
+        endpoint: aws.endpoint.clone().filter(|endpoint| !endpoint.is_empty()),
+        path_style: None,
+    })
 }
 
-/// The ADLS backend the vended `azure_user_delegation_sas` describes, with the
-/// account name recovered from the storage location's host so the SAS and account
-/// stay consistent. No CONNECTION `account_name`/`account_key`/`sas_token` is read.
-fn adls_from_vended(
-    vended: &TemporaryTableCredentials,
-    location: &str,
-) -> Result<StorageBackend, UdfError> {
-    let sas = vended
+/// The neutral SAS token the vended `azure_user_delegation_sas` describes, before
+/// the shared `abfs://` consent gate and account-name derivation in
+/// `storage::adls_backend` run.
+fn uc_vended_sas(vended: &TemporaryTableCredentials, location: &str) -> Result<String, UdfError> {
+    vended
         .azure_user_delegation_sas
         .as_ref()
         .map(|sas| sas.sas_token.as_str())
         .filter(|token| !token.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             UdfError::User(format!(
                 "the Unity Catalog returned no usable ADLS credential for the table location \
                  {location}: its scheme selects the ADLS backend but the temporary-credentials \
                  response carried no azure_user_delegation_sas"
             ))
-        })?;
-    let host = location_host(location);
-    let account_name = host
-        .split('.')
-        .next()
-        .filter(|label| !label.is_empty())
-        .ok_or_else(|| {
-            UdfError::User(format!(
-                "the Unity Catalog table location {location} carries no ADLS account name in its \
-                 host '{host}': expected the <account> of <account>.dfs.core.windows.net"
-            ))
-        })?;
-    Ok(StorageBackend::Adls {
-        account_name: account_name.to_string(),
-        cred: AdlsCred::Sas(sas.to_string()),
-    })
-}
-
-/// The storage host of a table location: its authority segment, read after any
-/// `<container>@` userinfo.
-fn location_host(location: &str) -> &str {
-    let after_scheme = location
-        .split_once("://")
-        .map_or(location, |(_, rest)| rest);
-    let authority = after_scheme
-        .split_once('/')
-        .map_or(after_scheme, |(authority, _)| authority);
-    authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host)
+        })
 }
 
 #[cfg(test)]

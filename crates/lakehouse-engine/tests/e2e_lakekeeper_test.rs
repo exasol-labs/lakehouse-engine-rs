@@ -59,8 +59,8 @@ use common::stack::{
 
 use futures::TryStreamExt;
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, ConnectionCreds, StorageBackend, load_table_any_auth,
-    redact_secret_values,
+    CatalogProps, CatalogSession, ConnectionCreds, StaticStoreAddress, StorageBackend,
+    load_table_any_auth, redact_secret_values,
 };
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
@@ -346,11 +346,12 @@ fn lakekeeper_static_creds_projection_filter_limit() {
 /// static storage field at all.
 ///
 /// The empty-static shape asserted below is the REQUIRED shape of a vended CONNECTION,
-/// not merely sufficient evidence of delegation: scheme-driven resolution builds the
-/// backend from the `loadTable` response ALONE, so a static `endpoint`, `region`, or
-/// key pair would be a live credential that is never read. With nothing to substitute
-/// for either a credential or the store address, the row set below can only have come
-/// through the `X-Iceberg-Access-Delegation: vended-credentials` request.
+/// not merely sufficient evidence of delegation: a static key pair would be a live
+/// credential that is never read, but a static `endpoint` or `region` would OVERRIDE
+/// the vended store address (`storage::resolved_address_field` prefers the CONNECTION
+/// value per field). With nothing to substitute for either a credential or the store
+/// address, the row set below can only have come through the
+/// `X-Iceberg-Access-Delegation: vended-credentials` request.
 #[test]
 fn lakekeeper_vended_creds_projection_filter() {
     setup();
@@ -367,9 +368,9 @@ fn lakekeeper_vended_creds_projection_filter() {
             && vended_pw.region.is_empty()
             && vended_pw.access_key.is_empty()
             && vended_pw.secret_key.is_empty(),
-        "a vended CONNECTION must carry NO static storage field: scheme-driven resolution \
-         builds the backend from the loadTable response alone, so a static endpoint, region, \
-         or key pair would be an unread credential rather than a fallback"
+        "a vended CONNECTION must carry NO static storage field: a static key pair would be \
+         an unread credential, while a static endpoint or region would OVERRIDE the vended \
+         store address"
     );
 
     // Same query shape as the static warehouse — results must be identical.
@@ -679,8 +680,13 @@ async fn probe_vended_credential(
          entry is selected BY that location, so the probe has no anchor to select with"
     );
     let (bucket, key_prefix) = split_s3_uri(&location);
-    let backend = lakehouse_catalog::resolve_vended_storage(&result, &location, true)
-        .unwrap_or_else(|e| panic!("resolve_vended_storage for {table} ({location}) failed: {e}"));
+    let backend = lakehouse_catalog::resolve_vended_storage(
+        &result,
+        &location,
+        true,
+        &StaticStoreAddress::from(creds),
+    )
+    .unwrap_or_else(|e| panic!("resolve_vended_storage for {table} ({location}) failed: {e}"));
     let StorageBackend::S3(props) = backend else {
         panic!("this fixture is MinIO (s3://): {table} ({location}) vended a non-S3 backend");
     };

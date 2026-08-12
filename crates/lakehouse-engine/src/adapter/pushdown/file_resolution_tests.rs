@@ -958,11 +958,16 @@ fn one_request_sigv4_creds() -> ConnectionCreds {
     }
 }
 
-/// Drive `resolve_file_list` against a single-shot loopback catalog that
-/// answers `loadTable` with an empty table location.
-async fn resolve_file_list_against_locationless_catalog(
+/// Drive `resolve_file_list` against a single-shot loopback catalog serving
+/// `body` as its one `loadTable` response, and answer with the EFFECTIVE storage
+/// it resolved for `db.t`.
+///
+/// One response is enough because the credentials are SigV4: `CatalogSession::resolve`
+/// contacts no catalog under them, so the `loadTable` GET is the only request issued.
+async fn effective_storage_from_loopback_catalog(
     creds: &ConnectionCreds,
-) -> Result<(), UdfError> {
+    body: String,
+) -> Result<StorageBackend, UdfError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -974,7 +979,6 @@ async fn resolve_file_list_against_locationless_catalog(
         let mut buf = vec![0u8; 4096];
         let _n = stream.read(&mut buf).await.expect("read");
 
-        let body = load_table_body_with_empty_location();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -994,13 +998,23 @@ async fn resolve_file_list_against_locationless_catalog(
 
     let result = resolve_file_list(&session, &catalog, &sample_storage(), creds, true, None)
         .await
-        .map(|_| ());
+        .map(|(_, storage, ..)| storage);
 
     server
         .await
         .expect("the loopback catalog fake must serve its one response without panicking");
 
     result
+}
+
+/// Drive `resolve_file_list` against a single-shot loopback catalog that
+/// answers `loadTable` with an empty table location.
+async fn resolve_file_list_against_locationless_catalog(
+    creds: &ConnectionCreds,
+) -> Result<(), UdfError> {
+    effective_storage_from_loopback_catalog(creds, load_table_body_with_empty_location())
+        .await
+        .map(|_| ())
 }
 
 /// A `loadTable` response with an empty table `location` is rejected as a
@@ -1052,5 +1066,105 @@ async fn absent_table_location_errors_on_both_vended_and_static_paths() {
         vended_message, static_message,
         "both paths must surface the SAME absent-location error — the vended-credential \
          flag must not change how a malformed catalog response is diagnosed"
+    );
+}
+
+/// The store address the CONNECTION configures, and the DIFFERENT one the catalog
+/// vends for the very same table. Every value is distinct, so which source placed
+/// the resolved store is readable off the resolved value alone.
+const CONNECTION_ENDPOINT: &str = "https://connection-store.example.com";
+const CONNECTION_REGION: &str = "eu-central-1";
+const VENDED_ENDPOINT: &str = "https://vended-store.example.com";
+const VENDED_REGION: &str = "us-west-2";
+const VENDED_ACCESS_KEY: &str = "vended-access-key";
+const VENDED_SECRET_KEY: &str = "vended-secret-key";
+const VENDED_SESSION_TOKEN: &str = "vended-session-token";
+
+/// A `loadTable` response vending a complete S3 credential set AND a store address
+/// of its own, for a table whose metadata carries NO snapshot.
+///
+/// The absent snapshot is what keeps this a pure unit test: `TableScanBuilder::build`
+/// answers an empty `TableScan` when `current_snapshot()` is `None`, so
+/// `resolve_file_list` reaches its effective-storage decision and returns without
+/// reading a single object from the store that address names.
+fn load_table_body_vending_its_own_store_address() -> String {
+    serde_json::json!({
+        "metadata-location": "s3://bucket/db/t/metadata/v1.json",
+        "metadata": {
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000002",
+            "location": "s3://bucket/db/t",
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 0,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "snapshots": []
+        },
+        "config": {
+            "s3.access-key-id": VENDED_ACCESS_KEY,
+            "s3.secret-access-key": VENDED_SECRET_KEY,
+            "s3.session-token": VENDED_SESSION_TOKEN,
+            "client.region": VENDED_REGION,
+            "s3.endpoint": VENDED_ENDPOINT
+        }
+    })
+    .to_string()
+}
+
+/// Under vending, a CONNECTION-configured `endpoint` and `region` place the store
+/// while the credentials still come from the catalog alone.
+///
+/// This is the only test at the layer that PERFORMS the split: `resolve_file_list`
+/// is what narrows the CONNECTION down to a `StaticStoreAddress` before handing it
+/// to the vended selector. Both vended E2E fixtures carry CONNECTIONs with an empty
+/// `endpoint` and `region`, so neither can tell an address that came from the
+/// CONNECTION from one that came from nowhere — substituting
+/// `&StaticStoreAddress::default()` at that call site fails HERE and nowhere else.
+#[tokio::test]
+async fn vended_addressing_prefers_the_connection_endpoint_and_region() {
+    let mut creds = one_request_sigv4_creds();
+    creds.use_vended_credentials = true;
+    creds.endpoint = CONNECTION_ENDPOINT.into();
+    creds.region = CONNECTION_REGION.into();
+
+    let storage = effective_storage_from_loopback_catalog(
+        &creds,
+        load_table_body_vending_its_own_store_address(),
+    )
+    .await
+    .expect("a vended key pair over a snapshotless s3:// table must resolve a backend");
+
+    let StorageBackend::S3(props) = storage else {
+        panic!("an s3:// table location must resolve an S3 backend");
+    };
+
+    assert_eq!(
+        props.endpoint, CONNECTION_ENDPOINT,
+        "the CONNECTION's endpoint must place the store, not the vended {VENDED_ENDPOINT}"
+    );
+    assert_eq!(
+        props.region, CONNECTION_REGION,
+        "the CONNECTION's region must place the store, not the vended {VENDED_REGION}"
+    );
+    assert_eq!(
+        props.access_key, VENDED_ACCESS_KEY,
+        "the access key must come from the catalog alone: the CONNECTION reaches this \
+         resolution as an ADDRESS, and must never supply a storage credential"
+    );
+    assert_eq!(
+        props.secret_key, VENDED_SECRET_KEY,
+        "the secret key must come from the catalog alone: the CONNECTION reaches this \
+         resolution as an ADDRESS, and must never supply a storage credential"
+    );
+    assert_eq!(
+        props.session_token.as_deref(),
+        Some(VENDED_SESSION_TOKEN),
+        "the vended session token must reach the effective storage the scan reads with"
     );
 }

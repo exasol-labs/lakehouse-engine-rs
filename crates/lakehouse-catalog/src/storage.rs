@@ -10,10 +10,19 @@
 //! is the one place those keys are named, and both the REST-catalog props map and
 //! the `FileIO` are configured from it, so neither can drift from the other.
 //!
+//! It is, third, the single home for vended-storage POLICY and CONSTRUCTION: the
+//! `abfs://` and plaintext-endpoint consent gates, the CONNECTION-wins
+//! store-address rule, and the two `StorageBackend` constructions both catalog
+//! kinds share. It lives here because this enum's own module already owns which
+//! module may name a variant, so the Iceberg and Unity Catalog vended selectors
+//! fork only on how a value is read off the wire, never on what makes it
+//! acceptable.
+//!
 //! Credential values NEVER appear in any returned error;
 //! [`StorageBackend::secret_values`] is what the redaction sites strip against.
 
-use crate::StorageProps;
+use crate::{ConnectionCreds, StorageProps};
+use exasol_udf_sdk::error::UdfError;
 use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, ADLS_SAS_TOKEN, FileIOBuilder, S3_ACCESS_KEY_ID,
     S3_ENDPOINT, S3_PATH_STYLE_ACCESS, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN,
@@ -192,6 +201,206 @@ pub(crate) fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> 
         "abfs" | "abfss" => Some(VendedBackendKind::Adls),
         _ => None,
     }
+}
+
+/// The URI scheme of a vended table location, lowercased per RFC 3986 §3.1, or
+/// empty when the location carries none.
+pub(crate) fn scheme_of(location: &str) -> String {
+    location
+        .split_once("://")
+        .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase())
+}
+
+/// The storage host of a table location: its authority segment, read after any
+/// `<container>@` userinfo. For ADLS that is the `<account>.dfs.core.windows.net`
+/// the vended SAS keys are suffixed with, so one reading serves both the SAS
+/// selection and the account name.
+pub(crate) fn location_host(location: &str) -> &str {
+    let after_scheme = location
+        .split_once("://")
+        .map_or(location, |(_, rest)| rest);
+    let authority = after_scheme
+        .split_once('/')
+        .map_or(after_scheme, |(authority, _)| authority);
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+}
+
+/// The ADLS account name the storage host of `location` names: the first
+/// dot-separated label of [`location_host`]'s result for it, the `<account>` of
+/// `<account>.dfs.core.windows.net`. The host is derived here rather than taken
+/// as a second argument, so it cannot be paired with a location it was not read
+/// from — a refusal always names a host the location actually has. Both vended
+/// selectors read the account name from the same host their SAS selection
+/// matched, so a disagreeing account name can never desynchronise from the SAS
+/// it travels with, and share this one refusal text, which names neither catalog
+/// kind.
+///
+/// The label is read from the host byte-exactly, never case-folded: the
+/// downstream `adls.account-name` wrong-account guard compares it byte-for-byte
+/// against the account parsed out of each file URI
+/// (`iceberg-storage-opendal-0.10.0/src/azdls.rs:165`), so case-folding it here
+/// would fire that guard on the very locations it was derived from.
+fn adls_account_name(location: &str) -> Result<&str, UdfError> {
+    let host = location_host(location);
+    host.split('.')
+        .next()
+        .filter(|label| !label.is_empty())
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "vended credentials were requested for table location {location}, but its storage \
+             host '{host}' carries no leading label to read an ADLS account name from: expected \
+             the <account> of <account>.dfs.core.windows.net"
+            ))
+        })
+}
+
+/// The store address a vended resolution may take from the CONNECTION: an S3
+/// endpoint and a region, and nothing else.
+///
+/// Under vending the catalog's response is the sole source of CREDENTIALS, while
+/// ADDRESSING may still come from the CONNECTION. Handing the selectors
+/// `&ConnectionCreds` to express that would put every static credential back
+/// within their reach, so the parameter is narrowed to a type that CANNOT carry
+/// one. Both fields are private, which leaves [`Default`] and the single
+/// [`From<&ConnectionCreds>`] conversion below as the only constructions
+/// reachable outside this module — widening what crosses over is then an edit to
+/// that one conversion rather than a field a distant call site can set.
+#[derive(Debug, Default)]
+pub struct StaticStoreAddress {
+    endpoint: String,
+    region: String,
+}
+
+impl StaticStoreAddress {
+    /// The CONNECTION's S3 endpoint, empty when it configured none.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The CONNECTION's S3 region, empty when it configured none.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+}
+
+impl From<&ConnectionCreds> for StaticStoreAddress {
+    fn from(creds: &ConnectionCreds) -> Self {
+        Self {
+            endpoint: creds.endpoint.clone(),
+            region: creds.region.clone(),
+        }
+    }
+}
+
+/// The S3 credential and address values a vended response yields, in the neutral
+/// shape both catalog kinds reduce to before the shared policy runs.
+///
+/// The two wire shapes genuinely differ — a flat map of Iceberg REST config keys,
+/// and Unity Catalog's typed `aws_temp_credentials` — but what makes the
+/// resulting values acceptable does not, so the fork stops at this type.
+/// `path_style` is an `Option` because "the response stated no
+/// `s3.path-style-access`" is a third state the derivation branches on, distinct
+/// from a stated `false`. Carries live credentials, so it deliberately derives no
+/// `Debug`.
+pub(crate) struct VendedS3 {
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) session_token: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) path_style: Option<bool>,
+}
+
+/// The S3 backend a vended credential family describes for `location`, addressed
+/// by the CONNECTION-wins rule and refused when the resolved endpoint names
+/// plaintext transport the operator has not consented to.
+///
+/// Credentials come from `vended` ALONE; only the ADDRESS may cross over from the
+/// CONNECTION, independently per field. The gate reads the RESOLVED endpoint
+/// rather than the vended one because either source can name plaintext transport,
+/// and the one that wins the address rule is the one the scan actually reads
+/// through.
+///
+/// An address that resolves both fields empty is a SUCCESS, not a refusal: AWS's
+/// default credential and region chain places the store from the ambient
+/// environment at read time, and a real Databricks AWS response vends a key pair
+/// with no endpoint and no region at all — rejecting it at plan time would refuse
+/// a legal table.
+///
+/// `path_style` falls back to whether an endpoint resolved at all, because
+/// `register_side_store` treats it as the gate on whether `endpoint` reaches
+/// `AmazonS3Builder` — an endpoint beside `path_style: false` would be silently
+/// dropped for a virtual-hosted host derived from the region, which is the wrong
+/// store rather than a plan-time error. A value the response states still wins.
+pub(crate) fn s3_backend(
+    vended: VendedS3,
+    location: &str,
+    allow_http: bool,
+    address: &StaticStoreAddress,
+) -> Result<StorageBackend, UdfError> {
+    let endpoint = resolved_address_field(address.endpoint(), vended.endpoint.as_deref());
+    let region = resolved_address_field(address.region(), vended.region.as_deref());
+
+    if !allow_http
+        && endpoint
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("http"))
+    {
+        return Err(UdfError::User(format!(
+            "the plaintext endpoint {endpoint} resolves the store address for table location \
+             {location}, but the ALLOW_HTTP virtual-schema property is false: vended credentials \
+             cannot move onto plaintext transport without the operator's consent, whether the \
+             catalog vended that endpoint or the CONNECTION configured it"
+        )));
+    }
+
+    let path_style = vended.path_style.unwrap_or(!endpoint.is_empty());
+
+    Ok(StorageBackend::S3(StorageProps {
+        endpoint,
+        region,
+        access_key: vended.access_key,
+        secret_key: vended.secret_key,
+        session_token: vended.session_token,
+        allow_http,
+        path_style,
+    }))
+}
+
+fn resolved_address_field(connection: &str, vended: Option<&str>) -> String {
+    if !connection.is_empty() {
+        return connection.to_string();
+    }
+    vended.unwrap_or_default().to_string()
+}
+
+/// The ADLS backend a vended SAS describes for `location`, refused when the
+/// location names plaintext transport the operator has not consented to.
+///
+/// The gate lives inside the construction rather than at the scheme
+/// classification so that reaching a backend is what enforces it: a selector
+/// that classifies and then constructs cannot end up ungated by omitting a match
+/// arm, which is exactly how the two selectors drifted apart.
+pub(crate) fn adls_backend(
+    sas: String,
+    location: &str,
+    allow_http: bool,
+) -> Result<StorageBackend, UdfError> {
+    if scheme_of(location) == "abfs" && !allow_http {
+        return Err(UdfError::User(format!(
+            "vended credentials were requested for the plaintext table location {location}, but \
+             the ALLOW_HTTP virtual-schema property is false: abfs:// names plaintext transport, \
+             and this engine has no plaintext Azure path — it would silently read the location \
+             over HTTPS instead, so honouring it requires the operator's explicit ALLOW_HTTP \
+             acknowledgement rather than a silent scheme upgrade"
+        )));
+    }
+    Ok(StorageBackend::Adls {
+        account_name: adls_account_name(location)?.to_string(),
+        cred: AdlsCred::Sas(sas),
+    })
 }
 
 #[cfg(test)]
