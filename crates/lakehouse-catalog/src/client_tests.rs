@@ -240,10 +240,11 @@ struct RequestLog {
 /// Serves the namespace enumeration `list_tables` (`GET .../namespaces/{ns}/tables`)
 /// with the `tables` identifiers in `namespace`, and reports no child namespaces
 /// (`GET .../namespaces?parent=`) so the recursion terminates. Every enumerated
-/// table then loads: one in `not_loadable` answers `loadTable` with HTTP 404 (the
-/// catalog's "not a loadable Iceberg table" signal); every other answers with a
-/// two-column (`id` long, `name` string) result. Returns the catalog URI and the
-/// shared log.
+/// table then loads: one in `server_error` answers `loadTable` with HTTP 500 (a
+/// catalog fault — NOT the "not an Iceberg table" signal), one in `not_loadable`
+/// answers `loadTable` with HTTP 404 (the catalog's "not a loadable Iceberg
+/// table" signal), and every other answers with a two-column (`id` long, `name`
+/// string) result. Returns the catalog URI and the shared log.
 ///
 /// Responses close the connection so the pooled `reqwest` client opens a fresh
 /// connection per request, letting a single-threaded accept loop serve the whole
@@ -252,6 +253,7 @@ async fn spawn_mock_catalog(
     namespace: &[&str],
     tables: &[&str],
     not_loadable: &[&str],
+    server_error: &[&str],
 ) -> (String, Arc<Mutex<RequestLog>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -260,6 +262,7 @@ async fn spawn_mock_catalog(
     let uri = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let log = Arc::new(Mutex::new(RequestLog::default()));
     let not_loadable: Vec<String> = not_loadable.iter().map(|s| s.to_string()).collect();
+    let server_error: Vec<String> = server_error.iter().map(|s| s.to_string()).collect();
     let list_tables_body = list_tables_response(namespace, tables);
 
     let server_log = log.clone();
@@ -302,7 +305,11 @@ async fn spawn_mock_catalog(
                     .unwrap()
                     .load_table_names
                     .push(table.to_string());
-                if not_loadable.iter().any(|t| t == table) {
+                if server_error.iter().any(|t| t == table) {
+                    // A catalog fault (unreachable/broken), NOT "not an Iceberg
+                    // table" — enumeration must abort, not skip.
+                    ("500 Internal Server Error", String::new())
+                } else if not_loadable.iter().any(|t| t == table) {
                     (
                         "404 Not Found",
                         r#"{"error":"not an iceberg table"}"#.to_string(),
@@ -404,7 +411,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
 /// would push the count above one.
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
-    let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[]).await;
+    let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
     let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
 
     let listing = client
@@ -428,7 +435,8 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
 /// original case.
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
-    let (uri, log) = spawn_mock_catalog(&["sales"], &["orders", "customers", "returns"], &[]).await;
+    let (uri, log) =
+        spawn_mock_catalog(&["sales"], &["orders", "customers", "returns"], &[], &[]).await;
     let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
 
     let listing = client
@@ -460,7 +468,7 @@ async fn enumeration_builds_exactly_one_session() {
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
-        spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &["hive_events"]).await;
+        spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &["hive_events"], &[]).await;
     let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
 
     let listing = client
@@ -484,5 +492,26 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
             name: "hive_events".to_string(),
         }],
         "the 404 table is reported skipped, verbatim"
+    );
+}
+
+/// Driving the PUBLIC `list_tables`: a non-404 `loadTable` failure (HTTP 500 —
+/// an unreachable/broken catalog, NOT "not an Iceberg table") aborts the whole
+/// enumeration with `Err`. The batch must never come back a short listing that
+/// looks complete: a table silently vanishing behind a catalog fault is the
+/// failure this guards. Guards `is_not_loadable_iceberg_table`'s non-404 branch
+/// against being widened to "any load failure = skip".
+#[tokio::test]
+async fn non_404_load_failure_aborts_the_batch() {
+    let (uri, _log) =
+        spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
+    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+
+    let result = client.list_tables(&["prod".to_string()]).await;
+
+    assert!(
+        result.is_err(),
+        "a 500 on loadTable is a catalog fault and must abort enumeration, \
+         not be routed into a skipped entry: {result:?}"
     );
 }

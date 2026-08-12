@@ -37,7 +37,7 @@ services:
     # core E2E dependency is a silent-CI-break risk. 0.5.0 is the current UC OSS
     # server line. NOTE: the image is large (~5.7 GB, bundles a JDK); the CI
     # e2e-setup free-disk step already accounts for heavy images.
-    image: "${LH_UNITY_IMAGE:-unitycatalog/unitycatalog:latest}"
+    image: "${LH_UNITY_IMAGE:-unitycatalog/unitycatalog:v0.5.0}"
     depends_on:
       minio:
         condition: service_healthy
