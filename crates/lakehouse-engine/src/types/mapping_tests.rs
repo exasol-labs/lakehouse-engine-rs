@@ -201,6 +201,22 @@ fn iceberg_types_map_to_exasol_type() {
         })),
         "VARCHAR(2000000)"
     );
+    // precision = 0 → VARCHAR
+    assert_eq!(
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        })),
+        "VARCHAR(2000000)"
+    );
+    // scale > precision → VARCHAR
+    assert_eq!(
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 5,
+            scale: 10,
+        })),
+        "VARCHAR(2000000)"
+    );
     // incompatible primitive → VARCHAR
     assert_eq!(
         iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Binary)),
@@ -422,6 +438,23 @@ fn iceberg_type_to_arrow_maps_all_families() {
         iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
             precision: 18,
             scale: 37,
+        })),
+        DataType::Utf8
+    );
+    // precision 0 — outside Exasol's catalog-decimal domain, and an Arrow
+    // precision arrow-rs refuses to build an array with
+    assert_eq!(
+        iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 0,
+            scale: 0,
+        })),
+        DataType::Utf8
+    );
+    // scale > precision — likewise rejected by arrow-rs
+    assert_eq!(
+        iceberg_type_to_arrow(&Type::Primitive(PrimitiveType::Decimal {
+            precision: 5,
+            scale: 10,
         })),
         DataType::Utf8
     );
@@ -841,4 +874,63 @@ fn incompatible_unity_types_declared_varchar() {
         }),
         "VARCHAR(2000000)"
     );
+    // precision = 0
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "DECIMAL".to_string(),
+            precision: 0,
+            scale: 0,
+        }),
+        "VARCHAR(2000000)"
+    );
+    // scale > precision
+    assert_eq!(
+        column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "DECIMAL".to_string(),
+            precision: 5,
+            scale: 10,
+        }),
+        "VARCHAR(2000000)"
+    );
+}
+
+/// Scenario (datafusion-scan/type-mapping): A catalog-declared DECIMAL outside
+/// Exasol's DECIMAL domain falls back to VARCHAR — identically for both
+/// catalog kinds, since both read the same shared guard.
+#[test]
+fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
+    let cases = [
+        (0, 0, "VARCHAR(2000000)"),
+        (0, 5, "VARCHAR(2000000)"),
+        (5, 10, "VARCHAR(2000000)"),
+        (5, 6, "VARCHAR(2000000)"),
+        (1, 0, "DECIMAL(1,0)"),
+        (18, 4, "DECIMAL(18,4)"),
+        (36, 36, "DECIMAL(36,36)"),
+        (37, 0, "VARCHAR(2000000)"),
+        (38, 10, "VARCHAR(2000000)"),
+        (18, 37, "VARCHAR(2000000)"),
+    ];
+    for (precision, scale, expected) in cases {
+        let iceberg_result = column_source_type_to_exasol(&ColumnSourceType::Iceberg(
+            Type::Primitive(PrimitiveType::Decimal { precision, scale }),
+        ));
+        let unity_result = column_source_type_to_exasol(&ColumnSourceType::Unity {
+            type_name: "DECIMAL".to_string(),
+            precision,
+            scale,
+        });
+        assert_eq!(
+            iceberg_result, expected,
+            "iceberg precision={precision} scale={scale}"
+        );
+        assert_eq!(
+            unity_result, expected,
+            "unity precision={precision} scale={scale}"
+        );
+        assert_eq!(
+            iceberg_result, unity_result,
+            "kinds diverged for precision={precision} scale={scale}"
+        );
+    }
 }

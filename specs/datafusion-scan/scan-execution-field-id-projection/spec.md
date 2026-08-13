@@ -85,6 +85,51 @@ column is nullable and defines no default.
   engine returns the `initial-default` (rule 3) rather than the partition value (rule 1). For
   an ADDED column read from older files this is the correct and only-available value, so this
   ordering is a deliberate, accurately-scoped trade-off, not a silent gap.
+* **This delta adds ONE scenario and is issue #329.** It records the domain gate on the VS's
+  `initial-default` encoding step for an Iceberg `decimal(P,S)` whose precision and scale fall
+  outside Exasol's catalog-decimal domain. `encode_initial_default`
+  (`crates/lakehouse-engine/src/adapter/pushdown/file_resolution.rs`) carried its own copy of the
+  predicate `precision <= 36 && scale <= 36`, held in agreement with the Arrow-type tag only by
+  convention. Nothing else in this feature changes: field-id resolution, the
+  `schema.name-mapping.default` fallback, the per-file default fill, the required-absent error,
+  the round-trip vocabulary, and the no-logical-schema fallback are all untouched.
+* **The gate reads the domain from `datafusion-scan/type-mapping` and does NOT restate it.** That
+  feature owns the predicate `exasol_representable_catalog_decimal` (`1 ≤ p ≤ 36` and `s ≤ p`), its
+  single-owner requirement, and the Exasol target-type trade-off behind it. This feature records
+  only that the encoding gate reads its answer from that one owner, which is what makes the encoded
+  default agree with the field's Arrow-type tag by construction rather than by two guards happening
+  to carry the same text.
+* **Divergence here is a silent WRONG VALUE, not a stale duplicate.** `datafusion-scan/type-mapping`
+  now maps a catalog decimal outside the domain to the `utf8` tag. The scan side reconstructs an
+  encoded default against that tag ALONE, so a decimal default still encoded as the literal's raw
+  unscaled `i128` mantissa comes back as that mantissa's DIGITS in a string column — an
+  `initial-default` of unscaled `1234` on a `decimal(5,10)` field surfacing as the string `"1234"`.
+  That is fabricated data, the outcome this feature's required-absent error and NULL fallback exist
+  to avoid.
+* **Leaving the default absent lands the field on an EXISTING recorded path, so no new scan-time
+  behavior is introduced.** The recorded scenario "The VS encodes each field's Iceberg
+  initial-default once per query into the scan spec" already leaves the encoded default absent for a
+  field whose `initial-default` is non-primitive, "so those fields fall through to NULL or the
+  required-absent error at scan time". A decimal outside Exasol's domain joins that same class: its
+  default is not representable under the tag its column actually carries.
+* **Apache Iceberg spec check — the field takes Column Projection rule (4) where the spec would take
+  rule (3), and that is a named Exasol target-type trade-off rather than a silent gap.** The spec's
+  ordered process runs "(3) Return the default value if it has a defined `initial-default`" before
+  "(4) Return `null` in all other cases". A `decimal(P,S)` with `P = 0` or `S > P` is spec-legal —
+  the Primitive Types table constrains only "Scale is fixed, precision must be 38 or less" — so a
+  field of that type carrying an `initial-default` is a case where this engine returns NULL, or the
+  required-absent error, where the spec defines a default. Exasol has no such `DECIMAL`, so the
+  column carries the `utf8` tag and the compact tag vocabulary holds no scale to render the literal
+  against. Rendering the correctly-scaled decimal TEXT under that tag would restore rule (3) and is
+  NOT implemented here.
+* **No tracked-exception issue is opened for that deviation, and the reachability that justifies it
+  is stated rather than assumed.** The alternative on offer was never rule (3) but a fabricated
+  value, since the unchanged gate encoded the raw unscaled mantissa. Reaching the case at all needs
+  all three of: a catalog serving a `decimal(P,S)` with `P = 0` or `S > P`, a non-null
+  `initial-default` declared on that field, and therefore a format-version-3 table — this feature
+  already records that "Non-null Iceberg `initial-default` values require table format-version 3".
+  Nothing is dropped or left untyped: the column itself stays queryable as a JSON-fallback
+  `VARCHAR(2000000)` string.
 
 ## Scenarios
 
@@ -172,4 +217,14 @@ column is nullable and defines no default.
 * *GIVEN* a scan spec that predates the logical-schema field (the logical schema is absent)
 * *WHEN* the scan UDF runs for that spec
 * *THEN* the UDF SHALL register the files with a schema inferred from the first file and bind columns by physical name, unchanged from prior behavior
+
+### Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
+
+* *GIVEN* a virtual schema query whose Iceberg current schema defines a field of type `decimal(P,S)` whose precision and scale fall OUTSIDE Exasol's catalog-decimal domain — `P = 0`, or `S > P` — and which declares a non-null primitive `initial-default`
+* *AND* that field's Arrow-type tag is therefore `utf8` rather than `decimal128(P,S)`, per `datafusion-scan/type-mapping`
+* *WHEN* the VS planning layer builds the logical schema from the Iceberg current schema and encodes each field's `initial-default`
+* *THEN* the VS SHALL gate the decimal encoding on the SAME predicate `datafusion-scan/type-mapping` owns, and MUST NOT carry its own copy of the precision/scale condition, so one predicate decides both the Arrow-type tag and whether a default is encoded
+* *AND* the VS SHALL leave that field's encoded default ABSENT, so the field falls through to NULL (nullable) or the required-absent error at scan time, exactly as a field carrying a non-primitive `initial-default` already does
+* *AND* the VS MUST NOT encode the decimal literal's raw unscaled `i128` mantissa as that field's default, because the scan side reconstructs an encoded default against the Arrow-type tag alone: under a `utf8` tag that mantissa reconstructs as its DIGITS in a string column, a fabricated value rather than a clean fallback
+* *AND* a decimal field INSIDE the domain SHALL keep its recorded behavior byte-identical — its tag stays `decimal128(P,S)`, its `initial-default` is still encoded, and it still reconstructs to a `ScalarValue` matching that tag across the serialization round-trip
 * *AND* the field-id expression adapter MUST NOT be installed for that scan

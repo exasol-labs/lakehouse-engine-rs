@@ -671,6 +671,62 @@ fn build_logical_schema_omits_default_for_no_default_field() {
     );
 }
 
+/// A decimal outside Exasol's catalog-decimal domain reaches only the `"utf8"`
+/// Arrow tag, so its `initial-default` must encode NO default: the scan side
+/// reconstructs an encoded default against the tag alone, so a raw `i128`
+/// mantissa carried under `"utf8"` would come back as that mantissa's digits in
+/// a string column. Pins the encoding gate to the shared domain predicate.
+#[test]
+fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
+    use std::sync::Arc;
+
+    let schema = Schema::builder()
+        .with_schema_id(1)
+        .with_fields(vec![
+            Arc::new(
+                NestedField::optional(
+                    1,
+                    "scale_over_precision",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 5,
+                        scale: 10,
+                    }),
+                )
+                .with_initial_default(Literal::decimal(1234)),
+            ),
+            Arc::new(
+                NestedField::optional(
+                    2,
+                    "zero_precision",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 0,
+                        scale: 0,
+                    }),
+                )
+                .with_initial_default(Literal::decimal(0)),
+            ),
+        ])
+        .build()
+        .unwrap();
+
+    let logical = build_logical_schema(&schema);
+
+    assert_eq!(logical.len(), 2);
+    for field in &logical {
+        assert_eq!(
+            field.arrow_type, "utf8",
+            "field {} must fall back to the utf8 tag",
+            field.name
+        );
+        assert!(
+            field.initial_default.is_none(),
+            "field {} must encode no default under the utf8 tag",
+            field.name
+        );
+    }
+}
+
 /// A NON-primitive (struct) `initial-default` encodes NO default: Exasol has no
 /// struct type (it surfaces as JSON-fallback VARCHAR), so the default is dropped
 /// and the column falls through to NULL / required-error downstream — a

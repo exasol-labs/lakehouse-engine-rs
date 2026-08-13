@@ -169,6 +169,12 @@ pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
 /// Max precision a scale-0 DECIMAL fits into a 64-bit int (Exasol ExaType Int64).
 pub const DECIMAL_INT64_MAX_PRECISION: u8 = 18;
 
+/// Exasol's maximum DECIMAL precision. `CAST(1 AS DECIMAL(0,0))` fails live with
+/// "illegal precision value: 0" and a precision above this ceiling is rejected the
+/// same way (SQL state 42000), so a catalog-declared decimal outside `1..=36` is
+/// declared VARCHAR(2000000) instead.
+const EXASOL_DECIMAL_MAX_PRECISION: u32 = 36;
+
 /// Parse the `(p,s)` arguments of a `DECIMAL(p,s)` Exasol type string.
 ///
 /// Accepts `DECIMAL(p,s)` and `DECIMAL(p)` (scale defaults to 0). The input must
@@ -201,6 +207,42 @@ pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
 }
 
+/// Whether Exasol can express a CATALOG-declared `DECIMAL(precision, scale)`.
+///
+/// Sole owner of Exasol's DECIMAL domain for catalog wire input:
+/// `1 <= p <= EXASOL_DECIMAL_MAX_PRECISION` and `s <= p`. Both bounds are live
+/// captures rather than documented limits — `CAST(1 AS DECIMAL(0,0))` is rejected
+/// with "illegal precision value: 0" and `CAST(1 AS DECIMAL(5,10))` with "illegal
+/// scale value: 10", both SQL state 42000. `s >= 0` needs no test: every
+/// catalog-sourced scale is unsigned.
+///
+/// Every consumer of a catalog-declared decimal reads the decision here — the
+/// Exasol type string, the logical Arrow tag, and the `initial-default` encoding
+/// gate — so a Unity `DECIMAL(0,0)`, an Iceberg `decimal(0,0)`, and the Arrow type
+/// the scan builds for it cannot disagree.
+///
+/// The two ARROW-input guards deliberately do NOT read this (decision-log decision
+/// [7]): `compatible_exasol_type` takes a signed `Decimal128` scale that is
+/// legitimately negative and has no `s <= p` analogue, and `exasol_type_from_json`
+/// reads Exasol's own `dataType` for a type Exasol has already accepted.
+pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -> bool {
+    (1..=EXASOL_DECIMAL_MAX_PRECISION).contains(&precision) && scale <= precision
+}
+
+/// Decide the Exasol type for a catalog-declared decimal.
+///
+/// Outside [`exasol_representable_catalog_decimal`] the column is declared
+/// VARCHAR(2000000) and carried as a JSON string, the same fallback an
+/// out-of-range precision already took. Both catalog kinds read the decision here
+/// so a Unity `DECIMAL(0,0)` and an Iceberg `decimal(0,0)` cannot diverge.
+fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
+    if exasol_representable_catalog_decimal(precision, scale) {
+        format!("DECIMAL({precision},{scale})")
+    } else {
+        "VARCHAR(2000000)".to_string()
+    }
+}
+
 /// Map an Iceberg `PrimitiveType` to an Exasol type string, used by
 /// `createVirtualSchema`.
 pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String {
@@ -211,11 +253,7 @@ pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String 
         Long => "DECIMAL(20,0)".to_string(),
         Float => "DOUBLE PRECISION".to_string(),
         Double => "DOUBLE PRECISION".to_string(),
-        Decimal { precision, scale } if *precision <= 36 && *scale <= 36 => {
-            format!("DECIMAL({precision},{scale})")
-        }
-        // Out-of-range Decimal
-        Decimal { .. } => "VARCHAR(2000000)".to_string(),
+        Decimal { precision, scale } => catalog_decimal_to_exasol(*precision, *scale),
         Date => "DATE".to_string(),
         // Time has no Exasol equivalent → VARCHAR via JSON
         Time => "VARCHAR(2000000)".to_string(),
@@ -234,9 +272,16 @@ pub fn iceberg_primitive_to_exasol(pt: &iceberg::spec::PrimitiveType) -> String 
 /// Map an Iceberg `PrimitiveType` to an Arrow `DataType`, used for building the
 /// logical Arrow schema carried in `ScanSpec::logical_schema`.
 ///
-/// Matches the Exasol mapping in [`iceberg_primitive_to_exasol`]: in-range
-/// Decimal128 maps to `Decimal128(p, s)`, out-of-range Decimal and types with no
-/// Arrow equivalent (Time, Fixed, Binary) map to `Utf8` (surfaced as JSON VARCHAR).
+/// Held in lockstep with [`iceberg_primitive_to_exasol`] by reading the same
+/// [`exasol_representable_catalog_decimal`] predicate: a decimal within Exasol's
+/// catalog-decimal domain (`1 <= p <= 36`, `s <= p`) maps to `Decimal128(p, s)`,
+/// and one outside it maps to `Utf8` (surfaced as JSON VARCHAR) alongside the
+/// types with no Arrow equivalent (Time, Fixed, Binary). The lockstep is load-
+/// bearing in both directions: a tag naming `Decimal128` for a column
+/// `createVirtualSchema` declared VARCHAR would break the single-source-of-truth
+/// contract in [`exasol_type_to_arrow`], and arrow-rs rejects `precision == 0`
+/// and `scale > precision` outright, so such a tag would name an Arrow type the
+/// scan cannot instantiate.
 ///
 /// This is the logical Iceberg→Arrow mapping and is unaffected by physical
 /// Parquet INT96 decode coercion, which is a scan-layer concern (see
@@ -250,10 +295,13 @@ pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType
         Long => DataType::Int64,
         Float => DataType::Float32,
         Double => DataType::Float64,
-        Decimal { precision, scale } if *precision <= 36 && *scale <= 36 => {
-            DataType::Decimal128(*precision as u8, *scale as i8)
+        Decimal { precision, scale } => {
+            if exasol_representable_catalog_decimal(*precision, *scale) {
+                DataType::Decimal128(*precision as u8, *scale as i8)
+            } else {
+                DataType::Utf8
+            }
         }
-        Decimal { .. } => DataType::Utf8,
         Date => DataType::Date32,
         Time => DataType::Utf8,
         Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -376,8 +424,9 @@ pub(crate) fn column_source_type_to_exasol(source_type: &ColumnSourceType) -> St
 /// Map a Unity Catalog Spark scalar type name to an Exasol type string, per the
 /// project's Arrow-to-Exasol convention. `precision`/`scale` only apply to
 /// `DECIMAL` and are ignored otherwise. Any type without a clean scalar Exasol
-/// equivalent, and an out-of-range `DECIMAL(p,s)`, fall back to VARCHAR(2000000)
-/// via JSON rather than failing enumeration.
+/// equivalent falls back to VARCHAR(2000000) via JSON rather than failing
+/// enumeration; for `DECIMAL` that fallback is decided by the shared
+/// [`exasol_representable_catalog_decimal`] domain (`1 <= p <= 36`, `s <= p`).
 fn unity_type_name_to_exasol(type_name: &str, precision: u32, scale: u32) -> String {
     match type_name {
         "BOOLEAN" => "BOOLEAN".to_string(),
@@ -389,9 +438,9 @@ fn unity_type_name_to_exasol(type_name: &str, precision: u32, scale: u32) -> Str
         "STRING" => "VARCHAR(2000000)".to_string(),
         "DATE" => "DATE".to_string(),
         "TIMESTAMP" | "TIMESTAMP_NTZ" => "TIMESTAMP".to_string(),
-        "DECIMAL" if precision <= 36 && scale <= 36 => format!("DECIMAL({precision},{scale})"),
-        // Out-of-range DECIMAL, and every incompatible Spark type (ARRAY, MAP,
-        // STRUCT, BINARY, INTERVAL, VARIANT, ...): VARCHAR via JSON fallback.
+        "DECIMAL" => catalog_decimal_to_exasol(precision, scale),
+        // Every incompatible Spark type (ARRAY, MAP, STRUCT, BINARY, INTERVAL,
+        // VARIANT, ...): VARCHAR via JSON fallback.
         _ => "VARCHAR(2000000)".to_string(),
     }
 }
