@@ -461,10 +461,24 @@ mod catalog_connection_password_tests {
         }
     }
 
+    /// Token and OAuth2 are separate CONNECTION shapes: `validate_creds` rule 6
+    /// rejects a password supplying both, so each is modelled on its own.
     #[test]
-    fn serializes_catalog_auth_fields_when_present() {
+    fn serializes_token_auth_field_when_present() {
         let password = CatalogConnectionPassword {
             token: Some("bearer-token".to_string()),
+            ..base_password()
+        };
+        let json_str = password.to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["token"], "bearer-token");
+    }
+
+    /// Token and OAuth2 are separate CONNECTION shapes: `validate_creds` rule 6
+    /// rejects a password supplying both, so each is modelled on its own.
+    #[test]
+    fn serializes_oauth2_auth_fields_when_present() {
+        let password = CatalogConnectionPassword {
             client_id: Some("my-client".to_string()),
             client_secret: Some("my-secret".to_string()),
             oauth2_server_uri: Some("https://idp.example.com/token".to_string()),
@@ -473,7 +487,6 @@ mod catalog_connection_password_tests {
         };
         let json_str = password.to_sql_password_json();
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed["token"], "bearer-token");
         assert_eq!(parsed["client_id"], "my-client");
         assert_eq!(parsed["client_secret"], "my-secret");
         assert_eq!(parsed["oauth2_server_uri"], "https://idp.example.com/token");

@@ -996,6 +996,73 @@ fn incomplete_oauth_rejected_no_leak() {
     );
 }
 
+/// A CONNECTION supplying a `token` together with a complete `client_id`/
+/// `client_secret` pair is rejected under both catalog kinds, naming all
+/// three fields and leaking none of their values.
+///
+/// A third case supplies `token` and `client_id` only: rule 7 (OAuth2
+/// completeness) still fires naming the missing `client_secret`, which is
+/// the disjointness assertion — it fails if rule 6 were widened to fire on
+/// a token beside any single OAuth2 field rather than the complete pair.
+#[test]
+fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "token": "sentinel-token-value",
+        "client_id": "sentinel-client-id-value",
+        "client_secret": "sentinel-client-secret-value"
+    })
+    .to_string();
+
+    for kind in [CatalogKind::IcebergRest, CatalogKind::UnityCatalogNative] {
+        let ctx = StubCtx::with_conn("http://catalog.example.com", &pw);
+        let err = read_connection(&ctx, Some("MY_CONN"), kind).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("token"), "must name token: {msg}");
+        assert!(msg.contains("client_id"), "must name client_id: {msg}");
+        assert!(
+            msg.contains("client_secret"),
+            "must name client_secret: {msg}"
+        );
+        assert!(
+            !msg.contains("sentinel-token-value"),
+            "must not leak token value: {msg}"
+        );
+        assert!(
+            !msg.contains("sentinel-client-id-value"),
+            "must not leak client_id value: {msg}"
+        );
+        assert!(
+            !msg.contains("sentinel-client-secret-value"),
+            "must not leak client_secret value: {msg}"
+        );
+    }
+
+    // token + client_id only (client_secret missing): the ambiguous-pair rule
+    // must not fire here, so rule 7 fires instead, naming only the missing field.
+    let pw_partial = serde_json::json!({
+        "warehouse": "wh",
+        "token": "sentinel-token-value",
+        "client_id": "sentinel-client-id-value"
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &pw_partial);
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("client_secret"),
+        "must name missing client_secret: {msg}"
+    );
+    assert!(
+        msg.contains("missing field: client_secret"),
+        "rule 7 must fire, not rule 6: {msg}"
+    );
+    assert!(
+        !msg.contains("mutually exclusive"),
+        "rule 6 must not fire on a token beside half a pair: {msg}"
+    );
+}
+
 /// Catalog token/OAuth auth and SigV4 are mutually exclusive.
 ///
 /// use_sigv4=true + token → rejected; use_sigv4=true + OAuth → rejected.

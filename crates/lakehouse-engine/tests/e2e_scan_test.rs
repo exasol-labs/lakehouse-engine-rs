@@ -459,6 +459,62 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
+/// A CONNECTION supplying a static `token` together with a complete OAuth2
+/// `client_id`/`client_secret` pair is rejected through the real Exasol +
+/// deployed `.so` path, not just the unit-level `StubCtx`.
+///
+/// Iceberg kind only: the Unity kind's equivalent ambiguity is already
+/// covered by the unit test `token_with_complete_oauth_pair_is_rejected_under_both_kinds`.
+#[test]
+fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let ambiguous_password = common::stack::CatalogConnectionPassword {
+        warehouse: "s3://warehouse/".to_string(),
+        endpoint: "http://does-not-exist.invalid:9000".to_string(),
+        region: "us-east-1".to_string(),
+        access_key: "SUPER_SECRET_KEY".to_string(),
+        secret_key: "SUPER_SECRET_VALUE".to_string(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+        token: Some("SUPER_SECRET_TOKEN".to_string()),
+        client_id: Some("SUPER_SECRET_CLIENT_ID".to_string()),
+        client_secret: Some("SUPER_SECRET_CLIENT_SECRET".to_string()),
+        ..Default::default()
+    };
+    let bogus_uri = "http://does-not-exist.invalid:8181";
+    let create_conn_sql =
+        build_create_connection_sql("AMBIGUOUS_CATALOG_CREDS", bogus_uri, &ambiguous_password);
+    conn.execute(&create_conn_sql);
+
+    let resp = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA AMBIGUOUS_CATALOG_VS
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION  = 'AMBIGUOUS_CATALOG_CREDS'
+  ICEBERG_NAMESPACE   = 'ns'
+  ALLOW_HTTP          = 'true'"#
+    ));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "expected an error when token and client_id/client_secret are both supplied, got: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("token") && msg.contains("client_id") && msg.contains("client_secret"),
+        "error message must name token, client_id, and client_secret: {msg}"
+    );
+    assert!(
+        !msg.contains("SUPER_SECRET_TOKEN")
+            && !msg.contains("SUPER_SECRET_CLIENT_ID")
+            && !msg.contains("SUPER_SECRET_CLIENT_SECRET"),
+        "error message must not leak credential values: {msg}"
+    );
+}
+
 /// Querying a non-existent virtual table name in the VS errors with a clear TABLE_MAP message.
 ///
 /// With namespace enumeration, a table that does not exist in the namespace was never
