@@ -35,6 +35,9 @@ mod file_resolution;
 pub use file_resolution::resolve_file_list;
 use file_resolution::{empty_result_sql, encode_initial_default, relativize_shards_to_root};
 
+mod format;
+pub use format::{ConnectionStorage, FormatReader, ResolvedScan, ScanSource, format_reader};
+
 mod topn;
 use topn::{detect_topn, parse_order_by_keys};
 
@@ -347,6 +350,7 @@ pub(crate) fn build_dispatch_sql(
         logical_schema: logical_schema.clone(),
         name_mapping: name_mapping.clone(),
         join: None,
+        delta: None,
         storage: storage.clone(),
         df_target_partitions,
         df_batch_size,

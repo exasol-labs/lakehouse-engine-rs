@@ -26,6 +26,7 @@ mod sql_support;
 pub use sql_support::build_alias_items;
 
 mod object_store;
+pub(crate) use self::object_store::build_table_root_store;
 use object_store::build_session_context;
 pub(crate) use spec::reconstruct_abs_uri;
 

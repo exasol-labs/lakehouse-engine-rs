@@ -5,10 +5,26 @@
 use super::*;
 use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
-use crate::{CatalogClient, CatalogTableIdent, CatalogTableType, ColumnSourceType};
+use crate::{CatalogClient, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat};
 use exasol_udf_sdk::error::UdfError;
 
 const PAT_SENTINEL: &str = "PAT_SECRET_SENTINEL_VALUE";
+
+/// A single-table wire body whose `data_source_format` member is the given raw
+/// JSON fragment — `"data_source_format":"CSV",`, `"data_source_format":null,`,
+/// or `""` for a body that omits the member entirely.
+fn table_body_with_raw_format(raw_format_member: &str) -> String {
+    format!(
+        r#"{{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED",{raw_format_member}"storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[]}}"#
+    )
+}
+
+fn orders_ident() -> CatalogTableIdent {
+    CatalogTableIdent {
+        namespace: vec!["cat".to_string(), "sch".to_string()],
+        name: "orders".to_string(),
+    }
+}
 
 fn tables_page_body() -> String {
     r#"{"tables":[
@@ -408,6 +424,215 @@ async fn posts_temporary_table_credentials() {
         "body carries the operation: {}",
         requests[0].body
     );
+}
+
+/// Every table the listing ADMITS carries the Delta tag and its vending key,
+/// while the admission filter itself is unchanged: the tag restates the filter's
+/// outcome, so a `VIEW` and a non-`DELTA` base table still reach `skipped` with
+/// their own reasons rather than being returned under a tag.
+#[tokio::test]
+async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter() {
+    let body = r#"{"tables":[
+        {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://b/orders","table_id":"uuid-managed","columns":[]},
+        {"name":"external_orders","table_type":"EXTERNAL","data_source_format":"DELTA","storage_location":"s3://b/external","table_id":"uuid-external","columns":[]},
+        {"name":"orders_summary","table_type":"VIEW","data_source_format":null,"columns":[]},
+        {"name":"legacy_orders","table_type":"MANAGED","data_source_format":"ICEBERG","table_id":"uuid-iceberg","columns":[]}
+    ]}"#
+    .to_string();
+    let server = spawn(move |_req| (200, body.clone())).await;
+    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+    let listing = session
+        .list_tables(&["cat".to_string(), "sch".to_string()])
+        .await
+        .expect("list failed");
+
+    assert_eq!(
+        listing
+            .tables
+            .iter()
+            .map(|table| (table.ident.name.as_str(), table.format))
+            .collect::<Vec<_>>(),
+        vec![
+            ("orders", TableFormat::Delta),
+            ("external_orders", TableFormat::Delta),
+        ],
+        "every admitted entry carries the Delta tag"
+    );
+    assert_eq!(
+        listing
+            .tables
+            .iter()
+            .map(|table| table.vended_credential_key.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("uuid-managed"), Some("uuid-external")],
+        "each admitted entry carries its own vending key"
+    );
+    assert_eq!(
+        listing
+            .skipped
+            .iter()
+            .map(|skipped| (skipped.ident.name.as_str(), &skipped.reason))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "orders_summary",
+                &SkipReason::NotDeltaBaseTable {
+                    detail: "table_type=VIEW".to_string()
+                }
+            ),
+            (
+                "legacy_orders",
+                &SkipReason::NotDeltaBaseTable {
+                    detail: "data_source_format=ICEBERG".to_string()
+                }
+            ),
+        ],
+        "the admission filter is unchanged: an ICEBERG base table is still skipped, not tagged"
+    );
+}
+
+/// The single-table load returns the mapped format tag, the vending key, and the
+/// columns in the order the response declares them.
+#[tokio::test]
+async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
+    let server = spawn(|_req| (200, single_table_body())).await;
+    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+    let table = session
+        .load_table(&orders_ident())
+        .await
+        .expect("load failed");
+
+    assert_eq!(table.format, TableFormat::Delta);
+    assert_eq!(table.vended_credential_key.as_deref(), Some("uuid-1"));
+    assert_eq!(
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "amount"],
+        "declared column order is preserved"
+    );
+}
+
+/// A Unity Catalog UniForm table reporting `ICEBERG` is named accurately rather
+/// than refused: the load applies no admission filter, so both formats the engine
+/// can plan map to their own tag.
+#[tokio::test]
+async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
+    let body = table_body_with_raw_format(r#""data_source_format":"ICEBERG","#);
+    let server = spawn(move |_req| (200, body.clone())).await;
+    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+    let table = session
+        .load_table(&orders_ident())
+        .await
+        .expect("an ICEBERG table loads under the Iceberg tag");
+
+    assert_eq!(table.format, TableFormat::Iceberg);
+}
+
+/// The load applies no admission filter, so an absent or unrecognized
+/// `data_source_format` is a refusal naming the table and the value — never a tag
+/// defaulted to Delta, which would route the table into the Delta log reader.
+#[tokio::test]
+async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
+    for (raw_format_member, expected_value) in [
+        (r#""data_source_format":"CSV","#, "CSV"),
+        (r#""data_source_format":"PARQUET","#, "PARQUET"),
+        (r#""data_source_format":"DELTASHARING","#, "DELTASHARING"),
+        (r#""data_source_format":"delta","#, "delta"),
+        (r#""data_source_format":null,"#, ABSENT_DATA_SOURCE_FORMAT),
+        (r#""data_source_format":"","#, ABSENT_DATA_SOURCE_FORMAT),
+        ("", ABSENT_DATA_SOURCE_FORMAT),
+    ] {
+        let body = table_body_with_raw_format(raw_format_member);
+        let server = spawn(move |_req| (200, body.clone())).await;
+        let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+        let err = session
+            .load_table(&orders_ident())
+            .await
+            .expect_err(&format!("{raw_format_member} must be refused, not tagged"));
+
+        let UdfError::User(msg) = err else {
+            panic!("expected a UdfError::User variant for {raw_format_member}");
+        };
+        assert!(
+            msg.contains("cat.sch.orders"),
+            "the refusal names the table: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("data_source_format={expected_value}")),
+            "the refusal names the offending value verbatim: {msg}"
+        );
+    }
+}
+
+/// The format refusal carries the table's identity and the reported format value
+/// only — never the resolved bearer the request was sent with.
+#[tokio::test]
+async fn load_table_format_refusal_carries_no_credential() {
+    let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
+    let server = spawn(move |_req| (200, body.clone())).await;
+    let mut creds = base_creds();
+    creds.token = Some(PAT_SENTINEL.to_string());
+    let session = UnityCatalogSession::new(&server.base_url, creds);
+
+    let err = session
+        .load_table(&orders_ident())
+        .await
+        .expect_err("a CSV table must be refused");
+
+    let UdfError::User(msg) = err else {
+        panic!("expected a UdfError::User variant");
+    };
+    assert!(
+        !msg.contains(PAT_SENTINEL),
+        "the bearer token must not reach the format refusal: {msg}"
+    );
+}
+
+/// A whitespace-only `table_id` is not a catalog-assigned key: it must project to
+/// an absent vending key through the public `load_table` path, matching the
+/// crate's own published guarantee that an empty-or-whitespace key is absent.
+#[tokio::test]
+async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
+    let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
+    let server = spawn(move |_req| (200, body.clone())).await;
+    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+
+    let table = session
+        .load_table(&orders_ident())
+        .await
+        .expect("load failed");
+
+    assert_eq!(
+        table.vended_credential_key, None,
+        "a whitespace-only table_id must project to an absent vending key"
+    );
+}
+
+/// An entry carrying no key — or an empty one — projects to an ABSENT key, so a
+/// caller that requires one fails naming the table instead of requesting
+/// credentials against an empty scope.
+#[test]
+fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
+    for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
+        let body = format!(
+            r#"{{"name":"orders","table_type":"MANAGED","data_source_format":"DELTA",{raw_key_member}"columns":[]}}"#
+        );
+        let info: TableInfo = serde_json::from_str(&body).expect("wire body parses");
+
+        let table = neutral_table(orders_ident(), info, TableFormat::Delta);
+
+        assert_eq!(
+            table.vended_credential_key, None,
+            "`{raw_key_member}` must project to an absent key, not an empty one"
+        );
+    }
 }
 
 #[test]

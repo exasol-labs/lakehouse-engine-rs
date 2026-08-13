@@ -26,6 +26,11 @@ const FORBIDDEN_DIRECT_DEPENDENCIES: &[&str] = &[
     "tracing",
     "exasol-udf-macros",
     "lakehouse-engine",
+    // The Delta table READER is an execution-layer dependency of the engine
+    // crate, under the same rule as arrow/parquet/object_store. Only the format
+    // TAG crosses into this crate; the reader never does.
+    "delta_kernel",
+    "delta_kernel_default_engine",
 ];
 
 /// Collects the dependency names declared under any `[*dependencies]` table

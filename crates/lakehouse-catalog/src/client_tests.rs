@@ -29,6 +29,8 @@ impl FixedCatalogClient {
             },
             table_type: CatalogTableType::Table,
             storage_location: Some("s3://warehouse/orders".to_string()),
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
@@ -44,6 +46,8 @@ impl FixedCatalogClient {
             },
             table_type: CatalogTableType::Table,
             storage_location: Some("s3://warehouse/payments".to_string()),
+            format: TableFormat::Delta,
+            vended_credential_key: Some("payments-uuid".to_string()),
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
                 source_type: ColumnSourceType::Unity {
@@ -467,6 +471,42 @@ async fn enumeration_builds_exactly_one_session() {
         2,
         "one enumeration grant + one load-batch grant (the single reused session); per-table loads would be four"
     );
+}
+
+/// The Iceberg REST client tags every table it returns — through either trait
+/// operation — with the Iceberg format and an ABSENT vending key: it vends
+/// storage credentials inline with the table's own metadata, so there is no
+/// per-table scope to carry and neither field forks its listing pipeline.
+#[tokio::test]
+async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
+    let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
+    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+
+    let listing = client
+        .list_tables(&["sales".to_string()])
+        .await
+        .expect("list_tables failed");
+    let loaded = client
+        .load_table(&CatalogTableIdent {
+            namespace: vec!["sales".to_string()],
+            name: "orders".to_string(),
+        })
+        .await
+        .expect("load_table failed");
+
+    for table in listing.tables.iter().chain(std::iter::once(&loaded)) {
+        assert_eq!(
+            table.format,
+            TableFormat::Iceberg,
+            "{} must carry the Iceberg format tag",
+            table.ident.name
+        );
+        assert_eq!(
+            table.vended_credential_key, None,
+            "{} must carry no vending key",
+            table.ident.name
+        );
+    }
 }
 
 /// Driving the PUBLIC `list_tables`: a table the catalog reports as not a

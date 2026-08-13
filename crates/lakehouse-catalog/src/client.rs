@@ -50,6 +50,18 @@ pub enum ColumnSourceType {
     },
 }
 
+/// The storage format a catalog reports one of its tables in.
+///
+/// Closed on purpose, naming exactly the formats this engine can plan a scan
+/// for: a catalog value outside the set is refused where that value is read, so
+/// no consumer matches this non-exhaustively and routes a table into a reader
+/// that cannot read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableFormat {
+    Iceberg,
+    Delta,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogColumn {
     pub name: String,
@@ -63,6 +75,19 @@ pub struct CatalogTable {
     pub table_type: CatalogTableType,
     /// Absent for an entry that has none, such as a view.
     pub storage_location: Option<String>,
+    /// The format this table's data is stored in, which selects the reader that
+    /// plans its scan.
+    pub format: TableFormat,
+    /// OPAQUE key the catalog that produced this table scopes a per-table
+    /// storage-credential request against.
+    ///
+    /// A caller hands it back to the same client that returned it and never
+    /// parses it — that is what keeps the producing catalog's own identifier
+    /// vocabulary from crossing this boundary. Absent when the catalog vends
+    /// storage credentials without a per-table scope, so a caller that requires
+    /// one fails naming the table rather than requesting against an empty scope.
+    /// An empty or whitespace-only key is treated the same as an absent one.
+    pub vended_credential_key: Option<String>,
     pub columns: Vec<CatalogColumn>,
 }
 
@@ -191,6 +216,11 @@ impl IcebergRestCatalogClient {
     /// ordered columns in their ORIGINAL case, each tagged with its Iceberg
     /// source type and left unmapped: the engine owns the single Exasol-mapping
     /// and case-folding home for both catalog kinds.
+    ///
+    /// Every table is tagged [`TableFormat::Iceberg`] with NO credential-vending
+    /// key, because this catalog vends storage credentials inline with the table's
+    /// own metadata and needs no per-table scope — so neither field forks the
+    /// listing pipeline.
     async fn load_on_session(
         &self,
         session: &CatalogSession,
@@ -219,6 +249,8 @@ impl IcebergRestCatalogClient {
             ident: ident.clone(),
             table_type: CatalogTableType::Table,
             storage_location: Some(storage_location),
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
             columns,
         })
     }

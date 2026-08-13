@@ -27,7 +27,7 @@ use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
     CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
     IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
-    StorageProps, TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth,
+    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth,
     parse_table_ident, redact_credentials, redact_secret_values, resolve_uc_vended_storage,
     resolve_vended_storage,
 };
@@ -162,7 +162,9 @@ fn both_clients_are_catalog_client_trait_objects() {
 /// The shared trait and its catalog-neutral metadata types are constructible
 /// from outside the crate, while the Unity Catalog wire types stay hidden —
 /// never re-exported and never `pub`-declared — so the engine consumes only the
-/// neutral shape.
+/// neutral shape. `CatalogTable` is constructed with its FORMAT tag and its
+/// credential-vending key named explicitly, so dropping either field or narrowing
+/// `TableFormat` below `pub` is a build failure here rather than a silent gap.
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {
@@ -181,8 +183,16 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         ident: ident.clone(),
         table_type: CatalogTableType::Table,
         storage_location: None,
+        format: TableFormat::Delta,
+        vended_credential_key: Some("opaque-vending-key".into()),
         columns: vec![column],
     };
+    assert_eq!(table.format, TableFormat::Delta);
+    assert_ne!(
+        TableFormat::Iceberg,
+        TableFormat::Delta,
+        "both formats the engine can plan are reachable from outside the crate and distinct"
+    );
     let listing = CatalogListing {
         tables: vec![table],
         skipped: vec![SkippedTable {
@@ -216,6 +226,28 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         assert!(
             !lib.contains(wire),
             "lib.rs must not re-export the Unity wire type `{wire}`"
+        );
+    }
+}
+
+/// The raw Unity Catalog wire fields behind the neutral format tag and the
+/// credential-vending key stay inside the Unity client: only their neutral
+/// PROJECTIONS cross the boundary. `client.rs` — the module declaring every
+/// neutral type — must name neither field in production code, so re-exposing a
+/// raw wire field on a neutral type fails here rather than putting a Unity
+/// Catalog concept on the crate's surface for every consumer to match on.
+/// Matched through `declares`, whose trailing-boundary check is what keeps the
+/// pre-existing local `table_ident` from reading as `table_id`.
+#[test]
+fn raw_unity_wire_fields_do_not_appear_in_the_neutral_types() {
+    let neutral = production_code(source("client.rs"));
+
+    for wire_field in ["data_source_format", "table_id"] {
+        assert!(
+            !declares(&neutral, wire_field),
+            "client.rs's PRODUCTION code must not name the raw Unity Catalog wire field \
+             `{wire_field}` — the neutral table carries its projection (a closed format tag, an \
+             opaque vending key), never the wire field itself"
         );
     }
 }

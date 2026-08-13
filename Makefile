@@ -229,7 +229,7 @@ bench: cross-musl-udf-build
 # seed cannot come up. `exasol` is included so the UDF can reach the
 # `unitycatalog` service name over the docker network (extra_hosts loop in the
 # overlay).
-#   Read path proven by the spike: UC resolve -> UC vend static creds ->
+#   Read path proven by the spike: UC resolve -> UC vend a real MinIO STS session ->
 #   delta-kernel-rs reads from MinIO with a CLIENT-SIDE endpoint override
 #   (UC OSS has no S3-endpoint config, upstream #43). See SPIKE_UC_DELTA_HARNESS.md.
 unity-up:

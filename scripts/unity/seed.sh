@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Seed the Unity Catalog + Delta E2E stack (spike #325):
 #   1. upload every vendored Delta fixture table to MinIO (bucket `warehouse`)
-#   2. register them in Unity Catalog as EXTERNAL Delta tables
+#   2. mint the MinIO STS session Unity Catalog vends for `s3://warehouse` and
+#      restart the server with it (see server.properties for why it must be real)
+#   3. register the fixtures in Unity Catalog as EXTERNAL Delta tables
 #
 # Convergent: re-running replaces every table registration from the manifest, so a
 # manifest/fixture change never leaves a stale registration behind. Fail-loud: any
@@ -24,6 +26,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NETWORK="${LH_NETWORK:-lakehouse-engine}"        # base compose sets name: lakehouse-engine
 MC_IMAGE="minio/mc:RELEASE.2025-08-13T08-35-41Z"
@@ -46,6 +49,98 @@ docker run --rm --network "$NETWORK" -v "$FIXTURES_DIR":/fx:ro \
       echo "  uploaded $name"
     done
   '
+
+echo "=== unity-seed: minting the MinIO STS session Unity Catalog vends ==="
+# Unity Catalog OSS 0.5.0 can only vend a credential for `s3://warehouse` through
+# its per-bucket static generator, and that generator is selected ONLY by a
+# non-empty `s3.sessionToken.0` — which it then hands back verbatim. A vended
+# session token is contractually real (the client must send it as
+# `x-amz-security-token`), and MinIO rejects any token that is not a live STS
+# session with 403 InvalidTokenId, so a placeholder there makes every vended read
+# fail. UC's own STS generator cannot stand in: its bundled SDK ignores
+# AWS_ENDPOINT_URL[_STS], so it would call the real sts.amazonaws.com.
+#
+# The harness therefore mints a genuine, expiring MinIO STS session here and
+# injects the resulting triple as UC's preset credential. MinIO serves STS
+# AssumeRole at its S3 endpoint (the same mechanism the Lakekeeper overlay's
+# vended warehouse uses); the session inherits the parent's permissions and lasts
+# MinIO's 7-day maximum, so it outlives the stack it is minted for.
+STS_TRIPLE=$(
+  MINIO_STS_ENDPOINT="http://localhost:${LH_MINIO_PORT:-19000}" python3 - <<'PY'
+import datetime, hashlib, hmac, os, sys, urllib.error, urllib.request
+import xml.etree.ElementTree as ET
+
+ENDPOINT = os.environ["MINIO_STS_ENDPOINT"]
+KEY = SECRET = "minioadmin"          # base compose's MinIO root credentials
+REGION, SERVICE = "us-east-1", "sts"
+DURATION = "604800"                  # MinIO's AssumeRole maximum: 7 days
+
+host = ENDPOINT.split("://", 1)[1]
+body = ("Action=AssumeRole&Version=2011-06-15"
+        f"&DurationSeconds={DURATION}&RoleSessionName=lakehouse-unity-e2e")
+now = datetime.datetime.now(datetime.timezone.utc)
+stamp, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+payload_hash = hashlib.sha256(body.encode()).hexdigest()
+
+signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
+canonical = (
+    "POST\n/\n\n"
+    f"content-type:application/x-www-form-urlencoded\nhost:{host}\n"
+    f"x-amz-content-sha256:{payload_hash}\nx-amz-date:{stamp}\n"
+    f"\n{signed_headers}\n{payload_hash}"
+)
+scope = f"{datestamp}/{REGION}/{SERVICE}/aws4_request"
+to_sign = (f"AWS4-HMAC-SHA256\n{stamp}\n{scope}\n"
+           f"{hashlib.sha256(canonical.encode()).hexdigest()}")
+
+def sign(k, m):
+    return hmac.new(k, m.encode(), hashlib.sha256).digest()
+
+signing_key = sign(sign(sign(sign(f"AWS4{SECRET}".encode(), datestamp), REGION),
+                        SERVICE), "aws4_request")
+signature = hmac.new(signing_key, to_sign.encode(), hashlib.sha256).hexdigest()
+
+req = urllib.request.Request(
+    ENDPOINT + "/", data=body.encode(), method="POST",
+    headers={"Content-Type": "application/x-www-form-urlencoded", "Host": host,
+             "X-Amz-Content-Sha256": payload_hash, "X-Amz-Date": stamp,
+             "Authorization": (f"AWS4-HMAC-SHA256 Credential={KEY}/{scope}, "
+                               f"SignedHeaders={signed_headers}, Signature={signature}")})
+try:
+    raw = urllib.request.urlopen(req, timeout=30).read()
+except (urllib.error.URLError, OSError) as e:
+    detail = e.read().decode(errors="replace")[:500] if hasattr(e, "read") else e
+    raise SystemExit(f"ERROR minting the MinIO STS session at {ENDPOINT}: {detail}")
+
+ns = {"s": "https://sts.amazonaws.com/doc/2011-06-15/"}
+creds = ET.fromstring(raw).find(".//s:Credentials", ns)
+if creds is None:
+    raise SystemExit("ERROR minting the MinIO STS session: response carried no "
+                     f"Credentials element: {raw.decode(errors='replace')[:500]}")
+triple = [creds.findtext(f"s:{f}", namespaces=ns)
+          for f in ("AccessKeyId", "SecretAccessKey", "SessionToken")]
+if not all(triple):
+    raise SystemExit("ERROR minting the MinIO STS session: incomplete credential triple")
+print(" ".join(triple))
+print(f"  session expires {creds.findtext('s:Expiration', namespaces=ns)}", file=sys.stderr)
+PY
+)
+read -r STS_ACCESS_KEY STS_SECRET_KEY STS_SESSION_TOKEN <<<"$STS_TRIPLE"
+
+echo "=== unity-seed: restarting Unity Catalog with the vended credential ==="
+# UC reads server.properties and its environment once, at boot, so the freshly
+# minted credential can only reach it through a container recreate. This runs
+# BEFORE registration on purpose: `server.env=test` keeps UC's catalog in an
+# in-memory H2 database, so a recreate discards every registration.
+#
+# `env` rather than a shell assignment because UC's property names are also the
+# environment-variable names it looks them up under, and `s3.accessKey.0` is not a
+# valid shell identifier. The compose service passes these three through by name.
+env "s3.accessKey.0=$STS_ACCESS_KEY" \
+    "s3.secretKey.0=$STS_SECRET_KEY" \
+    "s3.sessionToken.0=$STS_SESSION_TOKEN" \
+  docker compose -f "$REPO_ROOT/docker-compose.yml" -f "$REPO_ROOT/docker-compose.unity.yml" \
+  up -d --wait unitycatalog
 
 echo "=== unity-seed: registering catalog/schema/tables in Unity Catalog ==="
 # Registration is data-driven (a manifest) — Python keeps the multi-column and

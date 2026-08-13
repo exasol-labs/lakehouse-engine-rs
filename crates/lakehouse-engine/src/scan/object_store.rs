@@ -148,11 +148,6 @@ fn group_sides_by_store_url<'s, 'f>(
 /// files, so neither that credential nor that size index can serve another side's
 /// paths.
 ///
-/// Dispatches on the storage backend because CONSTRUCTING the store is a
-/// backend-specific decision. The store URL is not: [`side_store_url`] derives it
-/// once for every backend, and each arm only reads out of it the part its builder
-/// needs — the host as an S3 bucket name, the whole URL for Azure.
-///
 /// Registering the result is the CALLER's, because sides resolving to one
 /// DataFusion registry key must share one registered store and only the caller
 /// knows which sides those are. `all_secrets` arrives from the caller for the same
@@ -165,7 +160,44 @@ fn build_side_store(
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
     let sizes = side_size_index(side.files, side.table_root)?;
     let store_url = side_store_url(side.files, side.table_root)?;
-    match side.backend {
+    let store = build_undecorated_store(side.backend, &store_url, connection_budget, all_secrets)?;
+    Ok(Arc::new(SpecSizedObjectStore::new(store, sizes)))
+}
+
+/// Build the undecorated `Arc<dyn ObjectStore>` the table rooted at `table_root`
+/// is read through — no spec-sized HEAD wrapper.
+///
+/// Delta planning needs exactly this seam, and needs it keyed on the table root
+/// rather than on a scan side: its `_delta_log` file sizes are unknown until the
+/// log itself is read, so it cannot go through [`SpecSizedObjectStore`], which
+/// requires sizes up front, and at plan time it holds no file list to derive a
+/// store root from.
+pub(crate) fn build_table_root_store(
+    backend: &StorageBackend,
+    table_root: &str,
+    connection_budget: usize,
+    all_secrets: &[&str],
+) -> Result<Arc<dyn ObjectStore>, UdfError> {
+    let store_url = store_root_url(table_root)?;
+    build_undecorated_store(backend, &store_url, connection_budget, all_secrets)
+}
+
+/// Build the undecorated store `backend`'s credential covers, scoped to
+/// `store_url`.
+///
+/// Dispatches on the storage backend because CONSTRUCTING the store is a
+/// backend-specific decision. The store root is not: it arrives already derived,
+/// and each arm only reads out of it the part its builder needs — the host as an S3
+/// bucket name, the whole URL for Azure. The caller derives it because the two
+/// callers derive it from different things: a scan side from its first file, a
+/// Delta table from its root alone.
+fn build_undecorated_store(
+    backend: &StorageBackend,
+    store_url: &Url,
+    connection_budget: usize,
+    all_secrets: &[&str],
+) -> Result<Arc<dyn ObjectStore>, UdfError> {
+    match backend {
         StorageBackend::S3(storage) => {
             let bucket = store_url.host_str().ok_or_else(|| {
                 UdfError::User(format!("file URI has no bucket/host: {store_url}"))
@@ -206,7 +238,7 @@ fn build_side_store(
                 ))
             })?;
 
-            Ok(Arc::new(SpecSizedObjectStore::new(Arc::new(s3), sizes)))
+            Ok(Arc::new(s3))
         }
         StorageBackend::Adls { cred, .. } => {
             let builder = MicrosoftAzureBuilder::new()
@@ -224,7 +256,7 @@ fn build_side_store(
                 ))
             })?;
 
-            Ok(Arc::new(SpecSizedObjectStore::new(Arc::new(azure), sizes)))
+            Ok(Arc::new(azure))
         }
     }
 }
@@ -392,16 +424,24 @@ impl ObjectStore for SpecSizedObjectStore {
 ///
 /// The single derivation every backend and [`validate_sides_share_one_store`]
 /// read, so the key a store is registered under and the key DataFusion looks it
-/// up with agree by construction rather than by inspection. The slice is exactly
-/// the one `ListingTableUrl::object_store()` takes, and it deliberately KEEPS the
-/// userinfo — which is where an `abfss://` URI carries its container — unlike
-/// DataFusion's coarser registry key, which drops it.
+/// up with agree by construction rather than by inspection.
 fn side_store_url(files: &[FileEntry], table_root: &str) -> Result<Url, UdfError> {
     let first = files
         .first()
         .ok_or_else(|| UdfError::User("scan spec has no files".into()))?;
-    let abs = reconstruct_abs_uri(&first.path, table_root);
-    let url = Url::parse(&abs).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
+    store_root_url(&reconstruct_abs_uri(&first.path, table_root))
+}
+
+/// The object-store root `uri` sits under: its `scheme://userinfo@host:port` slice,
+/// with the path dropped.
+///
+/// ONE home for that derivation, so a scan side and a Delta table root cannot
+/// disagree on what "the store this credential covers" means. The slice is exactly
+/// the one `ListingTableUrl::object_store()` takes, and it deliberately KEEPS the
+/// userinfo — which is where an `abfss://` URI carries its container — unlike
+/// DataFusion's coarser registry key, which drops it.
+fn store_root_url(uri: &str) -> Result<Url, UdfError> {
+    let url = Url::parse(uri).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
     let store = &url[Position::BeforeScheme..Position::BeforePath];
     Url::parse(store)
         .map_err(|e| UdfError::User(format!("invalid object-store root '{store}': {e}")))

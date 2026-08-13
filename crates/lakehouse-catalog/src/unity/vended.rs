@@ -39,10 +39,11 @@ pub struct TemporaryTableCredentials {
     pub gcp_oauth_token: Option<GcpOauthToken>,
 }
 
-/// Vended S3 temporary credentials (dynamic STS on Databricks, static keys on the
-/// OSS fixture). `endpoint` is present only when the deployment vends one (an
-/// OSS/MinIO object store); absent for AWS STS credentials, whose store is the
-/// AWS default.
+/// Vended S3 temporary credentials: dynamic STS on Databricks, and — since the
+/// fixture harness now mints a real MinIO STS session and injects it — dynamic
+/// STS on the OSS fixture too, never a static key. `endpoint` is present only
+/// when the deployment vends one (an OSS/MinIO object store); absent for AWS STS
+/// credentials, whose store is the AWS default.
 #[derive(Clone, Deserialize)]
 pub struct AwsTempCredentials {
     pub access_key_id: String,

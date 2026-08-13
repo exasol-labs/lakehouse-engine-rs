@@ -44,6 +44,29 @@ roaring = { workspace = true }
 
 iceberg = { workspace = true }
 
+# Declared directly on this member manifest, not `[workspace.dependencies]` — member
+# manifests enter CI's cache key, the workspace manifest does not. De-risked by the
+# #317 spike against arrow 58 / parquet 58 / object_store 0.13.2 / DataFusion 54.1.
+# `delta_kernel_default_engine`'s own `default` feature set pulls in `arrow-59`
+# unconditionally, unioning a second arrow tree onto the `arrow-58` we ask for —
+# `default-features = false` is required to actually get exactly one arrow version.
+# `internal-api` is the ONLY way 0.26 exposes a table's ordered partition-column list
+# and its protocol-gated column-mapping mode (`TableConfiguration::partition_columns` /
+# `::column_mapping_mode`, both `pub(crate)` without it). It is the crate's declared
+# UNSTABLE surface — it changes visibility only, never behaviour, but carries no semver
+# guarantee across 0.26.x. Both accessors are reached from ONE place,
+# `format::delta_replay`, so a kernel upgrade that drops them is a compile error there
+# rather than a silent behaviour change.
+delta_kernel = { version = "0.26", features = [
+    "default-engine-base",
+    "arrow-58",
+    "internal-api",
+] }
+delta_kernel_default_engine = { version = "0.26", default-features = false, features = [
+    "arrow-58",
+    "rustls",
+] }
+
 # rt-multi-thread: for DATAFUSION_THREADS_PER_UDF > 1. sync: tokio::sync::Semaphore
 # (shared delete-read limiter), declared directly rather than pulled in transitively.
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }

@@ -19,7 +19,7 @@ use serde::de::DeserializeOwned;
 use crate::redaction::redact_error_text;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
-    CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable,
+    CatalogTableType, ColumnSourceType, ConnectionCreds, SkipReason, SkippedTable, TableFormat,
 };
 
 use super::auth::{UnityAuth, resolve_unity_auth};
@@ -217,7 +217,9 @@ impl CatalogClient for UnityCatalogSession {
                     delta_base_skip_reason(&info.table_type, info.data_source_format.as_deref());
                 match skip_reason {
                     Some(reason) => skipped.push(SkippedTable { ident, reason }),
-                    None => tables.push(neutral_table(ident, info)),
+                    // An admitted entry passed the DELTA admission filter above,
+                    // so the tag restates that outcome rather than re-deciding it.
+                    None => tables.push(neutral_table(ident, info, TableFormat::Delta)),
                 }
             }
             Ok(CatalogListing { tables, skipped })
@@ -232,7 +234,8 @@ impl CatalogClient for UnityCatalogSession {
         Box::pin(async move {
             let full_name = full_name(&ident);
             let info = self.get_table_info(&full_name).await?;
-            Ok(neutral_table(ident, info))
+            let format = neutral_table_format(info.data_source_format.as_deref(), &full_name)?;
+            Ok(neutral_table(ident, info, format))
         })
     }
 }
@@ -258,16 +261,28 @@ fn full_name(ident: &CatalogTableIdent) -> String {
 
 /// Convert one deserialized Unity Catalog table entry into the neutral shape,
 /// carrying the requested identifier, the neutral table type, the storage
-/// location (absent when the entry omits it, as a view does), and its columns in
-/// declared position order — each left unmapped, since the engine owns the single
+/// location (absent when the entry omits it, as a view does), the `format` its
+/// CALLER decided, its credential-vending key, and its columns in declared
+/// position order — each column left unmapped, since the engine owns the single
 /// Exasol type-mapping home.
-fn neutral_table(ident: CatalogTableIdent, info: TableInfo) -> CatalogTable {
+///
+/// The format tag is a parameter rather than derived here because the two callers
+/// reach it differently and only one of them can fail: the listing has already
+/// admitted Delta base tables only, while the single-table load must MAP the
+/// reported value and refuse one it cannot name (see [`neutral_table_format`]).
+///
+/// An empty OR whitespace-only vending key projects to an ABSENT one, so a caller
+/// that requires one fails naming the table rather than requesting credentials
+/// against an empty scope.
+fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat) -> CatalogTable {
     CatalogTable {
         ident,
         table_type: neutral_table_type(&info.table_type),
         storage_location: info
             .storage_location
             .filter(|location| !location.is_empty()),
+        format,
+        vended_credential_key: info.table_id.filter(|key| !key.trim().is_empty()),
         columns: info.columns.into_iter().map(neutral_column).collect(),
     }
 }
@@ -295,11 +310,20 @@ fn neutral_table_type(raw: &str) -> CatalogTableType {
     }
 }
 
-/// The only `data_source_format` the listing admits, compared case-sensitively
-/// against the uppercase vocabulary Unity Catalog emits.
+/// The `data_source_format` Delta tables report, compared case-sensitively
+/// against the uppercase vocabulary Unity Catalog emits. The listing admits ONLY
+/// this value; the single-table load, which applies no admission filter, also
+/// matches it to map the reported format.
 const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 
-/// How a missing or null `data_source_format` is named in a skip reason.
+/// The `data_source_format` of a Unity Catalog UniForm table, compared
+/// case-sensitively against the same uppercase vocabulary. The listing does NOT
+/// admit it; only the single-table load, which applies no admission filter, names
+/// it.
+const ICEBERG_DATA_SOURCE_FORMAT: &str = "ICEBERG";
+
+/// How a missing or null `data_source_format` is named in a skip reason or a
+/// format refusal.
 const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
 
 /// Why a listed entry is not a Delta base table, or `None` when it is one: an
@@ -324,6 +348,22 @@ fn delta_base_skip_reason(
         _ => format!("table_type={raw_table_type}"),
     };
     Some(SkipReason::NotDeltaBaseTable { detail })
+}
+
+fn neutral_table_format(
+    data_source_format: Option<&str>,
+    table: &str,
+) -> Result<TableFormat, UdfError> {
+    match data_source_format.filter(|format| !format.trim().is_empty()) {
+        Some(DELTA_DATA_SOURCE_FORMAT) => Ok(TableFormat::Delta),
+        Some(ICEBERG_DATA_SOURCE_FORMAT) => Ok(TableFormat::Iceberg),
+        unrecognized => Err(UdfError::User(format!(
+            "Unity Catalog table {table} reports data_source_format={}, which names no table \
+             format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT} or \
+             {ICEBERG_DATA_SOURCE_FORMAT})",
+            unrecognized.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+        ))),
+    }
 }
 
 /// A paginated Unity Catalog list response: its entries and the token for the
@@ -353,10 +393,13 @@ impl PagedResponse for TablesPage {
     }
 }
 
-/// One Unity Catalog table entry. `storage_location` and `data_source_format` are
-/// modeled as absent-tolerant because a VIEW carries neither, so a VIEW list entry
-/// deserializes without failing. Wire fields this client does not consume
-/// (`table_id`, `full_name`) are left out; serde ignores them.
+/// One Unity Catalog table entry, modeling only the fields this client consumes.
+/// `storage_location` and `data_source_format` are absent-tolerant because a VIEW
+/// carries neither, so a VIEW list entry deserializes without failing. `table_id`
+/// is absent-tolerant for a different reason — defensive tolerance of a catalog
+/// response that omits it, since Unity assigns a `table_id` to views too. Every
+/// other wire field this client has no use for, `full_name` among them, is simply
+/// not modeled here, and serde ignores it.
 #[derive(Deserialize)]
 struct TableInfo {
     name: String,
@@ -365,6 +408,10 @@ struct TableInfo {
     storage_location: Option<String>,
     #[serde(default)]
     data_source_format: Option<String>,
+    /// The catalog-assigned key a temporary-table-credentials request is scoped
+    /// against, projected onto [`CatalogTable::vended_credential_key`].
+    #[serde(default)]
+    table_id: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnInfo>,
 }

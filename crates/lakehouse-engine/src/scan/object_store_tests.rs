@@ -256,6 +256,36 @@ fn each_side_store_gets_the_full_connection_budget() {
     }
 }
 
+/// [`build_table_root_store`] answers the raw backend store from a table root ALONE,
+/// not wrapped in [`SpecSizedObjectStore`] — the seam Delta planning needs, since
+/// `_delta_log` file sizes are unknown until the log itself is read and the reader
+/// holds no file list to derive a store root from. [`build_side_store`] must still
+/// wrap that same store, unchanged, in [`SpecSizedObjectStore`].
+#[test]
+fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
+    let spec = minimal_spec();
+    let sides = present_sides(&spec);
+    let all_secrets = spec.common.all_secret_values();
+    let budget = spec.common.s3_max_connections;
+    // Same bucket as the fixture's one file, so both builders resolve one store.
+    let table_root = "s3://test-bucket/data";
+
+    let raw = build_table_root_store(sides[0].backend, table_root, budget, &all_secrets)
+        .expect("a table root alone must build a store");
+    let decorated =
+        build_side_store(&sides[0], budget, &all_secrets).expect("decorated store must build");
+
+    assert!(
+        !raw.to_string().starts_with("SpecSizedObjectStore("),
+        "the undecorated builder must not wrap in SpecSizedObjectStore: {raw}"
+    );
+    assert_eq!(
+        decorated.to_string(),
+        format!("SpecSizedObjectStore({raw})"),
+        "build_side_store must wrap the undecorated store unchanged"
+    );
+}
+
 /// Two sides resolving to distinct buckets each get their OWN registered store:
 /// the two buckets yield two DataFusion registry keys, so neither registration
 /// overwrites the other and each side keeps its own credential.
