@@ -103,8 +103,11 @@ shared-harness provisioning, and DDL-failure output redaction.
   matches `abfss` unconditionally and gates only `abfs` on `allow_http`. The shared
   VS DDL sets `ALLOW_HTTP = 'true'` on every virtual schema it creates
   (`crates/lakehouse-engine/tests/common/e2e_harness.rs:270`), so both Azure virtual
-  schemas carry it — inert on this path. The `abfs://`-requires-consent branch stays
-  unit-covered in `crates/lakehouse-catalog/src/vended.rs`.
+  schemas carry it — inert on this path. The `abfs://`-requires-consent branch now has
+  ONE shared home covering both vended selectors, `crates/lakehouse-catalog/src/storage.rs`,
+  unit-covered in the sibling `storage_tests.rs` (issue #330; this delta repoints ONE
+  cross-reference and changes no assertion — the bullet's substance is unchanged and is
+  not superseded).
 * **The vended SAS key shape is not specified by the Iceberg REST spec, which makes
   a live run its only conformance evidence.** The REST Catalog OpenAPI specification
   enumerates `config` keys under `## AWS Configurations` only and names no ADLS key
@@ -214,7 +217,7 @@ shared-harness provisioning, and DDL-failure output redaction.
 * *AND* the scan SHALL read the `abfss://` data files with that SAS and return rows identical to the same query run over the static-credential warehouse in the same container
 * *AND* the test SHALL assert that the vended CONNECTION carries no `account_name` key and no `account_key` key at all, and an empty `endpoint`, `region`, `access_key`, and `secret_key`, because that empty shape is the REQUIRED shape rather than merely a delegation proof — with no account name and no account key to fall back to, a passing scan is reachable only through the vended SAS
 * *AND* Lakekeeper SHALL report this warehouse's `sas-enabled` as `true` and its `filesystem` as the same container the static warehouse uses, read back through the management API rather than assumed from the request the harness sent
-* *AND* the scenario SHALL NOT depend on `ALLOW_HTTP`: `abfss://` names TLS transport and needs no plaintext consent, so the property the shared VS DDL sets on every virtual schema is inert here, and this scenario is NOT the Azure counterpart of the S3 arm's plaintext-consent case
+* *AND* the scenario SHALL NOT depend on `ALLOW_HTTP`: `abfss://` names TLS transport and needs no plaintext consent, so the property the shared VS DDL sets on every virtual schema is inert here, and this scenario is NOT the Azure counterpart of the S3 arm's plaintext-consent case; the `abfs://` counterpart is governed by ONE shared consent gate covering BOTH vended selectors, unit-covered in the shared vended home (`crates/lakehouse-catalog/src/storage.rs`) rather than in the Iceberg selector alone
 * *AND* no vended SAS value and no account-key value SHALL appear in any returned SQL string or test output, and the suite MUST NOT itself request `loadTable` to inspect the vended payload, because that would place a live SAS in the test process's memory and output for diagnostic value only
 * *AND* because both credential arms share one fixture and one test function, every assertion specific to the vended arm except the cross-arm row comparison SHALL run BEFORE the static arm's assertions, so a static-arm QUERY or ASSERTION regression cannot mask the vended proof this scenario adds; a static-arm PROVISIONING failure aborts the shared fixture before any assertion runs and does mask it, which is the residual cost of one fixture, reduced but not removed by provisioning the vended arm's warehouse, seed, and virtual schema BEFORE the static arm's
 * *AND* the test MUST fail (not skip) when the local stack or the Azure account is unavailable
