@@ -35,7 +35,7 @@ jobs:
     name: Build release .so (Docker)
     runs-on: ubuntu-latest
     # Skip draft PRs; still run on push/merge_group (where pull_request is null).
-    # e2e / e2e-lakekeeper / e2e-azure cascade-skip via `needs: [build-so]`.
+    # e2e / e2e-lakekeeper / e2e-unity / e2e-azure cascade-skip via `needs: [build-so]`.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
     # release build). 60 min is a safety backstop against a genuine hang, not
@@ -275,9 +275,9 @@ jobs:
           tool: cargo-llvm-cov@0.8.7
 
       # Keep flag-identical to the Makefile's `coverage` target; this step is
-      # the authority. exasol-e2e, cloud-e2e, lakekeeper-e2e and azure-e2e are
-      # opt-in features, off by default, so this compiles none of them and
-      # never touches a live stack or a cloud account.
+      # the authority. exasol-e2e, cloud-e2e, lakekeeper-e2e, azure-e2e and
+      # unity-e2e are opt-in features, off by default, so this compiles none of
+      # them and never touches a live stack or a cloud account.
       #
       # Doctests are NOT run (`--doctests` is unstable); zero cost today since
       # no crate has an executable doc test.
@@ -668,7 +668,99 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
 
-  # ── third viability gate: REAL Azure ADLS Gen2 storage, local catalog ────
+  # ── third viability gate: native Unity Catalog OSS ────────────────────────
+  # The overlay adds only `unitycatalog` plus an `exasol` `extra_hosts`
+  # override on top of the base stack, and reuses base `minio`. Independent
+  # of `e2e` and `e2e-lakekeeper` (same `needs`, no dependency between them)
+  # so all three run in parallel; gates `release`.
+  #
+  # Not yet in `main`'s ruleset required checks — tracked in #336.
+  e2e-unity:
+    name: E2E (Unity)
+    runs-on: ubuntu-latest
+    # See `e2e`'s identical `needs` and its rationale.
+    needs: [build-so]
+    # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`.
+    timeout-minutes: 45
+    env:
+      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      LH_EXASOL_CPUS: "2"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/e2e-setup
+
+      - name: Pull stack images
+        run: docker compose -f docker-compose.yml -f docker-compose.unity.yml pull --quiet
+
+      # Two-phase bring-up, same rationale as `e2e-lakekeeper`'s (see that
+      # job's own comment above its bring-up step): `docker compose up --wait`
+      # doesn't reliably hold a one-shot container in the same wait set as
+      # long-running services. Specific to this job: `minio-init` runs first
+      # because `scripts/unity/seed.sh` requires the `warehouse` bucket, and
+      # its exit code is checked because the Makefile's `unity-up` target does
+      # not check it.
+      - name: Start stack (Exasol + MinIO + Unity Catalog)
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
+
+          $COMPOSE up -d minio-init
+          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
+          if [ "$INIT_EXIT" != "0" ]; then
+            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
+            $COMPOSE logs minio-init
+            exit 1
+          fi
+
+          $COMPOSE up -d --wait minio exasol unitycatalog
+
+      - name: Seed Unity Catalog fixtures
+        run: ./scripts/unity/seed.sh
+
+      # MUST stay flag-identical to the Makefile's `test-e2e-unity` target's
+      # cargo line; this step is the authority. `make test-e2e-unity` is not
+      # used because it calls `$(MAKE) unity-up`, re-running the bring-up the
+      # two steps above just performed.
+      - name: Run Unity Catalog E2E suite
+        run: cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
+
+      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
+      # only shows up in the host kernel ring buffer, not DB-side logs.
+      - name: Dump Unity stack logs on failure
+        if: failure()
+        run: |
+          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
+          echo "=== container stats / host free ==="
+          $COMPOSE ps || true
+          free -m || true
+          echo "=== HOST kernel ring buffer (sudo) ==="
+          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
+          echo "--- last 40 kernel lines (fallback) ---"
+          sudo dmesg --ctime | tail -40 || true
+          echo "=== minio-init logs ==="
+          $COMPOSE logs minio-init | tail -100 || true
+          echo "=== unitycatalog logs ==="
+          $COMPOSE logs unitycatalog | tail -100 || true
+          echo "=== minio logs ==="
+          $COMPOSE logs minio | tail -100 || true
+          echo "=== exasql crash logs ==="
+          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
+          echo "=== collecting /exa/logs tree for artifact ==="
+          rm -rf exa-logs-unity && mkdir -p exa-logs-unity
+          $COMPOSE cp exasol:/exa/logs exa-logs-unity/ 2>/dev/null || true
+
+      - name: Upload Unity Exasol logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: exa-logs-unity
+          path: exa-logs-unity/
+          if-no-files-found: ignore
+
+      - name: Stop stack
+        if: always()
+        run: docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
+
+  # ── fourth viability gate: REAL Azure ADLS Gen2 storage, local catalog ───
   # No local ADLS Gen2 substitute exists (Azurite's `dfs` endpoint is
   # incomplete), so this suite runs against a real Azure account; catalog
   # (Lakekeeper), OIDC (Keycloak), and Exasol stay local Docker, same overlay
@@ -788,9 +880,11 @@ jobs:
     # served straight off `main` (see its own job comment), so a broken script
     # on `main` must never reach a release-gated push either.
     #
-    # `e2e-azure` is deliberately absent: a live third-party account there would
-    # let an Azure incident or rotated secret block every release.
-    needs: [e2e, e2e-lakekeeper, lint, unit-tests, licenses, install-script, install-script-e2e]
+    # `e2e-unity` gates releases: its stack is entirely local containers on a
+    # pinned image. `e2e-azure` is deliberately absent instead: a live
+    # third-party account there would let an outage or a rotated secret block
+    # every release.
+    needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
