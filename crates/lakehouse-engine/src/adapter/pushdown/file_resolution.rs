@@ -10,8 +10,8 @@ use iceberg::TableIdent;
 use serde_json::Value as Json;
 
 use lakehouse_catalog::{
-    CatalogSession, load_table_any_auth, parse_table_ident, redact_credentials, redact_error_text,
-    resolve_vended_storage,
+    CatalogSession, StaticStoreAddress, load_table_any_auth, parse_table_ident, redact_credentials,
+    redact_error_text, resolve_vended_storage,
 };
 
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
@@ -200,9 +200,12 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
 /// none). Vended-credential extraction is gated SOLELY on
 /// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it is
 /// true, `resolve_vended_storage` builds the whole `StorageBackend` from the loadTable
-/// response and the anchor's URI scheme, reading no CONNECTION storage field: a
-/// credential or store address the catalog does not vend is an error here rather than
-/// a silent fall-back to the static one. When it is false, returns
+/// response, the anchor's URI scheme, and the CONNECTION's store ADDRESS alone.
+/// Credentials stay vended-only — one the catalog does not vend is an error here
+/// rather than a silent fall-back to the static one — while addressing may cross
+/// over: the CONNECTION's `endpoint` and `region` reach the selector through a
+/// [`StaticStoreAddress`], which cannot carry a credential, and each wins over the
+/// vended value independently when the CONNECTION sets it. When it is false, returns
 /// `(files, storage.clone())` — byte-identical to the no-vending behaviour on every
 /// auth mode.
 ///
@@ -261,7 +264,12 @@ pub async fn resolve_file_list(
     // per-shard file paths relative to it (non-empty, per the guard above).
     let table_root = table_location.to_string();
     let effective_storage = if creds.use_vended_credentials {
-        resolve_vended_storage(&result, table_location, allow_http)?
+        resolve_vended_storage(
+            &result,
+            table_location,
+            allow_http,
+            &StaticStoreAddress::from(creds),
+        )?
     } else {
         storage.clone()
     };

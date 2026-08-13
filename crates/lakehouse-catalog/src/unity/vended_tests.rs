@@ -4,7 +4,7 @@
 //! asserted credential-safe.
 
 use super::*;
-use crate::{AdlsCred, StorageBackend};
+use crate::{AdlsCred, StaticStoreAddress, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 
 const SECRET_KEY_SENTINEL: &str = "SECRET_ACCESS_KEY_SENTINEL_VALUE";
@@ -72,8 +72,13 @@ fn s3_vended_response_terminates_in_s3_backend() {
         None,
     );
 
-    let backend = resolve_uc_vended_storage(&response, "s3://bucket/orders", false)
-        .expect("s3 vended resolves");
+    let backend = resolve_uc_vended_storage(
+        &response,
+        "s3://bucket/orders",
+        false,
+        &StaticStoreAddress::default(),
+    )
+    .expect("s3 vended resolves");
 
     match backend {
         StorageBackend::S3(props) => {
@@ -82,9 +87,12 @@ fn s3_vended_response_terminates_in_s3_backend() {
             assert_eq!(props.session_token.as_deref(), Some(SESSION_TOKEN_SENTINEL));
             assert!(
                 props.endpoint.is_empty(),
-                "no endpoint vended -> empty, no CONNECTION endpoint read"
+                "no CONNECTION address and no vended endpoint -> empty"
             );
-            assert!(props.region.is_empty(), "no CONNECTION region read");
+            assert!(
+                props.region.is_empty(),
+                "no CONNECTION address and no vended region -> empty"
+            );
         }
         StorageBackend::Adls { .. } => panic!("expected the S3 backend"),
     }
@@ -98,6 +106,7 @@ fn adls_vended_response_terminates_in_adls_backend() {
         &response,
         "abfss://container@myacct.dfs.core.windows.net/path",
         false,
+        &StaticStoreAddress::default(),
     )
     .expect("adls vended resolves");
 
@@ -116,9 +125,13 @@ fn adls_vended_response_terminates_in_adls_backend() {
 #[test]
 fn variant_selected_from_location_scheme() {
     for scheme in ["s3", "s3a"] {
-        let backend =
-            resolve_uc_vended_storage(&both_families(), &format!("{scheme}://bucket/tbl"), false)
-                .expect("resolves");
+        let backend = resolve_uc_vended_storage(
+            &both_families(),
+            &format!("{scheme}://bucket/tbl"),
+            false,
+            &StaticStoreAddress::default(),
+        )
+        .expect("resolves");
         assert!(
             matches!(backend, StorageBackend::S3(_)),
             "{scheme}:// selects S3 from the scheme alone"
@@ -126,8 +139,13 @@ fn variant_selected_from_location_scheme() {
     }
     for scheme in ["abfs", "abfss"] {
         let location = format!("{scheme}://c@acct.dfs.core.windows.net/p");
-        let backend =
-            resolve_uc_vended_storage(&both_families(), &location, false).expect("resolves");
+        let backend = resolve_uc_vended_storage(
+            &both_families(),
+            &location,
+            true,
+            &StaticStoreAddress::default(),
+        )
+        .expect("resolves");
         assert!(
             matches!(backend, StorageBackend::Adls { .. }),
             "{scheme}:// selects ADLS from the scheme alone"
@@ -145,8 +163,15 @@ fn unsupported_scheme_is_error() {
         }),
     };
 
-    let msg =
-        user_message(resolve_uc_vended_storage(&response, "gs://bucket/tbl", false).unwrap_err());
+    let msg = user_message(
+        resolve_uc_vended_storage(
+            &response,
+            "gs://bucket/tbl",
+            false,
+            &StaticStoreAddress::default(),
+        )
+        .unwrap_err(),
+    );
 
     assert!(
         msg.contains("gs://bucket/tbl"),
@@ -162,8 +187,13 @@ fn unsupported_scheme_is_error() {
 fn missing_matching_credential_is_error() {
     // An S3 location whose response carries only ADLS credentials.
     let s3_msg = user_message(
-        resolve_uc_vended_storage(&azure_response(SAS_SENTINEL), "s3://bucket/tbl", false)
-            .unwrap_err(),
+        resolve_uc_vended_storage(
+            &azure_response(SAS_SENTINEL),
+            "s3://bucket/tbl",
+            false,
+            &StaticStoreAddress::default(),
+        )
+        .unwrap_err(),
     );
     assert!(s3_msg.contains("s3://bucket/tbl"));
     assert!(
@@ -177,6 +207,7 @@ fn missing_matching_credential_is_error() {
             &aws_response("AK", SECRET_KEY_SENTINEL, None, None),
             "abfss://c@acct.dfs.core.windows.net/p",
             false,
+            &StaticStoreAddress::default(),
         )
         .unwrap_err(),
     );
@@ -196,8 +227,15 @@ fn plaintext_endpoint_requires_allow_http() {
         Some("http://minio:9000"),
     );
 
-    let msg =
-        user_message(resolve_uc_vended_storage(&response, "s3://bucket/tbl", false).unwrap_err());
+    let msg = user_message(
+        resolve_uc_vended_storage(
+            &response,
+            "s3://bucket/tbl",
+            false,
+            &StaticStoreAddress::default(),
+        )
+        .unwrap_err(),
+    );
     assert!(
         msg.contains("ALLOW_HTTP"),
         "names the ALLOW_HTTP property: {msg}"
@@ -212,12 +250,74 @@ fn plaintext_endpoint_requires_allow_http() {
     );
 
     // Honored with the operator's explicit consent.
-    let backend = resolve_uc_vended_storage(&response, "s3://bucket/tbl", true)
-        .expect("resolves with allow_http");
+    let backend = resolve_uc_vended_storage(
+        &response,
+        "s3://bucket/tbl",
+        true,
+        &StaticStoreAddress::default(),
+    )
+    .expect("resolves with allow_http");
     match backend {
         StorageBackend::S3(props) => {
             assert_eq!(props.endpoint, "http://minio:9000");
             assert!(props.allow_http);
+        }
+        StorageBackend::Adls { .. } => panic!("expected the S3 backend"),
+    }
+}
+
+#[test]
+fn abfs_location_requires_allow_http_on_the_unity_path() {
+    let response = azure_response(SAS_SENTINEL);
+    let location = "abfs://c@acct.dfs.core.windows.net/p";
+
+    let msg = user_message(
+        resolve_uc_vended_storage(&response, location, false, &StaticStoreAddress::default())
+            .unwrap_err(),
+    );
+    assert!(
+        msg.contains("ALLOW_HTTP"),
+        "names the ALLOW_HTTP property: {msg}"
+    );
+    assert!(msg.contains("abfs://"), "names the plaintext scheme: {msg}");
+    assert!(
+        !msg.contains(SAS_SENTINEL),
+        "no vended secret in the error: {msg}"
+    );
+
+    // Honored with the operator's explicit consent.
+    let backend =
+        resolve_uc_vended_storage(&response, location, true, &StaticStoreAddress::default())
+            .expect("resolves with allow_http");
+    assert!(
+        matches!(backend, StorageBackend::Adls { .. }),
+        "expected the ADLS backend"
+    );
+}
+
+#[test]
+fn s3_vended_response_with_no_store_address_resolves_successfully() {
+    // Real Databricks AWS responses vend a key pair with no endpoint and no
+    // region at all; the CONNECTION is silent too, so neither source resolves
+    // an address. That is a successful resolution — the AWS default chain
+    // places the store at read time — not the deleted "store address
+    // undetermined" refusal.
+    let response = aws_response("AK", SECRET_KEY_SENTINEL, None, None);
+
+    let backend = resolve_uc_vended_storage(
+        &response,
+        "s3://bucket/tbl",
+        false,
+        &StaticStoreAddress::default(),
+    )
+    .expect("an empty vended and CONNECTION address still resolves");
+
+    match backend {
+        StorageBackend::S3(props) => {
+            assert!(props.endpoint.is_empty(), "no endpoint from either source");
+            assert!(props.region.is_empty(), "no region from either source");
+            assert_eq!(props.access_key, "AK");
+            assert_eq!(props.secret_key, SECRET_KEY_SENTINEL);
         }
         StorageBackend::Adls { .. } => panic!("expected the S3 backend"),
     }

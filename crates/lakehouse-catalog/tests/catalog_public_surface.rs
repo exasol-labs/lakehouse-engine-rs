@@ -18,15 +18,18 @@
 //! (vs-adapter/catalog-crate-structure).
 #![allow(unused_imports)]
 
+use std::collections::BTreeSet;
+
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
     CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    IcebergRestCatalogClient, SkipReason, SkippedTable, StorageBackend, StorageProps,
-    TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth, parse_table_ident,
-    redact_credentials, redact_secret_values, resolve_uc_vended_storage, resolve_vended_storage,
+    IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
+    StorageProps, TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth,
+    parse_table_ident, redact_credentials, redact_secret_values, resolve_uc_vended_storage,
+    resolve_vended_storage,
 };
 
 /// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
@@ -80,15 +83,30 @@ fn connection_creds() -> ConnectionCreds {
     }
 }
 
-/// `resolve_vended_storage` is the crate's only vended entry point. Selecting
-/// the credential source and merging it into the storage props are two
-/// mechanism steps behind it, demoted from `pub`; `extract_vended_keys` names
-/// the four `extract_vended_*` readers the consolidation inlined. `build_s3_file_io` is
-/// the deleted predecessor of `StorageBackend::file_io` — its reappearance as
-/// a free function would be the same kind of surface regression.
-/// `s3_backend_from_vended` replaced the deleted `merge_vended_into_storage` for the
-/// S3 arm. A `pub` on any of these five is how that demotion or deletion could be
-/// silently reversed.
+/// True when `source` declares `declaration` — e.g. `pub fn s3_backend` — as that
+/// item ITSELF rather than as the prefix of a longer name. Without the boundary
+/// check `pub fn s3_backend` would also fire on `pub fn s3_backend_from_vended`,
+/// and the shared policy steps could not be asserted in exactly one probe apiece.
+fn declares(source: &str, declaration: &str) -> bool {
+    source.match_indices(declaration).any(|(index, matched)| {
+        source[index + matched.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_alphanumeric() && next != '_')
+    })
+}
+
+/// Mechanism steps behind `resolve_vended_storage`/`StorageBackend::file_io` that
+/// were demoted from `pub` or deleted outright. `merge_vended_into_storage` and
+/// `select_credential_source` are the two demoted steps; `extract_vended_keys`
+/// names the four `extract_vended_*` readers the consolidation inlined;
+/// `build_s3_file_io` is the deleted predecessor of `StorageBackend::file_io`.
+/// `s3_backend_from_vended` and `adls_backend_from_vended` are deleted
+/// predecessors too — the shared `s3_backend`/`adls_backend` in `storage.rs`
+/// replaced BOTH, one construction per backend for both catalog kinds — and it is
+/// `shared_vended_policy_steps_are_not_public`, not this test, that asserts those
+/// replacements stay crate-private. A `pub` on any name here is how a demotion or
+/// deletion could be silently reversed.
 #[test]
 fn demoted_and_deleted_functions_are_not_declared_public() {
     for (name, source) in CATALOG_SOURCES {
@@ -98,9 +116,10 @@ fn demoted_and_deleted_functions_are_not_declared_public() {
             "pub fn extract_vended_keys",
             "pub fn build_s3_file_io",
             "pub fn s3_backend_from_vended",
+            "pub fn adls_backend_from_vended",
         ] {
             assert!(
-                !source.contains(mechanism),
+                !declares(source, mechanism),
                 "{name} must not declare `{mechanism}` — it is a demoted or deleted \
                  function behind `resolve_vended_storage`/`StorageBackend::file_io` \
                  that the crate must keep private or removed"
@@ -226,8 +245,9 @@ fn list_namespace_tables_is_no_longer_public() {
 }
 
 /// The native Unity Catalog public items — the session, the temporary-table-
-/// credentials response type, and the vended selector — are reachable from
-/// outside the crate through the `unity` re-export.
+/// credentials response type, the vended selector, and the store address that
+/// selector takes — are reachable from outside the crate through the `unity` and
+/// `storage` re-exports.
 #[test]
 fn unity_catalog_public_items_are_reachable() {
     let _session = UnityCatalogSession::new("http://unity", connection_creds());
@@ -236,8 +256,12 @@ fn unity_catalog_public_items_are_reachable() {
         azure_user_delegation_sas: None,
         gcp_oauth_token: None,
     };
-    let _resolved: Result<StorageBackend, UdfError> =
-        resolve_uc_vended_storage(&vended, "s3://bucket/db/t", true);
+    let _resolved: Result<StorageBackend, UdfError> = resolve_uc_vended_storage(
+        &vended,
+        "s3://bucket/db/t",
+        true,
+        &StaticStoreAddress::default(),
+    );
 }
 
 /// Minimal `LoadTableResult` fixture; `vended.rs`'s own helper of the same shape is
@@ -272,10 +296,15 @@ fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
 }
 
 /// Pins `resolve_vended_storage`'s arity and return type from OUTSIDE the crate:
-/// `(&LoadTableResult, anchor: &str, allow_http: bool) -> Result<StorageBackend,
-/// UdfError>`, with no CONNECTION-derived parameter. Reintroducing a
-/// `base: &StorageBackend` would fail to compile here rather than only in the crate's
-/// own `#[cfg(test)]`-private unit tests.
+/// `(&LoadTableResult, anchor: &str, allow_http: bool, address: &StaticStoreAddress)
+/// -> Result<StorageBackend, UdfError>`. The store address is the ONLY
+/// CONNECTION-derived parameter, and it is a type that cannot carry a credential —
+/// asserted here as part of the arity pin, because the arity is only worth pinning
+/// while the added parameter stays credential-free. Reintroducing a
+/// `base: &StorageBackend`, or widening the address to `&ConnectionCreds`, would
+/// fail here rather than only in the crate's own `#[cfg(test)]`-private unit tests.
+/// Called with an UNSET address, so the assertions below still read the vended
+/// values.
 #[test]
 fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() {
     let result = minimal_load_table_result(vec![
@@ -284,8 +313,12 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
         ("client.region", "us-east-1"),
     ]);
 
-    let backend: Result<StorageBackend, UdfError> =
-        resolve_vended_storage(&result, "s3://bucket/db/t", true);
+    let backend: Result<StorageBackend, UdfError> = resolve_vended_storage(
+        &result,
+        "s3://bucket/db/t",
+        true,
+        &StaticStoreAddress::default(),
+    );
 
     match backend.expect("scheme-selected S3 arm must succeed") {
         StorageBackend::S3(props) => {
@@ -294,65 +327,94 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
         }
         StorageBackend::Adls { .. } => panic!("an s3:// anchor must select the S3 variant"),
     }
+
+    assert_static_store_address_declares_no_credential_field();
 }
 
 /// Pins `resolve_uc_vended_storage`'s arity and return type from OUTSIDE the
-/// crate: `(&TemporaryTableCredentials, storage_location: &str, allow_http: bool)
-/// -> Result<StorageBackend, UdfError>`, carrying no `warehouse`, `region`, or
-/// existing `StorageBackend` — the three vended selectors' input disjointness is
-/// enforced by this signature. A response with no usable S3 credential for an
-/// `s3://` location is a clear error, not a fabricated backend.
+/// crate: `(&TemporaryTableCredentials, storage_location: &str, allow_http: bool,
+/// address: &StaticStoreAddress) -> Result<StorageBackend, UdfError>`. It carries
+/// no `warehouse`, no static credential, and no existing `StorageBackend` — the
+/// three vended selectors' input disjointness is enforced by this signature. The
+/// one CONNECTION-derived value it does take is a store ADDRESS whose type cannot
+/// carry a credential, asserted here as part of the arity pin so the added
+/// parameter cannot widen back into a credential-bearing one. A response with no
+/// usable S3 credential for an `s3://` location is a clear error, not a fabricated
+/// backend.
 #[test]
-fn resolve_uc_vended_storage_signature_takes_no_connection_value() {
+fn resolve_uc_vended_storage_signature_takes_only_a_credential_free_store_address() {
     let vended = TemporaryTableCredentials {
         aws_temp_credentials: None,
         azure_user_delegation_sas: None,
         gcp_oauth_token: None,
     };
 
-    let resolved: Result<StorageBackend, UdfError> =
-        resolve_uc_vended_storage(&vended, "s3://bucket/db/t", true);
+    let resolved: Result<StorageBackend, UdfError> = resolve_uc_vended_storage(
+        &vended,
+        "s3://bucket/db/t",
+        true,
+        &StaticStoreAddress::default(),
+    );
 
     assert!(
         resolved.is_err(),
         "an s3:// location with no vended aws credential must surface a clear error"
     );
+
+    assert_static_store_address_declares_no_credential_field();
 }
 
-/// Every variant name declared in `storage.rs`'s `enum StorageBackend` source,
-/// extracted generically rather than hardcoding `["S3", "Adls"]`, so a third
-/// variant added to the enum propagates into every selector probe below.
-fn storage_backend_variant_names() -> Vec<&'static str> {
-    let storage_source = source("storage.rs");
+/// The production half of a crate source file, with whole-line comments removed:
+/// everything before its `#[cfg(test)]` sibling-module declaration, minus every
+/// `//`-prefixed line. A name a doc comment merely MENTIONS must not satisfy a
+/// probe that asks where a value is CONSTRUCTED or DISPATCHED on.
+fn production_code(source: &str) -> String {
+    let production = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+    production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-    let enum_start = storage_source
-        .find("enum StorageBackend")
-        .expect("storage.rs must declare `enum StorageBackend`");
-    let body_start = storage_source[enum_start..]
+/// The `{ ... }` body of the named declaration in `source` — `enum StorageBackend`,
+/// `struct StaticStoreAddress` — brace-matched, so a nested body cannot end it early.
+fn declaration_body<'a>(source: &'a str, declaration: &str) -> &'a str {
+    let start = source
+        .find(declaration)
+        .unwrap_or_else(|| panic!("the probed source must declare `{declaration}`"));
+    let body_start = source[start..]
         .find('{')
-        .map(|offset| enum_start + offset + 1)
-        .expect("`enum StorageBackend` must have a `{ ... }` body");
+        .map(|offset| start + offset + 1)
+        .unwrap_or_else(|| panic!("`{declaration}` must have a `{{ ... }}` body"));
 
     let mut depth = 1usize;
-    let mut body_end = body_start;
-    for (offset, ch) in storage_source[body_start..].char_indices() {
+    let mut body_end = None;
+    for (offset, ch) in source[body_start..].char_indices() {
         match ch {
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    body_end = body_start + offset;
+                    body_end = Some(body_start + offset);
                     break;
                 }
             }
             _ => {}
         }
     }
-    assert!(
-        depth == 0,
-        "failed to find the matching closing brace for `enum StorageBackend`'s body"
-    );
-    let body = &storage_source[body_start..body_end];
+
+    let body_end = body_end.unwrap_or_else(|| {
+        panic!("failed to find the matching closing brace for `{declaration}`'s body")
+    });
+    &source[body_start..body_end]
+}
+
+/// Every variant name the named enum declares in `source`, extracted generically
+/// rather than hardcoded, so a variant added to `StorageBackend` or a kind added
+/// to `VendedBackendKind` propagates into every probe below.
+fn enum_variant_names<'a>(source: &'a str, enum_name: &str) -> Vec<&'a str> {
+    let body = declaration_body(source, &format!("enum {enum_name}"));
 
     let variant_names: Vec<&str> = body
         .lines()
@@ -371,43 +433,211 @@ fn storage_backend_variant_names() -> Vec<&'static str> {
 
     assert!(
         !variant_names.is_empty(),
-        "extracted no variant names from `enum StorageBackend`'s body — the probe's own \
+        "extracted no variant names from `enum {enum_name}`'s body — the probe's own \
          parsing is broken, not just failing to find a match"
     );
     variant_names
 }
 
-/// Asserts a vended selector's PRODUCTION source names every `StorageBackend`
-/// variant in its scheme-to-variant mapping — a variant named only inside a
-/// `#[cfg(test)]` module must not satisfy the probe — so a third variant fails
-/// here until the selector maps it too.
-fn assert_source_names_every_storage_backend_variant(vended_source: &str) {
-    let production = &vended_source[..vended_source
-        .find("#[cfg(test)]")
-        .unwrap_or(vended_source.len())];
+/// `storage.rs` — the enum's own module — is the shared home the vended policy
+/// moved into, so every `StorageBackend` variant is CONSTRUCTED there. Neither
+/// vended selector names a variant any more: each classifies a location's scheme
+/// into a `VendedBackendKind` and hands neutral values to this home, which is the
+/// same relocation the dispatch probe below pins from the selectors' side.
+#[test]
+fn shared_vended_home_constructs_every_storage_backend_variant() {
+    let storage = source("storage.rs");
+    let code = production_code(storage);
 
-    for variant in storage_backend_variant_names() {
-        let qualified = format!("StorageBackend::{variant}");
+    for variant in enum_variant_names(storage, "StorageBackend") {
+        let constructed = format!("StorageBackend::{variant}");
         assert!(
-            production.contains(&qualified),
-            "the vended selector's PRODUCTION source must name `{qualified}` somewhere \
-             (its scheme-to-variant mapping), but that literal does not appear outside \
-             `#[cfg(test)]`"
+            code.contains(&constructed),
+            "storage.rs's PRODUCTION code must construct `{constructed}` — the shared vended \
+             home builds every backend variant, and a variant named only in a comment or only \
+             inside `#[cfg(test)]` does not satisfy that"
         );
     }
 }
 
-/// The Iceberg vended selector (`vended.rs`) names every `StorageBackend`
-/// variant in its scheme-to-variant mapping.
+/// Each vended selector dispatches on EVERY `VendedBackendKind` before calling
+/// into the shared home, so a kind added to the enum fails here until BOTH
+/// selectors map it. Leaving this to the construction probe alone would stop
+/// forcing that per-selector — and a kind one selector handled and the other did
+/// not is exactly the drift that let a plaintext `abfs://` location through
+/// ungated.
 #[test]
-fn vended_selector_source_names_every_storage_backend_variant() {
-    assert_source_names_every_storage_backend_variant(source("vended.rs"));
+fn each_vended_selector_dispatches_every_vended_backend_kind() {
+    let kinds = enum_variant_names(source("storage.rs"), "VendedBackendKind");
+
+    for selector in ["vended.rs", "unity/vended.rs"] {
+        let code = production_code(source(selector));
+        for kind in &kinds {
+            let dispatched = format!("VendedBackendKind::{kind}");
+            assert!(
+                code.contains(&dispatched),
+                "{selector}'s PRODUCTION code must dispatch on `{dispatched}` before calling \
+                 the shared home, but that literal appears in no code line outside \
+                 `#[cfg(test)]`"
+            );
+        }
+    }
 }
 
-/// The Unity Catalog vended selector (`unity/vended.rs`) — the third
-/// backend-selection site — names every `StorageBackend` variant, so the
-/// single-home and every-variant guarantees both hold as the enum grows.
+/// The two enums stay in step: every kind a selector can dispatch to has a
+/// constructible `StorageBackend` variant, and every variant has a kind that
+/// selects it. Without this binding, growing one enum alone would leave the
+/// construction probe and the dispatch probe each passing over a different set.
 #[test]
-fn uc_vended_selector_source_names_every_storage_backend_variant() {
-    assert_source_names_every_storage_backend_variant(source("unity/vended.rs"));
+fn vended_kind_and_storage_backend_variant_sets_are_equal() {
+    let storage = source("storage.rs");
+    let variants: BTreeSet<&str> = enum_variant_names(storage, "StorageBackend")
+        .into_iter()
+        .collect();
+    let kinds: BTreeSet<&str> = enum_variant_names(storage, "VendedBackendKind")
+        .into_iter()
+        .collect();
+
+    assert_eq!(
+        variants, kinds,
+        "`StorageBackend`'s variant names and `VendedBackendKind`'s must be the same set — a \
+         kind with no variant dispatches nowhere, and a variant with no kind is unreachable \
+         from a vended location's scheme"
+    );
+}
+
+/// Every field declaration `storage.rs`'s own `struct StaticStoreAddress`
+/// declaration carries, comment lines dropped and trailing commas removed, so the
+/// probes below read what the struct DECLARES rather than what its doc comment
+/// mentions.
+fn static_store_address_field_declarations() -> Vec<&'static str> {
+    let body = declaration_body(source("storage.rs"), "struct StaticStoreAddress");
+    let fields: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| line.trim_end_matches(','))
+        .collect();
+
+    assert!(
+        !fields.is_empty(),
+        "extracted no fields from `struct StaticStoreAddress`'s body — the probe's own \
+         parsing is broken, not just failing to find a match"
+    );
+    fields
+}
+
+/// `StaticStoreAddress` is the capability-narrowed parameter both vended selectors
+/// take instead of `&ConnectionCreds`: it can carry a store address and nothing
+/// else. The guarantee is the TYPE's, so it is asserted against that type's own
+/// declaration — a field added there is the single edit that would put a static
+/// credential back within a vended resolution's reach, and it must fail a test
+/// rather than depend on review.
+fn assert_static_store_address_declares_no_credential_field() {
+    for declaration in static_store_address_field_declarations() {
+        let name = declaration
+            .split(':')
+            .next()
+            .unwrap_or(declaration)
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("");
+        for credential in [
+            "access_key",
+            "secret_key",
+            "session_token",
+            "token",
+            "account_key",
+            "sas_token",
+            "password",
+        ] {
+            assert!(
+                !name.contains(credential),
+                "`struct StaticStoreAddress` must declare no credential field, but it names \
+                 `{name}`, which spells `{credential}` — the vended selectors take this type \
+                 precisely because it CANNOT carry a credential"
+            );
+        }
+    }
+}
+
+/// The store address both vended selectors take is reachable from OUTSIDE the
+/// crate through exactly the two constructions its private fields leave open —
+/// `Default` and the single `From<&ConnectionCreds>` conversion — and its
+/// declaration names no credential field. Together those decide WHICH CONNECTION
+/// values may cross into a vended resolution in one reviewed conversion rather
+/// than at each call site.
+#[test]
+fn static_store_address_is_reachable_and_declares_no_credential_field() {
+    let unset = StaticStoreAddress::default();
+    assert_eq!(unset.endpoint(), "");
+    assert_eq!(unset.region(), "");
+
+    let creds = connection_creds();
+    let configured = StaticStoreAddress::from(&creds);
+    assert_eq!(configured.endpoint(), creds.endpoint);
+    assert_eq!(configured.region(), creds.region);
+
+    assert_static_store_address_declares_no_credential_field();
+}
+
+/// The vended policy steps `storage.rs` now owns are mechanism, not surface: the
+/// two construction functions, the three derivations they read a location
+/// through, and the neutral `VendedS3` both selectors reduce their own wire shape
+/// to. Moving them into one shared home widened nothing — a `pub` on any of them,
+/// or a `lib.rs` re-export, would turn an internal refactor into a permanent API
+/// obligation. Each is asserted here and nowhere else:
+/// `demoted_and_deleted_functions_are_not_declared_public` covers their deleted
+/// predecessors instead.
+#[test]
+fn shared_vended_policy_steps_are_not_public() {
+    const SHARED_STEPS: [(&str, &str); 6] = [
+        ("pub fn s3_backend", "s3_backend"),
+        ("pub fn adls_backend", "adls_backend"),
+        ("pub fn scheme_of", "scheme_of"),
+        ("pub fn location_host", "location_host"),
+        ("pub fn adls_account_name", "adls_account_name"),
+        ("pub struct VendedS3", "VendedS3"),
+    ];
+
+    for (name, source) in CATALOG_SOURCES {
+        for (declaration, _) in SHARED_STEPS {
+            assert!(
+                !declares(source, declaration),
+                "{name} must not declare `{declaration}` — the shared vended policy step \
+                 behind `resolve_vended_storage`/`resolve_uc_vended_storage` stays \
+                 crate-private"
+            );
+        }
+    }
+
+    let lib = source("lib.rs");
+    for (_, item) in SHARED_STEPS {
+        assert!(
+            !lib.contains(item),
+            "lib.rs must not re-export the shared vended policy step `{item}` — the crate \
+             exposes the two concept-level selectors, not the policy they share"
+        );
+    }
+}
+
+/// Both `StaticStoreAddress` fields stay non-`pub`. Their privacy is the whole
+/// mechanism: it leaves `Default` and the single `From<&ConnectionCreds>`
+/// conversion as the only constructions reachable outside `storage.rs`, so WHICH
+/// CONNECTION values cross into a vended resolution is one reviewed edit rather
+/// than a field any call site can set. Widening either field to `pub` restores
+/// field-by-field construction at a distance and must fail here rather than pass
+/// silently — `static_store_address_is_reachable_and_declares_no_credential_field`
+/// would not notice, since it constrains which fields EXIST, not who may set them.
+#[test]
+fn static_store_address_fields_are_not_public() {
+    for declaration in static_store_address_field_declarations() {
+        let visibility = declaration.split_whitespace().next().unwrap_or("");
+        assert!(
+            visibility != "pub" && !visibility.starts_with("pub("),
+            "`struct StaticStoreAddress` must keep every field non-`pub`, but declares \
+             `{declaration}` — a public field is a second construction path around the one \
+             reviewed `From<&ConnectionCreds>` conversion"
+        );
+    }
 }

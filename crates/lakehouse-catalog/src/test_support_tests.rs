@@ -9,7 +9,7 @@ use crate::{ConnectionCreds, StorageBackend, StorageProps};
 /// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
 /// Individual tests set only the auth fields under test.
 ///
-/// Consumers: `auth`, `namespace`, `session`.
+/// Consumers: `auth`, `namespace`, `session`, `storage`.
 pub(crate) fn base_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "warehouse".into(),
@@ -56,7 +56,7 @@ pub(crate) fn static_backend() -> StorageBackend {
 /// fields against a `resolve_vended_storage` return value can stay unchanged
 /// below the unwrap.
 ///
-/// Consumers: `vended`.
+/// Consumers: `storage`, `vended`.
 pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     match backend {
         StorageBackend::S3(props) => props,

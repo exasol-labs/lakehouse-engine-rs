@@ -676,29 +676,35 @@ fn presence_label(present: bool) -> &'static str {
     if present { "VENDED" } else { "ABSENT" }
 }
 
-/// AWS Glue's vended payload carries a usable S3 credential set AND a store
-/// address for the table's own location.
+/// AWS Glue's vended payload carries a usable S3 credential set for the table's
+/// own location, and what it says about that location's store address.
 ///
 /// Evidence `cloud_scan_reads_with_vended_credentials` cannot supply: that CONNECTION
 /// also carries static AWS keys, so a green scan there is compatible with Glue vending
 /// nothing at all. This test issues the access-delegated `loadTable` GET itself and
 /// reads the response's vended config keys, which no static CONNECTION value can
-/// populate. A key absent here is a plan-time failure for every vended Glue virtual
-/// schema, which is why the assertions name the absent key rather than a failed scan.
+/// populate. An absent KEY PAIR is a plan-time failure for every vended Glue virtual
+/// schema, which is why those assertions name the absent key rather than a failed scan.
 ///
 /// The anchor is the table's OWN location, derived exactly as `resolve_file_list`
 /// derives it; there is no fallback for it, so this test asserts it is present rather
 /// than substituting the CONNECTION's `warehouse`.
 ///
-/// `s3.session-token` is REPORTED, not required — a permanent IAM identity vends a key
-/// pair with no token. Run with `--nocapture` to read the report line. Skips when the
-/// cloud env vars are absent, like every test in this module.
+/// `client.region`, `s3.endpoint`, and `s3.session-token` are REPORTED, not required.
+/// A permanent IAM identity vends a key pair with no token, and the store address is
+/// resolved with the CONNECTION's `endpoint`/`region` winning when set — so a payload
+/// vending neither addressing key still resolves, through the CONNECTION or AWS's own
+/// default chain. Only the credentials must be vended. Run with `--nocapture` to read
+/// the report line. Skips when the cloud env vars are absent, like every test in this
+/// module.
 #[test]
-fn cloud_glue_vends_s3_key_pair_and_store_address() {
+fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
     let env = match CloudEnv::from_env() {
         Some(e) => e,
         None => {
-            println!("SKIPPED: cloud_glue_vends_s3_key_pair_and_store_address — env vars absent");
+            println!(
+                "SKIPPED: cloud_glue_vends_the_s3_key_pair_for_the_table_location — env vars absent"
+            );
             return;
         }
     };
@@ -763,15 +769,8 @@ fn cloud_glue_vends_s3_key_pair_and_store_address() {
          s3.secret-access-key: under scheme-driven resolution no CONNECTION value can supply \
          one, so every vended Glue virtual schema fails at plan time"
     );
-    assert!(
-        region_vended || endpoint_vended,
-        "the credential source Glue vended for table location {anchor} carries neither a \
-         non-empty client.region nor a non-empty s3.endpoint: the store address is undetermined \
-         and under scheme-driven resolution no CONNECTION value can supply it"
-    );
-
     println!(
-        "cloud_glue_vends_s3_key_pair_and_store_address: table location {anchor} — \
+        "cloud_glue_vends_the_s3_key_pair_for_the_table_location: table location {anchor} — \
          s3.access-key-id {}, s3.secret-access-key {}, client.region {}, s3.endpoint {}, \
          s3.session-token {}",
         presence_label(access_key_vended),

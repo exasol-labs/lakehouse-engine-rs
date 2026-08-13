@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use crate::{AdlsCred, StorageProps};
 
 const VENDED_AK: &str = "VENDED_AK_SENTINEL";
 const VENDED_SK: &str = "VENDED_SK_SENTINEL";
@@ -114,9 +115,10 @@ fn vended_s3(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
     allow_http: bool,
+    address: &StaticStoreAddress,
 ) -> StorageProps {
     s3_payload(
-        resolve_vended_storage(result, anchor, allow_http)
+        resolve_vended_storage(result, anchor, allow_http, address)
             .expect("the vended request must be satisfiable"),
     )
 }
@@ -128,8 +130,9 @@ fn vended_user_error(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
     allow_http: bool,
+    address: &StaticStoreAddress,
 ) -> String {
-    let error = resolve_vended_storage(result, anchor, allow_http)
+    let error = resolve_vended_storage(result, anchor, allow_http, address)
         .expect_err("an unsatisfied vended request must not resolve a backend");
     assert!(
         matches!(error, UdfError::User(_)),
@@ -143,8 +146,9 @@ fn vended_adls_sas(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
     allow_http: bool,
+    address: &StaticStoreAddress,
 ) -> (String, String) {
-    match resolve_vended_storage(result, anchor, allow_http)
+    match resolve_vended_storage(result, anchor, allow_http, address)
         .expect("the vended request must be satisfiable")
     {
         StorageBackend::Adls {
@@ -204,7 +208,12 @@ fn vended_storage_prefers_storage_credentials_over_flat_config() {
         ],
     );
 
-    let merged = vended_s3(&result, result.metadata.location(), false);
+    let merged = vended_s3(
+        &result,
+        result.metadata.location(),
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.access_key, "VENDED_AK",
@@ -247,7 +256,12 @@ fn vended_storage_longest_matching_prefix_wins() {
         vec![],
     );
 
-    let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
+    let merged = vended_s3(
+        &result,
+        "s3://bucket/db/t/metadata/v1.json",
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.access_key, "LONG_AK",
@@ -278,7 +292,12 @@ fn vended_storage_matches_a_prefix_across_a_case_variant_scheme() {
         ],
     );
 
-    let merged = vended_s3(&result, "S3://bucket/db/t", false);
+    let merged = vended_s3(
+        &result,
+        "S3://bucket/db/t",
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.access_key, VENDED_AK,
@@ -302,7 +321,12 @@ fn vended_storage_falls_back_to_flat_config() {
         ],
     );
 
-    let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
+    let merged = vended_s3(
+        &result,
+        "s3://bucket/db/t/metadata/v1.json",
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.access_key, "CONFIG_AK",
@@ -324,7 +348,12 @@ fn vended_storage_uses_flat_config_when_no_storage_credentials() {
         ],
     );
 
-    let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", false);
+    let merged = vended_s3(
+        &result,
+        "s3://bucket/db/t/metadata/v1.json",
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(merged.access_key, "CONFIG_AK");
     assert_eq!(merged.secret_key, "CONFIG_SK");
@@ -367,7 +396,7 @@ fn vended_storage_anchor_is_the_s3_table_location() {
         s3_anchor.starts_with("s3://"),
         "metadata.location() must be an S3 URI, got: {s3_anchor}"
     );
-    let merged_s3 = vended_s3(&result, &s3_anchor, false);
+    let merged_s3 = vended_s3(&result, &s3_anchor, false, &StaticStoreAddress::default());
     assert_eq!(
         merged_s3.access_key, "VENDED_AK",
         "S3 table location anchor must match the storage_credentials prefix"
@@ -375,7 +404,7 @@ fn vended_storage_anchor_is_the_s3_table_location() {
 
     // Passing the HTTPS catalog URI instead is refused: it names no backend.
     let https_anchor = "https://glue.us-east-1.amazonaws.com/v1/catalog";
-    let message = vended_user_error(&result, https_anchor, false);
+    let message = vended_user_error(&result, https_anchor, false, &StaticStoreAddress::default());
     assert!(
         message.contains(https_anchor),
         "the refusal must name the location it could not read: {message}"
@@ -405,7 +434,12 @@ fn vended_creds_are_the_sole_storage_source_in_spec() {
         ],
     );
 
-    let merged = vended_s3(&result, result.metadata.location(), false);
+    let merged = vended_s3(
+        &result,
+        result.metadata.location(),
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.access_key, "VENDED_AK",
@@ -435,7 +469,12 @@ fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() 
         vec![("s3.access-key-id", ""), ("s3.secret-access-key", "")],
     );
 
-    let message = vended_user_error(&result, result.metadata.location(), true);
+    let message = vended_user_error(
+        &result,
+        result.metadata.location(),
+        true,
+        &StaticStoreAddress::default(),
+    );
 
     assert!(
         message.contains("s3.access-key-id"),
@@ -458,7 +497,12 @@ fn vended_storage_adopts_the_vended_session_token() {
         ],
     );
 
-    let merged = vended_s3(&result, result.metadata.location(), false);
+    let merged = vended_s3(
+        &result,
+        result.metadata.location(),
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.session_token.as_deref(),
@@ -489,7 +533,12 @@ fn vended_storage_adopts_endpoint_and_path_style_from_flat_config() {
         ],
     );
 
-    let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", true);
+    let merged = vended_s3(
+        &result,
+        "s3://bucket/db/t/metadata/v1.json",
+        true,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(merged.endpoint, "http://minio:9000/");
     assert!(merged.path_style);
@@ -512,7 +561,12 @@ fn vended_storage_adopts_endpoint_from_storage_credentials() {
         vec![("s3.endpoint", "http://wrong:1/")],
     );
 
-    let merged = vended_s3(&result, "s3://bucket/db/t/metadata/v1.json", true);
+    let merged = vended_s3(
+        &result,
+        "s3://bucket/db/t/metadata/v1.json",
+        true,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         merged.endpoint, "http://minio:9000/",
@@ -540,7 +594,7 @@ fn vended_creds_are_the_sole_storage_source_across_all_auth_modes() {
     // The vended extraction logic is auth-mode-independent: run it for each
     // logical auth mode and confirm identical output.
     for mode_label in ["no-auth", "bearer", "oauth2"] {
-        let merged = vended_s3(&result, &anchor, false);
+        let merged = vended_s3(&result, &anchor, false, &StaticStoreAddress::default());
 
         assert_eq!(
             merged.access_key, VENDED_AK,
@@ -573,7 +627,7 @@ fn bearer_token_path_extracts_vended_from_config() {
     let result = vended_result_flat_config();
     let anchor = result.metadata.location().to_string();
 
-    let merged = vended_s3(&result, &anchor, false);
+    let merged = vended_s3(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert_eq!(
         merged.access_key, VENDED_AK,
@@ -603,7 +657,7 @@ fn oauth2_path_extracts_vended_credentials() {
     let result = vended_result_flat_config();
     let anchor = result.metadata.location().to_string();
 
-    let merged = vended_s3(&result, &anchor, false);
+    let merged = vended_s3(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert_eq!(
         merged.access_key, VENDED_AK,
@@ -627,12 +681,13 @@ fn oauth2_path_extracts_vended_credentials() {
 // Region, endpoint, and path-style come from the response and nowhere else.
 // ---------------------------------------------------------------------------
 
-/// Scenario: a vended-credentials request takes every S3 transport value from
-/// the response — the region it advertises is adopted, the endpoint and
-/// path-style it omits are absent — and a response that advertises neither
-/// region nor endpoint leaves the store address undetermined.
+/// Scenario: with the CONNECTION silent on addressing, the response alone places
+/// the store — the region it advertises is adopted, the endpoint and path-style it
+/// omits stay absent — and a response advertising neither region nor endpoint still
+/// resolves, leaving the store for AWS's own default chain to place.
 #[test]
-fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() {
+fn empty_connection_address_adopts_the_vended_transport_values_and_a_response_placing_none_still_resolves()
+ {
     // Part A: client.region adopted; the omitted transport values stay absent.
     let result_with_region = make_load_table_result(
         None,
@@ -645,7 +700,12 @@ fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() 
     );
     let anchor = result_with_region.metadata.location().to_string();
 
-    let merged = vended_s3(&result_with_region, &anchor, false);
+    let merged = vended_s3(
+        &result_with_region,
+        &anchor,
+        false,
+        &StaticStoreAddress::default(),
+    );
     assert_eq!(
         merged.region, VENDED_REGION,
         "the vended region must be the resolved region"
@@ -664,7 +724,8 @@ fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() 
         "a path-style the response omits is absent"
     );
 
-    // Part B: neither client.region nor s3.endpoint → nothing can place the store.
+    // Part B: neither client.region nor s3.endpoint, and no CONNECTION value either —
+    // the shape a real Databricks AWS response vends, which the default chain places.
     let result_no_address = make_load_table_result(
         None,
         vec![
@@ -674,12 +735,24 @@ fn vended_storage_takes_region_endpoint_and_path_style_from_the_response_only() 
     );
     let anchor_no_address = result_no_address.metadata.location().to_string();
 
-    let message = vended_user_error(&result_no_address, &anchor_no_address, false);
-    assert!(
-        message.contains("client.region") && message.contains("s3.endpoint"),
-        "the refusal must name both keys that could have placed the store: {message}"
+    let unplaced = vended_s3(
+        &result_no_address,
+        &anchor_no_address,
+        false,
+        &StaticStoreAddress::default(),
     );
-    assert_names_no_credential_value(&message);
+    assert!(
+        unplaced.endpoint.is_empty() && unplaced.region.is_empty(),
+        "a store address neither side supplies stays empty rather than being invented"
+    );
+    assert_eq!(
+        unplaced.access_key, VENDED_AK,
+        "the vended key pair still places the credentials"
+    );
+    assert!(
+        !unplaced.path_style,
+        "no endpoint resolved, so nothing couples path_style to true"
+    );
 }
 
 /// Scenario: the `X-Iceberg-Access-Delegation` header is sent when vending is
@@ -767,7 +840,7 @@ fn resolve_vended_storage_empty_access_key_is_a_missing_credential() {
     );
     let anchor = result.metadata.location().to_string();
 
-    let message = vended_user_error(&result, &anchor, false);
+    let message = vended_user_error(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert!(
         message.contains("s3.access-key-id"),
@@ -791,7 +864,7 @@ fn resolve_vended_storage_empty_secret_key_is_a_missing_credential() {
     );
     let anchor = result.metadata.location().to_string();
 
-    let message = vended_user_error(&result, &anchor, false);
+    let message = vended_user_error(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert!(
         message.contains("s3.secret-access-key"),
@@ -815,7 +888,12 @@ fn resolve_vended_storage_absent_session_token_is_absent() {
         ],
     );
     let anchor_absent = result_absent.metadata.location().to_string();
-    let merged_absent = vended_s3(&result_absent, &anchor_absent, false);
+    let merged_absent = vended_s3(
+        &result_absent,
+        &anchor_absent,
+        false,
+        &StaticStoreAddress::default(),
+    );
     assert_eq!(
         merged_absent.session_token, None,
         "an absent vended session_token key resolves to no token"
@@ -832,7 +910,12 @@ fn resolve_vended_storage_absent_session_token_is_absent() {
         ],
     );
     let anchor_empty = result_empty.metadata.location().to_string();
-    let merged_empty = vended_s3(&result_empty, &anchor_empty, false);
+    let merged_empty = vended_s3(
+        &result_empty,
+        &anchor_empty,
+        false,
+        &StaticStoreAddress::default(),
+    );
     assert_eq!(
         merged_empty.session_token, None,
         "an empty vended session_token value resolves to no token"
@@ -841,7 +924,7 @@ fn resolve_vended_storage_absent_session_token_is_absent() {
 
 /// Scenario: an unparseable `s3.path-style-access` falls to the default rather than
 /// parsing as truthy — `bool::from_str` accepts only lowercase `"true"`/`"false"`.
-/// The default is whether an endpoint was vended, so with no endpoint here the
+/// The default is whether an endpoint RESOLVED, so with no endpoint here the
 /// expected value is `false`; the endpoint-present half is
 /// [`vended_endpoint_without_path_style_stays_reachable_by_the_scan`].
 #[test]
@@ -857,7 +940,7 @@ fn resolve_vended_storage_unparseable_path_style_without_an_endpoint_is_false() 
     );
     let anchor = result.metadata.location().to_string();
 
-    let merged = vended_s3(&result, &anchor, false);
+    let merged = vended_s3(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert!(
         merged.endpoint.is_empty(),
@@ -886,7 +969,7 @@ fn vended_endpoint_without_path_style_stays_reachable_by_the_scan() {
     );
     let anchor = result.metadata.location().to_string();
 
-    let merged = vended_s3(&result, &anchor, true);
+    let merged = vended_s3(&result, &anchor, true, &StaticStoreAddress::default());
 
     assert_eq!(
         merged.endpoint, "http://minio:9000/",
@@ -915,7 +998,7 @@ fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
     let anchor = result.metadata.location().to_string();
 
     assert!(
-        !vended_s3(&result, &anchor, false).path_style,
+        !vended_s3(&result, &anchor, false, &StaticStoreAddress::default()).path_style,
         "a path-style of false that the response states must not be overridden by the \
              presence of an endpoint"
     );
@@ -942,7 +1025,7 @@ fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config
     );
     let anchor = result.metadata.location().to_string();
 
-    let message = vended_user_error(&result, &anchor, false);
+    let message = vended_user_error(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert!(
         message.contains("s3.secret-access-key"),
@@ -965,11 +1048,11 @@ fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
     let anchor = result.metadata.location().to_string();
 
     assert!(
-        vended_s3(&result, &anchor, true).allow_http,
+        vended_s3(&result, &anchor, true, &StaticStoreAddress::default()).allow_http,
         "allow_http=true must carry through"
     );
     assert!(
-        !vended_s3(&result, &anchor, false).allow_http,
+        !vended_s3(&result, &anchor, false, &StaticStoreAddress::default()).allow_http,
         "allow_http=false must carry through, unaffected by the same vended result"
     );
 
@@ -983,7 +1066,12 @@ fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
     );
     let plaintext_anchor = plaintext.metadata.location().to_string();
 
-    let honoured = vended_s3(&plaintext, &plaintext_anchor, true);
+    let honoured = vended_s3(
+        &plaintext,
+        &plaintext_anchor,
+        true,
+        &StaticStoreAddress::default(),
+    );
     assert_eq!(
         honoured.endpoint, "http://minio:9000/",
         "a vended plaintext endpoint is honoured under operator consent"
@@ -993,7 +1081,12 @@ fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
         "and honouring it must leave it reachable: the scan passes the endpoint to the \
              builder only when path_style is set"
     );
-    let message = vended_user_error(&plaintext, &plaintext_anchor, false);
+    let message = vended_user_error(
+        &plaintext,
+        &plaintext_anchor,
+        false,
+        &StaticStoreAddress::default(),
+    );
     assert!(
         message.contains("ALLOW_HTTP"),
         "the refusal must name the property that withholds consent: {message}"
@@ -1036,7 +1129,7 @@ fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
     );
     let anchor = result.metadata.location().to_string();
 
-    let merged = vended_s3(&result, &anchor, true);
+    let merged = vended_s3(&result, &anchor, true, &StaticStoreAddress::default());
 
     assert_eq!(
         merged.access_key, VENDED_AK,
@@ -1083,8 +1176,9 @@ fn vended_backend_variant_comes_from_the_anchor_scheme() {
     );
     for scheme in ["s3", "s3a"] {
         let anchor = format!("{scheme}://bucket/db/t");
-        let resolved = resolve_vended_storage(&s3_result, &anchor, false)
-            .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
+        let resolved =
+            resolve_vended_storage(&s3_result, &anchor, false, &StaticStoreAddress::default())
+                .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
         assert!(
             matches!(resolved, StorageBackend::S3(_)),
             "{scheme}:// must select the S3 backend, got {resolved:?}"
@@ -1094,24 +1188,39 @@ fn vended_backend_variant_comes_from_the_anchor_scheme() {
     let adls_result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
     for (scheme, allow_http) in [("abfss", false), ("abfs", true)] {
         let anchor = format!("{scheme}://container@{ADLS_HOST}/db/t");
-        let resolved = resolve_vended_storage(&adls_result, &anchor, allow_http)
-            .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
+        let resolved = resolve_vended_storage(
+            &adls_result,
+            &anchor,
+            allow_http,
+            &StaticStoreAddress::default(),
+        )
+        .unwrap_or_else(|e| panic!("{scheme}:// must resolve a backend: {e}"));
         assert!(
             matches!(resolved, StorageBackend::Adls { .. }),
             "{scheme}:// must select the ADLS backend, got {resolved:?}"
         );
     }
 
-    let resolved_upper_s3 = resolve_vended_storage(&s3_result, "S3://bucket/db/t", false)
-        .unwrap_or_else(|e| panic!("S3:// must resolve a backend: {e}"));
+    let resolved_upper_s3 = resolve_vended_storage(
+        &s3_result,
+        "S3://bucket/db/t",
+        false,
+        &StaticStoreAddress::default(),
+    )
+    .unwrap_or_else(|e| panic!("S3:// must resolve a backend: {e}"));
     assert!(
         matches!(resolved_upper_s3, StorageBackend::S3(_)),
         "an upper-cased S3:// scheme must select the S3 backend, got {resolved_upper_s3:?}"
     );
 
     let upper_abfss_anchor = format!("ABFSS://container@{ADLS_HOST}/db/t");
-    let resolved_upper_abfss = resolve_vended_storage(&adls_result, &upper_abfss_anchor, false)
-        .unwrap_or_else(|e| panic!("ABFSS:// must resolve a backend: {e}"));
+    let resolved_upper_abfss = resolve_vended_storage(
+        &adls_result,
+        &upper_abfss_anchor,
+        false,
+        &StaticStoreAddress::default(),
+    )
+    .unwrap_or_else(|e| panic!("ABFSS:// must resolve a backend: {e}"));
     assert!(
         matches!(resolved_upper_abfss, StorageBackend::Adls { .. }),
         "an upper-cased ABFSS:// scheme must select the ADLS backend, got \
@@ -1130,7 +1239,7 @@ fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other()
         "https://glue.us-east-1.amazonaws.com/v1/catalog",
         "123456789012",
     ] {
-        let message = vended_user_error(&result, anchor, false);
+        let message = vended_user_error(&result, anchor, false, &StaticStoreAddress::default());
         assert_refused(
             &message,
             anchor,
@@ -1156,7 +1265,12 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
     // An absent S3 key pair.
     let absent_pair = make_load_table_result(None, vec![("client.region", VENDED_REGION)]);
     assert_refused(
-        &vended_user_error(&absent_pair, s3_anchor, false),
+        &vended_user_error(
+            &absent_pair,
+            s3_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         s3_anchor,
         &["s3.access-key-id"],
     );
@@ -1171,29 +1285,25 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
         ],
     );
     assert_refused(
-        &vended_user_error(&empty_pair, s3_anchor, false),
+        &vended_user_error(
+            &empty_pair,
+            s3_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         s3_anchor,
         &["s3.access-key-id"],
-    );
-
-    // Neither region nor endpoint: nothing left can place the store.
-    let no_address = make_load_table_result(
-        None,
-        vec![
-            ("s3.access-key-id", VENDED_AK),
-            ("s3.secret-access-key", VENDED_SK),
-        ],
-    );
-    assert_refused(
-        &vended_user_error(&no_address, s3_anchor, false),
-        s3_anchor,
-        &["client.region", "s3.endpoint"],
     );
 
     // An ADLS response carrying no adls.sas-token.* key at all.
     let no_sas = make_load_table_result(None, vec![("client.region", VENDED_REGION)]);
     assert_refused(
-        &vended_user_error(&no_sas, &abfss_anchor, false),
+        &vended_user_error(
+            &no_sas,
+            &abfss_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         &abfss_anchor,
         &[VENDED_SAS_TOKEN_KEY_PREFIX],
     );
@@ -1201,7 +1311,12 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
     // A SAS minted for a different host: account-scoped, so as unusable as none.
     let wrong_host_sas = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
     assert_refused(
-        &vended_user_error(&wrong_host_sas, &abfss_anchor, false),
+        &vended_user_error(
+            &wrong_host_sas,
+            &abfss_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         &abfss_anchor,
         &[VENDED_SAS_TOKEN_KEY_PREFIX, ADLS_HOST],
     );
@@ -1216,7 +1331,12 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
         ],
     );
     assert_refused(
-        &vended_user_error(&plaintext_endpoint, s3_anchor, false),
+        &vended_user_error(
+            &plaintext_endpoint,
+            s3_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         s3_anchor,
         &["ALLOW_HTTP", "http://minio:9000/"],
     );
@@ -1225,7 +1345,12 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
     // WOULD satisfy the same anchor over abfss://: the gate is on the transport.
     let satisfiable_sas = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
     assert_refused(
-        &vended_user_error(&satisfiable_sas, &abfs_anchor, false),
+        &vended_user_error(
+            &satisfiable_sas,
+            &abfs_anchor,
+            false,
+            &StaticStoreAddress::default(),
+        ),
         &abfs_anchor,
         &["ALLOW_HTTP", "abfs://"],
     );
@@ -1240,7 +1365,7 @@ fn adls_missing_sas_refusal_names_the_host_after_redaction() {
     let result = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
     let anchor = format!("abfss://container@{ADLS_HOST}/db/t");
 
-    let message = vended_user_error(&result, &anchor, false);
+    let message = vended_user_error(&result, &anchor, false, &StaticStoreAddress::default());
     assert_names_no_credential_value(&message);
 
     let redacted = crate::redact_error_text(&message, &[OTHER_HOST_SAS, VENDED_SAS]);
@@ -1277,7 +1402,8 @@ fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
     ]);
     let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
 
-    let (account_name, sas) = vended_adls_sas(&result, &anchor, false);
+    let (account_name, sas) =
+        vended_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
 
     assert_eq!(
         sas, VENDED_SAS,
@@ -1300,8 +1426,14 @@ fn vended_adls_reads_the_host_after_the_container_userinfo() {
         &result,
         &format!("abfss://mycontainer@{ADLS_HOST}/db/t"),
         false,
+        &StaticStoreAddress::default(),
     );
-    let without_container = vended_adls_sas(&result, &format!("abfss://{ADLS_HOST}/db/t"), false);
+    let without_container = vended_adls_sas(
+        &result,
+        &format!("abfss://{ADLS_HOST}/db/t"),
+        false,
+        &StaticStoreAddress::default(),
+    );
 
     assert_eq!(
         with_container.0, ADLS_ACCOUNT,
@@ -1337,6 +1469,7 @@ fn vended_adls_sas_host_match_is_case_insensitive() {
         &result,
         &format!("abfss://mycontainer@{mixed_case_host}/db/t"),
         false,
+        &StaticStoreAddress::default(),
     );
 
     assert_eq!(
@@ -1363,7 +1496,7 @@ fn vended_adls_sas_prefers_the_exact_host_spelling() {
     let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
 
     for _ in 0..16 {
-        let (_, sas) = vended_adls_sas(&result, &anchor, false);
+        let (_, sas) = vended_adls_sas(&result, &anchor, false, &StaticStoreAddress::default());
         assert_eq!(
             sas, VENDED_SAS,
             "the key whose host suffix matches the anchor exactly must win every time, not \
@@ -1403,6 +1536,7 @@ fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
             &result,
             &format!("abfss://mycontainer@{anchor_host}/db/t"),
             false,
+            &StaticStoreAddress::default(),
         );
 
         assert_eq!(
@@ -1417,15 +1551,22 @@ fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
 /// is no account name to read from it. Both ways a location can arrive without one:
 /// an empty authority behind a `<container>@` segment, and a host whose first
 /// dot-separated label is empty.
+///
+/// Each unlabelled host vends its OWN SAS, so the request is satisfiable up to the
+/// account name and the refusal under test cannot be a missing credential wearing
+/// the same anchor.
 #[test]
 fn vended_adls_account_name_requires_a_labelled_host() {
-    let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
-
-    for anchor in [
-        "abfss://mycontainer@/db/t",
-        "abfss://.dfs.core.windows.net/db/t",
+    for (anchor, unlabelled_host) in [
+        ("abfss://mycontainer@/db/t", ""),
+        (
+            "abfss://.dfs.core.windows.net/db/t",
+            ".dfs.core.windows.net",
+        ),
     ] {
-        let message = vended_user_error(&result, anchor, false);
+        let result = adls_vended_result(&[(unlabelled_host, VENDED_SAS)]);
+
+        let message = vended_user_error(&result, anchor, false, &StaticStoreAddress::default());
         assert_refused(&message, anchor, &["account name"]);
     }
 }
@@ -1446,7 +1587,7 @@ fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
     );
     let anchor = format!("abfss://mycontainer@{ADLS_HOST}/db/t");
 
-    let resolved = resolve_vended_storage(&result, &anchor, false)
+    let resolved = resolve_vended_storage(&result, &anchor, false, &StaticStoreAddress::default())
         .expect("the vended request must be satisfiable");
 
     match resolved {
