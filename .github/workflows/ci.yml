@@ -212,14 +212,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # `unity-e2e` gates crates/lakehouse-engine/tests/e2e_unity_test.rs entirely
-      # (`#![cfg(feature = "unity-e2e")]`) — without it that file compiles to an
-      # empty crate and can silently stop compiling. Costs nothing here: no
-      # Docker stack, no dependencies (`unity-e2e = []`). The other four e2e
-      # features remain
-      # unchecked here — tracked in #337.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --features unity-e2e -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # The test gate, and the only job that executes the suite. Produces the
   # lcov report the `sonar` job uploads.
