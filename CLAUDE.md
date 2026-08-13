@@ -219,7 +219,7 @@ before changing the shard count or fan-out shape.
 
 ## Data types
 
-Exasol types: BOOLEAN, DECIMAL(p≤36, s≤36), DOUBLE PRECISION, VARCHAR(n≤2,000,000),
+Exasol types: BOOLEAN, DECIMAL(1≤p≤36, 0≤s≤p), DOUBLE PRECISION, VARCHAR(n≤2,000,000),
 CHAR(n≤2,000), DATE, TIMESTAMP(p≤9), TIMESTAMP WITH LOCAL TIME ZONE, INTERVAL YEAR TO
 MONTH, INTERVAL DAY TO SECOND, GEOMETRY, HASHTYPE. **No arrays, lists, structs, or maps.**
 
@@ -238,6 +238,12 @@ conversion):
 | Timestamp(_, _) | TIMESTAMP |
 | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) |
 | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON |
+
+Exasol's own `DECIMAL` domain is `1 ≤ p ≤ 36` and `0 ≤ s ≤ p`: `DECIMAL(0,0)` is rejected with
+*illegal precision value: 0* and `DECIMAL(5,10)` with *illegal scale value: 10* (both SQL state
+`42000`, captured live). The two `Decimal128` table rows describe only the Arrow-input direction
+and are looser than that domain; a catalog-declared decimal (Iceberg or Unity) is checked against
+the full domain and otherwise maps to `VARCHAR(2000000)`.
 
 Iceberg `timestamptz` maps to plain `TIMESTAMP`, not `TIMESTAMP WITH LOCAL TIME ZONE`: Exasol
 rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output type (`sqlCode 22002`).
