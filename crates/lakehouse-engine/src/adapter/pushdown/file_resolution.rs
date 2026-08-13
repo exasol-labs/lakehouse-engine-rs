@@ -3,7 +3,7 @@ use crate::scan::spec::{
     AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
     NameMappingEntry, ProjectionItem, StorageBackend,
 };
-use crate::types::mapping::exasol_type_from_json;
+use crate::types::mapping::{exasol_representable_catalog_decimal, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use iceberg::TableIdent;
@@ -116,7 +116,7 @@ pub(super) fn encode_initial_default(field: &iceberg::spec::NestedField) -> Opti
             PrimitiveLiteral::Long(v),
         ) => v.to_string(),
         (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(v))
-            if *precision <= 36 && *scale <= 36 =>
+            if exasol_representable_catalog_decimal(*precision, *scale) =>
         {
             v.to_string()
         }
