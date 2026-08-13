@@ -11,12 +11,18 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 
 ## Background
 
-* Exasol's representable types are: BOOLEAN, DECIMAL(p≤36, s≤36), DOUBLE PRECISION,
+* Exasol's representable types are: BOOLEAN, DECIMAL(1≤p≤36, 0≤s≤p), DOUBLE PRECISION,
   VARCHAR(n≤2,000,000), CHAR(n≤2,000), DATE, TIMESTAMP(p≤9), TIMESTAMP WITH LOCAL TIME
   ZONE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, HASHTYPE. Exasol has
   no array, list, struct, or map type. `TIMESTAMP WITH LOCAL TIME ZONE` is a valid Exasol
   column type but NOT a valid UDF `EMITS` output type — Exasol rejects it at scan-script
   compile time (`sqlCode 22002: Column type not supported`) — so this mapping never targets it.
+* A CATALOG-DECLARED decimal (an Iceberg `PrimitiveType::Decimal` or a Unity Catalog
+  `DECIMAL`) is checked against Exasol's full `DECIMAL` domain — `1 ≤ p ≤ 36` and `s ≤ p` —
+  and falls back to `VARCHAR(2000000)` otherwise. The compatible-Arrow-types table's
+  `Decimal128(p,s) where p≤36 and s≤36` row governs only the ARROW-INPUT direction
+  (`arrow_to_exasol_type` / `compatible_exasol_type`), whose scale is signed and has no
+  `s ≤ p` analogue, and stays unchanged.
 * The mapping is applied in three places that MUST stay consistent: the adapter's
   `createVirtualSchema` schema declaration (Arrow type → declared Exasol column type),
   the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
@@ -126,3 +132,24 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * *AND* the function MUST NOT return `None` for a `TIMESTAMP(p)` string, so the column stays a timestamp and is NOT routed through the `Utf8`/string path — which would stringify the value and violate the `TIMESTAMP(p)` EMITS declaration
 * *AND* a bare `TIMESTAMP` string SHALL continue to map to `Some(DataType::Timestamp(TimeUnit::Microsecond, None))`, unchanged by this scenario
 * *AND* `exasol_type_to_arrow` SHALL leave its `TIMESTAMP WITH LOCAL TIME ZONE` exact-match arm unchanged, because `exasol_type_from_json`'s WLTZ branch short-circuits before any precision logic (`vs-adapter/pushdown-planning`, decision [3]) and emits the bare literal `TIMESTAMP WITH LOCAL TIME ZONE` with no `(p)` suffix, so no precision-aware WLTZ arm is ever needed
+
+### Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
+
+* *GIVEN* a column whose catalog-declared type is a decimal carrying an unsigned precision `p` and an unsigned scale `s` — an Iceberg `PrimitiveType::Decimal { precision, scale }` or a Unity Catalog `DECIMAL` whose `type_precision`/`type_scale` the neutral column carries
+* *WHEN* the adapter resolves that column's Exasol type for the `createVirtualSchema` declaration
+* *THEN* the resolver SHALL return `DECIMAL(p,s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `VARCHAR(2000000)` otherwise, so `p = 0` yields `VARCHAR(2000000)` rather than the invalid `DECIMAL(0,0)` and `s > p` yields `VARCHAR(2000000)` rather than an invalid shape such as `DECIMAL(5,10)`
+* *AND* exactly ONE function in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own that PREDICATE, exactly one SHALL own the two returned STRINGS that branch on it, and BOTH catalog kinds SHALL read their answer from those rather than each carrying its own copy — the guard is the significant design decision here, and a second copy is what let the two kinds agree by coincidence rather than by construction
+* *AND* the string-returning owner SHALL be declared PRIVATE to `types/mapping.rs`, because its only consumers are the Iceberg and Unity arms in that same file; the predicate owner SHALL be declared `pub(crate)`, because one consumer of the same decision lives OUTSIDE that file — the VS `initial-default` encoding gate in `adapter/pushdown/file_resolution.rs`, whose scenario `datafusion-scan/scan-execution-field-id-projection` owns — and a predicate hidden from a consumer is a predicate that consumer copies
+* *AND* the guard MUST NOT carry a separate `s ≤ 36` test, because `s ≤ p` and `p ≤ 36` already imply it and a redundant third condition invites the halves to drift, and MUST NOT carry a lower-bound test on `s`, because both catalog-sourced fields are unsigned and a negative scale is unrepresentable — unlike the Arrow `Decimal128(u8, i8)` path, which this scenario does NOT govern
+* *AND* the resolver MUST NOT fail, return a `Result`, or abort the enumeration on either bad pair — the `VARCHAR(2000000)` fallback absorbs them exactly as it absorbs `p > 36`, keeping `column_source_type_to_exasol` and `build_listing_virtual_tables` infallible
+* *AND* every pair already mapped SHALL keep its recorded answer byte-identical: `(18,4)` and `(10,2)` stay `DECIMAL(18,4)` and `DECIMAL(10,2)`, the boundary pair `(36,36)` stays `DECIMAL(36,36)` because `s ≤ p` holds there, `(1,0)` stays `DECIMAL(1,0)`, and `(38,10)` and `(18,37)` stay `VARCHAR(2000000)`
+
+### Scenario: The Iceberg-to-Arrow logical mapping reads the same catalog-decimal guard
+
+* *GIVEN* an Iceberg `PrimitiveType::Decimal { precision, scale }` carrying an unsigned precision `p` and an unsigned scale `s`
+* *WHEN* the VS resolves that column's LOGICAL ARROW type for the scan spec's logical schema, rather than its Exasol declaration string
+* *THEN* the resolver SHALL return `Decimal128(p, s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `Utf8` otherwise, reading that predicate from the SAME single owner the Exasol-string resolver reads and MUST NOT carry its own copy of it
+* *AND* the two directions SHALL therefore be in lockstep BY CONSTRUCTION rather than by convention: for every catalog-declared decimal, `Decimal128(p,s)` accompanies the `DECIMAL(p,s)` declaration and `Utf8` accompanies the `VARCHAR(2000000)` declaration, with no pair producing one of each
+* *AND* the resolver MUST NOT return a `Decimal128` tag for a column `createVirtualSchema` declares `VARCHAR(2000000)` — the lockstep is load-bearing in both directions, which is why it is recorded rather than left implicit: such a tag breaks the single-source-of-truth contract this feature records for `exasol_type_to_arrow`, and arrow-rs rejects `precision == 0` and `scale > precision` when a `Decimal128Array` is built, so the tag would name an Arrow type the scan cannot instantiate at all
+* *AND* every Arrow answer already recorded SHALL stay byte-identical: `(18,4)`, `(36,36)`, and `(36,0)` stay `Decimal128`, and `(38,10)` and `(18,37)` stay `Utf8` — the two pairs that move are `p = 0` and `s > p`, which move from `Decimal128` to `Utf8`
+* *AND* the mapping SHALL remain the LOGICAL Iceberg-to-Arrow mapping, unaffected by physical Parquet decode coercion, and this scenario MUST NOT be read as governing the ARROW-INPUT direction (`arrow_to_exasol_type` / `compatible_exasol_type`), whose signed `Decimal128(u8, i8)` scale has no `s ≤ p` analogue
