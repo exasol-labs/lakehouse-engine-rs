@@ -1,6 +1,6 @@
 name: E2E setup
 description: >
-  Common preparation shared by the e2e, e2e-lakekeeper and e2e-azure jobs.
+  Common preparation shared by the e2e, e2e-lakekeeper, e2e-unity and e2e-azure jobs.
   Callers must run `actions/checkout` themselves before this action.
 runs:
   using: composite

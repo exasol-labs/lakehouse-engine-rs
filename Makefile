@@ -245,6 +245,9 @@ unity-down:
 # createVirtualSchema listing suite. Mirrors test-e2e: the .so is rebuilt if
 # stale, and the suite FAILS (not skips) when the stack is unavailable. All
 # tests share one VS, so the binary runs serially (--test-threads=1).
+# The cargo line MUST stay flag-identical to the `Run Unity Catalog E2E
+# suite` step in ci.yml's e2e-unity job, which is the authority — a target
+# that drifts runs a command the CI gate does not.
 test-e2e-unity: cross-musl-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
