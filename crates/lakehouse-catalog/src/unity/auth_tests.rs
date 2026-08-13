@@ -268,3 +268,24 @@ async fn failed_oauth_grant_is_credential_safe_error() {
         "the client secret must be stripped from the error: {msg}"
     );
 }
+
+/// Scenario: `token` supplied alongside a complete `client_id`/`client_secret`
+/// pair is a shape `validate_creds` rejects (rule 6) before any catalog
+/// session exists — `supplied_catalog_auth` classifies it `Unauthenticated`,
+/// so `resolve_unity_auth` must resolve to `UnityAuth::None`. Synchronous and
+/// infallible, so no network fixture is needed.
+#[test]
+fn resolve_unity_auth_is_unauthenticated_for_the_validation_rejected_shape() {
+    let client = reqwest::Client::new();
+    let mut creds = base_creds();
+    creds.token = Some("pat-sentinel".into());
+    creds.client_id = Some("client-id-sentinel".into());
+    creds.client_secret = Some(OAUTH_SECRET_SENTINEL.into());
+
+    let auth = resolve_unity_auth(&client, "https://unity.example.com", &creds);
+
+    assert!(
+        matches!(auth, UnityAuth::None),
+        "a validation-rejected token+pair shape must classify as unauthenticated"
+    );
+}

@@ -105,3 +105,93 @@ fn debug_redacts_every_secret_bearing_field() {
     assert!(debug.contains("AKIA_EXAMPLE"), "{debug}");
     assert!(debug.contains("my-client-id"), "{debug}");
 }
+
+const TOKEN: &str = "static-bearer-token";
+const CLIENT_ID: &str = "oauth-client-id";
+const CLIENT_SECRET: &str = "oauth-client-secret";
+
+fn creds_with(
+    token: Option<&str>,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> ConnectionCreds {
+    ConnectionCreds {
+        token: token.map(String::from),
+        client_id: client_id.map(String::from),
+        client_secret: client_secret.map(String::from),
+        ..crate::test_support::creds_no_auth()
+    }
+}
+
+/// `validate_creds` accepts three of the eight presence shapes, so the
+/// classifier names one mode for each of those three and no mode for the other
+/// five. All eight are driven here: a `_ => StaticToken(..)` wildcard slip
+/// passes every accepted row, and only the rejected rows catch it.
+#[test]
+fn supplied_catalog_auth_names_one_mode_per_field_shape() {
+    let pair_only = creds_with(None, Some(CLIENT_ID), Some(CLIENT_SECRET));
+    match pair_only.supplied_catalog_auth() {
+        SuppliedCatalogAuth::ClientCredentials {
+            client_id,
+            client_secret,
+        } => {
+            assert_eq!(client_id, CLIENT_ID);
+            assert_eq!(client_secret, CLIENT_SECRET);
+        }
+        _ => panic!("a complete pair without a token must name ClientCredentials"),
+    }
+
+    let token_only = creds_with(Some(TOKEN), None, None);
+    match token_only.supplied_catalog_auth() {
+        SuppliedCatalogAuth::StaticToken(token) => assert_eq!(token, TOKEN),
+        _ => panic!("a token without either OAuth2 field must name StaticToken"),
+    }
+
+    for (token, client_id, client_secret) in [
+        (None, None, None),
+        (None, Some(CLIENT_ID), None),
+        (None, None, Some(CLIENT_SECRET)),
+        (Some(TOKEN), Some(CLIENT_ID), None),
+        (Some(TOKEN), None, Some(CLIENT_SECRET)),
+        (Some(TOKEN), Some(CLIENT_ID), Some(CLIENT_SECRET)),
+    ] {
+        let creds = creds_with(token, client_id, client_secret);
+        assert!(
+            matches!(
+                creds.supplied_catalog_auth(),
+                SuppliedCatalogAuth::Unauthenticated
+            ),
+            "shape (token={}, client_id={}, client_secret={}) describes no mode",
+            token.is_some(),
+            client_id.is_some(),
+            client_secret.is_some(),
+        );
+    }
+
+    // An empty field is an absent field. Each position is emptied in the one
+    // shape where that distinction changes the mode, so an `is_some()` reading
+    // fails all three.
+    let empty_token = creds_with(Some(""), Some(CLIENT_ID), Some(CLIENT_SECRET));
+    assert!(
+        matches!(
+            empty_token.supplied_catalog_auth(),
+            SuppliedCatalogAuth::ClientCredentials { .. }
+        ),
+        "an empty token leaves the complete pair, not the rejected all-three shape"
+    );
+
+    let empty_client_id = creds_with(Some(TOKEN), Some(""), None);
+    match empty_client_id.supplied_catalog_auth() {
+        SuppliedCatalogAuth::StaticToken(token) => assert_eq!(token, TOKEN),
+        _ => panic!("an empty client_id leaves the token alone, not a partial pair"),
+    }
+
+    let empty_client_secret = creds_with(None, Some(CLIENT_ID), Some(""));
+    assert!(
+        matches!(
+            empty_client_secret.supplied_catalog_auth(),
+            SuppliedCatalogAuth::Unauthenticated
+        ),
+        "an empty client_secret cannot complete a pair"
+    );
+}

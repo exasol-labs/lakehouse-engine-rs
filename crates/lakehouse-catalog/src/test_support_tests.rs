@@ -78,7 +78,7 @@ pub(crate) const OAUTH_ACCESS_TOKEN: &str = "OAUTH_OBTAINED_ACCESS_TOKEN";
 
 /// A `ConnectionCreds` with no auth, no vending — the no-op baseline.
 ///
-/// Consumers: `auth`, `iceberg_io`, `session`.
+/// Consumers: `auth`, `creds`, `iceberg_io`, `session`.
 pub(crate) fn creds_no_auth() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "warehouse".into(),

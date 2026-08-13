@@ -7,6 +7,7 @@
 //! every error site in this module routes through a redaction closure.
 
 use crate::ConnectionCreds;
+use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::redaction::{redact_credentials, redact_secret_values};
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
@@ -20,9 +21,9 @@ pub(crate) const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri"
 pub(crate) const REST_CATALOG_PROP_SCOPE: &str = "scope";
 
 /// Inject catalog-auth props from the resolved credentials into the REST-catalog
-/// props map. Three mutually exclusive modes:
+/// props map, one arm per mode named by `ConnectionCreds::supplied_catalog_auth`:
 ///
-/// * no `token` and no client credentials → inject nothing (no-auth, default).
+/// * no catalog credentials → inject nothing (no-auth, default).
 /// * non-empty `token` → inject only `token` (the bearer header; the crate never
 ///   consults `oauth2-server-uri`/`scope` in this mode).
 /// * non-empty `client_id` + `client_secret` → inject `credential` =
@@ -30,37 +31,38 @@ pub(crate) const REST_CATALOG_PROP_SCOPE: &str = "scope";
 ///   `oauth2_server_uri` is supplied and `scope` ONLY when a non-empty `scope` is
 ///   supplied; never inject `token` in this mode.
 ///
-/// Token and client-credentials are mutually exclusive by construction.
+/// Token and client-credentials are mutually exclusive by construction:
+/// `validate_creds` rule 6 rejects a CONNECTION supplying both before any session
+/// exists, so the classifier never has two modes to rank and this function never
+/// has an order to encode.
 pub(crate) fn inject_catalog_auth_props(
     props: &mut HashMap<String, String>,
     creds: &ConnectionCreds,
 ) {
-    let token = non_empty(&creds.token);
-    let client_id = non_empty(&creds.client_id);
-    let client_secret = non_empty(&creds.client_secret);
-
-    if let (Some(id), Some(secret)) = (client_id, client_secret) {
-        props.insert(
-            REST_CATALOG_PROP_CREDENTIAL.to_string(),
-            format!("{id}:{secret}"),
-        );
-        if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
+    match creds.supplied_catalog_auth() {
+        SuppliedCatalogAuth::Unauthenticated => {}
+        SuppliedCatalogAuth::StaticToken(token) => {
+            props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
+        }
+        SuppliedCatalogAuth::ClientCredentials {
+            client_id,
+            client_secret,
+        } => {
             props.insert(
-                REST_CATALOG_PROP_OAUTH2_SERVER_URI.to_string(),
-                uri.to_string(),
+                REST_CATALOG_PROP_CREDENTIAL.to_string(),
+                format!("{client_id}:{client_secret}"),
             );
+            if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
+                props.insert(
+                    REST_CATALOG_PROP_OAUTH2_SERVER_URI.to_string(),
+                    uri.to_string(),
+                );
+            }
+            if let Some(scope) = non_empty(&creds.scope) {
+                props.insert(REST_CATALOG_PROP_SCOPE.to_string(), scope.to_string());
+            }
         }
-        if let Some(scope) = non_empty(&creds.scope) {
-            props.insert(REST_CATALOG_PROP_SCOPE.to_string(), scope.to_string());
-        }
-    } else if let Some(token) = token {
-        props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
     }
-}
-
-/// Borrow the inner value of an `Option<String>` only when it is non-empty.
-fn non_empty(field: &Option<String>) -> Option<&str> {
-    field.as_deref().filter(|v| !v.is_empty())
 }
 
 /// Redact a catalog error that may have surfaced an auth value. Applies the
@@ -120,6 +122,10 @@ const OAUTH2_DEFAULT_TOKEN_PATH: &str = "/v1/oauth/tokens";
 /// and the optional `scope`, POSTed to `creds.oauth2_server_uri` when supplied,
 /// otherwise to the catalog default token endpoint (`{catalog_uri}/v1/oauth/tokens`).
 ///
+/// The pair is the one [`ConnectionCreds::supplied_catalog_auth`] named, never
+/// re-derived here: any field shape that mode owner does not call client
+/// credentials is refused before a request is issued.
+///
 /// `client_secret`, the request, and the obtained token NEVER appear in any
 /// returned error: every error site strips the client secret AND the obtained
 /// token via value-based redaction.
@@ -128,12 +134,16 @@ async fn oauth2_client_credentials_grant(
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<String, UdfError> {
-    let client_id = non_empty(&creds.client_id).ok_or_else(|| {
-        UdfError::User("OAuth2 grant requires client_id but none was resolved".into())
-    })?;
-    let client_secret = non_empty(&creds.client_secret).ok_or_else(|| {
-        UdfError::User("OAuth2 grant requires client_secret but none was resolved".into())
-    })?;
+    let SuppliedCatalogAuth::ClientCredentials {
+        client_id,
+        client_secret,
+    } = creds.supplied_catalog_auth()
+    else {
+        return Err(UdfError::User(
+            "OAuth2 grant requires a complete client_id/client_secret pair but none was resolved"
+                .into(),
+        ));
+    };
 
     let token_url = match non_empty(&creds.oauth2_server_uri) {
         Some(uri) => uri.to_string(),
@@ -207,12 +217,13 @@ async fn oauth2_client_credentials_grant(
 
 /// Resolve the catalog-auth strategy for a query from the resolved credentials.
 ///
-/// Precedence mirrors `inject_catalog_auth_props` (SigV4 is mutually exclusive with
-/// catalog auth, enforced upstream in `validate_creds`):
-/// 1. `use_sigv4` → SigV4 signing.
-/// 2. `client_id` + `client_secret` → OAuth2 client-credentials grant → bearer.
-/// 3. non-empty `token` → static bearer.
-/// 4. otherwise → no auth.
+/// The token-versus-OAuth2 decision is not made here: `ConnectionCreds::supplied_catalog_auth`
+/// owns it, and this function matches on the mode it names.
+///
+/// `use_sigv4` is answered ahead of that mode rather than ranked against it.
+/// `validate_creds` rule 4 rejects a CONNECTION supplying SigV4 signing together
+/// with catalog token/OAuth credentials, so the two are mutually exclusive
+/// upstream and the branch chooses between strategies that cannot co-occur.
 pub(crate) async fn resolve_catalog_auth(
     client: &reqwest::Client,
     catalog_uri: &str,
@@ -221,14 +232,13 @@ pub(crate) async fn resolve_catalog_auth(
     if creds.use_sigv4 {
         return Ok(CatalogAuth::Sigv4);
     }
-    if non_empty(&creds.client_id).is_some() && non_empty(&creds.client_secret).is_some() {
-        let token = oauth2_client_credentials_grant(client, catalog_uri, creds).await?;
-        return Ok(CatalogAuth::Bearer(token));
+    match creds.supplied_catalog_auth() {
+        SuppliedCatalogAuth::Unauthenticated => Ok(CatalogAuth::None),
+        SuppliedCatalogAuth::StaticToken(token) => Ok(CatalogAuth::Bearer(token.to_string())),
+        SuppliedCatalogAuth::ClientCredentials { .. } => Ok(CatalogAuth::Bearer(
+            oauth2_client_credentials_grant(client, catalog_uri, creds).await?,
+        )),
     }
-    if let Some(token) = non_empty(&creds.token) {
-        return Ok(CatalogAuth::Bearer(token.to_string()));
-    }
-    Ok(CatalogAuth::None)
 }
 
 #[cfg(test)]

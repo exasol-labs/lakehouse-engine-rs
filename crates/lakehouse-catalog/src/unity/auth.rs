@@ -9,6 +9,7 @@
 //! error: every grant error site strips them.
 
 use crate::ConnectionCreds;
+use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::redaction::redact_error_text;
 use exasol_udf_sdk::error::UdfError;
 use serde::Deserialize;
@@ -166,10 +167,9 @@ struct OAuthTokenResponse {
     expires_in: Option<u64>,
 }
 
-/// Resolve the authentication strategy from the CONNECTION credentials without a
-/// new credential field: a non-empty `token` selects the personal-access-token
-/// bearer, a `client_id`/`client_secret` pair selects the OAuth grant, and
-/// neither selects the unauthenticated mode.
+/// Resolve the authentication strategy from the CONNECTION credentials: the
+/// mode is selected by [`ConnectionCreds::supplied_catalog_auth`], never
+/// re-derived here.
 ///
 /// Synchronous by design: the OAuth grant is deferred to the first request, so
 /// building a session issues no request and an empty enumeration mints no token.
@@ -178,33 +178,31 @@ pub(crate) fn resolve_unity_auth(
     address: &str,
     creds: &ConnectionCreds,
 ) -> UnityAuth {
-    if let Some(token) = non_empty(&creds.token) {
-        return UnityAuth::Pat(token.to_string());
+    match creds.supplied_catalog_auth() {
+        SuppliedCatalogAuth::Unauthenticated => UnityAuth::None,
+        SuppliedCatalogAuth::StaticToken(token) => UnityAuth::Pat(token.to_string()),
+        SuppliedCatalogAuth::ClientCredentials {
+            client_id,
+            client_secret,
+        } => {
+            let token_url = match non_empty(&creds.oauth2_server_uri) {
+                Some(uri) => uri.to_string(),
+                None => format!("{}/oidc/v1/token", address.trim_end_matches('/')),
+            };
+            let scope = non_empty(&creds.scope)
+                .unwrap_or(OAUTH_DEFAULT_SCOPE)
+                .to_string();
+            UnityAuth::OAuth(OAuthTokenSource {
+                client: client.clone(),
+                token_url,
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+                scope,
+                cache: Mutex::new(None),
+                clock: Arc::new(Instant::now),
+            })
+        }
     }
-    if let (Some(id), Some(secret)) = (non_empty(&creds.client_id), non_empty(&creds.client_secret))
-    {
-        let token_url = match non_empty(&creds.oauth2_server_uri) {
-            Some(uri) => uri.to_string(),
-            None => format!("{}/oidc/v1/token", address.trim_end_matches('/')),
-        };
-        let scope = non_empty(&creds.scope)
-            .unwrap_or(OAUTH_DEFAULT_SCOPE)
-            .to_string();
-        return UnityAuth::OAuth(OAuthTokenSource {
-            client: client.clone(),
-            token_url,
-            client_id: id.to_string(),
-            client_secret: secret.to_string(),
-            scope,
-            cache: Mutex::new(None),
-            clock: Arc::new(Instant::now),
-        });
-    }
-    UnityAuth::None
-}
-
-fn non_empty(field: &Option<String>) -> Option<&str> {
-    field.as_deref().filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
