@@ -91,6 +91,24 @@ impl std::fmt::Debug for ConnectionCreds {
     }
 }
 
+/// Which of the three mutually exclusive catalog-auth modes a CONNECTION
+/// supplied.
+///
+/// The three variants are exactly the three field shapes `validate_creds`
+/// accepts; every other combination of `token`, `client_id`, and
+/// `client_secret` is a CONNECTION it rejects.
+pub(crate) enum SuppliedCatalogAuth<'a> {
+    /// No catalog credentials — the catalog is queried unauthenticated.
+    Unauthenticated,
+    /// A static bearer `token`, applied verbatim.
+    StaticToken(&'a str),
+    /// A complete OAuth2 client-credentials pair, exchanged for a bearer.
+    ClientCredentials {
+        client_id: &'a str,
+        client_secret: &'a str,
+    },
+}
+
 impl ConnectionCreds {
     /// Returns `true` when catalog authentication credentials are present:
     /// either a static bearer `token` OR any OAuth2 client-credential field
@@ -101,6 +119,61 @@ impl ConnectionCreds {
     pub fn has_catalog_auth(&self) -> bool {
         self.token.is_some() || self.client_id.is_some() || self.client_secret.is_some()
     }
+
+    /// Names the one catalog-auth mode this CONNECTION's fields describe.
+    ///
+    /// The sole owner of that decision: every consumer matches on the answer
+    /// rather than re-deriving it from the fields, so no two catalog kinds can
+    /// read one field shape two different ways. An empty field is an absent
+    /// field.
+    ///
+    /// Exactly one mode is ever describable because `validate_creds` rejects
+    /// every other shape before a session exists — rule 6 a `token` beside a
+    /// complete client-credentials pair, rule 7 a partial pair.
+    ///
+    /// Rule 6 tests field presence (`is_some()`) while this method tests
+    /// non-emptiness (`non_empty`); the two coincide only because the engine's
+    /// `parse_creds` normalizes every empty credential field to `None` before
+    /// validation ever runs, so a present-but-empty `Some("")` never reaches
+    /// either side.
+    pub(crate) fn supplied_catalog_auth(&self) -> SuppliedCatalogAuth<'_> {
+        match (
+            non_empty(&self.token),
+            non_empty(&self.client_id),
+            non_empty(&self.client_secret),
+        ) {
+            (None, Some(client_id), Some(client_secret)) => {
+                SuppliedCatalogAuth::ClientCredentials {
+                    client_id,
+                    client_secret,
+                }
+            }
+            (Some(token), None, None) => SuppliedCatalogAuth::StaticToken(token),
+            // Every remaining shape is one `validate_creds` rejects before a
+            // session exists: rule 6 for a token beside a complete pair, rule 7
+            // for a partial pair. Reaching one here means validation was
+            // bypassed, so the honest answer is "this describes no auth mode" —
+            // the request then fails on the catalog's own 401 rather than on a
+            // credential the operator never unambiguously supplied.
+            (None, None, None)
+            | (None, Some(_), None)
+            | (None, None, Some(_))
+            | (Some(_), Some(_), None)
+            | (Some(_), None, Some(_))
+            | (Some(_), Some(_), Some(_)) => SuppliedCatalogAuth::Unauthenticated,
+        }
+    }
+}
+
+/// Borrow the inner value of an `Option<String>` only when it is non-empty.
+///
+/// An empty credential field is an absent one for the purpose of deciding
+/// which catalog-auth mode was supplied: `supplied_catalog_auth` calls this
+/// rather than testing `is_some()`. `has_catalog_auth` deliberately does not
+/// — it asks whether catalog auth was INTENDED at all, not which mode, so a
+/// partial (and therefore still-rejected) OAuth2 shape must still count.
+pub(crate) fn non_empty(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|value| !value.is_empty())
 }
 
 /// Storage connection properties (S3-compatible / MinIO).

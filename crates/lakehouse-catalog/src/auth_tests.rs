@@ -136,26 +136,7 @@ fn build_rest_catalog_sets_credential_and_oauth_props() {
         "OAuth mode must NEVER set token"
     );
 
-    // (c) Mutual exclusivity by construction: client-credentials present alongside
-    //     a stray token → credential wins, token is never injected.
-    let mut creds = base_creds();
-    creds.client_id = Some("client-abc".into());
-    creds.client_secret = Some("secret-xyz".into());
-    creds.token = Some("stray-token".into());
-
-    let mut props = HashMap::new();
-    inject_catalog_auth_props(&mut props, &creds);
-
-    assert!(
-        props.contains_key(REST_CATALOG_PROP_CREDENTIAL),
-        "credential must be set when client credentials present"
-    );
-    assert!(
-        !props.contains_key(REST_CATALOG_PROP_TOKEN),
-        "client-credentials mode must NOT inject token even if one is set"
-    );
-
-    // (d) Incomplete client credentials (only client_id, empty secret) must NOT
+    // (c) Incomplete client credentials (only client_id, empty secret) must NOT
     //     enter the credential branch (guards the non_empty filter + the
     //     all-or-nothing pair requirement).
     let mut creds = base_creds();
@@ -265,6 +246,38 @@ async fn oauth2_grant_built_from_client_credentials() {
     );
 }
 
+/// Scenario: the grant refuses the `token` + complete-pair shape `validate_creds`
+/// rule 6 rejects, because it reads the mode named by `supplied_catalog_auth`
+/// instead of re-deriving pair completeness from the two fields.
+///
+/// The catalog URI is a closed loopback port, so a grant that re-derived
+/// completeness would fail with a transport error rather than this refusal —
+/// which is what makes the assertion distinguish the two.
+#[tokio::test]
+async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
+    let mut creds = creds_no_auth();
+    creds.token = Some(BEARER_TOK.into());
+    creds.client_id = Some("client-id-sentinel".into());
+    creds.client_secret = Some(CLIENT_SECRET.into());
+
+    let client = reqwest::Client::new();
+    let err = oauth2_client_credentials_grant(&client, "http://127.0.0.1:1", &creds)
+        .await
+        .expect_err("a validation-rejected token+pair shape must not reach the token endpoint");
+
+    let UdfError::User(msg) = err else {
+        panic!("an unresolvable auth mode must surface as a user error, got {err:?}");
+    };
+    assert!(
+        msg.contains("complete client_id/client_secret pair"),
+        "the grant must refuse on the mode owner's answer, not on a transport error: {msg}"
+    );
+    assert!(
+        !msg.contains(CLIENT_SECRET),
+        "the refusal must not leak the client secret: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // R3 — redact_catalog_auth_error strips client_id, oauth2_server_uri, scope
 // ---------------------------------------------------------------------------
@@ -307,29 +320,28 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
 // Group C — resolve_catalog_auth precedence
 // ---------------------------------------------------------------------------
 
-/// Scenario: `resolve_catalog_auth` selects the auth strategy by the
-/// documented precedence, on the non-network branches only (`use_sigv4` and
-/// the no-client-credentials paths never contact the network).
+/// Scenario: `resolve_catalog_auth` selects exactly one auth strategy per
+/// mutually-exclusive credential shape, on the non-network branches only
+/// (`use_sigv4` and the no-client-credentials paths never contact the network).
 #[tokio::test]
-async fn resolve_catalog_auth_precedence_non_network_branches() {
+async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
     let client = reqwest::Client::new();
 
-    // 1. use_sigv4 → Sigv4, regardless of any token also being set.
+    // SigV4 shape → Sigv4.
     let mut sigv4_creds = creds_no_auth();
     sigv4_creds.use_sigv4 = true;
-    sigv4_creds.token = Some(BEARER_TOK.into());
     let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &sigv4_creds)
         .await
         .expect("sigv4 resolution must not fail");
     assert!(
         matches!(auth, CatalogAuth::Sigv4),
-        "use_sigv4 must take precedence and resolve to CatalogAuth::Sigv4"
+        "use_sigv4 must resolve to CatalogAuth::Sigv4"
     );
 
-    // Precedence #2 (OAuth2 client-credentials grant) is the network branch and
-    // is exercised elsewhere; the remaining non-network branches follow.
+    // The OAuth2 client-credentials grant shape is the network branch and is
+    // exercised elsewhere; the remaining non-network shapes follow.
 
-    // 3. Non-empty token, no SigV4, no OAuth client credentials → Bearer.
+    // Bearer-token shape (no SigV4, no OAuth client credentials) → Bearer.
     let mut bearer_creds = creds_no_auth();
     bearer_creds.token = Some(BEARER_TOK.into());
     let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &bearer_creds)
@@ -343,7 +355,7 @@ async fn resolve_catalog_auth_precedence_non_network_branches() {
         _ => panic!("a non-empty static token must resolve to CatalogAuth::Bearer"),
     }
 
-    // 4. No auth supplied at all → None.
+    // No-auth shape → None.
     let no_auth_creds = creds_no_auth();
     let auth = resolve_catalog_auth(&client, "https://catalog.example.com", &no_auth_creds)
         .await
@@ -352,4 +364,52 @@ async fn resolve_catalog_auth_precedence_non_network_branches() {
         matches!(auth, CatalogAuth::None),
         "no auth fields supplied must resolve to CatalogAuth::None"
     );
+}
+
+/// Scenario: `token` supplied alongside a complete `client_id`/`client_secret`
+/// pair is a shape `validate_creds` rejects (rule 6) before any catalog
+/// session exists — `supplied_catalog_auth` classifies it `Unauthenticated`,
+/// so `resolve_catalog_auth` must resolve to `CatalogAuth::None` without
+/// attempting the OAuth2 grant. Nothing listens on the loopback port used
+/// here, so a network attempt fails fast and deterministically instead of
+/// hanging or depending on external DNS.
+#[tokio::test]
+async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_shape() {
+    let client = reqwest::Client::new();
+    let mut creds = creds_no_auth();
+    creds.token = Some(BEARER_TOK.into());
+    creds.client_id = Some("client-id-sentinel".into());
+    creds.client_secret = Some(CLIENT_SECRET.into());
+
+    let auth = resolve_catalog_auth(&client, "http://127.0.0.1:1", &creds)
+        .await
+        .expect(
+            "a validation-rejected token+pair shape must resolve without contacting the network",
+        );
+
+    assert!(
+        matches!(auth, CatalogAuth::None),
+        "a validation-rejected token+pair shape must classify as unauthenticated"
+    );
+}
+
+/// Scenario: same validation-rejected token+pair shape as above —
+/// `inject_catalog_auth_props` must inject none of the four REST-catalog
+/// auth props for it.
+#[test]
+fn inject_catalog_auth_props_injects_nothing_for_the_validation_rejected_shape() {
+    let mut creds = creds_no_auth();
+    creds.token = Some(BEARER_TOK.into());
+    creds.client_id = Some("client-id-sentinel".into());
+    creds.client_secret = Some(CLIENT_SECRET.into());
+
+    let mut props = HashMap::new();
+    inject_catalog_auth_props(&mut props, &creds);
+
+    for key in AUTH_PROP_KEYS {
+        assert!(
+            !props.contains_key(key),
+            "a validation-rejected token+pair shape must inject no auth prop, but {key} was set"
+        );
+    }
 }

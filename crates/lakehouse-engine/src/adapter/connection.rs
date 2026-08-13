@@ -89,7 +89,7 @@ pub fn read_connection(
 ///
 /// Under `CatalogKind::UnityCatalogNative` the kind first rejects `use_sigv4`
 /// (the native Unity Catalog API authenticates with a bearer token or Databricks
-/// OAuth, not a signed AWS request) and then applies rules 2-6 below; rule 1's
+/// OAuth, not a signed AWS request) and then applies rules 2-7 below; rule 1's
 /// `warehouse` requirement does not apply. Rejecting `use_sigv4` ahead of rules
 /// 4-5 keeps the operator from seeing a generic missing-SigV4-field error for a
 /// signing mode that does not apply to Unity Catalog.
@@ -113,9 +113,14 @@ pub fn read_connection(
 ///    required (they sign the catalog `load_table` request ahead of any vended
 ///    credentials); this holds regardless of `use_vended_credentials`. `endpoint`
 ///    stays optional.
-/// 6. OAuth2 client credentials require both `client_id` and `client_secret`.
+/// 6. A `token` together with a complete `client_id`/`client_secret` pair is
+///    rejected. This rule sits after the SigV4 rules so every SigV4 error stays
+///    byte-identical, and ahead of rule 7 for readability only — the two are
+///    disjoint (rule 6 requires all three fields; rule 7 requires exactly one of
+///    the pair), so their relative order has no behavioural consequence.
+/// 7. OAuth2 client credentials require both `client_id` and `client_secret`.
 ///
-/// Rules 2 and 3 sit ahead of 4-6 because they decide WHICH storage backend the
+/// Rules 2 and 3 sit ahead of 4-7 because they decide WHICH storage backend the
 /// credential set describes; reporting a catalog-authentication defect first
 /// would leave a malformed storage-credential set unreported until the operator
 /// fixed an unrelated field. Rule 2 sits ahead of rule 3 because a CONNECTION
@@ -130,6 +135,7 @@ fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Res
     validate_kind_preconditions(name, creds, kind)?;
     validate_azure_storage_creds(name, creds)?;
     validate_sigv4_creds(name, creds)?;
+    validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
     Ok(())
 }
@@ -235,7 +241,25 @@ fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfEr
     Ok(())
 }
 
-/// Rule 6: OAuth2 client credentials require both `client_id` and
+/// Rule 6: a `token` together with a complete `client_id`/`client_secret`
+/// pair is rejected. Fires only when all three fields are present — a
+/// `token` beside HALF a pair is already rejected by rule 7 (OAuth2
+/// completeness), so the two rules are disjoint and share no error text.
+fn validate_exclusive_catalog_auth_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+) -> Result<(), UdfError> {
+    if creds.token.is_some() && creds.client_id.is_some() && creds.client_secret.is_some() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies a token together with a complete \
+             client_id/client_secret pair; these are mutually exclusive, \
+             remove one: token, client_id, client_secret"
+        )));
+    }
+    Ok(())
+}
+
+/// Rule 7: OAuth2 client credentials require both `client_id` and
 /// `client_secret`, or neither.
 fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     match (creds.client_id.is_some(), creds.client_secret.is_some()) {
