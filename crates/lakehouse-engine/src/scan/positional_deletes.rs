@@ -86,9 +86,8 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 /// wrapper — roaring 0.11's `RoaringTreemap::iter()` already exposes the
 /// `advance_to` the wrapper existed to provide.
 ///
-/// Upstream tracking: apache/iceberg-rust #340 (a native Rust position-delete
-/// writer). Once iceberg-rust exposes this routine (or a position-delete writer
-/// lets us drop the Spark fixtures), this vendored copy can be reconsidered.
+/// Upstream tracking: #344. Once iceberg-rust exposes this routine publicly,
+/// this vendored copy can be reconsidered.
 pub(crate) fn build_deletes_row_selection(
     row_group_metadata_list: &[RowGroupMetaData],
     selected_row_groups: &Option<Vec<usize>>,
