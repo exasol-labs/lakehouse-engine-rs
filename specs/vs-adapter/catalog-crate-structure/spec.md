@@ -34,6 +34,14 @@ The running history of explicit, reviewed additions to this crate's enumerated `
 * **The classifier belongs beside the fields it reads, not beside either consumer.** It classifies `ConnectionCreds`' own `token`, `client_id`, and `client_secret`, and it serves consumers in two sibling module trees (`auth` and `unity::auth`), so declaring it in either would make one tree depend on the other's internals for a decision neither owns. `creds.rs` already declares the type and already hosts `ConnectionCreds::has_catalog_auth`, the existing predicate over those same three fields.
 * **Neither added item reaches the crate's public surface, and no widening is needed to reach both consumers.** `creds` is a private module of the crate whose items other private modules may name at `pub(crate)`, so the classifier serves `auth` and `unity::auth` without either `mod unity;` or `unity`'s `mod auth;` changing visibility. That keeps the Unity authentication strategy crate-private exactly as this feature's Unity-surface scenario requires.
 * The public-surface-extension history — the shared `CatalogClient` trait, the `list_namespace_tables` demotion, the Unity Catalog client, the Delta-base skip reason, the vended store-address type, and the neutral table's format tag and vending key — moved to `vs-adapter/catalog-crate-public-surface-extensions` when that history's own scenario count crossed this library's per-spec organization threshold. Every Background bullet and scenario narrating one of those additions moved with it; this feature keeps only the extraction's own structure, behavior-preservation, and concept-level-API scenarios.
+* **This delta is issue #342 and refreshes ONE name.** The engine-only scan-spec wire type
+  `DeleteFileRef` is absorbed into the format-neutral `DeleteMechanism` enum, so this feature's
+  MUST-NOT-name list is refreshed to name the type that exists. Nothing about the crate boundary, the
+  dependency direction, the manifest prohibition, or the moved tests changes.
+* **The extraction's historical scenarios are left standing.** "Every moved module keeps its own
+  tests" narrates what each moved test module named at extraction time; its `DeleteFileRef` mentions
+  are an accurate account of that moment rather than a live rule, so they are not rewritten. Only the
+  live prohibition — the one clause a future `lakehouse-catalog` change could violate — is refreshed.
 
 ## Scenarios
 
@@ -44,7 +52,7 @@ The running history of explicit, reviewed additions to this crate's enumerated `
 * *THEN* a crate named `lakehouse-catalog` at `crates/lakehouse-catalog` SHALL own that code, and `lakehouse-engine` SHALL declare it as a path dependency
 * *AND* the dependency SHALL point one way only: no `lakehouse-catalog` source file SHALL name `lakehouse_engine`, which the compiler enforces because the reverse edge would be a cycle
 * *AND* `lakehouse-catalog`'s manifest MUST NOT declare `arrow`, `parquet`, `datafusion`, `object_store`, `roaring`, `async-trait`, `tracing`, or `exasol-udf-macros` as a direct dependency, so the catalog layer cannot reach the execution engine even transitively through its own manifest
-* *AND* `lakehouse-catalog` MUST NOT name `FileEntry`, `LogicalField`, `NameMappingEntry`, `DeleteFileRef`, `ScanSpec`, or `CommonScanSpec`, because Iceberg file planning and the scan-spec wire format stay in `lakehouse-engine`
+* *AND* `lakehouse-catalog` MUST NOT name `FileEntry`, `LogicalField`, `NameMappingEntry`, `DeleteMechanism`, `ScanSpec`, or `CommonScanSpec`, because Iceberg file planning and the scan-spec wire format stay in `lakehouse-engine`
 * *AND* `make cross-musl-udf-build` SHALL still build `-p lakehouse-engine` and still emit exactly one `.so` exporting both entry points
 * *AND* the `.so` staleness guard SHALL list the new crate's sources and manifest — `Makefile`'s `VS_SRCS` SHALL include `crates/lakehouse-catalog/src` among its `find` roots and `crates/lakehouse-catalog/Cargo.toml` plus the root workspace `Cargo.toml` among its files — so that editing a catalog source file rebuilds the `.so` instead of leaving the E2E suites to run a stale binary
 

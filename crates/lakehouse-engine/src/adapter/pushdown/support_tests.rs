@@ -1,6 +1,6 @@
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteFileContentType, SortKey};
+use crate::scan::spec::{AggKind, DeleteMechanism, SortKey};
 use vs_expression::render_df_filter_safe;
 
 /// `walk_column_nodes` fires its callback exactly once per `column` node
@@ -230,10 +230,10 @@ fn adapter_preserves_positional_deletes_into_scan_spec() {
     let back = ScanSpec::files_from_json(&shard_files_json(&file_gran)).unwrap();
     assert_eq!(back, file_gran, "file-granularity deletes must round-trip");
     assert_eq!(back[0].deletes.len(), 1);
-    assert_eq!(
-        back[0].deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes
-    );
+    assert!(matches!(
+        back[0].deletes[0],
+        DeleteMechanism::IcebergPositionalDelete { .. }
+    ));
 
     // partition granularity: the SAME delete file is referenced by two data files.
     let shared = "data/deletes/part-del.parquet";
@@ -246,7 +246,7 @@ fn adapter_preserves_positional_deletes_into_scan_spec() {
         back2, part_gran,
         "both data files must retain the shared partition delete"
     );
-    assert_eq!(back2[1].deletes[0].path, shared);
+    assert_eq!(back2[1].deletes[0].object_store_path(), Some(shared));
 }
 
 /// A delete-carrying entry serializes with its content type on the wire; a
@@ -265,10 +265,10 @@ fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
         "delete content type must appear on the wire: {json}"
     );
     let back = ScanSpec::files_from_json(&json).unwrap();
-    assert_eq!(
-        back[0].deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes
-    );
+    assert!(matches!(
+        back[0].deletes[0],
+        DeleteMechanism::IcebergPositionalDelete { .. }
+    ));
 
     let free = vec![FileEntry::new("data/part-0.parquet", 1000)];
     assert_eq!(

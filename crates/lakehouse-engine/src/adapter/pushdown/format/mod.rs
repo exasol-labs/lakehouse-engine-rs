@@ -12,7 +12,7 @@ use lakehouse_catalog::{
 use serde_json::Value as Json;
 
 use crate::adapter::tables::catalog_identifier_string;
-use crate::scan::spec::{DeltaTableSpec, FileEntry, LogicalField, NameMappingEntry};
+use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
 mod delta_format_reader;
 mod delta_replay;
@@ -40,9 +40,10 @@ pub struct ResolvedScan {
     pub table_root: String,
     /// Physical-name-to-field-id entries for data files carrying no embedded id.
     pub name_mapping: Vec<NameMappingEntry>,
-    /// Absent on every Iceberg scan, which is what keeps an Iceberg spec's
-    /// encoding byte-identical to its pre-Delta form.
-    pub delta: Option<DeltaTableSpec>,
+    /// The table's ordered partition-column names. Empty on every Iceberg scan,
+    /// which is what keeps an Iceberg spec's encoding byte-identical to its
+    /// pre-Delta form.
+    pub partition_columns: Vec<String>,
 }
 
 /// Resolving ONE table into the scan the pushdown layer plans against, for one

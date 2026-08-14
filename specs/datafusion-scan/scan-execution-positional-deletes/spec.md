@@ -59,6 +59,27 @@ positional-delete case (tracked as issue #68).
 * Delete positions and access plans are unchanged by the restructure: the delete set for a data
   file is fixed by Phase A, and Phase B's footer fetch reads only the per-row-group row counts,
   which are a property of the file rather than of the fetch order.
+* **This delta is issue #342 and changes no applied-delete behavior.** A data file's delete list stops
+  being an Iceberg-only list of delete-FILE references and becomes one format-neutral list of delete
+  MECHANISMS, each naming itself. The scan reads that one list and dispatches on the variant, so it
+  never asks which table format produced the spec.
+* **Exactly one variant is applied and every other variant is refused.** The Iceberg positional-delete
+  variant keeps the whole read-once, concurrent, row-group-pruned pipeline unchanged. The Iceberg
+  equality-delete and Puffin-deletion-vector variants keep their existing refusal, with their existing
+  message text. The Delta deletion-vector variant joins the refusal.
+* **Refusing the Delta deletion vector is the reason it became modelled.** Before #342 a Delta
+  deletion vector sat in a Delta-named block this reader never opened, so an unapplied deletion vector
+  would have surfaced as pre-delete rows rather than an error. Now that the vector rides in the ONE
+  list this reader iterates, silence would be a silent-correctness bug of the same class the
+  read-time backstop exists to prevent. Applying it is issue #320, which replaces the refusal with
+  application.
+* **The refusal is unreachable from production today** and stays a backstop rather than a new query
+  path: `handle_pushdown` still refuses a Unity Catalog pushdown before any Delta scan spec is built
+  (`vs-adapter/delta-table-planning`), so no Delta deletion vector reaches this reader from a query.
+* **A deletion vector's `pathOrInlineDv` MUST NOT be echoed in the refusal.** Its inline form is a
+  base85 payload rather than a diagnostic, so the error names the DATA file whose deletion vector
+  cannot be applied. Redaction against the spec's secret values applies to that message as it does to
+  every other error path here.
 
 ## Scenarios
 
@@ -119,9 +140,12 @@ positional-delete case (tracked as issue #68).
 
 ### Scenario: An unapplicable delete file is rejected with a clean error (read-time backstop)
 
-* *GIVEN* a scan invocation whose assigned files include a delete file that is not a Parquet positional delete (a Puffin / deletion-vector payload, an equality-delete file, or an unknown delete content type)
+* *GIVEN* a scan invocation whose assigned files include a delete mechanism the scan cannot apply — an Iceberg equality-delete file, an Iceberg Puffin deletion-vector payload, or a Delta deletion vector
 * *WHEN* the scan UDF prepares that data file's scan
 * *THEN* the UDF SHALL return a clean error that names the unsupported delete mechanism BEFORE emitting any row for the affected data file
+* *AND* the UDF SHALL dispatch on the delete mechanism's own variant rather than on the table format that produced the scan spec, so exactly one variant — the Iceberg positional delete — reaches the delete-application pipeline and every other variant is refused
+* *AND* the error for an Iceberg equality delete or a Puffin deletion vector SHALL keep naming the offending delete FILE, and the error for a Delta deletion vector SHALL name the DATA file whose deletion vector cannot be applied and MUST NOT echo the vector's `pathOrInlineDv`, because its inline form is an opaque payload rather than a diagnostic
+* *AND* the error for a Delta deletion vector SHALL state that applying Delta deletion vectors is issue #320, so the refusal reads as a scoped gap rather than an unsupported table
 * *AND* the UDF MUST NOT silently emit pre-delete rows for that file
 * *AND* the error message MUST NOT contain any storage access key, secret key, or session token
 

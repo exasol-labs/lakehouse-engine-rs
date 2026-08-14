@@ -95,11 +95,12 @@ async fn loopback_catalog(body: String) -> (String, tokio::task::JoinHandle<()>)
 ///
 /// Driven twice against loopback catalogs serving the IDENTICAL `loadTable`
 /// response — once through `resolve_file_list` directly and once through the
-/// reader — every resolved value matches field for field and the Delta block is
-/// absent, so an Iceberg request's serialized spec cannot change through the
+/// reader — every resolved value matches field for field, the partition-column
+/// list is empty, and every logical field carries the field-id binding key
+/// alone, so an Iceberg request's serialized spec cannot change through the
 /// seam.
 #[tokio::test]
-async fn iceberg_reader_returns_resolve_file_lists_result_with_no_delta_block() {
+async fn iceberg_reader_returns_empty_partition_columns_and_field_id_bound_logical_fields() {
     let creds = one_request_sigv4_creds();
     let storage = sample_storage();
     let catalog_props = CatalogProps {
@@ -145,6 +146,15 @@ async fn iceberg_reader_returns_resolve_file_lists_result_with_no_delta_block() 
         !resolved.logical_schema.is_empty(),
         "the fixture's two-field schema must reach the comparison, or it proves nothing"
     );
+    assert!(
+        resolved
+            .logical_schema
+            .iter()
+            .all(|field| field.field_id.is_some() && field.physical_name.is_none()),
+        "every Iceberg logical field must carry a field-id and no declared physical name, \
+         so its encoding gains no key: {:?}",
+        resolved.logical_schema
+    );
     assert_eq!(
         resolved.files, files,
         "the seam must carry the shipped path's file list verbatim"
@@ -165,9 +175,9 @@ async fn iceberg_reader_returns_resolve_file_lists_result_with_no_delta_block() 
         !resolved.name_mapping.is_empty(),
         "the fixture's name-mapping property must reach the comparison, or it proves nothing"
     );
-    assert_eq!(
-        resolved.delta, None,
-        "an Iceberg scan must carry no Delta block, so its encoding stays byte-identical"
+    assert!(
+        resolved.partition_columns.is_empty(),
+        "an Iceberg scan must carry no partition columns, so its encoding stays byte-identical"
     );
 
     // Joined LAST: a reader that resolved nothing fails an assertion above rather

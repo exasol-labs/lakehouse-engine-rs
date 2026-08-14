@@ -23,8 +23,8 @@ use lakehouse_engine::adapter::pushdown::{
     build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
-    AggKind, CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType,
-    ProjectionItem, ScanSpec, SortKey, StorageBackend, StorageProps,
+    AggKind, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, ProjectionItem,
+    ScanSpec, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
@@ -855,10 +855,9 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
     spec.files = vec![FileEntry::with_deletes(
         data_url.clone(),
         local_size(&data_url),
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: local_size(&delete_url),
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     )];
     // Predicate keeps only ids 200..=399 → row groups 2 and 3; prunes the other

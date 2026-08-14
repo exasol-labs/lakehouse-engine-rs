@@ -1,6 +1,16 @@
-//! Iceberg field-id projection: logical-schema construction, field-id-first
-//! column binding (`FieldIdExprAdapterFactory` / `FieldIdExprAdapter`),
-//! physical→logical rename resolution, and `initial-default` reconstruction.
+//! Column binding for the scan's logical schema: logical-schema construction,
+//! the one binding pass that claims each physical field for a logical field
+//! ([`bind_columns`]), the `PhysicalExprAdapter` that installs it
+//! ([`FieldIdExprAdapterFactory`] / `FieldIdExprAdapter`), and `initial-default`
+//! reconstruction.
+//!
+//! A logical field declares HOW it binds, and the pass dispatches on that
+//! declaration: by field-id (an Iceberg field-id, or a Delta `id` column-mapping
+//! id) against a physical field's embedded `PARQUET:field_id`; by a declared
+//! physical name (Delta `name` column mapping) against the physical column's own
+//! name; or by identity (Delta `none` column mapping) against the logical name
+//! itself. Iceberg additionally falls back to `schema.name-mapping.default` and
+//! then to the physical name.
 
 use crate::scan::spec::NameMappingEntry;
 use datafusion::physical_expr_adapter::{
@@ -10,14 +20,15 @@ use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Arrow field-metadata key that carries the Iceberg field-id.
+/// Arrow field-metadata key that carries a column's field-id.
 ///
 /// Re-exported from the arrow-58 parquet crate so the whole scan crate has one
-/// canonical spelling; the logical-schema builder tags each field with it and
-/// [`rename_physical_to_logical`] reads it off both the logical and physical schemas.
+/// canonical spelling; [`build_logical_arrow_schema`] tags a field-id-bound
+/// logical field with it (and ONLY such a field), and [`bind_columns`] reads it
+/// off both the logical and physical schemas.
 pub(crate) use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-/// Read the Iceberg field-id off an Arrow field, if present.
+/// Read the field-id off an Arrow field, if present.
 ///
 /// Returns `None` when the field carries no `PARQUET:field_id` metadata (an older
 /// writer) or the value is not a parseable `i32`.
@@ -28,7 +39,7 @@ fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
         .and_then(|v| v.parse::<i32>().ok())
 }
 
-/// Factory for a field-id-aware [`PhysicalExprAdapter`], installed on the
+/// Factory for the column-binding [`PhysicalExprAdapter`], installed on the
 /// `ListingTableConfig` via `with_expr_adapter_factory`. The Parquet opener calls
 /// [`Self::create`] once per file, so files with divergent physical layouts each
 /// bind correctly.
@@ -36,11 +47,13 @@ fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
 /// It does NOT reimplement schema adaptation. It composes two steps around
 /// [`DefaultPhysicalExprAdapter`]:
 ///
-/// 1. Feed the default a physical schema renamed to logical names by field-id
-///    (see [`rename_physical_to_logical`]). The default then resolves each logical
-///    column to the correct physical index and reuses its own behavior for the
-///    rest — nullable-missing → NULL literal, type divergence → cast,
-///    required-missing → error.
+/// 1. Feed the default a physical schema renamed to the logical names its fields
+///    were claimed by (see [`bind_columns`] for the field-id / declared-physical-name
+///    / name-mapping / identity resolution order). The default then resolves each
+///    logical column to the correct physical index and reuses its own behavior for
+///    the rest — nullable-missing → NULL literal, type divergence → cast,
+///    required-missing → error. Every binding strategy therefore shares ONE set of
+///    adaptation semantics rather than getting a thinner path of its own.
 /// 2. Rename the default's OUTPUT columns back to the real physical names (at
 ///    their already-correct indices) — see [`FieldIdExprAdapter`].
 ///
@@ -55,41 +68,41 @@ fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
 /// (`score`). A projected `Column("rating")` therefore fails with
 /// `Unable to get field named "rating"`. Renaming the output back to the real
 /// physical name (order is preserved, so the index is already right) makes those
-/// name-based lookups succeed while keeping the field-id binding.
+/// name-based lookups succeed while keeping the binding.
 ///
-/// Carries the query's flattened `schema.name-mapping.default` entries
-/// (resolved once in the VS and threaded down via [`register_file_list`] /
-/// [`PositionalDeleteScanTable`]), so [`Self::create`] can hand them to
-/// [`rename_physical_to_logical`] for the no-embedded-field-id resolution step.
-/// Empty when the table has no name-mapping property, in which case resolution
-/// is unchanged from the field-id / physical-name fallback.
-///
-/// Also carries the query's reconstructed Iceberg `initial-default` values keyed
-/// by field-id (built once from the logical schema via
-/// [`reconstruct_initial_defaults`]). [`Self::create`] uses them to build the
-/// per-file absent-with-default fill map so [`FieldIdExprAdapter::rewrite`] can
-/// emit a `Literal(<default>)` for an absent field (Iceberg column-projection
-/// rule 3) BEFORE delegating to the default adapter. Empty when no field carries
-/// a default, in which case the absent-field behavior is unchanged (nullable →
-/// NULL, required → clean error).
+/// Carries the query's whole [`FieldIdResolution`] — the binding tables and the
+/// reconstructed `initial-default` values, resolved once in the VS and threaded
+/// down via [`register_file_list`] / [`PositionalDeleteScanTable`]. Holding that
+/// one value rather than mirroring its members keeps a new binding table from
+/// needing a second home here.
 #[derive(Debug)]
 pub(crate) struct FieldIdExprAdapterFactory {
-    pub(crate) name_mapping: Vec<NameMappingEntry>,
-    pub(crate) defaults: HashMap<i32, ScalarValue>,
+    pub(crate) resolution: FieldIdResolution,
 }
 
-/// Per-query field-id resolution metadata for one scan side (fact or
-/// dimension): the flattened `schema.name-mapping.default` entries and the
-/// reconstructed Iceberg `initial-default` values keyed by field-id, resolved
-/// once in the VS alongside the logical schema. Grouped into one value so
+/// Per-query column-binding metadata for one scan side (fact or dimension),
+/// resolved once in the VS alongside the logical schema: the tables a physical
+/// field is matched against, plus the reconstructed `initial-default` values an
+/// absent logical column falls back to. Grouped into one value so
 /// [`register_file_list`] threads a single argument through
-/// [`crate::scan::positional_deletes::PositionalDeleteScanTable::new`], which
-/// in turn hands the same two values to [`FieldIdExprAdapterFactory`] on each
+/// [`crate::scan::positional_deletes::PositionalDeleteScanTable::new`], which in
+/// turn hands the same value to [`FieldIdExprAdapterFactory`] on each
 /// [`crate::scan::positional_deletes::PositionalDeleteScanTable::scan`] call.
 #[derive(Debug, Clone)]
 pub(crate) struct FieldIdResolution {
+    /// Flattened `schema.name-mapping.default` entries: the table-level
+    /// physical-name → field-id fallback for files whose columns carry no
+    /// field-id at all. Empty when the table declares no name mapping.
     pub(crate) name_mapping: Vec<NameMappingEntry>,
-    pub(crate) defaults: HashMap<i32, ScalarValue>,
+    /// Logical column name keyed by the physical name that column DECLARES,
+    /// built by [`index_declared_physical_names`]. Empty for a table whose
+    /// fields all bind by field-id or by identity — every Iceberg table.
+    pub(crate) declared_physical_names: HashMap<String, String>,
+    /// Reconstructed `initial-default` values keyed by LOGICAL COLUMN NAME —
+    /// the one key every logical field carries, now that a field-id is optional,
+    /// and stable under projection as a column index would not be. Empty when no
+    /// field declares a default.
+    pub(crate) defaults: HashMap<String, ScalarValue>,
 }
 
 impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
@@ -99,42 +112,37 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         physical_file_schema: arrow::datatypes::SchemaRef,
     ) -> datafusion::error::Result<Arc<dyn PhysicalExprAdapter>> {
         // Delegate to the default adapter over a physical schema whose fields are
-        // renamed to their logical names by field-id. The default then resolves
+        // renamed to the logical names that claimed them. The default then resolves
         // each logical column to the correct physical INDEX (order is preserved by
         // the rename) and applies cast / NULL-fill / required-missing-error against
         // the logical field — the reused behavior.
-        let renamed_physical = rename_physical_to_logical(
+        let binding = bind_columns(
             &logical_file_schema,
             &physical_file_schema,
-            &self.name_mapping,
+            &self.resolution,
         );
 
-        // The absent-with-default fill map is PER FILE: a logical field-id absent
-        // from THIS physical file that carries a reconstructed default is keyed by
-        // its logical column index (what an incoming `Column` carries) so
-        // `rewrite` can substitute a `Literal(<default>)` BEFORE delegating. A
-        // field-id resolved by this file (embedded id or name-mapping) is present
-        // and is NEVER defaulted, even if a default exists.
-        let resolved_ids = resolved_logical_field_ids(
-            &logical_file_schema,
-            &physical_file_schema,
-            &self.name_mapping,
-        );
+        // The absent-with-default fill map is PER FILE: a logical column that NO
+        // physical field of THIS file claimed and that carries a reconstructed
+        // default is keyed by its logical column index (what an incoming `Column`
+        // carries) so `rewrite` can substitute a `Literal(<default>)` BEFORE
+        // delegating. A claimed column is present and is NEVER defaulted, even if a
+        // default exists.
         let absent_default_by_index: HashMap<usize, ScalarValue> = logical_file_schema
             .fields()
             .iter()
             .enumerate()
+            .filter(|(_, field)| !binding.bound_logical_names.contains(field.name().as_str()))
             .filter_map(|(index, field)| {
-                let id = field_id_of(field)?;
-                if resolved_ids.contains(&id) {
-                    return None;
-                }
-                self.defaults.get(&id).map(|value| (index, value.clone()))
+                self.resolution
+                    .defaults
+                    .get(field.name())
+                    .map(|value| (index, value.clone()))
             })
             .collect();
 
         let inner = DefaultPhysicalExprAdapterFactory
-            .create(logical_file_schema, Arc::clone(&renamed_physical))?;
+            .create(logical_file_schema, Arc::clone(&binding.renamed_physical))?;
         Ok(Arc::new(FieldIdExprAdapter {
             inner,
             physical_file_schema,
@@ -143,12 +151,13 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
     }
 }
 
-/// Wraps [`DefaultPhysicalExprAdapter`] so field-id resolution reaches the
-/// projection READ path, not just filter/predicate expressions.
+/// Wraps [`DefaultPhysicalExprAdapter`] so column binding reaches the projection
+/// READ path, not just filter/predicate expressions.
 ///
 /// The default adapter resolves columns by NAME. We feed it a physical schema
-/// renamed to logical names (so it binds by field-id and reuses its cast /
-/// NULL-fill / required-missing logic), which makes it emit `Column`s carrying
+/// renamed to the logical names that claimed its fields (so it binds by whichever
+/// key the logical field declares and reuses its cast / NULL-fill /
+/// required-missing logic), which makes it emit `Column`s carrying
 /// the LOGICAL name at the correct physical index. But every downstream consumer
 /// in the Parquet opener — `build_projection_read_plan`, `reassign_expr_columns`,
 /// and `make_projector` — resolves those `Column`s by NAME against the REAL
@@ -157,10 +166,10 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 ///
 /// So after delegating, we walk the rewritten expression and rename each
 /// resolved `Column` back to the real physical field NAME at its (already
-/// correct) index. Order is preserved by [`rename_physical_to_logical`], so the
-/// column's index still points at the right physical slot; only the name must be
-/// restored so the opener's name-based lookups succeed. NULL-filled columns
-/// become `Literal`s (no `Column` to rename) and pass through untouched.
+/// correct) index. Order is preserved by [`bind_columns`], so the column's index
+/// still points at the right physical slot; only the name must be restored so the
+/// opener's name-based lookups succeed. NULL-filled columns become `Literal`s (no
+/// `Column` to rename) and pass through untouched.
 #[derive(Debug)]
 struct FieldIdExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
@@ -226,35 +235,62 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
     }
 }
 
-/// Rename each physical field to the logical name that shares its Iceberg
-/// field-id, preserving field order, type, nullability, and metadata.
+/// One file's column binding: the physical schema renamed to the logical names
+/// that claimed its fields, and the set of logical column names some physical
+/// field claimed.
 ///
-/// Resolution per physical field:
-/// 1. If it carries a `PARQUET:field_id` matching a logical field's id → adopt
-///    that logical field's name (this is the rename/field-id binding). An
-///    embedded field-id is authoritative: if it is absent from the logical
-///    schema the physical name is kept and the name-mapping is NOT consulted.
-/// 2. Else if it carries NO embedded field-id and `name_mapping` maps its
-///    physical name to a field-id present in the logical schema → adopt that
-///    logical field's name (Iceberg column-projection rule #2, honoring
-///    `schema.name-mapping.default`).
-/// 3. Otherwise (no field-id and no covering name-mapping entry, or a mapped
-///    field-id absent from the logical schema) → keep the physical name
-///    unchanged, which makes the default adapter's name lookup act as the
-///    physical-name fallback (and leaves dropped columns unreferenced).
+/// Both views come out of ONE pass because they are one decision seen twice: the
+/// delegate adapter resolves a logical column by NAME against `renamed_physical`,
+/// so a logical name present there is exactly a column this file supplies, and a
+/// logical name absent from it is exactly a column the per-file
+/// `initial-default` / NULL fill must cover.
+struct ColumnBinding {
+    renamed_physical: arrow::datatypes::SchemaRef,
+    bound_logical_names: std::collections::HashSet<String>,
+}
+
+/// Bind one file's physical fields to the logical schema, renaming each physical
+/// field to the logical name that claims it and preserving field order, type,
+/// nullability, and metadata.
 ///
-/// Assumes that post-rename logical names are unique among the referenced physical
-/// fields. Name collisions from drop+rename-into-a-reused-name are a distinct,
-/// still-open concern, NOT resolved by (or in scope for) name-mapping support:
-/// `schema.name-mapping.default` maps CURRENT-state physical names to field-ids,
-/// so it cannot disambiguate a dropped column whose old physical name was later
-/// reused by an unrelated field.
-fn rename_physical_to_logical(
+/// Resolution per physical field, first match wins:
+/// 1. An embedded `PARQUET:field_id` matching a logical field's id → that logical
+///    field's name. This is the Iceberg binding and the Delta `id`
+///    column-mapping binding.
+/// 2. A logical field DECLARING this physical field's name as its physical name →
+///    that logical field's name (Delta `name` column mapping). It sits ABOVE the
+///    name-mapping because a per-column declaration read from the table's own
+///    metadata is authoritative while a name-mapping entry is a table-level
+///    fallback, and it is reached even for a physical field carrying a field-id no
+///    logical field declares — a `name`-mapped table's logical fields carry no ids
+///    for step 1 to match.
+/// 3. `name_mapping` mapping this physical name to a field-id present in the
+///    logical schema → that logical field's name (Iceberg column-projection rule
+///    2). Consulted ONLY for a physical field with NO embedded field-id, which is
+///    the case `schema.name-mapping.default` exists for.
+/// 4. Otherwise the physical name is kept unchanged. That is both the
+///    physical-name fallback for a field-id-bound field and what makes an
+///    identity-bound field (no field-id, no declared physical name) resolve — the
+///    delegate's name lookup does the work in both cases. A dropped column keeps a
+///    name no logical field carries and is simply never referenced.
+///
+/// A logical field counts as BOUND when the renamed schema supplies its name,
+/// which is precisely the question the delegate will ask, so the fill seam and the
+/// delegate can never disagree about whether a column is present in this file.
+///
+/// Assumes post-rename logical names are unique among the referenced physical
+/// fields, and that no two logical fields declare the same physical name (the
+/// Delta protocol guarantees the latter). Name collisions from
+/// drop+rename-into-a-reused-name are a distinct, still-open concern, NOT resolved
+/// by (or in scope for) name-mapping support: `schema.name-mapping.default` maps
+/// CURRENT-state physical names to field-ids, so it cannot disambiguate a dropped
+/// column whose old physical name was later reused by an unrelated field.
+fn bind_columns(
     logical: &arrow::datatypes::Schema,
     physical: &arrow::datatypes::Schema,
-    name_mapping: &[NameMappingEntry],
-) -> arrow::datatypes::SchemaRef {
-    use std::collections::HashMap;
+    resolution: &FieldIdResolution,
+) -> ColumnBinding {
+    use std::collections::{HashMap, HashSet};
 
     let logical_name_by_id: HashMap<i32, &str> = logical
         .fields()
@@ -262,7 +298,8 @@ fn rename_physical_to_logical(
         .filter_map(|f| field_id_of(f).map(|id| (id, f.name().as_str())))
         .collect();
 
-    let field_id_by_physical_name: HashMap<&str, i32> = name_mapping
+    let field_id_by_physical_name: HashMap<&str, i32> = resolution
+        .name_mapping
         .iter()
         .map(|entry| (entry.name.as_str(), entry.field_id))
         .collect();
@@ -271,19 +308,27 @@ fn rename_physical_to_logical(
         .fields()
         .iter()
         .map(|physical_field| {
-            let logical_name = match field_id_of(physical_field) {
-                // An embedded field-id is authoritative: resolve it, or keep the
-                // physical name if that id is absent from the logical schema. The
-                // name-mapping is never consulted for a field that carries an id.
-                Some(id) => logical_name_by_id.get(&id).copied(),
-                // No embedded field-id: consult the name-mapping (step 2), then
-                // fall back to the physical name (step 3).
-                None => field_id_by_physical_name
-                    .get(physical_field.name().as_str())
-                    .and_then(|id| logical_name_by_id.get(id).copied()),
-            };
+            let physical_name = physical_field.name().as_str();
+            let embedded_id = field_id_of(physical_field);
+            let logical_name = embedded_id
+                .and_then(|id| logical_name_by_id.get(&id).copied())
+                .or_else(|| {
+                    resolution
+                        .declared_physical_names
+                        .get(physical_name)
+                        .map(String::as_str)
+                })
+                .or_else(|| {
+                    // Iceberg rule 2 covers only columns written without a field-id.
+                    if embedded_id.is_some() {
+                        return None;
+                    }
+                    field_id_by_physical_name
+                        .get(physical_name)
+                        .and_then(|id| logical_name_by_id.get(id).copied())
+                });
             match logical_name {
-                Some(logical_name) if logical_name != physical_field.name() => {
+                Some(logical_name) if logical_name != physical_name => {
                     Arc::new(physical_field.as_ref().clone().with_name(logical_name))
                 }
                 _ => Arc::clone(physical_field),
@@ -291,18 +336,37 @@ fn rename_physical_to_logical(
         })
         .collect();
 
-    Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        renamed_fields,
-        physical.metadata().clone(),
-    ))
+    let supplied_names: HashSet<&str> = renamed_fields
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
+    let bound_logical_names: HashSet<String> = logical
+        .fields()
+        .iter()
+        .map(|field| field.name())
+        .filter(|name| supplied_names.contains(name.as_str()))
+        .cloned()
+        .collect();
+
+    ColumnBinding {
+        renamed_physical: Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            renamed_fields,
+            physical.metadata().clone(),
+        )),
+        bound_logical_names,
+    }
 }
 
 /// Build the logical Arrow schema from the spec's query-time logical schema.
 ///
-/// Each field is tagged with its Iceberg field-id (`PARQUET:field_id`) so
-/// [`FieldIdExprAdapterFactory`] can bind physical file columns to it by id, and
-/// carries the schema's declared nullability (Iceberg `optional`). The Arrow data
-/// type is reconstructed from the compact tag via [`arrow_type_from_tag`].
+/// Each field carries the schema's declared nullability (Iceberg `optional`) and
+/// an Arrow data type reconstructed from the compact tag via
+/// [`arrow_type_from_tag`]. A field that declares a field-id is ALSO tagged with
+/// it (`PARQUET:field_id`) so [`bind_columns`] can match a physical field's
+/// embedded id against it. A field that binds by a declared physical name or by
+/// identity is tagged with NO field-id: a synthesized id is a value no writer ever
+/// put in any file, and tagging one here would invite a false match against a file
+/// that does carry ids.
 pub(super) fn build_logical_arrow_schema(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> arrow::datatypes::SchemaRef {
@@ -316,11 +380,14 @@ pub(super) fn build_logical_arrow_schema(
                 &lf.name,
                 arrow_type_from_tag(&lf.arrow_type),
                 lf.nullable,
-            )
-            .with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                lf.field_id.to_string(),
-            )]));
+            );
+            let field = match lf.field_id {
+                Some(field_id) => field.with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    field_id.to_string(),
+                )])),
+                None => field,
+            };
             Arc::new(field)
         })
         .collect();
@@ -390,59 +457,44 @@ pub(crate) fn reconstruct_initial_default(
 }
 
 /// Reconstruct every field's encoded Iceberg `initial-default` into a
-/// `field_id → ScalarValue` map, built ONCE from the logical schema and handed
-/// to the [`FieldIdExprAdapterFactory`] so the per-file fill seam can look a
-/// default up by field-id. Fields with no `initial_default` contribute no entry;
-/// a reconstruction failure aborts with a clean `Err` (never a panic).
+/// `logical column name → ScalarValue` map, built ONCE from the logical schema and
+/// handed to the [`FieldIdExprAdapterFactory`] so the per-file fill seam can look a
+/// default up for a column no physical field claimed. Keyed by logical name
+/// because that is the one key every logical field carries — a field-id belongs to
+/// one binding strategy only, and a column index is not stable under projection.
+/// Fields with no `initial_default` contribute no entry; a reconstruction failure
+/// aborts with a clean `Err` (never a panic).
 pub(super) fn reconstruct_initial_defaults(
     logical_schema: &[crate::scan::spec::LogicalField],
-) -> Result<HashMap<i32, ScalarValue>, String> {
+) -> Result<HashMap<String, ScalarValue>, String> {
     logical_schema
         .iter()
         .filter_map(|lf| {
             lf.initial_default.as_ref().map(|encoded| {
                 reconstruct_initial_default(&lf.arrow_type, encoded)
-                    .map(|value| (lf.field_id, value))
+                    .map(|value| (lf.name.clone(), value))
             })
         })
         .collect()
 }
 
-/// The set of logical field-ids that SOME physical field in this file resolves
-/// to — the complement of the "absent from this file" set the fill seam needs.
+/// Index the logical schema's DECLARED physical names as
+/// `physical name → logical column name`, built ONCE per registration and handed
+/// to the [`FieldIdExprAdapterFactory`] so [`bind_columns`] can let a logical field
+/// claim the physical column it names (step 2 — Delta `name` column mapping).
 ///
-/// Mirrors [`rename_physical_to_logical`]'s resolution exactly: an embedded
-/// `PARQUET:field_id` is authoritative (and only counts when present in the
-/// logical schema); a physical field with no embedded id resolves through
-/// `name_mapping` (Iceberg column-projection rule 2). A physical field that
-/// resolves to nothing (dropped column, or an embedded id absent from the
-/// logical schema) contributes no id.
-fn resolved_logical_field_ids(
-    logical: &arrow::datatypes::Schema,
-    physical: &arrow::datatypes::Schema,
-    name_mapping: &[NameMappingEntry],
-) -> std::collections::HashSet<i32> {
-    let logical_ids: std::collections::HashSet<i32> = logical
-        .fields()
+/// A field that binds by field-id or by identity declares no physical name and
+/// contributes no entry, so the index is empty for every Iceberg table and step 2
+/// is then a no-op.
+pub(super) fn index_declared_physical_names(
+    logical_schema: &[crate::scan::spec::LogicalField],
+) -> HashMap<String, String> {
+    logical_schema
         .iter()
-        .filter_map(|f| field_id_of(f))
-        .collect();
-
-    let field_id_by_physical_name: HashMap<&str, i32> = name_mapping
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry.field_id))
-        .collect();
-
-    physical
-        .fields()
-        .iter()
-        .filter_map(|physical_field| match field_id_of(physical_field) {
-            Some(id) if logical_ids.contains(&id) => Some(id),
-            Some(_) => None,
-            None => field_id_by_physical_name
-                .get(physical_field.name().as_str())
-                .copied()
-                .filter(|id| logical_ids.contains(id)),
+        .filter_map(|lf| {
+            lf.physical_name
+                .as_ref()
+                .map(|physical| (physical.clone(), lf.name.clone()))
         })
         .collect()
 }

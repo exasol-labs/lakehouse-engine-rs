@@ -137,18 +137,20 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
 fn lineitem_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "L_ORDERKEY".into(),
             arrow_type: "decimal128(20,0)".into(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "L_EXTENDEDPRICE".into(),
             arrow_type: "decimal128(18,2)".into(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
     ]
 }
@@ -753,18 +755,20 @@ fn json_fallback_typed_sort_key_declines_topn() {
     // vocabulary (List/Struct/Binary all collapse to `utf8`). Must decline.
     let fallback_schema = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "L_ORDERKEY".into(),
             arrow_type: "decimal128(20,0)".into(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "L_EXTENDEDPRICE".into(),
             arrow_type: "decimal128(40,6)".into(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
     ];
     assert!(
@@ -780,11 +784,12 @@ fn json_fallback_typed_sort_key_declines_topn() {
 
     // The sort key column absent from the logical schema declines defensively.
     let missing_schema = vec![LogicalField {
-        field_id: 1,
+        field_id: Some(1),
         name: "L_ORDERKEY".into(),
         arrow_type: "decimal128(20,0)".into(),
         nullable: true,
         initial_default: None,
+        physical_name: None,
     }];
     assert!(
         detect_topn(&request, &pd(&request), &projected, &missing_schema).is_none(),

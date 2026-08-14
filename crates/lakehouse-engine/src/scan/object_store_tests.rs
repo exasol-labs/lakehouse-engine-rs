@@ -1,6 +1,8 @@
 use super::*;
 use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
-use crate::scan::spec::{JoinSpec, JoinType, StorageProps};
+use crate::scan::spec::{
+    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, JoinType, StorageProps,
+};
 use crate::scan::test_support::minimal_spec;
 use ::object_store::ClientConfigKey;
 use datafusion::execution::memory_pool::MemoryLimit;
@@ -789,6 +791,50 @@ async fn an_unroutable_path_is_refused_naming_no_credential() {
             "the refusal must not leak either side's credential: {message}"
         );
     }
+}
+
+/// A delete file resolving to a different object-store root than the first file
+/// is rejected, naming "delete file" so the message distinguishes it from a
+/// mismatched data file.
+#[test]
+fn a_delete_file_under_a_different_root_is_rejected() {
+    let files = vec![FileEntry::with_deletes(
+        "s3://bucket-a/data/f1.parquet",
+        1,
+        vec![DeleteMechanism::IcebergPositionalDelete {
+            path: "s3://bucket-b/deletes/f1-deletes.parquet".to_string(),
+            size: 1,
+        }],
+    )];
+
+    let error = validate_uniform_object_store_files(&files, "", "s3://bucket-a/data/f0.parquet")
+        .expect_err("a delete file under a different root must be rejected");
+
+    assert!(
+        matches!(error, UdfError::User(ref m) if m.contains("delete file")),
+        "the refusal must name 'delete file': {error:?}"
+    );
+}
+
+/// A deletion vector names no object-store path of its own, so it is never
+/// checked against the side's object-store root — even when `path_or_inline_dv`
+/// is not a URI at all.
+#[test]
+fn a_deletion_vector_is_not_checked_against_the_object_store_root() {
+    let files = vec![FileEntry::with_deletes(
+        "s3://bucket-a/data/f1.parquet",
+        1,
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::UuidRelative,
+            path_or_inline_dv: "not-a-uri-token".to_string(),
+            offset: None,
+            size_in_bytes: 1,
+            cardinality: 1,
+        }],
+    )];
+
+    validate_uniform_object_store_files(&files, "", "s3://bucket-a/data/f0.parquet")
+        .expect("a deletion vector must not be checked against the object-store root");
 }
 
 /// Each side's inner store is built from THAT side's OWN storage backend — the

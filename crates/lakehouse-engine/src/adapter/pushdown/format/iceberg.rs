@@ -46,7 +46,7 @@ impl FormatReader for IcebergFormatReader<'_> {
                 logical_schema,
                 table_root,
                 name_mapping,
-                delta: None,
+                partition_columns: Vec::new(),
             })
         })
     }

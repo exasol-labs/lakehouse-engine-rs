@@ -590,7 +590,7 @@ fn join_fan_out_scan_spec(
             logical_schema: primary.logical_schema.clone(),
             name_mapping: primary.name_mapping.clone(),
             join,
-            delta: None,
+            partition_columns: Vec::new(),
             storage: primary.effective_storage.clone(),
             df_target_partitions: tuning.df_target_partitions,
             df_batch_size: tuning.df_batch_size,

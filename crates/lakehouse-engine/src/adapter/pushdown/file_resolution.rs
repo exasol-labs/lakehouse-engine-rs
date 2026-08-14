@@ -1,7 +1,7 @@
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
-    AggKind, CatalogProps, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField,
-    NameMappingEntry, ProjectionItem, StorageBackend,
+    AggKind, CatalogProps, DeleteMechanism, FileEntry, LogicalField, NameMappingEntry,
+    ProjectionItem, StorageBackend,
 };
 use crate::types::mapping::{exasol_representable_catalog_decimal, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
@@ -48,11 +48,16 @@ fn relativize_path_to_root(path: &str, table_root: &str) -> String {
 /// [`relativize_path_to_root`]) while preserving byte sizes and shard membership.
 /// Paths not under the root stay absolute.
 ///
-/// Each data file's associated positional-delete file paths are relativized by
-/// the SAME [`relativize_path_to_root`] rule as the data-file path, so the scan
-/// UDF rejoins them onto `table_root` identically (delete files written by the
-/// same engine live under the same table root). Delete byte sizes and content
-/// types are preserved unchanged.
+/// A delete mechanism naming a delete FILE
+/// ([`DeleteMechanism::object_store_path`]) has that path relativized by the SAME
+/// [`relativize_path_to_root`] rule as the data-file path, so the scan UDF rejoins
+/// them onto `table_root` identically (delete files written by the same engine live
+/// under the same table root). A mechanism naming no path — a Delta deletion vector, whose `path_or_inline_dv`
+/// is resolved into a path at file registration and never addressed from the delete
+/// list itself — is left entirely untouched: relativizing it would corrupt a value
+/// the scan resolves later, regardless of whether it looks like a UUID token, an
+/// inline payload, or an absolute path. Every other member of every mechanism is
+/// preserved unchanged.
 pub(super) fn relativize_shards_to_root(
     shards: Vec<Vec<FileEntry>>,
     table_root: &str,
@@ -65,7 +70,9 @@ pub(super) fn relativize_shards_to_root(
                 .map(|mut entry| {
                     entry.path = relativize_path_to_root(&entry.path, table_root);
                     for delete in &mut entry.deletes {
-                        delete.path = relativize_path_to_root(&delete.path, table_root);
+                        if let Some(path) = delete.object_store_path_mut() {
+                            *path = relativize_path_to_root(path, table_root);
+                        }
                     }
                     entry
                 })
@@ -507,7 +514,8 @@ async fn ensure_supported_delete_mechanisms(
     Ok(())
 }
 
-/// Map an iceberg task-level delete content type to the wire [`DeleteFileContentType`].
+/// Build the [`DeleteMechanism`] for one iceberg task-level delete of `size` bytes
+/// at `path`.
 ///
 /// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
 /// ([`ensure_supported_delete_mechanisms`]) has already rejected any table that
@@ -518,11 +526,21 @@ async fn ensure_supported_delete_mechanisms(
 /// then rejects them cleanly. `Data` never appears in a task's delete list; it is
 /// mapped to a non-positional sentinel so it is likewise rejected rather than
 /// silently applied.
-fn map_delete_content_type(t: iceberg::spec::DataContentType) -> DeleteFileContentType {
-    match t {
-        iceberg::spec::DataContentType::PositionDeletes => DeleteFileContentType::PositionDeletes,
-        iceberg::spec::DataContentType::EqualityDeletes => DeleteFileContentType::EqualityDeletes,
-        iceberg::spec::DataContentType::Data => DeleteFileContentType::EqualityDeletes,
+fn iceberg_delete_mechanism(
+    path: String,
+    size: u64,
+    content_type: iceberg::spec::DataContentType,
+) -> DeleteMechanism {
+    match content_type {
+        iceberg::spec::DataContentType::PositionDeletes => {
+            DeleteMechanism::IcebergPositionalDelete { path, size }
+        }
+        iceberg::spec::DataContentType::EqualityDeletes => {
+            DeleteMechanism::IcebergEqualityDelete { path, size }
+        }
+        iceberg::spec::DataContentType::Data => {
+            DeleteMechanism::IcebergEqualityDelete { path, size }
+        }
     }
 }
 
@@ -578,13 +596,11 @@ async fn plan_files_from_table(
     Ok(tasks
         .into_iter()
         .map(|t| {
-            let deletes: Vec<DeleteFileRef> = t
+            let deletes: Vec<DeleteMechanism> = t
                 .deletes
                 .iter()
-                .map(|d| DeleteFileRef {
-                    path: d.file_path.clone(),
-                    size: d.file_size_in_bytes,
-                    content_type: map_delete_content_type(d.file_type),
+                .map(|d| {
+                    iceberg_delete_mechanism(d.file_path.clone(), d.file_size_in_bytes, d.file_type)
                 })
                 .collect();
             FileEntry::with_deletes(

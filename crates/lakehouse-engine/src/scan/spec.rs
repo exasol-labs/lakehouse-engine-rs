@@ -345,6 +345,25 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 
 /// One field in the logical schema carried by `ScanSpec::logical_schema`.
 ///
+/// # Binding key
+///
+/// `field_id` and `physical_name` are the two ways a logical field can name its
+/// physical counterpart, and AT MOST ONE of them is ever populated: two populated
+/// keys would need a precedence rule with no authority behind it, and the second key
+/// would never be consulted. Which one the producer populates encodes the binding
+/// DECISION rather than the input that drove it, so nothing downstream re-derives it:
+///
+/// | Producer | `field_id` | `physical_name` | Scan-side binding |
+/// |---|---|---|---|
+/// | Iceberg (always) | `Some(id)` | `None` | embedded `PARQUET:field_id`, then `name_mapping`, then the physical name |
+/// | Delta `id` column mapping | `Some(columnMapping.id)` | `None` | embedded `PARQUET:field_id` |
+/// | Delta `name` column mapping | `None` | `Some(physicalName)` | the declared physical name |
+/// | Delta `none` column mapping | `None` | `None` | identity — the logical name itself |
+///
+/// A field with NEITHER key deliberately carries no stand-in ordinal: an ordinal is a
+/// value no writer ever wrote into any file, so tagging the logical schema with one
+/// invites a false `PARQUET:field_id` match against a file that does carry ids.
+///
 /// The `arrow_type` is a compact string tag produced by
 /// `types::mapping::arrow_type_to_tag` and parsed back by
 /// `types::mapping::arrow_type_from_tag`. Using a string tag rather than a
@@ -390,9 +409,14 @@ pub use lakehouse_catalog::{AdlsCred, CatalogProps, StorageBackend, StorageProps
 /// inherently credential-free.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalField {
-    /// Iceberg field-id for this column.
-    pub field_id: i32,
-    /// Current logical name (from the Iceberg schema at query time).
+    /// This column's field-id binding key — an Iceberg field-id, or a Delta
+    /// `columnMapping.id` under `id` mapping. `None` when the column binds by its
+    /// declared `physical_name` or by identity instead (see the struct doc). Absent
+    /// from JSON when `None`, and declared FIRST so a field-id-bound column still
+    /// serializes `"field_id":N` as its leading key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<i32>,
+    /// Current logical name (from the table's schema at query time).
     pub name: String,
     /// Compact Arrow type tag (see struct doc for the tag vocabulary).
     pub arrow_type: String,
@@ -405,6 +429,13 @@ pub struct LogicalField {
     /// every spec authored before this field existed deserializes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_default: Option<String>,
+    /// This column's physical-name binding key — its `delta.columnMapping.physicalName`
+    /// under Delta `name` mapping, where the protocol requires a reader to match on the
+    /// physical name. `None` whenever the column binds by `field_id` or by identity
+    /// instead (see the struct doc), which is every Iceberg column. Appended LAST and
+    /// absent from JSON when `None`, so a field-id-bound column's encoding gains no key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_name: Option<String>,
 }
 
 /// One flattened, top-level entry of the Iceberg `schema.name-mapping.default`
@@ -471,8 +502,8 @@ pub struct JoinSpec {
     /// table with merge-on-read deletes joins on its post-delete rows.
     pub files: Vec<FileEntry>,
 
-    /// Full logical schema of the dimension Iceberg table at query time. Absent
-    /// (empty) falls back to first-file schema inference, as on the raw-scan path.
+    /// Full logical schema of the dimension table at query time. Absent (empty) falls
+    /// back to first-file schema inference, as on the raw-scan path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
@@ -508,106 +539,6 @@ pub struct JoinSpec {
     pub storage: StorageBackend,
 }
 
-/// The Iceberg delete mechanism a [`DeleteFileRef`] belongs to.
-///
-/// Carries just enough to tell an actually-applicable Parquet positional
-/// delete apart from every delete mechanism this engine does not apply. Plan
-/// time (the adapter) is the authoritative gate that fails loud on anything
-/// other than [`PositionDeletes`](DeleteFileContentType::PositionDeletes)
-/// BEFORE a file reaches this spec; the other variants exist so the scan
-/// reader's read-time backstop can still reject a delete file cleanly (rather
-/// than panic or apply it incorrectly) if one ever slips through — see
-/// ADR-085 ("Minimal Scan-Spec Surface for Delete Support") in
-/// `specs/decision-log.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeleteFileContentType {
-    /// A Parquet positional-delete file (`file_path`/`pos` columns) — the
-    /// only delete mechanism this engine applies.
-    PositionDeletes,
-    /// An Iceberg equality-delete file. Never applied by this engine.
-    EqualityDeletes,
-    /// A Puffin-encoded v3 deletion vector. Never applied by this engine.
-    PuffinDeletionVector,
-}
-
-/// Reference to one Iceberg delete file associated with a [`FileEntry`].
-///
-/// Deliberately minimal — `path`, `size`, and `content_type` only. Per the
-/// "Minimal ScanSpec surface" decision this carries NO serialized Iceberg
-/// `Schema` or `BoundPredicate`: the scan reader already has the logical
-/// schema (`ScanSpec::logical_schema`) and does its own predicate pushdown, so
-/// a delete ref needs nothing beyond what it takes to open the file (`path`,
-/// `size`, matching how a [`FileEntry`] itself carries no more than that) and
-/// to reject it cleanly if unsupported (`content_type`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeleteFileRef {
-    /// Path to the delete file, relative to `ScanSpec::table_root` when
-    /// non-empty and the file lives under it, otherwise an absolute URI —
-    /// exactly like [`FileEntry::path`].
-    pub path: String,
-    /// Byte size, used the same way as [`FileEntry::size`]: to build the
-    /// delete file's `ObjectMeta` without an object-store HEAD.
-    pub size: u64,
-    /// The delete mechanism this file encodes.
-    pub content_type: DeleteFileContentType,
-}
-
-/// How a Delta table maps a logical column onto its physical Parquet column.
-///
-/// Delta writes Parquet field-ids ONLY in `Id` mode, so this mode is what a scan
-/// consults before binding a column by field-id rather than by name. A table whose
-/// metadata sets no mode is carried as [`None`](DeltaColumnMappingMode::None) with
-/// each physical name equal to its logical name, so the scan side reads ONE shape
-/// for all three modes instead of distinguishing an absent block from a `none` one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeltaColumnMappingMode {
-    None,
-    Id,
-    Name,
-}
-
-/// One Delta column's mapping from its logical name to its physical Parquet
-/// counterpart, in the table's declared column order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeltaColumnMapping {
-    /// The column's name in the table's logical schema.
-    pub logical_name: String,
-    /// The column's name inside the Parquet file. Equal to `logical_name` under
-    /// [`DeltaColumnMappingMode::None`].
-    pub physical_name: String,
-    /// The column's physical field-id: its `delta.columnMapping.id` annotation
-    /// under [`Id`](DeltaColumnMappingMode::Id) or
-    /// [`Name`](DeltaColumnMappingMode::Name) mode — where the Delta protocol
-    /// requires one, so planning refuses a table omitting it — and its 1-based
-    /// ordinal position under [`None`](DeltaColumnMappingMode::None), where the
-    /// annotation is inert. Never a mix of the two within one table, so ids stay
-    /// unique and stable per column in every mode.
-    pub physical_id: i32,
-}
-
-/// The shard-INVARIANT Delta table block: the column mapping and the partition
-/// columns, both identical across every shard of one fan-out.
-///
-/// `Some` on [`CommonScanSpec::delta`] is the scan side's single signal that this
-/// is a Delta scan. Kept as ONE optional block per format rather than as scattered
-/// optional fields, so the Iceberg encoding stays byte-identical behind a single
-/// skip-serialize gate and a later format extension grows this block instead of
-/// the shared spec.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeltaTableSpec {
-    pub column_mapping_mode: DeltaColumnMappingMode,
-    /// Every column's mapping, in the table's declared order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub columns: Vec<DeltaColumnMapping>,
-    /// The table's partition-column names, in partition order. Carried once here
-    /// rather than per file, so a scan of a table with ZERO active files still
-    /// knows which logical columns have no physical counterpart.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partition_columns: Vec<String>,
-}
-
 /// Where a Delta deletion vector's bytes live — the closed set of the Delta
 /// protocol's three storage kinds.
 ///
@@ -625,101 +556,299 @@ pub enum DeltaDeletionVectorStorage {
     AbsolutePath,
 }
 
-/// One data file's Delta deletion-vector reference, carried VERBATIM.
+/// One row-deletion mechanism attached to a [`FileEntry`], naming ITSELF on the wire
+/// and carrying only that mechanism's own payload.
 ///
-/// Unrelated to [`DeleteFileRef`] and deliberately not encoded as one: an Iceberg
-/// delete reference names a whole delete FILE, while this names a byte RANGE
-/// inside a possibly-shared `.bin`. Nothing here is resolved into a path or
-/// applied to a row at plan time.
+/// A data file's deletions ride in ONE list of these values whichever table format
+/// planned the scan, so the scan side reads that one list and dispatches on CONTENT —
+/// it never asks which format produced the spec. A fifth mechanism is a new variant
+/// here, not another optional field and another fork at every reader.
+///
+/// Each variant carries the minimum needed to act on it, per the "Minimal ScanSpec
+/// surface" decision (ADR-085 in `specs/decision-log.md`): no serialized Iceberg
+/// `Schema` and no `BoundPredicate`, because the reader already has the logical schema
+/// ([`CommonScanSpec::logical_schema`]) and does its own predicate pushdown.
+///
+/// Only [`IcebergPositionalDelete`](DeleteMechanism::IcebergPositionalDelete) is
+/// applied today. Plan time is the authoritative gate that fails loud on every other
+/// mechanism BEFORE a file reaches this spec; the other variants exist so the scan
+/// reader's read-time backstop can reject one cleanly — rather than panic, or stay
+/// silent and return rows the table has deleted — if one ever slips through.
+///
+/// # Serde
+///
+/// (De)serialization routes through the private [`DeleteMechanismWire`], exactly as
+/// [`FileEntry`] routes through [`FileEntryWire`], which keeps the neutral Rust shape
+/// and the frozen JSON encoding two independent decisions with one owner each. An
+/// internally-tagged enum would emit its discriminant key FIRST and reorder every
+/// Iceberg member's keys, breaking the pinned
+/// `{"path":…,"size":…,"content_type":…}` encoding for no behavioral gain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeltaDeletionVector {
-    pub storage: DeltaDeletionVectorStorage,
-    /// The Delta `pathOrInlineDv` value, stored exactly as logged — a UUID, an
-    /// absolute path, or the inline vector — so path reconstruction stays deferred
-    /// to file registration.
-    pub path_or_inline_dv: String,
-    /// Byte offset of the vector inside its file. Absent when the file holds this
-    /// vector alone, and absent from JSON when absent here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<i32>,
-    pub size_in_bytes: i32,
-    /// Number of rows the vector deletes.
-    pub cardinality: i64,
+#[serde(from = "DeleteMechanismWire", into = "DeleteMechanismWire")]
+pub enum DeleteMechanism {
+    /// An Iceberg Parquet positional-delete file (`file_path`/`pos` columns) — the
+    /// only mechanism this engine applies.
+    IcebergPositionalDelete {
+        /// Path to the delete file, relative to [`CommonScanSpec::table_root`] when
+        /// non-empty and the file lives under it, otherwise an absolute URI —
+        /// exactly like [`FileEntry::path`].
+        path: String,
+        /// Byte size, used the same way as [`FileEntry::size`]: to build the delete
+        /// file's `ObjectMeta` without an object-store HEAD.
+        size: u64,
+    },
+    /// An Iceberg equality-delete file. Never applied by this engine.
+    IcebergEqualityDelete { path: String, size: u64 },
+    /// A Puffin-encoded Iceberg v3 deletion vector. Never applied by this engine.
+    IcebergPuffinDeletionVector { path: String, size: u64 },
+    /// A Delta deletion vector: a byte RANGE inside a possibly-shared `.bin` file,
+    /// carried verbatim and resolved into no path at plan time. Unrelated to the
+    /// Iceberg variants above, each of which names a whole delete FILE.
+    DeltaDeletionVector {
+        storage: DeltaDeletionVectorStorage,
+        /// The Delta `pathOrInlineDv` value, stored exactly as logged — a UUID, an
+        /// absolute path, or the inline vector — so path reconstruction stays
+        /// deferred to file registration.
+        path_or_inline_dv: String,
+        /// Byte offset of the vector inside its file. `None` when the file holds
+        /// this vector alone, and absent from JSON when `None`.
+        offset: Option<i32>,
+        size_in_bytes: i32,
+        /// Number of rows the vector deletes.
+        cardinality: i64,
+    },
 }
 
-/// The per-FILE Delta block: what a scan cannot recover from the Parquet file
-/// itself.
+impl DeleteMechanism {
+    /// Whether this mechanism names a whole delete FILE (every Iceberg variant)
+    /// rather than a byte range inside a shared one (the Delta deletion vector).
+    ///
+    /// The axis [`ScanSpec::files_from_json`]'s mutual-exclusion gate turns on.
+    /// Matched exhaustively, so a mechanism added later must state which side it
+    /// falls on instead of defaulting into one.
+    fn is_delete_file_reference(&self) -> bool {
+        match self {
+            Self::IcebergPositionalDelete { .. }
+            | Self::IcebergEqualityDelete { .. }
+            | Self::IcebergPuffinDeletionVector { .. } => true,
+            Self::DeltaDeletionVector { .. } => false,
+        }
+    }
+
+    /// The object-store path whose bytes this mechanism reads, or `None` for a
+    /// mechanism that names no path of its own.
+    ///
+    /// `None` for [`DeltaDeletionVector`](Self::DeltaDeletionVector): its
+    /// `path_or_inline_dv` is resolved into a path at file registration and is never
+    /// addressed from the delete list itself, so it is never fetched, relativized, or
+    /// claimed for a store here — regardless of whether the value happens to look
+    /// like a UUID token, an inline payload, or an absolute path
+    /// ([`AbsolutePath`](DeltaDeletionVectorStorage::AbsolutePath)).
+    /// Every caller that treats a delete member as an addressable file asks here
+    /// instead of reaching into a variant, so that refusal is stated once and a
+    /// mechanism added later cannot inherit it by accident.
+    pub fn object_store_path(&self) -> Option<&str> {
+        match self {
+            Self::IcebergPositionalDelete { path, .. }
+            | Self::IcebergEqualityDelete { path, .. }
+            | Self::IcebergPuffinDeletionVector { path, .. } => Some(path.as_str()),
+            Self::DeltaDeletionVector { .. } => None,
+        }
+    }
+
+    /// [`object_store_path`](Self::object_store_path) for the plan-time caller that
+    /// rewrites the path in place — same mechanisms carry one, same reason.
+    pub(crate) fn object_store_path_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::IcebergPositionalDelete { path, .. }
+            | Self::IcebergEqualityDelete { path, .. }
+            | Self::IcebergPuffinDeletionVector { path, .. } => Some(path),
+            Self::DeltaDeletionVector { .. } => None,
+        }
+    }
+}
+
+/// The frozen `content_type` tag of an Iceberg delete-file member. Wire-private: it
+/// exists only to reproduce that tag, and the public [`DeleteMechanism`] carries the
+/// same information as a variant instead.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IcebergDeleteContentType {
+    PositionDeletes,
+    EqualityDeletes,
+    PuffinDeletionVector,
+}
+
+/// Wire form of [`DeleteMechanism`] — see that enum's doc for why this shape exists.
+/// Not part of the public API; [`DeleteMechanism`] is the only type callers construct
+/// or match on.
 ///
-/// Both members are that: Delta stores a partition column's value ONLY in the
-/// transaction log, and a deletion vector lives outside the data file. Carried per
-/// file because both vary per file, unlike the shard-invariant
-/// [`DeltaTableSpec`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeltaFileSpec {
-    /// This file's partition values, one entry per partition column. A key
-    /// present with NO value is a partition value of NULL — a value the scan
-    /// materializes — whereas a partition column MISSING from the map is a
-    /// planning defect the scan can detect. Collapsing the two onto one encoding
-    /// would make that impossible, which is why the value is optional rather than
-    /// the key. Ordered by key on the wire, so a golden encoding is byte-stable
-    /// across runs.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub partition_values: BTreeMap<String, Option<String>>,
-    /// At most one deletion vector, since Delta attaches at most one per `add`
-    /// action. Absent from JSON when absent here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deletion_vector: Option<DeltaDeletionVector>,
+/// `untagged` resolves variants against structurally DISJOINT key sets: the Iceberg
+/// arm requires `path`, `size`, and `content_type`, the deletion-vector arm requires
+/// `storage`, `path_or_inline_dv`, `size_in_bytes`, and `cardinality`. So neither can
+/// match the other's encoding, and a member matching neither is refused rather than
+/// read as the wrong mechanism. The Iceberg arm's FIELD ORDER is the frozen key order
+/// `{"path":…,"size":…,"content_type":…}`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum DeleteMechanismWire {
+    IcebergDeleteFile {
+        path: String,
+        size: u64,
+        content_type: IcebergDeleteContentType,
+    },
+    DeltaDeletionVector {
+        storage: DeltaDeletionVectorStorage,
+        path_or_inline_dv: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<i32>,
+        size_in_bytes: i32,
+        cardinality: i64,
+    },
+}
+
+impl From<DeleteMechanismWire> for DeleteMechanism {
+    fn from(wire: DeleteMechanismWire) -> Self {
+        match wire {
+            DeleteMechanismWire::IcebergDeleteFile {
+                path,
+                size,
+                content_type,
+            } => match content_type {
+                IcebergDeleteContentType::PositionDeletes => {
+                    DeleteMechanism::IcebergPositionalDelete { path, size }
+                }
+                IcebergDeleteContentType::EqualityDeletes => {
+                    DeleteMechanism::IcebergEqualityDelete { path, size }
+                }
+                IcebergDeleteContentType::PuffinDeletionVector => {
+                    DeleteMechanism::IcebergPuffinDeletionVector { path, size }
+                }
+            },
+            DeleteMechanismWire::DeltaDeletionVector {
+                storage,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            } => DeleteMechanism::DeltaDeletionVector {
+                storage,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            },
+        }
+    }
+}
+
+impl From<DeleteMechanism> for DeleteMechanismWire {
+    fn from(mechanism: DeleteMechanism) -> Self {
+        match mechanism {
+            DeleteMechanism::IcebergPositionalDelete { path, size } => {
+                DeleteMechanismWire::IcebergDeleteFile {
+                    path,
+                    size,
+                    content_type: IcebergDeleteContentType::PositionDeletes,
+                }
+            }
+            DeleteMechanism::IcebergEqualityDelete { path, size } => {
+                DeleteMechanismWire::IcebergDeleteFile {
+                    path,
+                    size,
+                    content_type: IcebergDeleteContentType::EqualityDeletes,
+                }
+            }
+            DeleteMechanism::IcebergPuffinDeletionVector { path, size } => {
+                DeleteMechanismWire::IcebergDeleteFile {
+                    path,
+                    size,
+                    content_type: IcebergDeleteContentType::PuffinDeletionVector,
+                }
+            }
+            DeleteMechanism::DeltaDeletionVector {
+                storage,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            } => DeleteMechanismWire::DeltaDeletionVector {
+                storage,
+                path_or_inline_dv,
+                offset,
+                size_in_bytes,
+                cardinality,
+            },
+        }
+    }
 }
 
 /// One per-shard scanned-file entry: a data file's path and byte size, plus the
-/// positional-delete files (if any) that must be applied when reading it, and the
-/// Delta block a Delta data file carries.
+/// delete mechanisms (if any) that must be applied when reading it and the partition
+/// values (if any) the file's own bytes do not record.
 ///
 /// # Chosen shape: struct-per-file with an untagged legacy fallback
 ///
-/// The Rust-level API is a plain struct (`path`, `size`, `deletes`, `delta`) so
-/// callers never pattern-match a bare tuple to reach the delete list. On the wire,
-/// `#[serde(from/into = "FileEntryWire")]` routes (de)serialization through
-/// the private [`FileEntryWire`] enum, mirroring how [`ProjectionItem`]
-/// already gives a bare-string legacy payload a typed fallback in this same
-/// module:
+/// The Rust-level API is a plain struct (`path`, `size`, `deletes`,
+/// `partition_values`) so callers never pattern-match a bare tuple to reach the
+/// delete list. On the wire, `#[serde(from/into = "FileEntryWire")]` routes
+/// (de)serialization through the private [`FileEntryWire`] enum, mirroring how
+/// [`ProjectionItem`] already gives a bare-string legacy payload a typed fallback in
+/// this same module:
 /// - A legacy `[path, size]` 2-tuple (every entry written before
 ///   positional-delete support) deserializes with an empty `deletes` list.
 /// - `[path, size, deletes]` (a 3-tuple) deserializes with `deletes` intact.
-/// - A JSON OBJECT carrying a `delta` member deserializes with that block
-///   intact. An object is disjoint from both tuple forms, so adding it left
-///   their encodings and their deserialization precedence untouched — which a
-///   fourth tuple slot would not have.
-/// - Serialization always picks the SHORTEST form for the value at hand: the
-///   compact 2-tuple when `deletes` is empty and no Delta block is present
-///   (keeping the still-common delete-free Iceberg case exactly as small on the
-///   wire as before either field existed), the 3-tuple when there are deletes to
-///   carry, and the object whenever a Delta block is present.
+/// - A JSON OBJECT carrying a `partition_values` member deserializes with that map
+///   intact. An object is disjoint from both tuple forms, so adding it left their
+///   encodings and their deserialization precedence untouched — which a fourth tuple
+///   slot would not have.
+/// - Serialization always picks the SHORTEST form for the value at hand: the compact
+///   2-tuple when there is neither a delete mechanism nor a partition value (keeping
+///   the still-common bare case exactly as small on the wire as before either field
+///   existed), the 3-tuple when there are deletes to carry, and the object whenever
+///   there are partition values.
+///
+/// The object form is therefore selected by PARTITION VALUES, never by table format:
+/// an entry whose only extra content is a deletion vector rides in the 3-tuple, which
+/// is correct because each delete member names its own mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "FileEntryWire", into = "FileEntryWire")]
 pub struct FileEntry {
-    /// Path to the data file, relative to `ScanSpec::table_root` when
-    /// non-empty and the file lives under it, otherwise an absolute URI (S3
-    /// or s3a). A Delta data-file path is stored exactly as the transaction log
-    /// records it, resolved by nothing at plan time.
+    /// Path to the data file, relative to [`CommonScanSpec::table_root`] when
+    /// non-empty and the file lives under it, otherwise an absolute URI. Stored
+    /// exactly as the source catalog or transaction log records it, resolved by
+    /// nothing at plan time.
     pub path: String,
     /// Byte size, used to build the file's `ObjectMeta` without an
     /// object-store HEAD.
     pub size: u64,
-    /// Positional-delete files that must be applied when reading this data
-    /// file. Empty (the default for legacy and delete-free entries) means the
-    /// file is read as-is. Stays EMPTY on every Delta entry: a Delta deletion
-    /// vector rides in `delta` instead, so the Iceberg positional-delete reader is
-    /// never handed a reference it would misread — a combination
-    /// [`ScanSpec::files_from_json`] refuses rather than reconstitutes.
-    pub deletes: Vec<DeleteFileRef>,
-    /// This file's Delta block — its partition values and its deletion-vector
-    /// reference. `None` (the default) on every Iceberg entry, and absent from
-    /// JSON when `None`, so an Iceberg file list serializes byte-identically to
-    /// its pre-Delta encoding. The absence is expressed by the wire enum's
-    /// shortest-form variant selection, not by a field attribute, since this
+    /// EVERY row-deletion mechanism that must be applied when reading this data
+    /// file, whichever table format planned the scan — see [`DeleteMechanism`].
+    /// Empty (the default for legacy and delete-free entries) means the file is read
+    /// as-is. One list rather than one per format is what lets the scan dispatch on
+    /// each member's own mechanism instead of on the spec's provenance.
+    ///
+    /// A list may hold Iceberg delete-file references OR one deletion vector, never
+    /// both: the two are independent mechanisms, and applying both to one data file
+    /// returns wrong rows — a mix [`ScanSpec::files_from_json`] refuses rather than
+    /// reconstitutes.
+    pub deletes: Vec<DeleteMechanism>,
+    /// This file's partition values, one entry per column in
+    /// [`CommonScanSpec::partition_columns`] — the values a scan reading the Parquet
+    /// bytes alone cannot recover, because a partitioned writer records them outside
+    /// the data file.
+    ///
+    /// A key present with NO value is a partition value of NULL — a value the scan
+    /// materializes — whereas a partition column MISSING from the map is a planning
+    /// defect the scan can detect. Collapsing the two onto one encoding would make
+    /// that impossible, which is why the VALUE is optional rather than the key.
+    /// Ordered by key on the wire, so a golden encoding is byte-stable across runs.
+    ///
+    /// Empty (the default) on an unpartitioned entry and on every Iceberg entry
+    /// today, and absent from JSON when empty — expressed by the wire enum's
+    /// shortest-form variant selection rather than by a field attribute, since this
     /// struct's own serde attributes route through that enum.
-    pub delta: Option<DeltaFileSpec>,
+    pub partition_values: BTreeMap<String, Option<String>>,
 }
 
 /// Wire form of [`FileEntry`] — see that struct's doc for why this shape
@@ -727,23 +856,23 @@ pub struct FileEntry {
 /// construct or match on.
 ///
 /// `untagged` resolves variants in DECLARATION order, and a JSON object matches
-/// neither tuple variant while a JSON array matches neither the struct variant.
-/// So [`WithDelta`](FileEntryWire::WithDelta) is disjoint from both tuple forms
-/// and its addition left their precedence exactly as it was. It carries `deletes`
-/// as well, so the conversion from [`FileEntry`] is TOTAL and lossless for every
-/// value the struct admits rather than dropping a field in a combination the type
-/// permits but production construction never produces.
+/// neither tuple variant while a JSON array matches neither the struct variant. So
+/// [`WithPartitionValues`](FileEntryWire::WithPartitionValues) is disjoint from both
+/// tuple forms and its addition left their precedence exactly as it was. It carries
+/// `deletes` as well, so the conversion from [`FileEntry`] is TOTAL and lossless for
+/// every value the struct admits rather than dropping a field in a combination the
+/// type permits but production construction never produces.
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum FileEntryWire {
     Legacy(String, u64),
-    WithDeletes(String, u64, Vec<DeleteFileRef>),
-    WithDelta {
+    WithDeletes(String, u64, Vec<DeleteMechanism>),
+    WithPartitionValues {
         path: String,
         size: u64,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        deletes: Vec<DeleteFileRef>,
-        delta: DeltaFileSpec,
+        deletes: Vec<DeleteMechanism>,
+        partition_values: BTreeMap<String, Option<String>>,
     },
 }
 
@@ -754,24 +883,24 @@ impl From<FileEntryWire> for FileEntry {
                 path,
                 size,
                 deletes: Vec::new(),
-                delta: None,
+                partition_values: BTreeMap::new(),
             },
             FileEntryWire::WithDeletes(path, size, deletes) => FileEntry {
                 path,
                 size,
                 deletes,
-                delta: None,
+                partition_values: BTreeMap::new(),
             },
-            FileEntryWire::WithDelta {
+            FileEntryWire::WithPartitionValues {
                 path,
                 size,
                 deletes,
-                delta,
+                partition_values,
             } => FileEntry {
                 path,
                 size,
                 deletes,
-                delta: Some(delta),
+                partition_values,
             },
         }
     }
@@ -786,56 +915,61 @@ impl From<FileEntry> for FileEntryWire {
             path,
             size,
             deletes,
-            delta,
+            partition_values,
         } = entry;
-        match delta {
-            Some(delta) => FileEntryWire::WithDelta {
+        if !partition_values.is_empty() {
+            return FileEntryWire::WithPartitionValues {
                 path,
                 size,
                 deletes,
-                delta,
-            },
-            None if deletes.is_empty() => FileEntryWire::Legacy(path, size),
-            None => FileEntryWire::WithDeletes(path, size, deletes),
+                partition_values,
+            };
+        }
+        if deletes.is_empty() {
+            FileEntryWire::Legacy(path, size)
+        } else {
+            FileEntryWire::WithDeletes(path, size, deletes)
         }
     }
 }
 
 impl FileEntry {
-    /// A data-file entry with no associated delete files and no Delta block — the
-    /// common Iceberg case, and the only shape a legacy (pre-delete-support) entry
-    /// can take.
+    /// A data-file entry with no delete mechanisms and no partition values — the
+    /// common unpartitioned Iceberg case, and the only shape a legacy
+    /// (pre-delete-support) entry can take.
     pub fn new(path: impl Into<String>, size: u64) -> Self {
         FileEntry {
             path: path.into(),
             size,
             deletes: Vec::new(),
-            delta: None,
+            partition_values: BTreeMap::new(),
         }
     }
 
-    /// An Iceberg data-file entry with its associated positional-delete file refs.
-    pub fn with_deletes(path: impl Into<String>, size: u64, deletes: Vec<DeleteFileRef>) -> Self {
+    /// A data-file entry with its delete mechanisms. Callers must not mix a deletion
+    /// vector with an Iceberg delete-file reference in one list — see
+    /// [`FileEntry::deletes`].
+    pub fn with_deletes(path: impl Into<String>, size: u64, deletes: Vec<DeleteMechanism>) -> Self {
         FileEntry {
             path: path.into(),
             size,
             deletes,
-            delta: None,
+            partition_values: BTreeMap::new(),
         }
     }
 
-    /// A Delta data-file entry with its per-file block.
-    ///
-    /// Leaves `deletes` EMPTY: a Delta deletion vector rides inside `delta`, and the
-    /// Iceberg positional-delete reader must never be handed one. Construction is only
-    /// half of that guarantee — [`ScanSpec::files_from_json`] refuses the pair on the
-    /// way back in, so a payload this constructor did not build cannot carry it either.
-    pub fn with_delta(path: impl Into<String>, size: u64, delta: DeltaFileSpec) -> Self {
+    /// A data-file entry with its partition values and no delete mechanism. A caller
+    /// needing both assigns [`FileEntry::deletes`] on the result.
+    pub fn with_partition_values(
+        path: impl Into<String>,
+        size: u64,
+        partition_values: BTreeMap<String, Option<String>>,
+    ) -> Self {
         FileEntry {
             path: path.into(),
             size,
             deletes: Vec::new(),
-            delta: Some(delta),
+            partition_values,
         }
     }
 }
@@ -863,8 +997,8 @@ impl From<(String, u64)> for FileEntry {
 /// any error message produced by `from_json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommonScanSpec {
-    /// The Iceberg table's root location (`table.metadata().location()`), used
-    /// to reconstruct absolute file paths from per-shard relative paths.
+    /// The table's root location, used to reconstruct absolute file paths from
+    /// per-shard relative paths.
     ///
     /// An empty string (the default) means every per-shard file path is already
     /// absolute — either a legacy payload that predates this field, or a file
@@ -921,7 +1055,8 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emit_exa_types: Vec<String>,
 
-    /// Full logical schema of the Iceberg table at query time.
+    /// Full logical schema of the table at query time, each field carrying the
+    /// binding key its producer selected (see [`LogicalField`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub logical_schema: Vec<LogicalField>,
 
@@ -939,14 +1074,16 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<JoinSpec>,
 
-    /// The Delta table block for a Delta scan — its column mapping and its
-    /// partition columns. `None` (the default) means this is not a Delta scan, so
-    /// `Some` here is the scan side's single signal that it is; absent from JSON
-    /// when `None`, which is what keeps an Iceberg common blob byte-identical to
-    /// its pre-Delta encoding. Shard-invariant: the mapping and the partition
-    /// columns are table-level and identical across every shard.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delta: Option<DeltaTableSpec>,
+    /// The table's partition-column names, in partition order. Carried ONCE here
+    /// rather than per file, so a scan of a table with ZERO active files still knows
+    /// which logical columns have no physical counterpart. Shard-invariant: the
+    /// partition columns are table-level and identical across every shard.
+    ///
+    /// Empty (the default) on an unpartitioned table and on every Iceberg scan today,
+    /// and absent from JSON when empty, which is what keeps an Iceberg common blob
+    /// byte-identical to its pre-consolidation encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_columns: Vec<String>,
 
     pub storage: StorageBackend,
 
@@ -1049,7 +1186,7 @@ impl Default for CommonScanSpec {
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
             join: None,
-            delta: None,
+            partition_columns: Vec::new(),
             storage: StorageBackend::S3(StorageProps::default()),
             df_target_partitions: default_one_usize(),
             df_batch_size: default_batch_size(),
@@ -1176,10 +1313,10 @@ impl ScanSpec {
     }
 
     /// Serialize a per-shard files list to the JSON array carried in the UDF's
-    /// second argument. Each delete-free Iceberg entry is a compact `[path, size]`
-    /// 2-tuple; an entry carrying positional-delete refs is a `[path, size,
-    /// deletes]` 3-tuple; an entry carrying a Delta block is a self-describing
-    /// JSON object (see [`FileEntry`]). Paired with `files_from_json`.
+    /// second argument. Each delete-free entry is a compact `[path, size]` 2-tuple;
+    /// an entry carrying delete mechanisms is a `[path, size, deletes]` 3-tuple; an
+    /// entry carrying partition values is a self-describing JSON object (see
+    /// [`FileEntry`]). Paired with `files_from_json`.
     pub fn files_json(files: &[FileEntry]) -> String {
         serde_json::to_string(files).expect("files list serialization is infallible")
     }
@@ -1187,17 +1324,17 @@ impl ScanSpec {
     /// Deserialize a per-shard files list from the UDF's second argument.
     ///
     /// Accepts the legacy `[path, size]` wire form (reconstituted with an empty
-    /// delete list and no Delta block), the `[path, size, deletes]` form, and the
-    /// Delta object form — see [`FileEntry`]. Returns an error that does NOT
-    /// include the raw input.
+    /// delete list and no partition values), the `[path, size, deletes]` form, and
+    /// the partition-value object form — see [`FileEntry`]. Returns an error that
+    /// does NOT include the raw input.
     ///
-    /// Refuses an entry carrying a Delta block AND a non-empty `deletes` list: the
-    /// two are independent delete mechanisms, and applying both to one data file
-    /// returns wrong rows. This is the one gate that makes [`FileEntry::deletes`]'
-    /// "stays EMPTY on every Delta entry" invariant hold for a payload this process
-    /// did not build, so the scan never has to decide which mechanism wins. The
-    /// [`FileEntry`] wire conversions stay total and lossless either way, keeping the
-    /// struct-level round trip a property of the type rather than of this check.
+    /// Refuses an entry whose delete list MIXES a deletion vector with an Iceberg
+    /// delete-file reference: the two are independent delete mechanisms, and applying
+    /// both to one data file returns wrong rows. This is the one gate that holds for a
+    /// payload this process did not build, so the scan never has to decide which
+    /// mechanism wins. The [`FileEntry`] wire conversions stay total and lossless
+    /// either way, keeping the struct-level round trip a property of the type rather
+    /// than of this check.
     pub fn files_from_json(s: &str) -> Result<Vec<FileEntry>, String> {
         let files: Vec<FileEntry> = serde_json::from_str(s).map_err(|e| {
             // Do not echo `s`. A data error (e.g. a bare-string entry where a
@@ -1212,12 +1349,20 @@ impl ScanSpec {
         })?;
 
         for (index, entry) in files.iter().enumerate() {
-            if entry.delta.is_some() && !entry.deletes.is_empty() {
+            let mut delete_files = false;
+            let mut deletion_vectors = false;
+            for mechanism in &entry.deletes {
+                if mechanism.is_delete_file_reference() {
+                    delete_files = true;
+                } else {
+                    deletion_vectors = true;
+                }
+            }
+            if delete_files && deletion_vectors {
                 return Err(format!(
-                    "scan files deserialization failed (entry {index} carries a Delta block \
-                     and Iceberg positional-delete refs; a Delta entry's deletions ride in \
-                     its own deletion vector, so a Delta entry may not carry Iceberg \
-                     positional-delete refs)"
+                    "scan files deserialization failed (entry {index} mixes a deletion vector \
+                     with an Iceberg delete-file reference; the two are independent delete \
+                     mechanisms, so applying both to one data file returns wrong rows)"
                 ));
             }
         }

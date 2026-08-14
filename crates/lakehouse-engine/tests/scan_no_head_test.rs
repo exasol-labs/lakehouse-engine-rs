@@ -40,8 +40,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField, ScanSpec,
-    StorageBackend, StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -305,18 +305,20 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
             df_batch_size: 64,
             logical_schema: vec![
                 LogicalField {
-                    field_id: 1,
+                    field_id: Some(1),
                     name: "id".to_string(),
                     arrow_type: "int64".to_string(),
                     nullable: false,
                     initial_default: None,
+                    physical_name: None,
                 },
                 LogicalField {
-                    field_id: 2,
+                    field_id: Some(2),
                     name: "name".to_string(),
                     arrow_type: "utf8".to_string(),
                     nullable: false,
                     initial_default: None,
+                    physical_name: None,
                 },
             ],
             ..Default::default()
@@ -334,7 +336,7 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
 fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
     (0..columns)
         .map(|i| LogicalField {
-            field_id: (i + 1) as i32,
+            field_id: Some((i + 1) as i32),
             name: match i {
                 0 => "id".to_string(),
                 1 => "name".to_string(),
@@ -343,6 +345,7 @@ fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
             arrow_type: if i == 1 { "utf8" } else { "int64" }.to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         })
         .collect()
 }
@@ -810,7 +813,7 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
 
 /// Scenario (file-metadata): a delete-carrying scan issues NO object-store HEAD
 /// for its associated positional-delete file — the delete file's `ObjectMeta`
-/// is built directly from the spec-supplied size (`DeleteFileRef::size`), the
+/// is built directly from the spec-supplied size (`DeleteMechanism`'s `size`), the
 /// same no-HEAD mechanism `FileEntry::size` already gives data files.
 #[test]
 fn scan_issues_no_head_for_delete_files() {
@@ -828,10 +831,9 @@ fn scan_issues_no_head_for_delete_files() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         data_size,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
     let spec = raw_spec(vec![], String::new());
@@ -908,10 +910,9 @@ fn scan_reads_footer_via_range_get_once() {
     let delta_entry = FileEntry::with_deletes(
         delta_url.clone(),
         delta_size,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
 
@@ -1011,10 +1012,9 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         data_size,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
     let mut spec = raw_spec_with_logical_schema(vec![], String::new());
@@ -1222,10 +1222,9 @@ fn scan_footer_reuse_holds_at_shard_scale() {
             FileEntry::with_deletes(
                 data_url.clone(),
                 *data_size,
-                vec![DeleteFileRef {
+                vec![DeleteMechanism::IcebergPositionalDelete {
                     path: delete_url.clone(),
                     size: *delete_size,
-                    content_type: DeleteFileContentType::PositionDeletes,
                 }],
             )
         })

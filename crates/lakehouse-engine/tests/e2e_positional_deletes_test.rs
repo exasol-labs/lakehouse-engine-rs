@@ -36,7 +36,7 @@ use common::stack::{
 
 use lakehouse_engine::adapter::pushdown::shard_count;
 use lakehouse_engine::adapter::sharding::partition_files_by_bytes;
-use lakehouse_engine::scan::spec::DeleteFileContentType;
+use lakehouse_engine::scan::spec::DeleteMechanism;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -185,13 +185,19 @@ fn fixture_spark_file_granularity_delete_table() {
             entry.deletes.len()
         );
         for delete in &entry.deletes {
-            assert_eq!(
-                delete.content_type,
-                DeleteFileContentType::PositionDeletes,
+            assert!(
+                matches!(delete, DeleteMechanism::IcebergPositionalDelete { .. }),
                 "file granularity: delete file for {} must be a Parquet positional delete",
                 entry.path
             );
-            *refs_per_delete_path.entry(delete.path.clone()).or_insert(0) += 1;
+            *refs_per_delete_path
+                .entry(
+                    delete
+                        .object_store_path()
+                        .expect("positional delete path")
+                        .to_string(),
+                )
+                .or_insert(0) += 1;
         }
     }
     assert_eq!(
@@ -242,14 +248,21 @@ fn fixture_spark_partition_granularity_delete_table() {
             entry.path,
             entry.deletes.len()
         );
-        assert_eq!(
-            entry.deletes[0].content_type,
-            DeleteFileContentType::PositionDeletes,
+        assert!(
+            matches!(
+                entry.deletes[0],
+                DeleteMechanism::IcebergPositionalDelete { .. }
+            ),
             "partition granularity: delete file for {} must be a Parquet positional delete",
             entry.path
         );
         *refs_per_delete_path
-            .entry(entry.deletes[0].path.clone())
+            .entry(
+                entry.deletes[0]
+                    .object_store_path()
+                    .expect("positional delete path")
+                    .to_string(),
+            )
             .or_insert(0) += 1;
     }
     assert_eq!(

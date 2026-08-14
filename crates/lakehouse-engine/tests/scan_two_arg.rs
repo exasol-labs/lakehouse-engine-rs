@@ -28,8 +28,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, ScanSpec, StorageBackend,
-    StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
@@ -418,10 +417,9 @@ fn spec_reconstitutes_with_delete_entries() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         file_size(&data_url),
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: file_size(&delete_url),
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
     let spec = spec_for_files(vec![entry]);
@@ -442,10 +440,10 @@ fn spec_reconstitutes_with_delete_entries() {
         "two-arg reconstitution must equal the delete-carrying spec"
     );
     assert_eq!(reconstituted.files[0].deletes.len(), 1);
-    assert_eq!(
-        reconstituted.files[0].deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes
-    );
+    assert!(matches!(
+        reconstituted.files[0].deletes[0],
+        DeleteMechanism::IcebergPositionalDelete { .. }
+    ));
 
     // Functional reconstitution: driving the two-argument pipeline actually
     // applies the reconstituted deletes.

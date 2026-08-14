@@ -3,7 +3,7 @@
 //!
 //! Docker-free: drives the production raw-scan pipeline
 //! (`run_raw_scan_with_session` -> `build_dataframe` -> `register_files` ->
-//! `rename_physical_to_logical`) against a local `file://` Parquet written via
+//! `bind_columns`) against a local `file://` Parquet written via
 //! `ArrowWriter`, exactly mirroring the harness in `scan_no_head_test.rs`.
 //!
 //! Two scenarios (see plan.md "Verification" table):
@@ -176,18 +176,20 @@ fn name_mapping_spec(
 fn logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "new_col".to_string(),
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
     ]
 }
