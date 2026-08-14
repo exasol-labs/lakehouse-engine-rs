@@ -13,7 +13,7 @@ use super::delta_schema::build_delta_table_schema;
 use super::{ConnectionStorage, FormatReader, ResolvedScan};
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::build_table_root_store;
-use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, DeltaTableSpec, FileEntry, LogicalField};
+use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 
 #[cfg(test)]
 #[path = "delta_format_reader_tests.rs"]
@@ -129,10 +129,11 @@ impl FormatReader for DeltaFormatReader<'_> {
     /// statistics this plan deliberately carries none of (issue #321), and partition
     /// pruning is the scan side's once it reconstructs partition columns (issue #320).
     ///
-    /// `name_mapping` is always empty: the Delta table block already carries every
-    /// column's physical name and id, so an Iceberg-shaped name mapping here would be a
-    /// second home for one decision, free to drift from it — and the field-id binding
-    /// that consults either is #320's.
+    /// `name_mapping` is always empty: a column binding by physical name declares that
+    /// name on its own [`LogicalField`], which the scan-side binding consults BEFORE
+    /// any table-level mapping. An Iceberg-shaped name mapping here could therefore
+    /// never be reached, and would be a second home for one decision, free to drift
+    /// from it.
     fn resolve_scan<'a>(
         &'a self,
         _filter_json: Option<&'a Json>,
@@ -142,7 +143,7 @@ impl FormatReader for DeltaFormatReader<'_> {
             let effective_storage = self.effective_storage(table_root).await?;
             let secrets = effective_storage.secret_values();
 
-            let (files, logical_schema, delta) =
+            let (files, logical_schema, partition_columns) =
                 read_delta_log(&effective_storage, table_root, &secrets)?;
 
             Ok(ResolvedScan {
@@ -151,14 +152,18 @@ impl FormatReader for DeltaFormatReader<'_> {
                 logical_schema,
                 table_root: table_root.to_string(),
                 name_mapping: Vec::new(),
-                delta: Some(delta),
+                partition_columns,
             })
         })
     }
 }
 
+/// The three values a Delta log read contributes to a [`ResolvedScan`]: the active
+/// data files, the logical schema, and the table's ordered partition columns.
+type DeltaLogContents = (Vec<FileEntry>, Vec<LogicalField>, Vec<String>);
+
 /// Read `table_root`'s Delta log through a store built from `storage`, answering the
-/// active file list, the logical schema, and the shard-invariant Delta table block.
+/// active file list, the logical schema, and the table's ordered partition columns.
 ///
 /// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime on its
 /// own thread, so this stalls only the caller's own executor, which has nothing else
@@ -172,13 +177,13 @@ fn read_delta_log(
     storage: &StorageBackend,
     table_root: &str,
     secrets: &[&str],
-) -> Result<(Vec<FileEntry>, Vec<LogicalField>, DeltaTableSpec), UdfError> {
+) -> Result<DeltaLogContents, UdfError> {
     let store = build_table_root_store(storage, table_root, DEFAULT_S3_MAX_CONNECTIONS, secrets)
         .map_err(|error| redacted(error, secrets))?;
     let snapshot =
         DeltaSnapshot::open(store, table_root).map_err(|error| redacted(error, secrets))?;
 
-    let (logical_schema, delta) = build_delta_table_schema(
+    let (logical_schema, partition_columns) = build_delta_table_schema(
         &snapshot.schema(),
         snapshot.column_mapping_mode(),
         snapshot.partition_columns(),
@@ -189,7 +194,7 @@ fn read_delta_log(
         .active_files()
         .map_err(|error| redacted(error, secrets))?;
 
-    Ok((files, logical_schema, delta))
+    Ok((files, logical_schema, partition_columns))
 }
 
 /// Re-raise `error` with every value in `secrets` masked.

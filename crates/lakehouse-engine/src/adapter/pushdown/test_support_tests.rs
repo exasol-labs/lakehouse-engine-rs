@@ -5,7 +5,7 @@
 //! these through `super::test_support`.
 
 use super::*;
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, StorageProps};
+use crate::scan::spec::{DeleteMechanism, StorageProps};
 
 pub(super) fn sample_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
@@ -236,11 +236,10 @@ pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_j
 }
 
 /// A Parquet positional-delete file ref.
-pub(super) fn pos_delete(path: &str, size: u64) -> DeleteFileRef {
-    DeleteFileRef {
+pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
+    DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
         size,
-        content_type: DeleteFileContentType::PositionDeletes,
     }
 }
 

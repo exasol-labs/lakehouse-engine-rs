@@ -36,114 +36,97 @@ fn mapped_field(name: &str, id: i64, physical_name: &str) -> StructField {
     ])
 }
 
-// Scenario Coverage (add-delta-table-planning): `build_delta_table_schema` is `pub(super)`, so
-// this scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
-#[test]
-fn replay_carries_name_mode_column_mapping_and_physical_names() {
-    let schema = parse_schema(CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA);
-
-    let (logical_fields, table_spec) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new())
-            .expect("boolean/long/string/double/... all map to an Arrow tag");
-
-    assert_eq!(table_spec.column_mapping_mode, DeltaColumnMappingMode::Name);
-    assert_eq!(
-        table_spec.columns,
-        vec![
-            DeltaColumnMapping {
-                logical_name: "id".to_string(),
-                physical_name: "col-80396d42-d765-483e-b86e-7ac1e13ef88c".to_string(),
-                physical_id: 1,
+/// Every logical field's binding key rendered as `<logical name>=<key>`, so one expected string
+/// asserts BOTH which key a column carries and that it carries no second one — a field populating
+/// both renders as `BOTH(...)` rather than passing a one-sided assertion.
+fn binding_keys(fields: &[LogicalField]) -> String {
+    fields
+        .iter()
+        .map(
+            |field| match (field.field_id, field.physical_name.as_deref()) {
+                (Some(id), None) => format!("{}=id({id})", field.name),
+                (None, Some(physical_name)) => format!("{}=name({physical_name})", field.name),
+                (None, None) => format!("{}=identity", field.name),
+                (Some(id), Some(physical_name)) => {
+                    format!("{}=BOTH(id({id}),name({physical_name}))", field.name)
+                }
             },
-            DeltaColumnMapping {
-                logical_name: "name".to_string(),
-                physical_name: "col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1".to_string(),
-                physical_id: 2,
-            },
-            DeltaColumnMapping {
-                logical_name: "value".to_string(),
-                physical_name: "col-95e13b58-72f1-4d26-8390-49469180a8a2".to_string(),
-                physical_id: 3,
-            },
-        ]
-    );
-    assert!(table_spec.partition_columns.is_empty());
-
-    assert_eq!(logical_fields.len(), 3);
-    assert_eq!(logical_fields[0].field_id, 1);
-    assert_eq!(logical_fields[0].name, "id");
-    assert_eq!(logical_fields[0].arrow_type, "int64");
-    assert!(logical_fields[0].nullable);
-    assert_eq!(logical_fields[1].arrow_type, "utf8");
-    assert_eq!(logical_fields[2].arrow_type, "float64");
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
+// Scenario Coverage (refactor-neutralize-scan-spec): `build_delta_table_schema` is `pub(super)`,
+// so this scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
 #[test]
-fn absent_column_mapping_mode_defaults_to_none_with_physical_name_equal_to_logical_name() {
-    let schema = StructType::try_new([StructField::not_null("plain_col", DataType::INTEGER)])
-        .expect("single-field schema is valid");
-
-    let (logical_fields, table_spec) = build_delta_table_schema(
-        &schema,
-        ColumnMappingMode::None,
-        vec!["plain_col".to_string()],
-    )
-    .expect("integer maps to an Arrow tag");
-
-    assert_eq!(table_spec.column_mapping_mode, DeltaColumnMappingMode::None);
-    assert_eq!(table_spec.columns.len(), 1);
-    assert_eq!(table_spec.columns[0].physical_name, "plain_col");
-    assert_eq!(table_spec.columns[0].physical_id, 1);
-    assert_eq!(logical_fields[0].field_id, 1);
-    assert_eq!(logical_fields[0].arrow_type, "int32");
-    assert_eq!(table_spec.partition_columns, vec!["plain_col".to_string()]);
-}
-
-/// Under `id` mode the ANNOTATED id reaches both the logical schema and the column
-/// mapping — neither column's id is its ordinal position, so an assigned id is never
-/// silently overwritten by the position it happens to sit at.
-#[test]
-fn explicit_column_mapping_id_wins_over_ordinal_position_when_present() {
+fn each_column_mapping_mode_selects_its_own_binding_key() {
     let schema = StructType::try_new([
         mapped_field("a", 7, "col-a"),
         mapped_field("b", 99, "col-b"),
     ])
     .unwrap();
 
-    let (logical_fields, table_spec) =
+    let (id_mode, _) =
         build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new()).unwrap();
+    let (name_mode, _) =
+        build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new()).unwrap();
+    let (none_mode, _) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
 
-    assert_eq!(logical_fields[0].field_id, 7);
-    assert_eq!(logical_fields[1].field_id, 99);
-    assert_eq!(table_spec.columns[0].physical_id, 7);
-    assert_eq!(table_spec.columns[1].physical_id, 99);
-    assert_eq!(table_spec.columns[0].physical_name, "col-a");
-    assert_eq!(table_spec.columns[1].physical_name, "col-b");
+    assert_eq!(
+        binding_keys(&id_mode),
+        "a=id(7), b=id(99)",
+        "an annotated id is never replaced by the column's ordinal position"
+    );
+    assert_eq!(binding_keys(&name_mode), "a=name(col-a), b=name(col-b)");
+    assert_eq!(binding_keys(&none_mode), "a=identity, b=identity");
 }
 
-/// Under `none` mode a residual column-mapping annotation is INERT — the Delta
-/// protocol resolves every physical name to its logical one there, and `delta_kernel`
-/// documents the same read tolerance — so the id stays the field's 1-based ordinal.
-/// Honouring the annotation would put ordinals and assigned ids in one namespace,
-/// where an annotated id can collide with an unannotated sibling's ordinal.
+/// The `name`-mode fixture's columns each bind by their `col-<uuid>` physical name, and their
+/// Delta types reach the Arrow tags the logical schema declares.
 #[test]
-fn none_mode_uses_the_ordinal_position_even_when_a_column_mapping_id_is_annotated() {
+fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
+    let schema = parse_schema(CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA);
+
+    let (logical_fields, partition_columns) =
+        build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new())
+            .expect("boolean/long/string/double/... all map to an Arrow tag");
+
+    assert_eq!(
+        binding_keys(&logical_fields),
+        "id=name(col-80396d42-d765-483e-b86e-7ac1e13ef88c), \
+         name=name(col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1), \
+         value=name(col-95e13b58-72f1-4d26-8390-49469180a8a2)"
+    );
+    assert!(partition_columns.is_empty());
+
+    assert_eq!(logical_fields[0].arrow_type, "int64");
+    assert!(logical_fields[0].nullable);
+    assert_eq!(logical_fields[1].arrow_type, "utf8");
+    assert_eq!(logical_fields[2].arrow_type, "float64");
+}
+
+/// Under `none` mode a residual column-mapping annotation is INERT — the Delta protocol
+/// resolves every physical name to its logical one there, and `delta_kernel` documents the
+/// same read tolerance — so the column binds by its own logical name and carries neither key.
+/// Honouring the annotation would hand the scan a key its unannotated siblings cannot offer.
+/// Also pins the Delta `INTEGER` -> `int32` Arrow tag mapping.
+#[test]
+fn none_mode_ignores_a_residual_column_mapping_annotation() {
     let schema = StructType::try_new([
         StructField::not_null("a", DataType::INTEGER),
         mapped_field("b", 1, "col-b"),
     ])
     .unwrap();
 
-    let (logical_fields, table_spec) =
+    let (logical_fields, _) =
         build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
 
-    assert_eq!(logical_fields[0].field_id, 1);
+    assert_eq!(binding_keys(&logical_fields), "a=identity, b=identity");
     assert_eq!(
-        logical_fields[1].field_id, 2,
-        "the annotated id 1 would collide with the first column's ordinal id"
+        logical_fields[0].arrow_type, "int32",
+        "a Delta INTEGER column maps to the int32 Arrow tag"
     );
-    assert_eq!(table_spec.columns[1].physical_id, 2);
-    assert_eq!(table_spec.columns[1].physical_name, "b");
 }
 
 /// Under `id`/`name` mode the Delta protocol REQUIRES every field to carry a
@@ -235,11 +218,11 @@ fn partition_columns_are_threaded_through_verbatim_and_in_order() {
     let schema = StructType::try_new([StructField::not_null("region", DataType::STRING)]).unwrap();
     let partition_columns = vec!["region".to_string(), "day".to_string()];
 
-    let (_, table_spec) =
+    let (_, carried_partition_columns) =
         build_delta_table_schema(&schema, ColumnMappingMode::None, partition_columns.clone())
             .unwrap();
 
-    assert_eq!(table_spec.partition_columns, partition_columns);
+    assert_eq!(carried_partition_columns, partition_columns);
 }
 
 // Scenario Coverage (add-delta-table-planning): `build_delta_table_schema` is `pub(super)`, so

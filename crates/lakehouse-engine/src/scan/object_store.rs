@@ -516,7 +516,8 @@ fn validate_sides_share_one_store(spec: &ScanSpec) -> Result<(), UdfError> {
 }
 
 /// Verify every data file and associated delete file in `files` resolves to the
-/// same object-store root (scheme + host) as `first_abs`.
+/// same object-store root (scheme + host) as `first_abs`. A delete mechanism that
+/// names no object-store path has no root to check.
 ///
 /// The scan registers a single object store per side, keyed by that root (see
 /// [`register_file_list`] / [`build_session_context`]); a file under a different
@@ -555,10 +556,9 @@ pub(super) fn validate_uniform_object_store_files(
     for entry in files {
         check(&reconstruct_abs_uri(&entry.path, table_root), "data file")?;
         for delete in &entry.deletes {
-            check(
-                &reconstruct_abs_uri(&delete.path, table_root),
-                "delete file",
-            )?;
+            if let Some(path) = delete.object_store_path() {
+                check(&reconstruct_abs_uri(path, table_root), "delete file")?;
+            }
         }
     }
     Ok(())

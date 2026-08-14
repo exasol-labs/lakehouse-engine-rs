@@ -6,7 +6,7 @@ use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use super::*;
-use crate::scan::spec::DeltaDeletionVectorStorage;
+use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
 /// The vendored fixture tables are read through a plain local-filesystem store,
 /// which is the same injection the S3 path uses in production.
@@ -26,16 +26,6 @@ fn replay_fixture(table: &str) -> Vec<FileEntry> {
         .expect("fixture table opens")
         .active_files()
         .expect("fixture log replays")
-}
-
-fn partition_value(entry: &FileEntry, column: &str) -> Option<Option<String>> {
-    entry
-        .delta
-        .as_ref()
-        .expect("Delta entry carries its per-file block")
-        .partition_values
-        .get(column)
-        .cloned()
 }
 
 const SYNTHETIC_ROOT: &str = "memory:///synthetic_table";
@@ -195,8 +185,10 @@ fn replay_carries_each_active_files_path_verbatim_and_its_size() {
 fn replay_carries_partition_values_and_an_explicit_null() {
     let files = replay_fixture("basic_partitioned");
 
-    let carried: Vec<Option<Option<String>>> =
-        files.iter().map(|f| partition_value(f, "letter")).collect();
+    let carried: Vec<Option<Option<String>>> = files
+        .iter()
+        .map(|f| f.partition_values.get("letter").cloned())
+        .collect();
     assert_eq!(
         carried,
         vec![
@@ -210,15 +202,14 @@ fn replay_carries_partition_values_and_an_explicit_null() {
         "the Hive default-partition file carries an explicit absent value, not a literal"
     );
     for entry in &files {
-        let delta = entry.delta.as_ref().expect("Delta block");
         assert_eq!(
-            delta.partition_values.len(),
+            entry.partition_values.len(),
             1,
             "one entry per partition column for {}",
             entry.path
         );
         assert!(
-            !delta
+            !entry
                 .partition_values
                 .values()
                 .any(|v| v.as_deref() == Some("__HIVE_DEFAULT_PARTITION__")),
@@ -231,9 +222,8 @@ fn replay_carries_partition_values_and_an_explicit_null() {
 fn replay_carries_no_partition_value_for_an_unpartitioned_table() {
     let files = replay_fixture("table-with-dv-small");
 
-    let delta = files[0].delta.as_ref().expect("Delta block");
     assert!(
-        delta.partition_values.is_empty(),
+        files[0].partition_values.is_empty(),
         "an unpartitioned table logs an empty partitionValues map"
     );
 }
@@ -253,33 +243,33 @@ fn replay_carries_a_readded_files_deletion_vector_exactly_once() {
         files[0].path,
         "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet"
     );
-    let deletion_vector = files[0]
-        .delta
-        .as_ref()
-        .expect("Delta block")
-        .deletion_vector
-        .as_ref()
-        .expect("the re-added entry's deletion vector, not the earlier delete-free add's");
     assert_eq!(
-        deletion_vector.storage,
-        DeltaDeletionVectorStorage::UuidRelative
+        files[0].deletes,
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::UuidRelative,
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }],
+        "the re-added entry's deletion vector rides alone in the delete list, carried \
+         verbatim, and not the earlier delete-free add's"
     );
-    assert_eq!(deletion_vector.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA");
-    assert_eq!(deletion_vector.offset, Some(1));
-    assert_eq!(deletion_vector.size_in_bytes, 36);
-    assert_eq!(deletion_vector.cardinality, 2);
 }
 
 #[test]
-fn replay_leaves_the_iceberg_delete_list_empty_on_every_entry() {
+fn replay_carries_no_iceberg_delete_reference_on_any_entry() {
     for (table, active) in [("basic_partitioned", 6), ("table-with-dv-small", 1)] {
         let files = replay_fixture(table);
         assert_eq!(files.len(), active, "{table} has {active} active files");
         for entry in files {
             assert!(
-                entry.deletes.is_empty(),
-                "a Delta deletion vector never reaches the Iceberg positional-delete \
-                 reader ({table}/{})",
+                entry.deletes.iter().all(|mechanism| matches!(
+                    mechanism,
+                    DeleteMechanism::DeltaDeletionVector { .. }
+                )),
+                "a replayed Delta log names no Iceberg delete file, so a Delta deletion \
+                 vector never reaches the Iceberg positional-delete reader ({table}/{})",
                 entry.path
             );
         }
@@ -292,12 +282,7 @@ fn replay_carries_no_deletion_vector_for_a_delete_free_file() {
 
     for entry in &files {
         assert!(
-            entry
-                .delta
-                .as_ref()
-                .expect("Delta block")
-                .deletion_vector
-                .is_none(),
+            entry.deletes.is_empty(),
             "no `add` action in this log attaches a deletion vector ({})",
             entry.path
         );
@@ -375,9 +360,16 @@ fn replay_reads_the_active_files_out_of_a_multi_part_checkpoint() {
          exactly as logged"
     );
     for entry in &files {
-        let delta = entry.delta.as_ref().expect("Delta block");
-        assert!(delta.deletion_vector.is_none());
-        assert!(delta.partition_values.is_empty());
+        assert!(
+            entry.deletes.is_empty(),
+            "no `add` action in this checkpoint attaches a deletion vector ({})",
+            entry.path
+        );
+        assert!(
+            entry.partition_values.is_empty(),
+            "an unpartitioned table logs no partition value ({})",
+            entry.path
+        );
     }
 }
 

@@ -671,39 +671,44 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
     let mut spec = sample_spec();
     spec.common.logical_schema = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int32".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "rating".to_string(),
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 3,
+            field_id: Some(3),
             name: "label".to_string(),
             arrow_type: "utf8".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 4,
+            field_id: Some(4),
             name: "ts".to_string(),
             arrow_type: "timestamp_us".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 5,
+            field_id: Some(5),
             name: "amount".to_string(),
             arrow_type: "decimal128(18,4)".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
     ];
     let json = spec.to_json();
@@ -718,11 +723,11 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
     let back = ScanSpec::from_json(&json).unwrap();
     let fields = &back.common.logical_schema;
     assert_eq!(fields.len(), 5);
-    assert_eq!(fields[0].field_id, 1);
+    assert_eq!(fields[0].field_id, Some(1));
     assert_eq!(fields[0].name, "id");
     assert_eq!(fields[0].arrow_type, "int32");
     assert!(!fields[0].nullable);
-    assert_eq!(fields[1].field_id, 2);
+    assert_eq!(fields[1].field_id, Some(2));
     assert_eq!(fields[1].name, "rating");
     assert_eq!(fields[1].arrow_type, "float64");
     assert!(fields[1].nullable);
@@ -1280,10 +1285,9 @@ fn legacy_file_entry_reconstitutes_empty_deletes() {
     let with_deletes = FileEntry::with_deletes(
         "s3://w/f2.parquet",
         300,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: "s3://w/deletes/d0.parquet".to_string(),
             size: 50,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
     let mixed_json = ScanSpec::files_json(&[
@@ -1297,10 +1301,10 @@ fn legacy_file_entry_reconstitutes_empty_deletes() {
     let mixed_back = ScanSpec::files_from_json(&mixed_json).unwrap();
     assert_eq!(mixed_back[0].deletes, Vec::new());
     assert_eq!(mixed_back[1], with_deletes);
-    assert_eq!(
-        mixed_back[1].deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes
-    );
+    assert!(matches!(
+        mixed_back[1].deletes[0],
+        DeleteMechanism::IcebergPositionalDelete { .. }
+    ));
 }
 
 /// Task 2.1(b): a spec WITH a join block round-trips through JSON and through the
@@ -1329,11 +1333,12 @@ fn join_block_round_trips_through_split_and_merge() {
             FileEntry::new("data/dim-00001.parquet", 1024),
         ],
         logical_schema: vec![LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "d_key".into(),
             arrow_type: "int64".into(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         }],
         name_mapping: Vec::new(),
         join_type: JoinType::Inner,
@@ -1466,11 +1471,11 @@ fn common_blob_wire_is_byte_stable() {
     assert!(!common_wire.contains("catalog"));
 }
 
-/// The Delta deletion-vector descriptor from the `table-with-dv-small` fixture,
-/// carried verbatim: nothing here is resolved into a path or applied to a row at
-/// plan time.
-fn sample_deletion_vector() -> DeltaDeletionVector {
-    DeltaDeletionVector {
+/// The Delta deletion-vector delete mechanism built from the `table-with-dv-small`
+/// fixture's descriptor, carried verbatim: nothing here is resolved into a path or
+/// applied to a row at plan time.
+fn sample_deletion_vector() -> DeleteMechanism {
+    DeleteMechanism::DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage::UuidRelative,
         path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".into(),
         offset: Some(1),
@@ -1479,58 +1484,55 @@ fn sample_deletion_vector() -> DeltaDeletionVector {
     }
 }
 
-/// One Delta TABLE block per column-mapping mode, plus the unmapped,
-/// unpartitioned shape a table with no column mapping and no partition column
-/// produces — the empty-collection edge of the block.
-fn every_delta_table_block() -> Vec<DeltaTableSpec> {
-    let mut blocks: Vec<DeltaTableSpec> = [
-        DeltaColumnMappingMode::None,
-        DeltaColumnMappingMode::Id,
-        DeltaColumnMappingMode::Name,
+/// Every delete-mechanism list production can build: empty, each Iceberg
+/// delete-file variant alone, all three together, and each deletion-vector storage
+/// kind alone (the inline kind with no offset, since a file holding one vector alone
+/// records none).
+///
+/// A list MIXING a deletion vector with an Iceberg delete-file reference is
+/// deliberately EXCLUDED: `ScanSpec::files_from_json` refuses that pair outright,
+/// since one data file cannot carry two independent delete mechanisms, so it is no
+/// longer a shape the wire round-trips.
+fn every_delete_mechanism_list() -> Vec<Vec<DeleteMechanism>> {
+    let positional = DeleteMechanism::IcebergPositionalDelete {
+        path: "deletes/d0.parquet".into(),
+        size: 50,
+    };
+    let equality = DeleteMechanism::IcebergEqualityDelete {
+        path: "deletes/d1.parquet".into(),
+        size: 60,
+    };
+    let puffin = DeleteMechanism::IcebergPuffinDeletionVector {
+        path: "deletes/d2.puffin".into(),
+        size: 70,
+    };
+    vec![
+        Vec::new(),
+        vec![positional.clone()],
+        vec![equality.clone()],
+        vec![puffin.clone()],
+        vec![positional, equality, puffin],
+        vec![sample_deletion_vector()],
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::Inline,
+            path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".into(),
+            offset: None,
+            size_in_bytes: 36,
+            cardinality: 2,
+        }],
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::AbsolutePath,
+            path_or_inline_dv: "s3://bucket/wh/db/t/deletion_vector.bin".into(),
+            offset: Some(1),
+            size_in_bytes: 36,
+            cardinality: 2,
+        }],
     ]
-    .into_iter()
-    .map(|column_mapping_mode| DeltaTableSpec {
-        column_mapping_mode,
-        columns: vec![
-            DeltaColumnMapping {
-                logical_name: "id".into(),
-                physical_name: "col-a1b2".into(),
-                physical_id: 1,
-            },
-            DeltaColumnMapping {
-                logical_name: "region".into(),
-                physical_name: "col-c3d4".into(),
-                physical_id: 2,
-            },
-        ],
-        partition_columns: vec!["region".into()],
-    })
-    .collect();
-
-    blocks.push(DeltaTableSpec {
-        column_mapping_mode: DeltaColumnMappingMode::None,
-        columns: Vec::new(),
-        partition_columns: Vec::new(),
-    });
-    blocks
 }
 
 /// Every `FileEntry` shape production can build: each partition-value kind (none, a
-/// value, an explicit NULL, and both mixed) crossed with each deletion-vector
-/// storage kind and with the descriptor absent, crossed again with an absent and
-/// a present Delta block — and, on the Delta-free entries alone, with an empty and
-/// a non-empty Iceberg delete list.
-///
-/// A Delta block alongside a non-empty Iceberg delete list is deliberately EXCLUDED:
-/// `ScanSpec::files_from_json` refuses that pair outright, since one data file cannot
-/// carry two independent delete mechanisms, so it is no longer a shape the wire
-/// round-trips.
+/// value, an explicit NULL, and both mixed) crossed with every delete-mechanism list.
 fn every_file_entry_combination() -> Vec<FileEntry> {
-    let iceberg_deletes = vec![DeleteFileRef {
-        path: "deletes/d0.parquet".into(),
-        size: 50,
-        content_type: DeleteFileContentType::PositionDeletes,
-    }];
     let partition_value_sets = [
         BTreeMap::new(),
         BTreeMap::from([("region".to_string(), Some("eu".to_string()))]),
@@ -1540,62 +1542,116 @@ fn every_file_entry_combination() -> Vec<FileEntry> {
             ("region".to_string(), None),
         ]),
     ];
-    let deletion_vectors = [
-        None,
-        Some(sample_deletion_vector()),
-        Some(DeltaDeletionVector {
-            storage: DeltaDeletionVectorStorage::Inline,
-            offset: None,
-            ..sample_deletion_vector()
-        }),
-        Some(DeltaDeletionVector {
-            storage: DeltaDeletionVectorStorage::AbsolutePath,
-            path_or_inline_dv: "s3://bucket/wh/db/t/deletion_vector.bin".into(),
-            ..sample_deletion_vector()
-        }),
-    ];
-
-    let mut delta_blocks: Vec<Option<DeltaFileSpec>> = vec![None];
-    for partition_values in &partition_value_sets {
-        for deletion_vector in &deletion_vectors {
-            delta_blocks.push(Some(DeltaFileSpec {
-                partition_values: partition_values.clone(),
-                deletion_vector: deletion_vector.clone(),
-            }));
-        }
-    }
 
     let mut entries = Vec::new();
-    for (index, delta) in delta_blocks.into_iter().enumerate() {
-        let delete_lists = if delta.is_none() {
-            vec![Vec::new(), iceberg_deletes.clone()]
-        } else {
-            vec![Vec::new()]
-        };
-        for deletes in delete_lists {
+    for (index, partition_values) in partition_value_sets.into_iter().enumerate() {
+        for deletes in every_delete_mechanism_list() {
             entries.push(FileEntry {
                 path: format!("data/part-{index:05}.parquet"),
                 size: 1024 + index as u64,
                 deletes,
-                delta: delta.clone(),
+                partition_values: partition_values.clone(),
             });
         }
     }
     entries
 }
 
-/// The Delta table block and the per-file Delta blocks survive the two-argument
-/// wire losslessly in BOTH directions, and an Iceberg spec — one with both blocks
-/// absent — serializes byte-identically to its pre-Delta encoding.
+/// A logical field carries EXACTLY ONE binding key, or none at all, and each absent
+/// key emits no JSON at all — so an Iceberg field still serializes `"field_id":N` as
+/// its first key and gains no second one, which is what keeps every committed Iceberg
+/// golden encoding passing unedited.
+#[test]
+fn a_logical_field_carries_at_most_one_binding_key_and_emits_no_key_for_the_other() {
+    let field_of = |field_id, physical_name| LogicalField {
+        field_id,
+        name: "REGION".to_string(),
+        arrow_type: "utf8".to_string(),
+        nullable: true,
+        initial_default: None,
+        physical_name,
+    };
+
+    // Field-id bound (Iceberg, and Delta `id` mapping): `field_id` first, no
+    // `physical_name` key at all.
+    assert_eq!(
+        serde_json::to_string(&field_of(Some(7), None)).unwrap(),
+        r#"{"field_id":7,"name":"REGION","arrow_type":"utf8","nullable":true}"#
+    );
+
+    // Physical-name bound (Delta `name` mapping): no `field_id` key at all.
+    assert_eq!(
+        serde_json::to_string(&field_of(None, Some("col-a1b2".to_string()))).unwrap(),
+        r#"{"name":"REGION","arrow_type":"utf8","nullable":true,"physical_name":"col-a1b2"}"#
+    );
+
+    // Identity bound (Delta `none` mapping): NEITHER key — not even an ordinal
+    // standing in for a field-id, which no writer ever wrote into a file.
+    assert_eq!(
+        serde_json::to_string(&field_of(None, None)).unwrap(),
+        r#"{"name":"REGION","arrow_type":"utf8","nullable":true}"#
+    );
+
+    // Each shape reconstitutes as itself, so a binding key is never invented on the
+    // way back in.
+    for field in [
+        field_of(Some(7), None),
+        field_of(None, Some("col-a1b2".to_string())),
+        field_of(None, None),
+    ] {
+        let json = serde_json::to_string(&field).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LogicalField>(&json).unwrap(),
+            field,
+            "{field:?} must survive its own encoding"
+        );
+    }
+}
+
+/// The table's ordered partition-column names ride ONCE in the shard-invariant common
+/// blob, so a scan of a table with zero active files still knows which logical columns
+/// have no physical counterpart. Absent from JSON when empty, and order-preserving.
+#[test]
+fn partition_columns_round_trip_in_order_and_default_to_empty() {
+    let mut spec = sample_spec();
+    spec.common.partition_columns = vec!["year".to_string(), "region".to_string()];
+
+    let common_json = spec.to_common_json();
+    assert!(
+        common_json.contains(r#""partition_columns":["year","region"]"#),
+        "declared order must reach the wire verbatim: {common_json}"
+    );
+    assert_eq!(
+        ScanSpec::from_parts_json(&common_json, "[]")
+            .expect("the common blob must reconstitute")
+            .common
+            .partition_columns,
+        vec!["year".to_string(), "region".to_string()],
+        "partition-column order must survive the split"
+    );
+
+    // A blob written before the field existed reconstitutes with it empty.
+    assert!(
+        CommonScanSpec::from_json(&sample_spec().to_common_json())
+            .expect("an unpartitioned blob must reconstitute")
+            .partition_columns
+            .is_empty()
+    );
+}
+
+/// The shard-invariant partition columns and the per-file partition values and delete
+/// mechanisms survive the two-argument wire losslessly in BOTH directions, and an
+/// Iceberg spec — one with every neutral field empty — serializes byte-identically to
+/// its pre-consolidation encoding.
 ///
-/// The common blob's own pre-Delta bytes are pinned by
+/// The common blob's own pre-consolidation bytes are pinned by
 /// `common_blob_wire_is_byte_stable`, which passes UNEDITED: that is the
-/// byte-identity proof for argument 0. What this test adds is that neither
-/// argument gains a `delta` key while the blocks are absent, that both tuple
-/// file-entry encodings are unchanged, and that every combination the two blocks
+/// byte-identity proof for argument 0. What this test adds is that neither argument
+/// gains a partition key while the neutral fields are empty, that both tuple
+/// file-entry encodings are unchanged, and that every combination the neutral fields
 /// admit round-trips without dropping a field to the shortest-form rule.
 #[test]
-fn delta_blocks_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical() {
+fn neutral_fields_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical() {
     // Direction 1 — value -> JSON -> value is the identity for every file-entry
     // combination. Direction 2 — re-serializing the reconstituted value
     // reproduces the same bytes, so no field survives the round trip only to be
@@ -1616,30 +1672,34 @@ fn delta_blocks_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical
         );
     }
 
-    // Every Delta TABLE block shape survives the common/per-shard split and
+    // The shard-invariant partition columns survive the common/per-shard split and
     // merge, riding in argument 0 alongside a full per-shard file list.
-    for table_block in every_delta_table_block() {
+    for partition_columns in [
+        Vec::new(),
+        vec!["region".to_string()],
+        vec!["region".to_string(), "year".to_string()],
+    ] {
         let mut spec = sample_spec();
-        spec.common.delta = Some(table_block.clone());
+        spec.common.partition_columns = partition_columns.clone();
         spec.files = every_file_entry_combination();
 
         let merged =
             ScanSpec::from_parts_json(&spec.to_common_json(), &ScanSpec::files_json(&spec.files))
-                .expect("a Delta spec must reconstitute");
+                .expect("a partitioned spec must reconstitute");
 
         assert_eq!(
             merged, spec,
-            "the Delta table block {table_block:?} must survive the split and merge"
+            "partition columns {partition_columns:?} must survive the split and merge"
         );
     }
 
-    // An Iceberg spec — both blocks absent — carries no `delta` key in either
-    // argument, and both file-entry tuple encodings are unchanged.
+    // An Iceberg spec — every neutral field empty — carries no partition key in
+    // either argument, and both file-entry tuple encodings are unchanged.
     let iceberg = sample_spec();
     let common_json = iceberg.to_common_json();
     assert!(
-        !common_json.contains("delta"),
-        "an absent Delta table block must not appear in the common blob: {common_json}"
+        !common_json.contains("partition_columns"),
+        "empty partition columns must not appear in the common blob: {common_json}"
     );
     assert_eq!(
         ScanSpec::files_json(&iceberg.files),
@@ -1650,10 +1710,9 @@ fn delta_blocks_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical
         ScanSpec::files_json(&[FileEntry::with_deletes(
             "data/part-00002.parquet",
             4096,
-            vec![DeleteFileRef {
+            vec![DeleteMechanism::IcebergPositionalDelete {
                 path: "deletes/d0.parquet".into(),
                 size: 50,
-                content_type: DeleteFileContentType::PositionDeletes,
             }],
         )]),
         r#"[["data/part-00002.parquet",4096,[{"path":"deletes/d0.parquet","size":50,"content_type":"position_deletes"}]]]"#,
@@ -1661,27 +1720,35 @@ fn delta_blocks_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical
     );
 
     // Absent in JSON means absent in the value: a common blob and a file list
-    // written before either block existed reconstitute with both absent.
-    let pre_delta = ScanSpec::from_parts_json(
+    // written before the neutral fields existed reconstitute with both empty.
+    let pre_neutral = ScanSpec::from_parts_json(
         &common_json,
         r#"[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#,
     )
-    .expect("a pre-Delta two-argument wire must still reconstitute");
-    assert_eq!(pre_delta.common.delta, None);
-    assert!(pre_delta.files.iter().all(|entry| entry.delta.is_none()));
+    .expect("a pre-consolidation two-argument wire must still reconstitute");
+    assert!(pre_neutral.common.partition_columns.is_empty());
+    assert!(
+        pre_neutral
+            .files
+            .iter()
+            .all(|entry| entry.partition_values.is_empty())
+    );
 }
 
-/// A file entry carrying a Delta block is a self-describing JSON OBJECT, so the
+/// A file entry carrying partition values is a self-describing JSON OBJECT, so the
 /// 2-tuple legacy form and the 3-tuple delete-carrying form keep their exact
 /// encodings AND their deserialization precedence: object and tuple shapes are
-/// disjoint, so adding the object variant cannot change which variant a tuple
-/// matches.
+/// disjoint, so the object variant cannot change which variant a tuple matches.
+///
+/// The object form is selected by PARTITION VALUES, not by table format — so a Delta
+/// entry whose only extra content is a deletion vector rides in the 3-tuple form,
+/// correctly, because the delete member itself names its mechanism.
 #[test]
-fn delta_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
+fn a_partitioned_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
     let mixed = r#"[
         ["legacy.parquet", 1],
         ["deleted.parquet", 2, [{"path":"d.parquet","size":3,"content_type":"position_deletes"}]],
-        {"path":"delta.parquet","size":4,"delta":{"partition_values":{"region":"eu"}}}
+        {"path":"partitioned.parquet","size":4,"partition_values":{"region":"eu"}}
     ]"#;
 
     let files = ScanSpec::files_from_json(mixed).expect("all three wire forms must parse");
@@ -1692,26 +1759,33 @@ fn delta_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
         1,
         "the 3-tuple keeps its delete refs"
     );
-    assert_eq!(files[1].delta, None);
-    assert_eq!(files[2].path, "delta.parquet");
+    assert!(files[1].partition_values.is_empty());
+    assert_eq!(files[2].path, "partitioned.parquet");
     assert!(
         files[2].deletes.is_empty(),
-        "a Delta entry carries no Iceberg delete ref"
+        "a partitioned entry need carry no delete mechanism"
     );
     assert_eq!(
-        files[2]
-            .delta
-            .as_ref()
-            .expect("the object form carries the Delta block")
-            .partition_values,
+        files[2].partition_values,
         BTreeMap::from([("region".to_string(), Some("eu".to_string()))])
     );
 
-    // Serialization is the mirror image: only the Delta entry becomes an object.
+    // Serialization is the mirror image: only the partitioned entry becomes an object.
     let encoded = ScanSpec::files_json(&files);
     assert_eq!(
         encoded,
-        r#"[["legacy.parquet",1],["deleted.parquet",2,[{"path":"d.parquet","size":3,"content_type":"position_deletes"}]],{"path":"delta.parquet","size":4,"delta":{"partition_values":{"region":"eu"}}}]"#
+        r#"[["legacy.parquet",1],["deleted.parquet",2,[{"path":"d.parquet","size":3,"content_type":"position_deletes"}]],{"path":"partitioned.parquet","size":4,"partition_values":{"region":"eu"}}]"#
+    );
+
+    // A deletion vector alone leaves the entry in the 3-tuple form: the mechanism is
+    // self-describing, so no object wrapper is needed to tell the reader what it is.
+    assert_eq!(
+        ScanSpec::files_json(&[FileEntry::with_deletes(
+            "dv.parquet",
+            5,
+            vec![sample_deletion_vector()],
+        )]),
+        r#"[["dv.parquet",5,[{"storage":"uuid_relative","path_or_inline_dv":"vBn[lx{q8@P<9BNH/isA","offset":1,"size_in_bytes":36,"cardinality":2}]]]"#
     );
 }
 
@@ -1721,15 +1795,11 @@ fn delta_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
 /// onto one encoding would make impossible. Keys serialize in a deterministic
 /// order regardless of insertion order, so a golden encoding is byte-stable.
 #[test]
-fn delta_partition_values_distinguish_an_explicit_null_from_an_absent_column() {
-    let json = r#"[{"path":"f.parquet","size":1,"delta":{"partition_values":{"region":null}}}]"#;
+fn partition_values_distinguish_an_explicit_null_from_an_absent_column() {
+    let json = r#"[{"path":"f.parquet","size":1,"partition_values":{"region":null}}]"#;
 
     let files = ScanSpec::files_from_json(json).expect("an explicit NULL must parse");
-    let partition_values = &files[0]
-        .delta
-        .as_ref()
-        .expect("the Delta block is present")
-        .partition_values;
+    let partition_values = &files[0].partition_values;
 
     assert_eq!(
         partition_values.get("region"),
@@ -1748,20 +1818,17 @@ fn delta_partition_values_distinguish_an_explicit_null_from_an_absent_column() {
     );
 
     // Insertion order does not reach the wire: the map's key order does.
-    let unordered = FileEntry::with_delta(
+    let unordered = FileEntry::with_partition_values(
         "f.parquet",
         1,
-        DeltaFileSpec {
-            partition_values: BTreeMap::from([
-                ("year".to_string(), Some("2026".to_string())),
-                ("region".to_string(), None),
-            ]),
-            deletion_vector: None,
-        },
+        BTreeMap::from([
+            ("year".to_string(), Some("2026".to_string())),
+            ("region".to_string(), None),
+        ]),
     );
     assert_eq!(
         ScanSpec::files_json(&[unordered]),
-        r#"[{"path":"f.parquet","size":1,"delta":{"partition_values":{"region":null,"year":"2026"}}}]"#
+        r#"[{"path":"f.parquet","size":1,"partition_values":{"region":null,"year":"2026"}}]"#
     );
 }
 
@@ -1771,7 +1838,7 @@ fn delta_partition_values_distinguish_an_explicit_null_from_an_absent_column() {
 /// deserialization and echoes none of the input.
 #[test]
 fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
-    let json = r#"[{"path":"f.parquet","size":1,"delta":{"deletion_vector":{"storage":"puffin","path_or_inline_dv":"x","size_in_bytes":1,"cardinality":1}}}]"#;
+    let json = r#"[["f.parquet",1,[{"storage":"puffin","path_or_inline_dv":"x","size_in_bytes":1,"cardinality":1}]]]"#;
 
     let err = ScanSpec::files_from_json(json)
         .expect_err("a storage kind outside the closed set must be refused");
@@ -1786,21 +1853,24 @@ fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
     );
 }
 
-/// A Delta entry's deletions ride in its own deletion vector, so an entry carrying BOTH
-/// a Delta block and Iceberg positional-delete refs would have the scan apply two
-/// independent delete mechanisms to one data file and return wrong rows. The wire
-/// refuses it at reconstitution — the same place a deletion-vector storage kind outside
-/// the closed set is refused — identifying the offending entry by INDEX, because the
-/// entry's path and the raw input are text this message never echoes.
+/// An entry whose ONE delete list mixes a deletion vector with an Iceberg delete-file
+/// reference would have the scan apply two independent delete mechanisms to one data
+/// file and return wrong rows. The wire refuses it at reconstitution — the same place a
+/// deletion-vector storage kind outside the closed set is refused — identifying the
+/// offending entry by INDEX, because the entry's path and the raw input are text this
+/// message never echoes.
 #[test]
-fn a_file_entry_carrying_both_a_delta_block_and_iceberg_deletes_is_refused() {
+fn a_file_entry_mixing_a_deletion_vector_with_an_iceberg_delete_reference_is_refused() {
     let json = r#"[
         ["clean.parquet", 1],
-        {"path":"contested.parquet","size":2,"deletes":[{"path":"d0.parquet","size":3,"content_type":"position_deletes"}],"delta":{"partition_values":{"region":"eu"}}}
+        ["contested.parquet", 2, [
+            {"path":"d0.parquet","size":3,"content_type":"position_deletes"},
+            {"storage":"uuid_relative","path_or_inline_dv":"vBn[lx","size_in_bytes":36,"cardinality":2}
+        ]]
     ]"#;
 
     let err = ScanSpec::files_from_json(json)
-        .expect_err("a Delta entry carrying Iceberg positional deletes must be refused");
+        .expect_err("a delete list mixing both mechanisms must be refused");
 
     assert!(
         err.contains("scan files deserialization failed"),
@@ -1815,19 +1885,161 @@ fn a_file_entry_carrying_both_a_delta_block_and_iceberg_deletes_is_refused() {
         "the refusal must echo neither path: {err}"
     );
     assert!(
-        !err.contains("partition_values"),
-        "the refusal must not echo the raw input: {err}"
+        !err.contains("vBn[lx"),
+        "the refusal must not echo the deletion vector's reference: {err}"
+    );
+}
+
+/// A delete list holding ONLY Iceberg delete-file references, and one holding ONLY a
+/// deletion vector, are both accepted: the gate turns on MIXING the two mechanisms,
+/// not on either one appearing.
+#[test]
+fn a_delete_list_holding_one_mechanism_kind_is_accepted() {
+    let iceberg_only = r#"[["f.parquet",1,[
+        {"path":"d0.parquet","size":3,"content_type":"position_deletes"},
+        {"path":"d1.parquet","size":4,"content_type":"equality_deletes"}
+    ]]]"#;
+    assert_eq!(
+        ScanSpec::files_from_json(iceberg_only)
+            .expect("an Iceberg-only delete list must reconstitute")[0]
+            .deletes
+            .len(),
+        2
+    );
+
+    let vector_only = r#"[["f.parquet",1,[
+        {"storage":"inline","path_or_inline_dv":"x","size_in_bytes":36,"cardinality":2}
+    ]]]"#;
+    assert_eq!(
+        ScanSpec::files_from_json(vector_only)
+            .expect("a deletion-vector-only delete list must reconstitute")[0]
+            .deletes,
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::Inline,
+            path_or_inline_dv: "x".into(),
+            offset: None,
+            size_in_bytes: 36,
+            cardinality: 2,
+        }]
+    );
+}
+
+/// Each delete mechanism names ITSELF on the wire, so the scan reads one list and
+/// dispatches on content. The three Iceberg variants keep their pre-unification
+/// `{"path":…,"size":…,"content_type":…}` object with its key ORDER, which is what
+/// makes every committed 3-tuple golden encoding pass unedited; the deletion vector
+/// carries all five of its members in its own key order.
+#[test]
+fn every_delete_mechanism_serializes_its_own_self_describing_form() {
+    let cases = [
+        (
+            DeleteMechanism::IcebergPositionalDelete {
+                path: "deletes/d0.parquet".into(),
+                size: 50,
+            },
+            r#"[["f.parquet",1,[{"path":"deletes/d0.parquet","size":50,"content_type":"position_deletes"}]]]"#,
+        ),
+        (
+            DeleteMechanism::IcebergEqualityDelete {
+                path: "deletes/d1.parquet".into(),
+                size: 60,
+            },
+            r#"[["f.parquet",1,[{"path":"deletes/d1.parquet","size":60,"content_type":"equality_deletes"}]]]"#,
+        ),
+        (
+            DeleteMechanism::IcebergPuffinDeletionVector {
+                path: "deletes/d2.puffin".into(),
+                size: 70,
+            },
+            r#"[["f.parquet",1,[{"path":"deletes/d2.puffin","size":70,"content_type":"puffin_deletion_vector"}]]]"#,
+        ),
+        (
+            sample_deletion_vector(),
+            r#"[["f.parquet",1,[{"storage":"uuid_relative","path_or_inline_dv":"vBn[lx{q8@P<9BNH/isA","offset":1,"size_in_bytes":36,"cardinality":2}]]]"#,
+        ),
+    ];
+
+    for (mechanism, expected) in cases {
+        let entry = FileEntry::with_deletes("f.parquet", 1, vec![mechanism.clone()]);
+        let json = ScanSpec::files_json(std::slice::from_ref(&entry));
+        assert_eq!(json, expected, "{mechanism:?} must keep its own encoding");
+        assert_eq!(
+            ScanSpec::files_from_json(&json).expect("its own encoding must reconstitute"),
+            vec![entry],
+            "{mechanism:?} must survive the round trip"
+        );
+    }
+}
+
+/// Only a mechanism naming a whole delete FILE exposes an object-store path. The
+/// deletion vector exposes NONE: its `path_or_inline_dv` is resolved into a path at
+/// file registration and is never addressed from the delete list itself, so a caller
+/// that fetched, relativized, or claimed store ownership of it as a path here would be
+/// wrong — regardless of whether the value looks like a UUID token, an inline
+/// payload, or an absolute path.
+#[test]
+fn only_a_delete_file_mechanism_exposes_an_object_store_path() {
+    assert_eq!(
+        DeleteMechanism::IcebergPositionalDelete {
+            path: "deletes/d0.parquet".into(),
+            size: 50,
+        }
+        .object_store_path(),
+        Some("deletes/d0.parquet")
+    );
+    assert_eq!(
+        DeleteMechanism::IcebergEqualityDelete {
+            path: "deletes/d1.parquet".into(),
+            size: 60,
+        }
+        .object_store_path(),
+        Some("deletes/d1.parquet")
+    );
+    assert_eq!(
+        DeleteMechanism::IcebergPuffinDeletionVector {
+            path: "deletes/d2.puffin".into(),
+            size: 70,
+        }
+        .object_store_path(),
+        Some("deletes/d2.puffin")
+    );
+    assert_eq!(
+        sample_deletion_vector().object_store_path(),
+        None,
+        "a deletion vector's path_or_inline_dv is resolved at file registration, never addressed from the delete list as a path"
+    );
+}
+
+/// An Iceberg delete content type outside the closed set is refused at
+/// reconstitution rather than silently read as a supported mechanism — the same
+/// treatment an unknown deletion-vector storage kind gets, and for the same reason.
+#[test]
+fn an_iceberg_delete_content_type_outside_the_closed_set_is_refused() {
+    let json =
+        r#"[["f.parquet",1,[{"path":"d0.parquet","size":3,"content_type":"dictionary_deletes"}]]]"#;
+
+    let err = ScanSpec::files_from_json(json)
+        .expect_err("a content type outside the closed set must be refused");
+
+    assert!(
+        err.contains("scan files deserialization failed"),
+        "the refusal identifies scan-files deserialization: {err}"
+    );
+    assert!(
+        !err.contains("d0.parquet"),
+        "the refusal must not echo the input: {err}"
     );
 }
 
 /// The reconstituted scan spec carries no catalog handle — not the table's
 /// catalog-assigned credential-vending key, not any other catalog identifier —
-/// because the scan UDF never contacts the catalog. Asserted with the Delta blocks
-/// PRESENT, since they are the fields a planning-side identifier would ride in on.
+/// because the scan UDF never contacts the catalog. Asserted with the neutral
+/// partition fields POPULATED, since they are the fields a planning-side identifier
+/// would ride in on.
 #[test]
-fn a_delta_scan_spec_carries_no_catalog_identifier() {
+fn a_partitioned_scan_spec_carries_no_catalog_identifier() {
     let mut spec = sample_spec();
-    spec.common.delta = Some(every_delta_table_block()[2].clone());
+    spec.common.partition_columns = vec!["region".to_string(), "year".to_string()];
     spec.files = every_file_entry_combination();
 
     let common_json = spec.to_common_json();
@@ -1848,31 +2060,36 @@ fn a_delta_scan_spec_carries_no_catalog_identifier() {
 /// path and joined onto no table root, because applying it is the scan side's job.
 #[test]
 fn deletion_vector_is_carried_verbatim_with_every_member() {
-    let entry = FileEntry::with_delta(
+    let entry = FileEntry::with_deletes(
         "data/part-00000.parquet",
         1024,
-        DeltaFileSpec {
-            partition_values: BTreeMap::new(),
-            deletion_vector: Some(sample_deletion_vector()),
-        },
+        vec![sample_deletion_vector()],
     );
 
     let json = ScanSpec::files_json(std::slice::from_ref(&entry));
     assert_eq!(
         json,
-        r#"[{"path":"data/part-00000.parquet","size":1024,"delta":{"deletion_vector":{"storage":"uuid_relative","path_or_inline_dv":"vBn[lx{q8@P<9BNH/isA","offset":1,"size_in_bytes":36,"cardinality":2}}}]"#
+        r#"[["data/part-00000.parquet",1024,[{"storage":"uuid_relative","path_or_inline_dv":"vBn[lx{q8@P<9BNH/isA","offset":1,"size_in_bytes":36,"cardinality":2}]]]"#
     );
 
     let carried = ScanSpec::from_parts_json(&sample_spec().to_common_json(), &json)
         .expect("a deletion-vector entry must reconstitute")
         .files
         .remove(0)
-        .delta
-        .and_then(|delta| delta.deletion_vector)
-        .expect("the descriptor survives the two-argument wire");
-    assert_eq!(carried, sample_deletion_vector());
+        .deletes;
     assert_eq!(
-        carried.path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA",
+        carried,
+        vec![sample_deletion_vector()],
+        "all five members survive the two-argument wire as one mechanism"
+    );
+    let DeleteMechanism::DeltaDeletionVector {
+        path_or_inline_dv, ..
+    } = &carried[0]
+    else {
+        panic!("the deletion-vector variant survives the two-argument wire")
+    };
+    assert_eq!(
+        path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA",
         "the reference is stored verbatim, never joined onto the table root"
     );
 }

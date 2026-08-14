@@ -62,6 +62,49 @@ path exactly as they already are for Iceberg.
   is an abnormal VM exit that makes the engine SIGKILL every sibling VM of the statement part. No
   error text carries a bearer token, an OAuth client secret, a vended storage key, or any other
   credential value.
+* **This delta is issue #342 and changes NO planning behavior.** It re-homes what Delta planning
+  already resolves — partition values, the deletion-vector reference, and each column's physical name
+  and id — from Delta-named `ScanSpec` blocks onto format-neutral `ScanSpec` fields both table
+  formats populate. Every value the reader resolves, every refusal it raises, and every credential
+  decision it makes is unchanged; only the field each value lands in changes.
+* **The asymmetry this removes.** #319 put Iceberg concepts directly on the shared types
+  (`FileEntry::deletes`, `LogicalField::field_id`, `name_mapping`) and bolted Delta concepts on behind
+  `Option`-gated Delta blocks (`CommonScanSpec::delta`, `FileEntry::delta`). The scan side then had to
+  ask which FORMAT produced a spec before it could read it. After this delta both formats populate the
+  same neutral fields and the scan side dispatches on CONTENT.
+* **Neutral homes, one per concept.** A data file's deletions ride in ONE `FileEntry::deletes` list of
+  `DeleteMechanism` values, whose variant names the mechanism and carries that mechanism's payload. A
+  data file's partition values ride in `FileEntry::partition_values`. The table's ordered
+  partition-column names ride in `CommonScanSpec::partition_columns`. Each column's binding key rides
+  on its own `LogicalField`.
+* **The column-mapping MODE is no longer carried at all.** It survives as a plan-time input that
+  decides WHICH binding key each `LogicalField` gets, not as a value on the wire — see the scenario
+  below. `DeltaTableSpec`, `DeltaFileSpec`, `DeltaColumnMapping`, and `DeltaColumnMappingMode` cease to
+  exist; `DeltaDeletionVectorStorage` survives only as the payload enum of the deletion-vector delete
+  mechanism, keeping the closed 3-kind set this feature already requires.
+* **One recorded justification for the pushdown refusal is now half-true, and the refusal stands on
+  its other half.** This feature records that Delta planning is not wired into `handle_pushdown`
+  partly because "a Delta deletion vector left unmodelled triggers no rejection and the scan reads the
+  delete-free path with deleted rows restored". After this delta the deletion vector IS modelled and
+  IS refused at read time (`datafusion-scan/scan-execution-positional-deletes`), so that half no
+  longer holds. The other half is untouched: the scan still has no mechanism to materialize a
+  partition column absent from the physical Parquet file, so a Delta pushdown would still read those
+  columns as NULL. The recorded refusal therefore stays in force, unedited, and its own scenario needs
+  no change.
+* **Nothing this delta adds is consumed at scan time.** `partition_columns` and `partition_values` are
+  carried and round-tripped and read by nothing, exactly as their Delta-block predecessors were.
+  Consuming them is issue #320.
+* **Apache Iceberg spec check — the Iceberg path's behavior and its one recorded deviation are both
+  unchanged.** The table spec's Column Projection section states that "Columns in Iceberg data files
+  are selected by field id" and that "projection must be done using field ids". The Iceberg format
+  reader populates `LogicalField::field_id` for EVERY logical field and populates no physical name, so
+  every Iceberg column is still selected by field id and the new binding strategies are unreachable
+  from the Iceberg path. The spec's ordered resolution rule (1) — "Return the value from partition
+  metadata if an Identity Transform exists for the field and the partition value is present in the
+  `partition` struct on `data_file` object in the manifest" — stays unimplemented and stays the
+  deliberate, accurately-scoped trade-off `datafusion-scan/scan-execution-field-id-projection`
+  records. This delta neither closes nor widens it: it gives that rule a neutral wire shape to land in
+  later (issue #99), while the Iceberg reader leaves both new fields empty today.
 
 ## Scenarios
 
@@ -93,16 +136,21 @@ path exactly as they already are for Iceberg.
 * *GIVEN* a Delta table partitioned by one column, whose active data files include one written to the
   Hive default partition directory because that row's partition value is NULL
 * *WHEN* the Delta format reader resolves that table's scan
-* *THEN* each returned file entry SHALL carry that file's Delta `partitionValues` — one entry per
-  partition column, holding the serialized value or an explicit absent value for NULL — because
-  Delta stores a partition column's value ONLY in the transaction log and never inside the data file,
-  so a scan that reads the Parquet file alone cannot recover it
-* *AND* the file whose logged partition value is NULL SHALL carry an explicit absent value, and MUST
-  NOT carry the literal partition-directory text `__HIVE_DEFAULT_PARTITION__`, because that text is a
+* *THEN* each returned file entry SHALL carry that file's Delta `partitionValues` in the
+  format-neutral per-file `partition_values` map — one entry per partition column, holding the
+  serialized value or an explicit absent value for NULL — because Delta stores a partition column's
+  value ONLY in the transaction log and never inside the data file, so a scan that reads the Parquet
+  file alone cannot recover it
+* *AND* that map SHALL be the SAME field an Iceberg identity-transform partition value (issue #99) and
+  a future Hive-style partition value would populate, and MUST NOT be reachable only through a
+  format-named block, because resolving a per-file partition value at plan time is a property of
+  partitioned tables rather than of Delta
+* *AND* the file whose logged partition value is NULL SHALL carry an explicit absent value, and MUST NOT
+  carry the literal partition-directory text `__HIVE_DEFAULT_PARTITION__`, because that text is a
   directory-naming artifact and not the column's value
 * *AND* the returned scan SHALL carry the table's ordered partition-column names ONCE in the
-  shard-invariant common spec, so a scan of a table with zero active files still knows which schema
-  columns have no physical counterpart
+  shard-invariant common spec's format-neutral `partition_columns` field, so a scan of a table with
+  zero active files still knows which schema columns have no physical counterpart
 * *AND* the per-file partition values SHALL serialize in a deterministic key order, so a golden
   encoding of one scan spec is byte-stable across runs
 
@@ -114,35 +162,50 @@ path exactly as they already are for Iceberg.
 * *THEN* the reader SHALL return exactly ONE entry for that path, carrying the deletion vector from
   the re-added `add` action and NOT the earlier delete-free `add`
 * *AND* that entry SHALL carry the Delta `deletionVector` descriptor verbatim — its storage kind, its
-  `pathOrInlineDv`, its `offset`, its `sizeInBytes`, and its `cardinality` — resolved into no path
-  and applied to no row at plan time, because applying it belongs to #320
+  `pathOrInlineDv`, its `offset`, its `sizeInBytes`, and its `cardinality` — as ONE deletion-vector
+  delete mechanism in the entry's single format-neutral `deletes` list, resolved into no path and
+  applied to no row at plan time, because applying it belongs to #320
 * *AND* the storage kind SHALL be modelled as a closed set of the Delta protocol's three kinds
   (UUID-relative, inline, absolute path), so a descriptor naming a kind outside that set fails at
   plan time rather than reaching the scan as an unread string
-* *AND* the reference SHALL be carried in the Delta per-file block and MUST NOT be encoded as an
-  Iceberg positional-delete file reference, because the two mechanisms are unrelated: an Iceberg
-  delete reference names a whole delete FILE, while a Delta deletion vector names a byte range
-  inside a shared `.bin` file
-* *AND* `FileEntry::deletes` SHALL stay EMPTY on every Delta entry, so the Iceberg positional-delete
-  reader is never handed a reference it would misread
+* *AND* the deletion vector SHALL be a DISTINCT variant of the delete mechanism, never an Iceberg
+  positional-delete reference, because the two mechanisms are unrelated: an Iceberg delete reference
+  names a whole delete FILE, while a Delta deletion vector names a byte range inside a shared `.bin`
+  file
+* *AND* a Delta entry's `deletes` list SHALL hold ONLY its deletion vector and MUST NOT hold any
+  Iceberg delete-file reference, so the Iceberg positional-delete reader is never handed a reference
+  it would misread — the same guarantee the pre-#342 "`FileEntry::deletes` stays EMPTY on every Delta
+  entry" rule gave, restated for the unified list
+* *AND* the plan-time relativization of file paths against the table root SHALL apply to Iceberg
+  delete-file references ONLY, and MUST leave a deletion vector's `pathOrInlineDv` untouched, because
+  that member is a UUID token or an inline payload rather than an object-store path
 
-### Scenario: Column-mapping mode and physical column names are carried once per table
+### Scenario: Each logical field carries the binding key its column-mapping mode selects
 
-* *GIVEN* a Delta table whose metadata sets `delta.columnMapping.mode` to `name` and whose schema
-  fields each carry a `delta.columnMapping.physicalName` and a `delta.columnMapping.id`
-* *WHEN* the Delta format reader resolves that table's scan
-* *THEN* the returned scan SHALL carry the column-mapping MODE and, per column in declared order, its
-  logical name, its physical name, and its physical id, ONCE in the shard-invariant common spec —
-  because the mapping is table-level and identical across every shard
-* *AND* a table whose metadata sets no column-mapping mode SHALL carry the mode `none` with each
-  column's physical name equal to its logical name, so the scan side reads one shape for all three
-  modes rather than distinguishing an absent block from a `none` block
-* *AND* each logical field SHALL carry as its field-id the Delta `delta.columnMapping.id` when the
-  table assigns one, and its 1-based ordinal position otherwise, so field-ids stay unique and stable
-  per column
-* *AND* the carried mode SHALL be what a later scan consults before binding a column by field-id,
-  because Delta writes Parquet field-ids ONLY in `id` mode; the binding decision itself belongs to
-  #320
+* *GIVEN* three Delta tables, one per column-mapping mode: one setting `delta.columnMapping.mode` to
+  `name` with each schema field carrying a `delta.columnMapping.physicalName` and a
+  `delta.columnMapping.id`, one setting it to `id` with the same annotations, and one setting no mode
+  at all
+* *WHEN* the Delta format reader resolves each table's scan
+* *THEN* the reader SHALL carry each column's binding key on that column's OWN logical field, and the
+  returned scan MUST NOT carry a table-level column-mapping mode, a per-table column list, or any
+  other Delta-named block, because the mode's only consumer is the choice of binding key and encoding
+  the choice leaves nothing for a second home to drift from
+* *AND* under `id` mode each logical field SHALL carry its `delta.columnMapping.id` as its field-id
+  and SHALL carry NO physical name, because Delta writes Parquet field-ids in `id` mode and only there
+* *AND* under `name` mode each logical field SHALL carry its `delta.columnMapping.physicalName` as its
+  physical name and SHALL carry NO field-id, because the Delta protocol requires a `name`-mode reader
+  to match on the physical name and a carried field-id would offer a second, unauthorized key
+* *AND* under `none` mode each logical field SHALL carry NEITHER a field-id NOR a physical name, so
+  the scan binds it by its own logical name, superseding the removed scenario's 1-based-ordinal
+  field-id: an ordinal is a value the writer never wrote into any file, and carrying it invites a
+  false match against a file that happens to carry field-ids
+* *AND* a column under `id` or `name` mode missing the annotation its mode requires SHALL still be
+  refused with a `UdfError` naming the column, unchanged, because its ordinal position and its logical
+  name are values the writer never used
+* *AND* the reader SHALL still carry an EMPTY `schema.name-mapping.default` list, because a
+  name-mapping entry is a table-level fallback for files lacking field-ids and the per-column physical
+  name is the authoritative declaration that replaces it for Delta
 
 ### Scenario: Delta planning resolves its storage credential through the table's own catalog
 
@@ -217,19 +280,25 @@ path exactly as they already are for Iceberg.
 
 * *GIVEN* the shipped Iceberg file-resolution entry point `resolve_file_list` and its callers — the
   single-table pushdown path, every join leg, and the external test callers
-* *WHEN* the Iceberg format reader resolves a table's scan through the new trait
-* *THEN* the reader SHALL delegate to `resolve_file_list` UNCHANGED, keeping that function's name,
-  its `pub` visibility, its signature, and every one of its call sites, so this plan changes ZERO
-  bytes of the shipped Iceberg planning path
-* *AND* the reader SHALL return the resolved scan with an ABSENT Delta block, so the serialized
-  shard-invariant common blob and per-shard file list for every Iceberg request stay byte-identical
-  to their pre-change encoding
+* *WHEN* the Iceberg format reader resolves a table's scan through the trait
+* *THEN* the reader SHALL delegate to `resolve_file_list`, whose name, `pub` visibility, signature,
+  and every one of its call sites stay unchanged, so the shipped Iceberg planning path keeps its shape
+  and its callers
+* *AND* `resolve_file_list` SHALL construct each associated positional-delete reference as the Iceberg
+  positional-delete variant of the format-neutral delete mechanism — the ONE body change issue #342
+  makes to that function — and its SERIALIZED per-shard file list SHALL stay byte-identical to the
+  pre-#342 encoding, including the delete-carrying 3-tuple form and its
+  `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
+* *AND* the resolved scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry
+  EMPTY partition values, so the serialized shard-invariant common blob and per-shard file list
+  for every Iceberg request stay byte-identical to their pre-#342 encoding
+* *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical
+  name, so an Iceberg column is still bound by field-id and the physical-name and identity binding
+  strategies are unreachable from the Iceberg path
 * *AND* the existing Iceberg unit, integration, and E2E suites MUST pass with no change to any test
   assertion or expected value
-* *AND* collapsing `resolve_file_list` into the Iceberg reader SHALL be deferred to #320, which
-  removes its direct callers when it routes production pushdown through this seam — a scheduled
-  follow-up rather than an open-ended one, because a thin delegating wrapper is the shallow-module
-  shape this project's design rules otherwise reject
+* *AND* collapsing `resolve_file_list` into the Iceberg reader SHALL still be deferred to #320, which
+  removes its direct callers when it routes production pushdown through this seam
 
 ### Scenario: Delta planning adds no production pushdown path in this plan
 

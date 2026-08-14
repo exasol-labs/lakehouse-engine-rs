@@ -3,7 +3,7 @@
 //!
 //! Every test here writes a data Parquet and a positional-delete Parquet to a
 //! local temp directory (no S3 / MinIO, no Docker), hand-builds a `ScanSpec`
-//! whose `FileEntry`s carry `DeleteFileRef`s, drives the production raw-scan
+//! whose `FileEntry`s carry `DeleteMechanism`s, drives the production raw-scan
 //! pipeline ([`run_raw_scan_with_session`] → `build_dataframe` →
 //! `register_files` → `PositionalDeleteScanTable`), and asserts the deleted
 //! rows are gone from the emitted output.
@@ -31,8 +31,8 @@ use exasol_udf_sdk::value::Value;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, JoinSpec, JoinType,
-    LogicalField, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -201,12 +201,12 @@ fn write_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> 
         .to_string()
 }
 
-/// A [`DeleteFileRef`] for the Parquet positional-delete file at `abs_url`.
-fn delete_ref(abs_url: &str) -> DeleteFileRef {
-    DeleteFileRef {
+/// A [`DeleteMechanism::IcebergPositionalDelete`] for the Parquet positional-delete
+/// file at `abs_url`.
+fn delete_ref(abs_url: &str) -> DeleteMechanism {
+    DeleteMechanism::IcebergPositionalDelete {
         path: abs_url.to_string(),
         size: local_file_size(abs_url),
-        content_type: DeleteFileContentType::PositionDeletes,
     }
 }
 
@@ -237,11 +237,12 @@ fn logical_fields(fields: &[(&str, &str)]) -> Vec<LogicalField> {
         .iter()
         .enumerate()
         .map(|(i, (name, arrow_type))| LogicalField {
-            field_id: (i + 1) as i32,
+            field_id: Some((i + 1) as i32),
             name: (*name).to_string(),
             arrow_type: (*arrow_type).to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         })
         .collect()
 }
@@ -557,10 +558,9 @@ fn scan_rejects_unapplicable_delete_file() {
     let dir = temp_dir("unapplicable");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
 
-    let bogus_delete = DeleteFileRef {
+    let bogus_delete = DeleteMechanism::IcebergEqualityDelete {
         path: format!("{}/does-not-need-to-exist.parquet", dir.to_string_lossy()),
         size: 10,
-        content_type: DeleteFileContentType::EqualityDeletes,
     };
     let entry = FileEntry::with_deletes(
         data_url.clone(),
@@ -598,10 +598,9 @@ fn scan_rejects_puffin_deletion_vector() {
     let dir = temp_dir("puffin_dv");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
 
-    let bogus_delete = DeleteFileRef {
+    let bogus_delete = DeleteMechanism::IcebergPuffinDeletionVector {
         path: format!("{}/does-not-need-to-exist.puffin", dir.to_string_lossy()),
         size: 10,
-        content_type: DeleteFileContentType::PuffinDeletionVector,
     };
     let entry = FileEntry::with_deletes(
         data_url.clone(),

@@ -25,7 +25,8 @@ use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::needs_json_fallback;
 
 use super::field_id_projection::{
-    FieldIdResolution, build_logical_arrow_schema, reconstruct_initial_defaults,
+    FieldIdResolution, build_logical_arrow_schema, index_declared_physical_names,
+    reconstruct_initial_defaults,
 };
 use super::object_store::validate_uniform_object_store_files;
 use super::sql_support::{build_alias_items, quote_ident};
@@ -142,9 +143,10 @@ pub async fn register_files(
 /// the broadcast-join path ([`register_join_tables`]), which registers a fact and
 /// a dimension file list into the SAME session. `table_root` reconstructs relative
 /// paths; a non-empty `logical_schema` registers that schema and installs the
-/// field-id expression adapter (column binding is field-id-first — correct across
-/// Iceberg schema evolution), otherwise one Arrow schema is inferred from the
-/// first file. `name_mapping` is threaded alongside `logical_schema` into the
+/// column-binding expression adapter (each logical field binds by the key it
+/// declares — a field-id, a declared physical name, or its own name — which is
+/// correct across schema evolution), otherwise one Arrow schema is inferred from
+/// the first file. `name_mapping` is threaded alongside `logical_schema` into the
 /// [`PositionalDeleteScanTable`]/[`FieldIdExprAdapterFactory`] for the same side,
 /// shard-invariant like the logical schema itself. Read/inference errors route
 /// through [`classify_scan_error`] so no credential value can leak, whichever
@@ -200,11 +202,14 @@ pub(super) async fn register_file_list(
         .map_err(|e| UdfError::User(format!("invalid listing URL '{first_abs}': {e}")))?
         .object_store();
 
-    // Prefer the query-time logical schema (with Iceberg field-ids) when the
-    // adapter supplied one: use it as the table schema and install the field-id
-    // expression adapter so column binding is field-id-first (name fallback) —
-    // correct across schema evolution. When it is absent (legacy specs), fall
-    // back to inferring one Arrow schema from the first file.
+    // Prefer the query-time logical schema when the adapter supplied one: use it as
+    // the table schema and install the column-binding expression adapter so each
+    // column binds by the key its logical field declares — correct across schema
+    // evolution. The decision is the PRESENCE of a logical schema alone: a schema
+    // whose fields all bind by identity still installs the adapter, because only
+    // the adapter provides per-file NULL-fill, `initial-default` substitution, and
+    // the required-absent error. When it is absent (legacy specs), fall back to
+    // inferring one Arrow schema from the first file.
     let secrets = storage.secret_values();
     let use_field_id_adapter = !logical_schema.is_empty();
     let table_schema = if use_field_id_adapter {
@@ -221,14 +226,16 @@ pub(super) async fn register_file_list(
             .map_err(|e| classify_scan_error(e, &secrets))?
     };
 
-    // Reconstruct the field-id → ScalarValue initial-default map ONCE per
-    // registration from the logical schema; threaded into the field-id adapter
-    // factory for the per-file absent-with-default fill (Iceberg rule 3). A
-    // malformed encoded default surfaces as a clean user error, never a panic.
-    let defaults = reconstruct_initial_defaults(logical_schema).map_err(UdfError::User)?;
+    // Build the binding tables ONCE per registration from the logical schema —
+    // the declared-physical-name index and the logical-name → ScalarValue
+    // initial-default map — and thread them into the column-binding adapter
+    // factory, which uses them per file for the declared-physical-name binding and
+    // the absent-with-default fill (Iceberg rule 3). A malformed encoded default
+    // surfaces as a clean user error, never a panic.
     let field_id_resolution = FieldIdResolution {
         name_mapping: name_mapping.to_vec(),
-        defaults,
+        declared_physical_names: index_declared_physical_names(logical_schema),
+        defaults: reconstruct_initial_defaults(logical_schema).map_err(UdfError::User)?,
     };
 
     let table = crate::scan::positional_deletes::PositionalDeleteScanTable::new(

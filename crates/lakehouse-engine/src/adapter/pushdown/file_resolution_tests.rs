@@ -3,7 +3,7 @@ use super::super::single_group_agg::DistinctCount;
 use super::super::support::quote_ident;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::AggregatePlan;
+use crate::scan::spec::{AggregatePlan, DeltaDeletionVectorStorage};
 use iceberg::spec::{DataContentType, DataFileFormat};
 
 // ---------------------------------------------------------------------------
@@ -156,25 +156,41 @@ fn manifest_read_errors_redact_the_literal_azure_secret_values() {
 // Task 1.2 — adapter carries positional deletes into the per-shard scan spec
 // ---------------------------------------------------------------------------
 
-/// `map_delete_content_type` maps the iceberg task-level content type onto the
-/// wire enum honestly (position → position; equality → equality).
+/// `iceberg_delete_mechanism` maps the iceberg task-level content type onto the
+/// mechanism honestly: position → positional, equality → equality, and the `Data`
+/// sentinel (which never appears in a task's delete list) → the non-positional
+/// mechanism the scan's read-time backstop rejects rather than applies.
 #[test]
-fn map_delete_content_type_maps_position_and_equality() {
+fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     use iceberg::spec::DataContentType;
     assert_eq!(
-        map_delete_content_type(DataContentType::PositionDeletes),
-        DeleteFileContentType::PositionDeletes
+        iceberg_delete_mechanism("d0.parquet".into(), 50, DataContentType::PositionDeletes),
+        DeleteMechanism::IcebergPositionalDelete {
+            path: "d0.parquet".into(),
+            size: 50,
+        }
     );
     assert_eq!(
-        map_delete_content_type(DataContentType::EqualityDeletes),
-        DeleteFileContentType::EqualityDeletes
+        iceberg_delete_mechanism("d1.parquet".into(), 60, DataContentType::EqualityDeletes),
+        DeleteMechanism::IcebergEqualityDelete {
+            path: "d1.parquet".into(),
+            size: 60,
+        }
+    );
+    assert_eq!(
+        iceberg_delete_mechanism("d2.parquet".into(), 70, DataContentType::Data),
+        DeleteMechanism::IcebergEqualityDelete {
+            path: "d2.parquet".into(),
+            size: 70,
+        },
+        "the Data sentinel must map to a non-positional mechanism"
     );
 }
 
 /// A data file's associated positional-delete file paths are relativized by
 /// the SAME rule as the data-file path: an under-root path is stripped to a
 /// root-relative path, a path not under the root stays absolute. Delete size
-/// and content type are preserved.
+/// and mechanism are preserved.
 #[test]
 fn delete_file_paths_use_relative_absolute_encoding() {
     let root = "s3://warehouse/db/table";
@@ -192,18 +208,76 @@ fn delete_file_paths_use_relative_absolute_encoding() {
     let e = &shards[0][0];
     assert_eq!(e.path, "data/part-0.parquet", "data path must relativize");
     assert_eq!(
-        e.deletes[0].path, "data/deletes/del-0.parquet",
-        "under-root delete path must relativize EXACTLY like the data path"
+        e.deletes[0],
+        DeleteMechanism::IcebergPositionalDelete {
+            path: "data/deletes/del-0.parquet".into(),
+            size: 50,
+        },
+        "under-root delete path must relativize EXACTLY like the data path, with size \
+         and mechanism preserved"
     );
-    assert_eq!(e.deletes[0].size, 50, "delete size preserved");
     assert_eq!(
-        e.deletes[0].content_type,
-        DeleteFileContentType::PositionDeletes,
-        "delete content type preserved"
-    );
-    assert_eq!(
-        e.deletes[1].path, "s3://other-bucket/del-x.parquet",
+        e.deletes[1],
+        DeleteMechanism::IcebergPositionalDelete {
+            path: "s3://other-bucket/del-x.parquet".into(),
+            size: 60,
+        },
         "a delete path not under the root must stay absolute"
+    );
+}
+
+/// A Delta deletion vector rides through relativization byte for byte, while the DATA
+/// file path it accompanies relativizes as always.
+///
+/// The `p` (absolute-path) storage kind is the discriminating case: its
+/// `path_or_inline_dv` looks exactly like an under-root object-store path, so a
+/// path-blind relativization would strip the root from a value the scan resolves at
+/// file registration — turning a resolvable descriptor into an unreadable one.
+#[test]
+fn relativization_leaves_a_deletion_vectors_path_or_inline_dv_untouched() {
+    let root = "s3://warehouse/db/table";
+    let under_root_vector = DeleteMechanism::DeltaDeletionVector {
+        storage: DeltaDeletionVectorStorage::AbsolutePath,
+        path_or_inline_dv: format!("{root}/deletion_vector.bin"),
+        offset: Some(1),
+        size_in_bytes: 36,
+        cardinality: 2,
+    };
+    let uuid_vector = DeleteMechanism::DeltaDeletionVector {
+        storage: DeltaDeletionVectorStorage::UuidRelative,
+        path_or_inline_dv: "vBn[lx{q8@P<9BNH/isA".to_string(),
+        offset: None,
+        size_in_bytes: 36,
+        cardinality: 2,
+    };
+
+    let shards = relativize_shards_to_root(
+        vec![vec![
+            FileEntry::with_deletes(
+                format!("{root}/data/part-0.parquet"),
+                1000,
+                vec![under_root_vector.clone()],
+            ),
+            FileEntry::with_deletes(
+                format!("{root}/data/part-1.parquet"),
+                1000,
+                vec![uuid_vector.clone()],
+            ),
+        ]],
+        root,
+    );
+
+    assert_eq!(
+        shards[0][0].path, "data/part-0.parquet",
+        "the data file path must still relativize"
+    );
+    assert_eq!(
+        shards[0][0].deletes[0], under_root_vector,
+        "an under-root absolute path_or_inline_dv must survive untouched"
+    );
+    assert_eq!(
+        shards[0][1].deletes[0], uuid_vector,
+        "a UUID path_or_inline_dv must survive untouched"
     );
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, StorageProps};
+use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage, StorageProps};
 use object_store::memory::InMemory;
 use std::sync::LazyLock;
 
@@ -33,10 +33,9 @@ fn entry_with_delete(path: &str, delete: &str) -> FileEntry {
     FileEntry::with_deletes(
         path,
         1,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete.to_string(),
             size: 1,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     )
 }
@@ -195,6 +194,37 @@ async fn an_out_of_tree_positional_delete_file_routes_to_its_data_files_side() {
     ]);
 
     assert_eq!(text_at(&router, OUT_OF_TREE_DELETE).await, FACT_LABEL);
+}
+
+/// A mechanism naming no object-store path of its own — a Delta deletion vector —
+/// contributes nothing to the owned-path set: only the data file's own path is owned.
+#[tokio::test]
+async fn a_deletion_vector_contributes_no_owned_path() {
+    let files = [FileEntry::with_deletes(
+        "data/f1.parquet",
+        1,
+        vec![DeleteMechanism::DeltaDeletionVector {
+            storage: DeltaDeletionVectorStorage::UuidRelative,
+            path_or_inline_dv: "not-a-path-token".to_string(),
+            offset: None,
+            size_in_bytes: 10,
+            cardinality: 1,
+        }],
+    )];
+    let side = RoutedSide::new(
+        &scan_side(FACT_LABEL, &files, FACT_ROOT),
+        store_labelled(FACT_LABEL, &[]).await,
+    )
+    .expect("fact side");
+
+    let expected: HashSet<ObjectStorePath> =
+        [store_path("data/f1.parquet", FACT_ROOT).expect("data file path")]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        side.owned, expected,
+        "a deletion vector must contribute no owned path, only the data file's own"
+    );
 }
 
 #[tokio::test]

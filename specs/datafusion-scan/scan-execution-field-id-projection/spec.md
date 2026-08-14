@@ -130,6 +130,48 @@ column is nullable and defines no default.
   already records that "Non-null Iceberg `initial-default` values require table format-version 3".
   Nothing is dropped or left untyped: the column itself stays queryable as a JSON-fallback
   `VARCHAR(2000000)` string.
+* **This delta is issue #342.** It generalizes the column-binding adapter from ONE binding strategy
+  to THREE, so a logical field declares HOW it binds instead of the adapter assuming every field binds
+  by Iceberg field-id. A logical field carries either a field-id, or a physical name, or neither; the
+  adapter dispatches on which one is populated.
+* **The three strategies and who populates them.** By field-id — Iceberg (always) and Delta `id`
+  column mapping, matched against the physical field's `PARQUET:field_id`. By physical name — Delta
+  `name` column mapping, matched against the Parquet column's own name. By identity — Delta `none`
+  column mapping, matched against the logical name itself.
+* **Iceberg behavior is unchanged, and the recorded field-id scenarios stay accurate.** The Iceberg
+  planning path populates a field-id on EVERY logical field and never populates a physical name, so
+  the recorded embedded-field-id, `schema.name-mapping.default`, and physical-name-fallback scenarios
+  describe exactly what an Iceberg scan still does. They are now scoped by construction to fields that
+  carry a field-id.
+* **Per-physical-field resolution order, extended by one step.** For each physical field: (1) an
+  embedded `PARQUET:field_id` matching a logical field's id is authoritative, and a field carrying an
+  id that no logical field declares keeps its physical name; (2) a logical field DECLARING this
+  physical field's name as its physical name claims it; (3) `schema.name-mapping.default` maps this
+  physical name to a field-id present in the logical schema; (4) the physical name is kept unchanged,
+  which is what makes identity binding resolve. Step (2) is new and sits ABOVE the name-mapping
+  because a per-column declaration read from the table's own metadata is authoritative, while a
+  name-mapping entry is a table-level fallback for files that carry no field-id at all. The two never
+  co-occur today: the Iceberg path populates no physical name and the Delta path carries an empty
+  name-mapping.
+* **`name_mapping` and `initial_default` are unchanged.** Their resolution, their once-per-query VS
+  encoding step, their round-trip vocabulary, and the decimal-domain gate on the encoding step all
+  stay exactly as recorded.
+* **Every strategy wraps the SAME `DefaultPhysicalExprAdapterFactory`.** Type-divergence cast, per-file
+  NULL-fill for an absent nullable column, `initial-default` substitution, and the required-absent
+  clean error are decided by one delegate for all three strategies, so a Delta `none`-mode table gets
+  the same semantics as an Iceberg table rather than a thinner path.
+* **Apache Iceberg spec check — no Iceberg rule changes and no deviation is introduced.** The table
+  spec's Column Projection section states "Columns in Iceberg data files are selected by field id" and
+  that "projection must be done using field ids"; the Iceberg reader still gives every logical field
+  its field-id, so this holds unchanged. The spec's ordered resolution for a field id not present in a
+  data file — "(1) Return the value from partition metadata if an Identity Transform exists for the
+  field and the partition value is present in the `partition` struct on `data_file` object in the
+  manifest. (2) Use `schema.name-mapping.default` metadata to map field id to columns without field id
+  ... (3) Return the default value if it has a defined `initial-default` ... (4) Return `null` in all
+  other cases." — keeps its recorded implementation status exactly: rules (2), (3), and (4) are
+  implemented and unchanged, and rule (1) stays the deliberate, accurately-scoped trade-off this
+  feature already records. This delta neither closes nor widens that gap, and the physical-name and
+  identity strategies are unreachable from an Iceberg scan.
 
 ## Scenarios
 
@@ -212,11 +254,52 @@ column is nullable and defines no default.
 * *AND* the UDF MUST NOT emit wrong or fabricated data for that column
 * *AND* the UDF MUST NOT substitute NULL for the required column
 
+### Scenario: Column projection binds by a logical field's declared physical name
+
+* *GIVEN* a scan spec whose logical schema carries a field declaring a PHYSICAL NAME that differs from
+  its logical name and carrying NO field-id (the shape a Delta `name` column mapping produces)
+* *AND* an assigned file whose physical column bears that declared physical name
+* *WHEN* the scan UDF reads that file
+* *THEN* the UDF SHALL resolve that logical column to the physical column whose name equals the
+  declared physical name, and SHALL emit that column's real physical values (never NULL) under the
+  current logical name
+* *AND* the declared physical name SHALL take precedence over any `schema.name-mapping.default` entry
+  covering the same physical name, because a per-column declaration from the table's own metadata is
+  authoritative and a name-mapping entry is a table-level fallback
+* *AND* a physical field carrying an embedded `PARQUET:field_id` that no logical field declares SHALL keep
+  its physical name, so a declared-physical-name binding resolves it at step (2) rather than being
+  consumed by a field-id match
+* *AND* per-file NULL-fill, `initial-default` substitution, and the required-absent clean error SHALL behave
+  identically to the field-id-bound case, because both strategies wrap the same default
+  physical-expression adapter
+
+### Scenario: A logical field carrying no binding key binds by its own name
+
+* *GIVEN* a scan spec whose logical schema carries a field with NO field-id and NO declared physical
+  name (the identity binding a Delta `none` column mapping produces), a second such field that is
+  ABSENT from one assigned file and nullable, and a third such field that is absent from that file,
+  required, and carries no `initial-default`
+* *WHEN* the scan UDF reads the assigned files
+* *THEN* the UDF SHALL install the column-binding adapter, because the scan spec CARRIES a logical
+  schema, and SHALL bind the identity-bound field to the physical column whose name equals its logical
+  name
+* *AND* the UDF SHALL emit NULL for the absent nullable field for rows from the file lacking it, and SHALL
+  emit its `initial-default` instead when one is encoded, per file
+* *AND* the UDF SHALL return the same clean required-absent error for the absent required field as it
+  returns for a field-id-bound required column, and MUST NOT substitute NULL for it
+* *AND* the UDF MUST NOT tag an identity-bound logical field with a `PARQUET:field_id`, because a
+  synthesized id is a value no writer put in any file and would invite a false match against a file
+  that does carry field-ids
+* *AND* this identity binding MUST NOT be reached by an Iceberg scan, because the Iceberg planning
+  path populates a field-id on every logical field
+
 ### Scenario: Scan without a logical schema falls back to first-file inference
 
 * *GIVEN* a scan spec that predates the logical-schema field (the logical schema is absent)
 * *WHEN* the scan UDF runs for that spec
 * *THEN* the UDF SHALL register the files with a schema inferred from the first file and bind columns by physical name, unchanged from prior behavior
+* *AND* this fallback SHALL be selected by the ABSENCE of a logical schema ALONE, so a spec whose logical schema IS present still installs the column-binding adapter even when every one of its fields carries neither a field-id nor a declared physical name
+* *AND* identity binding MUST NOT be conflated with this fallback: identity binding resolves a DECLARED logical field through the same adapter and therefore keeps per-file NULL-fill, `initial-default` substitution, and the required-absent error, none of which first-file inference provides
 
 ### Scenario: A decimal initial-default outside Exasol's catalog-decimal domain is not encoded as a numeric default
 

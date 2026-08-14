@@ -532,7 +532,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     assert_eq!(logical.len(), 4, "must carry all 4 fields");
 
     // Field 1: required Int → nullable=false, arrow_type="int32"
-    assert_eq!(logical[0].field_id, 1);
+    assert_eq!(logical[0].field_id, Some(1));
     assert_eq!(logical[0].name, "id");
     assert_eq!(logical[0].arrow_type, "int32");
     assert!(
@@ -541,7 +541,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     );
 
     // Field 2: optional Double → nullable=true, arrow_type="float64"
-    assert_eq!(logical[1].field_id, 2);
+    assert_eq!(logical[1].field_id, Some(2));
     assert_eq!(logical[1].name, "score");
     assert_eq!(logical[1].arrow_type, "float64");
     assert!(
@@ -550,13 +550,13 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     );
 
     // Field 3: required String → nullable=false, arrow_type="utf8"
-    assert_eq!(logical[2].field_id, 3);
+    assert_eq!(logical[2].field_id, Some(3));
     assert_eq!(logical[2].name, "label");
     assert_eq!(logical[2].arrow_type, "utf8");
     assert!(!logical[2].nullable);
 
     // Field 4: optional Decimal(18,4) → nullable=true, arrow_type="decimal128(18,4)"
-    assert_eq!(logical[3].field_id, 4);
+    assert_eq!(logical[3].field_id, Some(4));
     assert_eq!(logical[3].name, "amount");
     assert_eq!(logical[3].arrow_type, "decimal128(18,4)");
     assert!(logical[3].nullable);
@@ -626,7 +626,7 @@ fn build_logical_schema_encodes_primitive_initial_default() {
     assert_eq!(logical.len(), 2);
 
     // Required-with-default encodes the raw i64 scalar as decimal text.
-    assert_eq!(logical[0].field_id, 1);
+    assert_eq!(logical[0].field_id, Some(1));
     assert!(!logical[0].nullable, "required field must be non-nullable");
     assert_eq!(logical[0].arrow_type, "int64");
     assert_eq!(
@@ -636,7 +636,7 @@ fn build_logical_schema_encodes_primitive_initial_default() {
     );
 
     // Nullable-with-default encodes the string value verbatim.
-    assert_eq!(logical[1].field_id, 2);
+    assert_eq!(logical[1].field_id, Some(2));
     assert!(logical[1].nullable, "optional field must be nullable");
     assert_eq!(logical[1].arrow_type, "utf8");
     assert_eq!(
@@ -1496,11 +1496,12 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
     let logical_schema = vec![LogicalField {
-        field_id: 2,
+        field_id: Some(2),
         name: "NAME".to_string(),
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        physical_name: None,
     }];
 
     let sql = guard_dispatch_sql(
@@ -1564,11 +1565,12 @@ fn nonzero_offset_nulls_the_effective_limit() {
     let proj_cols = vec![ProjectionItem::Column("NAME".to_string())];
     let proj_types = vec!["VARCHAR(2000000)".to_string()];
     let logical_schema = vec![LogicalField {
-        field_id: 2,
+        field_id: Some(2),
         name: "NAME".to_string(),
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        physical_name: None,
     }];
 
     let sql = guard_dispatch_sql(
@@ -1643,11 +1645,12 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     // NAME as `utf8`: a native, non-JSON-fallback type, so the JSON-fallback guard
     // would NOT be what declines the top-N had the extension already run.
     let logical_schema = vec![LogicalField {
-        field_id: 2,
+        field_id: Some(2),
         name: "NAME".to_string(),
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        physical_name: None,
     }];
 
     let sql = guard_dispatch_sql(
