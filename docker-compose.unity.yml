@@ -2,7 +2,8 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
 #     minio exasol unitycatalog
-#   ./scripts/unity/seed.sh          # upload Delta fixtures + register them in UC
+#   ./scripts/unity/seed.sh          # upload Delta fixtures, mint + inject the
+#                                     # MinIO STS session, register them in UC
 #
 # Adds a native Unity Catalog OSS server (the SECOND catalog kind in the
 # `native-unity-catalog-delta` milestone) backed by the base stack's MinIO,
@@ -19,14 +20,18 @@
 #   REST base ................. /api/2.1/unity-catalog
 #   Catalog / schema .......... unity / delta_e2e            (created by seed.sh)
 #   MinIO warehouse bucket .... warehouse                    (created by base minio-init)
-#   Credential vending ........ static MinIO keys for s3://warehouse (server.properties)
+#   Credential vending ........ a real MinIO STS session for s3://warehouse,
+#                               minted + injected by scripts/unity/seed.sh
 #
 # CREDENTIAL-VENDING CAVEAT (spike #325 / SPIKE_UC_DELTA_HARNESS.md):
 #   UC OSS 0.5.x has NO S3 endpoint-override config (upstream issue #43), so the
-#   `temporary-table-credentials` response carries the vended access-key/secret
-#   but NOT the MinIO endpoint. The CLIENT (our engine's ObjectStore) must inject
-#   the MinIO endpoint itself — exactly the per-side storage-routing seam already
-#   built for issue #294. The vended keys here are the static MinIO admin keys.
+#   `temporary-table-credentials` response carries the vended credential but NOT
+#   the MinIO endpoint. The CLIENT (our engine's ObjectStore) must inject the
+#   MinIO endpoint itself — exactly the per-side storage-routing seam already
+#   built for issue #294. The vended credential is a genuine, expiring MinIO STS
+#   session rather than a static key pair, because MinIO rejects a vended
+#   `session_token` that is not a live session and UC OSS cannot vend any
+#   credential without one (see server.properties for the full reasoning).
 #
 # Host port is env-overridable (matching the base file's convention):
 #   Unity Catalog 8080 -> ${LH_UNITY_PORT:-18080}
@@ -47,6 +52,25 @@ services:
     # what turns on S3 credential vending for the `warehouse` bucket.
     volumes:
       - ./scripts/unity/server.properties:/home/unitycatalog/etc/conf/server.properties:ro
+    # The credential UC vends for s3://warehouse. UC reads a property from the
+    # environment before the file, so these three supply the (absent) file keys.
+    # They hold a real MinIO STS session that `scripts/unity/seed.sh` mints and
+    # injects by recreating this container — see server.properties for why the
+    # session must be genuine and why UC cannot obtain one itself.
+    #
+    # Pass-through form (name, no value) on purpose: an unset variable is then
+    # ABSENT from the container rather than present-but-empty. UC strips blank
+    # values only from the properties FILE, so a present-but-empty key would keep
+    # the bucket's vending entry alive with no credential in it and route UC into
+    # its STS generator — a real sts.amazonaws.com AssumeRole attempt against
+    # whatever ambient AWS credentials the host happens to carry (verified live).
+    # Absent keys instead leave the bucket unvended, which fails locally and
+    # loudly at vend time. Every value here is minted per bring-up, so nothing
+    # about the harness depends on the developer's own environment.
+    environment:
+      - s3.accessKey.0
+      - s3.secretKey.0
+      - s3.sessionToken.0
     # Alpine/busybox image: no curl, but wget is present. A 2xx on the catalogs
     # endpoint proves the REST server is actually serving, not merely that the
     # port is open.

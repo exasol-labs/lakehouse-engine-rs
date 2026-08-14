@@ -1636,7 +1636,9 @@ fn create_vs_records_table_map_in_adapter_notes() {
 #[test]
 fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     use iceberg::spec::{PrimitiveType, Type};
-    use lakehouse_catalog::{CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType};
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
+    };
 
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
     let listing = CatalogListing {
@@ -1644,6 +1646,8 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             ident: cat_ident(&["prod", "finance", "eu"], "orders"),
             table_type: CatalogTableType::Table,
             storage_location: Some("s3://warehouse/orders".to_string()),
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
             columns: vec![
                 CatalogColumn {
                     name: "order_id".to_string(),

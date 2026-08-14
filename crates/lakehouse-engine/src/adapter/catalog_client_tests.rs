@@ -23,17 +23,20 @@ fn catalog_kind_is_matched_only_at_the_construction_site() {
 
 /// Both catalog kinds resolve their tables through the ONE shared listing
 /// pipeline: fed two listings that carry the same table and column names and
-/// differ only in each column's source-tagged type — exactly what a real Iceberg
-/// vs Unity client attaches — the pipeline produces the same Exasol table name,
-/// the same case-folded column name, and the same `TABLE_MAP`.
+/// differ only in the table's format tag and each column's source-tagged type —
+/// exactly what a real Iceberg vs Unity client attaches — the pipeline produces
+/// the same Exasol table name, the same case-folded column name, and the same
+/// `TABLE_MAP`.
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
     use iceberg::spec::{PrimitiveType, Type};
-    use lakehouse_catalog::{CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType};
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
+    };
 
     let configured_ns = vec!["cat".to_string(), "sch".to_string()];
 
-    let one_table_listing = |source_type: ColumnSourceType| CatalogListing {
+    let one_table_listing = |format: TableFormat, source_type: ColumnSourceType| CatalogListing {
         tables: vec![CatalogTable {
             ident: CatalogTableIdent {
                 namespace: vec!["cat".to_string(), "sch".to_string()],
@@ -41,6 +44,8 @@ fn both_kinds_share_one_listing_pipeline() {
             },
             table_type: CatalogTableType::Table,
             storage_location: None,
+            format,
+            vended_credential_key: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type,
@@ -49,14 +54,18 @@ fn both_kinds_share_one_listing_pipeline() {
         skipped: Vec::new(),
     };
 
-    let iceberg_listing = one_table_listing(ColumnSourceType::Iceberg(Type::Primitive(
-        PrimitiveType::Long,
-    )));
-    let unity_listing = one_table_listing(ColumnSourceType::Unity {
-        type_name: "LONG".to_string(),
-        precision: 0,
-        scale: 0,
-    });
+    let iceberg_listing = one_table_listing(
+        TableFormat::Iceberg,
+        ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+    );
+    let unity_listing = one_table_listing(
+        TableFormat::Delta,
+        ColumnSourceType::Unity {
+            type_name: "LONG".to_string(),
+            precision: 0,
+            scale: 0,
+        },
+    );
 
     let (ib_tables, ib_map, _) =
         build_listing_virtual_tables(&configured_ns, &iceberg_listing).unwrap();

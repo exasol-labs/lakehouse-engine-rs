@@ -19,7 +19,8 @@ make unity-down      # tear down + wipe volumes
 docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
   minio exasol unitycatalog
 docker compose -f docker-compose.yml up -d minio-init      # create warehouse bucket
-./scripts/unity/seed.sh                                     # upload fixtures + register in UC
+./scripts/unity/seed.sh                                     # upload fixtures, mint the
+                                                            # vended session, register in UC
 ```
 
 ## What the seed produces
@@ -37,8 +38,17 @@ docker compose -f docker-compose.yml up -d minio-init      # create warehouse bu
   | `stats_all_types` | broad types incl. array/map/struct → JSON `VARCHAR` | #322 |
   | `unshredded_variant` / `type_widening` | unsupported reader feature → fail-loud | #322 |
 
-  Real STS credential vending and the broad cloud matrix are **#323** (live
-  Databricks) — the local static-key harness cannot exercise them.
+- The credential Unity Catalog vends for `s3://warehouse`: `seed.sh` mints a real
+  MinIO STS session (AssumeRole at MinIO's S3 endpoint, 7-day maximum) and injects
+  it into the `unitycatalog` container as its preset per-bucket credential,
+  recreating the container so UC picks it up. It must be a genuine session — a
+  vended `session_token` is contractually real, the client sends it as
+  `x-amz-security-token`, and MinIO rejects anything that is not a live session
+  with `403 InvalidTokenId`. UC OSS 0.5.0 cannot vend a credential with no token
+  at all, and its own STS generator ignores `AWS_ENDPOINT_URL[_STS]` and so would
+  call the real `sts.amazonaws.com`; `server.properties` carries the full
+  reasoning. The broad cloud matrix and Databricks' dynamic vending remain
+  **#323** (live Databricks).
 
 ## Endpoints
 
@@ -58,15 +68,17 @@ SDK client has no endpoint override, and the contribution to add one was decline
 [#1532](https://github.com/unitycatalog/unitycatalog/issues/1532);
 [#1636](https://github.com/unitycatalog/unitycatalog/issues/1636) closed
 "Won't be merged"). The harness sidesteps this entirely: UC is only a metadata
-registry + **static-key** credential lookup (it makes no S3 call), and **the
-client (our engine's `ObjectStore`) does all MinIO access with its own endpoint**
-— the per-side storage-routing seam already built for #294. Never route storage
-through a UC server-side S3 path. Full rationale + evidence in
-`SPIKE_UC_DELTA_HARNESS.md` (§Q2).
+registry + a per-bucket credential lookup (it makes no S3 call of its own), and
+**the client (our engine's `ObjectStore`) does all MinIO access with its own
+endpoint** — the per-side storage-routing seam already built for #294. Never route
+storage through a UC server-side S3 path. The same missing endpoint override is
+why UC cannot mint its own session against MinIO, hence the minted-and-injected
+session above. Full rationale + evidence in `SPIKE_UC_DELTA_HARNESS.md` (§Q2).
 
 ## Read path (proven by the spike)
 
 `UC GET /tables/{full_name}` → `storage_location` + `table_id` →
-`POST /temporary-table-credentials` → vended keys →
+`POST /temporary-table-credentials` → a vended STS session (access key, secret
+key, session token) →
 delta-kernel-rs reads from MinIO with a client-side endpoint override
 (deletion vector applied: 10→8 rows; column mapping resolved: `[id, name, value]`).

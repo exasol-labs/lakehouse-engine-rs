@@ -23,6 +23,7 @@ mod test_support;
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
     CatalogTableType, ColumnSourceType, IcebergRestCatalogClient, SkipReason, SkippedTable,
+    TableFormat,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageProps};
 pub use namespace::parse_table_ident;

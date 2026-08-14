@@ -13,11 +13,7 @@ const SHARED_URI: &str = "s3://bucket/shared/x.parquet";
 const SHARED: &str = "shared/x.parquet";
 
 fn entry(path: &str) -> FileEntry {
-    FileEntry {
-        path: path.to_string(),
-        size: 1,
-        deletes: Vec::new(),
-    }
+    FileEntry::new(path, 1)
 }
 
 /// One side's routing coordinates. `RoutedSide::new` reads `label`, `files`,
@@ -34,15 +30,15 @@ fn scan_side<'a>(label: &'static str, files: &'a [FileEntry], table_root: &'a st
 }
 
 fn entry_with_delete(path: &str, delete: &str) -> FileEntry {
-    FileEntry {
-        path: path.to_string(),
-        size: 1,
-        deletes: vec![DeleteFileRef {
+    FileEntry::with_deletes(
+        path,
+        1,
+        vec![DeleteFileRef {
             path: delete.to_string(),
             size: 1,
             content_type: DeleteFileContentType::PositionDeletes,
         }],
-    }
+    )
 }
 
 /// An in-memory store holding `label` as the payload of every path in `paths`,

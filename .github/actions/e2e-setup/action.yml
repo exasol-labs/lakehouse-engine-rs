@@ -15,16 +15,6 @@ runs:
       shell: bash
       run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
 
-    # Downloaded after the caller's checkout, so its mtime is newer than the
-    # checked-out sources — the Makefile's mtime-based
-    # `test-e2e → cross-musl-udf-build` dependency then sees the artifact as
-    # up to date and skips rebuilding.
-    - name: Download liblakehouse_engine.so
-      uses: actions/download-artifact@v8
-      with:
-        name: lakehouse-engine-so
-        path: target/release/
-
     - name: Install Rust 1.94
       uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
@@ -36,14 +26,24 @@ runs:
       run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
     # Read-only restore of the shared workspace cache to warm the host debug
-    # build of the e2e test binary. save-if:false so this job doesn't prune
-    # target/ (which would delete the .so downloaded into target/release/
-    # above) and doesn't save a redundant copy.
+    # build of the e2e test binary. save-if:false so this job doesn't save a
+    # redundant copy. On a non-exact cache match, rust-cache wipes
+    # target/release/ except build/.fingerprint/deps — the .so download below
+    # must stay after this step.
     - name: Restore cargo & build artifacts
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       with:
         shared-key: workspace-rlib
         save-if: "false"
+
+    # After checkout, so its mtime is newer than the checked-out sources — the
+    # Makefile's mtime-based test-e2e → cross-musl-udf-build dependency then
+    # skips rebuilding.
+    - name: Download liblakehouse_engine.so
+      uses: actions/download-artifact@v8
+      with:
+        name: lakehouse-engine-so
+        path: target/release/
 
     # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's
     # ubuntu-latest kernel, diagnosed in exasol-labs/language-container-rs:
