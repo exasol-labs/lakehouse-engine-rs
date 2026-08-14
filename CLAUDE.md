@@ -122,6 +122,13 @@ DataFusion scan — omitting it returns wrong rows, not a safely-deferred check.
   an explicit assigned file list (a projection- + predicate-carrying scan spec); the UDF never
   discovers files itself. This seam is what later enables multi-node file sharding.
 - **File-level work assignment, no overlap** — a node scans only its assigned files.
+- **`ScanSpec` is format-neutral.** Every field on `ScanSpec`, `FileEntry`, and `LogicalField` must
+  serve any table format — Iceberg, Delta, Hive, or future ones. When a new format or feature needs
+  scan-time data, first look for an existing field that already models the same concept and widen it.
+  Only add a new field when no existing one covers the concept — and make the new field format-neutral
+  too, not a format-specific struct or `Option<FormatXSpec>` block. Format-specific knowledge lives in
+  the `FormatReader` at plan time — it populates neutral fields. The scan side dispatches on field
+  content (which enum variant, which `Option` is populated), never on format identity.
 
 ## UDF parallelization & memory model (Exasol engine behavior)
 
