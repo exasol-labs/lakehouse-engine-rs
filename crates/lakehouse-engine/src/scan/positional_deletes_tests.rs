@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan::spec::DeltaDeletionVectorStorage;
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::schema::types::{SchemaDescPtr, SchemaDescriptor};
 use std::sync::Arc;
@@ -268,16 +269,30 @@ fn reads_and_filters_delete_positions_by_file_path() {
     );
 }
 
-/// Task 2.6: the read-time backstop rejects a non-positional delete file with
-/// a clean error that names the mechanism and does not leak credentials.
+/// The read-time backstop dispatches on the delete mechanism's own variant:
+/// the Iceberg positional delete yields the payload the delete read needs, and
+/// every other mechanism is refused with a clean, credential-redacted error.
 #[test]
-fn backstop_rejects_equality_delete() {
-    let delete = DeleteFileRef {
-        path: "s3://bucket/db/t/data/eq-delete.parquet".to_string(),
+fn backstop_rejects_every_unappliable_delete_mechanism() {
+    const SECRET: &str = "SECRETKEY";
+    let secrets = [SECRET.to_string()];
+    let data_file = format!("s3://{SECRET}@bucket/db/t/data/f1.parquet");
+
+    let positional = DeleteMechanism::IcebergPositionalDelete {
+        path: "data/pos-delete.parquet".to_string(),
         size: 10,
-        content_type: DeleteFileContentType::EqualityDeletes,
     };
-    let err = ensure_positional_delete(&delete, &["SECRETKEY".to_string()])
+    assert_eq!(
+        applicable_positional_delete(&positional, &data_file, &secrets).unwrap(),
+        ("data/pos-delete.parquet", 10),
+        "the applied variant yields the path and size the delete read consumes"
+    );
+
+    let equality = DeleteMechanism::IcebergEqualityDelete {
+        path: format!("s3://{SECRET}@bucket/db/t/data/eq-delete.parquet"),
+        size: 10,
+    };
+    let err = applicable_positional_delete(&equality, &data_file, &secrets)
         .unwrap_err()
         .to_string();
     assert!(
@@ -285,16 +300,53 @@ fn backstop_rejects_equality_delete() {
         "names the mechanism: {err}"
     );
     assert!(
-        !err.contains("SECRETKEY"),
-        "must not leak credentials: {err}"
+        err.contains("eq-delete.parquet"),
+        "names the offending delete file: {err}"
     );
+    assert!(!err.contains(SECRET), "must not leak credentials: {err}");
 
-    let ok = DeleteFileRef {
-        path: "s3://bucket/db/t/data/pos-delete.parquet".to_string(),
+    let puffin = DeleteMechanism::IcebergPuffinDeletionVector {
+        path: format!("s3://{SECRET}@bucket/db/t/data/dv.puffin"),
         size: 10,
-        content_type: DeleteFileContentType::PositionDeletes,
     };
-    assert!(ensure_positional_delete(&ok, &[]).is_ok());
+    let err = applicable_positional_delete(&puffin, &data_file, &secrets)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Puffin deletion vector"),
+        "names the mechanism: {err}"
+    );
+    assert!(
+        err.contains("dv.puffin"),
+        "names the offending delete file: {err}"
+    );
+    assert!(!err.contains(SECRET), "must not leak credentials: {err}");
+
+    let inline_payload = "vBn[lx{q8@P<9BFT";
+    let delta = DeleteMechanism::DeltaDeletionVector {
+        storage: DeltaDeletionVectorStorage::Inline,
+        path_or_inline_dv: inline_payload.to_string(),
+        offset: None,
+        size_in_bytes: 40,
+        cardinality: 6,
+    };
+    let err = applicable_positional_delete(&delta, &data_file, &secrets)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Delta deletion vector"),
+        "names the mechanism: {err}"
+    );
+    assert!(
+        err.contains("f1.parquet"),
+        "names the affected data file, which is all it can name: {err}"
+    );
+    assert!(
+        !err.contains(inline_payload),
+        "must not echo the opaque path_or_inline_dv: {err}"
+    );
+    assert!(err.contains("#320"), "cites the tracking issue: {err}");
+    assert!(!err.contains(SECRET), "must not leak credentials: {err}");
 }
 
 /// Build a single-row-group meta whose `file_path` column (index 0) carries

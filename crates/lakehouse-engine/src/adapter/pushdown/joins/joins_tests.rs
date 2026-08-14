@@ -180,11 +180,12 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             .map(|(p, s)| FileEntry::new(p, s))
             .collect(),
         vec![LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: format!("{table_name}_KEY"),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         }],
         Vec::new(),
         sample_storage(),

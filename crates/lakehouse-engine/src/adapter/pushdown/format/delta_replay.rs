@@ -47,9 +47,7 @@ use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use exasol_udf_sdk::error::UdfError;
 use object_store::ObjectStore;
 
-use crate::scan::spec::{
-    DeltaDeletionVector, DeltaDeletionVectorStorage, DeltaFileSpec, FileEntry,
-};
+use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage, FileEntry};
 
 #[cfg(test)]
 #[path = "delta_replay_tests.rs"]
@@ -182,11 +180,16 @@ fn append_active_files(
             continue;
         }
         let size = size_at(sizes, row, &path)?;
-        let delta = DeltaFileSpec {
-            partition_values: partition_values_at(partition_values, row, &path)?,
-            deletion_vector: deletion_vector_at(deletion_vectors, row, &path)?,
-        };
-        active.push(FileEntry::with_delta(path, size, delta));
+        let partition_values = partition_values_at(partition_values, row, &path)?;
+        let deletes = deletion_vector_at(deletion_vectors, row, &path)?
+            .into_iter()
+            .collect();
+        active.push(FileEntry {
+            path,
+            size,
+            deletes,
+            partition_values,
+        });
     }
     Ok(())
 }
@@ -195,7 +198,7 @@ fn deletion_vector_at(
     deletion_vectors: Option<&StructArray>,
     row: usize,
     path: &str,
-) -> Result<Option<DeltaDeletionVector>, UdfError> {
+) -> Result<Option<DeleteMechanism>, UdfError> {
     let Some(deletion_vectors) = deletion_vectors else {
         return Ok(None);
     };
@@ -238,7 +241,7 @@ fn deletion_vector_at(
     )?
     .ok_or_else(|| incomplete_deletion_vector(path, "cardinality"))?;
 
-    Ok(Some(DeltaDeletionVector {
+    Ok(Some(DeleteMechanism::DeltaDeletionVector {
         storage,
         path_or_inline_dv,
         offset,

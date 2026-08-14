@@ -1,11 +1,11 @@
 use super::*;
-use crate::scan::spec::{FileEntry, ScanSpec};
+use crate::scan::spec::{FileEntry, NameMappingEntry, ScanSpec};
 use crate::scan::test_support::{local_file_size, minimal_spec};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 
-/// A field tagged with its Iceberg field-id (`PARQUET:field_id`).
+/// A field tagged with its field-id (`PARQUET:field_id`).
 fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
     Field::new(name, dt, nullable).with_metadata(HashMap::from([(
         PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -13,9 +13,58 @@ fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
     )]))
 }
 
-/// A field carrying no field-id metadata (older writer).
+/// A field carrying no field-id metadata (an older writer, or a column that
+/// binds by its declared physical name or by identity).
 fn field_no_id(name: &str, dt: DataType, nullable: bool) -> Field {
     Field::new(name, dt, nullable)
+}
+
+/// A resolution carrying no binding tables and no defaults: binding is then
+/// embedded-field-id-then-physical-name.
+fn bare_resolution() -> FieldIdResolution {
+    FieldIdResolution {
+        name_mapping: Vec::new(),
+        declared_physical_names: HashMap::new(),
+        defaults: HashMap::new(),
+    }
+}
+
+/// A resolution carrying only a flattened `schema.name-mapping.default`.
+fn resolution_with_mapping(entries: &[(&str, i32)]) -> FieldIdResolution {
+    FieldIdResolution {
+        name_mapping: entries
+            .iter()
+            .map(|(name, field_id)| NameMappingEntry {
+                name: (*name).to_string(),
+                field_id: *field_id,
+            })
+            .collect(),
+        ..bare_resolution()
+    }
+}
+
+/// A resolution carrying only the logical names claimed by declared physical
+/// names, keyed by physical name — what `index_declared_physical_names` builds.
+fn resolution_with_declared_names(entries: &[(&str, &str)]) -> FieldIdResolution {
+    FieldIdResolution {
+        declared_physical_names: entries
+            .iter()
+            .map(|(physical, logical)| ((*physical).to_string(), (*logical).to_string()))
+            .collect(),
+        ..bare_resolution()
+    }
+}
+
+/// A resolution carrying only reconstructed `defaults`, keyed by LOGICAL column
+/// name, so the absent-with-default fill seam can be exercised directly.
+fn resolution_with_defaults(defaults: &[(&str, ScalarValue)]) -> FieldIdResolution {
+    FieldIdResolution {
+        defaults: defaults
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), value.clone()))
+            .collect(),
+        ..bare_resolution()
+    }
 }
 
 fn rewrite(
@@ -23,31 +72,20 @@ fn rewrite(
     physical: SchemaRef,
     column: Column,
 ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
-    let adapter = FieldIdExprAdapterFactory {
-        name_mapping: Vec::new(),
-        defaults: HashMap::new(),
-    }
-    .create(logical, physical)
-    .expect("adapter creation");
-    adapter.rewrite(Arc::new(column))
+    rewrite_with(logical, physical, bare_resolution(), column)
 }
 
-/// Rewrite a single column through a factory carrying explicit
-/// `name_mapping` and reconstructed `defaults` (field-id → `ScalarValue`),
-/// so the absent-with-default fill seam can be exercised directly.
+/// Rewrite a single column through a factory carrying an explicit
+/// [`FieldIdResolution`].
 fn rewrite_with(
     logical: SchemaRef,
     physical: SchemaRef,
-    name_mapping: Vec<crate::scan::spec::NameMappingEntry>,
-    defaults: HashMap<i32, ScalarValue>,
+    resolution: FieldIdResolution,
     column: Column,
 ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
-    let adapter = FieldIdExprAdapterFactory {
-        name_mapping,
-        defaults,
-    }
-    .create(logical, physical)
-    .expect("adapter creation");
+    let adapter = FieldIdExprAdapterFactory { resolution }
+        .create(logical, physical)
+        .expect("adapter creation");
     adapter.rewrite(Arc::new(column))
 }
 
@@ -55,6 +93,20 @@ fn rewrite_with(
 /// injected default literal's value.
 fn literal_value(expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
     expr.downcast_ref::<Literal>().map(|l| l.value().clone())
+}
+
+/// The physical index a rewritten expression binds, accepting a bare `Column` or
+/// one wrapped in an identity cast — a physical field whose field-id metadata
+/// differs from its logical field's binds through a cast. `None` whenever nothing
+/// binds a column, a default `Literal` included.
+fn bound_physical_index(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+    expr.downcast_ref::<Column>()
+        .map(Column::index)
+        .or_else(|| {
+            expr.downcast_ref::<CastExpr>()
+                .and_then(|cast| cast.expr().downcast_ref::<Column>())
+                .map(Column::index)
+        })
 }
 
 /// A renamed column (physical `score`, logical `rating`, same field-id 2)
@@ -136,9 +188,9 @@ fn ignores_dropped_physical_column() {
     assert_eq!(col.index(), 0);
 }
 
-/// Task 4.2: the logical Arrow schema built from `ScanSpec::logical_schema`
-/// tags each field with its Iceberg field-id, reconstructs the Arrow type
-/// from the tag, and preserves the declared nullability.
+/// The logical Arrow schema built from `ScanSpec::logical_schema` tags each
+/// field-id-bound field with its field-id, reconstructs the Arrow type from the
+/// tag, and preserves the declared nullability.
 #[test]
 fn builds_logical_arrow_schema_with_field_ids() {
     use super::{build_logical_arrow_schema, field_id_of};
@@ -146,18 +198,20 @@ fn builds_logical_arrow_schema_with_field_ids() {
 
     let logical = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "rating".to_string(),
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
     ];
 
@@ -177,31 +231,92 @@ fn builds_logical_arrow_schema_with_field_ids() {
     assert_eq!(field_id_of(rating), Some(2));
 }
 
+/// Scenario: a logical field carrying no binding key binds by its own name.
+///
+/// A field that binds by identity — and one that binds by a declared physical
+/// name — is tagged with NO `PARQUET:field_id` metadata at all: a synthesized id
+/// is a value no writer put in any file and would invite a false match against a
+/// file that DOES carry field-ids. A field-id-bound sibling is still tagged.
+#[test]
+fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
+    use super::{build_logical_arrow_schema, field_id_of};
+    use crate::scan::spec::LogicalField;
+
+    let logical = vec![
+        LogicalField {
+            field_id: Some(1),
+            name: "by_id".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+            physical_name: None,
+        },
+        LogicalField {
+            field_id: None,
+            name: "by_identity".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            physical_name: None,
+        },
+        LogicalField {
+            field_id: None,
+            name: "by_physical_name".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            physical_name: Some("col-abc".to_string()),
+        },
+    ];
+
+    let schema = build_logical_arrow_schema(&logical);
+
+    assert_eq!(
+        field_id_of(schema.field(0)),
+        Some(1),
+        "a field-id-bound field must stay tagged"
+    );
+    for index in [1, 2] {
+        let field = schema.field(index);
+        assert!(
+            !field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY),
+            "'{}' carries no field-id, so it must carry no field-id metadata: {:?}",
+            field.name(),
+            field.metadata()
+        );
+    }
+}
+
 /// Scenario: a physical field with NO embedded field-id, whose physical
 /// name IS covered by a `name_mapping` entry pointing to a field-id that
 /// IS present in the logical schema, resolves to that logical field's name.
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
-    use super::rename_physical_to_logical;
-    use crate::scan::spec::NameMappingEntry;
-
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
     // No embedded field-id: name-mapping maps `score` -> id 2 -> `rating`.
     let physical = Schema::new(vec![field_no_id("score", DataType::Int64, true)]);
-    let mapping = vec![NameMappingEntry {
-        name: "score".to_string(),
-        field_id: 2,
-    }];
 
-    let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+    let binding = bind_columns(
+        &logical,
+        &physical,
+        &resolution_with_mapping(&[("score", 2)]),
+    );
 
     assert_eq!(
-        renamed.field(0).name(),
+        binding.renamed_physical.field(0).name(),
         "rating",
         "no-id field must resolve via name-mapping"
+    );
+    assert!(
+        binding.bound_logical_names.contains("rating"),
+        "a name-mapped column supplies real values, so it must count as bound"
+    );
+    assert!(
+        !binding.bound_logical_names.contains("id"),
+        "a logical field this file does not supply must stay unbound"
     );
 }
 
@@ -211,47 +326,51 @@ fn name_mapping_resolves_no_field_id_column() {
 /// is not consulted when an embedded field-id is present.
 #[test]
 fn embedded_field_id_wins_over_name_mapping() {
-    use super::rename_physical_to_logical;
-    use crate::scan::spec::NameMappingEntry;
-
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
     let physical = Schema::new(vec![field_with_id("score", DataType::Int64, true, 2)]);
-    let mapping = vec![NameMappingEntry {
-        name: "score".to_string(),
-        field_id: 1,
-    }];
 
-    let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+    let binding = bind_columns(
+        &logical,
+        &physical,
+        &resolution_with_mapping(&[("score", 1)]),
+    );
 
     assert_eq!(
-        renamed.field(0).name(),
+        binding.renamed_physical.field(0).name(),
         "rating",
         "embedded id 2 must win over a mapping to id 1"
     );
 }
 
 /// Scenario: `name_mapping` is empty/absent, so a physical field with no
-/// embedded field-id keeps its physical name unchanged (today's existing
-/// fallback, unaffected by name-mapping support).
+/// embedded field-id keeps its physical name unchanged — and a kept name that
+/// MATCHES a logical field counts as bound, because the physical-name fallback
+/// supplies that column's real values and must never be defaulted over.
 #[test]
 fn no_name_mapping_falls_back_to_physical_name() {
-    use super::rename_physical_to_logical;
-
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
-    let physical = Schema::new(vec![field_no_id("score", DataType::Int64, true)]);
+    let physical = Schema::new(vec![
+        field_no_id("score", DataType::Int64, true),
+        field_no_id("rating", DataType::Int64, true),
+    ]);
 
-    let renamed = rename_physical_to_logical(&logical, &physical, &[]);
+    let binding = bind_columns(&logical, &physical, &bare_resolution());
 
     assert_eq!(
-        renamed.field(0).name(),
+        binding.renamed_physical.field(0).name(),
         "score",
         "no mapping must keep the physical name"
+    );
+    assert_eq!(
+        binding.bound_logical_names,
+        std::iter::once("rating".to_string()).collect(),
+        "only the kept name matching a logical field binds"
     );
 }
 
@@ -260,25 +379,26 @@ fn no_name_mapping_falls_back_to_physical_name() {
 /// name-mapping augments but never replaces the fallback).
 #[test]
 fn uncovered_name_mapping_falls_back_to_physical_name() {
-    use super::rename_physical_to_logical;
-    use crate::scan::spec::NameMappingEntry;
-
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
     let physical = Schema::new(vec![field_no_id("unknown", DataType::Int64, true)]);
-    let mapping = vec![NameMappingEntry {
-        name: "score".to_string(),
-        field_id: 2,
-    }];
 
-    let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+    let binding = bind_columns(
+        &logical,
+        &physical,
+        &resolution_with_mapping(&[("score", 2)]),
+    );
 
     assert_eq!(
-        renamed.field(0).name(),
+        binding.renamed_physical.field(0).name(),
         "unknown",
         "uncovered field must keep the physical name"
+    );
+    assert!(
+        binding.bound_logical_names.is_empty(),
+        "a physical field matching no logical name binds nothing"
     );
 }
 
@@ -287,25 +407,115 @@ fn uncovered_name_mapping_falls_back_to_physical_name() {
 /// the physical name, exactly like the no-mapping fallback.
 #[test]
 fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
-    use super::rename_physical_to_logical;
-    use crate::scan::spec::NameMappingEntry;
-
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
     let physical = Schema::new(vec![field_with_id("score", DataType::Int64, true, 99)]);
-    let mapping = vec![NameMappingEntry {
-        name: "score".to_string(),
-        field_id: 2,
-    }];
 
-    let renamed = rename_physical_to_logical(&logical, &physical, &mapping);
+    let binding = bind_columns(
+        &logical,
+        &physical,
+        &resolution_with_mapping(&[("score", 2)]),
+    );
 
     assert_eq!(
-        renamed.field(0).name(),
+        binding.renamed_physical.field(0).name(),
         "score",
         "an unresolvable embedded id must NOT fall through to the name-mapping"
+    );
+}
+
+/// Scenario: column projection binds by a logical field's declared physical name.
+///
+/// The declared physical name claims the physical column even when a
+/// `name_mapping` entry covers that same physical name for a DIFFERENT logical
+/// field: a per-column declaration read from the table's own metadata is
+/// authoritative, while a name-mapping entry is only a table-level fallback.
+#[test]
+fn declared_physical_name_wins_over_a_covering_name_mapping_entry() {
+    // `amount` declares physical name `col-abc`; `other` binds by field-id 7,
+    // which the name-mapping ALSO reaches from `col-abc`.
+    let logical = Schema::new(vec![
+        field_no_id("amount", DataType::Int64, true),
+        field_with_id("other", DataType::Int64, true, 7),
+    ]);
+    let physical = Schema::new(vec![field_no_id("col-abc", DataType::Int64, true)]);
+    let resolution = FieldIdResolution {
+        declared_physical_names: HashMap::from([("col-abc".to_string(), "amount".to_string())]),
+        ..resolution_with_mapping(&[("col-abc", 7)])
+    };
+
+    let binding = bind_columns(&logical, &physical, &resolution);
+
+    assert_eq!(
+        binding.renamed_physical.field(0).name(),
+        "amount",
+        "the declared physical name must claim the column over the name-mapping"
+    );
+    assert!(
+        binding.bound_logical_names.contains("amount"),
+        "the declaring logical field must count as bound"
+    );
+    assert!(
+        !binding.bound_logical_names.contains("other"),
+        "the name-mapped logical field must NOT also claim the column"
+    );
+}
+
+/// Scenario: column projection binds by a logical field's declared physical name.
+///
+/// A physical field carrying an embedded field-id that NO logical field declares
+/// is not consumed by the field-id step, so a logical field declaring that
+/// physical name still claims it — the shape a `name`-mapped table has when its
+/// files were written with Parquet field-ids, whose logical fields carry none.
+#[test]
+fn declared_physical_name_claims_a_field_whose_embedded_id_is_unknown() {
+    let logical = Schema::new(vec![field_no_id("amount", DataType::Int64, true)]);
+    let physical = Schema::new(vec![field_with_id("col-abc", DataType::Int64, true, 42)]);
+
+    let binding = bind_columns(
+        &logical,
+        &physical,
+        &resolution_with_declared_names(&[("col-abc", "amount")]),
+    );
+
+    assert_eq!(
+        binding.renamed_physical.field(0).name(),
+        "amount",
+        "an unmatched embedded id must not block the declared-physical-name step"
+    );
+    assert!(binding.bound_logical_names.contains("amount"));
+}
+
+/// Scenario: a logical field carrying no binding key binds by its own name.
+///
+/// An identity-bound field present in the file binds to the physical column of
+/// the same name; one absent from the file stays unbound, which is what routes it
+/// to the per-file `initial-default` / NULL fill.
+#[test]
+fn identity_bound_fields_bind_by_their_own_name() {
+    let logical = Schema::new(vec![
+        field_no_id("id", DataType::Int64, false),
+        field_no_id("val", DataType::Int64, true),
+        field_no_id("added", DataType::Int64, true),
+    ]);
+    let physical = Schema::new(vec![
+        field_no_id("id", DataType::Int64, false),
+        field_no_id("val", DataType::Int64, true),
+    ]);
+
+    let binding = bind_columns(&logical, &physical, &bare_resolution());
+
+    assert_eq!(binding.renamed_physical.field(0).name(), "id");
+    assert_eq!(binding.renamed_physical.field(1).name(), "val");
+    assert!(
+        binding.bound_logical_names.contains("id") && binding.bound_logical_names.contains("val"),
+        "an identity-bound field the file supplies must bind to real values"
+    );
+    assert!(
+        !binding.bound_logical_names.contains("added"),
+        "an identity-bound field the file lacks must stay unbound for the fill seam"
     );
 }
 
@@ -414,13 +624,13 @@ fn absent_field_with_initial_default_emits_default_literal() {
         false,
         1,
     )]));
-    let defaults = HashMap::from([(9, ScalarValue::Utf8(Some("req-default".to_string())))]);
-
     let result = rewrite_with(
         Arc::clone(&logical),
         Arc::clone(&physical),
-        Vec::new(),
-        defaults,
+        resolution_with_defaults(&[(
+            "required_added",
+            ScalarValue::Utf8(Some("req-default".to_string())),
+        )]),
         Column::new("required_added", 1),
     )
     .expect("required-absent-with-default must not error");
@@ -435,13 +645,10 @@ fn absent_field_with_initial_default_emits_default_literal() {
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("nullable_added", DataType::Int64, true, 9),
     ]));
-    let defaults = HashMap::from([(9, ScalarValue::Int64(Some(-1)))]);
-
     let result = rewrite_with(
         logical,
         physical,
-        Vec::new(),
-        defaults,
+        resolution_with_defaults(&[("nullable_added", ScalarValue::Int64(Some(-1)))]),
         Column::new("nullable_added", 1),
     )
     .expect("nullable-absent-with-default must not error");
@@ -466,14 +673,14 @@ fn absent_nullable_without_default_is_null_filled() {
         false,
         1,
     )]));
-    // A default exists, but for a DIFFERENT field-id (5), not for 9.
-    let defaults = HashMap::from([(5, ScalarValue::Utf8(Some("unrelated".to_string())))]);
-
+    // A default exists, but for a DIFFERENT column (`elsewhere`), not for `note`.
     let result = rewrite_with(
         logical,
         physical,
-        Vec::new(),
-        defaults,
+        resolution_with_defaults(&[(
+            "elsewhere",
+            ScalarValue::Utf8(Some("unrelated".to_string())),
+        )]),
         Column::new("note", 1),
     )
     .expect("rewrite ok");
@@ -499,13 +706,10 @@ fn absent_required_without_default_errors_cleanly() {
         1,
     )]));
     // No default for the required-absent field.
-    let defaults = HashMap::new();
-
     let err = rewrite_with(
         logical,
         physical,
-        Vec::new(),
-        defaults,
+        bare_resolution(),
         Column::new("mandatory", 1),
     )
     .expect_err("required-absent with no default must error");
@@ -516,29 +720,30 @@ fn absent_required_without_default_errors_cleanly() {
     );
 }
 
-/// A field PRESENT in the file — whether resolved by embedded field-id or by
-/// name-mapping — binds to its REAL physical values and is NEVER defaulted,
-/// even when a default exists for its field-id.
+/// A field PRESENT in the file binds to its REAL physical values and is NEVER
+/// defaulted, even when a default exists for its logical column name. All four
+/// resolution paths that can claim a physical field are covered: a matching
+/// embedded field-id, a `name_mapping` entry, the physical-name fallback for a
+/// field carrying no embedded id, and that same fallback for a field whose
+/// embedded id no logical field claims.
 #[test]
 fn present_field_binds_real_value_not_default() {
-    use crate::scan::spec::NameMappingEntry;
-
-    // Present by embedded field-id (renamed score->rating, id 2).
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]));
+    let resolution = resolution_with_defaults(&[("rating", ScalarValue::Int64(Some(999)))]);
+
+    // Present by embedded field-id (renamed score->rating, id 2).
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("score", DataType::Int64, true, 2),
     ]));
-    let defaults = HashMap::from([(2, ScalarValue::Int64(Some(999)))]);
 
     let result = rewrite_with(
         Arc::clone(&logical),
         physical,
-        Vec::new(),
-        defaults.clone(),
+        resolution.clone(),
         Column::new("rating", 1),
     )
     .expect("rewrite ok");
@@ -552,38 +757,69 @@ fn present_field_binds_real_value_not_default() {
         field_with_id("id", DataType::Int64, false, 1),
         field_no_id("score", DataType::Int64, true),
     ]));
-    let mapping = vec![NameMappingEntry {
-        name: "score".to_string(),
-        field_id: 2,
-    }];
+    let name_mapped = FieldIdResolution {
+        name_mapping: vec![NameMappingEntry {
+            name: "score".to_string(),
+            field_id: 2,
+        }],
+        ..resolution.clone()
+    };
 
     let result = rewrite_with(
-        logical,
+        Arc::clone(&logical),
         physical,
-        mapping,
-        defaults,
+        name_mapped,
         Column::new("rating", 1),
     )
     .expect("rewrite ok");
-    // A name-mapped field carries no embedded field-id metadata, so the
-    // default adapter binds the real physical column wrapped in an identity
-    // cast (Int64→Int64) — same as the no-field-id name fallback. The point
-    // is that it binds the REAL physical column (index 1), never a default
-    // Literal, so accept either a bare Column or a cast-wrapped Column.
-    let bound_index = result
-        .downcast_ref::<Column>()
-        .map(Column::index)
-        .or_else(|| {
-            result
-                .downcast_ref::<CastExpr>()
-                .and_then(|c| c.expr().downcast_ref::<Column>())
-                .map(Column::index)
-        })
-        .expect(
-            "a field present via name-mapping must bind a real physical Column \
-             (bare or cast-wrapped), not a default Literal",
-        );
-    assert_eq!(bound_index, 1, "name-mapping must bind the score slot");
+    assert_eq!(
+        bound_physical_index(&result).expect(
+            "a field present via name-mapping must bind its real value, never a default Literal"
+        ),
+        1,
+        "name-mapping must bind the score slot"
+    );
+
+    // Present by the physical-name fallback: no embedded id, no name_mapping
+    // entry, the physical name already IS the logical name.
+    let physical = Arc::new(Schema::new(vec![
+        field_with_id("id", DataType::Int64, false, 1),
+        field_no_id("rating", DataType::Int64, true),
+    ]));
+
+    let result = rewrite_with(
+        Arc::clone(&logical),
+        physical,
+        resolution.clone(),
+        Column::new("rating", 1),
+    )
+    .expect("rewrite ok");
+    assert_eq!(
+        bound_physical_index(&result).expect(
+            "a column the file supplies under the logical name must bind its real \
+             value, never a default Literal"
+        ),
+        1,
+        "the physical-name fallback must bind the rating slot"
+    );
+
+    // Present under an embedded field-id no logical field claims: the field-id
+    // step matches nothing, the physical name still supplies the column.
+    let physical = Arc::new(Schema::new(vec![
+        field_with_id("id", DataType::Int64, false, 1),
+        field_with_id("rating", DataType::Int64, true, 99),
+    ]));
+
+    let result =
+        rewrite_with(logical, physical, resolution, Column::new("rating", 1)).expect("rewrite ok");
+    assert_eq!(
+        bound_physical_index(&result).expect(
+            "a column the file supplies under an unknown embedded field-id must bind \
+             its real value, never a default Literal"
+        ),
+        1,
+        "an unknown embedded id must still bind the rating slot"
+    );
 }
 
 /// The fill decision is PER FILE: one factory (one reconstructed default map)
@@ -596,8 +832,10 @@ fn default_fill_decision_is_per_file() {
         field_with_id("added", DataType::Utf8, true, 9),
     ]));
     let factory = FieldIdExprAdapterFactory {
-        name_mapping: Vec::new(),
-        defaults: HashMap::from([(9, ScalarValue::Utf8(Some("D".to_string())))]),
+        resolution: resolution_with_defaults(&[(
+            "added",
+            ScalarValue::Utf8(Some("D".to_string())),
+        )]),
     };
 
     // File B: the added column IS present — binds its real value.
@@ -702,18 +940,20 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     // Logical (current) schema: field-id 2 is now `rating`, not `score`.
     let logical = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "rating".to_string(),
             arrow_type: "float64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
     ];
 
@@ -826,18 +1066,20 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
 
     let logical = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "rating".to_string(),
             arrow_type: "float64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
     ];
 
@@ -956,11 +1198,12 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
         .iter()
         .enumerate()
         .map(|(i, (tag, encoded, _))| LogicalField {
-            field_id: i as i32 + 1,
+            field_id: Some(i as i32 + 1),
             name: format!("c{i}"),
             arrow_type: (*tag).to_string(),
             nullable: true,
             initial_default: Some((*encoded).to_string()),
+            physical_name: None,
         })
         .collect();
 

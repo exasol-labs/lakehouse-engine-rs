@@ -695,11 +695,12 @@ fn refusing_endpoint(message: &str) -> String {
 
 fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
     LogicalField {
-        field_id,
+        field_id: Some(field_id),
         name: name.into(),
         arrow_type: arrow_type.into(),
         nullable: false,
         initial_default: None,
+        physical_name: None,
     }
 }
 

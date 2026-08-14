@@ -106,6 +106,127 @@ async fn register_files_falls_back_without_logical_schema() {
     );
 }
 
+/// Scenario: scan without a logical schema falls back to first-file inference.
+///
+/// The fallback is selected by the ABSENCE of a logical schema ALONE: a spec whose
+/// logical schema IS present still installs the column-binding adapter even when
+/// every field binds by identity (no field-id, no declared physical name). The
+/// observable difference from inference is what this asserts — the DECLARED schema
+/// becomes the table schema, and a declared column absent from the file NULL-fills
+/// instead of being unknown to the query.
+#[tokio::test]
+async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter() {
+    use crate::scan::spec::LogicalField;
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::context::SessionContext;
+    use parquet::arrow::ArrowWriter;
+
+    // A file written with NO field-id metadata at all, as a Delta `none`
+    // column-mapping table's files are.
+    let dir = std::env::temp_dir().join(format!("lh_identity_binding_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("identity.parquet");
+
+    let physical_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("val", DataType::Int64, true),
+    ]));
+    {
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
+        let batch = RecordBatch::try_new(
+            physical_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+            ],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    let file_url = url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string();
+
+    // Every field binds by identity, and `added` is absent from the file.
+    let identity_field = |name: &str, nullable: bool| LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: "int64".to_string(),
+        nullable,
+        initial_default: None,
+        physical_name: None,
+    };
+    let mut spec = minimal_spec();
+    let file_size = local_file_size(&file_url);
+    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.common.logical_schema = vec![
+        identity_field("id", false),
+        identity_field("val", true),
+        identity_field("added", true),
+    ];
+    spec.common.projection = vec!["ID".into(), "VAL".into(), "ADDED".into()];
+
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    register_files(&ctx, "scan_target", &spec)
+        .await
+        .expect("register_files must succeed for an all-identity logical schema");
+
+    // The DECLARED schema is the table schema — first-file inference would have
+    // registered the file's own two columns instead.
+    let registered = ctx
+        .table("scan_target")
+        .await
+        .expect("scan_target must be registered");
+    assert_eq!(
+        registered
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "val", "added"],
+        "the logical schema must be registered, not one inferred from the file"
+    );
+
+    let sql = build_scan_sql(&ctx, "scan_target", &spec)
+        .await
+        .expect("build_scan_sql");
+    let df = ctx.sql(&sql).await.expect("plan scan SQL");
+    let batches = df.collect().await.expect("identity binding must read rows");
+
+    let mut rows: Vec<(i64, i64, bool)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column is Int64");
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("val column is Int64");
+        let added = batch.column(2);
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), vals.value(row), added.is_null(row)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+    assert_eq!(
+        rows,
+        vec![(1, 10, true), (2, 20, true), (3, 30, true)],
+        "identity-bound columns must read their real values, and the declared \
+         column absent from the file must NULL-fill"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Task B4 (scenario `topn: Ordered top-N preserves descending and NULL ordering`):
 /// `build_scan_sql` renders a pushed-down ORDER BY through the SAME shared
 /// `render_order_by_clause` the adapter's outer merge uses, so per-shard and
@@ -248,18 +369,20 @@ async fn build_scan_sql_aliases_over_logical_schema() {
 
     let logical = vec![
         LogicalField {
-            field_id: 1,
+            field_id: Some(1),
             name: "id".to_string(),
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            physical_name: None,
         },
         LogicalField {
-            field_id: 2,
+            field_id: Some(2),
             name: "rating".to_string(),
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            physical_name: None,
         },
     ];
     let logical_schema = build_logical_arrow_schema(&logical);

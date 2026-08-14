@@ -350,7 +350,7 @@ pub(crate) fn build_dispatch_sql(
         logical_schema: logical_schema.clone(),
         name_mapping: name_mapping.clone(),
         join: None,
-        delta: None,
+        partition_columns: Vec::new(),
         storage: storage.clone(),
         df_target_partitions,
         df_batch_size,
@@ -816,11 +816,12 @@ pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<Logica
             let arrow_dt = crate::types::mapping::iceberg_type_to_arrow(&f.field_type);
             let arrow_type = crate::types::mapping::arrow_type_to_tag(&arrow_dt);
             LogicalField {
-                field_id: f.id,
+                field_id: Some(f.id),
                 name: f.name.clone(),
                 arrow_type,
                 nullable: !f.required,
                 initial_default: encode_initial_default(f),
+                physical_name: None,
             }
         })
         .collect()

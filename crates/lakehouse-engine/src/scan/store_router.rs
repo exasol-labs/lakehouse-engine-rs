@@ -75,8 +75,10 @@ impl RoutedSide {
     /// THAT side's storage backend. `side.label` names the side in routing errors
     /// (`"fact"`, `"dimension"`).
     ///
-    /// The owned set holds every data file AND every positional-delete file of
-    /// every entry, since the scan requests both. Both the owned paths and the
+    /// The owned set holds every data file AND every delete FILE an entry's
+    /// mechanisms name, since the scan requests both; a mechanism carrying no
+    /// object-store path of its own claims nothing, having no path to route. Both
+    /// the owned paths and the
     /// root are derived through `ListingTableUrl::parse(..).prefix()` — the
     /// derivation the spec-sized HEAD index already uses — so file paths and roots
     /// share one coordinate system by construction rather than by inspection.
@@ -89,7 +91,9 @@ impl RoutedSide {
         for file in side.files {
             owned.insert(store_path(&file.path, side.table_root)?);
             for delete in &file.deletes {
-                owned.insert(store_path(&delete.path, side.table_root)?);
+                if let Some(path) = delete.object_store_path() {
+                    owned.insert(store_path(path, side.table_root)?);
+                }
             }
         }
         let root = match side.table_root {

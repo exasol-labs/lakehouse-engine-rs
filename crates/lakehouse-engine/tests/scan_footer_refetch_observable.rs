@@ -43,8 +43,8 @@ use lakehouse_engine::scan::diagnostics::{
     OpenerCoverage, PhaseTimers, footer_refetch_count, reset_access_plan_cached_footers,
 };
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteFileContentType, DeleteFileRef, FileEntry, LogicalField, ScanSpec,
-    StorageBackend, StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, run_scan_one, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -252,18 +252,20 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
             df_batch_size: 64,
             logical_schema: vec![
                 LogicalField {
-                    field_id: 1,
+                    field_id: Some(1),
                     name: "id".to_string(),
                     arrow_type: "int64".to_string(),
                     nullable: false,
                     initial_default: None,
+                    physical_name: None,
                 },
                 LogicalField {
-                    field_id: 2,
+                    field_id: Some(2),
                     name: "name".to_string(),
                     arrow_type: "utf8".to_string(),
                     nullable: false,
                     initial_default: None,
+                    physical_name: None,
                 },
             ],
             ..Default::default()
@@ -429,10 +431,9 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     let entry = FileEntry::with_deletes(
         data_url.clone(),
         data_size,
-        vec![DeleteFileRef {
+        vec![DeleteMechanism::IcebergPositionalDelete {
             path: delete_url.clone(),
             size: delete_size,
-            content_type: DeleteFileContentType::PositionDeletes,
         }],
     );
     let mut spec = raw_spec_with_logical_schema(String::new());
@@ -587,10 +588,9 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
             FileEntry::with_deletes(
                 url.clone(),
                 *size,
-                vec![DeleteFileRef {
+                vec![DeleteMechanism::IcebergPositionalDelete {
                     path: limit_delete_url.clone(),
                     size: limit_delete_size,
-                    content_type: DeleteFileContentType::PositionDeletes,
                 }],
             )
         })
@@ -702,10 +702,9 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
         spec.files = vec![FileEntry::with_deletes(
             data_url.to_string(),
             file_size(data_url),
-            vec![DeleteFileRef {
+            vec![DeleteMechanism::IcebergPositionalDelete {
                 path: delete_url.to_string(),
                 size: file_size(delete_url),
-                content_type: DeleteFileContentType::PositionDeletes,
             }],
         )];
         spec

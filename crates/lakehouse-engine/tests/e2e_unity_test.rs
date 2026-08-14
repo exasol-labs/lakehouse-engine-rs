@@ -40,7 +40,7 @@ use lakehouse_engine::adapter::connection::storage_block;
 use lakehouse_engine::adapter::pushdown::{
     ConnectionStorage, ResolvedScan, ScanSource, format_reader,
 };
-use lakehouse_engine::scan::spec::FileEntry;
+use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -391,18 +391,15 @@ async fn resolve_delta_scan(table_name: &str, use_vended_credentials: bool) -> R
 /// counterpart of the offline pin in
 /// `crates/lakehouse-engine/src/adapter/pushdown/format/delta_replay_tests.rs`.
 ///
-/// Panics unless EVERY entry carries a Delta block holding exactly one partition entry
-/// keyed `letter`: partition values live only in the transaction log, so an empty map
-/// (or an absent block) is a resolution that silently lost them, which comparing two
-/// runs against each other cannot detect.
+/// Panics unless EVERY entry carries exactly one partition entry keyed `letter`:
+/// partition values live only in the transaction log, so an empty map is a
+/// resolution that silently lost them, which comparing two runs against each
+/// other cannot detect.
 fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
     let mut carried: Vec<(&str, Option<String>)> = files
         .iter()
         .map(|entry| {
-            let delta = entry.delta.as_ref().unwrap_or_else(|| {
-                panic!("every resolved Delta file must carry its per-file block: {entry:?}")
-            });
-            let mut partition_values = delta.partition_values.iter();
+            let mut partition_values = entry.partition_values.iter();
             let (column, value) = partition_values.next().unwrap_or_else(|| {
                 panic!(
                     "{} must carry its logged partition value, not an empty map",
@@ -413,7 +410,7 @@ fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
                 partition_values.next().is_none(),
                 "{} must carry exactly one partition entry: {:?}",
                 entry.path,
-                delta.partition_values
+                entry.partition_values
             );
             assert_eq!(
                 column, "letter",
@@ -440,8 +437,8 @@ fn rt() -> tokio::runtime::Runtime {
 /// Catalog temporary-table-credentials request, vending a real MinIO STS session
 /// minted and injected by the fixture harness, never a static key)
 /// and once under the CONNECTION's own static MinIO credential — and both runs
-/// must agree on the file list, the per-file partition values (carried inside
-/// `FileEntry::delta`), and the table root: both read the SAME transaction log
+/// must agree on the file list, the per-file partition values (carried in
+/// `FileEntry::partition_values`), and the table root: both read the SAME transaction log
 /// through two DIFFERENT credential paths that must terminate in an equivalent
 /// view of the table. `effective_storage` is deliberately NOT compared, since
 /// the two runs read through genuinely different credentials by design.
@@ -512,12 +509,12 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
         "table_with_dv must resolve exactly one active data file: {:?}",
         dv_scan.files
     );
-    let deletion_vector = dv_scan.files[0]
-        .delta
-        .as_ref()
-        .and_then(|delta| delta.deletion_vector.as_ref());
+    let has_deletion_vector = dv_scan.files[0]
+        .deletes
+        .iter()
+        .any(|delete| matches!(delete, DeleteMechanism::DeltaDeletionVector { .. }));
     assert!(
-        deletion_vector.is_some(),
+        has_deletion_vector,
         "table_with_dv's single active file must carry a deletion-vector reference: {:?}",
         dv_scan.files[0]
     );

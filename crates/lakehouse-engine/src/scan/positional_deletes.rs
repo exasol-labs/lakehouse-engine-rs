@@ -27,7 +27,7 @@
 //! `FieldIdExprAdapter`.
 
 use crate::scan::diagnostics;
-use crate::scan::spec::{DeleteFileContentType, DeleteFileRef, FileEntry, StorageBackend};
+use crate::scan::spec::{DeleteMechanism, FileEntry, StorageBackend};
 use crate::scan::{
     FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
 };
@@ -225,21 +225,45 @@ fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     })
 }
 
-/// Read-time backstop (task 2.6): reject any assigned delete file this engine
-/// cannot apply as a Parquet positional delete, with a clean,
-/// credential-redacted error, BEFORE any row of the affected data file is
-/// emitted. The plan-time gate (adapter) is the authoritative filter; this is
-/// cheap defense-in-depth against a non-positional delete slipping through.
-fn ensure_positional_delete(delete: &DeleteFileRef, secrets: &[String]) -> Result<(), UdfError> {
-    if delete.content_type == DeleteFileContentType::PositionDeletes {
-        return Ok(());
-    }
-    let mechanism = match delete.content_type {
-        DeleteFileContentType::PositionDeletes => unreachable!(),
-        DeleteFileContentType::EqualityDeletes => "an Iceberg equality delete",
-        DeleteFileContentType::PuffinDeletionVector => "a Puffin deletion vector",
+/// Read-time backstop: dispatch on a delete mechanism's own variant, yielding the
+/// path and byte size of the ONE mechanism this engine applies — an Iceberg Parquet
+/// positional delete — and refusing every other variant with a clean,
+/// credential-redacted error.
+///
+/// The refusal is what makes the dispatch total: a mechanism the scan cannot apply
+/// can neither be read nor silently skipped, because the payload needed to read a
+/// delete file is reachable only through this call. The plan-time gate (adapter) is
+/// the authoritative filter; this is cheap defense-in-depth against a
+/// non-positional mechanism slipping through, and it runs before any row of the
+/// affected data file is emitted.
+///
+/// `data_file_path` names the entry carrying `delete`, and is what a Delta
+/// deletion-vector refusal reports: that variant has no delete-file path to name,
+/// and its `path_or_inline_dv` is an opaque token or payload rather than a
+/// diagnostic. Applying Delta deletion vectors is issue #320.
+fn applicable_positional_delete<'a>(
+    delete: &'a DeleteMechanism,
+    data_file_path: &str,
+    secrets: &[String],
+) -> Result<(&'a str, u64), UdfError> {
+    let (path, mechanism) = match delete {
+        DeleteMechanism::IcebergPositionalDelete { path, size } => {
+            return Ok((path.as_str(), *size));
+        }
+        DeleteMechanism::IcebergEqualityDelete { path, .. } => (path, "an Iceberg equality delete"),
+        DeleteMechanism::IcebergPuffinDeletionVector { path, .. } => {
+            (path, "a Puffin deletion vector")
+        }
+        DeleteMechanism::DeltaDeletionVector { .. } => {
+            let data_file = redact(data_file_path.to_string(), secrets);
+            return Err(UdfError::User(format!(
+                "data file '{data_file}' carries a Delta deletion vector, which this engine cannot \
+                 apply on read (applying Delta deletion vectors is issue #320); refusing to emit \
+                 rows for the affected data file"
+            )));
+        }
     };
-    let path = redact(delete.path.clone(), secrets);
+    let path = redact(path.clone(), secrets);
     Err(UdfError::User(format!(
         "assigned delete file '{path}' is {mechanism}, which this engine cannot apply on read \
          (only Parquet positional deletes are supported); refusing to emit rows for the affected \
@@ -529,16 +553,15 @@ impl PositionalDeleteScanTable {
     /// Construct the provider from the resolved logical Arrow schema and the
     /// per-shard file list. `use_field_id_adapter` mirrors the previous
     /// `register_files` behavior: the [`FieldIdExprAdapterFactory`] is attached
-    /// only when the adapter supplied a logical schema (field-id binding);
-    /// legacy specs that fell back to first-file inference bind by name.
-    /// `field_id_resolution` groups the query's flattened
-    /// `schema.name-mapping.default` entries for this side (fact or
-    /// dimension) together with the reconstructed Iceberg `initial-default`
-    /// values keyed by field-id — both resolved once in the VS alongside the
-    /// logical schema, and empty when the table has neither. It is carried
-    /// through unchanged to the [`FieldIdExprAdapterFactory`] installed in
-    /// [`Self::scan`] for name-mapping resolution and the absent-with-default
-    /// fill respectively. `delete_path_read_limiter` is the shared
+    /// only when the adapter supplied a logical schema, whichever key its fields
+    /// bind by; legacy specs that fell back to first-file inference bind by name.
+    /// `field_id_resolution` groups this side's (fact or dimension) binding
+    /// tables — the flattened `schema.name-mapping.default` entries and the
+    /// logical name each declared physical name claims — together with the
+    /// reconstructed Iceberg `initial-default` values keyed by logical column
+    /// name, all resolved once in the VS alongside the logical schema and empty
+    /// when the table declares none of them. It is carried through unchanged to
+    /// the [`FieldIdExprAdapterFactory`] installed in [`Self::scan`]. `delete_path_read_limiter` is the shared
     /// instance-level semaphore bounding every object-store read the delete
     /// path issues while preparing a scan — Phase A delete-file bodies and
     /// Phase B data-file footers alike, one permit per read — sized
@@ -579,19 +602,19 @@ impl PositionalDeleteScanTable {
     /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file
     /// absolute path each delete row targets.
     ///
-    /// Every unique delete file is backstop-validated with
-    /// [`ensure_positional_delete`] BEFORE any I/O, so an unapplicable delete
-    /// anywhere in the shard fails loud before a single row is read. Each read
-    /// holds a permit from the shared limiter, so the whole instance — both
-    /// sides of a broadcast join included — stays within one connection budget.
-    /// The per-delete-file maps are unioned; [`RoaringTreemap`] union is
-    /// commutative and associative, so the non-deterministic completion order of
-    /// the concurrent reads cannot change the result.
+    /// Every delete mechanism on every assigned entry passes through
+    /// [`applicable_positional_delete`] BEFORE any I/O, so an unapplicable mechanism
+    /// anywhere in the shard fails loud before a single row is read. That call is
+    /// also what supplies the path and size keyed and read below, which is why the
+    /// dedup cannot key on a mechanism the scan does not apply. Each read holds a
+    /// permit from the shared limiter, so the whole instance — both sides of a
+    /// broadcast join included — stays within one connection budget. The
+    /// per-delete-file maps are unioned; [`RoaringTreemap`] union is commutative and
+    /// associative, so the non-deterministic completion order of the concurrent
+    /// reads cannot change the result.
     ///
     /// No object-store HEAD is issued: each delete file's [`ObjectMeta`] is built
-    /// from its spec-supplied [`DeleteFileRef::size`] via [`object_meta_for`].
-    ///
-    /// [`DeleteFileRef::size`]: crate::scan::spec::DeleteFileRef::size
+    /// from its spec-supplied byte size via [`object_meta_for`].
     async fn collect_delete_positions(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -602,11 +625,12 @@ impl PositionalDeleteScanTable {
             .map(|entry| reconstruct_abs_uri(&entry.path, &self.table_root))
             .collect();
 
-        let mut unique_deletes: HashMap<&str, &DeleteFileRef> = HashMap::new();
+        let mut unique_deletes: HashMap<&str, u64> = HashMap::new();
         for entry in &self.files {
             for delete in &entry.deletes {
-                ensure_positional_delete(delete, &self.secrets)?;
-                unique_deletes.entry(delete.path.as_str()).or_insert(delete);
+                let (path, size) =
+                    applicable_positional_delete(delete, &entry.path, &self.secrets)?;
+                unique_deletes.entry(path).or_insert(size);
             }
         }
 
@@ -615,21 +639,22 @@ impl PositionalDeleteScanTable {
         }
 
         let assigned_ref = &assigned;
-        let reads = unique_deletes.into_values().map(|delete| {
-            let store = Arc::clone(store);
-            let limiter = Arc::clone(&self.delete_path_read_limiter);
-            let secrets = self.secrets.as_slice();
-            let table_root = self.table_root.as_str();
-            async move {
-                let _permit = limiter
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))?;
-                let delete_abs = reconstruct_abs_uri(&delete.path, table_root);
-                let delete_meta = object_meta_for(&delete_abs, delete.size)?;
-                read_delete_file_positions(store, delete_meta, assigned_ref, secrets).await
-            }
-        });
+        let reads = unique_deletes
+            .into_iter()
+            .map(|(delete_path, delete_size)| {
+                let store = Arc::clone(store);
+                let limiter = Arc::clone(&self.delete_path_read_limiter);
+                let secrets = self.secrets.as_slice();
+                let table_root = self.table_root.as_str();
+                async move {
+                    let _permit = limiter.acquire_owned().await.map_err(|e| {
+                        UdfError::User(format!("delete-read limiter unavailable: {e}"))
+                    })?;
+                    let delete_abs = reconstruct_abs_uri(delete_path, table_root);
+                    let delete_meta = object_meta_for(&delete_abs, delete_size)?;
+                    read_delete_file_positions(store, delete_meta, assigned_ref, secrets).await
+                }
+            });
         let per_file_maps = try_join_all(reads).await?;
 
         let mut merged: HashMap<String, RoaringTreemap> = HashMap::new();
@@ -764,8 +789,7 @@ impl TableProvider for PositionalDeleteScanTable {
 
         let expr_adapter = self.use_field_id_adapter.then(|| {
             Arc::new(FieldIdExprAdapterFactory {
-                name_mapping: self.field_id_resolution.name_mapping.clone(),
-                defaults: self.field_id_resolution.defaults.clone(),
+                resolution: self.field_id_resolution.clone(),
             }) as Arc<_>
         });
 
