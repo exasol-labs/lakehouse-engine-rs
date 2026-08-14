@@ -14,7 +14,7 @@ pub mod sharding;
 pub mod tables;
 
 use crate::adapter::capabilities::get_capabilities_response;
-use crate::adapter::catalog_kind::{CatalogKind, resolve_catalog_kind};
+use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::handle_pushdown;
@@ -155,20 +155,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // the schema that qualifies the scan/distributor/merge UDF names in the
             // generated pushdown SQL.
             let props = get_properties(request);
-
-            // Unity Catalog scan execution is not built yet (#319/#320): refuse
-            // before any catalog client, credential, or file resolution, so a
-            // Unity Catalog pushdown issues no catalog request at all rather than
-            // being silently routed through the Iceberg REST file-resolution path,
-            // which cannot read a Delta table.
-            if resolve_catalog_kind(&props)? == CatalogKind::UnityCatalogNative {
-                return Err(UdfError::User(
-                    "Unity Catalog scan execution is not yet supported".into(),
-                ));
-            }
-
-            let (catalog_uri, storage, creds, allow_http, _) =
-                resolve_connection_config(ctx, &props)?;
+            let config = resolve_connection_config(ctx, &props)?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
 
@@ -177,16 +164,7 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
             rt.block_on(async {
-                handle_pushdown_request(
-                    request,
-                    &catalog_uri,
-                    &storage,
-                    &creds,
-                    allow_http,
-                    &script_schema,
-                    cluster_nodes,
-                )
-                .await
+                handle_pushdown_request(request, &config, &script_schema, cluster_nodes).await
             })
         }
         other => Err(UdfError::User(format!(
@@ -196,6 +174,18 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     }
 }
 
+/// The catalog/storage configuration resolved from the `CATALOG_CONNECTION`
+/// object, bundled because [`resolve_connection_config`]'s callers thread every
+/// field on to [`TableScanResolver::for_request`] and [`ConnectionStorage`]
+/// without inspecting them individually.
+pub struct ResolvedConnectionConfig {
+    pub(crate) catalog_uri: String,
+    pub(crate) storage: StorageBackend,
+    pub(crate) creds: ConnectionCreds,
+    pub(crate) allow_http: bool,
+    pub(crate) catalog_kind: CatalogKind,
+}
+
 /// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION` object.
 ///
 /// Shared by the createVirtualSchema and pushdown entry points. `ctx.connection()`
@@ -203,22 +193,29 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 /// Table identity is no longer fixed at config-resolution time; callers build
 /// `CatalogProps` with the specific per-table identifier when known.
 ///
-/// The returned `bool` is the resolved `ALLOW_HTTP` property, read in this one place
-/// because both storage selectors need it: `storage_block` bakes it into the static
-/// S3 payload, the vended selector uses it as its plaintext-transport consent gate.
-/// The resolved `CatalogKind` is also returned so the create path reuses this single
-/// parse instead of resolving `CATALOG_KIND` a second time for client construction.
+/// `allow_http`, needed by both storage selectors (`storage_block` bakes it into
+/// the static S3 payload, the vended selector uses it as its plaintext-transport
+/// consent gate), and `catalog_kind`, reused by the create path instead of
+/// resolving `CATALOG_KIND` a second time for client construction, ride on the
+/// returned [`ResolvedConnectionConfig`] alongside the rest of the resolved
+/// configuration.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
-) -> Result<(String, StorageBackend, ConnectionCreds, bool, CatalogKind), UdfError> {
+) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
     let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION), kind)?;
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let storage = storage_block(&resolved.creds, allow_http);
-    Ok((resolved.uri, storage, resolved.creds, allow_http, kind))
+    Ok(ResolvedConnectionConfig {
+        catalog_uri: resolved.uri,
+        storage,
+        creds: resolved.creds,
+        allow_http,
+        catalog_kind: kind,
+    })
 }
 
 fn handle_create_virtual_schema(
@@ -233,10 +230,10 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
-    // `ALLOW_HTTP` is discarded here: schema enumeration reaches no vended selector,
-    // and `storage_block` already baked it into `storage`. `kind` is the single
-    // `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
-    let (catalog_uri, storage, creds, _, kind) = resolve_connection_config(ctx, &props)?;
+    // `allow_http` is discarded here: schema enumeration reaches no vended selector,
+    // and `storage_block` already baked it into `storage`. `catalog_kind` is the
+    // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
+    let config = resolve_connection_config(ctx, &props)?;
 
     let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
         .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
@@ -275,13 +272,18 @@ fn handle_create_virtual_schema(
 
     // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
     // identical for both kinds and never asks which catalog it holds.
-    let client = construct_catalog_client(kind, catalog_uri, storage.clone(), creds);
+    let client = construct_catalog_client(
+        config.catalog_kind,
+        config.catalog_uri,
+        config.storage.clone(),
+        config.creds,
+    );
     let listing = rt
         .block_on(async { client.list_tables(&configured_ns).await })
-        .map_err(|e| redact_error(&storage, e))?;
+        .map_err(|e| redact_error(&config.storage, e))?;
 
     let (tables_json, table_map, skipped) = build_listing_virtual_tables(&configured_ns, &listing)
-        .map_err(|e| redact_error(&storage, e))?;
+        .map_err(|e| redact_error(&config.storage, e))?;
 
     for entry in &skipped {
         udf_log!(ctx, warn, "{}", skip_warning(entry));
@@ -356,10 +358,7 @@ fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
 
 async fn handle_pushdown_request(
     request: &Json,
-    catalog_uri: &str,
-    storage: &StorageBackend,
-    creds: &ConnectionCreds,
-    allow_http: bool,
+    config: &ResolvedConnectionConfig,
     script_schema: &str,
     cluster_nodes: usize,
 ) -> Result<Json, UdfError> {
@@ -402,12 +401,11 @@ async fn handle_pushdown_request(
 
     // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
-    let catalog = catalog_block(creds, &iceberg_identifier);
+    let catalog = catalog_block(&config.creds, &iceberg_identifier);
 
     handle_pushdown(
         request,
-        catalog_uri,
-        storage,
+        config,
         &catalog,
         Some(script_schema),
         cluster_nodes,
@@ -419,11 +417,9 @@ async fn handle_pushdown_request(
         instance_overhead_mb,
         s3_max_connections,
         join_broadcast_max_bytes,
-        creds,
-        allow_http,
     )
     .await
-    .map_err(|e| redact_error(storage, e))
+    .map_err(|e| redact_error(&config.storage, e))
 }
 
 // ---------------------------------------------------------------------------

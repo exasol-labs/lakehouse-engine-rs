@@ -1,18 +1,22 @@
-//! Scan-side application of Iceberg merge-on-read **Parquet positional deletes**.
+//! Scan-side application of **row-position deletes**, whichever table format expresses
+//! them: Iceberg merge-on-read Parquet positional deletes and Delta deletion vectors.
 //!
-//! The adapter resolves each data file's associated positional-delete files once
-//! per query and carries them in the per-shard files argument (see
-//! [`crate::scan::spec::FileEntry`]). At read time this module runs a two-phase
-//! pipeline in [`PositionalDeleteScanTable::partitioned_files`]:
+//! The adapter resolves each data file's deletes once per query and carries them in the
+//! per-shard files argument (see [`crate::scan::spec::FileEntry`]). At read time this
+//! module runs a two-phase pipeline in
+//! [`PositionalDeleteScanTable::partitioned_files`]:
 //!
-//! 1. **Phase A** reads each of the shard's UNIQUE positional-delete Parquet
-//!    files exactly once (`file_path` / `pos` columns, Iceberg reserved
-//!    field-ids 2147483546 / 2147483545), concurrently within a shared
-//!    connection budget, buckets each surviving `pos` value under its
-//!    `file_path` (restricted to the assigned data files — the shape required
-//!    for `partition` granularity, where one delete file references many data
-//!    files), and unions across delete files into a merged
-//!    `HashMap<data_file_path, `[`RoaringTreemap`]`>`;
+//! 1. **Phase A** classifies every mechanism the shard carries via
+//!    [`applicable_delete_mechanism`], then reads each UNIQUE payload exactly once,
+//!    concurrently within one shared connection budget: a positional-delete Parquet
+//!    file's `file_path` / `pos` columns (Iceberg reserved field-ids 2147483546 /
+//!    2147483545), bucketing each surviving `pos` value under its `file_path`
+//!    (restricted to the assigned data files — the shape required for `partition`
+//!    granularity, where one delete file references many data files); and each Delta
+//!    deletion-vector sidecar body, decoded per descriptor by
+//!    [`crate::scan::deletion_vectors`]. Both merge into one
+//!    `HashMap<data_file_path, `[`RoaringTreemap`]`>`, so nothing downstream learns
+//!    which mechanism produced an entry;
 //! 2. converts that set plus the data file's per-row-group row counts into a
 //!    per-row-group [`RowSelection`] via [`build_deletes_row_selection`];
 //! 3. attaches it as a base [`ParquetAccessPlan`] on the data file's
@@ -26,7 +30,9 @@
 //! row-group + page pruning, statistics, streaming, and the existing
 //! `FieldIdExprAdapter`.
 
+use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector};
 use crate::scan::diagnostics;
+use crate::scan::partition_values::PartitionedScanSchema;
 use crate::scan::spec::{DeleteMechanism, FileEntry, StorageBackend};
 use crate::scan::{
     FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
@@ -34,6 +40,7 @@ use crate::scan::{
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::TimeZone;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::TableType;
@@ -44,13 +51,12 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::parquet::ParquetAccessPlan;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
-use datafusion::datasource::table_schema::TableSchema;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use futures::StreamExt;
 use futures::future::try_join_all;
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::file::metadata::{PageIndexPolicy, RowGroupMetaData};
@@ -59,6 +65,7 @@ use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use url::Url;
 
 /// Iceberg reserved field-id for the `file_path` column of a positional-delete file.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
@@ -225,49 +232,82 @@ fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     })
 }
 
-/// Read-time backstop: dispatch on a delete mechanism's own variant, yielding the
-/// path and byte size of the ONE mechanism this engine applies — an Iceberg Parquet
-/// positional delete — and refusing every other variant with a clean,
+/// A delete mechanism this engine applies, carrying what applying it needs.
+///
+/// Both members feed ONE position map: an accumulated positional-delete set and a
+/// decoded deletion vector are both a bitmap of 0-based row positions in one data
+/// file, so nothing downstream of the read phase learns which mechanism produced an
+/// entry.
+#[derive(Debug)]
+enum ApplicableDelete<'a> {
+    /// An Iceberg Parquet positional-delete FILE, named by the path and byte size the
+    /// delete read consumes. One such file may carry deletes for many data files.
+    PositionalDeleteFile { path: &'a str, size: u64 },
+    /// A Delta deletion vector, already validated and resolved to the sidecar body it
+    /// needs — or to none, when the vector is inline. Its positions index the ONE data
+    /// file that carries it.
+    DeletionVector(DeletionVector),
+}
+
+/// Read-time backstop: dispatch on a delete mechanism's own variant, classifying the
+/// two mechanisms this engine applies and refusing every other variant with a clean,
 /// credential-redacted error.
 ///
-/// The refusal is what makes the dispatch total: a mechanism the scan cannot apply
-/// can neither be read nor silently skipped, because the payload needed to read a
-/// delete file is reachable only through this call. The plan-time gate (adapter) is
-/// the authoritative filter; this is cheap defense-in-depth against a
-/// non-positional mechanism slipping through, and it runs before any row of the
-/// affected data file is emitted.
+/// The refusal is what makes the dispatch total: a mechanism the scan cannot apply can
+/// neither be read nor silently skipped, because the payload needed to act on a delete
+/// is reachable only through this call. The plan-time gate (adapter) is the
+/// authoritative filter; this is cheap defense-in-depth against an unsupported
+/// mechanism slipping through, and it runs before any row of the affected data file is
+/// emitted.
 ///
-/// `data_file_path` names the entry carrying `delete`, and is what a Delta
-/// deletion-vector refusal reports: that variant has no delete-file path to name,
-/// and its `path_or_inline_dv` is an opaque token or payload rather than a
-/// diagnostic. Applying Delta deletion vectors is issue #320.
-fn applicable_positional_delete<'a>(
+/// `data_file_path` names the entry carrying `delete`, and is what a deletion-vector
+/// refusal reports: that variant has no delete-file path to name, and its
+/// `path_or_inline_dv` is an opaque token or payload rather than a diagnostic.
+/// `table_root` is what a UUID-relative vector's sidecar path is reconstructed against.
+fn applicable_delete_mechanism<'a>(
     delete: &'a DeleteMechanism,
     data_file_path: &str,
+    table_root: &str,
     secrets: &[String],
-) -> Result<(&'a str, u64), UdfError> {
+) -> Result<ApplicableDelete<'a>, UdfError> {
     let (path, mechanism) = match delete {
         DeleteMechanism::IcebergPositionalDelete { path, size } => {
-            return Ok((path.as_str(), *size));
+            return Ok(ApplicableDelete::PositionalDeleteFile {
+                path: path.as_str(),
+                size: *size,
+            });
+        }
+        DeleteMechanism::DeltaDeletionVector {
+            storage,
+            path_or_inline_dv,
+            offset,
+            size_in_bytes,
+            cardinality,
+        } => {
+            let vector = DeletionVector::resolve(
+                LoggedDeletionVector {
+                    storage: *storage,
+                    path_or_inline_dv,
+                    offset: *offset,
+                    size_in_bytes: *size_in_bytes,
+                    cardinality: *cardinality,
+                },
+                table_root,
+                data_file_path,
+                secrets,
+            )?;
+            return Ok(ApplicableDelete::DeletionVector(vector));
         }
         DeleteMechanism::IcebergEqualityDelete { path, .. } => (path, "an Iceberg equality delete"),
         DeleteMechanism::IcebergPuffinDeletionVector { path, .. } => {
             (path, "a Puffin deletion vector")
         }
-        DeleteMechanism::DeltaDeletionVector { .. } => {
-            let data_file = redact(data_file_path.to_string(), secrets);
-            return Err(UdfError::User(format!(
-                "data file '{data_file}' carries a Delta deletion vector, which this engine cannot \
-                 apply on read (applying Delta deletion vectors is issue #320); refusing to emit \
-                 rows for the affected data file"
-            )));
-        }
     };
     let path = redact(path.clone(), secrets);
     Err(UdfError::User(format!(
         "assigned delete file '{path}' is {mechanism}, which this engine cannot apply on read \
-         (only Parquet positional deletes are supported); refusing to emit rows for the affected \
-         data file"
+         (only Iceberg Parquet positional deletes and Delta deletion vectors are supported); \
+         refusing to emit rows for the affected data file"
     )))
 }
 
@@ -532,7 +572,10 @@ fn build_access_plan(
 #[derive(Debug)]
 pub(crate) struct PositionalDeleteScanTable {
     object_store_url: ObjectStoreUrl,
-    table_schema: SchemaRef,
+    /// The table's declared logical schema together with the
+    /// `file_schema ++ table_partition_cols` split the `FileScanConfig` scans it
+    /// through — see [`PartitionedScanSchema`].
+    schema: PartitionedScanSchema,
     use_field_id_adapter: bool,
     field_id_resolution: FieldIdResolution,
     files: Vec<FileEntry>,
@@ -540,8 +583,9 @@ pub(crate) struct PositionalDeleteScanTable {
     secrets: Vec<String>,
     format: Arc<ParquetFormat>,
     /// Shared instance-level bound on every object-store read the delete path
-    /// issues while preparing a scan — Phase A delete-file bodies and Phase B
-    /// data-file footers alike, one permit per read — sized `s3_max_connections`
+    /// issues while preparing a scan — Phase A delete-file bodies and
+    /// deletion-vector sidecars and Phase B data-file footers alike, one permit
+    /// per read — sized `s3_max_connections`
     /// and constructed once per scan invocation. Every provider registered for
     /// the same invocation (including both sides of a broadcast join) holds a
     /// clone of the SAME `Arc`, so the whole instance stays within one
@@ -550,7 +594,7 @@ pub(crate) struct PositionalDeleteScanTable {
 }
 
 impl PositionalDeleteScanTable {
-    /// Construct the provider from the resolved logical Arrow schema and the
+    /// Construct the provider from the split logical Arrow schema and the
     /// per-shard file list. `use_field_id_adapter` mirrors the previous
     /// `register_files` behavior: the [`FieldIdExprAdapterFactory`] is attached
     /// only when the adapter supplied a logical schema, whichever key its fields
@@ -570,7 +614,7 @@ impl PositionalDeleteScanTable {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
-        table_schema: SchemaRef,
+        schema: PartitionedScanSchema,
         use_field_id_adapter: bool,
         field_id_resolution: FieldIdResolution,
         files: Vec<FileEntry>,
@@ -585,7 +629,7 @@ impl PositionalDeleteScanTable {
             .collect();
         Self {
             object_store_url,
-            table_schema,
+            schema,
             use_field_id_adapter,
             field_id_resolution,
             files,
@@ -596,25 +640,24 @@ impl PositionalDeleteScanTable {
         }
     }
 
-    /// Phase A: read each of the shard's UNIQUE positional-delete files exactly
-    /// once, concurrently within the shared [`Self::delete_path_read_limiter`] budget,
-    /// and merge the surviving positions into a
-    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file
-    /// absolute path each delete row targets.
+    /// Phase A: read every delete this shard carries, whichever mechanism expresses
+    /// it, and merge the resulting positions into ONE
+    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file absolute
+    /// path each delete targets.
     ///
-    /// Every delete mechanism on every assigned entry passes through
-    /// [`applicable_positional_delete`] BEFORE any I/O, so an unapplicable mechanism
-    /// anywhere in the shard fails loud before a single row is read. That call is
-    /// also what supplies the path and size keyed and read below, which is why the
-    /// dedup cannot key on a mechanism the scan does not apply. Each read holds a
-    /// permit from the shared limiter, so the whole instance — both sides of a
-    /// broadcast join included — stays within one connection budget. The
-    /// per-delete-file maps are unioned; [`RoaringTreemap`] union is commutative and
-    /// associative, so the non-deterministic completion order of the concurrent
-    /// reads cannot change the result.
+    /// Every mechanism on every assigned entry passes through
+    /// [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable mechanism
+    /// anywhere in the shard fails loud before a single delete-file body,
+    /// deletion-vector sidecar, or data-file footer is fetched. That call is also what
+    /// supplies the payload keyed and read below, which is why the dedup cannot key on
+    /// a mechanism the scan does not apply.
     ///
-    /// No object-store HEAD is issued: each delete file's [`ObjectMeta`] is built
-    /// from its spec-supplied byte size via [`object_meta_for`].
+    /// The two mechanisms' fan-outs run concurrently but draw permits from the ONE
+    /// shared [`Self::delete_path_read_limiter`], so the whole instance — both sides of
+    /// a broadcast join included — stays within one connection budget. Merging is
+    /// order-independent: [`RoaringTreemap`] union is commutative and associative, so
+    /// the non-deterministic completion order of the concurrent reads cannot change the
+    /// result.
     async fn collect_delete_positions(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -625,49 +668,151 @@ impl PositionalDeleteScanTable {
             .map(|entry| reconstruct_abs_uri(&entry.path, &self.table_root))
             .collect();
 
-        let mut unique_deletes: HashMap<&str, u64> = HashMap::new();
+        let mut delete_files: HashMap<&str, u64> = HashMap::new();
+        let mut vectors: Vec<(&str, DeletionVector)> = Vec::new();
         for entry in &self.files {
             for delete in &entry.deletes {
-                let (path, size) =
-                    applicable_positional_delete(delete, &entry.path, &self.secrets)?;
-                unique_deletes.entry(path).or_insert(size);
+                match applicable_delete_mechanism(
+                    delete,
+                    &entry.path,
+                    &self.table_root,
+                    &self.secrets,
+                )? {
+                    ApplicableDelete::PositionalDeleteFile { path, size } => {
+                        delete_files.entry(path).or_insert(size);
+                    }
+                    ApplicableDelete::DeletionVector(vector) => {
+                        vectors.push((entry.path.as_str(), vector));
+                    }
+                }
             }
         }
 
-        if unique_deletes.is_empty() {
+        if delete_files.is_empty() && vectors.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let assigned_ref = &assigned;
-        let reads = unique_deletes
-            .into_iter()
-            .map(|(delete_path, delete_size)| {
-                let store = Arc::clone(store);
-                let limiter = Arc::clone(&self.delete_path_read_limiter);
-                let secrets = self.secrets.as_slice();
-                let table_root = self.table_root.as_str();
-                async move {
-                    let _permit = limiter.acquire_owned().await.map_err(|e| {
-                        UdfError::User(format!("delete-read limiter unavailable: {e}"))
-                    })?;
-                    let delete_abs = reconstruct_abs_uri(delete_path, table_root);
-                    let delete_meta = object_meta_for(&delete_abs, delete_size)?;
-                    read_delete_file_positions(store, delete_meta, assigned_ref, secrets).await
-                }
-            });
-        let per_file_maps = try_join_all(reads).await?;
+        let (per_delete_file, sidecars) = futures::future::try_join(
+            self.read_delete_files(store, delete_files, &assigned),
+            self.fetch_deletion_vector_sidecars(store, &vectors),
+        )
+        .await?;
 
         let mut merged: HashMap<String, RoaringTreemap> = HashMap::new();
-        for map in per_file_maps {
+        for map in per_delete_file {
             for (path, positions) in map {
                 *merged.entry(path).or_default() |= positions;
             }
         }
+        for (data_file, vector) in &vectors {
+            let body = vector
+                .sidecar_url()
+                .and_then(|url| sidecars.get(url))
+                .cloned();
+            let positions = vector.decode(body, data_file, &self.secrets)?;
+            let abs = reconstruct_abs_uri(data_file, &self.table_root);
+            *merged.entry(abs).or_default() |= positions;
+        }
         Ok(merged)
     }
 
-    /// Build one `PartitionedFile` per assigned data file, attaching a base
-    /// `ParquetAccessPlan` (task 2.4) to each delete-carrying file.
+    /// Read each UNIQUE positional-delete file exactly once, concurrently within the
+    /// shared [`Self::delete_path_read_limiter`] budget, yielding one
+    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` per delete file for the caller
+    /// to union. No object-store HEAD is issued: each delete file's [`ObjectMeta`] is
+    /// built from its spec-supplied byte size via [`object_meta_for`].
+    async fn read_delete_files(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        delete_files: HashMap<&str, u64>,
+        assigned: &HashSet<String>,
+    ) -> Result<Vec<HashMap<String, RoaringTreemap>>, UdfError> {
+        let reads = delete_files.into_iter().map(|(delete_path, delete_size)| {
+            let store = Arc::clone(store);
+            let limiter = Arc::clone(&self.delete_path_read_limiter);
+            let secrets = self.secrets.as_slice();
+            let table_root = self.table_root.as_str();
+            async move {
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| UdfError::User(format!("delete-read limiter unavailable: {e}")))?;
+                let delete_abs = reconstruct_abs_uri(delete_path, table_root);
+                let delete_meta = object_meta_for(&delete_abs, delete_size)?;
+                read_delete_file_positions(store, delete_meta, assigned, secrets).await
+            }
+        });
+        try_join_all(reads).await
+    }
+
+    /// Fetch each UNIQUE deletion-vector sidecar exactly once for the whole shard,
+    /// keyed on the resolved absolute path, concurrently within the SAME
+    /// [`Self::delete_path_read_limiter`] budget the delete-file reads draw on — so a
+    /// mixed shard's total in-flight object-store reads stay within one budget.
+    ///
+    /// The WHOLE object is fetched rather than the descriptor's byte range: the decoder
+    /// validates the container's format-version byte at file position 0, which a range
+    /// starting at the descriptor's offset would not carry. Fetching whole is also what
+    /// lets one body serve every descriptor that resolves to it. No object-store HEAD is
+    /// issued — a descriptor carries the VECTOR's size, never the sidecar's, so a
+    /// sidecar's size is a size the scan never needs.
+    async fn fetch_deletion_vector_sidecars(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        vectors: &[(&str, DeletionVector)],
+    ) -> Result<HashMap<Url, Bytes>, UdfError> {
+        // Each sidecar is named by whichever data file first referenced it: a failed
+        // fetch has to report a DATA file, and a shared sidecar has several.
+        let mut unique: HashMap<&Url, &str> = HashMap::new();
+        for (data_file, vector) in vectors {
+            if let Some(url) = vector.sidecar_url() {
+                unique.entry(url).or_insert(data_file);
+            }
+        }
+
+        let reads = unique.into_iter().map(|(url, data_file)| {
+            let store = Arc::clone(store);
+            let limiter = Arc::clone(&self.delete_path_read_limiter);
+            let secrets = self.secrets.as_slice();
+            async move {
+                let unreadable = |e: String| {
+                    UdfError::User(redact(
+                        format!(
+                            "data file '{data_file}': its deletion vector could not be read: {e}"
+                        ),
+                        secrets,
+                    ))
+                };
+                let _permit = limiter
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| unreadable(format!("delete-read limiter unavailable: {e}")))?;
+                let location = ListingTableUrl::parse(url.as_str())
+                    .map_err(|e| unreadable(format!("invalid sidecar URL: {e}")))?
+                    .prefix()
+                    .clone();
+                let body = store
+                    .get(&location)
+                    .await
+                    .map_err(|e| unreadable(e.to_string()))?
+                    .bytes()
+                    .await
+                    .map_err(|e| unreadable(e.to_string()))?;
+                Ok::<_, UdfError>((url.clone(), body))
+            }
+        });
+        Ok(try_join_all(reads).await?.into_iter().collect())
+    }
+
+    /// Build one `PartitionedFile` per assigned data file, attaching that file's
+    /// partition values as scan-time constants and a base `ParquetAccessPlan` (task
+    /// 2.4) to each delete-carrying file.
+    ///
+    /// Partition values are converted for the whole shard before any read: they are
+    /// the one thing here that can fail on the spec's own content rather than on
+    /// storage, and doing them first keeps that failure ahead of every fetch, exactly
+    /// as [`applicable_delete_mechanism`] keeps an unapplicable mechanism ahead of
+    /// Phase A's.
     ///
     /// Phase A ([`Self::collect_delete_positions`]) performs all delete-file
     /// I/O up front. Phase B (this method) is a bounded-concurrent,
@@ -696,6 +841,13 @@ impl PositionalDeleteScanTable {
         &self,
         state: &dyn Session,
     ) -> Result<Vec<PartitionedFile>, UdfError> {
+        let partition_values = self
+            .files
+            .iter()
+            .map(|entry| self.schema.partition_values_for(entry))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| UdfError::User(redact(e, &self.secrets)))?;
+
         let store = state
             .runtime_env()
             .object_store(&self.object_store_url)
@@ -711,7 +863,7 @@ impl PositionalDeleteScanTable {
 
         let size_hint = self.format.metadata_size_hint();
         let delete_positions_ref = &delete_positions;
-        let builds = self.files.iter().map(|entry| {
+        let builds = self.files.iter().zip(partition_values).map(|(entry, values)| {
             let store = Arc::clone(&store);
             let metadata_cache = Arc::clone(&metadata_cache);
             let limiter = Arc::clone(&self.delete_path_read_limiter);
@@ -720,7 +872,7 @@ impl PositionalDeleteScanTable {
             async move {
                 let abs = reconstruct_abs_uri(&entry.path, table_root);
                 let meta = object_meta_for(&abs, entry.size)?;
-                let partitioned = PartitionedFile::from(meta.clone());
+                let partitioned = PartitionedFile::from(meta.clone()).with_partition_values(values);
 
                 let Some(deletes) = delete_positions_ref
                     .get(abs.as_str())
@@ -764,8 +916,11 @@ impl PositionalDeleteScanTable {
 
 #[async_trait]
 impl TableProvider for PositionalDeleteScanTable {
+    /// The table's DECLARED column order — the order the user's SQL and the
+    /// virtual schema's column list expect. The `file ++ partition` split stays
+    /// inside [`Self::scan`], reconciled by the projection remap.
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.table_schema)
+        Arc::clone(self.schema.declared_schema())
     }
 
     fn table_type(&self) -> TableType {
@@ -784,8 +939,9 @@ impl TableProvider for PositionalDeleteScanTable {
             .await
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(&self.table_schema));
-        let file_source = self.format.file_source(table_schema);
+        let file_source = self
+            .format
+            .file_source(self.schema.file_source_schema().clone());
 
         let expr_adapter = self.use_field_id_adapter.then(|| {
             Arc::new(FieldIdExprAdapterFactory {
@@ -798,7 +954,7 @@ impl TableProvider for PositionalDeleteScanTable {
         // repartition/coalesce is inserted.
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file_group(FileGroup::new(files))
-            .with_projection_indices(projection.cloned())?
+            .with_projection_indices(self.schema.remap_projection(projection))?
             .with_limit(limit)
             .with_expr_adapter(expr_adapter)
             .build();

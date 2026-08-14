@@ -21,6 +21,8 @@ mod iceberg;
 
 use delta_format_reader::DeltaFormatReader;
 use iceberg::IcebergFormatReader;
+#[cfg(test)]
+pub(crate) use iceberg::build_logical_schema;
 
 #[cfg(test)]
 #[path = "format_tests.rs"]

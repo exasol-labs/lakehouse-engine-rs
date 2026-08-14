@@ -36,7 +36,7 @@ use common::stack::{
 };
 
 use lakehouse_catalog::CatalogSession;
-use lakehouse_engine::adapter::pushdown::resolve_file_list;
+use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 
 use std::sync::OnceLock;
 
@@ -3163,11 +3163,11 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     );
 }
 
-/// Adapter-level file-count pruning, asserted by calling `resolve_file_list`
-/// directly (bypassing Exasol) with and without a filter and comparing the
-/// resolved file counts against the unfiltered snapshot. Both pruning paths the
-/// plan claims are exercised against the seeded `regions` table (3 files, one
-/// per partition, disjoint id ranges):
+/// Adapter-level file-count pruning, asserted by calling the format-reader
+/// seam directly (bypassing Exasol) with and without a filter and comparing
+/// the resolved file counts against the unfiltered snapshot. Both pruning
+/// paths the plan claims are exercised against the seeded `regions` table (3
+/// files, one per partition, disjoint id ranges):
 ///
 /// 1. Partition pruning (`region = 'north'`): Iceberg identity-partition pruning
 ///    eliminates the central and south files → 1 file.
@@ -3189,21 +3189,34 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .expect("tokio runtime for file-count pruning test");
 
     // One `CatalogSession` built once and reused across all three pruning calls
-    // below, mirroring the single-session-per-query contract `resolve_file_list`
-    // now requires (see `adapter/mod.rs`'s hoisted enumeration session and
-    // `pushdown/mod.rs`'s `handle_pushdown`).
+    // below, mirroring the single-session-per-query contract the format-reader
+    // seam now requires (see `adapter/mod.rs`'s hoisted enumeration session and
+    // `pushdown/mod.rs`'s `handle_pushdown`). The reader built from it is reused
+    // identically: it carries no per-call state, so a fresh `resolve_scan` call
+    // per filter is the same seam every pushdown request resolves through.
     let session = rt
         .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
         .expect("CatalogSession::resolve must succeed");
+    // `allow_http = true`: the local stack's MinIO is plain HTTP.
+    let connection = ConnectionStorage {
+        storage: &storage,
+        creds: &creds,
+        allow_http: true,
+    };
+    let reader = format_reader(
+        ScanSource::Iceberg {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
+        &connection,
+    )
+    .expect("format_reader must succeed");
 
     // --- baseline: no filter → 3 data files (one per partition) ---
-    // All three calls pass `allow_http = true`: the local stack's MinIO is plain HTTP.
     let all_files = rt
-        .block_on(async {
-            resolve_file_list(&session, &catalog_props, &storage, &creds, true, None).await
-        })
-        .expect("resolve_file_list (no filter) must succeed");
-    let all_files = all_files.0;
+        .block_on(reader.resolve_scan(None))
+        .expect("resolve_scan (no filter) must succeed")
+        .files;
     assert_eq!(
         all_files.len(),
         3,
@@ -3220,19 +3233,9 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         "right": {"type": "literal_string", "value": "north"}
     });
     let pruned_partition = rt
-        .block_on(async {
-            resolve_file_list(
-                &session,
-                &catalog_props,
-                &storage,
-                &creds,
-                true,
-                Some(&partition_filter),
-            )
-            .await
-        })
-        .expect("resolve_file_list (partition filter) must succeed");
-    let pruned_partition = pruned_partition.0;
+        .block_on(reader.resolve_scan(Some(&partition_filter)))
+        .expect("resolve_scan (partition filter) must succeed")
+        .files;
     assert_eq!(
         pruned_partition.len(),
         1,
@@ -3258,19 +3261,9 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         "right": {"type": "literal_exactnumeric", "value": "5"}
     });
     let pruned_range = rt
-        .block_on(async {
-            resolve_file_list(
-                &session,
-                &catalog_props,
-                &storage,
-                &creds,
-                true,
-                Some(&range_filter),
-            )
-            .await
-        })
-        .expect("resolve_file_list (range filter) must succeed");
-    let pruned_range = pruned_range.0;
+        .block_on(reader.resolve_scan(Some(&range_filter)))
+        .expect("resolve_scan (range filter) must succeed")
+        .files;
     // Only the north file (ids 1..=5) overlaps `id <= 5`; central (min=6) and
     // south (min=11) are pruned by their per-file min/max bounds.
     assert_eq!(

@@ -26,7 +26,7 @@ const VENDED_REGION: &str = "eu-west-2";
 #[test]
 fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     // Build a spec with VENDED storage credentials (simulating what
-    // resolve_file_list returns after vended extraction).
+    // the format-reader seam returns after vended extraction).
     let vended_storage = StorageBackend::S3(StorageProps {
         endpoint: "https://s3.amazonaws.com".into(),
         region: VENDED_REGION.into(),
@@ -965,6 +965,7 @@ fn guard_dispatch_result(
         "s3://warehouse/db/events".to_string(),
         logical_schema,
         Vec::new(),
+        Vec::new(),
         &sample_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -1022,6 +1023,7 @@ fn declined_dispatch_sql(pushdown_req_body: Json) -> String {
         order_by_present(&pushdown_req),
         &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
         "s3://warehouse/db/events".to_string(),
+        Vec::new(),
         Vec::new(),
         Vec::new(),
         &sample_storage(),
@@ -1212,8 +1214,8 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
 
 /// A DataFusion render decline changes what the ADAPTER renders, never what Iceberg
 /// manifest pruning sees. `classify_where_filter` hands back the ORIGINAL,
-/// un-rewritten tree — the very tree `handle_pushdown` forwards to
-/// `resolve_file_list` — so a still-prunable conjunct sitting beside the declined
+/// un-rewritten tree — the very tree `handle_pushdown` forwards to the
+/// resolver — so a still-prunable conjunct sitting beside the declined
 /// one keeps pruning exactly as many files as before.
 #[test]
 fn iceberg_pruning_input_unchanged_when_df_render_declines() {
@@ -1291,7 +1293,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         declined,
         Some(&filter),
         "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
-             tree resolve_file_list prunes with"
+             tree the resolver prunes with"
     );
     let pred = to_iceberg_predicate(&filter, &schema)
         .expect("the prunable conjunct must still yield an Iceberg predicate");
@@ -1999,6 +2001,7 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 /// port (`127.0.0.1:1`, connection refused) so a wrongly-ordered
 /// implementation fails fast with a transport error instead of hanging.
 #[tokio::test]
+
 async fn malformed_table_ident_fails_before_any_catalog_contact() {
     let creds = ConnectionCreds {
         warehouse: "warehouse".into(),
@@ -2032,23 +2035,15 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
     // would mask the ordering this test proves.
     let request = nq4_request();
 
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: "http://127.0.0.1:1".to_string(),
+        storage: sample_storage(),
+        creds,
+        allow_http: false,
+        catalog_kind: CatalogKind::IcebergRest,
+    };
     let result = handle_pushdown(
-        &request,
-        "http://127.0.0.1:1",
-        &sample_storage(),
-        &catalog,
-        None,
-        1,
-        1,
-        1,
-        1024,
-        1,
-        0.6,
-        200,
-        4,
-        1024,
-        &creds,
-        false,
+        &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
     )
     .await;
 
@@ -2063,6 +2058,330 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         "error must not be the OAuth2 token request/transport error \
              (would mean the session was built before the identifier was \
              validated): {message}"
+    );
+}
+
+/// The tuning knobs `handle_pushdown` takes positionally, fixed to one shard /
+/// one node for every seam-resolution test in this section.
+async fn seam_handle_pushdown(
+    request: &Json,
+    catalog_uri: &str,
+    catalog: &CatalogProps,
+    catalog_kind: CatalogKind,
+    creds: &ConnectionCreds,
+) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage: sample_storage(),
+        creds: creds.clone(),
+        allow_http: true,
+        catalog_kind,
+    };
+    handle_pushdown(
+        request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+    )
+    .await
+}
+
+/// Scenario: Every pushdown request shape resolves through the one
+/// format-reader seam.
+///
+/// Single-table sub-case: an `IcebergRest`-kind request reaches the Iceberg
+/// reader (its `/v1/config` + `loadTable` targets are hit) and a
+/// `UnityCatalogNative`-kind request reaches the Delta reader (its
+/// `unity-catalog/tables` target is hit, and the reader's OWN plan-time error
+/// — naming the table it could not plan — surfaces, never an Iceberg-shaped
+/// error). Both kinds are driven through the SAME `handle_pushdown` entry
+/// point, proving neither is special-cased ahead of the resolver.
+#[tokio::test]
+async fn every_request_shape_resolves_through_the_format_reader_seam() {
+    let iceberg = iceberg_catalog().await;
+    let creds = unauthenticated_creds();
+    let iceberg_catalog_props = CatalogProps {
+        warehouse: "wh".into(),
+        table: "db.t".into(),
+    };
+    let result = seam_handle_pushdown(
+        &nq4_request(),
+        &iceberg.uri,
+        &iceberg_catalog_props,
+        CatalogKind::IcebergRest,
+        &creds,
+    )
+    .await
+    .expect("a snapshotless Iceberg table resolves an empty pushdown result");
+    assert_eq!(result["type"], "pushdown");
+    assert_eq!(
+        iceberg.targets(),
+        vec![
+            ICEBERG_CONFIG_TARGET.to_string(),
+            ICEBERG_LOAD_TABLE_TARGET.to_string()
+        ],
+        "the Iceberg reader must be reached through the resolver"
+    );
+
+    let unity = RecordingCatalog::spawn(|target| {
+        if target == UNITY_TABLE_TARGET {
+            (200, locationless_delta_table_body())
+        } else {
+            (404, r#"{"message":"no such table"}"#.to_string())
+        }
+    })
+    .await;
+    let unity_catalog_props = CatalogProps {
+        warehouse: "wh".into(),
+        table: "cat.sch.orders".into(),
+    };
+    let err = seam_handle_pushdown(
+        &nq4_request(),
+        &unity.uri,
+        &unity_catalog_props,
+        CatalogKind::UnityCatalogNative,
+        &creds,
+    )
+    .await
+    .expect_err("a Delta table carrying no storage location cannot be planned");
+    assert_eq!(
+        unity.targets(),
+        vec![UNITY_TABLE_TARGET.to_string()],
+        "the Delta reader must be reached through the SAME resolver, not a routed-around path"
+    );
+    assert!(
+        err.to_string().contains("cat.sch.orders"),
+        "the Delta reader's own plan-time error must name the table: {err}"
+    );
+}
+
+/// Scenario: One catalog session per request serves every table the request
+/// resolves — the production JOIN path's twin of
+/// `scan_resolution_tests.rs::one_catalog_session_serves_every_table_the_resolver_resolves`.
+///
+/// Drives a two-table inner-join pushdown request through `handle_pushdown`
+/// (via `seam_handle_pushdown`), asserting the resolver built inside
+/// `plan_join` is the SAME one both legs resolve through: exactly one
+/// `/v1/config` for the whole request, then one `loadTable` per leg — never a
+/// second config round-trip, which is the exact regression the collapse of
+/// per-leg `resolve_file_list` is meant to prevent.
+#[tokio::test]
+async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
+    let iceberg = iceberg_catalog().await;
+    let creds = unauthenticated_creds();
+    let catalog_props = CatalogProps {
+        warehouse: "wh".into(),
+        // Unused on the join path: `plan_join` resolves each leg's own
+        // identifier from `involvedTables`/`TABLE_MAP`, never `catalog.table`.
+        table: "unused-on-the-join-path".into(),
+    };
+
+    let request = serde_json::json!({
+        "involvedTables": [
+            {
+                "name": "CUSTOMER",
+                "columns": [
+                    {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                ],
+            },
+            {
+                "name": "ORDERS",
+                "columns": [
+                    {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                ],
+            },
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": {
+                "type": "join",
+                "join_type": "inner",
+                "left": {"name": "CUSTOMER", "type": "table"},
+                "right": {"name": "ORDERS", "type": "table"},
+                "condition": {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                },
+            },
+            "selectList": [
+                {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+            ],
+        },
+        "schemaMetadataInfo": {
+            "properties": {},
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
+            }).to_string(),
+        },
+    });
+
+    seam_handle_pushdown(
+        &request,
+        &iceberg.uri,
+        &catalog_props,
+        CatalogKind::IcebergRest,
+        &creds,
+    )
+    .await
+    .expect("a two-leg join over snapshotless Iceberg tables resolves");
+
+    assert_eq!(
+        iceberg.targets(),
+        vec![
+            ICEBERG_CONFIG_TARGET.to_string(),
+            "/v1/namespaces/db/tables/customer".to_string(),
+            "/v1/namespaces/db/tables/orders".to_string(),
+        ],
+        "one /v1/config for the whole request, then exactly one loadTable per leg"
+    );
+}
+
+/// Scenario: A Unity Catalog table's identity survives the round trip from the
+/// involved table.
+///
+/// A recorded identifier is judged by the identifier rule of ITS OWN catalog
+/// kind: a Unity-kind request whose identifier carries no namespace separator is
+/// refused in Unity Catalog's terms, never by Iceberg's `namespace.table` rule,
+/// and — like the Iceberg arm above it — the refusal precedes any catalog
+/// contact, so a malformed identifier costs zero catalog HTTP under BOTH kinds.
+#[tokio::test]
+async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
+    let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
+    let creds = unauthenticated_creds();
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: "orders".into(),
+    };
+
+    let err = seam_handle_pushdown(
+        &nq4_request(),
+        &unity.uri,
+        &catalog,
+        CatalogKind::UnityCatalogNative,
+        &creds,
+    )
+    .await
+    .expect_err("an identifier that addresses no Unity Catalog table must be refused");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("catalog.schema.table"),
+        "the refusal must state the Unity Catalog address form: {message}"
+    );
+    assert!(
+        !message.contains("namespace.table"),
+        "Iceberg's identifier rule must not judge a Unity Catalog identifier: {message}"
+    );
+    assert!(
+        unity.targets().is_empty(),
+        "a malformed identifier must cost no catalog request: {:?}",
+        unity.targets()
+    );
+}
+
+/// Scenario: Resolved partition columns reach the scan spec for every side.
+///
+/// The fact/single-table side gets its partition columns from the resolved
+/// `ResolvedScan` through `build_dispatch_sql`'s shared `base`; the
+/// broadcast/dimension side gets its OWN, independently, into `JoinSpec` through
+/// `build_broadcast_join_sql`. Neither one derives the other's value.
+#[test]
+fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
+    let request = guard_events_request(serde_json::json!({"type": "select"}));
+    let pushdown_req = pd(&request);
+    let (proj_cols, proj_types, widened) =
+        extract_projection(&request, &pushdown_req).expect("the EVENTS fixture must project");
+    let result = build_dispatch_sql(
+        &request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        widened,
+        guard_col_types(),
+        None,
+        None,
+        None,
+        false,
+        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+        "s3://warehouse/db/events".to_string(),
+        Vec::new(),
+        Vec::new(),
+        vec!["LETTER".to_string()],
+        &sample_storage(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+    )
+    .expect("build_dispatch_sql must succeed for the EVENTS fixture");
+    let sql = result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+    let common = common_arg_literal(sql);
+    assert!(
+        common.contains(r#""partition_columns":["LETTER"]"#),
+        "the resolved partition columns must reach CommonScanSpec: {common}"
+    );
+
+    let fact = ResolvedJoinSide {
+        table_name: "ORDERS".to_string(),
+        table_identifier: "cat.sch.orders".to_string(),
+        table_root: "s3://warehouse/lh/orders".to_string(),
+        files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        effective_storage: sample_storage(),
+        partition_columns: Vec::new(),
+        total_bytes: 100,
+    };
+    let dimension = ResolvedJoinSide {
+        table_name: "CUSTOMER".to_string(),
+        table_identifier: "cat.sch.customer".to_string(),
+        table_root: "s3://warehouse/lh/customer".to_string(),
+        files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        effective_storage: sample_storage(),
+        partition_columns: vec!["REGION".to_string()],
+        total_bytes: 10,
+    };
+    let sides = JoinSides {
+        fact,
+        dimension,
+        broadcast_eligible: true,
+    };
+    let rendered = super::joins::RenderedJoinPushdown {
+        condition: "\"ORDERS\".\"CUSTOMER_KEY\" = \"CUSTOMER\".\"CUSTOMER_KEY\"".to_string(),
+        filter: None,
+        projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
+        projection_types: vec!["DECIMAL(20,0)".to_string()],
+    };
+    let tuning = super::joins::JoinScanTuning {
+        cluster_nodes: 1,
+        parallelism_factor: 1,
+        df_target_partitions: 1,
+        df_batch_size: 8192,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 200,
+        s3_max_connections: 8,
+    };
+    let join_sql = super::joins::build_broadcast_join_sql(
+        &sides,
+        &rendered,
+        super::joins::JoinWindowPlan::Unbounded,
+        &tuning,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("a broadcast-eligible plan with an unbounded window must render");
+    assert!(
+        join_sql.contains(r#""partition_columns":["REGION"]"#),
+        "the dimension side's OWN partition columns must reach JoinSpec, independent of \
+         the fact side's: {join_sql}"
     );
 }
 

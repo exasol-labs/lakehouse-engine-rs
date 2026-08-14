@@ -214,6 +214,7 @@ fn dispatch_sql_with_pushdown_req(
         "s3://warehouse/db/events".to_string(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         &sample_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -764,7 +765,7 @@ fn two_table_detected_join(request: &Json) -> DetectedJoin {
 fn resolved_customer_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
-        iceberg_ident: "lh.customer".to_string(),
+        table_identifier: "lh.customer".to_string(),
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("s3://w/c-0.parquet", 10)],
         logical_schema: vec![LogicalField {
@@ -777,6 +778,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         }],
         name_mapping: Vec::new(),
         effective_storage: sample_storage(),
+        partition_columns: Vec::new(),
         total_bytes: 10,
     }
 }
@@ -785,7 +787,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
 fn resolved_orders_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "ORDERS".to_string(),
-        iceberg_ident: "lh.orders".to_string(),
+        table_identifier: "lh.orders".to_string(),
         table_root: "s3://warehouse/lh/orders".to_string(),
         files: vec![FileEntry::new("s3://w/o-0.parquet", 100)],
         logical_schema: vec![LogicalField {
@@ -798,6 +800,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         }],
         name_mapping: Vec::new(),
         effective_storage: sample_storage(),
+        partition_columns: Vec::new(),
         total_bytes: 100,
     }
 }

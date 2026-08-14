@@ -173,6 +173,17 @@ async fn each_sides_own_enumerated_file_path_routes_to_that_side() {
     assert_eq!(text_at(&router, DIM_FILE).await, DIM_LABEL);
 }
 
+/// A Delta `add.path` is logged percent-encoded (RFC 2396); the router must key
+/// ownership by the DECODED object-store path, since that is the key the store
+/// actually holds.
+#[test]
+fn store_path_decodes_a_percent_encoded_entry_path() {
+    let path =
+        store_path("data/percent%3Dsign.parquet", FACT_ROOT).expect("valid object-store path");
+
+    assert_eq!(path.as_ref(), "wh/fact/data/percent=sign.parquet");
+}
+
 #[tokio::test]
 async fn an_out_of_tree_positional_delete_file_routes_to_its_data_files_side() {
     const OUT_OF_TREE_DELETE: &str = "deletes/f1-deletes.parquet";

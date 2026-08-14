@@ -6,6 +6,164 @@
 
 use super::*;
 use crate::scan::spec::{DeleteMechanism, StorageProps};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+/// A loopback HTTP/1.1 catalog answering every request from a caller-supplied
+/// responder and recording each request target in arrival order.
+///
+/// Every response closes its connection, so the pooled client opens a fresh one
+/// per request and one accept loop serves the whole sequential stream in order.
+pub(super) struct RecordingCatalog {
+    pub(super) uri: String,
+    targets: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingCatalog {
+    pub(super) async fn spawn<F>(responder: F) -> Self
+    where
+        F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let uri = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local_addr").port()
+        );
+        let targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let recorded = targets.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                if read == 0 {
+                    continue;
+                }
+                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = responder(&target);
+                recorded.lock().expect("recorded targets").push(target);
+                let reason = if (200..300).contains(&status) {
+                    "OK"
+                } else {
+                    "ERROR"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        Self { uri, targets }
+    }
+
+    pub(super) fn targets(&self) -> Vec<String> {
+        self.targets.lock().expect("recorded targets").clone()
+    }
+}
+
+/// Credentials supplying no catalog authentication at all, so a session issues
+/// exactly the requests its own resolution needs and no token grant.
+pub(super) fn unauthenticated_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "wh".into(),
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        session_token: None,
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+        token: None,
+        client_id: None,
+        client_secret: None,
+        oauth2_server_uri: None,
+        scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
+    }
+}
+
+/// The `/v1/config` target every non-SigV4 Iceberg session resolves its prefix
+/// from, exactly once per session.
+pub(super) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
+
+/// The `loadTable` target the recorded identifier `db.t` addresses under an
+/// empty prefix.
+pub(super) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
+
+/// The Unity Catalog get-table target the recorded identifier `cat.sch.orders`
+/// addresses.
+pub(super) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
+
+/// A `loadTable` response for a snapshotless single-column table.
+///
+/// The absent snapshot is what keeps this offline: an empty table scan reads no
+/// manifest, so resolution completes without touching the store its location
+/// names.
+pub(super) fn snapshotless_load_table_body(location: &str) -> String {
+    serde_json::json!({
+        "metadata-location": format!("{location}/metadata/v1.json"),
+        "metadata": {
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000003",
+            "location": location,
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [{
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]
+            }],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "snapshots": []
+        }
+    })
+    .to_string()
+}
+
+/// A loaded Unity Catalog Delta table carrying NO storage location, so the Delta
+/// reader refuses at its first check and reaches no object store.
+pub(super) fn locationless_delta_table_body() -> String {
+    serde_json::json!({
+        "name": "orders",
+        "table_type": "MANAGED",
+        "data_source_format": "DELTA",
+        "table_id": "table-1",
+        "columns": []
+    })
+    .to_string()
+}
+
+/// An Iceberg REST catalog serving its config and one snapshotless table per
+/// requested identifier.
+pub(super) async fn iceberg_catalog() -> RecordingCatalog {
+    RecordingCatalog::spawn(|target| {
+        if target.starts_with("/v1/config") {
+            return (200, "{}".to_string());
+        }
+        match target.rsplit_once('/') {
+            Some((_, table)) => (
+                200,
+                snapshotless_load_table_body(&format!("s3://bucket/{table}")),
+            ),
+            None => (404, r#"{"message":"no such table"}"#.to_string()),
+        }
+    })
+    .await
+}
 
 pub(super) fn sample_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
@@ -19,7 +177,7 @@ pub(super) fn sample_storage() -> StorageBackend {
 }
 
 /// Assemble the scan-driving SQL from a known file list + spec — the same
-/// logic `handle_pushdown` runs after `resolve_file_list`.
+/// logic `handle_pushdown` runs after resolution.
 /// Uses `cluster_nodes=1` (single-shard / legacy shape).
 pub(super) fn build_sql_for_fixture(
     files: Vec<String>,

@@ -6,7 +6,7 @@ use serde_json::Value as Json;
 use std::collections::HashMap;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
-use super::super::file_resolution::relativize_shards_to_root;
+use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
     extract_offset, quote_ident, render_limit_offset, shard_count, strip_table_alias,
@@ -590,7 +590,7 @@ fn join_fan_out_scan_spec(
             logical_schema: primary.logical_schema.clone(),
             name_mapping: primary.name_mapping.clone(),
             join,
-            partition_columns: Vec::new(),
+            partition_columns: primary.partition_columns.clone(),
             storage: primary.effective_storage.clone(),
             df_target_partitions: tuning.df_target_partitions,
             df_batch_size: tuning.df_batch_size,
@@ -702,6 +702,9 @@ fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bo
 /// stated once in [`JoinSpec::post_join_limit`]. An unordered cap composes per
 /// shard, so it rides in the join block AND on the outer merge; an ordered window
 /// is global, so it rides on an outer wrapper with every shard left unbounded.
+///
+/// Each side's `partition_columns` ride in that side's own spec block: the fact
+/// side's in the common blob, the dimension side's in this [`JoinSpec`].
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
@@ -747,6 +750,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
         post_join_limit: shard_cap,
+        partition_columns: dimension.partition_columns.clone(),
         storage: dimension.effective_storage.clone(),
     };
 

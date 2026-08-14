@@ -1,68 +1,67 @@
-//! Compile-time proof that `resolve_file_list` accepts
-//! `&lakehouse_catalog::CatalogSession` as its first parameter.
+//! Compile-time proof that `ScanSource::Iceberg` carries a shared
+//! `&lakehouse_catalog::CatalogSession` reference, not an owned session.
 //!
-//! Both functions perform real catalog/network I/O (`CatalogSession::resolve`
-//! itself runs an OAuth2 grant and a config lookup), so unlike
-//! `shared_type_reexports.rs`'s plain-struct probes, this file cannot prove
-//! its fact by actually constructing a session and calling either function —
-//! that would need live catalog infrastructure this compile-time test does
-//! not have. Instead, each `accepts_shared_session_for_*` function below is
-//! never invoked; its only job is to exist with a signature that names
-//! `&lakehouse_catalog::CatalogSession` explicitly for the first parameter
-//! and forwards every argument into the real function. The compiler still
-//! type-checks that forwarding call against `resolve_file_list`'s real
-//! signature while compiling this crate, so a regression in that signature
-//! (e.g. the `&CatalogSession` parameter being dropped or changed to an owned
-//! value) fails this file's compilation rather than surfacing only in a
-//! live-catalog integration test.
+//! `format_reader` performs no catalog/network I/O itself (only the
+//! [`FormatReader::resolve_scan`] it answers does), but the session it wraps
+//! IS built from real catalog I/O (`CatalogSession::resolve` runs an OAuth2
+//! grant and a config lookup under most auth modes), so this file still
+//! avoids constructing a live one: like `shared_type_reexports.rs`'s
+//! plain-struct probes, it proves the fact by SIGNATURE alone.
+//! `accepts_shared_session_for_iceberg_scan_source` below is never invoked;
+//! its only job is to exist with a signature that names
+//! `&lakehouse_catalog::CatalogSession` explicitly and forwards it into
+//! `ScanSource::Iceberg`, which `format_reader` accepts. The compiler still
+//! type-checks that forwarding call against `ScanSource`'s and
+//! `format_reader`'s real signatures while compiling this crate, so a
+//! regression (e.g. the session becoming an owned value, or the resolver
+//! matching a table format some other way) fails this file's compilation
+//! rather than surfacing only in a live-catalog integration test.
 //!
-//! Covers Verification > Scenario Coverage rows (vs-adapter/pushdown-catalog-session):
-//! - "CatalogSession is public and every file-resolution entry point takes
-//!   one" -> `file_resolution_entry_points_take_a_shared_session`
+//! Covers Verification > Scenario Coverage rows
+//! (vs-adapter/pushdown-format-neutral-resolution):
+//! - "The Iceberg scan source carries a shared catalog session" ->
+//!   `iceberg_scan_source_carries_a_shared_session`
+//!
+//! The companion façade-departure claim (that collapsing the resolver leaves
+//! the pushdown façade unchanged) is NOT pinned here: that is
+//! `tests/pushdown_public_surface.rs` and
+//! `src/adapter/pushdown_surface_probe_tests.rs`'s compile-time `use` probes'
+//! job.
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
-use lakehouse_engine::adapter::pushdown::resolve_file_list;
-use lakehouse_engine::scan::spec::{
-    CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageBackend,
+use lakehouse_engine::adapter::pushdown::{
+    ConnectionStorage, FormatReader, ScanSource, format_reader,
 };
-use serde_json::Value as Json;
+use lakehouse_engine::scan::spec::{CatalogProps, StorageBackend};
 
 /// Never invoked. Its signature naming `&lakehouse_catalog::CatalogSession`
-/// as the first parameter, forwarded into `resolve_file_list`, is the proof:
-/// this file only compiles while `resolve_file_list`'s real first parameter
-/// stays a shared reference to the catalog crate's session type.
+/// as `session`, forwarded into `ScanSource::Iceberg` and then `format_reader`,
+/// is the proof: this file only compiles while the Iceberg scan source's
+/// session field stays a shared reference to the catalog crate's session type.
 #[allow(dead_code)]
-async fn accepts_shared_session_for_file_resolution(
-    session: &lakehouse_catalog::CatalogSession,
-    catalog_props: &CatalogProps,
-    storage: &StorageBackend,
-    creds: &ConnectionCreds,
+fn accepts_shared_session_for_iceberg_scan_source<'a>(
+    session: &'a lakehouse_catalog::CatalogSession,
+    catalog_props: &'a CatalogProps,
+    storage: &'a StorageBackend,
+    creds: &'a ConnectionCreds,
     allow_http: bool,
-    filter_json: Option<&Json>,
-) -> Result<
-    (
-        Vec<FileEntry>,
-        StorageBackend,
-        Vec<LogicalField>,
-        String,
-        Vec<NameMappingEntry>,
-    ),
-    UdfError,
-> {
-    resolve_file_list(
-        session,
-        catalog_props,
-        storage,
-        creds,
-        allow_http,
-        filter_json,
+) -> Result<Box<dyn FormatReader + 'a>, UdfError> {
+    format_reader(
+        ScanSource::Iceberg {
+            session,
+            catalog_props,
+        },
+        &ConnectionStorage {
+            storage,
+            creds,
+            allow_http,
+        },
     )
-    .await
 }
 
 #[test]
-fn file_resolution_entry_points_take_a_shared_session() {
-    // The proof is that `accepts_shared_session_for_file_resolution` above
+fn iceberg_scan_source_carries_a_shared_session() {
+    // The proof is that `accepts_shared_session_for_iceberg_scan_source` above
     // compiled: no live catalog is built or called here.
 }
