@@ -1,44 +1,32 @@
-# Feature: Unity Catalog E2E Harness
+# Feature: Unity Catalog E2E Harness — Delta Query Result Coverage
 
-End-to-end coverage of the Virtual Schema against a native Unity Catalog OSS server backed by MinIO
-and seeded with the vendored Delta fixtures, run through the shared harness so the script DDL is
-byte-identical to every other E2E binary. The suite fails, never skips, when the stack is unavailable.
+End-to-end coverage of the actual rows a query returns over the seeded Delta fixtures — delete-free,
+deletion-vector, column-mapped, partitioned, join/aggregate, and unplannable-type tables — run through
+the same `unity-e2e` stack and virtual schema as `e2e-harness/unity-catalog-e2e-harness`. Split out of
+that feature once its scenario count crossed this library's per-spec organization threshold.
 
 ## Background
 
-* **This delta is issue #320 and lifts the suite's scan-execution ceiling.** The suite stops at
-  catalog metadata and plan-time scan resolution today; it now issues real queries through Exasol and
-  asserts the rows they return.
-* The seeded fixtures this delta queries are `multi_part_stats` (5 files, 5 rows, delete-free,
+* **Split from `e2e-harness/unity-catalog-e2e-harness`, issue #320.** That feature keeps harness
+  bring-up, createVirtualSchema enumeration, the virtual schema's storage-credential wiring, the
+  stack-unavailable failure contract, and the credential-leak guarantee. This feature owns every
+  scenario that asserts the ROWS a query returns over a seeded Delta table.
+* The seeded fixtures these scenarios query are `multi_part_stats` (5 files, 5 rows, delete-free,
   unpartitioned), `table_with_dv` (1 file, 10 physical rows, a UUID-relative deletion vector of
   cardinality 2), `cm_id_mode` and `cm_name_mode` (`col-<uuid>` physical names under `id` and `name`
-  column mapping), and `basic_partitioned` (6 files, 6 rows, partitioned by `letter`, one file under
-  the Hive default-partition directory).
-* No new fixture, Makefile target, or test tier is added. The scenarios extend the existing
-  `make test-e2e-unity` suite.
+  column mapping), `basic_partitioned` (6 files, 6 rows, partitioned by `letter`, one file under the
+  Hive default-partition directory), and `unshredded_variant` / `stats_all_types` (types this engine
+  does not map).
+* No new fixture, Makefile target, or test tier is added. These scenarios extend the existing
+  `make test-e2e-unity` suite, in the same `e2e_unity_test.rs` binary as the sibling feature's
+  scenarios.
+* The virtual schema these scenarios query against is the one
+  `e2e-harness/unity-catalog-e2e-harness` § "The suite's virtual schema carries the storage
+  credentials a UDF-side scan needs" creates; that scenario's guarantee — a CONNECTION carrying the
+  MinIO endpoint and static storage credentials, provisioned through the shared harness scan-UDF
+  definition — is a precondition every scenario below relies on.
 
 ## Scenarios
-
-<!-- DELTA:CHANGED -->
-### Scenario: Create virtual schema over a Unity Catalog namespace lists the fixture tables and columns
-
-* *GIVEN* a running Unity Catalog stack seeded with the fixtures and an Exasol CONNECTION whose address is `http://unitycatalog:8080`, whose password supplies no auth field, and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `ICEBERG_NAMESPACE` property is `unity.delta_e2e`
-* *WHEN* the suite issues createVirtualSchema against that CONNECTION
-* *THEN* the created virtual schema SHALL expose one virtual table per seeded fixture table, each named by the shared flatten-and-uppercase rule
-* *AND* each virtual table SHALL declare its columns with Exasol types mapped from the Unity Catalog column types, so a seeded fixture's columns appear with the expected Exasol types
-* *AND* the suite SHALL assert the presence of a representative fixture table and its column set, so a regression in enumeration or column mapping fails the suite
-* *AND* this scenario SHALL keep issuing no scan-driving query of its own, SUPERSEDING the recorded clause that bounded the WHOLE SUITE to no scan execution: the scenarios below now run real queries, so what this scenario asserts is enumeration alone rather than the suite's ceiling
-<!-- /DELTA:CHANGED -->
-
-<!-- DELTA:NEW -->
-### Scenario: The suite's virtual schema carries the storage credentials a UDF-side scan needs
-
-* *GIVEN* the seeded fixtures on MinIO and an OSS Unity Catalog server that vends no object-storage endpoint
-* *WHEN* the suite creates the virtual schema the query scenarios below run against
-* *THEN* that virtual schema's CONNECTION SHALL supply the MinIO endpoint and static storage credentials, so the scan UDF running inside Exasol reaches MinIO with a credential resolved from the CONNECTION rather than from a test-process injection
-* *AND* the suite SHALL provision the scan UDF script through the SAME shared harness definition every other E2E binary uses, so the scan script DDL is byte-identical across suites
-* *AND* adding those credentials MUST NOT change the enumeration scenario's result, because listing reads catalog metadata and no object storage
-* *AND* the vended-versus-static planning scenario SHALL keep running unchanged, so credential vending stays covered where the OSS server can serve it
 
 ### Scenario: A delete-free Delta table returns its rows end to end
 
@@ -87,4 +75,3 @@ byte-identical to every other E2E binary. The suite fails, never skips, when the
 * *THEN* each query SHALL fail with the reader's plan-time error naming the column and its Delta type, and MUST NOT return a row
 * *AND* the failure MUST arrive as a SQL error rather than as a crashed UDF VM, so an unsupported table is a diagnosable refusal rather than an abnormal exit
 * *AND* the error text MUST NOT contain any credential value
-<!-- /DELTA:NEW -->

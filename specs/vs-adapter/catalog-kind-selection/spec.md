@@ -4,7 +4,13 @@ Selects which catalog kind a virtual schema resolves against — the existing Ic
 
 ## Background
 
-The catalog kind is a `CatalogKind` enum with exactly two variants, `IcebergRest` and `UnityCatalogNative`; the variant IS the catalog kind. The kind is matched EXHAUSTIVELY at exactly ONE site — the construction site that builds the boxed `CatalogClient` — so adding a third kind is a build failure there rather than a silent fall-through, and no listing operation re-matches it. The `CATALOG_KIND` property value is compared case-insensitively. `CatalogKind` is an adapter-layer type in `crates/lakehouse-engine`: it is read from an Exasol virtual-schema property, and the `lakehouse-catalog` crate must not name that delivery mechanism. Credential validation is the one further place the kind is an input, and it takes the kind as an explicit parameter rather than re-deriving it.
+The catalog kind is a `CatalogKind` enum with exactly two variants, `IcebergRest` and `UnityCatalogNative`; the variant IS the catalog kind. The kind is matched EXHAUSTIVELY at a small, enumerated set of construction sites, so adding a third kind is a build failure there rather than a silent fall-through, and no listing or pushdown operation re-matches it per request shape. The `CATALOG_KIND` property value is compared case-insensitively. `CatalogKind` is an adapter-layer type in `crates/lakehouse-engine`: it is read from an Exasol virtual-schema property, and the `lakehouse-catalog` crate must not name that delivery mechanism. Credential validation is one further place the kind is an input, and it takes the kind as an explicit parameter rather than re-deriving it.
+
+* **This delta is issue #320.** It replaces the pushdown-time refusal with pushdown-time resolution.
+  The kind's role does not widen: the refusal site becomes a construction site, so the count of
+  production sites permitted to name a variant is unchanged.
+* Every createVirtualSchema rule — kind resolution, case-insensitive comparison, credential
+  validation, and the unrecognized-value rejection — is unchanged by this delta.
 
 ## Scenarios
 
@@ -31,8 +37,9 @@ The catalog kind is a `CatalogKind` enum with exactly two variants, `IcebergRest
 * *WHEN* the adapter handles a createVirtualSchema request under either kind
 * *THEN* the adapter SHALL match `CatalogKind` EXHAUSTIVELY at exactly ONE construction site, which returns a boxed `CatalogClient`, so a third catalog kind is a compile error at that site
 * *AND* every subsequent createVirtualSchema step — enumerating the namespace, flattening and case-folding names, mapping column types, building `TABLE_MAP`, and assembling the response — SHALL run ONE pipeline that reads the boxed client through the trait and MUST NOT name or match `CatalogKind`, so a listing change lands once rather than once per kind
-* *AND* the ONLY other production site permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter (see the Connection-Object Credential Source feature), and the pushdown refusal below; no other production module SHALL match on the enum
-* *AND* a source-level probe SHALL assert that `CatalogKind`'s variant names appear in no production module other than the enum's own declaration, `resolve_catalog_kind`, the construction site, credential validation, and the pushdown refusal, so a per-operation fork cannot be reintroduced silently
+* *AND* the ONLY other production sites permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter (see the Connection-Object Credential Source feature), and the pushdown path's per-request scan-source construction site, which SUPERSEDES the pushdown refusal in this list because `vs-adapter/pushdown-format-neutral-resolution` replaces that refusal with a resolution seam; no other production module SHALL match on the enum
+* *AND* the pushdown scan-source construction site SHALL match the kind EXHAUSTIVELY and SHALL yield the per-request resolver every request shape resolves through, so the site count is unchanged and pushdown gains no per-shape fork
+* *AND* a source-level probe SHALL assert that `CatalogKind`'s variant names appear in no production module other than the enum's own declaration, `resolve_catalog_kind`, the catalog-client construction site, credential validation, and the pushdown scan-source construction site, so a per-operation fork cannot be reintroduced silently
 
 ### Scenario: Unity Catalog validation does not require a warehouse and rejects SigV4
 
@@ -57,10 +64,12 @@ The catalog kind is a `CatalogKind` enum with exactly two variants, `IcebergRest
 * *AND* the adapter MUST NOT fall back to a default catalog kind, because silently defaulting an unrecognized kind would resolve a misconfigured virtual schema against the wrong catalog
 * *AND* the error message MUST NOT contain any credential value
 
-### Scenario: A pushdown request under the Unity Catalog kind is refused as not yet executable
+### Scenario: A pushdown request under the Unity Catalog kind is planned as a Delta scan
 
-* *GIVEN* a pushdown request whose virtual schema was created with `CATALOG_KIND` set to `UNITY_CATALOG`
+* *GIVEN* a pushdown request whose virtual schema was created with `CATALOG_KIND` set to `UNITY_CATALOG`, over a seeded Delta table
 * *WHEN* the adapter handles the pushdown request
-* *THEN* the adapter SHALL return an error stating that Unity Catalog scan execution is not yet supported and MUST NOT resolve the request through the Iceberg REST file-resolution path, because a Unity Catalog table is a Delta table the Iceberg path cannot read and a silent Iceberg attempt would surface a misleading catalog error
-* *AND* the refusal SHALL happen before any catalog client is constructed and before any credential or file resolution, so a Unity Catalog pushdown issues no catalog request at all
-* *AND* the error message MUST NOT contain any credential value
+* *THEN* the adapter SHALL resolve the request through the Unity Catalog scan source and the Delta format reader, and SHALL return a scan-driving SQL response, SUPERSEDING the recorded refusal that Unity Catalog scan execution is not yet supported
+* *AND* the adapter MUST NOT resolve the request through the Iceberg REST file-resolution path, because a Unity Catalog table is a Delta table the Iceberg path cannot read
+* *AND* the adapter SHALL keep resolving the catalog kind BEFORE it reads the CONNECTION, so an unrecognized `CATALOG_KIND` still fails without a connect-back round-trip
+* *AND* a pushdown request whose Delta table cannot be planned SHALL fail with the reader's own plan-time error rather than a kind-level refusal, so an unreadable table and an unsupported catalog kind are distinguishable
+* *AND* no error message on any of these paths SHALL contain a credential value
