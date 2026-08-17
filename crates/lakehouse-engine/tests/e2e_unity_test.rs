@@ -29,9 +29,9 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts, exa_conn,
-    explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc, parse_int,
-    upload_so,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts,
+    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc,
+    parse_int, upload_so,
 };
 use common::exasol_ws::ExaConn;
 use common::stack::{
@@ -975,19 +975,24 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     );
 }
 
-/// Scenario: A Delta table this engine cannot plan fails the query loud.
+/// Scenario: A Delta table using an unsupported reader feature fails the query
+/// loud.
 ///
-/// `unshredded_variant` and `stats_all_types` declare Delta types this engine
-/// does not map (`variant`, `byte`, among others) — a plan-time refusal, not a
-/// silently wrong or partial result. The failure arrives as a SQL error (never a
-/// crashed UDF VM, checked by a follow-up query surviving on the same
-/// connection) and must not leak a credential value.
+/// `type_widening` declares `typeWidening-preview` (tracked as issue #349) and
+/// `unshredded_variant` declares `variantType-preview`; `DeltaSnapshot::open`
+/// refuses both at plan time, before any log replay. The refusal must be the
+/// protocol gate's own message — never something that looks like the per-column
+/// type-mapping refusal (which names a column and cites #350) — and the session
+/// must survive to prove no crashed UDF VM took it down.
 #[test]
-fn unity_delta_unmappable_table_fails_the_query_loud() {
+fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
     let mut conn = exa_conn();
 
-    for table in ["UNSHREDDED_VARIANT", "STATS_ALL_TYPES"] {
+    for (table, feature, cites_349) in [
+        ("TYPE_WIDENING", "typeWidening-preview", true),
+        ("UNSHREDDED_VARIANT", "variantType-preview", false),
+    ] {
         let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
         assert_eq!(
             resp["status"].as_str(),
@@ -996,13 +1001,18 @@ fn unity_delta_unmappable_table_fails_the_query_loud() {
         );
         let msg = resp["exception"]["text"].as_str().unwrap_or("");
         assert!(
-            msg.contains("Delta column '") && msg.contains("does not map at plan time"),
-            "{table} must fail with the reader's specific plan-time-type error \
-             naming the column and its Delta type, not an opaque one: {msg}"
+            msg.contains(feature),
+            "{table}'s error must name its actual unsupported reader feature: {msg}"
+        );
+        assert_eq!(
+            msg.contains("#349"),
+            cites_349,
+            "{table}'s error must cite issue #349 only for typeWidening: {msg}"
         );
         assert!(
-            msg.contains("#322"),
-            "{table}'s error must cite the tracked type-mapping issue: {msg}"
+            !msg.contains("#350") && !msg.to_lowercase().contains("does not map at plan time"),
+            "{table}'s error must be the protocol-gate refusal, not a column-typed \
+             type-mapping error: {msg}"
         );
         assert!(
             !msg.to_lowercase().contains("minioadmin"),
@@ -1015,5 +1025,177 @@ fn unity_delta_unmappable_table_fails_the_query_loud() {
         survives, 1,
         "the connection must survive both refusals: a crashed UDF VM would take \
          the session down, not return a clean SQL error"
+    );
+}
+
+/// The 13 Delta types this engine maps for `stats_all_types`, in fixture column
+/// order. The other 3 declared columns (`binary_col`, `map_col`,
+/// `nested_struct`) are refused per column — exercised by
+/// `unity_delta_refused_column_refuses_only_the_queries_naming_it`.
+const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LONG_COL, FLOAT_COL, DOUBLE_COL, DATE_COL, \
+     TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL";
+
+/// Scenario: A Delta table spanning varied types returns the expected Exasol
+/// types and values.
+///
+/// `stats_all_types` carries one active Parquet file of 4 rows across its 13
+/// mappable columns. `BYTE_COL`/`SHORT_COL` are checked by their real logged
+/// values (not merely "present") to prove `byte`/`short` are not silently
+/// NULLed by a missing mapping; `ARRAY_COL`'s bracketed rendering matches the
+/// scan-level expression-adapter cast proven in `raw_scan_tests`.
+#[test]
+fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
+    setup();
+    let mut conn = exa_conn();
+    let table = table_ref("STATS_ALL_TYPES");
+
+    let count = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {table}"));
+    assert_eq!(
+        count, 4,
+        "stats_all_types must carry exactly 4 rows: {count}"
+    );
+
+    let cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
+    for (column, expected) in [
+        ("BYTE_COL", "DECIMAL(3,0)"),
+        ("SHORT_COL", "DECIMAL(5,0)"),
+        ("INT_COL", "DECIMAL(10,0)"),
+        ("LONG_COL", "DECIMAL(20,0)"),
+        ("FLOAT_COL", "DOUBLE"),
+        ("DOUBLE_COL", "DOUBLE"),
+        ("DATE_COL", "DATE"),
+        ("TIMESTAMP_COL", "TIMESTAMP"),
+        ("TIMESTAMP_NTZ_COL", "TIMESTAMP"),
+        ("STRING_COL", "VARCHAR(2000000)"),
+        ("DECIMAL_COL", "DECIMAL(10,2)"),
+        ("BOOLEAN_COL", "BOOLEAN"),
+        ("ARRAY_COL", "VARCHAR(2000000)"),
+    ] {
+        assert_col_type(&cols, column, expected);
+    }
+
+    let select_sql = format!("SELECT {STATS_ALL_TYPES_MAPPABLE_COLUMNS} FROM {table}");
+    let pushed = explain_virtual_sql(&mut conn, &select_sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME),
+        "the mappable-column projection must drive the scan UDF, not an \
+         unaccelerated fallback: {pushed}"
+    );
+
+    let rows = conn.query_columns(&select_sql);
+    assert_eq!(rows.len(), 13, "expected 13 projected columns: {rows:?}");
+    assert_eq!(rows[0].len(), 4, "expected 4 rows: {rows:?}");
+
+    let byte_non_null: Vec<i64> = rows[0]
+        .iter()
+        .filter(|v| !v.is_null())
+        .map(parse_int)
+        .collect();
+    assert_eq!(
+        byte_non_null.len(),
+        3,
+        "BYTE_COL must carry 3 real logged values and 1 NULL, not be silently \
+         NULLed by a missing mapping: {:?}",
+        rows[0]
+    );
+
+    let short_non_null: Vec<i64> = rows[1]
+        .iter()
+        .filter(|v| !v.is_null())
+        .map(parse_int)
+        .collect();
+    assert_eq!(
+        short_non_null.len(),
+        3,
+        "SHORT_COL must carry 3 real logged values and 1 NULL, not be silently \
+         NULLed by a missing mapping: {:?}",
+        rows[1]
+    );
+
+    let array_col = &rows[12];
+    let mut rendered: Vec<Option<String>> = array_col
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect();
+    rendered.sort();
+    assert_eq!(
+        rendered,
+        vec![
+            None,
+            Some("[1, 2, 3]".to_string()),
+            Some("[4, 5]".to_string()),
+            Some("[6]".to_string()),
+        ],
+        "ARRAY_COL must render each populated array bracketed and keep a NULL \
+         array NULL, matching the scan's own field-id expression adapter cast: \
+         {array_col:?}"
+    );
+}
+
+/// Scenario: A Delta column this engine cannot render refuses only the queries
+/// that name it.
+///
+/// `stats_all_types` carries `binary_col`, `map_col`, and `nested_struct` —
+/// each refused per column (issue #350), not table-wide. A projection naming
+/// one individually, a `SELECT *` (which widens to the full base row), and a
+/// WHERE clause referencing one all refuse; the 13-column mappable projection
+/// from `unity_delta_varied_types_return_their_expected_exasol_types_and_values`
+/// still succeeds afterward on the SAME connection, proving the refusal is
+/// per-request rather than session-poisoning.
+#[test]
+fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
+    setup();
+    let mut conn = exa_conn();
+    let table = table_ref("STATS_ALL_TYPES");
+
+    for (column, delta_name) in [
+        ("BINARY_COL", "binary_col"),
+        ("MAP_COL", "map_col"),
+        ("NESTED_STRUCT", "nested_struct"),
+    ] {
+        let resp = conn.try_execute(&format!("SELECT {column} FROM {table}"));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "{column} must refuse the query, not return a row: {resp}"
+        );
+        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        assert!(
+            msg.contains(delta_name) && msg.contains("#350"),
+            "{column}'s refusal must name its Delta column and cite issue #350: {msg}"
+        );
+    }
+
+    let star_resp = conn.try_execute(&format!("SELECT * FROM {table}"));
+    assert_eq!(
+        star_resp["status"].as_str(),
+        Some("error"),
+        "SELECT * widens to the full base row, so a refused column anywhere in \
+         the table must refuse it too: {star_resp}"
+    );
+
+    let where_resp = conn.try_execute(&format!(
+        "SELECT INT_COL FROM {table} WHERE BINARY_COL IS NOT NULL"
+    ));
+    assert_eq!(
+        where_resp["status"].as_str(),
+        Some("error"),
+        "a WHERE clause referencing a refused column must refuse it even though \
+         the select list names only a mappable column: {where_resp}"
+    );
+
+    let mappable = conn.query_columns(&format!(
+        "SELECT {STATS_ALL_TYPES_MAPPABLE_COLUMNS} FROM {table}"
+    ));
+    assert_eq!(
+        mappable.len(),
+        13,
+        "the mappable 13-column projection must still succeed on the same \
+         connection, proving the refusals above were per-request: {mappable:?}"
+    );
+    assert_eq!(
+        mappable[0].len(),
+        4,
+        "expected 4 rows from the mappable projection: {mappable:?}"
     );
 }

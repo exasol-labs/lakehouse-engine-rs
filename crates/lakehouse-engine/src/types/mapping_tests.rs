@@ -115,6 +115,71 @@ fn incompatible_types_map_to_varchar_json() {
     assert!(!needs_json_fallback(&DataType::Decimal128(36, 6)));
 }
 
+/// Scenario (delta-type-mapping): The castability claims behind the Delta type
+/// mapping are asserted against `arrow-cast` directly, not assumed. Pins the
+/// native/text-rendered/refused set membership so an `arrow-cast` upgrade that
+/// changes one of these answers fails this test instead of silently
+/// re-partitioning the sets.
+#[test]
+fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
+    use arrow::compute::can_cast_types;
+    use arrow::datatypes::{Fields, IntervalUnit};
+
+    let populated_struct = DataType::Struct(Fields::from(vec![arrow::datatypes::Field::new(
+        "a",
+        DataType::Int32,
+        true,
+    )]));
+    let map = DataType::Map(
+        std::sync::Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                arrow::datatypes::Field::new("keys", DataType::Utf8, false),
+                arrow::datatypes::Field::new("values", DataType::Int32, true),
+            ])),
+            false,
+        )),
+        false,
+    );
+    let list_of_struct = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        populated_struct.clone(),
+        true,
+    )));
+
+    // Text-rendered set: castable to Utf8, mapped by rendering the value as text.
+    assert!(can_cast_types(
+        &DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true
+        ))),
+        &DataType::Utf8
+    ));
+    assert!(can_cast_types(
+        &DataType::Interval(IntervalUnit::YearMonth),
+        &DataType::Utf8
+    ));
+    assert!(can_cast_types(
+        &DataType::Interval(IntervalUnit::DayTime),
+        &DataType::Utf8
+    ));
+    assert!(can_cast_types(
+        &DataType::Decimal128(38, 10),
+        &DataType::Utf8
+    ));
+
+    // Binary IS castable to Utf8, but is refused anyway: the cast replaces any
+    // non-UTF-8 byte sequence with NULL rather than erroring, which would silently
+    // corrupt data this engine has no way to detect.
+    assert!(can_cast_types(&DataType::Binary, &DataType::Utf8));
+
+    // Refused set: NOT castable to Utf8 (a POPULATED struct, not a zero-field one).
+    assert!(!can_cast_types(&populated_struct, &DataType::Utf8));
+    assert!(!can_cast_types(&map, &DataType::Utf8));
+    assert!(!can_cast_types(&list_of_struct, &DataType::Utf8));
+}
+
 /// Scenario: One arm list decides both the Exasol type string and the
 /// JSON-fallback flag — and the string alone cannot decide it. `Utf8` and
 /// `LargeUtf8` declare `VARCHAR(2000000)` and cross the boundary unchanged,

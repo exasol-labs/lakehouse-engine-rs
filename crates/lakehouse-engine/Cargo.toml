@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.36.1"
+version = "0.37.0"
 edition = "2024"
 license.workspace = true
 
@@ -50,13 +50,15 @@ iceberg = { workspace = true }
 # `delta_kernel_default_engine`'s own `default` feature set pulls in `arrow-59`
 # unconditionally, unioning a second arrow tree onto the `arrow-58` we ask for —
 # `default-features = false` is required to actually get exactly one arrow version.
-# `internal-api` is the ONLY way 0.26 exposes a table's ordered partition-column list
-# and its protocol-gated column-mapping mode (`TableConfiguration::partition_columns` /
-# `::column_mapping_mode`, both `pub(crate)` without it). It is the crate's declared
+# `internal-api` is the ONLY way 0.26 exposes a table's ordered partition-column list,
+# its protocol-gated column-mapping mode, and its reader protocol
+# (`TableConfiguration::partition_columns` / `::column_mapping_mode` / `::protocol`,
+# `Snapshot::table_configuration`, `Protocol::min_reader_version` / `::reader_features`,
+# and the `TableFeature` enum, all `pub(crate)` without it). It is the crate's declared
 # UNSTABLE surface — it changes visibility only, never behaviour, but carries no semver
-# guarantee across 0.26.x. Both accessors are reached from ONE place,
-# `format::delta_replay`, so a kernel upgrade that drops them is a compile error there
-# rather than a silent behaviour change.
+# guarantee across 0.26.x. Every accessor is called from ONE place, `format::delta_replay`,
+# and `format::delta_protocol` alone names `TableFeature`, so a kernel upgrade that drops
+# one is a compile error there rather than a silent behaviour change.
 delta_kernel = { version = "0.26", features = [
     "default-engine-base",
     "arrow-58",

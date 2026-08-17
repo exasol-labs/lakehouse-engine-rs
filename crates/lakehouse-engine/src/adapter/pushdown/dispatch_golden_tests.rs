@@ -780,6 +780,7 @@ fn resolved_customer_side() -> ResolvedJoinSide {
         effective_storage: sample_storage(),
         partition_columns: Vec::new(),
         total_bytes: 10,
+        refused_columns: Vec::new(),
     }
 }
 
@@ -802,6 +803,7 @@ fn resolved_orders_side() -> ResolvedJoinSide {
         effective_storage: sample_storage(),
         partition_columns: Vec::new(),
         total_bytes: 100,
+        refused_columns: Vec::new(),
     }
 }
 

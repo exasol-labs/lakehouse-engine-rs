@@ -2,10 +2,10 @@ use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBacken
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::ResolvedScan;
 use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{column_types, extract_limit, extract_offset};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
+use super::super::{RefusedColumn, ResolvedScan};
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///
@@ -211,6 +211,10 @@ pub(crate) struct ResolvedJoinSide {
     pub partition_columns: Vec<String>,
     /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
     pub total_bytes: u64,
+    /// The columns THIS side's format reader declined to map, each with its reason.
+    /// Empty on every Iceberg side. Carried per side rather than merged across the
+    /// join because a reason belongs to the table that raised it.
+    pub refused_columns: Vec<RefusedColumn>,
 }
 
 impl ResolvedJoinSide {
@@ -229,6 +233,7 @@ impl ResolvedJoinSide {
             table_root,
             name_mapping,
             partition_columns,
+            refused_columns,
         } = resolved;
         let total_bytes = files
             .iter()
@@ -243,6 +248,7 @@ impl ResolvedJoinSide {
             effective_storage,
             partition_columns,
             total_bytes,
+            refused_columns,
         }
     }
 }

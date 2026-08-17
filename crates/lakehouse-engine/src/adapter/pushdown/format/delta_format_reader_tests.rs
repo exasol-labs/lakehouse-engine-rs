@@ -257,3 +257,64 @@ async fn a_failed_log_read_reports_no_static_credential_value() {
         "no error may carry the secret key it read through: {message}"
     );
 }
+
+fn refused(column_name: &str, reason: &str) -> RefusedColumn {
+    RefusedColumn {
+        column_name: column_name.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+// Scenario Coverage (delta-type-mapping): A Delta table with no mappable column is refused as a
+// whole
+#[test]
+fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
+    let refused_columns = vec![
+        refused("binary_col", "binary is refused, see #350"),
+        refused("map_col", "map is refused, see #350"),
+    ];
+
+    let error = ensure_table_has_a_mappable_column(&[], &refused_columns)
+        .expect_err("a table with zero mappable columns must be refused as a whole");
+
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(message.contains("binary_col"), "message was: {message}");
+    assert!(
+        message.contains("binary is refused, see #350"),
+        "message was: {message}"
+    );
+    assert!(message.contains("map_col"), "message was: {message}");
+    assert!(
+        message.contains("map is refused, see #350"),
+        "message was: {message}"
+    );
+}
+
+/// The `stats_all_types` shape: some columns refused, at least one mappable. The table stays
+/// queryable on its mappable columns rather than being refused as a whole.
+#[test]
+fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
+    let logical_schema = vec![LogicalField {
+        field_id: None,
+        name: "id".to_string(),
+        arrow_type: "int64".to_string(),
+        nullable: false,
+        initial_default: None,
+        physical_name: None,
+    }];
+    let refused_columns = vec![refused("binary_col", "binary is refused, see #350")];
+
+    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)
+        .expect("a table with a mappable column must not be refused as a whole");
+}
+
+/// A table declaring no column at all trivially satisfies "every column is mappable" — there is
+/// no refused column to justify a whole-table refusal.
+#[test]
+fn a_table_with_no_columns_and_no_refusals_is_not_refused_as_a_whole() {
+    ensure_table_has_a_mappable_column(&[], &[])
+        .expect("an empty schema with nothing refused must not be refused as a whole");
+}

@@ -35,8 +35,8 @@ docker compose -f docker-compose.yml up -d minio-init      # create warehouse bu
   | `cm_name_mode` / `cm_id_mode` | column mapping (name / id) | #320 |
   | `basic_partitioned` | partition values / partition pruning | #319, #321 |
   | `multi_part_stats` | multi-file stats-based pruning | #321 |
-  | `stats_all_types` | broad types incl. array/map/struct → JSON `VARCHAR` | #322 |
-  | `unshredded_variant` / `type_widening` | unsupported reader feature → fail-loud | #322 |
+  | `stats_all_types` | broad types: `array` maps to text VARCHAR, `map`/`struct`/`binary` refused per column; `timestampNtz` maps to TIMESTAMP | #322, #350 |
+  | `unshredded_variant` / `type_widening` | reader features outside the plan-time gate's five-feature allow-list (`variantType`/`typeWidening`, concretely) → fail-loud | #322, #349 |
 
 - The credential Unity Catalog vends for `s3://warehouse`: `seed.sh` mints a real
   MinIO STS session (AssumeRole at MinIO's S3 endpoint, 7-day maximum) and injects

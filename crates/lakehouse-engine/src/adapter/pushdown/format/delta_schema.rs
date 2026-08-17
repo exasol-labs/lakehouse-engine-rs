@@ -7,14 +7,21 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::spec::LogicalField;
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
+use super::RefusedColumn;
+
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
 mod tests;
 
-/// Resolves a Delta table's logical schema and metadata into the two format-neutral values the
+/// The three values `build_delta_table_schema` answers: the ordered [`LogicalField`] list, the
+/// table's ordered partition-column names, and the columns it declined to map.
+type DeltaTableSchema = (Vec<LogicalField>, Vec<String>, Vec<RefusedColumn>);
+
+/// Resolves a Delta table's logical schema and metadata into the three format-neutral values the
 /// scan spec carries for it: the ordered [`LogicalField`] list feeding `ScanSpec::logical_schema`,
-/// each field carrying the ONE binding key its column-mapping mode selects, and the table's ordered
-/// partition-column names feeding `CommonScanSpec::partition_columns`.
+/// each field carrying the ONE binding key its column-mapping mode selects; the table's ordered
+/// partition-column names feeding `CommonScanSpec::partition_columns`; and the columns this call
+/// declined to map, each named with the reason.
 ///
 /// `column_mapping_mode` is the column-mapping mode already IN FORCE — the protocol-gated mode
 /// from [`DeltaSnapshot::column_mapping_mode`](super::delta_replay::DeltaSnapshot::column_mapping_mode),
@@ -26,23 +33,43 @@ mod tests;
 /// home free to disagree with it.
 ///
 /// `partition_columns` is the table's own partition-column list, threaded through unchanged so a
-/// table with zero active files still carries it. Maps only the Delta primitive types that already
-/// have an Arrow type tag in this engine's vocabulary; anything else — including a decimal outside
-/// Exasol's representable domain — is refused with a [`UdfError`] naming the column and its Delta
-/// type rather than emitting a misdescribed tag. Performs no Delta reader-feature gating.
+/// table with zero active files still carries it. Maps each column's Delta type onto its own Arrow
+/// tag, onto the `utf8` tag when Exasol cannot represent the type natively — an out-of-domain
+/// decimal, `void`, either interval type, or an `array` whose element type is itself mappable at
+/// every nesting depth — or REFUSES the column: no [`LogicalField`] is emitted for it, and it is
+/// recorded in the returned refused list, naming the reason its type cannot be rendered faithfully.
+/// A refused column never fails this call by itself — refusing the whole table when NO column is
+/// mappable is the caller's decision, made once every column has been classified. A [`UdfError`]
+/// surfaces from this call only when a MAPPABLE column carries a malformed column-mapping
+/// annotation, below. Performs no Delta reader-feature gating.
 ///
-/// Under `id`/`name` column mapping a column's binding key comes from its `delta.columnMapping.*`
-/// annotations ALONE: a column missing either annotation, or carrying an id no `i32` holds, is
-/// refused — its ordinal position and its logical name are values the writer never used.
+/// A column's TYPE is classified BEFORE its `delta.columnMapping.*` binding key is ever read: a
+/// refused column's binding key is never looked up, so a column is refused for its type and never
+/// for an annotation on a column this engine will not read.
+///
+/// Under `id`/`name` column mapping a MAPPABLE column's binding key comes from its
+/// `delta.columnMapping.*` annotations ALONE: a column missing either annotation, or carrying an id
+/// no `i32` holds, is refused — its ordinal position and its logical name are values the writer
+/// never used.
 pub(super) fn build_delta_table_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
     partition_columns: Vec<String>,
-) -> Result<(Vec<LogicalField>, Vec<String>), UdfError> {
+) -> Result<DeltaTableSchema, UdfError> {
     let mut logical_fields = Vec::with_capacity(schema.num_fields());
+    let mut refused_columns = Vec::new();
 
     for field in schema.fields() {
-        let arrow_type = delta_type_to_arrow_tag(field.name(), field.data_type())?;
+        let arrow_type = match classify_delta_type(field.name(), field.data_type()) {
+            ClassifiedDeltaColumn::Tag(arrow_type) => arrow_type,
+            ClassifiedDeltaColumn::Refused(reason) => {
+                refused_columns.push(RefusedColumn {
+                    column_name: field.name().clone(),
+                    reason,
+                });
+                continue;
+            }
+        };
         let (field_id, physical_name) = binding_key(field, column_mapping_mode)?;
         logical_fields.push(LogicalField {
             field_id,
@@ -54,7 +81,7 @@ pub(super) fn build_delta_table_schema(
         });
     }
 
-    Ok((logical_fields, partition_columns))
+    Ok((logical_fields, partition_columns, refused_columns))
 }
 
 /// The ONE binding key `field`'s logical field carries, as the `(field_id, physical_name)` pair
@@ -162,38 +189,103 @@ fn unusable_column_mapping(
     ))
 }
 
-fn delta_type_to_arrow_tag(column_name: &str, data_type: &DataType) -> Result<String, UdfError> {
-    let DataType::Primitive(primitive) = data_type else {
-        return Err(unmapped_delta_type_error(column_name, data_type));
-    };
-    use PrimitiveType::*;
-    let tag = match primitive {
-        Boolean => "bool".to_string(),
-        Integer => "int32".to_string(),
-        Long => "int64".to_string(),
-        Float => "float32".to_string(),
-        Double => "float64".to_string(),
-        String => "utf8".to_string(),
-        Date => "date32".to_string(),
-        Timestamp => "timestamptz_us".to_string(),
-        TimestampNtz => "timestamp_us".to_string(),
-        Decimal(decimal) => {
-            let (precision, scale) = (u32::from(decimal.precision()), u32::from(decimal.scale()));
-            if exasol_representable_catalog_decimal(precision, scale) {
-                format!("decimal128({precision},{scale})")
-            } else {
-                return Err(unmapped_delta_type_error(column_name, data_type));
-            }
-        }
-        _ => return Err(unmapped_delta_type_error(column_name, data_type)),
-    };
-    Ok(tag)
+/// What classifying ONE Delta column's type answers: the Arrow tag the scan binds the column
+/// by, or the reason this engine will not render it.
+///
+/// Refusing a column is an expected outcome of reading a Delta schema — never a failure of it —
+/// so it is answered as a value rather than signalled as an error and converted back to data one
+/// line later. That leaves a [`UdfError`] out of [`build_delta_table_schema`] meaning exactly one
+/// thing: a MAPPABLE column carries a malformed column-mapping annotation.
+enum ClassifiedDeltaColumn {
+    Tag(String),
+    Refused(String),
 }
 
-fn unmapped_delta_type_error(column_name: &str, data_type: &DataType) -> UdfError {
-    UdfError::User(format!(
-        "Delta column '{column_name}' has type '{data_type}', which this engine does not map \
-         at plan time; broad Delta type mapping, including the incompatible-type \
-         VARCHAR(2000000)-via-JSON convention, is tracked as issue #322"
-    ))
+/// Classifies `data_type` for the column named `column_name`.
+///
+/// An `array` classifies as its INNERMOST element type does — mirroring `can_cast_types`' own
+/// `(List(inner), Utf8) => can_cast_types(inner, Utf8)` rule, where only whether the element
+/// classifies at all decides and its tag is discarded. Its refusal is composed ONCE against the
+/// column's own declared type, so nesting adds no message layer and no operator is told the
+/// column has the element's type.
+fn classify_delta_type(column_name: &str, data_type: &DataType) -> ClassifiedDeltaColumn {
+    use ClassifiedDeltaColumn::{Refused, Tag};
+    use PrimitiveType::*;
+    match data_type {
+        DataType::Primitive(primitive) => match primitive {
+            Boolean => Tag("bool".to_string()),
+            Byte | Short | Integer => Tag("int32".to_string()),
+            Long => Tag("int64".to_string()),
+            Float => Tag("float32".to_string()),
+            Double => Tag("float64".to_string()),
+            String => Tag("utf8".to_string()),
+            Date => Tag("date32".to_string()),
+            Timestamp => Tag("timestamptz_us".to_string()),
+            TimestampNtz => Tag("timestamp_us".to_string()),
+            Void | IntervalYearMonth | IntervalDayTime => Tag("utf8".to_string()),
+            Decimal(decimal) => {
+                let (precision, scale) =
+                    (u32::from(decimal.precision()), u32::from(decimal.scale()));
+                Tag(if exasol_representable_catalog_decimal(precision, scale) {
+                    format!("decimal128({precision},{scale})")
+                } else {
+                    "utf8".to_string()
+                })
+            }
+            Binary => Refused(binary_refusal(column_name)),
+        },
+        DataType::Struct(_) => Refused(struct_refusal(column_name)),
+        DataType::Map(_) => Refused(map_refusal(column_name)),
+        DataType::Variant(_) => Refused(variant_refusal(column_name)),
+        DataType::Array(array) => {
+            let mut element = array.element_type();
+            while let DataType::Array(nested) = element {
+                element = nested.element_type();
+            }
+            match classify_delta_type(column_name, element) {
+                Tag(_) => Tag("utf8".to_string()),
+                Refused(element_reason) => Refused(array_element_refusal(
+                    column_name,
+                    data_type,
+                    &element_reason,
+                )),
+            }
+        }
+    }
+}
+
+fn array_element_refusal(column_name: &str, data_type: &DataType, element_reason: &str) -> String {
+    format!(
+        "Delta column '{column_name}' has type '{data_type}', whose element type is refused: \
+         {element_reason}"
+    )
+}
+
+fn binary_refusal(column_name: &str) -> String {
+    format!(
+        "Delta column '{column_name}' has type 'binary', which this engine refuses rather than \
+         casting to text: the cast replaces every byte sequence that is not valid UTF-8 with NULL, \
+         silently corrupting the value; real JSON rendering is tracked as issue #350"
+    )
+}
+
+fn struct_refusal(column_name: &str) -> String {
+    format!(
+        "Delta column '{column_name}' has type 'struct', which arrow-cast reports no cast to text \
+         for; real JSON rendering is tracked as issue #350"
+    )
+}
+
+fn map_refusal(column_name: &str) -> String {
+    format!(
+        "Delta column '{column_name}' has type 'map', which arrow-cast reports no cast to text for; \
+         real JSON rendering is tracked as issue #350"
+    )
+}
+
+fn variant_refusal(column_name: &str) -> String {
+    format!(
+        "Delta column '{column_name}' has type 'variant', whose on-disk form is an opaque \
+         (metadata, value) binary pair this engine cannot render as a meaningful value"
+    )
 }

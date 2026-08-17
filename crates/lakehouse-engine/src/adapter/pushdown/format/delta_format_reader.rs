@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 
 use super::delta_replay::DeltaSnapshot;
 use super::delta_schema::build_delta_table_schema;
-use super::{ConnectionStorage, FormatReader, ResolvedScan};
+use super::{ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan};
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::build_table_root_store;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
@@ -143,7 +143,7 @@ impl FormatReader for DeltaFormatReader<'_> {
             let effective_storage = self.effective_storage(table_root).await?;
             let secrets = effective_storage.secret_values();
 
-            let (files, logical_schema, partition_columns) =
+            let (files, logical_schema, partition_columns, refused_columns) =
                 read_delta_log(&effective_storage, table_root, &secrets)?;
 
             Ok(ResolvedScan {
@@ -153,17 +153,25 @@ impl FormatReader for DeltaFormatReader<'_> {
                 table_root: table_root.to_string(),
                 name_mapping: Vec::new(),
                 partition_columns,
+                refused_columns,
             })
         })
     }
 }
 
-/// The three values a Delta log read contributes to a [`ResolvedScan`]: the active
-/// data files, the logical schema, and the table's ordered partition columns.
-type DeltaLogContents = (Vec<FileEntry>, Vec<LogicalField>, Vec<String>);
+/// The four values a Delta log read contributes to a [`ResolvedScan`]: the active
+/// data files, the logical schema, the table's ordered partition columns, and the
+/// columns the schema step declined to map.
+type DeltaLogContents = (
+    Vec<FileEntry>,
+    Vec<LogicalField>,
+    Vec<String>,
+    Vec<RefusedColumn>,
+);
 
 /// Read `table_root`'s Delta log through a store built from `storage`, answering the
-/// active file list, the logical schema, and the table's ordered partition columns.
+/// active file list, the logical schema, the table's ordered partition columns, and
+/// the columns the schema step declined to map.
 ///
 /// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime on its
 /// own thread, so this stalls only the caller's own executor, which has nothing else
@@ -183,18 +191,46 @@ fn read_delta_log(
     let snapshot =
         DeltaSnapshot::open(store, table_root).map_err(|error| redacted(error, secrets))?;
 
-    let (logical_schema, partition_columns) = build_delta_table_schema(
+    let (logical_schema, partition_columns, refused_columns) = build_delta_table_schema(
         &snapshot.schema(),
         snapshot.column_mapping_mode(),
         snapshot.partition_columns(),
     )
     .map_err(|error| redacted(error, secrets))?;
+    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)?;
 
     let files = snapshot
         .active_files()
         .map_err(|error| redacted(error, secrets))?;
 
-    Ok((files, logical_schema, partition_columns))
+    Ok((files, logical_schema, partition_columns, refused_columns))
+}
+
+/// Refuses the WHOLE table when NO column classified as mappable: `raw_scan` registers
+/// `logical_schema` as the DataFusion table's own schema, and an EMPTY logical schema is not a
+/// table this engine can scan. Falling back to the first data file's own schema — the only other
+/// source such a table could offer — would bind columns by physical file order and by physical
+/// file name, exactly the unauthorized binding the column-mapping binding key exists to prevent.
+///
+/// A table with at least one mappable column is left fully alone here: it stays queryable on its
+/// mappable columns, and only a request that reads or emits a refused one is turned away — this
+/// function refuses a whole TABLE, never a single request.
+fn ensure_table_has_a_mappable_column(
+    logical_schema: &[LogicalField],
+    refused_columns: &[RefusedColumn],
+) -> Result<(), UdfError> {
+    if !logical_schema.is_empty() || refused_columns.is_empty() {
+        return Ok(());
+    }
+
+    let reasons = refused_columns
+        .iter()
+        .map(|column| format!("'{}': {}", column.column_name, column.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(UdfError::User(format!(
+        "Delta table has no mappable column; every column is refused: {reasons}"
+    )))
 }
 
 /// Re-raise `error` with every value in `secrets` masked.
