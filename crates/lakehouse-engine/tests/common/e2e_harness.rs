@@ -50,7 +50,7 @@ pub const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehous
 /// BucketFS path for the SLC tarball.
 pub const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
 /// SLC version linked against.
-pub const SLC_VERSION: &str = "0.21.0";
+pub const SLC_VERSION: &str = "0.22.1";
 /// Language alias for the SLC.
 pub const LANG_ALIAS: &str = "RUST";
 
