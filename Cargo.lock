@@ -2191,9 +2191,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-macros"
-version = "0.21.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3a9dd0f3bd250e77a5641fe9c1ef6d7c18ead4b26b9ce3508ff9b2faad8e204"
+checksum = "ce946fe8d0224345d7cca254952a2d0bdfa01ca99d8d843b9e0df66ed7928f8b"
 dependencies = [
  "exasol-udf-sdk",
  "proc-macro2",
@@ -2203,9 +2203,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-sdk"
-version = "0.21.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3261eb9c740e0be422dd49db3233c38a637137451a5a9a3f132cdbbf5d946d22"
+checksum = "3dbc946614a95e343fabcfa5f9d16be4e9ad4d1c419321d0e4341fc7cd79f535"
 dependencies = [
  "arrow",
  "chrono",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.36.0"
+version = "0.36.1"
 dependencies = [
  "anyhow",
  "arrow",

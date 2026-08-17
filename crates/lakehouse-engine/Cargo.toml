@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.36.0"
+version = "0.36.1"
 edition = "2024"
 license.workspace = true
 
@@ -21,8 +21,8 @@ azure-e2e = []
 unity-e2e = []
 
 [dependencies]
-exasol-udf-sdk    = { version = "0.21.0", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.21.0" }
+exasol-udf-sdk    = { workspace = true }
+exasol-udf-macros = { workspace = true }
 
 vs-expression     = { path = "../vs-expression" }
 lakehouse-catalog = { path = "../lakehouse-catalog" }
