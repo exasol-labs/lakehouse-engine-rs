@@ -49,8 +49,25 @@ pub const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 pub const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the SLC tarball.
 pub const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-/// SLC version linked against.
-pub const SLC_VERSION: &str = "0.22.1";
+/// SLC version to download: the version of the `exasol-udf-sdk` this harness
+/// links, since the `.so` only loads against a matching SLC fingerprint.
+pub const SLC_VERSION: &str = sdk_version_from_fingerprint();
+
+/// Const-evaluates the version field of `EXA_SDK_FINGERPRINT`
+/// (`"{sdk_version}:{rustc_hash}\0"`); `const` so `SLC_VERSION` stays a
+/// `&'static str` usable in inline format captures.
+const fn sdk_version_from_fingerprint() -> &'static str {
+    let bytes = exasol_udf_sdk::abi::EXA_SDK_FINGERPRINT.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && bytes[end] != b':' {
+        end += 1;
+    }
+    assert!(end > 0 && end < bytes.len(), "malformed SDK fingerprint");
+    match str::from_utf8(bytes.split_at(end).0) {
+        Ok(version) => version,
+        Err(_) => panic!("SDK fingerprint version field is not UTF-8"),
+    }
+}
 /// Language alias for the SLC.
 pub const LANG_ALIAS: &str = "RUST";
 

@@ -273,6 +273,6 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   enumeration, vended-storage resolution, SigV4 signing). The catalog crate compiles into the
   engine's cdylib, so one `.so` still exports **both** entry points (VS adapter + DataFusion scan
   SET UDF) — `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
-- SDK: `exasol-udf-sdk` **0.22.1** + `exasol-udf-macros` **0.22.1** (built with rustc 1.94 to match
-  the v0.22.1 SLC fingerprint). Since 0.18.0, `connect-back`
-  is **always-on** (no longer a feature flag). Enable `emit-arrow` to unlock `ctx.emit_batch`.
+- SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
+  root `Cargo.toml`. Since 0.18.0, `connect-back` is **always-on** (no longer a feature flag).
+  Enable `emit-arrow` to unlock `ctx.emit_batch`.
