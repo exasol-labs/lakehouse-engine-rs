@@ -1,5 +1,7 @@
 use super::*;
-use crate::adapter::pushdown::test_support::sample_storage;
+use crate::adapter::pushdown::test_support::{
+    delta_commit_zero_key, delta_object_endpoint, sample_storage,
+};
 use crate::scan::spec::StorageProps;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, TableFormat};
 
@@ -317,4 +319,98 @@ fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
 fn a_table_with_no_columns_and_no_refusals_is_not_refused_as_a_whole() {
     ensure_table_has_a_mappable_column(&[], &[])
         .expect("an empty schema with nothing refused must not be refused as a whole");
+}
+
+const PRUNING_FIXTURE_TABLE: &str = "letter_partitioned";
+
+fn pruning_fixture_commit() -> String {
+    let protocol = serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+    let metadata = serde_json::json!({"metaData": {
+        "id": "pruning-fixture",
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::json!({"type": "struct", "fields": [
+            {"name": "letter", "type": "string", "nullable": true, "metadata": {}},
+        ]}).to_string(),
+        "partitionColumns": ["letter"],
+        "configuration": {},
+        "createdTime": 1,
+    }});
+    let add_a = serde_json::json!({"add": {
+        "path": "letter=a/part-0.parquet",
+        "partitionValues": {"letter": "a"},
+        "size": 100,
+        "modificationTime": 1,
+        "dataChange": true,
+    }});
+    let add_b = serde_json::json!({"add": {
+        "path": "letter=b/part-0.parquet",
+        "partitionValues": {"letter": "b"},
+        "size": 100,
+        "modificationTime": 1,
+        "dataChange": true,
+    }});
+    format!("{protocol}\n{metadata}\n{add_a}\n{add_b}\n")
+}
+
+async fn pruning_fixture_storage() -> StorageBackend {
+    delta_object_endpoint(vec![(
+        delta_commit_zero_key(PRUNING_FIXTURE_TABLE),
+        pruning_fixture_commit(),
+    )])
+    .await
+}
+
+fn letter_equals_a_filter() -> Json {
+    serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "letter"},
+        "right": {"type": "literal_string", "value": "a"},
+    })
+}
+
+/// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pruning_changes_only_the_file_list_of_the_resolved_scan() {
+    let creds = creds(false);
+    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
+    let storage = pruning_fixture_storage().await;
+    let table = delta_table(Some(&format!("s3://bucket/{PRUNING_FIXTURE_TABLE}")), None);
+    let connection = ConnectionStorage {
+        storage: &storage,
+        creds: &creds,
+        allow_http: true,
+    };
+    let reader = DeltaFormatReader::new(&session, &table, &connection);
+
+    let filter = letter_equals_a_filter();
+    let pruned = reader
+        .resolve_scan(Some(&filter))
+        .await
+        .expect("a filter naming the partition column must resolve a pruned scan");
+    let unpruned = reader
+        .resolve_scan(None)
+        .await
+        .expect("an unfiltered request must resolve every active file");
+
+    let unpruned_paths: Vec<&str> = unpruned
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    let pruned_paths: Vec<&str> = pruned.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        unpruned_paths,
+        vec!["letter=a/part-0.parquet", "letter=b/part-0.parquet"],
+        "an unfiltered request must resolve both fixture files"
+    );
+    assert_eq!(
+        pruned_paths,
+        vec!["letter=a/part-0.parquet"],
+        "the letter = 'a' filter must leave exactly the letter=a file, never zero files"
+    );
+    assert_eq!(pruned.logical_schema, unpruned.logical_schema);
+    assert_eq!(pruned.partition_columns, unpruned.partition_columns);
+    assert_eq!(pruned.table_root, unpruned.table_root);
+    assert_eq!(pruned.name_mapping, unpruned.name_mapping);
+    assert_eq!(pruned.refused_columns, unpruned.refused_columns);
 }

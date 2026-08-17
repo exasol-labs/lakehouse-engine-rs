@@ -12,11 +12,12 @@
 //! feature's contract.
 //!
 //! `delta_kernel` scan-row contract this module's replay code relies on:
-//! - `StatsOptions::none()` and `without_row_transforms()` are deliberate: statistics
-//!   are out of scope for this plan (which also stops the kernel reading stats columns
-//!   out of checkpoint parquet at all), and the scan side reconstructs partition
-//!   columns and applies deletion vectors itself, so per-file kernel transforms would
-//!   be built unread.
+//! - `without_row_transforms()` alone is deliberate: the scan side reconstructs
+//!   partition columns and applies deletion vectors itself, so per-file kernel
+//!   transforms would be built unread. The scan builder keeps `delta_kernel`'s
+//!   default `StatsOptions` so the kernel's own internal data-skipping and
+//!   partition-pruning pass still runs during replay — no statistic is surfaced
+//!   onto `FileEntry`.
 //! - A selection vector shorter than the batch leaves its remaining rows selected.
 //! - The kernel leaves `path` NULL on a row that carries no `add` action.
 //! - Replay walks the log newest-first, so the first row for a path holds its latest
@@ -36,9 +37,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, MapArray, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Int32Type, Int64Type};
+use delta_kernel::PredicateRef;
 use delta_kernel::Snapshot;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::scan::StatsOptions;
 use delta_kernel::schema::SchemaRef;
 use delta_kernel::snapshot::SnapshotRef;
 use delta_kernel::table_features::ColumnMappingMode;
@@ -132,12 +133,19 @@ impl DeltaSnapshot {
     /// each carrying its logged path verbatim, its size, its partition values and
     /// its deletion-vector reference, and no statistic. Ordered by path, so the
     /// list depends on the log's content rather than on replay internals.
-    pub(super) fn active_files(&self) -> Result<Vec<FileEntry>, UdfError> {
+    ///
+    /// `prune` is `None` for no constraint — every active file is returned; a
+    /// `Some` predicate lets the kernel's own data-skipping and partition pruning
+    /// trim the file list before it reaches this method.
+    pub(super) fn active_files(
+        &self,
+        prune: Option<PredicateRef>,
+    ) -> Result<Vec<FileEntry>, UdfError> {
         let scan = self
             .snapshot
             .clone()
             .scan_builder()
-            .with_stats(StatsOptions::none())
+            .with_predicate(prune)
             .without_row_transforms()
             .build()
             .map_err(|cause| self.failed_to("plan the Delta scan", &cause))?;

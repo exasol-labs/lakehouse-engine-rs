@@ -367,9 +367,14 @@ fn delta_e2e_table(name: &str) -> CatalogTableIdent {
 /// Resolve `table_name`'s Delta scan through the `FormatReader` seam: load the
 /// table's metadata from the live Unity Catalog server, select the Delta reader
 /// via `format_reader`, and resolve its scan. `use_vended_credentials` selects
-/// which of the two credential modes the request exercises; `handle_pushdown`
-/// is never reached, matching this plan's scope.
-async fn resolve_delta_scan(table_name: &str, use_vended_credentials: bool) -> ResolvedScan {
+/// which of the two credential modes the request exercises; `filter` forwards
+/// an optional pushdown filter to `resolve_scan`; `handle_pushdown` is never
+/// reached, matching this plan's scope.
+async fn resolve_delta_scan(
+    table_name: &str,
+    use_vended_credentials: bool,
+    filter: Option<&serde_json::Value>,
+) -> ResolvedScan {
     let creds = delta_creds(use_vended_credentials);
     let session = UnityCatalogSession::new(&unity_catalog_url(), creds.clone());
     let table = session
@@ -392,7 +397,7 @@ async fn resolve_delta_scan(table_name: &str, use_vended_credentials: bool) -> R
     .unwrap_or_else(|e| panic!("format_reader({table_name}) failed: {e}"));
 
     reader
-        .resolve_scan(None)
+        .resolve_scan(filter)
         .await
         .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
 }
@@ -473,8 +478,8 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_unity_catalog();
 
     let rt = rt();
-    let vended = rt.block_on(resolve_delta_scan("basic_partitioned", true));
-    let static_creds = rt.block_on(resolve_delta_scan("basic_partitioned", false));
+    let vended = rt.block_on(resolve_delta_scan("basic_partitioned", true, None));
+    let static_creds = rt.block_on(resolve_delta_scan("basic_partitioned", false, None));
 
     assert!(
         !vended.files.is_empty(),
@@ -512,7 +517,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
          {letters:?}"
     );
 
-    let dv_scan = rt.block_on(resolve_delta_scan("table_with_dv", true));
+    let dv_scan = rt.block_on(resolve_delta_scan("table_with_dv", true, None));
     assert_eq!(
         dv_scan.files.len(),
         1,
@@ -527,6 +532,63 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
         has_deletion_vector,
         "table_with_dv's single active file must carry a deletion-vector reference: {:?}",
         dv_scan.files[0]
+    );
+}
+
+/// Scenario: Pruning reaches every request shape and changes no result end to end
+#[test]
+fn unity_delta_filters_prune_the_resolved_file_list() {
+    wait_for_minio();
+    wait_for_unity_catalog();
+
+    let rt = rt();
+
+    let all_partitioned = rt.block_on(resolve_delta_scan("basic_partitioned", true, None));
+    assert_eq!(
+        all_partitioned.files.len(),
+        6,
+        "basic_partitioned must resolve 6 unfiltered files: {:?}",
+        all_partitioned.files
+    );
+    let letter_filter = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "LETTER"},
+        "right": {"type": "literal_string", "value": "a"}
+    });
+    let pruned_partitioned = rt.block_on(resolve_delta_scan(
+        "basic_partitioned",
+        true,
+        Some(&letter_filter),
+    ));
+    assert_eq!(
+        pruned_partitioned.files.len(),
+        2,
+        "LETTER = 'a' must prune basic_partitioned to 2 files: {:?}",
+        pruned_partitioned.files
+    );
+
+    let all_stats = rt.block_on(resolve_delta_scan("multi_part_stats", true, None));
+    assert_eq!(
+        all_stats.files.len(),
+        5,
+        "multi_part_stats must resolve 5 unfiltered files: {:?}",
+        all_stats.files
+    );
+    let id_filter = serde_json::json!({
+        "type": "predicate_lessequal",
+        "left": {"type": "column", "name": "ID"},
+        "right": {"type": "literal_exactnumeric", "value": "2"}
+    });
+    let pruned_stats = rt.block_on(resolve_delta_scan(
+        "multi_part_stats",
+        true,
+        Some(&id_filter),
+    ));
+    assert_eq!(
+        pruned_stats.files.len(),
+        2,
+        "ID <= 2 must prune multi_part_stats to 2 files: {:?}",
+        pruned_stats.files
     );
 }
 
@@ -1197,5 +1259,197 @@ fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
         mappable[0].len(),
         4,
         "expected 4 rows from the mappable projection: {mappable:?}"
+    );
+}
+
+/// Scenario: Pruning reaches every request shape and changes no result end to end
+#[test]
+fn unity_delta_pruned_queries_return_unchanged_rows() {
+    setup();
+    let mut conn = exa_conn();
+
+    let partitioned = conn.query_columns(&format!(
+        "SELECT LETTER, \"NUMBER\" FROM {}",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    let all_partitioned: Vec<(Option<String>, i64)> = partitioned[0]
+        .iter()
+        .zip(partitioned[1].iter())
+        .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
+        .collect();
+    assert_eq!(
+        all_partitioned.len(),
+        6,
+        "basic_partitioned's six files hold six rows: {all_partitioned:?}"
+    );
+
+    let mut expected_letter_a: Vec<(Option<String>, i64)> = all_partitioned
+        .iter()
+        .filter(|(letter, _)| letter.as_deref() == Some("a"))
+        .cloned()
+        .collect();
+    expected_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        expected_letter_a.len(),
+        2,
+        "letter 'a' must cover exactly 2 rows in the unfiltered scan: {expected_letter_a:?}"
+    );
+    let letter_a = conn.query_columns(&format!(
+        "SELECT LETTER, \"NUMBER\" FROM {} WHERE LETTER = 'a'",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    let mut actual_letter_a: Vec<(Option<String>, i64)> = letter_a[0]
+        .iter()
+        .zip(letter_a[1].iter())
+        .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
+        .collect();
+    actual_letter_a.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        actual_letter_a, expected_letter_a,
+        "the partition predicate LETTER = 'a' must return the same rows pruning \
+         inert would: {actual_letter_a:?}"
+    );
+
+    let stats = conn.query_columns(&format!(
+        "SELECT ID, \"VALUE\" FROM {}",
+        table_ref("MULTI_PART_STATS")
+    ));
+    let all_stats: Vec<(i64, Option<String>)> = stats[0]
+        .iter()
+        .zip(stats[1].iter())
+        .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
+        .collect();
+    assert_eq!(
+        all_stats.len(),
+        5,
+        "multi_part_stats' five active data files hold five rows: {all_stats:?}"
+    );
+
+    let mut expected_id_le_2: Vec<(i64, Option<String>)> = all_stats
+        .iter()
+        .filter(|(id, _)| *id <= 2)
+        .cloned()
+        .collect();
+    expected_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        expected_id_le_2.len(),
+        2,
+        "ID <= 2 must cover exactly 2 rows in the unfiltered scan: {expected_id_le_2:?}"
+    );
+    let id_le_2 = conn.query_columns(&format!(
+        "SELECT ID, \"VALUE\" FROM {} WHERE ID <= 2",
+        table_ref("MULTI_PART_STATS")
+    ));
+    let mut actual_id_le_2: Vec<(i64, Option<String>)> = id_le_2[0]
+        .iter()
+        .zip(id_le_2[1].iter())
+        .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
+        .collect();
+    actual_id_le_2.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        actual_id_le_2, expected_id_le_2,
+        "the range predicate ID <= 2 must return the same rows pruning inert \
+         would: {actual_id_le_2:?}"
+    );
+
+    let expected_id_eq_3: Vec<(i64, Option<String>)> = all_stats
+        .iter()
+        .filter(|(id, _)| *id == 3)
+        .cloned()
+        .collect();
+    assert_eq!(
+        expected_id_eq_3.len(),
+        1,
+        "ID = 3 must cover exactly 1 row in the unfiltered scan: {expected_id_eq_3:?}"
+    );
+    let id_eq_3 = conn.query_columns(&format!(
+        "SELECT ID, \"VALUE\" FROM {} WHERE ID = 3",
+        table_ref("MULTI_PART_STATS")
+    ));
+    let actual_id_eq_3: Vec<(i64, Option<String>)> = id_eq_3[0]
+        .iter()
+        .zip(id_eq_3[1].iter())
+        .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
+        .collect();
+    assert_eq!(
+        actual_id_eq_3, expected_id_eq_3,
+        "the equality ID = 3 must return the same row pruning inert would: \
+         {actual_id_eq_3:?}"
+    );
+
+    let no_match_count = conn.query_row_count(&format!(
+        "SELECT LETTER, \"NUMBER\" FROM {} WHERE LETTER = 'z'",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    assert_eq!(
+        no_match_count, 0,
+        "a predicate matching no partition file must return zero rows, not an error"
+    );
+
+    let expected_mix: Vec<(i64, Option<String>)> = all_stats
+        .iter()
+        .filter(|(id, value)| *id == 3 && value.as_deref().is_some_and(|v| v.starts_with("value_")))
+        .cloned()
+        .collect();
+    assert_eq!(
+        expected_mix.len(),
+        1,
+        "the equality-plus-LIKE mix must cover exactly 1 row in the unfiltered \
+         scan: {expected_mix:?}"
+    );
+    let mix = conn.query_columns(&format!(
+        "SELECT ID, \"VALUE\" FROM {} WHERE ID = 3 AND \"VALUE\" LIKE 'value_%'",
+        table_ref("MULTI_PART_STATS")
+    ));
+    let actual_mix: Vec<(i64, Option<String>)> = mix[0]
+        .iter()
+        .zip(mix[1].iter())
+        .map(|(id, value)| (parse_int(id), value.as_str().map(str::to_string)))
+        .collect();
+    assert_eq!(
+        actual_mix, expected_mix,
+        "the equality-plus-LIKE mix must return exactly what both predicates \
+         together select, even though only the equality drove file pruning: \
+         {actual_mix:?}"
+    );
+}
+
+/// Scenario: Pruning reaches every request shape and changes no result end to end
+#[test]
+fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf() {
+    setup();
+    let mut conn = exa_conn();
+
+    const BASIC_PARTITIONED_ACTIVE_FILES: usize = 6;
+    const LETTER_A_ACTIVE_FILES: usize = 2;
+
+    let select_sql = format!(
+        "SELECT LETTER, \"NUMBER\" FROM {} WHERE LETTER = 'a'",
+        table_ref("BASIC_PARTITIONED")
+    );
+    let pushed = explain_virtual_sql(&mut conn, &select_sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME),
+        "the pruned query must drive the scan UDF, not an unaccelerated \
+         fallback: {pushed}"
+    );
+
+    let mut embedded_files: Vec<&str> = pushed
+        .match_indices(".parquet")
+        .map(|(dot, extension)| {
+            let end = dot + extension.len();
+            let start = pushed[..end].rfind('"').map_or(0, |quote| quote + 1);
+            &pushed[start..end]
+        })
+        .collect();
+    embedded_files.sort_unstable();
+    embedded_files.dedup();
+    assert_eq!(
+        embedded_files.len(),
+        LETTER_A_ACTIVE_FILES,
+        "LETTER = 'a' must embed exactly its own {LETTER_A_ACTIVE_FILES} files out of \
+         basic_partitioned's {BASIC_PARTITIONED_ACTIVE_FILES} active ones — never zero — \
+         gathered across every shard fragment and every echoed copy of the pushed SQL, \
+         got {embedded_files:?}: {pushed}"
     );
 }

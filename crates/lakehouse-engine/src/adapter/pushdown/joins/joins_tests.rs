@@ -444,3 +444,142 @@ fn assert_refuses_binary_col(error: UdfError) {
          {message}"
     );
 }
+
+/// A commit with a partitioned two-column schema and exactly two `add` files, one
+/// per `values` entry — `two_delta_legs_one_refusing_binary_col`'s fixture has no
+/// `add` action at all, so it cannot demonstrate pruning; this one exists so a
+/// local equality predicate on `partition_column` has one file to keep and one to
+/// prune.
+fn two_file_delta_commit(
+    id: &str,
+    columns: &[(&str, &str)],
+    partition_column: &str,
+    values: [&str; 2],
+) -> String {
+    let fields: Vec<Json> = columns
+        .iter()
+        .map(|(name, delta_type)| {
+            serde_json::json!({"name": name, "type": delta_type, "nullable": true, "metadata": {}})
+        })
+        .collect();
+    let protocol = serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+    let metadata = serde_json::json!({"metaData": {
+        "id": id,
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::json!({"type": "struct", "fields": fields}).to_string(),
+        "partitionColumns": [partition_column],
+        "configuration": {},
+        "createdTime": 1,
+    }});
+    let adds: Vec<Json> = values
+        .iter()
+        .map(|value| {
+            let mut partition_values = serde_json::Map::new();
+            partition_values.insert(
+                partition_column.to_string(),
+                Json::String(value.to_string()),
+            );
+            serde_json::json!({"add": {
+                "path": format!("{partition_column}={value}/part-0.parquet"),
+                "partitionValues": Json::Object(partition_values),
+                "size": 100,
+                "modificationTime": 1,
+                "dataChange": true,
+            }})
+        })
+        .collect();
+    format!("{protocol}\n{metadata}\n{}\n{}\n", adds[0], adds[1])
+}
+
+/// `CUSTOMER` partitioned by `c_region` (files `us`, `eu`) joined to `ORDERS`
+/// partitioned by `o_status` (files `open`, `closed`) — two files per leg so each
+/// leg's own local equality predicate has exactly one file to keep and one to prune.
+async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend {
+    delta_object_endpoint(vec![
+        (
+            delta_commit_zero_key("customer"),
+            two_file_delta_commit(
+                "customer",
+                &[("c_custkey", "long"), ("c_region", "string")],
+                "c_region",
+                ["us", "eu"],
+            ),
+        ),
+        (
+            delta_commit_zero_key("orders"),
+            two_file_delta_commit(
+                "orders",
+                &[("o_custkey", "long"), ("o_status", "string")],
+                "o_status",
+                ["open", "closed"],
+            ),
+        ),
+    ])
+    .await
+}
+
+/// Scenario: Pruning reaches every request shape and changes no result end to end
+///
+/// A broadcast-eligible inner equi-join over two Delta tables, each with its own
+/// local WHERE conjunct scoped to that leg's own column: `CUSTOMER.C_REGION = 'us'`
+/// and `ORDERS.O_STATUS = 'open'`. Each leg's local predicate must drive that leg's
+/// own file pruning independently — leg A's filter never affects leg B's surviving
+/// files and vice versa.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
+    let customer_columns = serde_json::json!([
+        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+        {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
+    ]);
+    let orders_columns = serde_json::json!([
+        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+        {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
+    ]);
+    let select_list = serde_json::json!([
+        {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+        {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+    ]);
+    let mut request = delta_join_request_over(customer_columns, orders_columns, select_list);
+    request["pushdownRequest"]["filter"] = serde_json::json!({
+        "type": "predicate_and",
+        "expressions": [
+            {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+                "right": {"type": "literal_string", "value": "us"},
+            },
+            {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+                "right": {"type": "literal_string", "value": "open"},
+            },
+        ],
+    });
+
+    let result = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("a broadcast-eligible join with per-leg local predicates must plan");
+
+    let sql = result["sql"]
+        .as_str()
+        .expect("a planned pushdown carries sql");
+
+    assert!(
+        sql.contains("c_region=us/part-0.parquet"),
+        "CUSTOMER's own local filter must keep its matching file: {sql}"
+    );
+    assert!(
+        !sql.contains("c_region=eu/part-0.parquet"),
+        "CUSTOMER's own local filter must prune its non-matching file: {sql}"
+    );
+    assert!(
+        sql.contains("o_status=open/part-0.parquet"),
+        "ORDERS' own local filter must keep its matching file: {sql}"
+    );
+    assert!(
+        !sql.contains("o_status=closed/part-0.parquet"),
+        "ORDERS' own local filter must prune its non-matching file, unaffected by CUSTOMER's filter: {sql}"
+    );
+}

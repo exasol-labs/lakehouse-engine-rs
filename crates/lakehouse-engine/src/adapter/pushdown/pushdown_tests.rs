@@ -1,6 +1,8 @@
 use super::test_support::*;
 use super::*;
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageProps};
+use crate::scan::spec::{
+    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, StorageProps,
+};
 
 // ---------------------------------------------------------------------------
 // Task 4.4 — catalog-auth secrets never in ScanSpec
@@ -2506,6 +2508,121 @@ async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_colum
     );
 }
 
+/// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine
+/// or the wire
+///
+/// This plan lets `ScanBuilder` keep its own default `StatsOptions`, restoring the
+/// kernel's internal data-skipping pass — but `ScanSpec` gains no new field to
+/// carry it (see this project's CLAUDE.md "Architecture boundaries": `ScanSpec`
+/// stays format-neutral). A non-pruning request (no WHERE clause, one active
+/// file) drives the SAME production `handle_pushdown` entry point the sibling
+/// Delta pushdown tests above use, and its serialized common blob is checked two
+/// ways: its JSON key set is exactly this plan's pre-change field set with none
+/// of them naming a statistic, bound, or null count, and the parsed
+/// `CommonScanSpec` equals a hand-built value carrying only the fields this
+/// request was always going to produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_no_statistic() {
+    let catalog = unity_delta_catalog().await;
+    let add = serde_json::json!({"add": {
+        "path": "part-0.parquet",
+        "partitionValues": {},
+        "size": 100,
+        "modificationTime": 1,
+        "dataChange": true,
+    }});
+    let storage = delta_object_endpoint(vec![(
+        delta_commit_zero_key("orders"),
+        format!(
+            "{}{add}\n",
+            fileless_delta_commit("orders", &[("int_col", "integer")])
+        ),
+    )])
+    .await;
+
+    let request = serde_json::json!({
+        "involvedTables": [{
+            "name": "ORDERS",
+            "columns": [
+                {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+            ],
+        }],
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [{"type": "column", "name": "INT_COL", "tableName": "ORDERS"}],
+        },
+    });
+
+    let planned = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("a one-file table with no WHERE clause must drive the scan UDF");
+
+    let sql = planned["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+    assert!(
+        sql.contains(SCAN_UDF_NAME),
+        "one active file with no pruning filter must reach the scan path, not the \
+         empty-result early return: {sql}"
+    );
+
+    let common = common_arg_literal(sql);
+    let parsed: serde_json::Value =
+        serde_json::from_str(common).expect("common blob must be valid JSON");
+    let object = parsed
+        .as_object()
+        .expect("common blob must be a JSON object");
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "df_batch_size",
+            "df_target_partitions",
+            "df_threads_per_udf",
+            "emit_exa_types",
+            "instance_overhead_mb",
+            "logical_schema",
+            "memory_pool_fraction",
+            "projection",
+            "s3_max_connections",
+            "storage",
+            "table_root",
+        ],
+        "a non-pruning Delta request's common blob must keep exactly this plan's \
+         pre-change field set: {common}"
+    );
+
+    let back = CommonScanSpec::from_json(common)
+        .expect("the common blob must round-trip through CommonScanSpec");
+    let expected = CommonScanSpec {
+        table_root: "s3://bucket/orders".to_string(),
+        projection: vec![ProjectionItem::Column("INT_COL".to_string())],
+        emit_exa_types: vec!["DECIMAL(10,0)".to_string()],
+        logical_schema: vec![LogicalField {
+            field_id: None,
+            name: "int_col".to_string(),
+            arrow_type: "int32".to_string(),
+            nullable: true,
+            initial_default: None,
+            physical_name: None,
+        }],
+        storage: back.storage.clone(),
+        df_target_partitions: 1,
+        df_batch_size: 1024,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 200,
+        s3_max_connections: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        back, expected,
+        "a non-pruning Delta request's parsed CommonScanSpec must match its \
+         pre-change shape field for field"
+    );
+}
+
 /// Scenario: A refused column refuses only the requests that read or emit it
 ///
 /// `COUNT(*)` reads no column value at all — `parse_agg_item` gives
@@ -2964,5 +3081,202 @@ fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() 
         sql.contains("rpad("),
         "the DataFusion-side copy must still be padded alongside the resolved \
              ORDER BY: {sql}"
+    );
+}
+
+const PRUNED_TO_EMPTY_TABLE: &str = "pruned_to_empty";
+
+fn letter_partitioned_commit() -> String {
+    let protocol = serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}});
+    let metadata = serde_json::json!({"metaData": {
+        "id": "pruned-to-empty",
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::json!({"type": "struct", "fields": [
+            {"name": "letter", "type": "string", "nullable": true, "metadata": {}},
+            {"name": "number", "type": "integer", "nullable": true, "metadata": {}},
+        ]})
+        .to_string(),
+        "partitionColumns": ["letter"],
+        "configuration": {},
+        "createdTime": 1,
+    }});
+    let adds = ["a", "b"]
+        .into_iter()
+        .map(|letter| {
+            serde_json::json!({"add": {
+                "path": format!("letter={letter}/part-0.parquet"),
+                "partitionValues": {"letter": letter},
+                "size": 100,
+                "modificationTime": 1,
+                "dataChange": true,
+            }})
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{protocol}\n{metadata}\n{adds}\n")
+}
+
+fn letter_partitioned_request(letter: &str) -> Json {
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "PRUNED_TO_EMPTY",
+            "columns": [
+                {"name": "LETTER", "dataType": {"type": "varchar", "size": 2000000}},
+                {"name": "NUMBER", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+            ],
+        }],
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [
+                {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
+                {"type": "column", "name": "NUMBER", "tableName": "PRUNED_TO_EMPTY"},
+            ],
+            "filter": {
+                "type": "predicate_equal",
+                "left": {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
+                "right": {"type": "literal_string", "value": letter},
+            },
+        },
+    })
+}
+
+/// Scenario: Equality on a partition column prunes every file in a non-matching partition
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delta_request_pruned_to_no_file_takes_the_empty_result_route() {
+    let catalog = unity_delta_catalog().await;
+    let storage = delta_object_endpoint(vec![(
+        delta_commit_zero_key(PRUNED_TO_EMPTY_TABLE),
+        letter_partitioned_commit(),
+    )])
+    .await;
+    let table = format!("cat.sch.{PRUNED_TO_EMPTY_TABLE}");
+
+    let matching = delta_pushdown(
+        &letter_partitioned_request("a"),
+        &catalog.uri,
+        storage.clone(),
+        &table,
+    )
+    .await
+    .expect("a filter matching one partition must plan a scan, not fail");
+    let matching_sql = matching["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+    assert!(
+        matching_sql.contains(SCAN_UDF_NAME),
+        "the fixture must reach the scan path when one file survives, otherwise \
+         the pruned-to-empty assertions below prove nothing: {matching_sql}"
+    );
+
+    let pruned = delta_pushdown(
+        &letter_partitioned_request("z"),
+        &catalog.uri,
+        storage,
+        &table,
+    )
+    .await
+    .expect("a filter matching no partition must answer empty, never error");
+    let sql = pruned["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+
+    assert!(
+        !sql.contains(SCAN_UDF_NAME),
+        "a fully-pruned file list must take the empty-result early return, not \
+         invoke the scan UDF: {sql}"
+    );
+    assert!(
+        !sql.contains(DISTRIBUTE_FILES_UDF_NAME),
+        "a fully-pruned file list must fan out to no shard at all: {sql}"
+    );
+    assert!(
+        !sql.contains(".parquet"),
+        "a fully-pruned file list must embed no data-file path: {sql}"
+    );
+    assert!(
+        sql.contains("WHERE 1=0"),
+        "a fully-pruned row-scan request must render the typed zero-row shape: {sql}"
+    );
+}
+
+fn letter_partitioned_select_request() -> Json {
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "PRUNED_TO_EMPTY",
+            "columns": [
+                {"name": "LETTER", "dataType": {"type": "varchar", "size": 2000000}},
+                {"name": "NUMBER", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+            ],
+        }],
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [
+                {"type": "column", "name": "LETTER", "tableName": "PRUNED_TO_EMPTY"},
+                {"type": "column", "name": "NUMBER", "tableName": "PRUNED_TO_EMPTY"},
+            ],
+        },
+    })
+}
+
+/// Scenario: The Delta reader is reached from production pushdown under the Unity
+/// Catalog kind
+///
+/// Proves pruning end-to-end through `handle_pushdown`, not just the lower-level
+/// `DeltaSnapshot`/reader: a partition-equality filter must shrink the file list
+/// production pushdown embeds in the emitted scan SQL, relative to an equivalent
+/// unfiltered request over the same two-file fixture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_unity_catalog_pushdown_prunes_the_delta_file_list_by_its_filter() {
+    let catalog = unity_delta_catalog().await;
+    let table_name = "letter_pruned_by_filter";
+    let table = format!("cat.sch.{table_name}");
+
+    let filtered_storage = delta_object_endpoint(vec![(
+        delta_commit_zero_key(table_name),
+        letter_partitioned_commit(),
+    )])
+    .await;
+    let filtered = delta_pushdown(
+        &letter_partitioned_request("a"),
+        &catalog.uri,
+        filtered_storage,
+        &table,
+    )
+    .await
+    .expect("a filter matching one partition must plan a scan, not fail");
+    let filtered_sql = filtered["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+
+    let unfiltered_storage = delta_object_endpoint(vec![(
+        delta_commit_zero_key(table_name),
+        letter_partitioned_commit(),
+    )])
+    .await;
+    let unfiltered = delta_pushdown(
+        &letter_partitioned_select_request(),
+        &catalog.uri,
+        unfiltered_storage,
+        &table,
+    )
+    .await
+    .expect("an unfiltered request over the same fixture must plan a scan, not fail");
+    let unfiltered_sql = unfiltered["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+
+    let filtered_file_count = filtered_sql.matches(".parquet").count();
+    let unfiltered_file_count = unfiltered_sql.matches(".parquet").count();
+    assert_eq!(
+        unfiltered_file_count, 2,
+        "the two-file letter=a/letter=b fixture must embed both files when unfiltered: \
+         unfiltered={unfiltered_sql}"
+    );
+    assert_eq!(
+        filtered_file_count, 1,
+        "a LETTER = 'a' partition-equality filter must prune the Delta file list to \
+         exactly the one matching partition through production pushdown: \
+         filtered={filtered_sql}"
     );
 }
