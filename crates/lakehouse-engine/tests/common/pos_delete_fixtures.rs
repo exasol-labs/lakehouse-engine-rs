@@ -11,15 +11,15 @@
 //! MinIO every other E2E table uses (`NAMESPACE` below matches
 //! `seed::E2E_NAMESPACE`).
 //!
-//! UPSTREAM TRACKING (apache/iceberg-rust#340): iceberg-rust 0.10 has no
-//! position-delete writer, so the two positional-delete fixtures below cannot
-//! be authored the same way as `seed.rs`'s tables — Apache Spark (an official
-//! Apache Iceberg ecosystem engine) is used instead. DROP CONDITION: once
-//! #340 lands and iceberg-rust exposes a position-delete writer, those two
-//! fixtures' constants and Spark fixture scripts should be replaced by native
-//! Rust fixture authoring here, matching `seed.rs`'s pattern. The
-//! deletion-vector fixture (`DELETION_VECTOR_TABLE`) has its own, separate
-//! upstream-tracking note — see its doc comment.
+//! UPSTREAM TRACKING (#344): iceberg-rust 0.10 has no position-delete writer,
+//! so the two positional-delete fixtures below cannot be authored the same way
+//! as `seed.rs`'s tables — Apache Spark (an official Apache Iceberg ecosystem
+//! engine) is used instead. DROP CONDITION: see #344 for the upstream PRs to
+//! track; once a position-delete writer lands, those two fixtures' constants
+//! and Spark fixture scripts should be replaced by native Rust fixture
+//! authoring here, matching `seed.rs`'s pattern. The deletion-vector fixture
+//! (`DELETION_VECTOR_TABLE`) has its own, separate upstream-tracking note —
+//! see its doc comment.
 //!
 //! The row/id/deletion facts below are NOT discovered at test time — they
 //! are the fixed ground truth the Spark SQL scripts commit, and MUST stay in
@@ -111,8 +111,8 @@ pub const PARTITION_WEST_DELETED_IDS: [i64; 4] = [13, 14, 17, 19];
 /// fail-loud gate in `adapter/pushdown.rs`), so there is no successful read
 /// to assert row-level ground truth against.
 ///
-/// UPSTREAM TRACKING (apache/iceberg-rust#2681, #2580, #2411): once
-/// iceberg-rust gains v3 deletion-vector READ support, this fixture becomes
-/// READABLE (not just rejected) — see the fixture SQL's own header comment
-/// for the follow-up this implies for `e2e_unsupported_delete_fails_loud`.
+/// UPSTREAM TRACKING (#12): once iceberg-rust gains v3 deletion-vector READ
+/// support, this fixture becomes READABLE (not just rejected) — see the
+/// fixture SQL's own header comment for the follow-up this implies for
+/// `e2e_unsupported_delete_fails_loud`. See #12 for the upstream PRs to track.
 pub const DELETION_VECTOR_TABLE: &str = "mor_dv_unsupported";
