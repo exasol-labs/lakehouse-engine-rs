@@ -142,6 +142,21 @@ path exactly as they already are for Iceberg.
   holds for every Iceberg column, and its ordered resolution rule (1) — the partition-metadata rule —
   remains the deliberate, accurately-scoped trade-off
   `datafusion-scan/scan-execution-field-id-projection` records, neither closed nor widened here.
+* **This delta is issue #321, and it closes the LAST deferral this feature has carried since #319.**
+  Filter-based file pruning is now implemented and owned by `vs-adapter/delta-file-pruning`. Three
+  recorded statements are superseded, all of them assertions that pruning does NOT happen: the
+  "**Per-file min/max statistics are OUT of scope**" bullet, the "filter-based file pruning is issue
+  #321" half of the two-deferrals bullet, and the "**Filter-based file pruning stays deferred,
+  unchanged**" bullet. This feature therefore records NO remaining pruning exception. Nothing else
+  about Delta planning changes: log replay, partition values, deletion-vector descriptors,
+  column-mapping binding keys, credential vending, the protocol gate, and type refusal are all
+  untouched.
+* **The no-stats-on-the-wire rule SURVIVES this delta, with a corrected justification.** The scan still
+  carries no per-file minimum or maximum, because `delta_kernel` evaluates the bounds internally during
+  log replay and hands back a selection vector — pruning completes before a file entry exists, so the
+  stats wire shape this feature deferred never acquired a consumer and is not designed now either. The
+  scenario clause below is CHANGED only in its reason, never in its obligation, so `ScanSpec` stays
+  format-neutral per CLAUDE.md and every golden scan-spec encoding is unmoved.
 
 ## Scenarios
 
@@ -164,7 +179,9 @@ path exactly as they already are for Iceberg.
 * *AND* the returned scan SHALL carry the table root taken from the table's own catalog-reported
   storage location, so the shard-invariant common spec carries it once
 * *AND* the returned scan MUST NOT carry any per-file minimum or maximum statistic, because
-  stats-based file pruning is issue #321 and its wire shape is designed with its consumer
+  `delta_kernel` compares those bounds itself during log replay and returns a selection vector rather
+  than values — so plan-time pruning (`vs-adapter/delta-file-pruning`) needs no wire shape for them,
+  SUPERSEDING the recorded reason that stats-based pruning was deferred to issue #321
 * *AND* the reader MUST NOT construct its own object store: it SHALL read the log through the store
   it is given, so the replay is exercised over a local filesystem store as well as over S3
 
@@ -328,9 +345,10 @@ path exactly as they already are for Iceberg.
   per-file partition values SHALL reach the per-shard file entries, so the deferred scan-side partition
   reconstruction this reader's contract names is satisfied by
   `datafusion-scan/scan-execution-partition-values` rather than left open
-* *AND* the reader SHALL still apply NO filter-based file pruning, because per-file statistics and
-  partition pruning remain issue #321, so a filter narrows the rows the scan emits without narrowing
-  the files it reads
+* *AND* the reader SHALL now PRUNE the file list by the request's filter, on partition values and on
+  per-file statistics alike (`vs-adapter/delta-file-pruning`), SUPERSEDING the recorded rule that it
+  applies NO filter-based file pruning: a filter now narrows the files the scan reads as well as the
+  rows it emits, so this feature records NO remaining pruning exception
 * *AND* the reader SHALL now GATE the Delta reader protocol and reader-feature set
   (`vs-adapter/delta-reader-feature-gating`), SUPERSEDING the recorded rule that it performs no such
   gating: a table whose reader features this engine does not implement is no longer query-reachable,
