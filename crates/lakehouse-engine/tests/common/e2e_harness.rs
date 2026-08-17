@@ -19,7 +19,7 @@ use super::stack::{
 
 use lakehouse_catalog::CatalogSession;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
-use lakehouse_engine::adapter::pushdown::resolve_file_list;
+use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
 
 use std::collections::HashMap;
@@ -311,7 +311,7 @@ pub fn parse_int(v: &serde_json::Value) -> i64 {
 
 // ---------------------------------------------------------------------------
 // Adapter-level catalog inspection helpers (host-visible URLs) — used by tests
-// that call `resolve_file_list` directly rather than going through Exasol.
+// that call the format-reader seam directly rather than going through Exasol.
 // ---------------------------------------------------------------------------
 
 /// `ConnectionCreds` for the host-visible local Docker stack (MinIO + Iceberg
@@ -359,9 +359,9 @@ pub fn local_stack_catalog(table: &str) -> CatalogProps {
 }
 
 /// Resolve a fixture table's current data files directly from the Iceberg REST
-/// catalog, bypassing Exasol — the same `resolve_file_list` seam the adapter
-/// uses. `resolve_file_list` returns each `FileEntry` with an ABSOLUTE data-file
-/// URI, so the returned paths can be opened as-is.
+/// catalog, bypassing Exasol — the same format-reader seam the adapter uses.
+/// The resolved scan returns each `FileEntry` with an ABSOLUTE data-file URI,
+/// so the returned paths can be opened as-is.
 ///
 /// Async (runtime-agnostic): callers drive it with whatever runtime they hold
 /// (e.g. `rt.block_on(resolve_fixture_files(NAMESPACE, table))`). `namespace` is
@@ -376,10 +376,24 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         .unwrap_or_else(|e| panic!("CatalogSession::resolve({table}) must succeed: {e}"));
 
     // `allow_http = true` mirrors every VS this harness creates: MinIO over plain HTTP.
-    let (files, ..) = resolve_file_list(&session, &catalog_props, &storage, &creds, true, None)
+    let connection = ConnectionStorage {
+        storage: &storage,
+        creds: &creds,
+        allow_http: true,
+    };
+    let reader = format_reader(
+        ScanSource::Iceberg {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
+        &connection,
+    )
+    .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
+    let resolved = reader
+        .resolve_scan(None)
         .await
-        .unwrap_or_else(|e| panic!("resolve_file_list({table}) must succeed: {e}"));
-    files
+        .unwrap_or_else(|e| panic!("resolve_scan({table}) must succeed: {e}"));
+    resolved.files
 }
 
 // ---------------------------------------------------------------------------

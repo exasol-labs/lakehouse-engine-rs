@@ -2,7 +2,7 @@
 //!
 //! [`classify_request_shape`] owns the single routing decision that BOTH the
 //! non-empty dispatcher ([`build_dispatch_sql`](super::build_dispatch_sql)) and
-//! the empty-result path ([`empty_result_sql`](super::file_resolution)) consume,
+//! the empty-result path ([`empty_result_sql`](super::empty_result)) consume,
 //! so the empty and non-empty output shapes are identical by construction rather
 //! than by two independently-maintained routing trees that merely agree today
 //! (issue #175 / plan `refactor-scan-spec-dispatch-dedup`).

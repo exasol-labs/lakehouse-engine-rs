@@ -29,6 +29,7 @@ use super::field_id_projection::{
     reconstruct_initial_defaults,
 };
 use super::object_store::validate_uniform_object_store_files;
+use super::partition_values::PartitionedScanSchema;
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Stream the raw-row scan over an already-built session and emit phase telemetry.
@@ -130,6 +131,7 @@ pub async fn register_files(
         &spec.common.table_root,
         &spec.common.logical_schema,
         &spec.common.name_mapping,
+        &spec.common.partition_columns,
         &spec.common.storage,
         delete_path_read_limiter,
     )
@@ -148,7 +150,10 @@ pub async fn register_files(
 /// correct across schema evolution), otherwise one Arrow schema is inferred from
 /// the first file. `name_mapping` is threaded alongside `logical_schema` into the
 /// [`PositionalDeleteScanTable`]/[`FieldIdExprAdapterFactory`] for the same side,
-/// shard-invariant like the logical schema itself. Read/inference errors route
+/// shard-invariant like the logical schema itself. `partition_columns` names, in
+/// partition order, the logical columns no data file carries; they leave the file
+/// schema here and are materialized per file from each entry's logged partition
+/// value (see [`PartitionedScanSchema`]). Read/inference errors route
 /// through [`classify_scan_error`] so no credential value can leak, whichever
 /// side's file list is unreadable.
 ///
@@ -177,6 +182,7 @@ pub(super) async fn register_file_list(
     table_root: &str,
     logical_schema: &[crate::scan::spec::LogicalField],
     name_mapping: &[NameMappingEntry],
+    partition_columns: &[String],
     storage: &crate::scan::spec::StorageBackend,
     delete_path_read_limiter: Arc<Semaphore>,
 ) -> Result<(), UdfError> {
@@ -238,9 +244,15 @@ pub(super) async fn register_file_list(
         defaults: reconstruct_initial_defaults(logical_schema).map_err(UdfError::User)?,
     };
 
+    // The partition columns leave the file schema here: they have no physical
+    // counterpart in any data file, and each is instead materialized per file from
+    // that file's logged partition value.
+    let schema = PartitionedScanSchema::split(table_schema, partition_columns)
+        .map_err(|e| UdfError::User(format!("cannot register '{table_name}': {e}")))?;
+
     let table = crate::scan::positional_deletes::PositionalDeleteScanTable::new(
         object_store_url,
-        table_schema,
+        schema,
         use_field_id_adapter,
         field_id_resolution,
         files.to_vec(),

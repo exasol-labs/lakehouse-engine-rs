@@ -16,7 +16,7 @@
 //! - `join_unreadable_file_errors_without_secrets`
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
@@ -257,6 +257,7 @@ fn join_spec(
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: limit,
+                partition_columns: Vec::new(),
                 storage: dim_storage(),
             }),
             storage: storage(),
@@ -459,6 +460,103 @@ fn join_projection_filter_limit_streamed() {
     // Both custkey-10 orders belong to Alice, so the surviving row is deterministic
     // in the dimension column even though which order survives is not.
     assert_eq!(name.value(0), "Alice", "the custkey-10 customer is Alice");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: Each side of a broadcast join materializes its own partition columns.
+///
+/// The fact side is partitioned by `o_region`, the dimension side by `c_country` —
+/// disjoint columns with distinct values — so a wiring bug that dropped, swapped, or
+/// crossed the two sides' `partition_columns` lists shows up as either a wrong value
+/// or a scan failure, never a silent pass.
+#[test]
+fn each_join_side_materializes_its_own_partition_columns() {
+    let dir = std::env::temp_dir().join(format!("lh_join_partition_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (orders_url, orders_size) = write_orders(&dir);
+    let (customer_url, customer_size) = write_customer(&dir);
+
+    let fact_file = FileEntry::with_partition_values(
+        orders_url,
+        orders_size,
+        BTreeMap::from([("o_region".to_string(), Some("US".to_string()))]),
+    );
+    let dim_file = FileEntry::with_partition_values(
+        customer_url,
+        customer_size,
+        BTreeMap::from([("c_country".to_string(), Some("CA".to_string()))]),
+    );
+
+    let spec = ScanSpec {
+        common: CommonScanSpec {
+            projection: vec![
+                "O_ORDERKEY".into(),
+                "O_REGION".into(),
+                "C_NAME".into(),
+                "C_COUNTRY".into(),
+            ],
+            logical_schema: vec![
+                logical_field(1, "o_orderkey", "int64"),
+                logical_field(2, "o_custkey", "int64"),
+                logical_field(3, "o_totalprice", "float64"),
+                logical_field(4, "o_region", "utf8"),
+            ],
+            partition_columns: vec!["o_region".to_string()],
+            join: Some(JoinSpec {
+                table_root: String::new(),
+                files: vec![dim_file],
+                logical_schema: vec![
+                    logical_field(1, "c_custkey", "int64"),
+                    logical_field(2, "c_name", "utf8"),
+                    logical_field(3, "c_country", "utf8"),
+                ],
+                name_mapping: Vec::new(),
+                join_type: JoinType::Inner,
+                condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
+                post_join_limit: None,
+                partition_columns: vec!["c_country".to_string()],
+                storage: dim_storage(),
+            }),
+            storage: storage(),
+            ..Default::default()
+        },
+        files: vec![fact_file],
+    };
+
+    let batches = run_join(&spec);
+
+    assert_eq!(
+        total_rows(&batches),
+        5,
+        "inner join must drop the one order (custkey 999) with no matching customer"
+    );
+
+    for batch in &batches {
+        assert_eq!(batch.num_columns(), 4);
+        let region = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("O_REGION must be Utf8");
+        let country = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("C_COUNTRY must be Utf8");
+        for i in 0..batch.num_rows() {
+            assert_eq!(
+                region.value(i),
+                "US",
+                "fact-side partition value must reach the joined row unswapped"
+            );
+            assert_eq!(
+                country.value(i),
+                "CA",
+                "dimension-side partition value must reach the joined row unswapped"
+            );
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -749,6 +847,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
+                partition_columns: Vec::new(),
                 storage: s3_backend(&dim_endpoint, "DIMSECRETVALUE"),
             }),
             storage: s3_backend(&fact_endpoint, "TOPSECRETVALUE"),

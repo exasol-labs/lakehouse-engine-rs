@@ -28,18 +28,13 @@ path exactly as they already are for Iceberg.
   source-level probe; `ScanSource` carries a resolved session and a loaded table. Matching
   `ScanSource` is what removes the need for a second `CatalogKind` match site, so that probe stays
   intact and unweakened.
-* **This plan wires NOTHING into the production pushdown path.** The recorded refusal
+* **Production pushdown now wires into the Delta path, issue #320.** The recorded refusal
   `vs-adapter/catalog-kind-selection` § "A pushdown request under the Unity Catalog kind is refused
-  as not yet executable" stays in force, verbatim, and is NOT superseded here. Removing it belongs to
-  #320, which applies deletion vectors, partition values, and column mapping at scan time. Wiring
-  Delta planning into `handle_pushdown` before #320 exists would return silently wrong rows rather
-  than a clean failure, for two verified reasons: `FileEntry::deletes` and its consumer
-  `crates/lakehouse-engine/src/scan/positional_deletes.rs` model Iceberg positional-delete FILES
-  only, so a Delta deletion vector left unmodelled triggers no rejection and the scan reads the
-  delete-free path with deleted rows restored; and `register_file_list`
-  (`crates/lakehouse-engine/src/scan/raw_scan.rs`) has no mechanism to inject a column value absent
-  from the physical Parquet file, so Delta partition columns would read NULL. No interim guard is
-  built either — a guard would be a slice of #320's work delivered early.
+  as not yet executable" is SUPERSEDED by "A pushdown request under the Unity Catalog kind is
+  planned as a Delta scan": deletion vectors, partition values, and column mapping are now applied
+  at scan time (`datafusion-scan/scan-execution-delta-deletion-vectors`,
+  `datafusion-scan/scan-execution-partition-values`), so wiring `handle_pushdown` through the
+  scan-source seam no longer returns silently wrong rows.
 * **Apache Iceberg spec check — this feature changes no Iceberg behavior, and the one overlapping
   rule is already a recorded trade-off.** The Iceberg table spec's "Column Projection" ordered
   resolution defines rule (1) as "Return the value from partition metadata if an Identity Transform
@@ -82,18 +77,15 @@ path exactly as they already are for Iceberg.
   below. `DeltaTableSpec`, `DeltaFileSpec`, `DeltaColumnMapping`, and `DeltaColumnMappingMode` cease to
   exist; `DeltaDeletionVectorStorage` survives only as the payload enum of the deletion-vector delete
   mechanism, keeping the closed 3-kind set this feature already requires.
-* **One recorded justification for the pushdown refusal is now half-true, and the refusal stands on
-  its other half.** This feature records that Delta planning is not wired into `handle_pushdown`
-  partly because "a Delta deletion vector left unmodelled triggers no rejection and the scan reads the
-  delete-free path with deleted rows restored". After this delta the deletion vector IS modelled and
-  IS refused at read time (`datafusion-scan/scan-execution-positional-deletes`), so that half no
-  longer holds. The other half is untouched: the scan still has no mechanism to materialize a
-  partition column absent from the physical Parquet file, so a Delta pushdown would still read those
-  columns as NULL. The recorded refusal therefore stays in force, unedited, and its own scenario needs
-  no change.
-* **Nothing this delta adds is consumed at scan time.** `partition_columns` and `partition_values` are
-  carried and round-tripped and read by nothing, exactly as their Delta-block predecessors were.
-  Consuming them is issue #320.
+* **The pushdown refusal is gone, issue #320.** Both halves of its former justification are now
+  closed: the Delta deletion vector is modelled AND applied at read time
+  (`datafusion-scan/scan-execution-positional-deletes`), and the scan now materializes a partition
+  column absent from the physical Parquet file
+  (`datafusion-scan/scan-execution-partition-values`). Production pushdown reaches the Delta reader
+  through the scan-source seam — see the scenario below.
+* **`partition_columns` and `partition_values` are now consumed at scan time**, by
+  `datafusion-scan/scan-execution-partition-values` — issue #320 closed the deferral this feature
+  recorded.
 * **Apache Iceberg spec check — the Iceberg path's behavior and its one recorded deviation are both
   unchanged.** The table spec's Column Projection section states that "Columns in Iceberg data files
   are selected by field id" and that "projection must be done using field ids". The Iceberg format
@@ -105,6 +97,25 @@ path exactly as they already are for Iceberg.
   deliberate, accurately-scoped trade-off `datafusion-scan/scan-execution-field-id-projection`
   records. This delta neither closes nor widens it: it gives that rule a neutral wire shape to land in
   later (issue #99), while the Iceberg reader leaves both new fields empty today.
+* **This delta is issue #320.** The Delta reader's own resolution behavior — log replay, partition
+  values, deletion-vector descriptors, column-mapping binding keys, credential vending, and type
+  refusal — is unchanged. What changes is that production pushdown now reaches it.
+* The Iceberg reader stops delegating and owns its resolution logic, closing the collapse this
+  feature's recorded contract scheduled for #320.
+* Two recorded deferrals stay deferred and are restated here as scoped exceptions: filter-based file
+  pruning is issue #321, and Delta reader-feature gating with broad type mapping is issue #322.
+* **Percent-decoding of `add.path` is VERIFIED, not assumed (task 5.1).** `delta_kernel` 0.26 leaves
+  `add.path` percent-encoded on the `scan_row` `path` column this reader reads
+  (`DeltaSnapshot::active_files` in `delta_replay.rs`); its own reference `DefaultEngine` only decodes
+  it later, at the URL-to-object-store-path boundary (`Path::from_url_path`,
+  `delta_kernel_default_engine::parquet` — e.g. `src/parquet.rs:433`). This reader's own path,
+  `reconstruct_abs_uri` joined through `ListingTableUrl::parse` (`store_path` in
+  `crates/lakehouse-engine/src/scan/store_router.rs`, and the identical construction in
+  `index_file_sizes`/`object_meta_for`), reaches that exact same `Path::from_url_path` decode inside
+  `datafusion-datasource`'s `ListingTableUrl::try_new`, so every object-store request this reader
+  issues already carries the DECODED path. Covered by
+  `store_path_decodes_a_percent_encoded_entry_path` in `store_router_tests.rs`. No gap; no tracked
+  issue needed.
 
 ## Scenarios
 
@@ -273,45 +284,49 @@ path exactly as they already are for Iceberg.
   already excluded non-Delta tables, because the single-table load applies no listing filter
 * *AND* the selection site MUST NOT match `CatalogKind`, so the source-level probe of
   `vs-adapter/catalog-kind-selection` — which asserts `CatalogKind`'s variant names appear in no
-  production module beyond the enum, its resolver, the client construction site, credential
-  validation, and the pushdown refusal — stays intact and unweakened
+  production module beyond the enum, its resolver, the catalog-client construction site, credential
+  validation, and the pushdown scan-source construction site — stays intact and unweakened
 
 ### Scenario: Iceberg planning is byte-identical through the new seam
 
-* *GIVEN* the shipped Iceberg file-resolution entry point `resolve_file_list` and its callers — the
-  single-table pushdown path, every join leg, and the external test callers
+* *GIVEN* the shipped Iceberg file-resolution logic and its former callers — the single-table pushdown
+  path, every join leg, and the external test callers
 * *WHEN* the Iceberg format reader resolves a table's scan through the trait
-* *THEN* the reader SHALL delegate to `resolve_file_list`, whose name, `pub` visibility, signature,
-  and every one of its call sites stay unchanged, so the shipped Iceberg planning path keeps its shape
-  and its callers
-* *AND* `resolve_file_list` SHALL construct each associated positional-delete reference as the Iceberg
-  positional-delete variant of the format-neutral delete mechanism — the ONE body change issue #342
-  makes to that function — and its SERIALIZED per-shard file list SHALL stay byte-identical to the
-  pre-#342 encoding, including the delete-carrying 3-tuple form and its
-  `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
-* *AND* the resolved scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry
-  EMPTY partition values, so the serialized shard-invariant common blob and per-shard file list
-  for every Iceberg request stay byte-identical to their pre-#342 encoding
+* *THEN* the reader SHALL OWN that resolution logic outright: the separately published
+  `resolve_file_list` entry point SHALL be deleted and its body SHALL live in the reader, SUPERSEDING
+  the recorded rule that its name, `pub` visibility, signature, and call sites stay unchanged, because
+  `vs-adapter/pushdown-format-neutral-resolution` routes every former caller through this seam
+* *AND* the reader SHALL construct each associated positional-delete reference as the Iceberg
+  positional-delete variant of the format-neutral delete mechanism, and its SERIALIZED per-shard file
+  list SHALL stay byte-identical to the pre-#342 encoding, including the delete-carrying 3-tuple form
+  and its `{"path":…,"size":…,"content_type":"position_deletes"}` member encoding
+* *AND* the returned scan SHALL carry EMPTY partition columns, and each of its file entries SHALL carry
+  EMPTY partition values, so the serialized shard-invariant common blob and per-shard file list for
+  every Iceberg request stay byte-identical to their pre-#342 encoding
 * *AND* every logical field the Iceberg reader emits SHALL carry its Iceberg field-id and NO physical
   name, so an Iceberg column is still bound by field-id and the physical-name and identity binding
   strategies are unreachable from the Iceberg path
 * *AND* the existing Iceberg unit, integration, and E2E suites MUST pass with no change to any test
   assertion or expected value
-* *AND* collapsing `resolve_file_list` into the Iceberg reader SHALL still be deferred to #320, which
-  removes its direct callers when it routes production pushdown through this seam
 
-### Scenario: Delta planning adds no production pushdown path in this plan
+### Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 
-* *GIVEN* the recorded refusal that a pushdown request under the Unity Catalog kind is not yet
-  executable, and its existing test asserting the refusal message
-* *WHEN* a pushdown request arrives whose virtual schema was created with `CATALOG_KIND` set to
-  `UNITY_CATALOG`
-* *THEN* the adapter SHALL still return that refusal, before any catalog client, credential, or file
-  resolution, and its existing test MUST pass UNEDITED
-* *AND* `handle_pushdown` MUST NOT select a format reader, resolve a Delta scan, or reach any code
-  this plan adds, so a Unity Catalog pushdown still issues no catalog request at all
-* *AND* the recorded refusal scenario SHALL NOT be superseded, narrowed, or re-scoped by this plan,
-  because its removal is #320's and depends on deletion-vector, partition-value, and column-mapping
-  application existing
-* *AND* the Delta path this plan adds SHALL be reachable from its own tests alone, so the plan's
-  value is verified without exposing a query path that returns wrong rows
+* *GIVEN* a virtual schema created with `CATALOG_KIND` set to `UNITY_CATALOG`, and a query against one
+  of its Delta tables
+* *WHEN* the adapter handles the resulting pushdown request
+* *THEN* the adapter SHALL select the Delta format reader through the scan-source seam and SHALL plan
+  the query from the `ResolvedScan` that reader returns, SUPERSEDING the recorded rule that the Delta
+  path is reachable from its own tests alone
+* *AND* the reader's resolved partition columns SHALL reach the shard-invariant common spec and its
+  per-file partition values SHALL reach the per-shard file entries, so the deferred scan-side partition
+  reconstruction this reader's contract names is satisfied by
+  `datafusion-scan/scan-execution-partition-values` rather than left open
+* *AND* the reader SHALL still apply NO filter-based file pruning, because per-file statistics and
+  partition pruning remain issue #321, so a filter narrows the rows the scan emits without narrowing
+  the files it reads
+* *AND* the reader SHALL still perform NO Delta reader-feature gating, because gating remains issue
+  #322; a table whose reader features this engine does not implement is therefore query-reachable and
+  its correctness is bounded by #322 rather than by a refusal, which this feature records as a known,
+  scoped exception rather than leaving unstated
+* *AND* every error the reader surfaces on this path MUST be returned as an error value, never raised
+  as a panic, and MUST NOT contain any vended or static credential value

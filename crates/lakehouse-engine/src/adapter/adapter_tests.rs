@@ -208,12 +208,14 @@ impl UdfContext for NoopCtx {
     }
 }
 
-// Proves the Unity Catalog pushdown refusal runs before any credential or
-// catalog resolution: connection() panics if the dispatch ever reaches it,
-// so a refusal that let the request fall through to resolve_connection_config
-// first would fail loudly here instead of just returning a different error.
-struct PanicOnConnectionCtx;
-impl UdfContext for PanicOnConnectionCtx {
+// A CONNECTION that resolves successfully, carrying a static-token-free S3-style
+// credential payload valid under EITHER catalog kind (see `validate_creds`:
+// `warehouse` is required only under `IcebergRest`), and an address that is a
+// closed local port — a connection refused, no DNS, no hang — so a request that
+// reaches catalog resolution fails fast, deterministically, on the FIRST call
+// the resolved kind's client makes.
+struct ClosedPortConnCtx;
+impl UdfContext for ClosedPortConnCtx {
     fn num_columns(&self) -> usize {
         0
     }
@@ -230,29 +232,64 @@ impl UdfContext for PanicOnConnectionCtx {
         &self,
         _name: &str,
     ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
-        panic!("connection() must not be called for a Unity Catalog pushdown refusal");
+        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
+            kind: "PASSWORD".into(),
+            address: "http://127.0.0.1:1".into(),
+            user: String::new(),
+            password: serde_json::json!({
+                "warehouse": "wh",
+                "endpoint": "http://s3.example.com",
+                "region": "us-east-1",
+                "access_key": "AKID",
+                "secret_key": "SECRET",
+            })
+            .to_string(),
+        })
     }
 }
 
-/// A pushdown request under `CATALOG_KIND: UNITY_CATALOG` is refused with a
-/// clear "not yet supported" error before any catalog client is constructed,
-/// credentials are resolved, or files are resolved through the Iceberg path.
+/// A pushdown request under `CATALOG_KIND: UNITY_CATALOG` is planned as a Delta
+/// scan: it reaches the SAME resolver the Iceberg path reaches — no early
+/// refusal, no routing through the Iceberg REST file-resolution path.
+///
+/// No live Unity Catalog is reachable in a unit test, so this proves routing by
+/// WHICH failure surfaces: `UnityCatalogSession`'s own "Unity Catalog load table
+/// request failed" error, naming its `unity-catalog/tables` endpoint, never the
+/// removed "not yet supported" refusal and never an Iceberg-shaped error (no
+/// `/v1/config` involved).
 #[test]
-fn unity_kind_pushdown_is_refused_not_iceberg_routed() {
+
+fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
     let req = serde_json::json!({
         "type": "pushdown",
         "properties": {
             "CATALOG_KIND": "UNITY_CATALOG",
+            "CATALOG_CONNECTION": "MY_CONN",
+        },
+        "involvedTables": [{
+            "name": "ORDERS",
+            "columns": [{"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
+        }],
+        "schemaMetadataInfo": {
+            "adapterNotes": serde_json::json!({"TABLE_MAP": {"ORDERS": "cat.sch.orders"}}).to_string(),
         },
     });
 
-    let err = dispatch(&mut PanicOnConnectionCtx, &req)
-        .expect_err("a Unity Catalog pushdown must be refused, not executed");
+    let err = dispatch(&mut ClosedPortConnCtx, &req)
+        .expect_err("no live Unity Catalog is reachable in a unit test");
 
     let message = err.to_string();
     assert!(
-        message.contains("Unity Catalog") && message.contains("not yet supported"),
-        "expected a clear 'Unity Catalog scan execution is not yet supported' refusal, got: {message}"
+        message.contains("Unity Catalog load table request failed"),
+        "must reach the Unity Catalog load-table call, got: {message}"
+    );
+    assert!(
+        message.contains("unity-catalog/tables"),
+        "must name the Unity Catalog load-table endpoint: {message}"
+    );
+    assert!(
+        !message.contains("not yet supported"),
+        "the removed pushdown-path refusal must not resurface: {message}"
     );
 }
 

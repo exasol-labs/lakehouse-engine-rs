@@ -14,6 +14,21 @@ fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
     })
 }
 
+/// Capability advertisement cannot consult the catalog kind.
+///
+/// This is a compile-time surface probe: `get_capabilities_response` compiles
+/// with a signature taking NO arguments at all, so it is structurally
+/// incapable of branching on `CatalogKind` (or any other per-request value —
+/// `dispatch`'s `getCapabilities` arm calls it with nothing). `CAPABILITIES`
+/// itself is a plain `&[&str]` constant, not a function of anything. Together
+/// these two signatures are the whole capability-advertisement surface, and
+/// neither can name `CatalogKind`.
+#[test]
+fn capabilities_are_assembled_without_the_catalog_kind() {
+    let _capabilities: &[&str] = CAPABILITIES;
+    let _response_builder: fn() -> Json = get_capabilities_response;
+}
+
 /// Adapter advertises GROUP BY column, expression, and multi-column (tuple)
 /// capabilities — and `AGGREGATE_GROUP_BY_TUPLE` is advertised ONLY because the
 /// N-key detection path that serves it works (issue #53). This test therefore

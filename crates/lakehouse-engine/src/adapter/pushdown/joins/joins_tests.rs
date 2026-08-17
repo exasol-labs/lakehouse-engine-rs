@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{FileEntry, LogicalField};
 
@@ -174,21 +175,24 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
     ResolvedJoinSide::new(
         table_name.to_string(),
         format!("lh.{lower}"),
-        format!("s3://warehouse/lh/{lower}"),
-        files
-            .into_iter()
-            .map(|(p, s)| FileEntry::new(p, s))
-            .collect(),
-        vec![LogicalField {
-            field_id: Some(1),
-            name: format!("{table_name}_KEY"),
-            arrow_type: "int64".to_string(),
-            nullable: false,
-            initial_default: None,
-            physical_name: None,
-        }],
-        Vec::new(),
-        sample_storage(),
+        ResolvedScan {
+            files: files
+                .into_iter()
+                .map(|(p, s)| FileEntry::new(p, s))
+                .collect(),
+            effective_storage: sample_storage(),
+            logical_schema: vec![LogicalField {
+                field_id: Some(1),
+                name: format!("{table_name}_KEY"),
+                arrow_type: "int64".to_string(),
+                nullable: false,
+                initial_default: None,
+                physical_name: None,
+            }],
+            table_root: format!("s3://warehouse/lh/{lower}"),
+            name_mapping: Vec::new(),
+            partition_columns: Vec::new(),
+        },
     )
 }
 

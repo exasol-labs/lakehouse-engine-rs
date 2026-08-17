@@ -1,0 +1,77 @@
+# Feature: Unity Catalog E2E Harness — Delta Query Result Coverage
+
+End-to-end coverage of the actual rows a query returns over the seeded Delta fixtures — delete-free,
+deletion-vector, column-mapped, partitioned, join/aggregate, and unplannable-type tables — run through
+the same `unity-e2e` stack and virtual schema as `e2e-harness/unity-catalog-e2e-harness`. Split out of
+that feature once its scenario count crossed this library's per-spec organization threshold.
+
+## Background
+
+* **Split from `e2e-harness/unity-catalog-e2e-harness`, issue #320.** That feature keeps harness
+  bring-up, createVirtualSchema enumeration, the virtual schema's storage-credential wiring, the
+  stack-unavailable failure contract, and the credential-leak guarantee. This feature owns every
+  scenario that asserts the ROWS a query returns over a seeded Delta table.
+* The seeded fixtures these scenarios query are `multi_part_stats` (5 files, 5 rows, delete-free,
+  unpartitioned), `table_with_dv` (1 file, 10 physical rows, a UUID-relative deletion vector of
+  cardinality 2), `cm_id_mode` and `cm_name_mode` (`col-<uuid>` physical names under `id` and `name`
+  column mapping), `basic_partitioned` (6 files, 6 rows, partitioned by `letter`, one file under the
+  Hive default-partition directory), and `unshredded_variant` / `stats_all_types` (types this engine
+  does not map).
+* No new fixture, Makefile target, or test tier is added. These scenarios extend the existing
+  `make test-e2e-unity` suite, in the same `e2e_unity_test.rs` binary as the sibling feature's
+  scenarios.
+* The virtual schema these scenarios query against is the one
+  `e2e-harness/unity-catalog-e2e-harness` § "The suite's virtual schema carries the storage
+  credentials a UDF-side scan needs" creates; that scenario's guarantee — a CONNECTION carrying the
+  MinIO endpoint and static storage credentials, provisioned through the shared harness scan-UDF
+  definition — is a precondition every scenario below relies on.
+
+## Scenarios
+
+### Scenario: A delete-free Delta table returns its rows end to end
+
+* *GIVEN* the seeded delete-free, unpartitioned fixture registered as `unity.delta_e2e.multi_part_stats`, whose five active data files hold five rows in total
+* *WHEN* the suite issues `SELECT *` and `SELECT COUNT(*)` against that virtual table
+* *THEN* `SELECT COUNT(*)` SHALL return 5 and `SELECT *` SHALL return those 5 rows with their column values, which is this engine's FIRST full round trip over a Delta table
+* *AND* the rows SHALL arrive under the virtual table's declared column names and Exasol types
+* *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
+
+### Scenario: A Delta table with deletion vectors returns only its live rows
+
+* *GIVEN* the seeded deletion-vector fixture registered as `unity.delta_e2e.table_with_dv`, whose single active data file physically holds 10 rows and carries a deletion vector of cardinality 2 removing the rows whose `value` is 0 and 9
+* *WHEN* the suite issues `SELECT COUNT(*)` and `SELECT value` against that virtual table
+* *THEN* `SELECT COUNT(*)` SHALL return 8, not 10, so the aggregate observes post-delete rows
+* *AND* the returned `value` set MUST NOT contain 0 or 9, and SHALL contain every other value the file holds
+* *AND* a query whose predicate selects a deleted row — `WHERE value = 0` — SHALL return no row, so the deletion vector is applied beneath the pushed-down filter rather than after it
+
+### Scenario: A column-mapped Delta table returns values under its logical column names
+
+* *GIVEN* the seeded column-mapping fixtures registered as `unity.delta_e2e.cm_id_mode` and `unity.delta_e2e.cm_name_mode`, whose Parquet columns are named `col-<uuid>` while their Delta schemas declare `id`, `name`, and `value`
+* *WHEN* the suite issues `SELECT id, name, value` against EACH virtual table
+* *THEN* both queries SHALL return the real physical values under the logical column names, so the id-mode table binds by Parquet field id and the name-mode table binds by declared physical name
+* *AND* neither query SHALL return NULL for a column the data file carries, which is what a logical-name-only binding would produce against a `col-<uuid>` physical name
+* *AND* both tables SHALL return the SAME rows for the same projection, because the two column-mapping modes differ only in the binding key
+
+### Scenario: A partitioned Delta table returns its partition column values
+
+* *GIVEN* the seeded partitioned fixture registered as `unity.delta_e2e.basic_partitioned`, partitioned by `letter` across six data files holding six rows, one of which lives under the Hive default-partition directory because its `letter` is NULL
+* *WHEN* the suite issues `SELECT letter, number, a_float` against that virtual table
+* *THEN* each row SHALL carry the `letter` value logged for the file it came from, and the row from the default-partition file SHALL carry NULL
+* *AND* no row SHALL carry the Hive default-partition directory name as its `letter` value
+* *AND* `SELECT * FROM ... WHERE letter = 'a'` SHALL return exactly the rows whose logged partition value is `a`, and `SELECT letter, COUNT(*) ... GROUP BY letter` SHALL group on the materialized values, so a partition column is usable as a predicate target and as a group key
+
+### Scenario: Join and aggregate pushdown reach a Delta table by the same route as a scan
+
+* *GIVEN* the seeded fixtures `unity.delta_e2e.basic_partitioned` and `unity.delta_e2e.multi_part_stats` in one virtual schema
+* *WHEN* the suite issues a grouped aggregate over one table, an ORDER BY with LIMIT over one table, and an inner equi-join between the two whose broadcast side is the PARTITIONED table
+* *THEN* every query SHALL return the same rows a single-node engine returns for the same data, so no request shape is left unreachable or wrong by the Delta routing
+* *AND* the join result SHALL carry the broadcast side's partition column values, so partitioning the broadcast side changes nothing about the join result
+* *AND* the suite SHALL capture the generated pushdown SQL for at least one of these queries and assert it drives the scan UDF, so a silent fallback to an unaccelerated wrapper fails the suite rather than passing on correct rows
+
+### Scenario: A Delta table this engine cannot plan fails the query loud
+
+* *GIVEN* the seeded fixtures whose Delta schemas declare types this engine does not map — `unity.delta_e2e.unshredded_variant` and `unity.delta_e2e.stats_all_types`
+* *WHEN* the suite issues a query against each
+* *THEN* each query SHALL fail with the reader's plan-time error naming the column and its Delta type, and MUST NOT return a row
+* *AND* the failure MUST arrive as a SQL error rather than as a crashed UDF VM, so an unsupported table is a diagnosable refusal rather than an abnormal exit
+* *AND* the error text MUST NOT contain any credential value

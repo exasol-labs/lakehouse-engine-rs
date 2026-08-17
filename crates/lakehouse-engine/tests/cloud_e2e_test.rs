@@ -686,7 +686,7 @@ fn presence_label(present: bool) -> &'static str {
 /// populate. An absent KEY PAIR is a plan-time failure for every vended Glue virtual
 /// schema, which is why those assertions name the absent key rather than a failed scan.
 ///
-/// The anchor is the table's OWN location, derived exactly as `resolve_file_list`
+/// The anchor is the table's OWN location, derived exactly as the Iceberg reader
 /// derives it; there is no fallback for it, so this test asserts it is present rather
 /// than substituting the CONNECTION's `warehouse`.
 ///
@@ -739,7 +739,7 @@ fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
     assert!(
         !anchor.is_empty(),
         "Glue's loadTable response carries no table `location`: the Iceberg spec marks it \
-         required in v1-v3, and `resolve_file_list` errors on an absent one rather than \
+         required in v1-v3, and the Iceberg reader errors on an absent one rather than \
          substituting the catalog `warehouse`, so a scan of this table resolves no backend \
          at all and the S3 keys below have no anchor to be selected by"
     );
@@ -849,7 +849,7 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
         .to_uppercase();
     let vs_table = format!("{auth_vs_name}.{table_part}");
 
-    // A SELECT proves that `resolve_file_list` succeeded against the auth-gated catalog.
+    // A SELECT proves that the Iceberg reader succeeded against the auth-gated catalog.
     let cols = conn.query_columns(&format!("SELECT * FROM {vs_table} LIMIT 5"));
     assert!(
         !cols.is_empty(),

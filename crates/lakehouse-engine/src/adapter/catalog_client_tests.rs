@@ -7,8 +7,10 @@ use super::*;
 /// listing pipeline is structurally incapable of consulting the kind or a client;
 /// `construct_catalog_client` is the listing path's sole kind→client construction
 /// site. The probe pins only these two signatures — it does not (and cannot) prove
-/// the kind is matched nowhere else. `validate_creds` and the pushdown-path early
-/// refusal legitimately consult the kind, both OUTSIDE this listing pipeline.
+/// the kind is matched nowhere else. `validate_creds` and the pushdown path's
+/// `TableScanResolver::for_request` — the pushdown pipeline's own ONE
+/// kind→session construction site — legitimately consult the kind, both OUTSIDE
+/// this listing pipeline.
 #[test]
 fn catalog_kind_is_matched_only_at_the_construction_site() {
     let _pipeline: fn(&[String], &CatalogListing) -> Result<VirtualTables, UdfError> =
