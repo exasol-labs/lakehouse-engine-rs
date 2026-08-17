@@ -205,9 +205,15 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 * *AND* the request-JSON half SHALL cover a refused column reached through a WHERE filter, a GROUP BY
   key, an ORDER BY key, an aggregate argument, or a join condition, because a `binary` column pushed
   into the scan's filter would otherwise be compared as text with every non-UTF-8 value silently NULL
-* *AND* the projection half SHALL cover the full-base-row projection the adapter falls back to for a
-  `SELECT *`, an aggregate select list, and an untranslatable select-list item, so `SELECT *` over a
-  table carrying a refused column is refused rather than emitting a column the scan cannot bind
+* *AND* the projection half SHALL union in the full-base-row projection ONLY when the request's own
+  select list is absent or empty — a genuine `SELECT *` — so `SELECT *` over a table carrying a
+  refused column is refused rather than emitting a column the scan cannot bind
+* *AND* the projection half MUST NOT union in the full-base-row projection the adapter separately
+  renders when a select-list item is an aggregate or otherwise untranslatable, because that fallback
+  is a synthetic placeholder the scan never reads — each such item's own referenced columns already
+  reach the touched-column set through the request-JSON walk's aggregate-argument coverage above — and
+  unioning it would refuse a bare `COUNT(*)`, which reads no column value, on a table carrying an
+  unrelated refused column
 * *AND* the gate SHALL run BEFORE the zero-active-files early return, so a query naming a refused
   column against an EMPTY Delta table is refused rather than answered with an empty result
 * *AND* the gate SHALL run on the JOIN path for each resolved side as well as on the single-table

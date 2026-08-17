@@ -116,6 +116,32 @@ path exactly as they already are for Iceberg.
   issues already carries the DECODED path. Covered by
   `store_path_decodes_a_percent_encoded_entry_path` in `store_router_tests.rs`. No gap; no tracked
   issue needed.
+* **This delta is issue #322.** The two deferrals this feature has recorded since #319 — Delta
+  reader-feature gating and broad Delta type mapping — are both closed. Neither the log replay, the
+  partition values, the deletion-vector descriptors, the column-mapping binding keys, nor the
+  credential vending changes; what changes is that an unsupported table is now refused and a wider
+  type surface is now mapped.
+* **Gating moves to `vs-adapter/delta-reader-feature-gating`** and type mapping to
+  `vs-adapter/delta-type-mapping`, rather than growing this feature further. This feature already
+  carries nine scenarios spanning log replay, partition values, deletion vectors, column mapping,
+  credentials, format dispatch, and Iceberg parity; a protocol gate and a full type-surface mapping are
+  each a distinct reason to change and each carries its own normative protocol citations.
+* **Only two recorded statements are affected.** The scenario "A Delta type this plan does not map is
+  refused at plan time" is REMOVED, because every clause of it either restates a mapping
+  `vs-adapter/delta-type-mapping` now owns or asserts the absence of the gate
+  `vs-adapter/delta-reader-feature-gating` now adds. The scenario "The Delta reader is reached from
+  production pushdown under the Unity Catalog kind" is CHANGED, because its "SHALL still perform NO
+  Delta reader-feature gating" clause and its scoped-exception clause are the exception this plan
+  closes.
+* **Filter-based file pruning stays deferred, unchanged.** Per-file statistics and partition pruning
+  remain issue #321, so a filter still narrows the rows the scan emits without narrowing the files it
+  reads. This plan touches neither.
+* **Apache Iceberg spec check — this delta changes no Iceberg behavior.** It adds a Delta protocol
+  gate and widens the Delta type mapping; no code on the Iceberg resolution path changes. The Iceberg
+  table spec's Column Projection requirement that "projection must be done using field ids" still
+  holds for every Iceberg column, and its ordered resolution rule (1) — the partition-metadata rule —
+  remains the deliberate, accurately-scoped trade-off
+  `datafusion-scan/scan-execution-field-id-projection` records, neither closed nor widened here.
 
 ## Scenarios
 
@@ -251,24 +277,6 @@ path exactly as they already are for Iceberg.
 * *AND* the reader MUST NOT request vended credentials, build an object store, or read one log file,
   so a malformed catalog response costs zero object-storage access
 
-### Scenario: A Delta type this plan does not map is refused at plan time
-
-* *GIVEN* a Delta table whose schema declares a field whose type has no Arrow type tag in the
-  engine's tag vocabulary — for example `byte`, `short`, `binary`, `array`, `map`, `struct`, or
-  `variant`
-* *WHEN* the Delta format reader resolves that table's scan
-* *THEN* the reader SHALL return a `UdfError` naming the column and its Delta type, and MUST NOT emit
-  a logical field whose Arrow tag widens, narrows, or otherwise misdescribes the column, because a
-  misdescribed tag returns wrong values rather than an error
-* *AND* the error SHALL state that broad Delta type mapping — including the incompatible-type
-  `VARCHAR(2000000)`-via-JSON convention — is issue #322, so the refusal reads as a scoped gap rather
-  than an unsupported table
-* *AND* the reader SHALL map the Delta primitive types that DO have a tag — `boolean`, `integer`,
-  `long`, `float`, `double`, `string`, `date`, `timestamp`, `timestamp_ntz`, and `decimal(p,s)` — and
-  SHALL carry each field's nullability from the Delta schema
-* *AND* the reader SHALL perform NO Delta reader-feature gating, because gating is issue #322 and a
-  gate added here would refuse the deletion-vector and column-mapping fixtures this plan resolves
-
 ### Scenario: The format reader is selected at one site and refuses a mismatched pairing
 
 * *GIVEN* a `ScanSource` whose variant pairs one live catalog session with the table it reads
@@ -315,8 +323,7 @@ path exactly as they already are for Iceberg.
   of its Delta tables
 * *WHEN* the adapter handles the resulting pushdown request
 * *THEN* the adapter SHALL select the Delta format reader through the scan-source seam and SHALL plan
-  the query from the `ResolvedScan` that reader returns, SUPERSEDING the recorded rule that the Delta
-  path is reachable from its own tests alone
+  the query from the `ResolvedScan` that reader returns
 * *AND* the reader's resolved partition columns SHALL reach the shard-invariant common spec and its
   per-file partition values SHALL reach the per-shard file entries, so the deferred scan-side partition
   reconstruction this reader's contract names is satisfied by
@@ -324,9 +331,13 @@ path exactly as they already are for Iceberg.
 * *AND* the reader SHALL still apply NO filter-based file pruning, because per-file statistics and
   partition pruning remain issue #321, so a filter narrows the rows the scan emits without narrowing
   the files it reads
-* *AND* the reader SHALL still perform NO Delta reader-feature gating, because gating remains issue
-  #322; a table whose reader features this engine does not implement is therefore query-reachable and
-  its correctness is bounded by #322 rather than by a refusal, which this feature records as a known,
-  scoped exception rather than leaving unstated
+* *AND* the reader SHALL now GATE the Delta reader protocol and reader-feature set
+  (`vs-adapter/delta-reader-feature-gating`), SUPERSEDING the recorded rule that it performs no such
+  gating: a table whose reader features this engine does not implement is no longer query-reachable,
+  so this feature records NO remaining reader-feature exception
+* *AND* the reader SHALL refuse a request that reads or emits a column whose Delta type this engine
+  cannot render faithfully, per column rather than per table
+  (`vs-adapter/delta-type-mapping`), so a table carrying one struct column stays queryable on its
+  other columns
 * *AND* every error the reader surfaces on this path MUST be returned as an error value, never raised
   as a panic, and MUST NOT contain any vended or static credential value
