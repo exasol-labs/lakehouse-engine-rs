@@ -147,6 +147,207 @@ pub(super) fn locationless_delta_table_body() -> String {
     .to_string()
 }
 
+/// A Unity Catalog serving a Delta table for every `cat.sch.<name>` identifier,
+/// each located at `s3://bucket/<name>` — the location the object endpoint below
+/// serves that table's log under.
+pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
+    RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
+        Some((_, name)) if !name.is_empty() => (
+            200,
+            serde_json::json!({
+                "name": name,
+                "table_type": "MANAGED",
+                "data_source_format": "DELTA",
+                "storage_location": format!("s3://bucket/{name}"),
+                "table_id": format!("table-{name}"),
+                "columns": [],
+            })
+            .to_string(),
+        ),
+        _ => (404, r#"{"message":"no such table"}"#.to_string()),
+    })
+    .await
+}
+
+/// One Delta commit declaring `columns` as `(name, Delta type)` pairs and NO `add`
+/// action, so the table resolves with an EMPTY active-file list.
+pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> String {
+    fileless_delta_commit_with_protocol(
+        id,
+        columns,
+        serde_json::json!({"minReaderVersion": 1, "minWriterVersion": 2}),
+    )
+}
+
+/// [`fileless_delta_commit`], with the `protocol` action replaced by the caller's
+/// own — for a table whose reader protocol declares features outside the gate's
+/// allow-list.
+pub(super) fn fileless_delta_commit_with_protocol(
+    id: &str,
+    columns: &[(&str, &str)],
+    protocol: Json,
+) -> String {
+    let fields: Vec<Json> = columns
+        .iter()
+        .map(|(name, delta_type)| {
+            serde_json::json!({
+                "name": name, "type": delta_type, "nullable": true, "metadata": {},
+            })
+        })
+        .collect();
+    let protocol = serde_json::json!({"protocol": protocol});
+    let metadata = serde_json::json!({"metaData": {
+        "id": id,
+        "format": {"provider": "parquet", "options": {}},
+        "schemaString": serde_json::json!({"type": "struct", "fields": fields}).to_string(),
+        "partitionColumns": [],
+        "configuration": {},
+        "createdTime": 1,
+    }});
+    format!("{protocol}\n{metadata}\n")
+}
+
+/// The log path a table located at `s3://bucket/<name>` holds its first commit at.
+pub(super) fn delta_commit_zero_key(name: &str) -> String {
+    format!("{name}/_delta_log/00000000000000000000.json")
+}
+
+/// A loopback S3 endpoint serving a fixed key → body map, answered as the
+/// [`StorageBackend`] a CONNECTION would carry.
+///
+/// Serving the log over HTTP rather than injecting a store is what lets a WHOLE
+/// `handle_pushdown` call resolve a real Delta table offline: `read_delta_log`
+/// builds its own store from the storage backend, so no test store can be reached
+/// past that seam. Answers exactly the three request shapes a `delta_kernel` log
+/// read issues — the `_last_checkpoint` probe, the `_delta_log/` listing, and a GET
+/// per commit — and 404s everything else, including every data-file read, which no
+/// plan-time resolution performs.
+pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
+    let objects = Arc::new(objects);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+    let port = listener.local_addr().expect("local_addr").port();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let objects = objects.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16384];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                if read == 0 {
+                    return;
+                }
+                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let target = raw
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+                let response = if query.contains("list-type=2") {
+                    ok_response("application/xml", &list_bucket_result(query, &objects))
+                } else {
+                    match objects
+                        .iter()
+                        .find(|(key, _)| key == path.trim_start_matches("/bucket/"))
+                    {
+                        Some((_, body)) => ok_response("application/octet-stream", body),
+                        None => {
+                            let error =
+                                r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
+                            format!(
+                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                                error.len()
+                            )
+                        }
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    StorageBackend::S3(StorageProps {
+        endpoint: format!("http://127.0.0.1:{port}"),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        allow_http: true,
+        path_style: true,
+        ..Default::default()
+    })
+}
+
+fn ok_response(content_type: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         ETag: \"e{}\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+         Accept-Ranges: bytes\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+        body.len()
+    )
+}
+
+/// The `ListObjectsV2` answer for the listing `query`, over every served key under
+/// its `prefix` that sorts after its `start-after` marker.
+fn list_bucket_result(query: &str, objects: &[(String, String)]) -> String {
+    let param = |key: &str| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default()
+    };
+    let (prefix, after) = (param("prefix"), param("start-after"));
+    let contents: String = objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix) && key > &after)
+        .map(|(key, body)| {
+            format!(
+                "<Contents><Key>{key}</Key>\
+                 <LastModified>2024-01-01T00:00:00.000Z</LastModified>\
+                 <ETag>&quot;e{}&quot;</ETag><Size>{}</Size>\
+                 <StorageClass>STANDARD</StorageClass></Contents>",
+                body.len(),
+                body.len()
+            )
+        })
+        .collect();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Name>bucket</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
+         <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+    )
+}
+
+/// Drive a whole pushdown request against a Unity Catalog Delta table, on the
+/// single-shard tuning every offline resolution test uses.
+pub(super) async fn delta_pushdown(
+    request: &Json,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    table: &str,
+) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage,
+        creds: unauthenticated_creds(),
+        allow_http: true,
+        catalog_kind: CatalogKind::UnityCatalogNative,
+    };
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: table.into(),
+    };
+    handle_pushdown(
+        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+    )
+    .await
+}
+
 /// An Iceberg REST catalog serving its config and one snapshotless table per
 /// requested identifier.
 pub(super) async fn iceberg_catalog() -> RecordingCatalog {

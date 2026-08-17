@@ -192,6 +192,7 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
             table_root: format!("s3://warehouse/lh/{lower}"),
             name_mapping: Vec::new(),
             partition_columns: Vec::new(),
+            refused_columns: Vec::new(),
         },
     )
 }
@@ -236,5 +237,210 @@ fn golden_ineligible_decline_message_unchanged() {
     assert_eq!(
         unsupported,
         "join pushdown declined: the join `from` clause has an unsupported shape; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
+    );
+}
+
+fn delta_join_request(select_list: Json) -> Json {
+    delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+        ]),
+        select_list,
+    )
+}
+
+/// The same two-Delta-table inner equi-join over caller-declared column lists, so a
+/// test can declare the SAME column name on both legs.
+fn delta_join_request_over(
+    customer_columns: Json,
+    orders_columns: Json,
+    select_list: Json,
+) -> Json {
+    serde_json::json!({
+        "involvedTables": [
+            {"name": "CUSTOMER", "columns": customer_columns},
+            {"name": "ORDERS", "columns": orders_columns},
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": {
+                "type": "join",
+                "join_type": "inner",
+                "left": {"name": "CUSTOMER", "type": "table"},
+                "right": {"name": "ORDERS", "type": "table"},
+                "condition": {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                },
+            },
+            "selectList": select_list,
+        },
+        "schemaMetadataInfo": {
+            "properties": {},
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"CUSTOMER": "cat.sch.customer", "ORDERS": "cat.sch.orders"}
+            }).to_string(),
+        },
+    })
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The JOIN half: a refused column reached through a join leg is refused by the same
+/// rule as on the single-table path, per resolved side and ahead of the empty-side
+/// early return — both legs here resolve with NO active file, so a gate placed after
+/// that return would answer the refused request with an empty result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let mappable = serde_json::json!([
+        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+    ]);
+    let reaching_refused = serde_json::json!([
+        {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+        {"type": "column", "name": "BINARY_COL", "tableName": "ORDERS"},
+    ]);
+
+    delta_pushdown(
+        &delta_join_request(mappable),
+        &catalog.uri,
+        storage.clone(),
+        "cat.sch.orders",
+    )
+    .await
+    .expect("a join naming only mappable columns must plan");
+
+    let error = delta_pushdown(
+        &delta_join_request(reaching_refused),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("a join leg emitting the refused column must be refused, never answered empty");
+
+    assert_refuses_binary_col(error);
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// A refusal belongs to the table that raised it. Both legs here declare a
+/// `BINARY_COL`, but only `ORDERS`' is a Delta `binary`; `CUSTOMER`'s is a `string`
+/// the reader maps. A select list naming only `CUSTOMER.BINARY_COL` therefore reads
+/// nothing `ORDERS` refused, and a gate matching a request-global touched set
+/// against every side's refused list would refuse it on the strength of the name
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable_column_on_the_other()
+ {
+    let catalog = unity_delta_catalog().await;
+    let storage = delta_object_endpoint(vec![
+        (
+            delta_commit_zero_key("customer"),
+            fileless_delta_commit(
+                "customer",
+                &[
+                    ("c_custkey", "long"),
+                    ("c_name", "string"),
+                    ("binary_col", "string"),
+                ],
+            ),
+        ),
+        (
+            delta_commit_zero_key("orders"),
+            fileless_delta_commit("orders", &[("o_custkey", "long"), ("binary_col", "binary")]),
+        ),
+    ])
+    .await;
+    let request = delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+        ]),
+        serde_json::json!([
+            {"type": "column", "name": "BINARY_COL", "tableName": "CUSTOMER"},
+        ]),
+    );
+
+    delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("a select list naming only the mappable side's column must plan");
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The fail-safe half of per-side attribution: an unqualified `BINARY_COL` names no
+/// side, so it is charged to BOTH and the leg that refused it refuses the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let request = delta_join_request(serde_json::json!([
+        {"type": "column", "name": "BINARY_COL"},
+    ]));
+
+    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect_err("a column reference naming no side must be charged to every side");
+
+    assert_refuses_binary_col(error);
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// A `SELECT *` join names no column anywhere yet emits every column each side
+/// declares, so the side carrying the refused column must be charged its own
+/// declared row rather than admitted for lack of a `column` node naming it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let request = delta_join_request(Json::Null);
+
+    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect_err("SELECT * emits ORDERS.BINARY_COL, which ORDERS refused");
+
+    assert_refuses_binary_col(error);
+}
+
+/// `CUSTOMER` (all mappable) joined to `ORDERS`, whose `binary_col` the Delta reader
+/// refuses. Neither leg carries an active file.
+async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
+    delta_object_endpoint(vec![
+        (
+            delta_commit_zero_key("customer"),
+            fileless_delta_commit("customer", &[("c_custkey", "long"), ("c_name", "string")]),
+        ),
+        (
+            delta_commit_zero_key("orders"),
+            fileless_delta_commit("orders", &[("o_custkey", "long"), ("binary_col", "binary")]),
+        ),
+    ])
+    .await
+}
+
+fn assert_refuses_binary_col(error: UdfError) {
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(
+        message.contains("binary_col") && message.contains("#350"),
+        "the refusal must be the gate's own message, naming the column and its reason: \
+         {message}"
     );
 }

@@ -2278,6 +2278,323 @@ async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catal
     );
 }
 
+fn refused_column_table_request(select_list: Json) -> Json {
+    refused_column_table(serde_json::json!({"type": "select", "selectList": select_list}))
+}
+
+/// The same `ORDERS` request, with a WHERE filter added beside the select list.
+fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> Json {
+    refused_column_table(serde_json::json!({
+        "type": "select", "selectList": select_list, "filter": filter,
+    }))
+}
+
+/// The `SELECT *` wire form: no `selectList` key at all (Exasol omits it), so
+/// `extract_projection` falls back to the full base row.
+fn refused_column_table_select_star_request() -> Json {
+    refused_column_table(serde_json::json!({"type": "select"}))
+}
+
+/// The shared `ORDERS` fixture: one mappable column (`INT_COL`) and one refused
+/// column (`BINARY_COL`), wrapped around any `pushdownRequest` shape.
+fn refused_column_table(pushdown_request: Json) -> Json {
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "ORDERS",
+            "columns": [
+                {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+                {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            ],
+        }],
+        "pushdownRequest": pushdown_request,
+    })
+}
+
+/// The `ORDERS` fixture's Delta log, matching [`refused_column_table`]'s declared
+/// columns: `int_col` maps, `binary_col` is refused. No active file.
+async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
+    delta_object_endpoint(vec![(
+        delta_commit_zero_key("orders"),
+        fileless_delta_commit(
+            "orders",
+            &[("int_col", "integer"), ("binary_col", "binary")],
+        ),
+    )])
+    .await
+}
+
+fn column_item(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": "ORDERS"})
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The ORDERING half. The table declares one mappable and one refused column and has
+/// NO active file, so both requests below reach the zero-active-files early return.
+/// The mappable-only request is answered by it; the request naming the refused column
+/// must be refused BEFORE it, because a gate placed after would answer that request
+/// with an empty result — a wrong answer, not a refusal. Only the gate's position
+/// distinguishes the two outcomes: the table, the catalog, and the store are the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_column_is_refused_before_the_zero_active_files_early_return() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_column_table_storage().await;
+
+    let planned = delta_pushdown(
+        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
+        &catalog.uri,
+        storage.clone(),
+        "cat.sch.orders",
+    )
+    .await
+    .expect("a request naming only the mappable column must plan");
+    let sql = planned["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field");
+    assert!(
+        !sql.contains(SCAN_UDF_NAME),
+        "the table must resolve with NO active file, so the empty-result early return \
+         answers this request — otherwise the ordering below proves nothing: {sql}"
+    );
+
+    let error = delta_pushdown(
+        &refused_column_table_request(serde_json::json!([column_item("BINARY_COL")])),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("a request emitting the refused column must be refused, never answered empty");
+
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(
+        message.contains("binary_col") && message.contains("#350"),
+        "the refusal must be the gate's own message, naming the column and its reason: \
+         {message}"
+    );
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The PROJECTION half, complementing the ordering half proven above. The same
+/// `ORDERS` fixture (one mappable, one refused column) drives four request
+/// shapes: a projection naming only the mappable column plans; a projection
+/// naming the refused column, a WHERE filter reaching it while the select list
+/// names only the mappable column, and a `SELECT *` (whose absent `selectList`
+/// widens the projection to the full base row) all refuse it instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_delta_column_refuses_only_the_requests_that_reference_it() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_column_table_storage().await;
+
+    delta_pushdown(
+        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
+        &catalog.uri,
+        storage.clone(),
+        "cat.sch.orders",
+    )
+    .await
+    .expect("a projection naming only the mappable column must plan");
+
+    let projection_error = delta_pushdown(
+        &refused_column_table_request(serde_json::json!([column_item("BINARY_COL")])),
+        &catalog.uri,
+        storage.clone(),
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("a projection naming the refused column must be refused");
+    assert_refuses_binary_col(projection_error);
+
+    let where_error = delta_pushdown(
+        &refused_column_table_request_with_filter(
+            serde_json::json!([column_item("INT_COL")]),
+            serde_json::json!({
+                "type": "predicate_equal",
+                "left": column_item("BINARY_COL"),
+                "right": {"type": "literal_string", "value": "x"},
+            }),
+        ),
+        &catalog.uri,
+        storage.clone(),
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err(
+        "a WHERE filter referencing the refused column must be refused even though \
+         the select list names only the mappable column",
+    );
+    assert_refuses_binary_col(where_error);
+
+    let select_star_error = delta_pushdown(
+        &refused_column_table_select_star_request(),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err(
+        "SELECT * widens to the full base row, so a refused column anywhere in the \
+         table must refuse it too",
+    );
+    assert_refuses_binary_col(select_star_error);
+}
+
+fn assert_refuses_binary_col(error: UdfError) {
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(
+        message.contains("binary_col") && message.contains("#350"),
+        "the refusal must be the gate's own message, naming the column and its reason: \
+         {message}"
+    );
+}
+
+/// The `ORDERS` fixture's Delta log, with the `protocol` action replaced so its
+/// reader features fall outside the plan-time gate's allow-list.
+async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
+    delta_object_endpoint(vec![(
+        delta_commit_zero_key("orders"),
+        fileless_delta_commit_with_protocol(
+            "orders",
+            &[("int_col", "integer")],
+            serde_json::json!({
+                "minReaderVersion": 3,
+                "minWriterVersion": 7,
+                "readerFeatures": ["typeWidening-preview"],
+                "writerFeatures": ["typeWidening-preview"],
+            }),
+        ),
+    )])
+    .await
+}
+
+/// Scenario: The Delta reader is reached from production pushdown under the Unity
+/// Catalog kind
+///
+/// `handle_pushdown`'s per-COLUMN gate is proven above; this drives the reader
+/// PROTOCOL gate through the same production entrypoint, so a regression that stops
+/// `handle_pushdown` from surfacing a protocol refusal is caught here rather than
+/// only by `DeltaSnapshot::open` unit tests or a live Exasol E2E run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_column() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_protocol_table_storage().await;
+
+    let error = delta_pushdown(
+        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("a reader feature outside the allow-list must refuse before any column gate");
+
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(
+        message.contains("typeWidening-preview") && message.contains("#349"),
+        "the refusal must be the protocol gate's own message, naming the feature and citing \
+         #349: {message}"
+    );
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// `COUNT(*)` reads no column value at all — `parse_agg_item` gives
+/// `AggKind::Count` both `column: None` and `arg_expr: None` — so it must be
+/// admitted over a table carrying a refused column exactly like the mappable
+/// projection is. `project_columns` widens ANY select list holding an
+/// aggregate to the synthetic full base row (needed so `RequestShape::RowScan`
+/// can route a non-decomposable aggregate to Exasol's own post-processing),
+/// but that synthetic projection is never what the gate should read as "the
+/// columns this request touches" — the blind JSON walk over the whole request
+/// already finds every column a `function_aggregate`'s own arguments name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_column_table_storage().await;
+
+    delta_pushdown(
+        &refused_column_table_request(serde_json::json!([
+            {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false}
+        ])),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect(
+        "COUNT(*) reads no column value, so it must not be refused by a column \
+         this table cannot render",
+    );
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The complement of the `COUNT(*)` admit above, driven through production
+/// pushdown. An aggregate select list widens the projection exactly the same way,
+/// so only the blind walk over the request's own JSON can tell `MAX(BINARY_COL)`
+/// — which reads the refused column — apart from `COUNT(*)`, which reads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aggregate_over_a_refused_column_is_refused() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_column_table_storage().await;
+
+    let error = delta_pushdown(
+        &refused_column_table_request(serde_json::json!([{
+            "type": "function_aggregate",
+            "name": "MAX",
+            "arguments": [column_item("BINARY_COL")],
+            "distinct": false,
+        }])),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("an aggregate reading the refused column must be refused");
+
+    assert_refuses_binary_col(error);
+}
+
+/// Scenario: A refused column refuses only the requests that read or emit it
+///
+/// The other half of the same complement: `COUNT(*)` reads no column value, but a
+/// WHERE clause on the refused column does — and the widened projection is withheld
+/// from the gate for both, so the filter is reached by the walk alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_count_star_filtered_on_a_refused_column_is_refused() {
+    let catalog = unity_delta_catalog().await;
+    let storage = refused_column_table_storage().await;
+
+    let error = delta_pushdown(
+        &refused_column_table_request_with_filter(
+            serde_json::json!([
+                {"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false},
+            ]),
+            serde_json::json!({
+                "type": "predicate_is_not_null",
+                "expression": column_item("BINARY_COL"),
+            }),
+        ),
+        &catalog.uri,
+        storage,
+        "cat.sch.orders",
+    )
+    .await
+    .expect_err("a COUNT(*) filtered on the refused column reads it, so it must be refused");
+
+    assert_refuses_binary_col(error);
+}
+
 /// Scenario: Resolved partition columns reach the scan spec for every side.
 ///
 /// The fact/single-table side gets its partition columns from the resolved
@@ -2336,6 +2653,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         effective_storage: sample_storage(),
         partition_columns: Vec::new(),
         total_bytes: 100,
+        refused_columns: Vec::new(),
     };
     let dimension = ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -2347,6 +2665,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         effective_storage: sample_storage(),
         partition_columns: vec!["REGION".to_string()],
         total_bytes: 10,
+        refused_columns: Vec::new(),
     };
     let sides = JoinSides {
         fact,

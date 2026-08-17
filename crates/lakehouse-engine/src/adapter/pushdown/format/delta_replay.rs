@@ -47,6 +47,7 @@ use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use exasol_udf_sdk::error::UdfError;
 use object_store::ObjectStore;
 
+use super::delta_protocol::ensure_readable;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage, FileEntry};
 
 #[cfg(test)]
@@ -67,7 +68,13 @@ pub(super) struct DeltaSnapshot {
 }
 
 impl DeltaSnapshot {
-    /// Resolves `table_root`'s CURRENT version through `store`, reading no data file.
+    /// Resolves `table_root`'s CURRENT version through `store`, reading no data file,
+    /// and refuses a table whose reader protocol this engine does not implement.
+    ///
+    /// The gate runs HERE, on the resolved version and before anything else reads the
+    /// snapshot, so a `DeltaSnapshot`'s existence proves its protocol was checked: a
+    /// refused table yields no value from which a schema, a partition-column list, a
+    /// column-mapping mode, or an active file list could be read.
     pub(super) fn open(store: Arc<dyn ObjectStore>, table_root: &str) -> Result<Self, UdfError> {
         let engine = DefaultEngine::builder(store).build();
         let snapshot = Snapshot::builder_for(table_root)
@@ -78,6 +85,14 @@ impl DeltaSnapshot {
                      '{table_root}': {cause}"
                 ))
             })?;
+        let protocol = snapshot.table_configuration().protocol();
+        ensure_readable(protocol.min_reader_version(), protocol.reader_features()).map_err(
+            |refusal| {
+                UdfError::User(format!(
+                    "cannot read Delta table root '{table_root}': {refusal}"
+                ))
+            },
+        )?;
         Ok(Self { engine, snapshot })
     }
 

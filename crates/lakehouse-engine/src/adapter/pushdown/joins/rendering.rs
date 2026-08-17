@@ -366,6 +366,37 @@ fn collect_side_column_names(
     });
 }
 
+/// Every UPPERCASE column name in `expr` that MAY belong to `table_name`: the ones
+/// `tableName` attributes to it, plus every `column` node carrying no `tableName`.
+///
+/// An untagged reference is charged to EVERY side because nothing in the request
+/// says which side it names — the fail-safe direction for a caller deciding whether
+/// a side must answer for a column its reader could not render.
+pub(super) fn possible_side_column_names(
+    expr: &Json,
+    table_name: &str,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    collect_side_column_names(expr, table_name, &mut names);
+    walk_column_nodes(expr, &mut |map| {
+        if map.get("tableName").and_then(|t| t.as_str()).is_none()
+            && let Some(name) = map.get("name").and_then(|n| n.as_str())
+        {
+            names.insert(name.to_ascii_uppercase());
+        }
+    });
+    names
+}
+
+/// Whether `pushdown_req` carries no explicit select list — absent, null, or empty.
+///
+/// The projection then holds columns the request itself names nowhere: the full
+/// base row (`SELECT *`) or the column universe's first column. A per-side consumer
+/// must charge those to the sides itself, because no `column` node attributes them.
+pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
+    !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty())
+}
+
 /// Visit every clause of `pushdown_req` whose rendered SQL can name a source column:
 /// `selectList`, a non-null `filter`, `groupBy`, `orderBy`, then a non-null `having`.
 ///
@@ -445,7 +476,7 @@ pub(super) fn referenced_side_columns(
     full_cols: &[(String, String)],
 ) -> Vec<(String, String)> {
     // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
-    if !matches!(pushdown_req.get("selectList"), Some(Json::Array(list)) if !list.is_empty()) {
+    if has_no_explicit_select_list(pushdown_req) {
         return full_cols.to_vec();
     }
     let mut names = std::collections::HashSet::new();

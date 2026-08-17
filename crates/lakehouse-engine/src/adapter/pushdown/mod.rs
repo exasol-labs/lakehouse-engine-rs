@@ -40,10 +40,15 @@ mod shard_paths;
 use shard_paths::relativize_shards_to_root;
 
 mod format;
-pub use format::{ConnectionStorage, FormatReader, ResolvedScan, ScanSource, format_reader};
+pub use format::{
+    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan, ScanSource, format_reader,
+};
 
 mod scan_resolution;
 use scan_resolution::TableScanResolver;
+
+mod refused_columns;
+use refused_columns::ensure_no_refused_column_referenced;
 
 mod topn;
 use topn::{detect_topn, parse_order_by_keys};
@@ -236,8 +241,18 @@ pub async fn handle_pushdown(
         table_root,
         name_mapping,
         partition_columns,
+        refused_columns,
     } = resolver.resolve(&catalog.table, filter_json_raw).await?;
     let storage = &effective_storage;
+
+    // BEFORE the zero-active-files early return: a table with no active file must
+    // still refuse a request naming a column it cannot render, never answer that
+    // request with an empty result.
+    ensure_no_refused_column_referenced(
+        request,
+        (!projection_widened).then_some(proj_cols.as_slice()),
+        &refused_columns,
+    )?;
 
     if files.is_empty() {
         return empty_result_sql(

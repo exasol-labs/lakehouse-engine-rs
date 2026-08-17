@@ -15,6 +15,7 @@ use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
 mod delta_format_reader;
+mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
 mod iceberg;
@@ -27,6 +28,18 @@ pub(crate) use iceberg::build_logical_schema;
 #[cfg(test)]
 #[path = "format_tests.rs"]
 mod tests;
+
+/// One column a table format's reader declined to map to an Arrow tag, named
+/// with the reason it gave. Iceberg never produces one; a Delta reader does for
+/// a `binary`, `struct`, `map`, or `variant` column (or an array nesting one).
+///
+/// Never a `ScanSpec` field: the scan itself never reads this list, only the
+/// pushdown-resolution gate that runs before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedColumn {
+    pub column_name: String,
+    pub reason: String,
+}
 
 /// One table's resolved scan, in the shape every table format answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +59,9 @@ pub struct ResolvedScan {
     /// which is what keeps an Iceberg spec's encoding byte-identical to its
     /// pre-Delta form.
     pub partition_columns: Vec<String>,
+    /// Columns this reader declined to map, absent from `logical_schema`. Always
+    /// empty on Iceberg.
+    pub refused_columns: Vec<RefusedColumn>,
 }
 
 /// Resolving ONE table into the scan the pushdown layer plans against, for one

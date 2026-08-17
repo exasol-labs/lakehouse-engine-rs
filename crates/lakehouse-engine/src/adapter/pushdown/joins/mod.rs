@@ -6,6 +6,7 @@ use serde_json::Value as Json;
 
 use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
+use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
@@ -31,7 +32,7 @@ pub(super) use planning::JoinWindowPlan;
 use planning::{
     classify_join_window, involved_table_columns, resolve_one_join_side, select_broadcast_sides,
 };
-use rendering::side_local_filter;
+use rendering::{has_no_explicit_select_list, possible_side_column_names, side_local_filter};
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
 // (a sibling of `joins` under `pushdown`, gated `#[cfg(test)]`) can drive both
 // join SQL builders directly to pin cross-site golden-SQL fixtures — the same
@@ -77,6 +78,42 @@ pub(super) fn ineligible_join_decline(reason: IneligibleJoinReason) -> UdfError 
         "join pushdown declined: {detail}; the adapter cannot render this join shape, \
          so this is a hard error, not a native re-plan"
     ))
+}
+
+/// Refuses the join when a side's format reader declined a column this request
+/// reads or emits FROM THAT SIDE.
+///
+/// Attribution is per side, never request-global: a refusal belongs to the table
+/// that raised it, so a name refused on one side must not refuse a query that reads
+/// only the other side's same-named mappable column. A `column` node carrying no
+/// `tableName` is charged to every side. A request with no explicit select list
+/// emits each side's declared row without naming a single column, so every side is
+/// then charged everything the request declares for it; any other select list names
+/// its emitted columns itself and the walk has already attributed them.
+///
+/// Lives beside its one call site rather than in `planning`, which must not reach
+/// into `rendering` — the module that owns column-to-side attribution.
+fn ensure_no_side_refuses_a_referenced_column(
+    request: &Json,
+    pushdown_req: &Json,
+    sides: &[ResolvedJoinSide],
+) -> Result<(), UdfError> {
+    if sides.iter().all(|side| side.refused_columns.is_empty()) {
+        return Ok(());
+    }
+    let emits_unnamed_row = has_no_explicit_select_list(pushdown_req);
+    for side in sides {
+        let mut touched = possible_side_column_names(request, &side.table_name);
+        if emits_unnamed_row {
+            touched.extend(
+                involved_table_columns(request, &side.table_name)
+                    .into_iter()
+                    .map(|(name, _)| name),
+            );
+        }
+        ensure_no_touched_column_is_refused(&touched, &side.refused_columns)?;
+    }
+    Ok(())
 }
 
 /// Plan an inner join (N ≥ 2 involved tables) through the SINGLE unified join path.
@@ -165,6 +202,8 @@ pub(super) async fn plan_join(
         .await?;
         sides.push(side);
     }
+
+    ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
 
     // An inner join with any empty side is empty regardless of the plan. Emit the
     // shape-correct empty result over the combined N-table column universe (stable

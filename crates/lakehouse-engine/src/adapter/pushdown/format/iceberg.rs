@@ -166,6 +166,7 @@ impl FormatReader for IcebergFormatReader<'_> {
                 table_root,
                 name_mapping,
                 partition_columns: Vec::new(),
+                refused_columns: Vec::new(),
             })
         })
     }

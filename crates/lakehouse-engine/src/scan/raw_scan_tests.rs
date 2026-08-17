@@ -467,3 +467,146 @@ async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
         "column 0 must remain the bare ID column, unaffected by the alias"
     );
 }
+
+/// Scenario (delta-type-mapping): a Delta type Exasol cannot represent natively is
+/// surfaced as a VARCHAR rendering.
+///
+/// The classifier tags a mappable `array<E>` column `utf8`, so the LOGICAL schema
+/// declares `Utf8` while the physical Parquet column is a real `List(Int32)`.
+/// `build_scan_sql` emits NO `CAST(... AS VARCHAR)` for a logically-`Utf8` column,
+/// so the physical-to-logical cast can only come from the scan's OWN
+/// [`FieldIdExprAdapter`] — not from DataFusion's default schema adapter, which
+/// this provider never installs. That link is what this asserts.
+///
+/// The column binds by field-id across a physical-name divergence (Delta `id`
+/// column mapping), so the rename and the cast have to compose: the delegate
+/// inserts the cast against the logical name, and the outer rewrite must restore
+/// the physical name UNDER that cast for the opener's name-based lookups.
+///
+/// NULL and empty lists are covered because the three render differently and the
+/// distinction is observable in Exasol: a NULL array must stay NULL rather than
+/// collapse to `[]` or the empty string.
+#[tokio::test]
+async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() {
+    use crate::scan::spec::LogicalField;
+    use arrow::array::{Array, Int64Array, ListArray, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::context::SessionContext;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use std::collections::HashMap;
+
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+
+    // Physical file: an obfuscated Delta `id`-mapping physical name over a real
+    // List(Int32) column, with one populated, one NULL, and one empty list.
+    let dir = std::env::temp_dir().join("lh_list_utf8_cast");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("list.parquet");
+
+    let lists = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2), Some(3)]),
+        None,
+        Some(vec![]),
+    ]);
+    let physical_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("col-8f0a", lists.data_type().clone(), true).with_metadata(field_id_meta(2)),
+    ]));
+    {
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
+        let batch = RecordBatch::try_new(
+            physical_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(lists),
+            ],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    let file_url = url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string();
+
+    // Logical schema: field-id 2 is the current name `arr_col`, tagged `utf8` —
+    // exactly what the Delta classifier emits for `array<integer>`.
+    let mut spec = minimal_spec();
+    let file_size = local_file_size(&file_url);
+    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.common.logical_schema = vec![
+        LogicalField {
+            field_id: Some(1),
+            name: "id".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+            physical_name: None,
+        },
+        LogicalField {
+            field_id: Some(2),
+            name: "arr_col".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            physical_name: None,
+        },
+    ];
+    spec.common.projection = vec!["ID".into(), "ARR_COL".into()];
+
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    register_files(&ctx, "scan_target", &spec)
+        .await
+        .expect("register_files must succeed for a utf8-tagged list column");
+    let sql = build_scan_sql(&ctx, "scan_target", &spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        !sql.contains("CAST("),
+        "build_scan_sql must add no SQL cast for a logically-Utf8 column, leaving \
+         the physical-to-logical cast entirely to the expression adapter: {sql}"
+    );
+
+    let df = ctx.sql(&sql).await.expect("plan scan SQL");
+    let batches = df
+        .collect()
+        .await
+        .expect("the expression adapter must cast the physical list to the logical Utf8");
+
+    let mut rows: Vec<(i64, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column is Int64");
+        let rendered = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("the list column must arrive as Utf8, not as its physical list type");
+        for row in 0..batch.num_rows() {
+            let value = (!rendered.is_null(row)).then(|| rendered.value(row).to_string());
+            rows.push((ids.value(row), value));
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, Some("[1, 2, 3]".to_string())),
+            (2, None),
+            (3, Some("[]".to_string())),
+        ],
+        "a populated array must render bracketed, an empty array as `[]`, and a \
+         NULL array must stay NULL"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
