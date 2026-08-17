@@ -1,12 +1,11 @@
 //! Delta reader-protocol gate: refuses a table whose reader protocol version or
 //! reader-feature set this engine does not implement, before any log replay.
 
-use delta_kernel::table_features::{MAX_VALID_READER_VERSION, MIN_VALID_RW_VERSION, TableFeature};
+use delta_kernel::table_features::{
+    MAX_VALID_READER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TableFeature,
+};
 use exasol_udf_sdk::error::UdfError;
 
-/// Refuses a Delta table whose reader protocol this engine does not implement,
-/// so no log replay, checkpoint read, or object-store listing happens beyond
-/// opening the snapshot itself.
 pub(crate) fn ensure_readable(
     min_reader_version: i32,
     reader_features: Option<&[TableFeature]>,
@@ -16,8 +15,17 @@ pub(crate) fn ensure_readable(
             "Delta table declares min_reader_version {min_reader_version}, outside the range this engine reads ({MIN_VALID_RW_VERSION}..={MAX_VALID_READER_VERSION})"
         )));
     }
-    let Some(features) = reader_features else {
-        return Ok(());
+    let features = match reader_features {
+        Some(features) => features,
+        // The protocol makes the array mandatory at reader version 3, so an absent list there is a
+        // malformed protocol action; default-deny refuses it instead of reading it as feature-free.
+        None if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION => {
+            return Err(UdfError::User(format!(
+                "Delta table declares min_reader_version {TABLE_FEATURES_MIN_READER_VERSION} but carries no readerFeatures list, which the Delta protocol requires at that version"
+            )));
+        }
+        // A legacy protocol (reader version 1 or 2) carries no list at all.
+        None => return Ok(()),
     };
     let mut refused: Vec<String> = features
         .iter()

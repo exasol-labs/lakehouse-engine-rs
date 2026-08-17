@@ -74,7 +74,16 @@ normative obligations this feature enforces:
   `table_features::MIN_VALID_RW_VERSION` (`1`) and `table_features::MAX_VALID_READER_VERSION` (`3`),
   rather than from literals, so a kernel upgrade that widens the readable range is a one-line change
   at one site instead of a silent divergence. Both constants are plain `pub` and need no cargo
-  feature.
+  feature. `table_features::TABLE_FEATURES_MIN_READER_VERSION` (`3`) — the version at which the
+  protocol makes `readerFeatures` mandatory — is likewise plain `pub`, so the gate names that version
+  by the kernel's own constant rather than by the literal `3` or by reusing
+  `MAX_VALID_READER_VERSION`, which happens to hold the same value today for an unrelated reason.
+* **The malformed version-3-without-a-feature-list refusal is defense in depth, not a reachable path
+  today.** `delta_kernel` 0.26 constructs every `Protocol` through `Protocol::try_new`, which already
+  rejects reader version 3 with no `readerFeatures` (and reader version ≠ 3 WITH one) while parsing
+  the log, so a table of that shape fails before this gate sees it. The gate still checks it, because
+  the gate's contract is default-deny on its own inputs and the kernel's validation is not this
+  engine's to rely on — the same reason `ensure_operation_supported` is not a substitute above.
 * **The reader-feature and reader-version accessors need the `internal-api` cargo feature**, already
   enabled on `delta_kernel` for `TableConfiguration::partition_columns` and `::column_mapping_mode`.
   `Snapshot::table_configuration`, `TableConfiguration::protocol`, `Protocol::reader_features`,
@@ -163,6 +172,14 @@ normative obligations this feature enforces:
 * *AND* the reader MUST NOT treat an absent `readerFeatures` list as an empty list of a
   version-3 table, and MUST NOT refuse the table for carrying no list, because the protocol makes the
   array exist *"only when `minReaderVersion` is set to `3`"*
+* *AND* conversely, a table declaring `minReaderVersion` equal to
+  `delta_kernel::table_features::TABLE_FEATURES_MIN_READER_VERSION` (`3`) while carrying NO
+  `readerFeatures` array SHALL be refused with a `UdfError` naming the missing list, because the
+  protocol makes the array mandatory at that version — a default-deny gate fails loud on a malformed
+  `protocol` action rather than reading it as feature-free and admitting every unimplemented reader
+  feature the table may actually use
+* *AND* a version-3 table carrying an EMPTY `readerFeatures` array SHALL pass the gate, because an
+  empty list is a well-formed declaration of no reader features rather than a missing one
 * *AND* the `cm_id_mode` and `cm_name_mode` fixtures — Reader Version 2 with
   `delta.columnMapping.mode` set — SHALL keep resolving their column-mapping binding keys exactly as
   `vs-adapter/delta-table-planning` records, so the gate regresses neither column-mapping mode

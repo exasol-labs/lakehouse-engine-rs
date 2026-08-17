@@ -114,12 +114,30 @@ fn a_legacy_protocol_table_with_no_reader_feature_list_passes_the_gate() {
     ensure_readable(2, None).expect("min_reader_version 2 with no reader features is readable");
 }
 
+/// Scenario: A legacy-protocol table carries no explicit reader-feature list
+#[test]
+fn a_version_3_table_with_no_reader_feature_list_is_refused_as_malformed() {
+    let err = ensure_readable(3, None)
+        .expect_err("the protocol requires a readerFeatures list at reader version 3");
+
+    let message = user_message(err);
+    assert!(
+        message.contains("readerFeatures"),
+        "refusal must name the missing list, got: {message}"
+    );
+    assert!(
+        message.contains('3'),
+        "refusal must name the declared min_reader_version, got: {message}"
+    );
+}
+
 /// Scenario: A reader protocol version outside the readable range is refused
 #[test]
 fn the_readable_version_range_is_inclusive_at_both_ends() {
     ensure_readable(0, None).expect_err("reader version 0 is below the readable range");
     ensure_readable(1, None).expect("reader version 1 is the readable range's lower bound");
-    ensure_readable(3, None).expect("reader version 3 is the readable range's upper bound");
+    // Reader version 3 must carry the array; an empty one is the feature-free version-3 shape.
+    ensure_readable(3, Some(&[])).expect("reader version 3 is the readable range's upper bound");
 }
 
 /// Scenario: Every allow-listed reader feature together still passes the gate
