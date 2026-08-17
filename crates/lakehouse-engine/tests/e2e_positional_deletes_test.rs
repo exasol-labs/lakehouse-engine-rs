@@ -133,19 +133,18 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
 /// whose `file_path` is data file 1, delete file 2 contains ONLY entries
 /// whose `file_path` is data file 2. No cross-references.
 ///
-/// UPSTREAM TRACKING (apache/iceberg-rust#2532, pre-work for #340): what this
-/// test can actually OBSERVE through the Iceberg reader is weaker than what
-/// Spark committed. `iceberg-rust` 0.10.0's `DeleteFileIndex` has not
-/// yet closed the TODO in `delete_file_index.rs` that gates position deletes
-/// by their `referenced_data_file` field — it still applies every
-/// partition-scoped position-delete file to every data file in the same
-/// partition (correct for `write.delete.granularity=partition`, but for
-/// `granularity=file` on this UNPARTITIONED table it means each of the two
-/// data files resolves BOTH delete files, not just its own). PR #2532 closes
-/// that TODO but is not yet merged/released. DROP CONDITION: once a release
-/// containing #2532 is picked up, tighten this assertion back to "exactly 1
-/// delete file per data file, referencing only that file" (the ORIGINAL,
-/// intended assertion — see git history) and cross-check against
+/// UPSTREAM TRACKING (#345): what this test can actually OBSERVE through the
+/// Iceberg reader is weaker than what Spark committed. `iceberg-rust`
+/// 0.10.0's `DeleteFileIndex` has not yet closed the TODO in
+/// `delete_file_index.rs` that gates position deletes by their
+/// `referenced_data_file` field — it still applies every partition-scoped
+/// position-delete file to every data file in the same partition (correct
+/// for `write.delete.granularity=partition`, but for `granularity=file` on
+/// this UNPARTITIONED table it means each of the two data files resolves
+/// BOTH delete files, not just its own). DROP CONDITION: see #345 for the
+/// upstream PRs to track; once released, tighten this assertion back to
+/// "exactly 1 delete file per data file, referencing only that file" (the
+/// ORIGINAL, intended assertion — see git history) and cross-check against
 /// `position_deletes` as done here to confirm the read side, not just the
 /// write side, is now correct.
 #[test]
@@ -179,7 +178,7 @@ fn fixture_spark_file_granularity_delete_table() {
         assert_eq!(
             entry.deletes.len(),
             2,
-            "file granularity (pending apache/iceberg-rust#2532): data file {} \
+            "file granularity (pending #345): data file {} \
              must resolve both partition-scoped delete files, got {}",
             entry.path,
             entry.deletes.len()
@@ -674,11 +673,11 @@ fn e2e_deletes_with_single_and_grouped_agg() {
 /// DeletionVector arm exercised here, and is covered directly by that
 /// function's unit tests.
 ///
-/// UPSTREAM TRACKING (apache/iceberg-rust#2681, #2580, #2411): once
-/// iceberg-rust gains v3 deletion-vector READ support, `mor_dv_unsupported`
-/// becomes readable rather than rejected, and this test will need a
-/// genuinely unsupported fixture in its place (or retirement) plus a new
-/// positive-path DV read test.
+/// UPSTREAM TRACKING (#12): once iceberg-rust gains v3 deletion-vector READ
+/// support, `mor_dv_unsupported` becomes readable rather than rejected, and
+/// this test will need a genuinely unsupported fixture in its place (or
+/// retirement) plus a new positive-path DV read test. See #12 for the
+/// upstream PRs to track.
 #[test]
 fn e2e_unsupported_delete_fails_loud() {
     setup_e2e();

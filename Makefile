@@ -123,7 +123,8 @@ test-e2e-azure: cross-musl-udf-build
 #
 # BucketFS write password is extracted at runtime from EXAConf.
 # Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
-SLC_VERSION ?= 0.21.0
+# Derived from the workspace `exasol-udf-sdk` pin; override on the command line.
+SLC_VERSION ?= $(shell sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 

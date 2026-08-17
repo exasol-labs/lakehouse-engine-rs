@@ -68,7 +68,10 @@ iceberg-storage-opendal = { version = "0.10.0", default-features = false, featur
 # points; full feature set available behind the exasol-e2e feature.
 tokio = { version = "1", features = ["rt", "macros"] }
 
-exasol-udf-sdk = { version = "0.21.0", features = ["emit-arrow"] }
+# Also the SLC version (fingerprint must match). `make install-slc` and
+# deploy/scripts/install.sh both scrape this line, so keep `version` inline.
+exasol-udf-sdk    = { version = "0.22.1", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.22.1" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
