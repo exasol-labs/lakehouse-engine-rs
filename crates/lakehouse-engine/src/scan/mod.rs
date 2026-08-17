@@ -32,6 +32,10 @@ pub(crate) use spec::reconstruct_abs_uri;
 
 mod store_router;
 
+mod deletion_vectors;
+
+mod partition_values;
+
 mod raw_scan;
 pub use raw_scan::{
     build_raw_scan_physical_plan, int96_coerced_parquet_format, register_files,

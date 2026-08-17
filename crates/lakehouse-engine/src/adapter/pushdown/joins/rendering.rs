@@ -215,7 +215,7 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 ///
 /// THREE consumers receive DIFFERENT trees built from this function's output,
 /// deliberately:
-/// (a) that side's `resolve_file_list` for Iceberg manifest pruning is given the
+/// (a) that side's resolver call for format-level manifest pruning is given the
 /// RAW filter, unscreened, so every side-local conjunct prunes manifests even when
 /// the DataFusion dialect cannot render it — screening here would silently open
 /// more files while still returning correct rows;

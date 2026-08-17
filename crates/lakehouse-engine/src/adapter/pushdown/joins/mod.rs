@@ -1,11 +1,13 @@
+use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, StorageBackend};
+use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::file_resolution::empty_result_sql;
+use super::ConnectionStorage;
+use super::empty_result::empty_result_sql;
+use super::scan_resolution::TableScanResolver;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
-use lakehouse_catalog::CatalogSession;
 
 mod planning;
 mod rendering;
@@ -27,8 +29,7 @@ pub(super) use sql_builders::{
 
 pub(super) use planning::JoinWindowPlan;
 use planning::{
-    JoinSideResolution, classify_join_window, involved_table_columns, resolve_one_join_side,
-    select_broadcast_sides,
+    classify_join_window, involved_table_columns, resolve_one_join_side, select_broadcast_sides,
 };
 use rendering::side_local_filter;
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
@@ -115,9 +116,9 @@ pub(super) async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    session: &CatalogSession,
+    catalog_uri: &str,
+    catalog_kind: CatalogKind,
     storage: &StorageBackend,
-    catalog: &CatalogProps,
     creds: &ConnectionCreds,
     allow_http: bool,
     scan_schema: Option<&str>,
@@ -132,23 +133,33 @@ pub(super) async fn plan_join(
     join_broadcast_max_bytes: u64,
 ) -> Result<Json, UdfError> {
     // Resolve each side ONCE (one catalog resolution per involved table, never per
-    // shard), each pruned by its own side-local WHERE conjuncts for Iceberg manifest
-    // pruning — attributed by `tableName`, so a shared-column-name case stays correct.
+    // shard), through the SAME per-request resolver, each pruned by its own
+    // side-local WHERE conjuncts for format-level manifest pruning — attributed by
+    // `tableName`, so a shared-column-name case stays correct.
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
-    let inputs = JoinSideResolution {
-        session,
+    let connection = ConnectionStorage {
         storage,
-        catalog,
         creds,
         allow_http,
     };
+    // Every leg's identifier is validated inside the resolver's own catalog-kind
+    // match, ahead of any catalog HTTP, so a malformed leg costs no catalog
+    // round-trip. Building the resolver here (once) and threading `&resolver` into
+    // every leg is what makes a per-leg rebuild structurally inexpressible.
+    let identifiers: Vec<&str> = join
+        .tables
+        .iter()
+        .map(|leaf| leaf.table_identifier.as_str())
+        .collect();
+    let resolver =
+        TableScanResolver::for_request(catalog_kind, catalog_uri, connection, &identifiers).await?;
     let mut sides = Vec::with_capacity(join.tables.len());
     for leaf in &join.tables {
         let side_filter = filter.and_then(|f| side_local_filter(f, &leaf.table_name));
         let side = resolve_one_join_side(
             &leaf.table_name,
-            &leaf.iceberg_ident,
-            &inputs,
+            &leaf.table_identifier,
+            &resolver,
             side_filter.as_ref(),
         )
         .await?;

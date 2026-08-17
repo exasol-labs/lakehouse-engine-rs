@@ -1344,6 +1344,7 @@ fn join_block_round_trips_through_split_and_merge() {
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
+        partition_columns: Vec::new(),
         storage: dim_storage.clone(),
     });
 
@@ -1425,6 +1426,7 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
+        partition_columns: Vec::new(),
         storage,
     });
 
@@ -1444,6 +1446,44 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
         Some(7),
         "a set cap must survive the common/per-shard split"
     );
+}
+
+/// `partition_columns` on `JoinSpec` mirrors `CommonScanSpec::partition_columns`
+/// (the same neutral concept, needed by the broadcast/dimension side): it
+/// defaults to empty and is skipped from JSON when empty, so an Iceberg join
+/// spec — which never populates it — serializes byte-identically to before the
+/// field existed.
+#[test]
+fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identical() {
+    let storage = StorageBackend::S3(StorageProps {
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "dimkey".into(),
+        secret_key: "dimsecret".into(),
+        allow_http: true,
+        ..Default::default()
+    });
+    let join = JoinSpec {
+        table_root: "s3://warehouse/db/dim".into(),
+        files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        post_join_limit: None,
+        partition_columns: Vec::new(),
+        storage,
+    };
+
+    let json = serde_json::to_string(&join).unwrap();
+    assert_eq!(
+        json,
+        r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"dimkey","secret_key":"dimsecret","allow_http":true,"path_style":true}}}"#,
+        "an Iceberg join spec must serialize byte-identically with partition_columns defaulted and skipped"
+    );
+
+    let back: JoinSpec = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, join);
 }
 
 /// The two-argument UDF wire (shard-invariant common blob + per-shard files

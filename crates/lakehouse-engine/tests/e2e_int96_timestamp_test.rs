@@ -8,7 +8,7 @@
 //! 1. `e2e_int96_fixture_present_and_int96_encoded` (this file, task 2.3) — the
 //!    fixture-shape guard. It resolves the committed
 //!    `e2e_lakehouse.int96_ts_far_future` table's data file via
-//!    `resolve_file_list` (exactly as `e2e_positional_deletes_test.rs`'s
+//!    the Iceberg reader (exactly as `e2e_positional_deletes_test.rs`'s
 //!    `fixture_spark_file_granularity_delete_table` does), opens that Parquet
 //!    file directly from MinIO (NOT through the scan UDF), and asserts the
 //!    timestamp column's PHYSICAL type is `INT96`.
@@ -122,7 +122,7 @@ fn vs_table(vs_name: &str, table: &str) -> String {
 /// `register_side_store` in `scan/object_store.rs`), so the fixture-shape
 /// guard inspects the exact bytes the scan path would decode.
 ///
-/// `resolve_file_list` yields an absolute `s3://<bucket>/<key>` (or `s3a://…`)
+/// The Iceberg reader yields an absolute `s3://<bucket>/<key>` (or `s3a://…`)
 /// URI; this splits off the bucket and reads the object by its key.
 async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
     let without_scheme = uri

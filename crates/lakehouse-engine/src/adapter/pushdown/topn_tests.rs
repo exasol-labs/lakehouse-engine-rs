@@ -13,7 +13,7 @@ use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
 // -----------------------------------------------------------------------
 
 /// Reproduce `handle_pushdown`'s SYNCHRONOUS row-scan decision path (everything
-/// after `resolve_file_list`) so tests exercise the real `detect_topn`,
+/// after resolution) so tests exercise the real `detect_topn`,
 /// `effective_limit` withholding glue, and `build_scan_driving_sql` — the exact
 /// composition production runs, minus the network file resolution.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {

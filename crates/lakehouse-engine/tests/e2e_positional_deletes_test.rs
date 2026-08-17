@@ -121,7 +121,7 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
 
 // ---------------------------------------------------------------------------
 // Fixture-shape tests (packaging/positional-delete-fixtures) — inspect the
-// Spark-committed Iceberg manifests directly via resolve_file_list, bypassing
+// Spark-committed Iceberg manifests directly via the Iceberg reader, bypassing
 // Exasol, to verify the fixtures actually have the delete-file shape the
 // e2e_* correctness tests below assume.
 // ---------------------------------------------------------------------------
@@ -133,10 +133,11 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
 /// whose `file_path` is data file 1, delete file 2 contains ONLY entries
 /// whose `file_path` is data file 2. No cross-references.
 ///
-/// UPSTREAM TRACKING (#345): what this test can actually OBSERVE through
-/// `resolve_file_list` is weaker than what Spark committed. `iceberg-rust`
-/// 0.10.0's `DeleteFileIndex` does not yet gate position deletes by their
-/// `referenced_data_file` field — it applies every partition-scoped
+/// UPSTREAM TRACKING (#345): what this test can actually OBSERVE through the
+/// Iceberg reader is weaker than what Spark committed. `iceberg-rust`
+/// 0.10.0's `DeleteFileIndex` has not yet closed the TODO in
+/// `delete_file_index.rs` that gates position deletes by their
+/// `referenced_data_file` field — it still applies every partition-scoped
 /// position-delete file to every data file in the same partition (correct
 /// for `write.delete.granularity=partition`, but for `granularity=file` on
 /// this UNPARTITIONED table it means each of the two data files resolves

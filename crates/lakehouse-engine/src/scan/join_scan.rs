@@ -105,6 +105,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.common.table_root,
         &spec.common.logical_schema,
         &spec.common.name_mapping,
+        &spec.common.partition_columns,
         &spec.common.storage,
         Arc::clone(&delete_path_read_limiter),
     )
@@ -116,6 +117,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.table_root,
         &join.logical_schema,
         &join.name_mapping,
+        &join.partition_columns,
         &join.storage,
         delete_path_read_limiter,
     )

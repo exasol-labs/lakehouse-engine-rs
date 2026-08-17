@@ -1,12 +1,11 @@
-use crate::adapter::connection::ConnectionCreds;
-use crate::scan::spec::{CatalogProps, FileEntry, LogicalField, NameMappingEntry, StorageBackend};
+use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::file_resolution::resolve_file_list;
+use super::super::ResolvedScan;
+use super::super::scan_resolution::TableScanResolver;
 use super::super::support::{column_types, extract_limit, extract_offset};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
-use lakehouse_catalog::CatalogSession;
 
 /// Why a join `from` clause cannot be rendered by the join path at all.
 ///
@@ -27,20 +26,20 @@ pub(crate) enum IneligibleJoinReason {
 }
 
 /// One base-table leaf of a detected inner-join tree, with its original-cased
-/// Iceberg identifier already recovered from `TABLE_MAP`.
+/// catalog identifier already recovered from `TABLE_MAP`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinLeaf {
     /// The Exasol virtual table name (a `from`-tree leaf's `name`).
     pub table_name: String,
-    /// `table_name`'s original-cased Iceberg identifier, from `TABLE_MAP`.
-    pub iceberg_ident: String,
+    /// `table_name`'s original-cased catalog identifier, from `TABLE_MAP`.
+    pub table_identifier: String,
 }
 
 /// A detected all-inner join tree over N ≥ 2 involved tables — the single unified
 /// join shape (the two-involved-table case is simply N = 2).
 ///
 /// `tables` are the base-table leaves in stable left-to-right tree order; every
-/// leaf's Iceberg identifier is resolved from `TABLE_MAP` at detection time (a
+/// leaf's catalog identifier is resolved from `TABLE_MAP` at detection time (a
 /// missing leaf is a hard `Err`, not a value here). `conditions` are the N-1
 /// join-node `condition` expressions collected while walking the tree —
 /// AND-conjoined by the N-scan fallback, which is order-agnostic for an all-inner
@@ -64,7 +63,7 @@ pub(crate) enum JoinShape {
     /// join node in the tree, or a malformed shape). Routed to a hard error — the
     /// genuine last resort, never a native re-plan.
     Ineligible(IneligibleJoinReason),
-    /// An all-inner join tree spanning N ≥ 2 involved tables, every leaf's Iceberg
+    /// An all-inner join tree spanning N ≥ 2 involved tables, every leaf's catalog
     /// identifier resolved from `TABLE_MAP`. Served by the SINGLE unified join path
     /// ([`plan_join`]): broadcast when the two-table (N = 2) case is eligible,
     /// otherwise the N-scan unaccelerated fallback. The two-table case is simply
@@ -140,7 +139,7 @@ fn collect_join_tree(
 ///
 /// A non-inner join node or a malformed node is [`JoinShape::Ineligible`] (a hard
 /// error, the genuine last resort). Once the tree is a valid all-inner join, every
-/// involved table's original-cased Iceberg identifier MUST be recoverable from
+/// involved table's original-cased catalog identifier MUST be recoverable from
 /// `TABLE_MAP` — a virtual table absent from `TABLE_MAP` is the same "stale virtual
 /// schema" condition the single-table path reports, so it is a hard `Err`, not a
 /// decline.
@@ -162,7 +161,7 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
     let table_map = crate::adapter::read_table_map(request);
     let mut tables = Vec::with_capacity(table_names.len());
     for table_name in table_names {
-        let iceberg_ident = table_map.get(&table_name).cloned().ok_or_else(|| {
+        let table_identifier = table_map.get(&table_name).cloned().ok_or_else(|| {
             UdfError::User(format!(
                 "pushdown: virtual table '{table_name}' is not in TABLE_MAP; \
                  drop and recreate the virtual schema"
@@ -170,7 +169,7 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         })?;
         tables.push(JoinLeaf {
             table_name,
-            iceberg_ident,
+            table_identifier,
         });
     }
 
@@ -179,34 +178,37 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 
 /// One fully-resolved side of a two-table inner equi-join.
 ///
-/// Every field is resolved ONCE per query in the VS planning layer from Iceberg
-/// manifest metadata — the same `resolve_file_list` path the single-table scan
-/// uses — never per shard and never per node (mission.md "resolve metadata once
-/// per query"). `total_bytes` is the sum of every file's `file_size_in_bytes`
-/// (the Iceberg-manifest byte size, NO Parquet read), the quantity the broadcast
-/// threshold is evaluated against.
+/// Every field is resolved ONCE per query in the VS planning layer, through the
+/// same `TableScanResolver` seam the single-table scan uses — never per shard
+/// and never per node (mission.md "resolve metadata once per query"). `total_bytes`
+/// is the sum of every file's `file_size_in_bytes` (the catalog-manifest byte
+/// size, NO Parquet read), the quantity the broadcast threshold is evaluated
+/// against.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedJoinSide {
     /// The Exasol virtual table name (a detected join leaf).
     pub table_name: String,
-    /// The original-cased Iceberg identifier this side was resolved from.
-    pub iceberg_ident: String,
-    /// The Iceberg table root (`table.metadata().location()`); empty ⇒ every
-    /// `files` path is absolute.
+    /// The original-cased catalog identifier this side was resolved from.
+    pub table_identifier: String,
+    /// The table's storage root; empty ⇒ every `files` path is absolute.
     pub table_root: String,
     /// This side's FULL file list as [`FileEntry`] values (path,
     /// `file_size_in_bytes`, and any associated positional-delete files). Deletes
-    /// are resolved once here — the same `resolve_file_list` path the single-table
-    /// scan uses — and travel with the side so the scan applies them per side.
+    /// are resolved once here — the same resolver seam the single-table scan
+    /// uses — and travel with the side so the scan applies them per side.
     pub files: Vec<FileEntry>,
-    /// Full logical schema of this side's Iceberg table at query time.
+    /// Full logical schema of this side's table at query time.
     pub logical_schema: Vec<LogicalField>,
     /// This side's flattened Iceberg `schema.name-mapping.default` entries
-    /// (empty when the table has no name-mapping property). Resolved ONCE per
-    /// query on the same `resolve_file_list` path as `logical_schema`.
+    /// (empty when the table has no name-mapping property, and on every Delta
+    /// side). Resolved ONCE per query alongside `logical_schema`.
     pub name_mapping: Vec<NameMappingEntry>,
     /// Effective storage for this side (vended STS creds when applicable).
     pub effective_storage: StorageBackend,
+    /// This side's ordered partition-column names — the same neutral concept as
+    /// [`crate::scan::spec::CommonScanSpec::partition_columns`]. Empty on every
+    /// Iceberg side.
+    pub partition_columns: Vec<String>,
     /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
     pub total_bytes: u64,
 }
@@ -217,39 +219,32 @@ impl ResolvedJoinSide {
     /// which is correctly treated as "far over any broadcast threshold").
     pub(super) fn new(
         table_name: String,
-        iceberg_ident: String,
-        table_root: String,
-        files: Vec<FileEntry>,
-        logical_schema: Vec<LogicalField>,
-        name_mapping: Vec<NameMappingEntry>,
-        effective_storage: StorageBackend,
+        table_identifier: String,
+        resolved: ResolvedScan,
     ) -> Self {
+        let ResolvedScan {
+            files,
+            effective_storage,
+            logical_schema,
+            table_root,
+            name_mapping,
+            partition_columns,
+        } = resolved;
         let total_bytes = files
             .iter()
             .fold(0u64, |acc, entry| acc.saturating_add(entry.size));
         Self {
             table_name,
-            iceberg_ident,
+            table_identifier,
             table_root,
             files,
             logical_schema,
             name_mapping,
             effective_storage,
+            partition_columns,
             total_bytes,
         }
     }
-}
-
-/// The per-call-unchanging inputs to [`resolve_one_join_side`], grouped the way
-/// `JoinScanTuning` (`joins/sql_builders.rs`) groups this module's other forwarded
-/// scalars. Only `table_name`, `iceberg_ident`, and `filter_json` vary per side.
-#[derive(Clone, Copy)]
-pub(super) struct JoinSideResolution<'a> {
-    pub session: &'a CatalogSession,
-    pub storage: &'a StorageBackend,
-    pub catalog: &'a CatalogProps,
-    pub creds: &'a ConnectionCreds,
-    pub allow_http: bool,
 }
 
 /// The outcome of resolving BOTH sides of an eligible inner equi-join once and
@@ -320,56 +315,33 @@ pub(super) fn select_broadcast_sides(
     }
 }
 
-/// Resolve ONE join side's file list, logical schema, table root, and effective
-/// storage from the Iceberg catalog, reusing the single-table `resolve_file_list`
-/// path unchanged.
+/// Resolve ONE join side's file list, logical schema, table root, effective
+/// storage, and partition columns, through the SAME per-request
+/// `TableScanResolver` the single-table scan uses.
 ///
-/// `iceberg_ident` (the original-cased identifier recovered from `TABLE_MAP`)
-/// replaces only the `table` field of the shared `catalog` template, so both
-/// sides resolve against the same catalog URI and warehouse.
+/// `table_identifier` (the original-cased identifier recovered from `TABLE_MAP`)
+/// is this side's table identifier; both sides resolve through the same
+/// `resolver`, which is built once per request, so a two-leg join performs no
+/// more catalog authentication round-trips than a single-table scan.
 ///
 /// `filter_json` is this side's SIDE-LOCAL sub-predicate (see [`side_local_filter`])
 /// — the conjuncts of the WHERE every column of which is this table's — forwarded
-/// for Iceberg manifest pruning exactly as `filter_json_raw` is on the single-table
+/// for format-level file pruning exactly as `filter_json_raw` is on the single-table
 /// path. For an inner join a side-local conjunct is a necessary condition for that
 /// side's rows to survive, so pruning by it is sound; cross-table and OR-spanning
-/// conjuncts are already excluded from `filter_json`. `to_iceberg_predicate`
-/// resolves it against this table's OWN schema, and sound-drops anything it cannot
-/// translate. `None` (no side-local conjunct) prunes nothing — every file is kept.
+/// conjuncts are already excluded from `filter_json`. `None` (no side-local
+/// conjunct) prunes nothing — every file is kept.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
-    iceberg_ident: &str,
-    inputs: &JoinSideResolution<'_>,
+    table_identifier: &str,
+    resolver: &TableScanResolver<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedJoinSide, UdfError> {
-    let JoinSideResolution {
-        session,
-        storage,
-        catalog,
-        creds,
-        allow_http,
-    } = *inputs;
-    let side_catalog = CatalogProps {
-        table: iceberg_ident.to_string(),
-        ..catalog.clone()
-    };
-    let (files, effective_storage, logical_schema, table_root, name_mapping) = resolve_file_list(
-        session,
-        &side_catalog,
-        storage,
-        creds,
-        allow_http,
-        filter_json,
-    )
-    .await?;
+    let resolved = resolver.resolve(table_identifier, filter_json).await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
-        iceberg_ident.to_string(),
-        table_root,
-        files,
-        logical_schema,
-        name_mapping,
-        effective_storage,
+        table_identifier.to_string(),
+        resolved,
     ))
 }
 

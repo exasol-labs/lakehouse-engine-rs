@@ -4,33 +4,39 @@
 //!
 //! These tests run against the overlay stack (Exasol + MinIO + Unity Catalog),
 //! brought up by `make unity-up`. They FAIL (never skip) when the stack is
-//! unavailable — the same contract as the baseline `exasol-e2e` suite. The suite
-//! stops at createVirtualSchema for the pushdown path: #318 lists tables and
-//! their column metadata and `handle_pushdown` runs no Delta scan (that lands in
-//! #319/#320). `unity_delta_planning_agrees_under_vended_and_static_credentials`
-//! exercises Delta table PLANNING directly through the `FormatReader` seam
+//! unavailable — the same contract as the baseline `exasol-e2e` suite. #318
+//! lists tables and their column metadata; `handle_pushdown` now routes a Unity
+//! Catalog / Delta pushdown request through the same `TableScanResolver` and
+//! `FormatReader` seam an Iceberg request uses (#320), so the round-trip
+//! scenarios below issue real queries through Exasol and assert the rows they
+//! return. `unity_delta_planning_agrees_under_vended_and_static_credentials`
+//! separately exercises Delta table PLANNING directly through the seam
 //! (`format_reader`/`ScanSource::UnityDelta`), bypassing `handle_pushdown`
-//! entirely — the only path this plan wires up.
+//! entirely.
 //!
 //! All tests share one Exasol (one virtual schema), so they must run serially
 //! (`--test-threads=1`); the `make test-e2e-unity` target passes the flag.
 //!
 //! The CONNECTION address is the docker-network Unity Catalog host and its
-//! password supplies no auth field, because the OSS server's authorization is
-//! disabled. `unity_credentials_never_appear_in_output` pins the redaction
-//! contract on the failure path.
+//! password supplies no CATALOG-auth field, because the OSS server's
+//! authorization is disabled — but it does carry the MinIO endpoint and static
+//! storage credentials the UDF-side scan reads through, since the OSS Unity
+//! Catalog server vends no S3 endpoint of its own.
+//! `unity_credentials_never_appear_in_output` pins the redaction contract on
+//! the failure path.
 #![cfg(feature = "unity-e2e")]
 
 mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts, exa_conn,
-    install_slc, upload_so,
+    explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc, parse_int,
+    upload_so,
 };
 use common::exasol_ws::ExaConn;
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    wait_for_exasol, wait_for_minio, wait_for_url,
+    local_stack_connection_password, wait_for_exasol, wait_for_minio, wait_for_url,
 };
 
 use lakehouse_catalog::{
@@ -114,12 +120,16 @@ fn setup() {
 }
 
 /// Create the Unity Catalog virtual schema over `unity.delta_e2e` through the
-/// shared adapter script. The CONNECTION carries the no-auth Unity address; the
-/// `UNITY_CATALOG` catalog kind routes createVirtualSchema through the native
-/// Unity Catalog client.
+/// shared adapter script. The CONNECTION carries the Unity address plus a
+/// password that now also carries the MinIO endpoint and static storage
+/// credentials the UDF-side scan reads through; the `UNITY_CATALOG` catalog
+/// kind routes createVirtualSchema through the native Unity Catalog client.
 fn create_unity_virtual_schema(conn: &mut ExaConn) {
-    // Default password: no warehouse, no auth field — the no-auth Unity mode.
-    let password = CatalogConnectionPassword::default();
+    // MinIO endpoint + static storage credentials, the SAME shape every other
+    // E2E suite's CONNECTION carries: the OSS Unity Catalog server vends no
+    // S3 endpoint of its own, so the UDF-side scan resolves object storage
+    // through this CONNECTION rather than a test-process injection.
+    let password = local_stack_connection_password();
     let create_conn_sql =
         build_create_connection_sql(CONN_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
     conn.execute(&create_conn_sql);
@@ -517,5 +527,493 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
         has_deletion_vector,
         "table_with_dv's single active file must carry a deletion-vector reference: {:?}",
         dv_scan.files[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-trip query scenarios (#320): the format-reader seam wired into
+// production pushdown, exercised end to end through Exasol.
+// ---------------------------------------------------------------------------
+
+/// A virtual table reference, `VS_NAME.TABLE`.
+fn table_ref(table: &str) -> String {
+    format!("{VS_NAME}.{table}")
+}
+
+/// Parse the JSON value (object or array) starting at `start` — the index of its
+/// opening `{` or `[` — within `text`, matching brackets through quoted strings so
+/// an embedded `{`/`}`/`[`/`]` inside a string value cannot end the scan early.
+/// Returns the parsed value and the index just past its closing bracket.
+fn json_value_at(text: &str, start: usize) -> (serde_json::Value, usize) {
+    let bytes = text.as_bytes();
+    let (open, close) = match bytes[start] {
+        b'{' => (b'{', b'}'),
+        b'[' => (b'[', b']'),
+        other => {
+            panic!("expected a JSON object or array at offset {start}, found byte {other}: {text}")
+        }
+    };
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b if b == open => depth += 1,
+            b if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(start + i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.unwrap_or_else(|| panic!("unbalanced JSON at offset {start}: {text}"));
+    let value = serde_json::from_str(&text[start..end])
+        .unwrap_or_else(|e| panic!("expected valid JSON at offset {start} ({e}): {text}"));
+    (value, end)
+}
+
+/// Scenario: A delete-free Delta table returns its rows end to end.
+///
+/// `multi_part_stats` (5 files, 5 rows, delete-free, unpartitioned) is this
+/// engine's FIRST full round trip over a Delta table. `create_unity_virtual_schema`'s
+/// CONNECTION carries the MinIO endpoint and static storage credentials
+/// (`local_stack_connection_password`, the same credential shape and shared-harness
+/// provisioning every other E2E binary uses), because the OSS Unity Catalog server
+/// vends no S3 endpoint of its own — this table's non-NULL column values prove the
+/// UDF-side scan actually resolved a credential from the CONNECTION; with none, the
+/// read against MinIO would fail.
+#[test]
+fn unity_delta_delete_free_table_returns_its_rows() {
+    setup();
+    let mut conn = exa_conn();
+
+    let count = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {}",
+        table_ref("MULTI_PART_STATS")
+    ));
+    assert_eq!(
+        count, 5,
+        "multi_part_stats' five active data files hold five rows in total"
+    );
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ID, \"VALUE\" FROM {}",
+        table_ref("MULTI_PART_STATS")
+    ));
+    assert_eq!(cols.len(), 2, "expected ID, VALUE columns: {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "SELECT must return the same 5 rows COUNT(*) reports: {cols:?}"
+    );
+    assert!(
+        cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
+        "a delete-free table's rows must carry real column values, not NULL: {cols:?}"
+    );
+}
+
+/// Scenario: A Delta table with deletion vectors returns only its live rows.
+///
+/// `table_with_dv` (1 file, 10 physical rows, a UUID-relative deletion vector of
+/// cardinality 2) removes the rows whose `value` is 0 and 9.
+#[test]
+fn unity_delta_deletion_vector_table_returns_only_live_rows() {
+    setup();
+    let mut conn = exa_conn();
+
+    let count = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {}",
+        table_ref("TABLE_WITH_DV")
+    ));
+    assert_eq!(
+        count, 8,
+        "the deletion vector removes 2 of table_with_dv's 10 physical rows"
+    );
+
+    let cols = conn.query_columns(&format!(
+        "SELECT \"VALUE\" FROM {}",
+        table_ref("TABLE_WITH_DV")
+    ));
+    let values: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(values.len(), 8, "expected 8 live values: {values:?}");
+    assert!(
+        !values.contains(&0) && !values.contains(&9),
+        "the deleted values 0 and 9 must be absent: {values:?}"
+    );
+
+    let filtered = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE \"VALUE\" = 0",
+        table_ref("TABLE_WITH_DV")
+    ));
+    assert_eq!(
+        filtered, 0,
+        "a predicate selecting a deleted row must return no row: the deletion \
+         vector is applied beneath the pushed-down filter"
+    );
+}
+
+/// Scenario: A column-mapped Delta table returns values under its logical
+/// column names.
+///
+/// `cm_id_mode` and `cm_name_mode` carry Parquet columns physically named
+/// `col-<uuid>` while their Delta schemas declare `id`, `name`, `value`. Neither
+/// column may be NULL — a logical-name-only binding against a `col-<uuid>`
+/// physical name would produce exactly that.
+///
+/// The two fixtures are independently seeded delta-kernel-rs CDF tables that
+/// share a schema shape, not two views of the same underlying data: a live run
+/// shows `cm_id_mode` holding ids `{1,2,4}` and `cm_name_mode` holding ids
+/// `{2,3,4}` with different names and values throughout. So this scenario
+/// verifies each table's binding independently rather than asserting row
+/// equality between them.
+#[test]
+fn unity_delta_column_mapped_tables_return_logical_column_values() {
+    setup();
+    let mut conn = exa_conn();
+
+    let id_mode = conn.query_columns(&format!(
+        "SELECT ID, NAME, \"VALUE\" FROM {} ORDER BY ID",
+        table_ref("CM_ID_MODE")
+    ));
+    let name_mode = conn.query_columns(&format!(
+        "SELECT ID, NAME, \"VALUE\" FROM {} ORDER BY ID",
+        table_ref("CM_NAME_MODE")
+    ));
+
+    assert_eq!(
+        id_mode.len(),
+        3,
+        "expected ID, NAME, VALUE columns: {id_mode:?}"
+    );
+    assert!(
+        !id_mode[0].is_empty(),
+        "cm_id_mode must return at least one row"
+    );
+    assert!(
+        !name_mode[0].is_empty(),
+        "cm_name_mode must return at least one row"
+    );
+
+    for (label, cols) in [("CM_ID_MODE", &id_mode), ("CM_NAME_MODE", &name_mode)] {
+        for (col_idx, col_name) in ["ID", "NAME", "VALUE"].iter().enumerate() {
+            assert!(
+                cols[col_idx].iter().all(|v| !v.is_null()),
+                "{label}.{col_name} must never be NULL: a logical-name-only \
+                 binding against a col-<uuid> physical name would produce NULL: \
+                 {cols:?}"
+            );
+        }
+    }
+}
+
+/// Scenario: A partitioned Delta table returns its partition column values.
+///
+/// `basic_partitioned` (6 files, 6 rows) is partitioned by `letter`; one file
+/// lives under the Hive default-partition directory because its `letter` is
+/// NULL. The live values are pinned outright — `a,a,b,c,e,NULL` — the same
+/// six-file fixture `unity_delta_planning_agrees_under_vended_and_static_credentials`
+/// already proves at the `FormatReader` layer; this scenario proves the SAME
+/// values reach a real query, its WHERE clause, and its GROUP BY.
+#[test]
+fn unity_delta_partitioned_table_returns_partition_values() {
+    setup();
+    let mut conn = exa_conn();
+
+    let letters: Vec<Option<String>> = conn.query_columns(&format!(
+        "SELECT LETTER FROM {}",
+        table_ref("BASIC_PARTITIONED")
+    ))[0]
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        letters.len(),
+        6,
+        "basic_partitioned's six files hold six rows: {letters:?}"
+    );
+    assert!(
+        !letters
+            .iter()
+            .any(|l| l.as_deref() == Some("__HIVE_DEFAULT_PARTITION__")),
+        "the Hive default-partition DIRECTORY literal must never surface as a \
+         value: {letters:?}"
+    );
+    assert_eq!(
+        letters.iter().filter(|l| l.is_none()).count(),
+        1,
+        "exactly one row's logged letter is NULL (the default-partition file): \
+         {letters:?}"
+    );
+
+    let filtered = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE LETTER = 'a'",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    assert_eq!(
+        filtered, 2,
+        "exactly the rows whose logged partition value is 'a' must match the filter"
+    );
+
+    let grouped = conn.query_columns(&format!(
+        "SELECT LETTER, COUNT(*) FROM {} GROUP BY LETTER",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    assert_eq!(
+        grouped.len(),
+        2,
+        "expected LETTER, COUNT(*) columns: {grouped:?}"
+    );
+    let mut group_counts: std::collections::HashMap<Option<String>, i64> = grouped[0]
+        .iter()
+        .zip(grouped[1].iter())
+        .map(|(letter, count)| (letter.as_str().map(str::to_string), parse_int(count)))
+        .collect();
+    assert_eq!(
+        group_counts.remove(&None),
+        Some(1),
+        "the NULL-letter group must hold exactly 1 row: {group_counts:?}"
+    );
+    assert_eq!(
+        group_counts.remove(&Some("a".to_string())),
+        Some(2),
+        "group 'a' must hold exactly 2 rows: {group_counts:?}"
+    );
+    for letter in ["b", "c", "e"] {
+        assert_eq!(
+            group_counts.remove(&Some(letter.to_string())),
+            Some(1),
+            "group '{letter}' must hold exactly 1 row: {group_counts:?}"
+        );
+    }
+    assert!(
+        group_counts.is_empty(),
+        "no group beyond NULL,a,b,c,e is expected: {group_counts:?}"
+    );
+}
+
+/// Scenario: Join and aggregate pushdown reach a Delta table by the same route
+/// as a scan.
+///
+/// Every assertion below is self-consistent against a ground-truth full scan
+/// fetched in-process, rather than a fixture value pinned in the test, since
+/// only `basic_partitioned`'s partition values are pinned upstream (the
+/// previous scenario and `unity_delta_planning_agrees_under_vended_and_static_credentials`).
+///
+/// - a grouped aggregate (`GROUP BY ID`) over `multi_part_stats`
+/// - an `ORDER BY ... LIMIT` top-N over `multi_part_stats`
+/// - a broadcast-eligible inner equi-join whose broadcast side is
+///   `basic_partitioned`, the PARTITIONED table, joined against `cm_id_mode`
+///   (NOT `multi_part_stats`: a live run's active-file byte totals are
+///   `basic_partitioned` 4505, `multi_part_stats` 3804, `cm_id_mode` 5253 —
+///   `select_broadcast_sides` gives the broadcast/dimension role to the
+///   SMALLER side, so pairing with `multi_part_stats` would make
+///   `basic_partitioned` the FACT side instead, never exercising
+///   `JoinSpec.partition_columns`. `cm_id_mode` is already seeded and larger
+///   than `basic_partitioned`, so it reliably keeps `basic_partitioned` on the
+///   broadcast side.)
+#[test]
+fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
+    setup();
+    let mut conn = exa_conn();
+
+    let raw_ids: Vec<i64> = conn
+        .query_columns(&format!("SELECT ID FROM {}", table_ref("MULTI_PART_STATS")))[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    assert_eq!(
+        raw_ids.len(),
+        5,
+        "multi_part_stats holds 5 rows: {raw_ids:?}"
+    );
+
+    // Grouped aggregate: GROUP BY ID must match a hand-computed grouping of the
+    // same ground-truth ids.
+    let grouped = conn.query_columns(&format!(
+        "SELECT ID, COUNT(*) FROM {} GROUP BY ID",
+        table_ref("MULTI_PART_STATS")
+    ));
+    let mut expected_group_counts: std::collections::HashMap<i64, i64> =
+        std::collections::HashMap::new();
+    for id in &raw_ids {
+        *expected_group_counts.entry(*id).or_insert(0) += 1;
+    }
+    for (id, count) in grouped[0].iter().zip(grouped[1].iter()) {
+        let key = parse_int(id);
+        let actual_count = parse_int(count);
+        let expected_count = expected_group_counts
+            .remove(&key)
+            .unwrap_or_else(|| panic!("unexpected group key {key}: {grouped:?}"));
+        assert_eq!(
+            actual_count, expected_count,
+            "group {key}: COUNT(*) mismatch"
+        );
+    }
+    assert!(
+        expected_group_counts.is_empty(),
+        "GROUP BY ID must cover every id the ground-truth scan saw: missing {expected_group_counts:?}"
+    );
+
+    // ORDER BY ... LIMIT: top-3 by ID DESC must match a full sort + truncate of
+    // the same ground-truth ids.
+    let mut expected_top3 = raw_ids.clone();
+    expected_top3.sort_unstable_by(|a, b| b.cmp(a));
+    expected_top3.truncate(3);
+    let top3: Vec<i64> = conn.query_columns(&format!(
+        "SELECT ID FROM {} ORDER BY ID DESC LIMIT 3",
+        table_ref("MULTI_PART_STATS")
+    ))[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    assert_eq!(
+        top3, expected_top3,
+        "ORDER BY ID DESC LIMIT 3 must match a full sort + truncate"
+    );
+
+    // Broadcast join: basic_partitioned (partitioned, the smaller side) joined
+    // to cm_id_mode on NUMBER = ID.
+    let join_sql = format!(
+        "SELECT p.LETTER, c.ID FROM {} p JOIN {} c ON p.NUMBER = c.ID",
+        table_ref("BASIC_PARTITIONED"),
+        table_ref("CM_ID_MODE")
+    );
+    let pushed = explain_virtual_sql(&mut conn, &join_sql);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "the join must drive one broadcast scan UDF, not the two-scan fallback: {pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "the join must not fall back to the two-scan Exasol-joined shape: {pushed}"
+    );
+    let common_table_root_idx = pushed
+        .find("\"table_root\":\"")
+        .unwrap_or_else(|| panic!("expected the surrounding common spec's table_root: {pushed}"));
+    let common_table_root_start = common_table_root_idx + "\"table_root\":\"".len();
+    let common_table_root_end = pushed[common_table_root_start..]
+        .find('"')
+        .map(|rel| common_table_root_start + rel)
+        .unwrap_or_else(|| panic!("unterminated table_root string: {pushed}"));
+    let common_table_root = &pushed[common_table_root_start..common_table_root_end];
+    assert!(
+        common_table_root.contains("cdf-column-mapping-id-mode"),
+        "the sharded (fact) side must be cm_id_mode, the larger of the two: {pushed}"
+    );
+
+    let join_key_idx = pushed
+        .find("\"join\":{")
+        .unwrap_or_else(|| panic!("expected a join block in the pushed SQL: {pushed}"));
+    let join_value_start = join_key_idx + "\"join\":".len();
+    let (join_value, _) = json_value_at(&pushed, join_value_start);
+    let join_table_root = join_value["table_root"]
+        .as_str()
+        .unwrap_or_else(|| panic!("join block must carry a table_root: {join_value}"));
+    assert!(
+        join_table_root.contains("basic_partitioned"),
+        "the broadcast (dimension) side's join block must carry \
+         basic_partitioned's table root, the PARTITIONED table: {pushed}"
+    );
+
+    // Ground-truth join, computed in-process from both tables' full contents.
+    let cm_ids: Vec<i64> = conn
+        .query_columns(&format!("SELECT ID FROM {}", table_ref("CM_ID_MODE")))[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    let distinct_cm_ids: std::collections::HashSet<i64> = cm_ids.iter().copied().collect();
+    assert_eq!(
+        distinct_cm_ids.len(),
+        cm_ids.len(),
+        "cm_id_mode's ID values must be distinct for the semi-join ground truth \
+         (membership via cm_ids.contains) to equal a real join: {cm_ids:?}"
+    );
+    let base_cols = conn.query_columns(&format!(
+        "SELECT LETTER, \"NUMBER\" FROM {}",
+        table_ref("BASIC_PARTITIONED")
+    ));
+    let mut expected_join: Vec<(Option<String>, i64)> = base_cols[0]
+        .iter()
+        .zip(base_cols[1].iter())
+        .map(|(letter, number)| (letter.as_str().map(str::to_string), parse_int(number)))
+        .filter(|(_, number)| cm_ids.contains(number))
+        .collect();
+    expected_join.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let join_cols = conn.query_columns(&join_sql);
+    let mut actual_join: Vec<(Option<String>, i64)> = join_cols[0]
+        .iter()
+        .zip(join_cols[1].iter())
+        .map(|(letter, id)| (letter.as_str().map(str::to_string), parse_int(id)))
+        .collect();
+    actual_join.sort_by(|a, b| a.1.cmp(&b.1));
+
+    assert!(
+        !actual_join.is_empty(),
+        "the join must return at least one matching row to prove more than an \
+         empty-result coincidence: basic_partitioned NUMBER and cm_id_mode ID \
+         must overlap"
+    );
+    assert_eq!(
+        actual_join, expected_join,
+        "the broadcast join result must match an in-process join over the two \
+         tables' full contents, carrying basic_partitioned's LETTER value"
+    );
+}
+
+/// Scenario: A Delta table this engine cannot plan fails the query loud.
+///
+/// `unshredded_variant` and `stats_all_types` declare Delta types this engine
+/// does not map (`variant`, `byte`, among others) — a plan-time refusal, not a
+/// silently wrong or partial result. The failure arrives as a SQL error (never a
+/// crashed UDF VM, checked by a follow-up query surviving on the same
+/// connection) and must not leak a credential value.
+#[test]
+fn unity_delta_unmappable_table_fails_the_query_loud() {
+    setup();
+    let mut conn = exa_conn();
+
+    for table in ["UNSHREDDED_VARIANT", "STATS_ALL_TYPES"] {
+        let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "{table} must fail the query loud, not return a row: {resp}"
+        );
+        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("Delta column '") && msg.contains("does not map at plan time"),
+            "{table} must fail with the reader's specific plan-time-type error \
+             naming the column and its Delta type, not an opaque one: {msg}"
+        );
+        assert!(
+            msg.contains("#322"),
+            "{table}'s error must cite the tracked type-mapping issue: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("minioadmin"),
+            "{table}'s error text must not contain a credential value: {msg}"
+        );
+    }
+
+    let survives = conn.query_scalar_i64("SELECT 1 FROM DUAL");
+    assert_eq!(
+        survives, 1,
+        "the connection must survive both refusals: a crashed UDF VM would take \
+         the session down, not return a clean SQL error"
     );
 }

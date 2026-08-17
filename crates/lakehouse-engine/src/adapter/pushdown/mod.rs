@@ -13,6 +13,10 @@
 //!   in any returned SQL string or error message. Storage (S3) credentials are a
 //!   documented exception — see `handle_pushdown`'s doc comment.
 
+use crate::adapter::ResolvedConnectionConfig;
+#[cfg(test)]
+use crate::adapter::catalog_kind::CatalogKind;
+#[cfg(test)]
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
@@ -29,14 +33,17 @@ use support::{
 };
 pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
-use lakehouse_catalog::{CatalogSession, parse_table_ident};
+mod empty_result;
+use empty_result::empty_result_sql;
 
-mod file_resolution;
-pub use file_resolution::resolve_file_list;
-use file_resolution::{empty_result_sql, encode_initial_default, relativize_shards_to_root};
+mod shard_paths;
+use shard_paths::relativize_shards_to_root;
 
 mod format;
 pub use format::{ConnectionStorage, FormatReader, ResolvedScan, ScanSource, format_reader};
+
+mod scan_resolution;
+use scan_resolution::TableScanResolver;
 
 mod topn;
 use topn::{detect_topn, parse_order_by_keys};
@@ -100,11 +107,13 @@ mod dispatch_golden;
 /// byte size is at or below this threshold. See backlog BL-001 / plan
 /// `add-join-pushdown-broadcast`.
 ///
-/// `creds` — the resolved CONNECTION credentials, used to determine whether
-/// to sign catalog requests and whether to apply vended storage credentials.
-///
-/// `allow_http` — the resolved `ALLOW_HTTP` property; under vending it is the
-/// operator's consent gate for plaintext transport.
+/// `conn` — the resolved `CATALOG_CONNECTION` configuration: `catalog_uri` and
+/// `catalog_kind` (threaded from `dispatch`'s single handshake-time resolution so
+/// the pushdown path matches it nowhere else; passed to
+/// [`TableScanResolver::for_request`], the seam's own one construction site),
+/// `creds` (used to determine whether to sign catalog requests and whether to
+/// apply vended storage credentials), `storage`, and `allow_http` (under vending,
+/// the operator's consent gate for plaintext transport).
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///
@@ -117,8 +126,7 @@ mod dispatch_golden;
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,
-    catalog_uri: &str,
-    storage: &StorageBackend,
+    conn: &ResolvedConnectionConfig,
     catalog: &CatalogProps,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
@@ -130,8 +138,6 @@ pub async fn handle_pushdown(
     instance_overhead_mb: u64,
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
-    creds: &ConnectionCreds,
-    allow_http: bool,
 ) -> Result<Json, UdfError> {
     let pushdown_req = request
         .get("pushdownRequest")
@@ -151,25 +157,15 @@ pub async fn handle_pushdown(
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
         JoinShape::Join(join) => {
-            // Parse-before-config (intent-fidelity): validate every involved-table
-            // identifier at the pushdown seam BEFORE `CatalogSession::resolve` issues
-            // the `/v1/config` lookup, so a malformed identifier issues zero catalog
-            // HTTP and returns the same parse error. Building the session here (once)
-            // and threading `&session` into every leg is what makes a per-leg rebuild
-            // structurally inexpressible.
-            for leaf in &join.tables {
-                parse_table_ident(&leaf.iceberg_ident)?;
-            }
-            let session = CatalogSession::resolve(catalog_uri, &catalog.warehouse, creds).await?;
             return plan_join(
                 request,
                 &pushdown_req,
                 &join,
-                &session,
-                storage,
-                catalog,
-                creds,
-                allow_http,
+                &conn.catalog_uri,
+                conn.catalog_kind,
+                &conn.storage,
+                &conn.creds,
+                conn.allow_http,
                 scan_schema,
                 cluster_nodes,
                 parallelism_factor,
@@ -201,8 +197,8 @@ pub async fn handle_pushdown(
     // `classify_where_filter`: `filter` is the DataFusion-bound scan-spec predicate,
     // `declined_filter` the original tree the adapter must self-apply because the
     // scan cannot carry it. At most one is `Some`. `filter_json_raw` itself is left
-    // completely unmodified for the later `resolve_file_list` Iceberg-level pruning
-    // call below, which must see the original, un-rewritten predicate tree — a
+    // completely unmodified for the later format-level pruning the resolver
+    // applies below, which must see the original, un-rewritten predicate tree — a
     // decline changes what the ADAPTER renders, never what pruning sees.
     let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
 
@@ -214,24 +210,33 @@ pub async fn handle_pushdown(
     // never emitted ahead of an ordering the adapter did not itself render.
     let has_order_by = order_by_present(&pushdown_req);
 
-    parse_table_ident(&catalog.table)?;
-
-    // Resolve the file list exactly once, on one session built once for this request.
-    // The returned `effective_storage` carries vended STS creds when
-    // use_vended_credentials is true; otherwise it equals the static `storage` passed
-    // in. Every per-shard ScanSpec uses this storage. filter_json_raw is forwarded for
-    // Iceberg-level file pruning; ScanSpec.filter (DataFusion SQL string) is set
-    // separately above and left completely unchanged.
-    let session = CatalogSession::resolve(catalog_uri, &catalog.warehouse, creds).await?;
-    let (files, effective_storage, logical_schema, table_root, name_mapping) = resolve_file_list(
-        &session,
-        catalog,
-        storage,
-        creds,
-        allow_http,
-        filter_json_raw,
+    // Resolve the table exactly once, on one resolver built once for this request:
+    // the ONE format-reader seam every request shape resolves through. The returned
+    // `effective_storage` carries vended STS creds when use_vended_credentials is
+    // true; otherwise it equals the static `storage` passed in. Every per-shard
+    // ScanSpec uses this storage. filter_json_raw is forwarded for format-level file
+    // pruning; ScanSpec.filter (DataFusion SQL string) is set separately above and
+    // left completely unchanged.
+    let connection = ConnectionStorage {
+        storage: &conn.storage,
+        creds: &conn.creds,
+        allow_http: conn.allow_http,
+    };
+    let resolver = TableScanResolver::for_request(
+        conn.catalog_kind,
+        &conn.catalog_uri,
+        connection,
+        &[catalog.table.as_str()],
     )
     .await?;
+    let ResolvedScan {
+        files,
+        effective_storage,
+        logical_schema,
+        table_root,
+        name_mapping,
+        partition_columns,
+    } = resolver.resolve(&catalog.table, filter_json_raw).await?;
     let storage = &effective_storage;
 
     if files.is_empty() {
@@ -275,6 +280,7 @@ pub async fn handle_pushdown(
         table_root,
         logical_schema,
         name_mapping,
+        partition_columns,
         storage,
         &udf_name,
         &distribute_udf_name,
@@ -321,6 +327,7 @@ pub(crate) fn build_dispatch_sql(
     table_root: String,
     logical_schema: Vec<LogicalField>,
     name_mapping: Vec<NameMappingEntry>,
+    partition_columns: Vec<String>,
     storage: &StorageBackend,
     udf_name: &str,
     distribute_udf_name: &str,
@@ -350,7 +357,7 @@ pub(crate) fn build_dispatch_sql(
         logical_schema: logical_schema.clone(),
         name_mapping: name_mapping.clone(),
         join: None,
-        partition_columns: Vec::new(),
+        partition_columns,
         storage: storage.clone(),
         df_target_partitions,
         df_batch_size,
@@ -377,7 +384,7 @@ pub(crate) fn build_dispatch_sql(
     }
 
     // One shared classifier decides the routing shape for BOTH this dispatcher and
-    // the empty-result path (`file_resolution::empty_result_sql`), so their output
+    // the empty-result path (`empty_result::empty_result_sql`), so their output
     // shapes are identical by construction rather than by two hand-synced routing
     // trees. The 3-tier priority (grouped → single-group → row scan), the numeric
     // gates, and the grouped HAVING merge-render — whose failure is a route to
@@ -802,30 +809,8 @@ pub(crate) fn build_dispatch_sql(
     Ok(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
 
-/// Build the logical schema (`Vec<LogicalField>`) from an Iceberg current schema.
-///
-/// Iterates over the top-level struct fields of `schema` and maps each to a
-/// `LogicalField` carrying its Iceberg field-id, current name, Arrow type tag,
-/// and nullability (required → `false`, optional → `true`).
-pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
-    schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| {
-            let arrow_dt = crate::types::mapping::iceberg_type_to_arrow(&f.field_type);
-            let arrow_type = crate::types::mapping::arrow_type_to_tag(&arrow_dt);
-            LogicalField {
-                field_id: Some(f.id),
-                name: f.name.clone(),
-                arrow_type,
-                nullable: !f.required,
-                initial_default: encode_initial_default(f),
-                physical_name: None,
-            }
-        })
-        .collect()
-}
+#[cfg(test)]
+pub(crate) use format::build_logical_schema;
 
 #[cfg(test)]
 #[path = "pushdown_tests.rs"]

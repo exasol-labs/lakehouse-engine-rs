@@ -534,6 +534,15 @@ pub struct JoinSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_join_limit: Option<u64>,
 
+    /// The dimension table's partition-column names, in partition order — the same
+    /// neutral concept as [`CommonScanSpec::partition_columns`], needed on this side
+    /// because the broadcast/dimension side is its own table with its own partition
+    /// layout. Empty (the default) on every Iceberg join spec today, and absent from
+    /// JSON when empty, which is what keeps an Iceberg join spec byte-identical to
+    /// its pre-existing encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_columns: Vec<String>,
+
     /// The dimension side's own resolved [`StorageBackend`], distinct from
     /// `common.storage` (the fact side's). Required — see the struct doc.
     pub storage: StorageBackend,

@@ -22,8 +22,8 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
             assert_eq!(join.tables.len(), 2);
             assert_eq!(join.tables[0].table_name, "CUSTOMER");
             assert_eq!(join.tables[1].table_name, "ORDERS");
-            assert_eq!(join.tables[0].iceberg_ident, "lh.customer");
-            assert_eq!(join.tables[1].iceberg_ident, "lh.orders");
+            assert_eq!(join.tables[0].table_identifier, "lh.customer");
+            assert_eq!(join.tables[1].table_identifier, "lh.orders");
             assert_eq!(join.conditions, vec![equi_condition()]);
         }
         other => panic!("expected Join, got {other:?}"),
@@ -101,7 +101,7 @@ fn three_table_inner_join_is_unified_join() {
             let idents: Vec<&str> = join
                 .tables
                 .iter()
-                .map(|t| t.iceberg_ident.as_str())
+                .map(|t| t.table_identifier.as_str())
                 .collect();
             assert_eq!(idents, ["lh.customer", "lh.orders", "lh.lineitem"]);
             assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 tables");
@@ -156,7 +156,7 @@ fn four_table_inner_join_is_unified_join() {
             let idents: Vec<&str> = join
                 .tables
                 .iter()
-                .map(|t| t.iceberg_ident.as_str())
+                .map(|t| t.table_identifier.as_str())
                 .collect();
             assert_eq!(
                 idents,
@@ -250,8 +250,8 @@ fn dimension_is_left_when_left_side_is_smaller() {
         "1000 bytes is well under the 128 MiB threshold"
     );
     // Resolved payload travels with the role.
-    assert_eq!(sides.dimension.iceberg_ident, "lh.customer");
-    assert_eq!(sides.fact.iceberg_ident, "lh.orders");
+    assert_eq!(sides.dimension.table_identifier, "lh.customer");
+    assert_eq!(sides.fact.table_identifier, "lh.orders");
     assert_eq!(sides.dimension.files, vec![FileEntry::new("c1", 1_000)]);
     assert_eq!(sides.dimension.table_root, "s3://warehouse/lh/customer");
     assert_eq!(sides.dimension.logical_schema.len(), 1);
