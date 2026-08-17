@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
@@ -8,6 +9,7 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
+use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
 use super::delta_schema::build_delta_table_schema;
 use super::{ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan};
@@ -125,9 +127,9 @@ impl<'a> DeltaFormatReader<'a> {
 }
 
 impl FormatReader for DeltaFormatReader<'_> {
-    /// `filter_json` prunes nothing: Delta-level file pruning needs the per-file
-    /// statistics this plan deliberately carries none of (issue #321), and partition
-    /// pruning is the scan side's once it reconstructs partition columns (issue #320).
+    /// Forwards `filter_json` to [`read_delta_log`], which builds a `delta_kernel`
+    /// predicate from it and applies it during log replay to prune files by partition
+    /// value and per-file statistics before scanning.
     ///
     /// `name_mapping` is always empty: a column binding by physical name declares that
     /// name on its own [`LogicalField`], which the scan-side binding consults BEFORE
@@ -136,7 +138,7 @@ impl FormatReader for DeltaFormatReader<'_> {
     /// from it.
     fn resolve_scan<'a>(
         &'a self,
-        _filter_json: Option<&'a Json>,
+        filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
         Box::pin(async move {
             let table_root = self.checked_table_root()?;
@@ -144,7 +146,7 @@ impl FormatReader for DeltaFormatReader<'_> {
             let secrets = effective_storage.secret_values();
 
             let (files, logical_schema, partition_columns, refused_columns) =
-                read_delta_log(&effective_storage, table_root, &secrets)?;
+                read_delta_log(&effective_storage, table_root, &secrets, filter_json)?;
 
             Ok(ResolvedScan {
                 files,
@@ -185,6 +187,7 @@ fn read_delta_log(
     storage: &StorageBackend,
     table_root: &str,
     secrets: &[&str],
+    filter_json: Option<&Json>,
 ) -> Result<DeltaLogContents, UdfError> {
     let store = build_table_root_store(storage, table_root, DEFAULT_S3_MAX_CONNECTIONS, secrets)
         .map_err(|error| redacted(error, secrets))?;
@@ -199,8 +202,12 @@ fn read_delta_log(
     .map_err(|error| redacted(error, secrets))?;
     ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)?;
 
+    let prune = filter_json
+        .and_then(|filter| to_delta_predicate(filter, &snapshot.schema()))
+        .map(Arc::new);
+
     let files = snapshot
-        .active_files()
+        .active_files(prune)
         .map_err(|error| redacted(error, secrets))?;
 
     Ok((files, logical_schema, partition_columns, refused_columns))

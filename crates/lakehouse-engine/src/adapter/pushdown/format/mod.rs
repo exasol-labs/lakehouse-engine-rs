@@ -15,6 +15,7 @@ use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
 mod delta_format_reader;
+mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;

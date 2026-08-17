@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
+use delta_kernel::scan::{Scan, StatsOptions};
+use delta_kernel::{Expression, Predicate};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use serde_json::json;
 
+use super::super::delta_predicate::to_delta_predicate;
 use super::*;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
@@ -22,10 +26,93 @@ fn fixture_root(table: &str) -> String {
 }
 
 fn replay_fixture(table: &str) -> Vec<FileEntry> {
-    DeltaSnapshot::open(local_store(), &fixture_root(table))
-        .expect("fixture table opens")
-        .active_files()
+    open_fixture(table)
+        .active_files(None)
         .expect("fixture log replays")
+}
+
+fn replay_fixture_pruned(table: &str, predicate: Predicate) -> Vec<FileEntry> {
+    open_fixture(table)
+        .active_files(Some(Arc::new(predicate)))
+        .expect("fixture log replays")
+}
+
+fn open_fixture(table: &str) -> DeltaSnapshot {
+    DeltaSnapshot::open(local_store(), &fixture_root(table)).expect("fixture table opens")
+}
+
+impl super::DeltaSnapshot {
+    fn files_surviving(&self, prune: Predicate) -> Vec<FileEntry> {
+        self.active_files(Some(Arc::new(prune)))
+            .expect("the probe scan replays")
+    }
+
+    /// Deliberately does NOT call `DeltaSnapshot::active_files` and MUST NOT be
+    /// refactored to: `active_files` no longer exposes `StatsOptions`, and
+    /// re-routing through it would make the two `disabling_stats_forfeits_*`
+    /// tests assert nothing about the mechanism this plan removed.
+    ///
+    /// `replay_probe` reproduces `active_files`'s replay loop minus its path
+    /// sort, so callers of this helper must assert on counts or on a
+    /// sorted/set-based comparison, never on raw order.
+    fn files_surviving_without_stats(&self, prune: Predicate) -> Vec<FileEntry> {
+        self.replay_probe(
+            self.snapshot
+                .clone()
+                .scan_builder()
+                .with_predicate(Arc::new(prune))
+                .with_stats(StatsOptions::none())
+                .without_row_transforms()
+                .build()
+                .expect("the probe scan plans"),
+        )
+    }
+
+    fn replay_probe(&self, scan: Scan) -> Vec<FileEntry> {
+        let mut active = Vec::new();
+        let mut listed_paths = HashSet::new();
+        for replayed in scan
+            .scan_metadata(&self.engine)
+            .expect("the probe scan replays")
+        {
+            let (data, selected) = replayed
+                .expect("the probe scan replays")
+                .scan_files
+                .into_parts();
+            let batch =
+                ArrowEngineData::try_from_engine_data(data).expect("the replayed probe log reads");
+            append_active_files(
+                batch.record_batch(),
+                &selected,
+                &mut listed_paths,
+                &mut active,
+            )
+            .expect("the replayed probe log reads");
+        }
+        active
+    }
+}
+
+fn id_above_three() -> Predicate {
+    Predicate::gt(Expression::column(["id"]), Expression::literal(3i64))
+}
+
+fn letter_is_a() -> Predicate {
+    Predicate::eq(Expression::column(["letter"]), Expression::literal("a"))
+}
+
+#[test]
+fn disabling_stats_forfeits_range_skipping_and_keeps_every_file() {
+    let files = open_fixture("multi-part-stats").files_surviving_without_stats(id_above_three());
+
+    assert_eq!(files.len(), 5);
+}
+
+#[test]
+fn disabling_stats_forfeits_partition_pruning_and_keeps_every_file() {
+    let files = open_fixture("basic_partitioned").files_surviving_without_stats(letter_is_a());
+
+    assert_eq!(files.len(), 6);
 }
 
 const SYNTHETIC_ROOT: &str = "memory:///synthetic_table";
@@ -336,7 +423,7 @@ async fn an_unrecognized_deletion_vector_storage_kind_is_refused() {
 
     let error = DeltaSnapshot::open(store, SYNTHETIC_ROOT)
         .expect("synthetic table opens")
-        .active_files()
+        .active_files(None)
         .expect_err("an unknown storage kind must not reach the scan as an unread string");
 
     let text = error.to_string();
@@ -355,7 +442,7 @@ async fn a_negative_logged_file_size_is_refused() {
 
     let error = DeltaSnapshot::open(store, SYNTHETIC_ROOT)
         .expect("synthetic table opens")
-        .active_files()
+        .active_files(None)
         .expect_err("a negative size must not wrap into a huge unsigned size");
 
     let text = error.to_string();
@@ -365,6 +452,7 @@ async fn a_negative_logged_file_size_is_refused() {
     );
 }
 
+/// Scenario: A Delta table resolves its current version's active data files
 #[test]
 fn replay_reads_the_active_files_out_of_a_multi_part_checkpoint() {
     let files = replay_fixture("multi-part-stats");
@@ -421,7 +509,7 @@ async fn a_table_whose_every_file_was_removed_replays_to_no_file() {
 
     let files = DeltaSnapshot::open(store, SYNTHETIC_ROOT)
         .expect("synthetic table opens")
-        .active_files()
+        .active_files(None)
         .expect("a fully emptied table replays without error");
 
     assert!(
@@ -598,7 +686,7 @@ async fn the_protocol_gate_runs_inside_snapshot_construction() {
         .expect("an allow-listed protocol still yields a snapshot");
 
     assert_eq!(
-        gated.active_files().expect("its log replays").len(),
+        gated.active_files(None).expect("its log replays").len(),
         1,
         "the other outcome of construction is a gated snapshot that resolves unchanged"
     );
@@ -618,7 +706,7 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
             .unwrap_or_else(|error| panic!("{table} has only allow-listed features: {error}"));
 
         snapshot
-            .active_files()
+            .active_files(None)
             .unwrap_or_else(|error| panic!("{table}'s log replays past the gate: {error}"));
     }
 }
@@ -793,7 +881,7 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     )
     .expect("the void table's schema builds");
     let files = snapshot
-        .active_files()
+        .active_files(None)
         .expect("the void table's log replays");
 
     assert!(
@@ -857,4 +945,306 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: Equality on a partition column prunes every file in a non-matching partition
+#[test]
+fn a_partition_equality_prunes_every_file_in_a_non_matching_partition() {
+    let letter_a = replay_fixture_pruned("basic_partitioned", letter_is_a());
+    let letter_a_paths: Vec<&str> = letter_a.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        letter_a_paths,
+        vec![
+            "letter=a/part-00000-0dbe0cc5-e3bf-4fb0-b36a-b5fdd67fe843.c000.snappy.parquet",
+            "letter=a/part-00000-a08d296a-d2c5-4a99-bea9-afcea42ba2e9.c000.snappy.parquet",
+        ]
+    );
+
+    let letter_z = replay_fixture_pruned(
+        "basic_partitioned",
+        Predicate::eq(Expression::column(["letter"]), Expression::literal("z")),
+    );
+    assert!(letter_z.is_empty());
+}
+
+/// Scenario: Equality on a partition column prunes every file in a non-matching partition
+#[test]
+fn an_is_null_partition_predicate_resolves_the_default_partition_file_alone() {
+    let files = replay_fixture_pruned(
+        "basic_partitioned",
+        Predicate::is_null(Expression::column(["letter"])),
+    );
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "letter=__HIVE_DEFAULT_PARTITION__/part-00000-8eb7f29a-e6a1-436e-a638-bbf0a7953f09.c000.snappy.parquet",
+        ]
+    );
+}
+
+/// Scenario: A range predicate prunes files whose min/max bounds exclude the value
+#[test]
+fn a_range_predicate_prunes_files_whose_logged_bounds_exclude_the_value() {
+    let by_number = replay_fixture_pruned(
+        "basic_partitioned",
+        Predicate::le(Expression::column(["number"]), Expression::literal(2i64)),
+    );
+    let number_paths: Vec<&str> = by_number.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        number_paths,
+        vec![
+            "letter=a/part-00000-a08d296a-d2c5-4a99-bea9-afcea42ba2e9.c000.snappy.parquet",
+            "letter=b/part-00000-41954fb0-ef91-47e5-bd41-b75169c41c17.c000.snappy.parquet",
+        ]
+    );
+
+    let by_id = replay_fixture_pruned(
+        "multi-part-stats",
+        Predicate::le(Expression::column(["id"]), Expression::literal(2i64)),
+    );
+    let id_paths: Vec<&str> = by_id.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        id_paths,
+        vec![
+            "test%25file%25prefix-part-00000-2699f745-4b33-4eb9-b3cf-04f6af08307f-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-f98612d6-6213-41f1-a006-a11beb0bb544-c000.snappy.parquet",
+        ]
+    );
+}
+
+#[test]
+fn an_equality_predicate_on_a_data_column_prunes_by_its_logged_bounds() {
+    let by_id = replay_fixture_pruned(
+        "multi-part-stats",
+        Predicate::eq(Expression::column(["id"]), Expression::literal(3i64)),
+    );
+    let id_paths: Vec<&str> = by_id.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        id_paths,
+        vec![
+            "test%25file%25prefix-part-00000-ff529603-203f-4a68-9ab1-d495e5c1c409-c000.snappy.parquet"
+        ]
+    );
+
+    let by_missing_id = replay_fixture_pruned(
+        "multi-part-stats",
+        Predicate::eq(Expression::column(["id"]), Expression::literal(99i64)),
+    );
+    assert!(by_missing_id.is_empty());
+
+    let by_value = replay_fixture_pruned(
+        "multi-part-stats",
+        Predicate::eq(
+            Expression::column(["value"]),
+            Expression::literal("value_3"),
+        ),
+    );
+    let value_paths: Vec<&str> = by_value.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        value_paths,
+        vec![
+            "test%25file%25prefix-part-00000-ff529603-203f-4a68-9ab1-d495e5c1c409-c000.snappy.parquet"
+        ]
+    );
+}
+
+const SYNTHETIC_BOOLEAN_PREAMBLE: &str = concat!(
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+    "\n",
+    r#"{"metaData":{"id":"synthetic-boolean","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"flag\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
+    "\n",
+    r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true}}"#,
+    "\n",
+);
+
+async fn synthetic_boolean_table() -> Arc<dyn ObjectStore> {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &StorePath::from("synthetic_table/_delta_log/00000000000000000000.json"),
+            PutPayload::from(SYNTHETIC_BOOLEAN_PREAMBLE.to_string()),
+        )
+        .await
+        .expect("synthetic commit is stored");
+    store
+}
+
+const SYNTHETIC_PARTIAL_STATS_PREAMBLE: &str = concat!(
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+    "\n",
+    r#"{"metaData":{"id":"synthetic-partial-stats","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}},{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
+    "\n",
+    r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"id\":1},\"maxValues\":{\"id\":1},\"nullCount\":{\"id\":0}}"}}"#,
+    "\n",
+    r#"{"add":{"path":"part-1.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true,"stats":"{\"numRecords\":1,\"minValues\":{\"id\":5},\"maxValues\":{\"id\":5},\"nullCount\":{\"id\":0}}"}}"#,
+    "\n",
+);
+
+async fn synthetic_partial_stats_table() -> Arc<dyn ObjectStore> {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &StorePath::from("synthetic_table/_delta_log/00000000000000000000.json"),
+            PutPayload::from(SYNTHETIC_PARTIAL_STATS_PREAMBLE.to_string()),
+        )
+        .await
+        .expect("synthetic commit is stored");
+    store
+}
+
+/// Scenario: A predicate the kernel cannot evaluate keeps every file
+#[tokio::test]
+async fn a_predicate_over_a_statless_or_boolean_column_keeps_every_file() {
+    let statless = DeltaSnapshot::open(synthetic_table(&[SYNTHETIC_ADD]).await, SYNTHETIC_ROOT)
+        .expect("synthetic table opens")
+        .active_files(Some(Arc::new(Predicate::gt(
+            Expression::column(["value"]),
+            Expression::literal(0i32),
+        ))))
+        .expect("a predicate over a statless column still replays");
+    assert_eq!(statless.len(), 1);
+
+    let boolean = DeltaSnapshot::open(synthetic_boolean_table().await, SYNTHETIC_ROOT)
+        .expect("synthetic table opens")
+        .active_files(Some(Arc::new(Predicate::eq(
+            Expression::column(["flag"]),
+            Expression::literal(true),
+        ))))
+        .expect("a boolean equality predicate still replays");
+    assert_eq!(boolean.len(), 1);
+}
+
+/// Scenario: An untranslatable conjunct disables pruning for that conjunct only
+#[tokio::test]
+async fn a_partly_untranslatable_conjunction_still_prunes_by_its_translatable_half() {
+    let predicate = Predicate::and(
+        Predicate::gt(Expression::column(["id"]), Expression::literal(3i32)),
+        Predicate::gt(Expression::column(["value"]), Expression::literal(100i32)),
+    );
+
+    let files = DeltaSnapshot::open(synthetic_partial_stats_table().await, SYNTHETIC_ROOT)
+        .expect("synthetic table opens")
+        .active_files(Some(Arc::new(predicate)))
+        .expect("a conjunction mixing a usable and an unusable comparison still replays");
+
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, vec!["part-1.parquet"]);
+}
+
+/// Scenario: A predicate the kernel cannot evaluate keeps every file
+///
+/// Column mapping is NOT one of the keep-all cases: under both `name` and
+/// `id` column mapping the kernel resolves a logical predicate column to its
+/// physical statistics path, so pruning stays live and does not degrade to
+/// keep-all.
+#[test]
+fn pruning_under_column_mapping_records_its_observed_behavior() {
+    let name_mode_all = replay_fixture("cdf-column-mapping-name-mode");
+    let name_mode_pruned = replay_fixture_pruned(
+        "cdf-column-mapping-name-mode",
+        Predicate::eq(Expression::column(["id"]), Expression::literal(3i64)),
+    );
+    let id_mode_all = replay_fixture("cdf-column-mapping-id-mode");
+    let id_mode_pruned = replay_fixture_pruned(
+        "cdf-column-mapping-id-mode",
+        Predicate::eq(Expression::column(["id"]), Expression::literal(1i64)),
+    );
+    let id_mode_unmatched = replay_fixture_pruned(
+        "cdf-column-mapping-id-mode",
+        Predicate::eq(Expression::column(["id"]), Expression::literal(99i64)),
+    );
+
+    let name_mode_paths: Vec<&str> = name_mode_pruned.iter().map(|f| f.path.as_str()).collect();
+    let id_mode_paths: Vec<&str> = id_mode_pruned.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(name_mode_all.len(), 3);
+    assert_eq!(id_mode_all.len(), 3);
+    assert_eq!(
+        name_mode_paths,
+        vec!["part-00015-1238a68f-8818-47d5-868f-fd5c382d5d95-c000.snappy.parquet"]
+    );
+    assert_eq!(
+        id_mode_paths,
+        vec!["part-00005-a921c063-2ccf-43f3-94ed-016896b6df42-c000.snappy.parquet"]
+    );
+    assert!(id_mode_unmatched.is_empty());
+}
+
+/// Scenario: A range predicate prunes files whose min/max bounds exclude the value
+#[test]
+fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
+    let schema = open_fixture("multi-part-stats").schema();
+    let node = json!({
+        "type": "predicate_between",
+        "expression": {"type": "column", "name": "ID"},
+        "left": {"type": "literal_exactnumeric", "value": 4},
+        "right": {"type": "literal_string", "value": "ten"},
+    });
+    let predicate =
+        to_delta_predicate(&node, &schema).expect("a BETWEEN must keep the bound it can translate");
+
+    let files = replay_fixture_pruned("multi-part-stats", predicate);
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "test%25file%25prefix-part-00000-323f4e76-58ff-48ce-bf0d-14d179e9bf0c-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-743ccd8e-15b0-49f2-b0e2-aa0efbf148ae-c000.snappy.parquet",
+        ]
+    );
+}
+
+/// Scenario: An untranslatable branch of an OR disables pruning entirely
+#[test]
+fn an_or_with_an_untranslatable_branch_keeps_every_file() {
+    let schema = open_fixture("multi-part-stats").schema();
+    let node = json!({"type": "predicate_or", "expressions": [
+        {"type": "predicate_lessequal", "left": {"type": "column", "name": "ID"}, "right": {"type": "literal_exactnumeric", "value": 2}},
+        {"type": "predicate_notequal", "left": {"type": "column", "name": "ID"}, "right": {"type": "literal_exactnumeric", "value": 7}},
+    ]});
+
+    assert_eq!(to_delta_predicate(&node, &schema), None);
+
+    let forfeited = replay_fixture("multi-part-stats");
+    let paths: Vec<&str> = forfeited.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "test%25file%25prefix-part-00000-2699f745-4b33-4eb9-b3cf-04f6af08307f-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-323f4e76-58ff-48ce-bf0d-14d179e9bf0c-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-743ccd8e-15b0-49f2-b0e2-aa0efbf148ae-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-f98612d6-6213-41f1-a006-a11beb0bb544-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-ff529603-203f-4a68-9ab1-d495e5c1c409-c000.snappy.parquet",
+        ]
+    );
+}
+
+/// Scenario: An IN list prunes as an OR-chain of equalities and never as an empty junction
+#[test]
+fn an_in_list_prunes_to_the_union_of_its_element_files() {
+    let files = replay_fixture_pruned(
+        "multi-part-stats",
+        Predicate::or_from([
+            Predicate::eq(Expression::column(["id"]), Expression::literal(1i64)),
+            Predicate::eq(Expression::column(["id"]), Expression::literal(2i64)),
+        ]),
+    );
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "test%25file%25prefix-part-00000-2699f745-4b33-4eb9-b3cf-04f6af08307f-c000.snappy.parquet",
+            "test%25file%25prefix-part-00000-f98612d6-6213-41f1-a006-a11beb0bb544-c000.snappy.parquet",
+        ]
+    );
+}
+
+/// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
+#[test]
+fn the_stats_disabling_option_is_what_suppresses_pruning() {
+    let pruned = open_fixture("multi-part-stats").files_surviving(id_above_three());
+    let unpruned = open_fixture("multi-part-stats").files_surviving_without_stats(id_above_three());
+
+    assert_eq!(pruned.len(), 2);
+    assert_eq!(unpruned.len(), 5);
 }
