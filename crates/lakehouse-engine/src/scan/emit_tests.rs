@@ -642,3 +642,146 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
     assert_eq!(str_col.value(1), "event-02");
     assert_eq!(str_col.value(2), "event-03");
 }
+
+/// Scenario: A relaxed column crosses the emit boundary at its declared
+/// Exasol type.
+///
+/// A relaxed column (Delta type widening / Iceberg type promotion) reaches
+/// `coerce_batch_to_exa_types` already cast to the table's CURRENT Arrow type
+/// by the scan's column-binding adapter, before this function ever runs — the
+/// feature adds no relaxation-aware branch, pair table, or allow-list to this
+/// path. This test proves the existing generic `safe: true` cast (the same
+/// one `coerce_batch_casts_every_column_to_declared_exatype` exercises for an
+/// unevolved column) needs none of that: a value sitting at the narrow source
+/// type's boundary, already stored under the WIDENED Arrow type, round-trips
+/// through the coercion to its declared EMITS type unchanged, with no NULL
+/// introduced — across `int`→`long`, `float`→`double`, a scale-preserving
+/// decimal widening, and `date`→`timestamp`.
+#[test]
+fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch() {
+    use arrow::array::{
+        Array, Decimal128Array, Float64Array, Int64Array, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{Field, TimeUnit};
+
+    // `int` -> `long`: the source file's value sits at the narrow `int32`
+    // boundary, but the column already carries Arrow `Int64` (the scan's
+    // column-binding adapter already cast it). Declared "DECIMAL(20,0)" (the
+    // `long` binning) parses to precision 20 — above the Int64 threshold of
+    // 18 — so the target is `Decimal128(20,0)`, a genuine cast.
+    let int_boundary = i32::MAX as i64;
+    let long_col: Arc<dyn arrow::array::Array> = Arc::new(Int64Array::from(vec![int_boundary]));
+
+    // `float` -> `double`: value at the narrow `float32` boundary, already
+    // stored as Arrow `Float64`. Declared "DOUBLE PRECISION" maps to
+    // `Float64` — an identity target, proven via the same generic path.
+    let double_boundary = f32::MAX as f64;
+    let double_col: Arc<dyn arrow::array::Array> =
+        Arc::new(Float64Array::from(vec![double_boundary]));
+
+    // `decimal(15,5)` -> `decimal(20,5)`: value at the narrow decimal(15,5)
+    // boundary (15 nines), already stored as Arrow `Decimal128(20,5)`.
+    // Declared "DECIMAL(20,5)" has scale > 0, so `exasol_type_to_arrow`
+    // returns `Decimal128(20,5)` — again an identity target.
+    let decimal_boundary: i128 = 999_999_999_999_999;
+    let decimal_col: Arc<dyn arrow::array::Array> = Arc::new(
+        Decimal128Array::from(vec![decimal_boundary])
+            .with_precision_and_scale(20, 5)
+            .unwrap(),
+    );
+
+    // `date` -> `timestamp without time zone`: value at the Delta-protocol
+    // date boundary (9999-12-31 23:59:59 UTC), already stored as Arrow
+    // `Timestamp(Microsecond, None)` (the current, widened type). Declared
+    // "TIMESTAMP" maps to the same Arrow type — an identity target.
+    let timestamp_boundary: i64 = 253_402_300_799_000_000;
+    let timestamp_col: Arc<dyn arrow::array::Array> =
+        Arc::new(TimestampMicrosecondArray::from(vec![timestamp_boundary]));
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c_long", DataType::Int64, false),
+        Field::new("c_double", DataType::Float64, false),
+        Field::new("c_decimal", DataType::Decimal128(20, 5), false),
+        Field::new(
+            "c_timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![long_col, double_col, decimal_col, timestamp_col],
+    )
+    .unwrap();
+
+    let exa_types = vec![
+        "DECIMAL(20,0)".to_string(),
+        "DOUBLE PRECISION".to_string(),
+        "DECIMAL(20,5)".to_string(),
+        "TIMESTAMP".to_string(),
+    ];
+
+    let coerced = coerce_batch_to_exa_types(batch, &exa_types)
+        .expect("an already-widened value must coerce without error");
+
+    assert_eq!(coerced.num_rows(), 1);
+
+    let long_out = coerced
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("c_long must coerce to Decimal128 (DECIMAL(20,0) precision > 18)");
+    assert_eq!(long_out.data_type(), &DataType::Decimal128(20, 0));
+    assert!(!long_out.is_null(0), "widened long value must not be NULL");
+    assert_eq!(
+        long_out.value(0),
+        int_boundary as i128,
+        "long value at the int32 boundary must round-trip unchanged"
+    );
+
+    let double_out = coerced
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("c_double must remain Float64 (DOUBLE PRECISION target)");
+    assert!(
+        !double_out.is_null(0),
+        "widened double value must not be NULL"
+    );
+    assert_eq!(
+        double_out.value(0),
+        double_boundary,
+        "double value at the float32 boundary must round-trip unchanged"
+    );
+
+    let decimal_out = coerced
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("c_decimal must remain Decimal128(20,5)");
+    assert_eq!(decimal_out.data_type(), &DataType::Decimal128(20, 5));
+    assert!(
+        !decimal_out.is_null(0),
+        "widened decimal value must not be NULL"
+    );
+    assert_eq!(
+        decimal_out.value(0),
+        decimal_boundary,
+        "decimal value at the decimal(15,5) boundary must round-trip unchanged"
+    );
+
+    let timestamp_out = coerced
+        .column(3)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("c_timestamp must remain Timestamp(Microsecond, None)");
+    assert!(
+        !timestamp_out.is_null(0),
+        "widened timestamp value must not be NULL"
+    );
+    assert_eq!(
+        timestamp_out.value(0),
+        timestamp_boundary,
+        "timestamp value at the date boundary must round-trip unchanged"
+    );
+}

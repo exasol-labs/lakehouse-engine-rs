@@ -1,5 +1,5 @@
 use delta_kernel::schema::{
-    ColumnMetadataKey, DataType, MetadataValue, PrimitiveType, StructField, StructType,
+    ColumnMetadataKey, DataType, DecimalType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::table_features::ColumnMappingMode;
 use exasol_udf_sdk::error::UdfError;
@@ -40,12 +40,23 @@ type DeltaTableSchema = (Vec<LogicalField>, Vec<String>, Vec<RefusedColumn>);
 /// recorded in the returned refused list, naming the reason its type cannot be rendered faithfully.
 /// A refused column never fails this call by itself — refusing the whole table when NO column is
 /// mappable is the caller's decision, made once every column has been classified. A [`UdfError`]
-/// surfaces from this call only when a MAPPABLE column carries a malformed column-mapping
-/// annotation, below. Performs no Delta reader-feature gating.
+/// surfaces from this call for two reasons only: a MAPPABLE column carries a malformed
+/// column-mapping annotation, or any column carries a malformed `delta.typeChanges` annotation.
+/// An UNSUPPORTED (as opposed to malformed) recorded type change refuses only its own column and
+/// never fails the call. Performs no Delta reader-feature gating.
 ///
 /// A column's TYPE is classified BEFORE its `delta.columnMapping.*` binding key is ever read: a
 /// refused column's binding key is never looked up, so a column is refused for its type and never
 /// for an annotation on a column this engine will not read.
+///
+/// A column whose type classifies successfully is then checked against its OWN recorded
+/// `delta.typeChanges` history: an entry whose `fromType`/`toType` pair the Delta protocol's
+/// type-widening feature does not support refuses the column, naming both types, through the SAME
+/// refused-column list — the reader obligation `PROTOCOL.md` § Reader Requirements for Type
+/// Widening states as *"validate that they support all type changes … and fail when finding any
+/// unsupported type change"*. This check runs BEFORE the binding-key lookup too, for the same
+/// reason: a column refused for an unsupported recorded change is never also failed for a missing
+/// column-mapping annotation.
 ///
 /// Under `id`/`name` column mapping a MAPPABLE column's binding key comes from its
 /// `delta.columnMapping.*` annotations ALONE: a column missing either annotation, or carrying an id
@@ -70,6 +81,15 @@ pub(super) fn build_delta_table_schema(
                 continue;
             }
         };
+
+        if let Some(change) = unsupported_type_change(field)? {
+            refused_columns.push(RefusedColumn {
+                column_name: field.name().clone(),
+                reason: type_change_refusal(field.name(), &change.from_type, &change.to_type),
+            });
+            continue;
+        }
+
         let (field_id, physical_name) = binding_key(field, column_mapping_mode)?;
         logical_fields.push(LogicalField {
             field_id,
@@ -82,6 +102,12 @@ pub(super) fn build_delta_table_schema(
     }
 
     Ok((logical_fields, partition_columns, refused_columns))
+}
+
+fn unsupported_type_change(field: &StructField) -> Result<Option<RecordedTypeChange>, UdfError> {
+    Ok(recorded_type_changes(field)?
+        .into_iter()
+        .find(|change| !is_supported_type_change(change)))
 }
 
 /// The ONE binding key `field`'s logical field carries, as the `(field_id, physical_name)` pair
@@ -194,8 +220,9 @@ fn unusable_column_mapping(
 ///
 /// Refusing a column is an expected outcome of reading a Delta schema — never a failure of it —
 /// so it is answered as a value rather than signalled as an error and converted back to data one
-/// line later. That leaves a [`UdfError`] out of [`build_delta_table_schema`] meaning exactly one
-/// thing: a MAPPABLE column carries a malformed column-mapping annotation.
+/// line later. That leaves a [`UdfError`] out of [`build_delta_table_schema`] meaning a MALFORMED
+/// annotation — either column-mapping or `delta.typeChanges` — never anything else; a refused
+/// column is still answered as a value, never as an error.
 enum ClassifiedDeltaColumn {
     Tag(String),
     Refused(String),
@@ -288,4 +315,177 @@ fn variant_refusal(column_name: &str) -> String {
         "Delta column '{column_name}' has type 'variant', whose on-disk form is an opaque \
          (metadata, value) binary pair this engine cannot render as a meaningful value"
     )
+}
+
+/// The `delta.typeChanges` metadata key, quoted from the Delta protocol's § Type Change Metadata.
+const TYPE_CHANGES_KEY: &str = "delta.typeChanges";
+
+/// One recorded entry of a Delta field's `delta.typeChanges` metadata: a single type change the
+/// table schema declares as applied to this field, per § Type Change Metadata. `from_type` and
+/// `to_type` are the RAW `fromType`/`toType` strings the entry carries — `"byte"`, `"long"`,
+/// `"decimal(10,2)"`, and so on — left unparsed because interpreting them against the protocol's
+/// supported-pair rule is a separate concern from reading the entry's shape. An entry's optional
+/// `fieldPath` — present only "When updating the type of a map key/value or array element", per
+/// the protocol — is validated for shape alone and not retained: no production code reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedTypeChange {
+    from_type: String,
+    to_type: String,
+}
+
+fn type_change_refusal(column_name: &str, from_type: &str, to_type: &str) -> String {
+    format!(
+        "Delta column '{column_name}' records a 'delta.typeChanges' entry from '{from_type}' to \
+         '{to_type}', which the Delta protocol's type-widening feature does not support: readers \
+         must fail on any unsupported recorded type change"
+    )
+}
+
+/// Parses `field`'s `delta.typeChanges` metadata into its recorded type-change entries.
+///
+/// Validates only the entry's SHAPE, never whether the recorded change is one this engine
+/// supports — that predicate belongs to the Delta protocol validation this parser feeds, not to
+/// reading the annotation. Returns an empty list for a field carrying no `delta.typeChanges` key,
+/// so an unannotated table (or column) is unaffected. Ignores every entry key besides `fromType`,
+/// `toType`, and `fieldPath` — notably `tableVersion`, which the superseded accepted RFC required
+/// and which Delta 3.2-era clients still write on every entry, including all thirteen entries of
+/// the vendored `type-widening` fixture — because rejecting an unrecognized key would refuse an
+/// otherwise valid, protocol-conformant entry for carrying one.
+fn recorded_type_changes(field: &StructField) -> Result<Vec<RecordedTypeChange>, UdfError> {
+    let Some(value) = field.metadata().get(TYPE_CHANGES_KEY) else {
+        return Ok(Vec::new());
+    };
+    let MetadataValue::Other(json) = value else {
+        return Err(malformed_type_change(
+            field,
+            format!("{TYPE_CHANGES_KEY} is '{value}', which is not a JSON list"),
+        ));
+    };
+    let entries = json.as_array().ok_or_else(|| {
+        malformed_type_change(
+            field,
+            format!("{TYPE_CHANGES_KEY} is '{json}', which is not a JSON list"),
+        )
+    })?;
+
+    entries
+        .iter()
+        .map(|entry| parse_type_change_entry(field, entry))
+        .collect()
+}
+
+fn parse_type_change_entry(
+    field: &StructField,
+    entry: &serde_json::Value,
+) -> Result<RecordedTypeChange, UdfError> {
+    let object = entry.as_object().ok_or_else(|| {
+        malformed_type_change(field, format!("entry '{entry}' is not a JSON object"))
+    })?;
+
+    let from_type = required_type_change_string(field, object, "fromType")?;
+    let to_type = required_type_change_string(field, object, "toType")?;
+    match object.get("fieldPath") {
+        None | Some(serde_json::Value::String(_)) => {}
+        Some(other) => {
+            return Err(malformed_type_change(
+                field,
+                format!("fieldPath is '{other}', which is not a string"),
+            ));
+        }
+    }
+
+    Ok(RecordedTypeChange { from_type, to_type })
+}
+
+fn required_type_change_string(
+    field: &StructField,
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, UdfError> {
+    match object.get(key) {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(other) => Err(malformed_type_change(
+            field,
+            format!("{key} is '{other}', which is not a string"),
+        )),
+        None => Err(malformed_type_change(field, format!("{key} is absent"))),
+    }
+}
+
+fn malformed_type_change(field: &StructField, problem: String) -> UdfError {
+    UdfError::User(format!(
+        "Delta column '{}' carries a malformed '{TYPE_CHANGES_KEY}' entry: {problem}",
+        field.name(),
+    ))
+}
+
+/// The precision the Delta protocol gives a `Byte`, `Short`, or `Int` source when the target is a
+/// decimal. All three are stored as `INT32`, so the protocol's supported target is
+/// `Decimal(10 + k1, k2)` for every one of them — never a target derived from the declared source
+/// type's own narrower range.
+const INT32_SOURCE_DECIMAL_PRECISION: u8 = 10;
+
+/// The precision the Delta protocol gives a `Long` source when the target is a decimal:
+/// `Decimal(20 + k1, k2)`, `INT64` being the physical form.
+const INT64_SOURCE_DECIMAL_PRECISION: u8 = 20;
+
+/// Answers whether the Delta protocol's type-widening feature supports the change `change`
+/// records, per § Type Widening's supported list — the check § Reader Requirements for Type
+/// Widening makes a reader obligation: *"Readers must validate that they support all type changes
+/// in the `delta.typeChanges` field … and fail when finding any unsupported type change."*
+///
+/// Answers the protocol's list and nothing else. `long` → `double` is REFUSED: the floating-point
+/// bullet names `Byte`, `Short` or `Int` and omits `Long`, which is lossy above 2^53, so a cast
+/// arrow-cast will happily perform is still not a change any conforming writer records.
+///
+/// `field_path` is deliberately not read. It names a map key/value or an array element, and this
+/// engine refuses `map` outright and text-renders `array<E>`, so no scalar value is at risk and
+/// parsing the nested path grammar would buy nothing.
+///
+/// A `fromType`/`toType` that is not a Delta primitive type name answers `false` — one more pair
+/// the protocol's list does not contain. It is not a malformed entry: [`recorded_type_changes`]
+/// owns the entry's shape, and every type change the protocol defines is primitive to primitive.
+fn is_supported_type_change(change: &RecordedTypeChange) -> bool {
+    match (
+        parse_delta_type(&change.from_type),
+        parse_delta_type(&change.to_type),
+    ) {
+        (Some(from), Some(to)) => widens(&from, &to),
+        _ => false,
+    }
+}
+
+fn widens(from: &PrimitiveType, to: &PrimitiveType) -> bool {
+    use PrimitiveType::*;
+    match (from, to) {
+        (Byte, Short | Integer | Long) | (Short, Integer | Long) | (Integer, Long) => true,
+        (Float, Double) => true,
+        (Byte | Short | Integer, Double) => true,
+        (Date, TimestampNtz) => true,
+        (Decimal(source), Decimal(target)) => {
+            widens_decimal((source.precision(), source.scale()), target)
+        }
+        (Byte | Short | Integer, Decimal(target)) => {
+            widens_decimal((INT32_SOURCE_DECIMAL_PRECISION, 0), target)
+        }
+        (Long, Decimal(target)) => widens_decimal((INT64_SOURCE_DECIMAL_PRECISION, 0), target),
+        _ => false,
+    }
+}
+
+/// The protocol's decimal rule: `Decimal(p, s)` → `Decimal(p + k1, s + k2)` where `k1 >= k2 >= 0`.
+/// `k1 >= k2` forbids the INTEGRAL digit count shrinking, which makes this strictly stronger than
+/// "precision and scale may both grow" — `decimal(10,1)` → `decimal(11,3)` grows both and is
+/// still refused.
+fn widens_decimal((from_precision, from_scale): (u8, u8), to: &DecimalType) -> bool {
+    let precision_growth = i32::from(to.precision()) - i32::from(from_precision);
+    let scale_growth = i32::from(to.scale()) - i32::from(from_scale);
+    scale_growth >= 0 && precision_growth >= scale_growth
+}
+
+/// Parses a raw `fromType`/`toType` name with the SAME deserializer the table's `schemaString` is
+/// read by, so the two can never disagree on a spelling — including `decimal(p,s)`, whose grammar
+/// would otherwise have a second owner here.
+fn parse_delta_type(raw: &str) -> Option<PrimitiveType> {
+    serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
 }

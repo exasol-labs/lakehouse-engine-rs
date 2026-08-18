@@ -181,9 +181,18 @@ TABLES = [
     ("unshredded_variant", "unshredded-variant",
         [("id","long",False),("v","variant",False),("array_of_variants","array",False),
          ("struct_of_variants","struct",False),("map_of_variants","map",False)]),
-    ("type_widening", "type-widening",
-        [("int_long","long",False),("float_double","double",False),
-         ("decimal_decimal_same_scale","decimal(20,2)",False)]),
+    # #349 type widening: registers all 13 columns of the vendored fixture at
+    # their WIDENED Delta type (commit 2's schema) so every widening pair gets
+    # live E2E coverage; the fixture's own bytes are unchanged (decision [3]).
+    ("type_widening", "type-widening", [
+        ("byte_long","long",False),("int_long","long",False),
+        ("float_double","double",False),("byte_double","double",False),
+        ("short_double","double",False),("int_double","double",False),
+        ("decimal_decimal_same_scale","decimal(20,2)",False),
+        ("decimal_decimal_greater_scale","decimal(20,5)",False),
+        ("byte_decimal","decimal(4,1)",False),("short_decimal","decimal(6,1)",False),
+        ("int_decimal","decimal(11,1)",False),("long_decimal","decimal(21,1)",False),
+        ("date_timestamp_ntz","timestamp_ntz",False)]),
 ]
 
 # Delta/Spark type -> (UC type_name, type_json spark type, precision, scale)

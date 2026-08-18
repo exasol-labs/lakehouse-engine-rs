@@ -2468,8 +2468,8 @@ async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
             serde_json::json!({
                 "minReaderVersion": 3,
                 "minWriterVersion": 7,
-                "readerFeatures": ["typeWidening-preview"],
-                "writerFeatures": ["typeWidening-preview"],
+                "readerFeatures": ["variantType"],
+                "writerFeatures": ["variantType"],
             }),
         ),
     )])
@@ -2502,9 +2502,9 @@ async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_colum
         other => panic!("every refusal must be a user error, got {other:?}"),
     };
     assert!(
-        message.contains("typeWidening-preview") && message.contains("#349"),
-        "the refusal must be the protocol gate's own message, naming the feature and citing \
-         #349: {message}"
+        message.contains("variantType"),
+        "the refusal must be the protocol gate's own message, naming the unsupported feature: \
+         {message}"
     );
 }
 

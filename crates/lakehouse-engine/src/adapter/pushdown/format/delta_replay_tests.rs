@@ -172,14 +172,13 @@ const SYNTHETIC_COMMIT_ZERO: &str = "00000000000000000000.json";
 
 const SYNTHETIC_ADD: &str = r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true}}"#;
 
-/// A log declaring a reader feature this engine does not implement, alongside an
-/// allow-listed one and the `delta.enableTypeWidening` property a real widened table
-/// carries — so `delta_kernel` itself reads this log without complaint and the refusal
-/// can only come from this engine's own gate.
+/// A log declaring a reader feature this engine does not implement (`variantType`),
+/// alongside an allow-listed one — so `delta_kernel` itself reads this log without
+/// complaint and the refusal can only come from this engine's own gate.
 const SYNTHETIC_REFUSED_PREAMBLE: &str = concat!(
-    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["typeWidening-preview","deletionVectors"],"writerFeatures":["typeWidening-preview","deletionVectors"]}}"#,
+    r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["variantType","deletionVectors"],"writerFeatures":["variantType","deletionVectors"]}}"#,
     "\n",
-    r#"{"metaData":{"id":"synthetic-refused","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableTypeWidening":"true"},"createdTime":1}}"#,
+    r#"{"metaData":{"id":"synthetic-refused","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1}}"#,
     "\n",
 );
 
@@ -642,8 +641,8 @@ async fn an_unsupported_reader_feature_is_refused_before_any_schema_or_file_read
 
     let message = error.to_string();
     assert!(
-        message.contains("typeWidening-preview") && message.contains("#349"),
-        "the refusal names the unsupported feature and cites its tracker: {message}"
+        message.contains("variantType"),
+        "the refusal names the unsupported feature: {message}"
     );
     assert!(
         message.contains(SYNTHETIC_ROOT),
@@ -701,6 +700,7 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
         "basic_partitioned",
         "cdf-column-mapping-id-mode",
         "cdf-column-mapping-name-mode",
+        "type-widening",
     ] {
         let snapshot = DeltaSnapshot::open(local_store(), &fixture_root(table))
             .unwrap_or_else(|error| panic!("{table} has only allow-listed features: {error}"));
@@ -711,32 +711,104 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
     }
 }
 
-/// Scenario: A reader feature outside the allow-list refuses the table before any log replay
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its
+/// column
 ///
-/// `type-widening` declares `typeWidening-preview` and `unshredded-variant` declares
-/// `variantType-preview`, neither of which this engine implements, over the real
-/// vendored fixture logs rather than a synthetic one.
+/// Over the vendored `type-widening` fixture, whose commit-2 `schemaString` records a
+/// `delta.typeChanges` entry on every one of its thirteen columns. Eleven pairs are on the
+/// protocol's supported list; `byte_decimal` and `short_decimal` derive a negative `k1` against the
+/// protocol's fixed base-10 precision for a `Byte`/`Short`/`Int` source, so they fail
+/// `k1 >= k2 >= 0` and are refused one column at a time while the other eleven stay queryable.
 #[test]
-fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refused() {
-    for (table, unsupported_feature) in [
-        ("type-widening", "typeWidening-preview"),
-        ("unshredded-variant", "variantType-preview"),
-    ] {
-        let root = fixture_root(table);
-        let error = DeltaSnapshot::open(local_store(), &root)
-            .err()
-            .unwrap_or_else(|| panic!("{table} declares a reader feature outside the allow-list"));
+fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
+    const QUERYABLE_COLUMNS: [&str; 11] = [
+        "byte_long",
+        "int_long",
+        "float_double",
+        "byte_double",
+        "short_double",
+        "int_double",
+        "decimal_decimal_same_scale",
+        "decimal_decimal_greater_scale",
+        "int_decimal",
+        "long_decimal",
+        "date_timestamp_ntz",
+    ];
+    const REFUSED_COLUMNS: [(&str, &str, &str); 2] = [
+        ("byte_decimal", "byte", "decimal(4,1)"),
+        ("short_decimal", "short", "decimal(6,1)"),
+    ];
 
-        let message = error.to_string();
+    let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("type-widening"))
+        .expect("the type-widening fixture declares only allow-listed reader features");
+
+    let (logical_fields, _partition_columns, refused_columns) =
+        super::super::delta_schema::build_delta_table_schema(
+            &snapshot.schema(),
+            snapshot.column_mapping_mode(),
+            snapshot.partition_columns(),
+        )
+        .expect("an unsupported recorded change is answered as a refused column, never an error");
+
+    let mapped: Vec<&str> = logical_fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(
+        mapped, QUERYABLE_COLUMNS,
+        "the eleven columns whose recorded change the protocol supports stay queryable, in schema \
+         order"
+    );
+
+    let refused: Vec<&str> = refused_columns
+        .iter()
+        .map(|column| column.column_name.as_str())
+        .collect();
+    assert_eq!(
+        refused,
+        REFUSED_COLUMNS.map(|(column_name, _, _)| column_name),
+        "only the two columns whose recorded change derives a negative k1 are refused"
+    );
+
+    for (column, (column_name, from_type, to_type)) in refused_columns.iter().zip(REFUSED_COLUMNS) {
+        let reason = &column.reason;
         assert!(
-            message.contains(unsupported_feature),
-            "{table}'s refusal names its unsupported feature: {message}"
+            reason.contains(&format!("'{column_name}'")),
+            "the refusal names the column it scopes to: {reason}"
         );
         assert!(
-            message.contains(&root),
-            "{table}'s refusal names the table root it was given: {message}"
+            reason.contains(&format!("'{from_type}'")),
+            "the refusal names the recorded source type: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("'{to_type}'")),
+            "the refusal names the recorded target type: {reason}"
         );
     }
+}
+
+/// Scenario: A reader feature outside the allow-list refuses the table before any log replay
+///
+/// `unshredded-variant` declares `variantType-preview`, which this engine does not implement,
+/// over the real vendored fixture log rather than a synthetic one.
+#[test]
+fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refused() {
+    let table = "unshredded-variant";
+    let unsupported_feature = "variantType-preview";
+    let root = fixture_root(table);
+    let error = DeltaSnapshot::open(local_store(), &root)
+        .err()
+        .unwrap_or_else(|| panic!("{table} declares a reader feature outside the allow-list"));
+
+    let message = error.to_string();
+    assert!(
+        message.contains(unsupported_feature),
+        "{table}'s refusal names its unsupported feature: {message}"
+    );
+    assert!(
+        message.contains(&root),
+        "{table}'s refusal names the table root it was given: {message}"
+    );
 }
 
 /// The `name`-mode physical name the synthetic `void` table assigns its mappable

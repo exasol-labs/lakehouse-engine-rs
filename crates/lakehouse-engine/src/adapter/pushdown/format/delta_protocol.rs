@@ -30,7 +30,7 @@ pub(crate) fn ensure_readable(
     let mut refused: Vec<String> = features
         .iter()
         .filter(|f| !is_allow_listed(f))
-        .map(describe_refused_feature)
+        .map(|f| f.to_string())
         .collect();
     if refused.is_empty() {
         return Ok(());
@@ -42,21 +42,14 @@ pub(crate) fn ensure_readable(
     )))
 }
 
-fn describe_refused_feature(feature: &TableFeature) -> String {
-    match feature {
-        TableFeature::TypeWidening | TableFeature::TypeWideningPreview => {
-            format!("{feature} (tracked as issue #349)")
-        }
-        other => other.to_string(),
-    }
-}
-
 fn is_allow_listed(feature: &TableFeature) -> bool {
     matches!(
         feature,
         TableFeature::ColumnMapping
             | TableFeature::DeletionVectors
             | TableFeature::TimestampWithoutTimezone
+            | TableFeature::TypeWidening
+            | TableFeature::TypeWideningPreview
             | TableFeature::V2Checkpoint
             | TableFeature::VacuumProtocolCheck
     )

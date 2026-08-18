@@ -529,3 +529,328 @@ fn an_array_inherits_its_element_types_refusal_at_any_nesting_depth() {
         }
     }
 }
+
+// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
+// unsupported one refuses its column
+#[test]
+fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
+    let field = StructField::not_null("plain", DataType::INTEGER);
+
+    let changes = recorded_type_changes(&field).expect("an unannotated field parses cleanly");
+
+    assert!(changes.is_empty());
+}
+
+/// A field carrying OTHER metadata but no `delta.typeChanges` key still parses to an empty list —
+/// the key's absence, not the field's overall metadata shape, decides.
+#[test]
+fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list() {
+    let field = mapped_field("a", 1, "col-a");
+
+    let changes = recorded_type_changes(&field).expect("no delta.typeChanges key at all");
+
+    assert!(changes.is_empty());
+}
+
+/// Verbatim shape of one entry from the vendored `type-widening` fixture's commit 2
+/// `schemaString`, `tableVersion` included — Delta 3.2-era clients still write the superseded RFC
+/// key on every entry, and it must be ignored rather than refused.
+#[test]
+fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
+    let field = StructField::nullable("byte_long", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([
+            {"toType": "long", "fromType": "byte", "tableVersion": 2}
+        ])),
+    )]);
+
+    let changes = recorded_type_changes(&field).expect("a well-formed entry must parse");
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].from_type, "byte");
+    assert_eq!(changes[0].to_type, "long");
+}
+
+#[test]
+fn parses_multiple_entries_and_ignores_an_optional_field_path() {
+    let field = StructField::nullable("m", DataType::STRING).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([
+            {"fromType": "byte", "toType": "long"},
+            {"fromType": "integer", "toType": "long", "fieldPath": "value"}
+        ])),
+    )]);
+
+    let changes = recorded_type_changes(&field).expect("both entries must parse");
+
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[0], type_change("byte", "long"));
+    assert_eq!(changes[1], type_change("integer", "long"));
+}
+
+#[test]
+fn a_non_list_type_changes_value_is_refused_naming_the_column() {
+    let field = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::String("not-a-list".to_string()),
+    )]);
+
+    let err = recorded_type_changes(&field).expect_err("a non-list value must be refused");
+    let message = user_message(err);
+
+    assert!(message.contains("'bad'"), "message was: {message}");
+    assert!(
+        message.contains("delta.typeChanges"),
+        "message was: {message}"
+    );
+}
+
+#[test]
+fn a_non_object_entry_is_refused_naming_the_column() {
+    let field = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!(["not-an-object"])),
+    )]);
+
+    let err = recorded_type_changes(&field).expect_err("a non-object entry must be refused");
+    let message = user_message(err);
+
+    assert!(message.contains("'bad'"), "message was: {message}");
+}
+
+#[test]
+fn an_entry_missing_or_misshaping_fromtype_or_totype_is_refused_naming_the_column() {
+    let missing_from = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([{"toType": "long"}])),
+    )]);
+    let missing_to = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([{"fromType": "byte"}])),
+    )]);
+    let non_string_from = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([{"fromType": 1, "toType": "long"}])),
+    )]);
+
+    for field in [missing_from, missing_to, non_string_from] {
+        let err = recorded_type_changes(&field).expect_err("a malformed entry must be refused");
+        let message = user_message(err);
+        assert!(message.contains("'bad'"), "message was: {message}");
+    }
+}
+
+#[test]
+fn a_non_string_field_path_is_refused_naming_the_column() {
+    let field = StructField::nullable("bad", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([
+            {"fromType": "byte", "toType": "long", "fieldPath": 7}
+        ])),
+    )]);
+
+    let err = recorded_type_changes(&field).expect_err("a non-string fieldPath must be refused");
+    let message = user_message(err);
+
+    assert!(message.contains("'bad'"), "message was: {message}");
+    assert!(message.contains("fieldPath"), "message was: {message}");
+}
+
+fn type_change(from_type: &str, to_type: &str) -> RecordedTypeChange {
+    RecordedTypeChange {
+        from_type: from_type.to_string(),
+        to_type: to_type.to_string(),
+    }
+}
+
+/// Every `fromType`/`toType` pair the Delta protocol's § Type Widening lists, spelled as the Delta
+/// schema spells them. `decimal(10,2)` -> `decimal(10,2)` is the `k1 = k2 = 0` corner the
+/// protocol's own formula admits.
+const PROTOCOL_SUPPORTED_PAIRS: &[(&str, &str)] = &[
+    ("byte", "short"),
+    ("byte", "integer"),
+    ("byte", "long"),
+    ("short", "integer"),
+    ("short", "long"),
+    ("integer", "long"),
+    ("float", "double"),
+    ("byte", "double"),
+    ("short", "double"),
+    ("integer", "double"),
+    ("date", "timestamp_ntz"),
+    ("decimal(10,2)", "decimal(10,2)"),
+    ("decimal(10,2)", "decimal(20,2)"),
+    ("decimal(10,2)", "decimal(20,5)"),
+    ("decimal(10,1)", "decimal(12,3)"),
+    ("byte", "decimal(10,0)"),
+    ("short", "decimal(12,2)"),
+    ("integer", "decimal(11,1)"),
+    ("long", "decimal(20,0)"),
+    ("long", "decimal(21,1)"),
+];
+
+#[test]
+fn every_pair_the_protocol_lists_is_supported() {
+    let refused: Vec<&(&str, &str)> = PROTOCOL_SUPPORTED_PAIRS
+        .iter()
+        .filter(|(from_type, to_type)| !is_supported_type_change(&type_change(from_type, to_type)))
+        .collect();
+
+    assert!(
+        refused.is_empty(),
+        "pairs the protocol lists but this engine refused: {refused:?}"
+    );
+}
+
+/// The floating-point bullet names `Byte`, `Short` or `Int` and omits `Long`, which is lossy above
+/// 2^53. arrow-cast performs the cast regardless — `scan/type_relaxation_tests.rs` pins that — so
+/// castability is no evidence of protocol support.
+#[test]
+fn long_to_double_is_refused_because_the_protocol_omits_it() {
+    assert!(!is_supported_type_change(&type_change("long", "double")));
+}
+
+/// `decimal(10,1)` -> `decimal(11,3)` grows BOTH precision and scale, so the `P' >= P && S' >= S`
+/// paraphrase accepts it; the protocol's `k1 >= k2 >= 0` refuses it because the integral digit
+/// count shrinks from 9 to 8.
+#[test]
+fn a_decimal_target_is_checked_as_k1_ge_k2_ge_0_not_as_precision_and_scale_both_growing() {
+    assert!(!is_supported_type_change(&type_change(
+        "decimal(10,1)",
+        "decimal(11,3)"
+    )));
+    assert!(is_supported_type_change(&type_change(
+        "decimal(10,1)",
+        "decimal(12,3)"
+    )));
+}
+
+#[test]
+fn a_decimal_target_narrowing_precision_or_scale_is_refused() {
+    for (from_type, to_type) in [
+        ("decimal(10,2)", "decimal(9,2)"),
+        ("decimal(10,2)", "decimal(10,1)"),
+        ("decimal(20,5)", "decimal(10,2)"),
+    ] {
+        assert!(
+            !is_supported_type_change(&type_change(from_type, to_type)),
+            "{from_type} -> {to_type} must be refused"
+        );
+    }
+}
+
+/// `Byte`, `Short`, and `Int` are all stored as `INT32`, so the protocol's integral-to-decimal
+/// target is `Decimal(10 + k1, k2)` for all three and `Decimal(20 + k1, k2)` for `Long` — never a
+/// target derived from the declared source type's own narrower range.
+#[test]
+fn an_integral_source_is_checked_against_the_protocols_int32_and_int64_decimal_bases() {
+    for (from_type, to_type) in [
+        ("byte", "decimal(4,1)"),
+        ("short", "decimal(6,1)"),
+        ("integer", "decimal(10,1)"),
+        ("long", "decimal(20,1)"),
+    ] {
+        assert!(
+            !is_supported_type_change(&type_change(from_type, to_type)),
+            "{from_type} -> {to_type} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_narrowing_or_unrelated_pair_is_refused() {
+    for (from_type, to_type) in [
+        ("long", "integer"),
+        ("integer", "byte"),
+        ("double", "float"),
+        ("timestamp_ntz", "date"),
+        ("date", "timestamp"),
+        ("string", "long"),
+        ("integer", "string"),
+        ("boolean", "integer"),
+    ] {
+        assert!(
+            !is_supported_type_change(&type_change(from_type, to_type)),
+            "{from_type} -> {to_type} must be refused"
+        );
+    }
+}
+
+/// A name no Delta primitive spelling matches — a nested type, another format's spelling, or a
+/// decimal outside the type's own domain — is one more pair the protocol's list does not contain.
+#[test]
+fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
+    for (from_type, to_type) in [
+        ("struct", "long"),
+        ("byte", "int"),
+        ("byte", "decimal(0,0)"),
+        ("byte", "decimal(4,9)"),
+        ("", "long"),
+    ] {
+        assert!(
+            !is_supported_type_change(&type_change(from_type, to_type)),
+            "{from_type} -> {to_type} must be refused"
+        );
+    }
+}
+
+/// An entry carrying a `fieldPath` is validated by its pair ALONE: the path names a map key/value
+/// or an array element and is never parsed.
+#[test]
+fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
+    let supported = type_change("byte", "long");
+    let unsupported = type_change("long", "double");
+
+    assert!(is_supported_type_change(&supported));
+    assert!(!is_supported_type_change(&unsupported));
+}
+
+// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
+// unsupported one refuses its column
+#[test]
+fn a_field_carrying_an_unsupported_recorded_type_change_is_refused_naming_both_types() {
+    let field = StructField::nullable("value", DataType::DOUBLE).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([
+            {"fromType": "long", "toType": "double"}
+        ])),
+    )]);
+    let schema = StructType::try_new([field]).unwrap();
+
+    let (logical_fields, _, refused_columns) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
+            .expect("an unsupported recorded type change refuses the column, not the whole call");
+
+    assert!(
+        logical_fields.is_empty(),
+        "value must carry no LogicalField once its recorded type change is unsupported"
+    );
+    assert_eq!(refused_columns.len(), 1);
+    assert_eq!(refused_columns[0].column_name, "value");
+    let message = &refused_columns[0].reason;
+    assert!(message.contains("value"), "message was: {message}");
+    assert!(message.contains("long"), "message was: {message}");
+    assert!(message.contains("double"), "message was: {message}");
+}
+
+#[test]
+fn a_field_whose_recorded_type_changes_are_all_supported_plans_normally() {
+    let field = StructField::nullable("value", DataType::LONG).with_metadata([(
+        "delta.typeChanges",
+        MetadataValue::Other(serde_json::json!([
+            {"fromType": "byte", "toType": "long"}
+        ])),
+    )]);
+    let schema = StructType::try_new([field]).unwrap();
+
+    let (logical_fields, _, refused_columns) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
+            .expect("a supported recorded type change must not fail the call");
+
+    assert!(
+        refused_columns.is_empty(),
+        "a supported recorded type change must not refuse the column"
+    );
+    assert_eq!(logical_fields.len(), 1);
+    assert_eq!(logical_fields[0].name, "value");
+}
