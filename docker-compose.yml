@@ -112,7 +112,7 @@ services:
       - lakehouse
 
   exasol:
-    image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.2.1}"
+    image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:8.29.13}"
     privileged: true
     # Give Exasol multiple CPUs so the scan UDF's shard fan-out + DataFusion
     # threading have cores to run on (the live-smoke test exercises this).

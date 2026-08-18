@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-EXASOL_IMAGE     ?= exasol/docker-db:2025.2.1
+EXASOL_IMAGE     ?= exasol/docker-db:8.29.13
 EXASOL_SYS_PASSWORD ?= exasol
 EXASOL_DB_MEM_SIZE  ?= 4 GiB
 
