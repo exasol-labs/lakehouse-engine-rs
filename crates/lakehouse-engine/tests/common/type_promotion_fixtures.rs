@@ -21,7 +21,9 @@
 //! Iceberg Java never implements that promotion at any version this stack
 //! can run, so no conforming writer can author it. Its refusal
 //! (`refuse_date_promotion`) is covered by unit tests over a synthetic
-//! `TableMetadata` alone — see decision [14] in this plan's decision log.
+//! `TableMetadata` alone — see `specs/_decision/074-add-type-relaxation.md`,
+//! "Iceberg `date` -> `timestamp` / `timestamp_ns` is refused at plan time from
+//! the schema history".
 //!
 //! Iceberg source/target types committed by the fixture SQL (the authority
 //! for these types): `int_long` `int` -> `long`; `float_double` `float` ->

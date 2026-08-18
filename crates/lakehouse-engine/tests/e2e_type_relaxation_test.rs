@@ -21,8 +21,9 @@
 //! There is no `date` -> `timestamp` promotion test here: Apache Iceberg Java
 //! never implements that promotion at any version this stack can run, so no
 //! fixture can carry it. Its refusal (`refuse_date_promotion`) is covered by
-//! unit tests over a synthetic `TableMetadata` alone — see decision [14] in
-//! `specs/_plans/add-type-relaxation/decision-log.md`.
+//! unit tests over a synthetic `TableMetadata` alone — see
+//! `specs/_decision/074-add-type-relaxation.md`, "Iceberg `date` -> `timestamp` /
+//! `timestamp_ns` is refused at plan time from the schema history".
 //!
 //! The `iceberg_type_promotion` table is authored ONCE, at stack bring-up, by
 //! the `spark-iceberg-fixtures` one-shot Compose job (see
