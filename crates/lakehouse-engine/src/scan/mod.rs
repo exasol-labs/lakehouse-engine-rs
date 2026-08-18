@@ -55,6 +55,10 @@ pub use partial_agg::{build_grouped_partial_agg_sql, build_partial_agg_sql_filte
 #[path = "test_support_tests.rs"]
 mod test_support;
 
+#[cfg(test)]
+#[path = "type_relaxation_tests.rs"]
+mod type_relaxation;
+
 /// Bounded grace period for draining background async work at runtime teardown.
 ///
 /// After the scan future returns, object_store's S3 client (hyper) may still hold

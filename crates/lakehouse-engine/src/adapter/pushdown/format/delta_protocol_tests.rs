@@ -11,16 +11,20 @@ fn user_message(err: UdfError) -> String {
 
 /// Scenario: A reader feature outside the allow-list refuses the table before any log replay
 #[test]
-fn a_reader_feature_outside_the_allow_list_is_refused_by_its_protocol_name() {
-    let features = [TableFeature::TypeWideningPreview];
+fn a_reader_feature_outside_the_allow_list_is_refused_with_no_per_feature_special_case() {
+    let features = [TableFeature::VariantType];
 
-    let err = ensure_readable(3, Some(&features))
-        .expect_err("typeWidening-preview is not on the allow-list");
+    let err =
+        ensure_readable(3, Some(&features)).expect_err("variantType is not on the allow-list");
 
     let message = user_message(err);
     assert!(
-        message.contains("typeWidening-preview"),
+        message.contains("variantType"),
         "refusal must name the feature by its protocol spelling, got: {message}"
+    );
+    assert!(
+        !message.contains("issue"),
+        "refusal must carry no per-feature special-case citation, got: {message}"
     );
 }
 
@@ -43,13 +47,13 @@ fn a_reader_version_outside_the_kernels_range_is_refused_before_any_feature_chec
 /// Scenario: A reader protocol version outside the readable range is refused
 #[test]
 fn the_version_check_runs_before_the_per_feature_check() {
-    let features = [TableFeature::TypeWideningPreview];
+    let features = [TableFeature::VariantType];
 
     let err = ensure_readable(4, Some(&features)).expect_err("reader version 4 is unreadable");
 
     let message = user_message(err);
     assert!(
-        !message.contains("typeWidening-preview"),
+        !message.contains("variantType"),
         "version check must be reported instead of the feature check, got: {message}"
     );
 }
@@ -59,16 +63,16 @@ fn the_version_check_runs_before_the_per_feature_check() {
 fn refusing_multiple_features_names_all_of_them_sorted_in_one_error() {
     let features = [
         TableFeature::VariantType,
-        TableFeature::TypeWideningPreview,
+        TableFeature::DomainMetadata,
         TableFeature::AdaptiveMetadataPreview,
     ];
 
     let err = ensure_readable(3, Some(&features)).expect_err("none of these are allow-listed");
 
     let message = user_message(err);
-    let type_widening_preview_pos = message
-        .find("typeWidening-preview")
-        .expect("message must name typeWidening-preview");
+    let domain_metadata_pos = message
+        .find("domainMetadata")
+        .expect("message must name domainMetadata");
     let adaptive_metadata_pos = message
         .find("adaptiveMetadata-preview")
         .expect("message must name adaptiveMetadata-preview");
@@ -76,35 +80,18 @@ fn refusing_multiple_features_names_all_of_them_sorted_in_one_error() {
         .find("variantType")
         .expect("message must name variantType");
     assert!(
-        adaptive_metadata_pos < type_widening_preview_pos
-            && type_widening_preview_pos < variant_type_pos,
+        adaptive_metadata_pos < domain_metadata_pos && domain_metadata_pos < variant_type_pos,
         "refused features must be sorted, got: {message}"
     );
 }
 
-/// Scenario: A reader feature outside the allow-list refuses the table before any log replay
+/// Scenario: Every allow-listed reader feature keeps its table queryable
 #[test]
-fn typewidening_variants_cite_issue_349_other_refusals_do_not() {
-    let type_widening_err = ensure_readable(3, Some(&[TableFeature::TypeWidening]))
-        .expect_err("typeWidening is not allow-listed");
-    assert!(
-        user_message(type_widening_err).contains("#349"),
-        "typeWidening refusal must cite issue #349"
-    );
-
-    let type_widening_preview_err = ensure_readable(3, Some(&[TableFeature::TypeWideningPreview]))
-        .expect_err("typeWidening-preview is not allow-listed");
-    assert!(
-        user_message(type_widening_preview_err).contains("#349"),
-        "typeWidening-preview refusal must cite issue #349"
-    );
-
-    let variant_type_err = ensure_readable(3, Some(&[TableFeature::VariantType]))
-        .expect_err("variantType is not allow-listed");
-    assert!(
-        !user_message(variant_type_err).contains("#349"),
-        "variantType refusal must not cite issue #349"
-    );
+fn both_type_widening_variants_are_allow_listed_and_pass_the_gate() {
+    ensure_readable(3, Some(&[TableFeature::TypeWidening]))
+        .expect("typeWidening is on the allow-list");
+    ensure_readable(3, Some(&[TableFeature::TypeWideningPreview]))
+        .expect("typeWidening-preview is on the allow-list");
 }
 
 /// Scenario: A legacy protocol with no reader-feature list passes the gate
@@ -142,11 +129,13 @@ fn the_readable_version_range_is_inclusive_at_both_ends() {
 
 /// Scenario: Every allow-listed reader feature together still passes the gate
 #[test]
-fn every_allow_listed_reader_feature_together_passes_the_gate() {
+fn all_seven_allow_listed_reader_features_pass_including_both_type_widening_names() {
     let features = [
         TableFeature::ColumnMapping,
         TableFeature::DeletionVectors,
         TableFeature::TimestampWithoutTimezone,
+        TableFeature::TypeWidening,
+        TableFeature::TypeWideningPreview,
         TableFeature::V2Checkpoint,
         TableFeature::VacuumProtocolCheck,
     ];

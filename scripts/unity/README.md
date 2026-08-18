@@ -36,7 +36,8 @@ docker compose -f docker-compose.yml up -d minio-init      # create warehouse bu
   | `basic_partitioned` | partition values / partition pruning | #319, #321 |
   | `multi_part_stats` | multi-file stats-based pruning | #321 |
   | `stats_all_types` | broad types: `array` maps to text VARCHAR, `map`/`struct`/`binary` refused per column; `timestampNtz` maps to TIMESTAMP | #322, #350 |
-  | `unshredded_variant` / `type_widening` | reader features outside the plan-time gate's five-feature allow-list (`variantType`/`typeWidening`, concretely) → fail-loud | #322, #349 |
+  | `unshredded_variant` | reader feature outside the plan-time gate's seven-feature allow-list (`variantType`, concretely) → fail-loud | #322 |
+  | `type_widening` | type widening read across the boundary; 11 of 13 columns queryable at their widened types, `byte_decimal`/`short_decimal` refused per column (outside the Delta protocol's supported-pair list) | #349 |
 
 - The credential Unity Catalog vends for `s3://warehouse`: `seed.sh` mints a real
   MinIO STS session (AssumeRole at MinIO's S3 endpoint, 7-day maximum) and injects

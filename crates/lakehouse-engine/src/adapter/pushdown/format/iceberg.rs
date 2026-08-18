@@ -72,6 +72,12 @@ impl FormatReader for IcebergFormatReader<'_> {
             // manifests from S3.
             let result = load_table_any_auth(self.session, self.catalog_props, creds).await?;
 
+            // Refuse a recorded `date` -> `timestamp`/`timestamp_ns` promotion from the
+            // schema history ALONE, before any manifest is loaded and before the Table
+            // is even built, so the refusal fires identically for a filtered request and
+            // an unfiltered (`SELECT *`) one.
+            refuse_date_promotion(&result.metadata, &self.catalog_props.table)?;
+
             // Resolve the effective storage (vended or static). The anchor is the
             // TABLE'S OWN location: what `storage_credentials[*].prefix` is matched
             // against, and the sole input the backend variant is read from. Nothing
@@ -310,6 +316,82 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
         mechanism.describe(),
     );
     UdfError::User(redact_credentials(&msg))
+}
+
+/// Refuse a pushdown request against an Iceberg table whose schema history records a
+/// `date` → `timestamp` or `date` → `timestamp_ns` promotion, naming the table, the
+/// column, both Iceberg types, and the tracked issue (#355).
+///
+/// The decision is read from [`iceberg::spec::TableMetadata::schemas_iter`] alone, so it
+/// spends no object-store byte and MUST run BEFORE
+/// [`ensure_supported_delete_mechanisms`]: the failure it stands in front of is raised
+/// inside manifest Avro deserialization, which every request performs — `iceberg` 0.10.0
+/// reads a `timestamp` / `timestamp_ns` bound as 8 bytes unconditionally instead of
+/// applying the spec's bounds-width inference, so a pre-promotion file's 4-byte bound
+/// surfaces as `failed to convert byte slice to array`, naming neither column nor
+/// promotion, and a second bounds decode in the same crate `unwrap()`s, giving the shape a
+/// reachable panic path. Gating on that decode error would therefore sit downstream of a
+/// panic and depend on an error string; gating on the schema history refuses an unfiltered
+/// `SELECT *` exactly as it refuses a filtered request.
+///
+/// A promotion counts as recorded when ANY schema in the history declares the field id as
+/// `date`. Position within [`iceberg::spec::TableMetadata::schemas_iter`] is not consulted:
+/// the current schema already declares the field `timestamp` / `timestamp_ns`, so it can
+/// never match, and any other schema that ever declared it `date` could have written a
+/// still-live 4-byte-bound file. The whole field-id index is walked, so a promoted field
+/// nested inside a struct, list, or map is caught too — manifest bounds are keyed by field
+/// id, not by nesting depth.
+///
+/// DELIBERATELY CONSERVATIVE: the refusal fires on the RECORDED PROMOTION ALONE, WITHOUT
+/// checking whether any pre-promotion data file still exists. A table whose files were ALL
+/// rewritten after the promotion carries only 8-byte bounds and would read fine, and is
+/// refused anyway. That over-refusal is intentional and accepted, not a defect —
+/// establishing that no pre-promotion file remains requires reading every manifest, which
+/// is the very operation that fails.
+fn refuse_date_promotion(
+    metadata: &iceberg::spec::TableMetadata,
+    table_name: &str,
+) -> Result<(), UdfError> {
+    use iceberg::spec::PrimitiveType;
+
+    let current = metadata.current_schema();
+    let mut fields: Vec<_> = current.field_id_to_fields().values().collect();
+    fields.sort_by_key(|field| field.id);
+
+    for field in fields {
+        let Some(current_type @ (PrimitiveType::Timestamp | PrimitiveType::TimestampNs)) =
+            field.field_type.as_primitive_type()
+        else {
+            continue;
+        };
+        let promoted_from_date = metadata.schemas_iter().any(|schema| {
+            matches!(
+                schema
+                    .field_by_id(field.id)
+                    .and_then(|earlier| earlier.field_type.as_primitive_type()),
+                Some(PrimitiveType::Date)
+            )
+        });
+        if !promoted_from_date {
+            continue;
+        }
+        let column = current
+            .name_by_field_id(field.id)
+            .unwrap_or(field.name.as_str());
+        let msg = format!(
+            "lakehouse pushdown declined for table '{table_name}': column '{column}' is \
+             declared Iceberg type '{current_type}' in the current schema and 'date' in an \
+             earlier one, and this engine cannot read that promotion — `iceberg` 0.10.0 \
+             omits the spec's bounds-width inference for '{current_type}', so a \
+             pre-promotion data file's 4-byte manifest bound fails to decode; tracked as \
+             issue #355. The refusal is deliberately conservative: it fires on the recorded \
+             promotion alone, even for a table whose data files have all been rewritten \
+             since"
+        );
+        return Err(UdfError::User(redact_credentials(&msg)));
+    }
+
+    Ok(())
 }
 
 /// Fail loud at plan time if the table's current snapshot uses ANY delete/data

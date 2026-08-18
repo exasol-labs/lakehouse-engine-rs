@@ -999,3 +999,90 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
         );
     }
 }
+
+// Scenario Coverage (iceberg-type-promotion): The unknown primitive type is unrepresentable, and
+// the mapping is the tripwire
+//
+// `iceberg_primitive_to_exasol` and `iceberg_primitive_to_arrow` are each an EXHAUSTIVE match over
+// `iceberg::spec::PrimitiveType` with no catch-all arm, so an `iceberg` upgrade that adds a variant
+// fails the BUILD with a compile error — that is a build event, not something a running test could
+// observe. `expected_mapping` is a third such match, so it fails that same build alongside them;
+// what it adds on top is an answer written independently of production for every variant, so each
+// variant that does compile has both its Exasol type string and its Arrow `DataType` asserted.
+#[test]
+fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build() {
+    let every_variant = [
+        PrimitiveType::Boolean,
+        PrimitiveType::Int,
+        PrimitiveType::Long,
+        PrimitiveType::Float,
+        PrimitiveType::Double,
+        PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        },
+        PrimitiveType::Date,
+        PrimitiveType::Time,
+        PrimitiveType::Timestamp,
+        PrimitiveType::Timestamptz,
+        PrimitiveType::TimestampNs,
+        PrimitiveType::TimestamptzNs,
+        PrimitiveType::String,
+        PrimitiveType::Uuid,
+        PrimitiveType::Fixed(16),
+        PrimitiveType::Binary,
+    ];
+
+    for variant in &every_variant {
+        let (expected_exasol, expected_arrow) = expected_mapping(variant);
+        assert_eq!(
+            iceberg_primitive_to_exasol(variant),
+            expected_exasol,
+            "iceberg_primitive_to_exasol mapped {variant:?} to an unexpected Exasol type"
+        );
+        assert_eq!(
+            iceberg_primitive_to_arrow(variant),
+            expected_arrow,
+            "iceberg_primitive_to_arrow mapped {variant:?} to an unexpected Arrow type"
+        );
+    }
+}
+
+fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
+    match pt {
+        PrimitiveType::Boolean => ("BOOLEAN", DataType::Boolean),
+        PrimitiveType::Int => ("DECIMAL(10,0)", DataType::Int32),
+        PrimitiveType::Long => ("DECIMAL(20,0)", DataType::Int64),
+        PrimitiveType::Float => ("DOUBLE PRECISION", DataType::Float32),
+        PrimitiveType::Double => ("DOUBLE PRECISION", DataType::Float64),
+        PrimitiveType::Decimal { precision, scale } => {
+            assert_eq!(
+                (*precision, *scale),
+                (10, 2),
+                "expected_mapping pins only the decimal shape every_variant drives"
+            );
+            ("DECIMAL(10,2)", DataType::Decimal128(10, 2))
+        }
+        PrimitiveType::Date => ("DATE", DataType::Date32),
+        PrimitiveType::Time => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Timestamp => (
+            "TIMESTAMP",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ),
+        PrimitiveType::TimestampNs => {
+            ("TIMESTAMP", DataType::Timestamp(TimeUnit::Nanosecond, None))
+        }
+        PrimitiveType::Timestamptz => (
+            "TIMESTAMP",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ),
+        PrimitiveType::TimestamptzNs => (
+            "TIMESTAMP",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ),
+        PrimitiveType::String => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Uuid => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Fixed(_) => ("VARCHAR(2000000)", DataType::Utf8),
+        PrimitiveType::Binary => ("VARCHAR(2000000)", DataType::Utf8),
+    }
+}

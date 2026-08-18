@@ -80,6 +80,9 @@ echo "=== spark-iceberg-fixtures: write.delete.granularity=partition MOR fixture
 echo "=== spark-iceberg-fixtures: format-version=3 Puffin deletion-vector fixture ==="
 /opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_deletion_vector_fixture.sql
 
+echo "=== spark-iceberg-fixtures: type-promotion fixture ==="
+/opt/spark/bin/spark-sql "${SPARK_CONF[@]}" -f /fixtures/create_iceberg_type_promotion_fixture.sql
+
 # INT96 far-future-timestamp fixture (issue #143). Unlike the merge-on-read
 # fixtures above (authored by Spark's *Iceberg* writer, which emits INT64
 # regardless of outputTimestampType), this one needs a genuinely INT96-encoded

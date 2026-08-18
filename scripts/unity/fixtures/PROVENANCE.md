@@ -13,7 +13,7 @@ in spike #317. Apache-2.0 licensed. They are read fixtures — never mutated.
 | `multi-part-stats/` | `v1-multi-part-struct-stats-only` (dir) | **Multi-file + per-file stats** (5 files) | #321 | `[id,value]`, 5 rows |
 | `stats-all-types/` | `stats-writing-all-types/delta` | **Broad types**: `array` maps to text-rendered VARCHAR, `map`/`struct`/`binary` refused per column (#350); declares `timestampNtz` (mapped to Exasol TIMESTAMP, not gated) +`columnMapping` | #322 (types, closed) | 16 cols, 13 mappable, 4 rows |
 | `unshredded-variant/` | `unshredded-variant.tar.zst` | **Unsupported reader feature** `variantType-preview` + nested variant/array/struct/map | #322 (fail-loud) | reads in kernel, 102 rows |
-| `type-widening/` | `type-widening` (dir) | **Unsupported reader feature** `typeWidening-preview` (+`timestampNtz`); numeric/decimal widening | #322 (fail-loud) | reads in kernel, 2 rows |
+| `type-widening/` | `type-widening` (dir) | **Type widening** `typeWidening-preview` (+`timestampNtz`); numeric/decimal widening, read across the widening boundary | #349 (read), was #322 (fail-loud) | reads in kernel, 2 rows; 11 of 13 columns queryable, `byte_decimal`/`short_decimal` refused per column (outside the protocol's supported list) |
 
 All verified over MinIO/S3 during the spike: `UC resolve → UC vend static creds →
 delta-kernel-rs read with a client-side MinIO endpoint override`.
@@ -22,15 +22,23 @@ delta-kernel-rs read with a client-side MinIO endpoint override`.
 (`variantType`, `typeWidening`, `timestampNtz`) without error — so #322's fail-loud
 check could not rely on the kernel erroring. #322 shipped a plan-time gate that
 inspects the Delta `protocol.readerFeatures` directly, independently of kernel
-capability. The gate is default-DENY: it allow-lists exactly five reader features
+capability. The gate is default-DENY: it allow-lists exactly seven reader features
 (`columnMapping`, `deletionVectors`, `timestampNtz`, `v2Checkpoint`,
-`vacuumProtocolCheck`) and refuses every other reader feature, including any
-feature a future `delta_kernel` upgrade adds. `variantType`/`variantType-preview`
-and `typeWidening`/`typeWidening-preview` (widening tracked further as issue #349)
-are simply this fixture set's two concrete refused cases, not the gate's full
-refusal list. `timestampNtz` sits on the allow-list, so `stats-all-types`
-resolved the "gate vs. map to Exasol TIMESTAMP" question in favor of mapping —
-the column reads as Exasol TIMESTAMP, not a refusal.
+`vacuumProtocolCheck`, `typeWidening`, `typeWidening-preview`) and refuses every
+other reader feature, including any feature a future `delta_kernel` upgrade adds.
+`variantType`/`variantType-preview` is this fixture set's remaining concrete
+refused case, not the gate's full refusal list. `timestampNtz` sits on the
+allow-list, so `stats-all-types` resolved the "gate vs. map to Exasol TIMESTAMP"
+question in favor of mapping — the column reads as Exasol TIMESTAMP, not a
+refusal.
+
+**#349 note:** `typeWidening`/`typeWidening-preview` moved from the refused set
+to the allow-listed, readable set (issue #349). The fixture's data is read
+across the widening boundary rather than refused as a whole; per-column
+refusal instead applies to any recorded `delta.typeChanges` entry outside the
+Delta protocol's supported-pair list — two of this fixture's thirteen entries
+(`byte_decimal`, `short_decimal`) fall outside that list and stay refused,
+while the other eleven are queryable at their widened types.
 
 Separately, `stats-all-types`'s `array`, `map`, `struct`, and `binary` columns
 are classified per COLUMN, not per table: `array` of a mappable element type

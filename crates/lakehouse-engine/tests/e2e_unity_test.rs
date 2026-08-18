@@ -31,7 +31,7 @@ mod common;
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts,
     exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc,
-    parse_int, upload_so,
+    parse_int, parse_numeric, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::stack::{
@@ -1037,57 +1037,250 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     );
 }
 
+/// `type_widening`'s eleven Delta-protocol-supported columns (`byte_decimal` and
+/// `short_decimal` are refused per column — decision [15]), in the order the
+/// scenario below indexes their query results.
+const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE, BYTE_DOUBLE, SHORT_DOUBLE, INT_DOUBLE, \
+     DECIMAL_DECIMAL_SAME_SCALE, DECIMAL_DECIMAL_GREATER_SCALE, INT_DECIMAL, LONG_DECIMAL, \
+     DATE_TIMESTAMP_NTZ";
+
 /// Scenario: A Delta table using an unsupported reader feature fails the query
 /// loud.
 ///
-/// `type_widening` declares `typeWidening-preview` (tracked as issue #349) and
 /// `unshredded_variant` declares `variantType-preview`; `DeltaSnapshot::open`
-/// refuses both at plan time, before any log replay. The refusal must be the
+/// refuses it at plan time, before any log replay. The refusal must be the
 /// protocol gate's own message — never something that looks like the per-column
 /// type-mapping refusal (which names a column and cites #350) — and the session
-/// must survive to prove no crashed UDF VM took it down.
+/// must survive to prove no crashed UDF VM took it down. `type_widening` is no
+/// longer a case here: `typeWidening-preview` is now allow-listed, so the error
+/// must not cite the now-closed issue #349 either.
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
     let mut conn = exa_conn();
 
-    for (table, feature, cites_349) in [
-        ("TYPE_WIDENING", "typeWidening-preview", true),
-        ("UNSHREDDED_VARIANT", "variantType-preview", false),
-    ] {
-        let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{table} must fail the query loud, not return a row: {resp}"
-        );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
-        assert!(
-            msg.contains(feature),
-            "{table}'s error must name its actual unsupported reader feature: {msg}"
-        );
-        assert_eq!(
-            msg.contains("#349"),
-            cites_349,
-            "{table}'s error must cite issue #349 only for typeWidening: {msg}"
-        );
-        assert!(
-            !msg.contains("#350") && !msg.to_lowercase().contains("does not map at plan time"),
-            "{table}'s error must be the protocol-gate refusal, not a column-typed \
-             type-mapping error: {msg}"
-        );
-        assert!(
-            !msg.to_lowercase().contains("minioadmin"),
-            "{table}'s error text must not contain a credential value: {msg}"
-        );
-    }
+    let table = "UNSHREDDED_VARIANT";
+    let feature = "variantType-preview";
+    let resp = conn.try_execute(&format!("SELECT * FROM {} LIMIT 1", table_ref(table)));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "{table} must fail the query loud, not return a row: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(feature),
+        "{table}'s error must name its actual unsupported reader feature: {msg}"
+    );
+    assert!(
+        !msg.contains("#349"),
+        "{table}'s error must not cite issue #349: type widening is no longer \
+         refused, so a closed issue cited in a shipped refusal would read as an \
+         unfixed gap with no owner: {msg}"
+    );
+    assert!(
+        !msg.contains("#350") && !msg.to_lowercase().contains("does not map at plan time"),
+        "{table}'s error must be the protocol-gate refusal, not a column-typed \
+         type-mapping error: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("minioadmin"),
+        "{table}'s error text must not contain a credential value: {msg}"
+    );
 
     let survives = conn.query_scalar_i64("SELECT 1 FROM DUAL");
     assert_eq!(
         survives, 1,
-        "the connection must survive both refusals: a crashed UDF VM would take \
+        "the connection must survive the refusal: a crashed UDF VM would take \
          the session down, not return a clean SQL error"
     );
+}
+
+/// Scenario: A type-widened Delta table returns its current wider types across
+/// the widening boundary.
+///
+/// `type_widening`'s two live data files straddle commit 2's widening — one row
+/// was written under the narrow types, the other under the widened ones — so
+/// every column must read back at its CURRENT wider type from both files.
+/// Eleven of the table's thirteen recorded type changes are supported by the
+/// Delta type-widening protocol; `byte_decimal` and `short_decimal` are refused
+/// per column, leaving the other eleven queryable (decision [15]).
+#[test]
+fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
+    setup();
+    let mut conn = exa_conn();
+    let table = table_ref("TYPE_WIDENING");
+
+    let count = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {table}"));
+    assert_eq!(
+        count, 2,
+        "type_widening must carry exactly 2 rows, one from each of its two live \
+         data files: {count}"
+    );
+
+    let cols = column_types(&mut conn, VS_NAME, "TYPE_WIDENING");
+    for (column, expected) in [
+        ("BYTE_LONG", "DECIMAL(20,0)"),
+        ("INT_LONG", "DECIMAL(20,0)"),
+        ("FLOAT_DOUBLE", "DOUBLE"),
+        ("BYTE_DOUBLE", "DOUBLE"),
+        ("SHORT_DOUBLE", "DOUBLE"),
+        ("INT_DOUBLE", "DOUBLE"),
+        ("DECIMAL_DECIMAL_SAME_SCALE", "DECIMAL(20,2)"),
+        ("DECIMAL_DECIMAL_GREATER_SCALE", "DECIMAL(20,5)"),
+        ("INT_DECIMAL", "DECIMAL(11,1)"),
+        ("LONG_DECIMAL", "DECIMAL(21,1)"),
+        ("DATE_TIMESTAMP_NTZ", "TIMESTAMP"),
+    ] {
+        assert_col_type(&cols, column, expected);
+    }
+
+    let select_sql =
+        format!("SELECT {TYPE_WIDENING_SUPPORTED_COLUMNS} FROM {table} ORDER BY INT_LONG");
+    let pushed = explain_virtual_sql(&mut conn, &select_sql);
+    assert!(
+        pushed.contains(SCAN_SCRIPT_NAME),
+        "the eleven-column projection must drive the scan UDF, not an \
+         unaccelerated fallback: {pushed}"
+    );
+
+    let rows = conn.query_columns(&select_sql);
+    assert_eq!(rows.len(), 11, "expected 11 projected columns: {rows:?}");
+    assert_eq!(
+        rows[0].len(),
+        2,
+        "expected both the pre- and post-widening rows, not one skipped or \
+         failed: {rows:?}"
+    );
+
+    // ORDER BY INT_LONG puts the pre-widening row (INT_LONG = 2) first and the
+    // post-widening row (INT_LONG = 9223372036854775807, i64::MAX) second.
+    const PRE: usize = 0;
+    const POST: usize = 1;
+
+    assert_eq!(
+        parse_int(&rows[0][PRE]),
+        1,
+        "pre-widening BYTE_LONG must be its real logged value, not NULL: {rows:?}"
+    );
+    assert_eq!(
+        parse_int(&rows[0][POST]),
+        9_223_372_036_854_775_807,
+        "post-widening BYTE_LONG must hold a value no 32-bit width could \
+         represent: {rows:?}"
+    );
+
+    assert_eq!(
+        parse_int(&rows[1][PRE]),
+        2,
+        "pre-widening INT_LONG must be its real logged value, not NULL: {rows:?}"
+    );
+    assert_eq!(
+        parse_int(&rows[1][POST]),
+        9_223_372_036_854_775_807,
+        "post-widening INT_LONG must hold a value no 32-bit width could \
+         represent: {rows:?}"
+    );
+
+    let pre_widening_float = parse_numeric(&rows[2][PRE]);
+    assert!(
+        (pre_widening_float - f64::from(3.4f32)).abs() < 1e-9,
+        "pre-widening FLOAT_DOUBLE must be the stored 32-bit float's exact double \
+         expansion, not the decimal literal 3.4: {pre_widening_float}"
+    );
+
+    for (index, column, expected_pre) in [
+        (3, "BYTE_DOUBLE", 5.0),
+        (4, "SHORT_DOUBLE", 6.0),
+        (5, "INT_DOUBLE", 7.0),
+    ] {
+        let pre = parse_numeric(&rows[index][PRE]);
+        assert!(
+            (pre - expected_pre).abs() < 1e-9,
+            "pre-widening {column} must be its real logged value, not NULL: {pre}"
+        );
+        let post = parse_numeric(&rows[index][POST]);
+        assert!(
+            (post - 1.234_567_890_123_f64).abs() < 1e-9,
+            "post-widening {column} must hold a fractional value no integral \
+             width could represent: {post}"
+        );
+    }
+
+    assert_eq!(
+        value_to_string(&rows[6][PRE]),
+        "123.45",
+        "pre-widening DECIMAL_DECIMAL_SAME_SCALE must be its real logged value, \
+         not NULL: {rows:?}"
+    );
+    assert_eq!(
+        value_to_string(&rows[6][POST]),
+        "12345678901234.56",
+        "post-widening DECIMAL_DECIMAL_SAME_SCALE must hold a value no narrower \
+         decimal precision could represent: {rows:?}"
+    );
+
+    assert_eq!(
+        value_to_string(&rows[7][PRE]),
+        "67.89",
+        "pre-widening DECIMAL_DECIMAL_GREATER_SCALE must prove the \
+         decimal(10,2) -> decimal(20,5) RESCALE, not a re-tag: re-reading the \
+         stored unscaled 6789 at scale 5 would render 0.06789: {rows:?}"
+    );
+    assert_eq!(
+        value_to_string(&rows[7][POST]),
+        "12345678901.23456",
+        "post-widening DECIMAL_DECIMAL_GREATER_SCALE must keep all five \
+         fractional digits its widened scale allows: {rows:?}"
+    );
+
+    assert_eq!(
+        value_to_string(&rows[8][PRE]),
+        "3",
+        "pre-widening INT_DECIMAL must be its real logged value, not NULL: {rows:?}"
+    );
+    assert_eq!(
+        value_to_string(&rows[9][PRE]),
+        "4",
+        "pre-widening LONG_DECIMAL must be its real logged value, not NULL: {rows:?}"
+    );
+    assert_eq!(
+        value_to_string(&rows[9][POST]),
+        "123456789012345678.9",
+        "post-widening LONG_DECIMAL must hold a value no narrower decimal width \
+         could represent: {rows:?}"
+    );
+
+    let pre_widening_timestamp = rows[10][PRE].as_str().unwrap_or("");
+    assert!(
+        pre_widening_timestamp.starts_with("2024-09-09 00:00:00"),
+        "pre-widening DATE_TIMESTAMP_NTZ must be the midnight instant of its \
+         logged date, not NULL: {pre_widening_timestamp}"
+    );
+
+    for (column, delta_name, from_type, to_type) in [
+        ("BYTE_DECIMAL", "byte_decimal", "byte", "decimal(4,1)"),
+        ("SHORT_DECIMAL", "short_decimal", "short", "decimal(6,1)"),
+    ] {
+        let resp = conn.try_execute(&format!("SELECT {column} FROM {table}"));
+        assert_eq!(
+            resp["status"].as_str(),
+            Some("error"),
+            "{column} must refuse the query, not return a row or a NULL value: {resp}"
+        );
+        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        assert!(
+            msg.contains(delta_name)
+                && msg.contains(&format!("'{from_type}'"))
+                && msg.contains(to_type),
+            "{column}'s refusal must name its Delta column and both its Delta \
+             types: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("minioadmin"),
+            "{column}'s error text must not contain a credential value: {msg}"
+        );
+    }
 }
 
 /// The 13 Delta types this engine maps for `stats_all_types`, in fixture column

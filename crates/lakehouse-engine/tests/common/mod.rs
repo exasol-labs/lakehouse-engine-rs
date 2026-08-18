@@ -47,3 +47,5 @@ pub mod pos_delete_fixtures;
 ))]
 pub mod seed;
 pub mod stack;
+#[cfg(feature = "exasol-e2e")]
+pub mod type_promotion_fixtures;

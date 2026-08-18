@@ -624,3 +624,433 @@ async fn vended_addressing_prefers_the_connection_endpoint_and_region() {
         "the vended session token must reach the effective storage the scan reads with"
     );
 }
+
+fn metadata_with_schema_history(
+    schemas: Json,
+    current_schema_id: i32,
+) -> iceberg::spec::TableMetadata {
+    serde_json::from_value(serde_json::json!({
+        "format-version": 3,
+        "table-uuid": "00000000-0000-0000-0000-000000000009",
+        "location": "s3://bucket/db/t",
+        "last-sequence-number": 0,
+        "last-updated-ms": 0,
+        "last-column-id": 9,
+        "current-schema-id": current_schema_id,
+        "schemas": schemas,
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-sort-order-id": 0,
+        "next-row-id": 0,
+        "snapshots": []
+    }))
+    .expect("synthetic Iceberg table metadata must deserialize")
+}
+
+#[test]
+fn date_to_timestamp_promotion_is_refused_naming_table_column_both_types_and_the_issue() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "event_day", "required": false, "type": "date"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "event_day", "required": false, "type": "timestamp"}
+            ]}
+        ]),
+        1,
+    );
+
+    let err = refuse_date_promotion(&metadata, "db.promoted")
+        .expect_err("a recorded date -> timestamp promotion must be refused");
+
+    let msg = match err {
+        UdfError::User(m) => m,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    };
+    assert!(
+        msg.contains("db.promoted"),
+        "error must name the table: {msg}"
+    );
+    assert!(
+        msg.contains("event_day"),
+        "error must name the column: {msg}"
+    );
+    assert!(
+        msg.contains("'date'"),
+        "error must name the earlier Iceberg type: {msg}"
+    );
+    assert!(
+        msg.contains("'timestamp'"),
+        "error must name the current Iceberg type: {msg}"
+    );
+    assert!(
+        msg.contains("#355"),
+        "error must cite the tracked issue: {msg}"
+    );
+    assert!(
+        !msg.contains("access_key") && !msg.contains("secret_key"),
+        "error must not leak credentials: {msg}"
+    );
+}
+
+#[test]
+fn date_to_timestamp_ns_promotion_is_refused() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "event_day", "required": false, "type": "date"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "event_day", "required": false, "type": "timestamp_ns"}
+            ]}
+        ]),
+        1,
+    );
+
+    let err = refuse_date_promotion(&metadata, "db.promoted_ns")
+        .expect_err("a recorded date -> timestamp_ns promotion must be refused");
+
+    let msg = match err {
+        UdfError::User(m) => m,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    };
+    assert!(
+        msg.contains("'timestamp_ns'"),
+        "error must name the current Iceberg type: {msg}"
+    );
+    assert!(
+        msg.contains("'date'") && msg.contains("#355"),
+        "error must name the earlier type and cite the issue: {msg}"
+    );
+}
+
+#[test]
+fn a_date_column_that_was_never_promoted_is_not_refused() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "event_day", "required": false, "type": "date"},
+                {"id": 2, "name": "seen_at", "required": false, "type": "timestamp"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "event_day", "required": false, "type": "date"},
+                {"id": 2, "name": "seen_at", "required": false, "type": "timestamp"},
+                {"id": 3, "name": "label", "required": false, "type": "string"}
+            ]}
+        ]),
+        1,
+    );
+
+    refuse_date_promotion(&metadata, "db.unpromoted")
+        .expect("a date column that was never promoted must plan normally");
+}
+
+#[test]
+fn a_date_promotion_nested_inside_a_struct_is_refused_by_its_full_name() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "payload", "required": false, "type": {
+                    "type": "struct",
+                    "fields": [
+                        {"id": 2, "name": "stamped", "required": false, "type": "date"}
+                    ]
+                }}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "payload", "required": false, "type": {
+                    "type": "struct",
+                    "fields": [
+                        {"id": 2, "name": "stamped", "required": false, "type": "timestamp"}
+                    ]
+                }}
+            ]}
+        ]),
+        1,
+    );
+
+    let err = refuse_date_promotion(&metadata, "db.nested")
+        .expect_err("a date promotion on a nested field must be refused");
+
+    let msg = match err {
+        UdfError::User(m) => m,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    };
+    assert!(
+        msg.contains("payload.stamped"),
+        "error must name the nested column by its full path: {msg}"
+    );
+}
+
+#[test]
+fn an_int_to_long_promotion_history_plans_normally() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "amount", "required": false, "type": "int"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "amount", "required": false, "type": "long"}
+            ]}
+        ]),
+        1,
+    );
+
+    refuse_date_promotion(&metadata, "db.int_to_long")
+        .expect("an int -> long promotion must plan normally");
+}
+
+#[test]
+fn a_float_to_double_promotion_history_plans_normally() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "reading", "required": false, "type": "float"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "reading", "required": false, "type": "double"}
+            ]}
+        ]),
+        1,
+    );
+
+    refuse_date_promotion(&metadata, "db.float_to_double")
+        .expect("a float -> double promotion must plan normally");
+}
+
+#[test]
+fn a_decimal_precision_widening_history_plans_normally() {
+    let metadata = metadata_with_schema_history(
+        serde_json::json!([
+            {"type": "struct", "schema-id": 0, "fields": [
+                {"id": 1, "name": "price", "required": false, "type": "decimal(10,2)"}
+            ]},
+            {"type": "struct", "schema-id": 1, "fields": [
+                {"id": 1, "name": "price", "required": false, "type": "decimal(20,2)"}
+            ]}
+        ]),
+        1,
+    );
+
+    refuse_date_promotion(&metadata, "db.decimal_widening")
+        .expect("a decimal precision widening must plan normally");
+}
+
+/// A `loadTable` response for a table whose schema history records `event_day`
+/// as `date` in an earlier schema and `timestamp` in the current one, with NO
+/// snapshot — so a wiring test that reaches this refusal proves `resolve_scan`
+/// invokes it, without needing a live manifest read to fail on.
+fn load_table_body_with_promoted_date_column() -> String {
+    serde_json::json!({
+        "metadata-location": "s3://bucket/db/t/metadata/v1.json",
+        "metadata": {
+            "format-version": 3,
+            "table-uuid": "00000000-0000-0000-0000-000000000005",
+            "location": "s3://bucket/db/t",
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 2,
+            "current-schema-id": 1,
+            "schemas": [
+                {"type": "struct", "schema-id": 0, "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"},
+                    {"id": 2, "name": "event_day", "required": false, "type": "date"}
+                ]},
+                {"type": "struct", "schema-id": 1, "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"},
+                    {"id": 2, "name": "event_day", "required": false, "type": "timestamp"}
+                ]}
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "next-row-id": 0,
+            "snapshots": []
+        }
+    })
+    .to_string()
+}
+
+async fn resolve_promoted_date_table(filter_json: Option<&Json>) -> Result<ResolvedScan, UdfError> {
+    let creds = one_request_sigv4_creds();
+    let storage = sample_storage();
+    let catalog_props = CatalogProps {
+        warehouse: creds.warehouse.clone(),
+        table: "db.promoted".into(),
+    };
+    let body = load_table_body_with_promoted_date_column();
+    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, &creds)
+        .await
+        .expect("the SigV4 path resolves a session without contacting the catalog");
+    let reader = IcebergFormatReader {
+        session: &session,
+        catalog_props: &catalog_props,
+        connection: ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    };
+
+    reader.resolve_scan(filter_json).await
+}
+
+fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
+    let msg = match err {
+        UdfError::User(m) => m,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    };
+    assert!(
+        msg.contains("db.promoted"),
+        "error must name the table: {msg}"
+    );
+    assert!(
+        msg.contains("event_day"),
+        "error must name the column: {msg}"
+    );
+    assert!(
+        msg.contains("#355"),
+        "error must cite the tracked issue: {msg}"
+    );
+}
+
+/// `resolve_scan` — the real plan-time entry point, not the isolated
+/// `refuse_date_promotion` unit — refuses an unfiltered (`SELECT *`) request
+/// against a table carrying a recorded `date` -> `timestamp` promotion.
+#[tokio::test]
+async fn resolve_scan_refuses_a_promoted_date_table_for_an_unfiltered_request() {
+    let err = resolve_promoted_date_table(None)
+        .await
+        .expect_err("resolve_scan must refuse a table with a recorded date -> timestamp promotion");
+
+    assert_promotion_refusal_names_table_column_and_issue(err);
+}
+
+/// The same refusal fires identically when the request carries a filter,
+/// because the manifest bounds-decode gap it stands in front of occurs during
+/// manifest deserialization rather than during predicate pruning.
+#[tokio::test]
+async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
+    let filter = serde_json::json!({"op": "eq", "column": "id", "value": 1});
+
+    let err = resolve_promoted_date_table(Some(&filter)).await.expect_err(
+        "resolve_scan must refuse a table with a recorded date -> timestamp promotion \
+             even when a filter is supplied",
+    );
+
+    assert_promotion_refusal_names_table_column_and_issue(err);
+}
+
+/// A `loadTable` response whose schema history records the three promotions this
+/// engine reads — `amount` `int` -> `long`, `reading` `float` -> `double`,
+/// `price` `decimal(10,2)` -> `decimal(20,2)` — each keeping its field id, with
+/// NO snapshot so the resolution reaches its schema without a manifest read.
+fn load_table_body_with_readable_promotions() -> String {
+    serde_json::json!({
+        "metadata-location": "s3://bucket/db/t/metadata/v1.json",
+        "metadata": {
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000006",
+            "location": "s3://bucket/db/t",
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 3,
+            "current-schema-id": 1,
+            "schemas": [
+                {"type": "struct", "schema-id": 0, "fields": [
+                    {"id": 1, "name": "amount", "required": false, "type": "int"},
+                    {"id": 2, "name": "reading", "required": false, "type": "float"},
+                    {"id": 3, "name": "price", "required": false, "type": "decimal(10,2)"}
+                ]},
+                {"type": "struct", "schema-id": 1, "fields": [
+                    {"id": 1, "name": "amount", "required": false, "type": "long"},
+                    {"id": 2, "name": "reading", "required": false, "type": "double"},
+                    {"id": 3, "name": "price", "required": false, "type": "decimal(20,2)"}
+                ]}
+            ],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "snapshots": []
+        }
+    })
+    .to_string()
+}
+
+/// Scenario: a promotion this engine reads resolves through the shared
+/// relaxation cast — the logical schema is built from the table's CURRENT
+/// schema, so each promoted column carries the PROMOTED type against its
+/// original field id rather than the type schema 0 declared.
+#[tokio::test]
+async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_type() {
+    let creds = one_request_sigv4_creds();
+    let storage = sample_storage();
+    let catalog_props = CatalogProps {
+        warehouse: creds.warehouse.clone(),
+        table: "db.promoted_numerics".into(),
+    };
+    let body = load_table_body_with_readable_promotions();
+    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, &creds)
+        .await
+        .expect("the SigV4 path resolves a session without contacting the catalog");
+    let reader = IcebergFormatReader {
+        session: &session,
+        catalog_props: &catalog_props,
+        connection: ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    };
+
+    let resolved = reader.resolve_scan(None).await.expect(
+        "int -> long, float -> double and decimal precision widening must all plan normally",
+    );
+
+    assert_eq!(
+        resolved.logical_schema,
+        vec![
+            LogicalField {
+                field_id: Some(1),
+                name: "amount".to_string(),
+                arrow_type: "int64".to_string(),
+                nullable: true,
+                initial_default: None,
+                physical_name: None,
+            },
+            LogicalField {
+                field_id: Some(2),
+                name: "reading".to_string(),
+                arrow_type: "float64".to_string(),
+                nullable: true,
+                initial_default: None,
+                physical_name: None,
+            },
+            LogicalField {
+                field_id: Some(3),
+                name: "price".to_string(),
+                arrow_type: "decimal128(20,2)".to_string(),
+                nullable: true,
+                initial_default: None,
+                physical_name: None,
+            },
+        ],
+        "each promoted column must carry its CURRENT type against its original field id"
+    );
+    assert!(
+        resolved.refused_columns.is_empty(),
+        "a promotion this engine reads refuses no column: {:?}",
+        resolved.refused_columns
+    );
+}
