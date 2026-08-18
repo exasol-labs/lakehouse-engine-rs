@@ -8,6 +8,15 @@ use super::*;
 /// `name`-mode column mapping with `col-<uuid>` physical names.
 const CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-80396d42-d765-483e-b86e-7ac1e13ef88c"}},{"name":"name","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1"}},{"name":"value","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-95e13b58-72f1-4d26-8390-49469180a8a2"}}]}"#;
 
+/// Verbatim `nested_struct` field from the vendored `stats-all-types` fixture's `schemaString`
+/// (`scripts/unity/fixtures/stats-all-types/_delta_log/00000000000000000000.json`): `name`-mode
+/// column mapping, with a `col-<uuid>` physical name on every INNER field as well as on the column.
+const STATS_ALL_TYPES_NESTED_STRUCT_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"nested_struct","type":{"type":"struct","fields":[{"name":"inner_int","type":"integer","nullable":true,"metadata":{"delta.columnMapping.id":17,"delta.columnMapping.physicalName":"col-7f2f94cf-7082-430c-bba7-852bc6c5215e"}},{"name":"inner_string","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":18,"delta.columnMapping.physicalName":"col-26fcfd6b-04c7-4772-8bdf-04ac9425f06e"}},{"name":"inner_double","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":19,"delta.columnMapping.physicalName":"col-92dcf16d-d249-48a9-afb8-93deeaf7ce23"}}]},"nullable":true,"metadata":{"delta.columnMapping.id":16,"delta.columnMapping.physicalName":"col-481c7590-d3b8-4e9c-b40e-7b7128a972f4"}}]}"#;
+
+const INNER_INT_PHYSICAL_NAME: &str = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
+const INNER_STRING_PHYSICAL_NAME: &str = "col-26fcfd6b-04c7-4772-8bdf-04ac9425f06e";
+const INNER_DOUBLE_PHYSICAL_NAME: &str = "col-92dcf16d-d249-48a9-afb8-93deeaf7ce23";
+
 fn parse_schema(json: &str) -> StructType {
     serde_json::from_str(json).expect("fixture schemaString must parse as a Delta StructType")
 }
@@ -19,16 +28,25 @@ fn user_message(err: UdfError) -> String {
     }
 }
 
-/// A field annotated the way the Delta protocol requires under `id`/`name` mode:
-/// both a column-mapping id and a physical name.
-fn mapped_field(name: &str, id: i64, physical_name: &str) -> StructField {
-    StructField::not_null(name, DataType::INTEGER).with_metadata([
+/// `field` annotated the way the Delta protocol requires under `id`/`name` mode: both a
+/// column-mapping id and a physical name.
+fn annotated(field: StructField, id: i64, physical_name: &str) -> StructField {
+    field.with_metadata([
         ("delta.columnMapping.id", MetadataValue::Number(id)),
         (
             "delta.columnMapping.physicalName",
             MetadataValue::String(physical_name.to_string()),
         ),
     ])
+}
+
+/// An annotated `integer` field, the shape most binding-key assertions need.
+fn mapped_field(name: &str, id: i64, physical_name: &str) -> StructField {
+    annotated(
+        StructField::not_null(name, DataType::INTEGER),
+        id,
+        physical_name,
+    )
 }
 
 /// Every logical field's binding key rendered as `<logical name>=<key>`, so one expected string
@@ -53,6 +71,43 @@ fn binding_keys(fields: &[LogicalField]) -> String {
 
 fn array_of(element_type: DataType) -> DataType {
     ArrayType::new(element_type, true).into()
+}
+
+fn map_of(key_type: DataType, value_type: DataType) -> DataType {
+    MapType::new(key_type, value_type, true).into()
+}
+
+fn struct_of(fields: impl IntoIterator<Item = StructField>) -> DataType {
+    StructType::try_new(fields)
+        .expect("a test fixture's struct fields are distinct by construction")
+        .into()
+}
+
+/// One expected primitive nested field: its logical name and the ONE binding key its mode selects.
+fn nested_field(name: &str, field_id: Option<i32>, physical_name: Option<&str>) -> NestedField {
+    NestedField {
+        field_id,
+        name: name.to_string(),
+        physical_name: physical_name.map(str::to_string),
+        nested: None,
+    }
+}
+
+/// `field` carrying `entries` as its `delta.typeChanges` annotation.
+fn with_type_changes(field: StructField, entries: serde_json::Value) -> StructField {
+    field.with_metadata([("delta.typeChanges", MetadataValue::Other(entries))])
+}
+
+/// The single logical field a one-column table resolves to under `mode`.
+fn only_logical_field(schema: &StructType, mode: ColumnMappingMode) -> LogicalField {
+    let (logical_fields, _, refused_columns) = build_delta_table_schema(schema, mode, Vec::new())
+        .expect("this fixture's only column is mappable");
+    assert!(
+        refused_columns.is_empty(),
+        "expected no refusal, got: {refused_columns:?}"
+    );
+    assert_eq!(logical_fields.len(), 1);
+    logical_fields.into_iter().next().unwrap()
 }
 
 /// The refusal reason a single-column table of `data_type` produces. A single refused column
@@ -326,57 +381,6 @@ fn every_natively_representable_delta_type_maps_to_its_own_arrow_tag() {
     );
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
-// faithfully is refused by name
-#[test]
-fn binary_struct_map_and_variant_are_refused_with_their_own_reason_citing_350() {
-    for (name, type_json, delta_type_name, cites_350) in [
-        ("binary_col", r#""binary""#, "binary", true),
-        (
-            "nested_struct",
-            r#"{"type":"struct","fields":[{"name":"inner","type":"integer","nullable":true,"metadata":{}}]}"#,
-            "struct",
-            true,
-        ),
-        (
-            "map_col",
-            r#"{"type":"map","keyType":"string","valueType":"integer","valueContainsNull":true}"#,
-            "map",
-            true,
-        ),
-        ("variant_col", r#""variant""#, "variant", false),
-    ] {
-        let schema_json = format!(
-            r#"{{"type":"struct","fields":[{{"name":"{name}","type":{type_json},"nullable":true,"metadata":{{}}}}]}}"#
-        );
-        let schema = parse_schema(&schema_json);
-
-        let (logical_fields, _, refused_columns) =
-            build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-                .unwrap_or_else(|_| panic!("a refused column type never fails the whole call"));
-
-        assert!(
-            logical_fields.is_empty(),
-            "{name} is in the refused set and must carry no LogicalField"
-        );
-        assert_eq!(refused_columns.len(), 1);
-        assert_eq!(refused_columns[0].column_name, name);
-        let message = &refused_columns[0].reason;
-
-        assert!(message.contains(name), "message was: {message}");
-        assert!(
-            message.contains(delta_type_name),
-            "message must name the Delta type {delta_type_name}, was: {message}"
-        );
-        assert_eq!(
-            message.contains("#350"),
-            cites_350,
-            "message was: {message}"
-        );
-        assert!(!message.contains("#322"), "message was: {message}");
-    }
-}
-
 #[test]
 fn decimal_within_exasol_domain_maps_to_decimal128_tag() {
     let schema = StructType::try_new([StructField::not_null(
@@ -446,11 +450,13 @@ fn nullability_is_carried_from_the_delta_schema() {
 
 // Scenario Coverage (delta-type-mapping): A Delta type Exasol cannot represent natively is
 // surfaced as a VARCHAR rendering
+/// A container is tagged `utf8` exactly when every one of its members is itself renderable, at
+/// every nesting depth and through every member position — an `array`'s element, a `struct`'s
+/// field, and a `map`'s key and value alike.
 #[test]
-fn a_type_exasol_cannot_represent_is_tagged_utf8_including_a_recursive_array() {
+fn containers_classify_recursively_by_renderability() {
     let schema = StructType::try_new([
         StructField::not_null("array_col", array_of(DataType::INTEGER)),
-        StructField::not_null("nested_array_col", array_of(array_of(DataType::INTEGER))),
         StructField::not_null(
             "deeply_nested_array_col",
             array_of(array_of(array_of(DataType::STRING))),
@@ -463,13 +469,52 @@ fn a_type_exasol_cannot_represent_is_tagged_utf8_including_a_recursive_array() {
             "nested_array_of_void_col",
             array_of(array_of(DataType::VOID)),
         ),
+        StructField::not_null(
+            "struct_col",
+            struct_of([StructField::nullable("inner", DataType::INTEGER)]),
+        ),
+        StructField::not_null(
+            "struct_of_void_col",
+            struct_of([StructField::nullable("v", DataType::VOID)]),
+        ),
+        StructField::not_null(
+            "struct_of_out_of_domain_decimal_col",
+            struct_of([StructField::nullable(
+                "d",
+                DataType::decimal(38, 10).unwrap(),
+            )]),
+        ),
+        StructField::not_null("map_col", map_of(DataType::STRING, DataType::INTEGER)),
+        StructField::not_null(
+            "map_of_int_key_col",
+            map_of(DataType::INTEGER, DataType::STRING),
+        ),
+        StructField::not_null(
+            "array_of_struct_col",
+            array_of(struct_of([StructField::nullable("a", DataType::INTEGER)])),
+        ),
+        StructField::not_null(
+            "map_of_array_col",
+            map_of(DataType::STRING, array_of(DataType::INTEGER)),
+        ),
+        StructField::not_null(
+            "struct_of_map_col",
+            struct_of([StructField::nullable(
+                "m",
+                map_of(DataType::STRING, array_of(DataType::INTEGER)),
+            )]),
+        ),
     ])
     .unwrap();
 
-    let (logical_fields, _, _) =
+    let (logical_fields, _, refused_columns) =
         build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("every element type here is native or text-rendered, at every nesting depth");
+            .expect("every member type here is native, text-rendered, or a container of those");
 
+    assert!(
+        refused_columns.is_empty(),
+        "no container of renderable members may be refused, got: {refused_columns:?}"
+    );
     let tags: Vec<(&str, &str)> = logical_fields
         .iter()
         .map(|field| (field.name.as_str(), field.arrow_type.as_str()))
@@ -478,56 +523,145 @@ fn a_type_exasol_cannot_represent_is_tagged_utf8_including_a_recursive_array() {
         tags,
         vec![
             ("array_col", "utf8"),
-            ("nested_array_col", "utf8"),
             ("deeply_nested_array_col", "utf8"),
             ("array_of_out_of_domain_decimal_col", "utf8"),
             ("nested_array_of_void_col", "utf8"),
+            ("struct_col", "utf8"),
+            ("struct_of_void_col", "utf8"),
+            ("struct_of_out_of_domain_decimal_col", "utf8"),
+            ("map_col", "utf8"),
+            ("map_of_int_key_col", "utf8"),
+            ("array_of_struct_col", "utf8"),
+            ("map_of_array_col", "utf8"),
+            ("struct_of_map_col", "utf8"),
         ]
     );
 }
 
 // Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
 // faithfully is refused by name
+/// `binary` and `variant` are the whole refused set, and a container joins it exactly when one of
+/// its members is in it — at any depth, through any member position. One composer states every
+/// container refusal: the column's OWN declared type, the offending member's path, and that
+/// member's own cause, so no operator is told the column has a member's type.
 #[test]
-fn an_array_inherits_its_element_types_refusal_at_any_nesting_depth() {
-    let populated_struct = DataType::from(
-        StructType::try_new([StructField::nullable("inner", DataType::INTEGER)]).unwrap(),
-    );
-    let map = DataType::from(MapType::new(DataType::STRING, DataType::INTEGER, true));
+fn refused_set_is_binary_variant_and_containers_of_them() {
+    let variant = DataType::unshredded_variant();
+    let binary_field = || StructField::nullable("b", DataType::BINARY);
 
-    for (element_type, delta_type_name, cites_350) in [
-        (DataType::BINARY, "binary", true),
-        (populated_struct, "struct", true),
-        (map, "map", true),
-        (DataType::unshredded_variant(), "variant", false),
+    for (declared_type, member_path, refused_type) in [
+        (DataType::BINARY, None, "binary"),
+        (variant.clone(), None, "variant"),
+        (array_of(DataType::BINARY), Some("col.element"), "binary"),
+        (
+            array_of(array_of(DataType::BINARY)),
+            Some("col.element.element"),
+            "binary",
+        ),
+        (struct_of([binary_field()]), Some("col.b"), "binary"),
+        (
+            struct_of([
+                StructField::nullable("ok", DataType::INTEGER),
+                StructField::nullable("v", variant.clone()),
+            ]),
+            Some("col.v"),
+            "variant",
+        ),
+        (
+            map_of(DataType::BINARY, DataType::STRING),
+            Some("col.key"),
+            "binary",
+        ),
+        (
+            map_of(DataType::STRING, DataType::BINARY),
+            Some("col.value"),
+            "binary",
+        ),
+        (
+            array_of(struct_of([binary_field()])),
+            Some("col.element.b"),
+            "binary",
+        ),
+        (
+            struct_of([StructField::nullable("inner", struct_of([binary_field()]))]),
+            Some("col.inner.b"),
+            "binary",
+        ),
+        (
+            map_of(DataType::STRING, array_of(struct_of([binary_field()]))),
+            Some("col.value.element.b"),
+            "binary",
+        ),
     ] {
-        let bare = refusal_message("col", element_type.clone());
-        assert!(bare.contains("'col'"), "message was: {bare}");
-        assert!(bare.contains(delta_type_name), "message was: {bare}");
+        let message = refusal_message("col", declared_type.clone());
 
-        let mut nested = element_type;
-        for depth in 1..=3 {
-            nested = array_of(nested);
-            let message = refusal_message("col", nested.clone());
-
-            assert!(
-                message.contains(&bare),
-                "an array of {delta_type_name} nested {depth} deep must carry the element's own \
-                 reason: {message}"
-            );
-            assert!(
-                message.contains(&format!("'{nested}'")),
-                "the refusal must name the column's OWN declared type, never only its \
-                 element's: {message}"
-            );
-            assert_eq!(
-                message.contains("#350"),
-                cites_350,
-                "message was: {message}"
-            );
-            assert!(!message.contains("#322"), "message was: {message}");
+        assert!(
+            message.contains("Delta column 'col'"),
+            "message was: {message}"
+        );
+        assert!(
+            message.contains(&format!("has type '{declared_type}'")),
+            "the refusal must name the column's OWN declared type: {message}"
+        );
+        assert!(
+            message.contains(&format!("type '{refused_type}'")),
+            "the refusal must name the refused type {refused_type}: {message}"
+        );
+        match member_path {
+            Some(member_path) => assert!(
+                message.contains(&format!("whose member '{member_path}'")),
+                "the refusal must name the offending member's path {member_path}: {message}"
+            ),
+            None => assert!(
+                !message.contains("whose member"),
+                "a column refused for its OWN type names no member: {message}"
+            ),
         }
+        assert_eq!(
+            message.contains("#351"),
+            refused_type == "binary",
+            "binary's reason cites the issue that owns it, and variant's cites none: {message}"
+        );
+        assert!(!message.contains("#350"), "message was: {message}");
+        assert!(!message.contains("#322"), "message was: {message}");
     }
+}
+
+// Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
+// faithfully is refused by name
+/// The nested counterpart of `a_refused_columns_binding_key_is_never_looked_up_even_when_it_would
+/// _itself_fail`: a column refused for one member's TYPE must never instead FAIL the call for a
+/// sibling member's missing column-mapping annotation, which under `id` mode the whole nested tree
+/// would otherwise be checked for.
+#[test]
+fn a_refused_containers_nested_binding_key_is_never_looked_up() {
+    let refused_member_beside_an_unannotated_one = annotated(
+        StructField::nullable(
+            "keep",
+            struct_of([
+                StructField::nullable("unannotated", DataType::INTEGER),
+                StructField::nullable("b", DataType::BINARY),
+            ]),
+        ),
+        1,
+        "col-keep",
+    );
+    let schema = StructType::try_new([refused_member_beside_an_unannotated_one]).unwrap();
+
+    let (logical_fields, _, refused_columns) =
+        build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new()).expect(
+            "a column refused for a member's type must not fail the call for a sibling member's \
+             missing annotation",
+        );
+
+    assert!(logical_fields.is_empty());
+    assert_eq!(refused_columns.len(), 1);
+    assert_eq!(refused_columns[0].column_name, "keep");
+    assert!(
+        refused_columns[0].reason.contains("'keep.b'"),
+        "message was: {}",
+        refused_columns[0].reason
+    );
 }
 
 // Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
@@ -536,7 +670,7 @@ fn an_array_inherits_its_element_types_refusal_at_any_nesting_depth() {
 fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
     let field = StructField::not_null("plain", DataType::INTEGER);
 
-    let changes = recorded_type_changes(&field).expect("an unannotated field parses cleanly");
+    let changes = parsed_type_changes(&field).expect("an unannotated field parses cleanly");
 
     assert!(changes.is_empty());
 }
@@ -547,7 +681,7 @@ fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
 fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list() {
     let field = mapped_field("a", 1, "col-a");
 
-    let changes = recorded_type_changes(&field).expect("no delta.typeChanges key at all");
+    let changes = parsed_type_changes(&field).expect("no delta.typeChanges key at all");
 
     assert!(changes.is_empty());
 }
@@ -564,15 +698,17 @@ fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
         ])),
     )]);
 
-    let changes = recorded_type_changes(&field).expect("a well-formed entry must parse");
+    let changes = parsed_type_changes(&field).expect("a well-formed entry must parse");
 
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].from_type, "byte");
     assert_eq!(changes[0].to_type, "long");
 }
 
+/// An entry's `fieldPath` is RETAINED: the refusal reports it so an operator can locate the change
+/// inside a nested tree, even though it is never an input to the supported-pair check.
 #[test]
-fn parses_multiple_entries_and_ignores_an_optional_field_path() {
+fn parses_multiple_entries_and_retains_an_optional_field_path() {
     let field = StructField::nullable("m", DataType::STRING).with_metadata([(
         "delta.typeChanges",
         MetadataValue::Other(serde_json::json!([
@@ -581,11 +717,11 @@ fn parses_multiple_entries_and_ignores_an_optional_field_path() {
         ])),
     )]);
 
-    let changes = recorded_type_changes(&field).expect("both entries must parse");
+    let changes = parsed_type_changes(&field).expect("both entries must parse");
 
     assert_eq!(changes.len(), 2);
     assert_eq!(changes[0], type_change("byte", "long"));
-    assert_eq!(changes[1], type_change("integer", "long"));
+    assert_eq!(changes[1], type_change_at("integer", "long", "value"));
 }
 
 #[test]
@@ -595,7 +731,7 @@ fn a_non_list_type_changes_value_is_refused_naming_the_column() {
         MetadataValue::String("not-a-list".to_string()),
     )]);
 
-    let err = recorded_type_changes(&field).expect_err("a non-list value must be refused");
+    let err = parsed_type_changes(&field).expect_err("a non-list value must be refused");
     let message = user_message(err);
 
     assert!(message.contains("'bad'"), "message was: {message}");
@@ -612,7 +748,7 @@ fn a_non_object_entry_is_refused_naming_the_column() {
         MetadataValue::Other(serde_json::json!(["not-an-object"])),
     )]);
 
-    let err = recorded_type_changes(&field).expect_err("a non-object entry must be refused");
+    let err = parsed_type_changes(&field).expect_err("a non-object entry must be refused");
     let message = user_message(err);
 
     assert!(message.contains("'bad'"), "message was: {message}");
@@ -634,7 +770,7 @@ fn an_entry_missing_or_misshaping_fromtype_or_totype_is_refused_naming_the_colum
     )]);
 
     for field in [missing_from, missing_to, non_string_from] {
-        let err = recorded_type_changes(&field).expect_err("a malformed entry must be refused");
+        let err = parsed_type_changes(&field).expect_err("a malformed entry must be refused");
         let message = user_message(err);
         assert!(message.contains("'bad'"), "message was: {message}");
     }
@@ -649,7 +785,7 @@ fn a_non_string_field_path_is_refused_naming_the_column() {
         ])),
     )]);
 
-    let err = recorded_type_changes(&field).expect_err("a non-string fieldPath must be refused");
+    let err = parsed_type_changes(&field).expect_err("a non-string fieldPath must be refused");
     let message = user_message(err);
 
     assert!(message.contains("'bad'"), "message was: {message}");
@@ -660,7 +796,23 @@ fn type_change(from_type: &str, to_type: &str) -> RecordedTypeChange {
     RecordedTypeChange {
         from_type: from_type.to_string(),
         to_type: to_type.to_string(),
+        field_path: None,
     }
+}
+
+/// A recorded entry carrying a `fieldPath`, which the protocol writes when the change applies to a
+/// map key/value or an array element rather than to the annotated field itself.
+fn type_change_at(from_type: &str, to_type: &str, field_path: &str) -> RecordedTypeChange {
+    RecordedTypeChange {
+        from_type: from_type.to_string(),
+        to_type: to_type.to_string(),
+        field_path: Some(field_path.to_string()),
+    }
+}
+
+/// The recorded entries `field` carries, read at the path a top-level column of its name occupies.
+fn parsed_type_changes(field: &StructField) -> Result<Vec<RecordedTypeChange>, UdfError> {
+    recorded_type_changes(field, &FieldPath::column(field.name()))
 }
 
 /// Every `fromType`/`toType` pair the Delta protocol's § Type Widening lists, spelled as the Delta
@@ -794,12 +946,13 @@ fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
     }
 }
 
-/// An entry carrying a `fieldPath` is validated by its pair ALONE: the path names a map key/value
-/// or an array element and is never parsed.
+/// An entry carrying a `fieldPath` is validated by its pair ALONE: the path is retained for the
+/// refusal to report and never interpreted, coerced into a type decision, or resolved against the
+/// schema.
 #[test]
 fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
-    let supported = type_change("byte", "long");
-    let unsupported = type_change("long", "double");
+    let supported = type_change_at("byte", "long", "value");
+    let unsupported = type_change_at("long", "double", "element");
 
     assert!(is_supported_type_change(&supported));
     assert!(!is_supported_type_change(&unsupported));
@@ -853,4 +1006,275 @@ fn a_field_whose_recorded_type_changes_are_all_supported_plans_normally() {
     );
     assert_eq!(logical_fields.len(), 1);
     assert_eq!(logical_fields[0].name, "value");
+}
+
+// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
+// unsupported one refuses its column
+/// Every recorded entry is validated at EVERY nesting depth, and the refusal reports the
+/// structural path from the top-level column down to the annotated field, composed with that
+/// entry's own `fieldPath` when it carries one.
+#[test]
+fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
+    let long_to_double = || serde_json::json!([{"fromType": "long", "toType": "double"}]);
+    let long_to_double_on_a_value =
+        || serde_json::json!([{"fromType": "long", "toType": "double", "fieldPath": "value"}]);
+
+    for (column_name, data_type, expected_path) in [
+        (
+            "payload",
+            struct_of([with_type_changes(
+                StructField::nullable("inner", DataType::LONG),
+                long_to_double(),
+            )]),
+            "payload.inner",
+        ),
+        (
+            "payload",
+            struct_of([with_type_changes(
+                StructField::nullable("attrs", map_of(DataType::STRING, DataType::LONG)),
+                long_to_double_on_a_value(),
+            )]),
+            "payload.attrs.value",
+        ),
+        (
+            "rows",
+            array_of(struct_of([with_type_changes(
+                StructField::nullable("v", DataType::LONG),
+                long_to_double(),
+            )])),
+            "rows.element.v",
+        ),
+        (
+            "deep",
+            struct_of([StructField::nullable(
+                "mid",
+                struct_of([with_type_changes(
+                    StructField::nullable("leaf", DataType::LONG),
+                    long_to_double(),
+                )]),
+            )]),
+            "deep.mid.leaf",
+        ),
+    ] {
+        let schema = StructType::try_new([StructField::nullable(column_name, data_type)]).unwrap();
+
+        let (logical_fields, _, refused_columns) =
+            build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).expect(
+                "an unsupported recorded type change refuses the column, not the whole call",
+            );
+
+        assert!(logical_fields.is_empty());
+        assert_eq!(refused_columns.len(), 1);
+        assert_eq!(refused_columns[0].column_name, column_name);
+        let message = &refused_columns[0].reason;
+        assert!(
+            message.contains(&format!("whose member '{expected_path}'")),
+            "the refusal must locate the annotated field: {message}"
+        );
+        assert!(
+            message.contains("delta.typeChanges"),
+            "message was: {message}"
+        );
+        assert!(message.contains("'long'"), "message was: {message}");
+        assert!(message.contains("'double'"), "message was: {message}");
+    }
+}
+
+/// The `fieldPath` an entry on the TOP-LEVEL field carries is reported too: the annotation sits on
+/// the column, but the change it records applies to the column's map value.
+#[test]
+fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
+    let schema = StructType::try_new([with_type_changes(
+        StructField::nullable("m", map_of(DataType::STRING, DataType::LONG)),
+        serde_json::json!([{"fromType": "long", "toType": "double", "fieldPath": "value"}]),
+    )])
+    .unwrap();
+
+    let (_, _, refused_columns) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+
+    assert_eq!(refused_columns.len(), 1);
+    assert!(
+        refused_columns[0].reason.contains("whose member 'm.value'"),
+        "message was: {}",
+        refused_columns[0].reason
+    );
+}
+
+/// A SUPPORTED nested change refuses nothing, and a MALFORMED nested annotation surfaces the same
+/// `UdfError` a malformed top-level one does rather than being skipped for sitting in a container.
+#[test]
+fn a_nested_annotation_is_supported_or_malformed_by_the_same_rules_as_a_top_level_one() {
+    let supported = StructType::try_new([StructField::nullable(
+        "payload",
+        struct_of([with_type_changes(
+            StructField::nullable("inner", DataType::LONG),
+            serde_json::json!([{"fromType": "byte", "toType": "long"}]),
+        )]),
+    )])
+    .unwrap();
+    let malformed = StructType::try_new([StructField::nullable(
+        "payload",
+        struct_of([with_type_changes(
+            StructField::nullable("inner", DataType::LONG),
+            serde_json::json!([{"toType": "long"}]),
+        )]),
+    )])
+    .unwrap();
+
+    let (logical_fields, _, refused_columns) =
+        build_delta_table_schema(&supported, ColumnMappingMode::None, Vec::new())
+            .expect("a supported nested change must not fail the call");
+    assert!(refused_columns.is_empty());
+    assert_eq!(logical_fields.len(), 1);
+
+    let err = build_delta_table_schema(&malformed, ColumnMappingMode::None, Vec::new())
+        .expect_err("a malformed nested annotation must surface as a UdfError");
+    let message = user_message(err);
+    assert!(
+        message.contains("'payload.inner'"),
+        "message was: {message}"
+    );
+    assert!(message.contains("fromType"), "message was: {message}");
+}
+
+// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
+// the scan
+/// The vendored `stats-all-types` fixture's `nested_struct` is the pairing the JSON renderer keys
+/// by: each inner field's LOGICAL name plus the ONE binding key the mode in force selects, and
+/// never a `col-`-prefixed physical name in the `name` slot.
+#[test]
+fn nested_descriptor_carries_logical_names_and_mode_selected_binding_keys() {
+    let schema = parse_schema(STATS_ALL_TYPES_NESTED_STRUCT_SCHEMA);
+
+    for (mode, expected_fields) in [
+        (
+            ColumnMappingMode::Name,
+            vec![
+                nested_field("inner_int", None, Some(INNER_INT_PHYSICAL_NAME)),
+                nested_field("inner_string", None, Some(INNER_STRING_PHYSICAL_NAME)),
+                nested_field("inner_double", None, Some(INNER_DOUBLE_PHYSICAL_NAME)),
+            ],
+        ),
+        (
+            ColumnMappingMode::Id,
+            vec![
+                nested_field("inner_int", Some(17), None),
+                nested_field("inner_string", Some(18), None),
+                nested_field("inner_double", Some(19), None),
+            ],
+        ),
+        (
+            ColumnMappingMode::None,
+            vec![
+                nested_field("inner_int", None, None),
+                nested_field("inner_string", None, None),
+                nested_field("inner_double", None, None),
+            ],
+        ),
+    ] {
+        let field = only_logical_field(&schema, mode);
+
+        assert_eq!(field.arrow_type, "utf8", "mode was: {mode:?}");
+        assert_eq!(
+            field.nested,
+            Some(NestedMembers::Struct {
+                fields: expected_fields
+            }),
+            "mode was: {mode:?}"
+        );
+    }
+}
+
+// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
+// the scan
+/// A list's element and a map's key and value are POSITIONAL: the descriptor records them without
+/// a name or a binding key, and records them at all only when the member is itself a container.
+/// A primitive column carries no descriptor whatsoever.
+#[test]
+fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor() {
+    let schema = StructType::try_new([
+        StructField::nullable("primitive_col", DataType::LONG),
+        StructField::nullable("array_col", array_of(DataType::INTEGER)),
+        StructField::nullable("map_col", map_of(DataType::STRING, DataType::INTEGER)),
+        StructField::nullable(
+            "array_of_struct_col",
+            array_of(struct_of([StructField::nullable("a", DataType::INTEGER)])),
+        ),
+        StructField::nullable(
+            "map_of_array_col",
+            map_of(DataType::STRING, array_of(DataType::INTEGER)),
+        ),
+    ])
+    .unwrap();
+
+    let (logical_fields, _, _) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+
+    let descriptors: Vec<(&str, Option<&NestedMembers>)> = logical_fields
+        .iter()
+        .map(|field| (field.name.as_str(), field.nested.as_ref()))
+        .collect();
+    assert_eq!(
+        descriptors,
+        vec![
+            ("primitive_col", None),
+            ("array_col", Some(&NestedMembers::List { element: None })),
+            (
+                "map_col",
+                Some(&NestedMembers::Map {
+                    key: None,
+                    value: None
+                })
+            ),
+            (
+                "array_of_struct_col",
+                Some(&NestedMembers::List {
+                    element: Some(Box::new(NestedMembers::Struct {
+                        fields: vec![nested_field("a", None, None)]
+                    }))
+                })
+            ),
+            (
+                "map_of_array_col",
+                Some(&NestedMembers::Map {
+                    key: None,
+                    value: Some(Box::new(NestedMembers::List { element: None }))
+                })
+            ),
+        ]
+    );
+}
+
+// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
+// the scan
+/// A nested field whose physical identity the writer never wrote cannot be bound, so it is refused
+/// at the depth it is missing, by the same rule and the same message a missing top-level
+/// annotation already uses.
+#[test]
+fn a_nested_field_missing_its_modes_annotation_is_refused_naming_its_path() {
+    let schema = StructType::try_new([annotated(
+        StructField::nullable(
+            "payload",
+            struct_of([StructField::nullable("inner", DataType::INTEGER)]),
+        ),
+        1,
+        "col-payload",
+    )])
+    .unwrap();
+
+    for (mode, expected_key) in [
+        (ColumnMappingMode::Id, "delta.columnMapping.id"),
+        (ColumnMappingMode::Name, "delta.columnMapping.physicalName"),
+    ] {
+        let err = build_delta_table_schema(&schema, mode, Vec::new())
+            .expect_err("an unannotated nested field must be refused");
+        let message = user_message(err);
+
+        assert!(
+            message.contains("'payload.inner'"),
+            "message was: {message}"
+        );
+        assert!(message.contains(expected_key), "message was: {message}");
+    }
 }

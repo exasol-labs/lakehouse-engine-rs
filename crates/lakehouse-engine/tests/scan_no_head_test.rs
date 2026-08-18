@@ -310,6 +310,7 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
                     arrow_type: "int64".to_string(),
                     nullable: false,
                     initial_default: None,
+                    nested: None,
                     physical_name: None,
                 },
                 LogicalField {
@@ -318,6 +319,7 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
                     arrow_type: "utf8".to_string(),
                     nullable: false,
                     initial_default: None,
+                    nested: None,
                     physical_name: None,
                 },
             ],
@@ -345,6 +347,7 @@ fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
             arrow_type: if i == 1 { "utf8" } else { "int64" }.to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         })
         .collect()

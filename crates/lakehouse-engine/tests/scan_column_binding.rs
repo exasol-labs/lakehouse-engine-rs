@@ -28,8 +28,8 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem, ScanSpec,
-    StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
+    ProjectionItem, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -234,6 +234,7 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -242,6 +243,7 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: Some("col-abc".to_string()),
         },
         LogicalField {
@@ -250,6 +252,7 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -315,6 +318,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         arrow_type: "int64".to_string(),
         nullable: false,
         initial_default: None,
+        nested: None,
         physical_name: None,
     };
 
@@ -328,6 +332,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -336,6 +341,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: Some("42".to_string()),
+            nested: None,
             physical_name: None,
         },
     ];
@@ -382,6 +388,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -398,6 +405,153 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     assert!(
         text.contains("mandatory"),
         "error must name the missing required column: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (type-mapping): one Parquet file carrying a nested `list` column, a
+/// nested `struct` column, and an ordinary primitive column together — the
+/// nested columns render as valid JSON while the primitive column passes
+/// through the scan completely unaffected, proving the two column-handling
+/// paths coexist correctly within one scan.
+#[test]
+fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
+    use arrow::array::{ArrayRef, ListBuilder, StringArray, StringBuilder, StructArray};
+    use arrow::datatypes::Fields;
+
+    let dir = std::env::temp_dir().join(format!("lh_column_binding_mixed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut tags_builder = ListBuilder::new(StringBuilder::new());
+    tags_builder.values().append_value("a");
+    tags_builder.values().append_value("b");
+    tags_builder.append(true);
+    let tags = tags_builder.finish();
+
+    let addr = StructArray::try_new(
+        Fields::from(vec![
+            Arc::new(Field::new("street", DataType::Utf8, true)),
+            Arc::new(Field::new("city", DataType::Utf8, true)),
+        ]),
+        vec![
+            Arc::new(StringArray::from(vec![Some("Main St")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("Berlin")])) as ArrayRef,
+        ],
+        None,
+    )
+    .expect("struct array");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Int64, true),
+        Field::new("tags", tags.data_type().clone(), true),
+        Field::new("addr", addr.data_type().clone(), true),
+    ]));
+    let path = dir.join("mixed.parquet");
+    {
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![0i64])),
+                Arc::new(Int64Array::from(vec![250i64])),
+                Arc::new(tags),
+                Arc::new(addr),
+            ],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    let file_url = url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string();
+    let file_size = std::fs::metadata(&path).expect("stat parquet").len();
+
+    let identity_field =
+        |name: &str, arrow_type: &str, nested: Option<NestedMembers>| LogicalField {
+            field_id: None,
+            name: name.to_string(),
+            arrow_type: arrow_type.to_string(),
+            nullable: true,
+            initial_default: None,
+            nested,
+            physical_name: None,
+        };
+    let logical_schema = vec![
+        LogicalField {
+            nullable: false,
+            ..identity_field("id", "int64", None)
+        },
+        identity_field("amount", "int64", None),
+        identity_field("tags", "utf8", Some(NestedMembers::List { element: None })),
+        identity_field(
+            "addr",
+            "utf8",
+            Some(NestedMembers::Struct {
+                fields: vec![
+                    NestedField {
+                        field_id: None,
+                        name: "street".to_string(),
+                        physical_name: None,
+                        nested: None,
+                    },
+                    NestedField {
+                        field_id: None,
+                        name: "city".to_string(),
+                        physical_name: None,
+                        nested: None,
+                    },
+                ],
+            }),
+        ),
+    ];
+    let spec = raw_scan_spec(
+        file_url.clone(),
+        file_size,
+        vec!["ID", "AMOUNT", "TAGS", "ADDR"],
+        logical_schema,
+        vec![],
+    );
+
+    let batches = block_on(run_scan(&spec, &file_url)).expect("mixed-column scan must succeed");
+    assert_eq!(
+        1,
+        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+        "row count"
+    );
+    let batch = &batches[0];
+
+    let amounts = int64_column(batch, "AMOUNT");
+    assert_eq!(
+        amounts.value(0),
+        250,
+        "the ordinary primitive column must pass through the scan unaffected"
+    );
+
+    let tags_index = batch.schema().index_of("TAGS").expect("TAGS present");
+    let rendered_tags = batch
+        .column(tags_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("TAGS must render as Utf8 JSON");
+    let parsed_tags: serde_json::Value =
+        serde_json::from_str(rendered_tags.value(0)).expect("TAGS must be valid JSON");
+    assert_eq!(parsed_tags, serde_json::json!(["a", "b"]));
+
+    let addr_index = batch.schema().index_of("ADDR").expect("ADDR present");
+    let rendered_addr = batch
+        .column(addr_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("ADDR must render as Utf8 JSON");
+    let parsed_addr: serde_json::Value =
+        serde_json::from_str(rendered_addr.value(0)).expect("ADDR must be valid JSON");
+    assert_eq!(
+        parsed_addr,
+        serde_json::json!({"street": "Main St", "city": "Berlin"})
     );
 
     let _ = std::fs::remove_dir_all(&dir);

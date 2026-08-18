@@ -1027,6 +1027,7 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
                 arrow_type: "int64".to_string(),
                 nullable: true,
                 initial_default: None,
+                nested: None,
                 physical_name: None,
             },
             LogicalField {
@@ -1035,6 +1036,7 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
                 arrow_type: "float64".to_string(),
                 nullable: true,
                 initial_default: None,
+                nested: None,
                 physical_name: None,
             },
             LogicalField {
@@ -1043,6 +1045,7 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
                 arrow_type: "decimal128(20,2)".to_string(),
                 nullable: true,
                 initial_default: None,
+                nested: None,
                 physical_name: None,
             },
         ],
@@ -1052,5 +1055,109 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
         resolved.refused_columns.is_empty(),
         "a promotion this engine reads refuses no column: {:?}",
         resolved.refused_columns
+    );
+}
+
+#[test]
+fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
+    use iceberg::spec::{
+        ListType, MapType, NestedField as IcebergField, PrimitiveType, Schema, StructType, Type,
+    };
+
+    let struct_ty = Type::Struct(StructType::new(vec![]));
+    let list_ty = Type::List(ListType::new(
+        IcebergField::list_element(100, Type::Primitive(PrimitiveType::String), true).into(),
+    ));
+    let map_ty = Type::Map(MapType::new(
+        IcebergField::map_key_element(101, Type::Primitive(PrimitiveType::Int)).into(),
+        IcebergField::map_value_element(102, Type::Primitive(PrimitiveType::String), true).into(),
+    ));
+    for ty in [&struct_ty, &list_ty, &map_ty] {
+        assert_eq!(
+            crate::types::mapping::iceberg_type_to_arrow(ty),
+            arrow::datatypes::DataType::Utf8,
+            "{ty:?} must stay Utf8-tagged"
+        );
+    }
+
+    let address = Type::Struct(StructType::new(vec![
+        IcebergField::required(3, "street", Type::Primitive(PrimitiveType::String)).into(),
+        IcebergField::required(4, "city", Type::Primitive(PrimitiveType::String)).into(),
+    ]));
+    let inner_struct = Type::Struct(StructType::new(vec![
+        IcebergField::required(10, "a", Type::Primitive(PrimitiveType::String)).into(),
+    ]));
+    let items = Type::List(ListType::new(
+        IcebergField::list_element(9, inner_struct, true).into(),
+    ));
+    let tags = Type::Map(MapType::new(
+        IcebergField::map_key_element(6, Type::Primitive(PrimitiveType::Int)).into(),
+        IcebergField::map_value_element(7, Type::Primitive(PrimitiveType::String), true).into(),
+    ));
+
+    let schema = Schema::builder()
+        .with_fields(vec![
+            IcebergField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            IcebergField::required(2, "address", address).into(),
+            IcebergField::required(5, "tags", tags).into(),
+            IcebergField::required(8, "items", items).into(),
+        ])
+        .build()
+        .expect("well-formed nested schema builds");
+
+    let logical = build_logical_schema(&schema);
+
+    assert_eq!(logical[0].arrow_type, "int32");
+    assert_eq!(
+        logical[0].nested, None,
+        "a primitive field carries no nested descriptor"
+    );
+
+    assert_eq!(logical[1].arrow_type, "utf8", "struct stays Utf8-tagged");
+    assert_eq!(
+        logical[1].nested,
+        Some(NestedMembers::Struct {
+            fields: vec![
+                NestedField {
+                    field_id: Some(3),
+                    name: "street".to_string(),
+                    physical_name: None,
+                    nested: None,
+                },
+                NestedField {
+                    field_id: Some(4),
+                    name: "city".to_string(),
+                    physical_name: None,
+                    nested: None,
+                },
+            ],
+        }),
+        "each struct field carries its real Iceberg field-id and logical name"
+    );
+
+    assert_eq!(logical[2].arrow_type, "utf8", "map stays Utf8-tagged");
+    assert_eq!(
+        logical[2].nested,
+        Some(NestedMembers::Map {
+            key: None,
+            value: None
+        }),
+        "a map of primitives carries no key/value descriptor"
+    );
+
+    assert_eq!(logical[3].arrow_type, "utf8", "list stays Utf8-tagged");
+    assert_eq!(
+        logical[3].nested,
+        Some(NestedMembers::List {
+            element: Some(Box::new(NestedMembers::Struct {
+                fields: vec![NestedField {
+                    field_id: Some(10),
+                    name: "a".to_string(),
+                    physical_name: None,
+                    nested: None,
+                }],
+            })),
+        }),
+        "a list of structs recurses into the element's own struct descriptor"
     );
 }

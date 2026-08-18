@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.39.0"
+version = "0.40.0"
 edition = "2024"
 license.workspace = true
 
@@ -27,7 +27,7 @@ exasol-udf-macros = { workspace = true }
 vs-expression     = { path = "../vs-expression" }
 lakehouse-catalog = { path = "../lakehouse-catalog" }
 
-arrow      = { workspace = true }
+arrow      = { workspace = true, features = ["json"] }
 parquet    = { workspace = true }
 datafusion = { workspace = true }
 

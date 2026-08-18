@@ -676,6 +676,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
             arrow_type: "int32".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -684,6 +685,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -692,6 +694,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
             arrow_type: "utf8".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -700,6 +703,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
             arrow_type: "timestamp_us".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -708,6 +712,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
             arrow_type: "decimal128(18,4)".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -1338,6 +1343,7 @@ fn join_block_round_trips_through_split_and_merge() {
             arrow_type: "int64".into(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         }],
         name_mapping: Vec::new(),
@@ -1609,6 +1615,7 @@ fn a_logical_field_carries_at_most_one_binding_key_and_emits_no_key_for_the_othe
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name,
     };
 
@@ -2132,4 +2139,153 @@ fn deletion_vector_is_carried_verbatim_with_every_member() {
         path_or_inline_dv, "vBn[lx{q8@P<9BNH/isA",
         "the reference is stored verbatim, never joined onto the table root"
     );
+}
+
+/// A logical schema authored before the nested descriptor existed still reconstitutes,
+/// so an in-flight spec from an older adapter build is never rejected by the scan.
+#[test]
+fn a_logical_field_authored_before_the_nested_descriptor_deserializes_unchanged() {
+    let old_shape = r#"{"field_id":7,"name":"REGION","arrow_type":"utf8","nullable":true}"#;
+
+    let field: LogicalField =
+        serde_json::from_str(old_shape).expect("the pre-descriptor encoding must reconstitute");
+
+    assert_eq!(
+        field,
+        LogicalField {
+            field_id: Some(7),
+            name: "REGION".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            nested: None,
+            physical_name: None,
+        },
+        "an absent nested key must read as no descriptor, not as an error"
+    );
+}
+
+/// A primitive column's encoding gains NO key from the descriptor, so every committed
+/// golden encoding of a primitive-only logical schema still passes unedited.
+#[test]
+fn a_primitive_logical_field_serializes_no_nested_key() {
+    let primitive = LogicalField {
+        field_id: Some(7),
+        name: "REGION".to_string(),
+        arrow_type: "utf8".to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+
+    assert_eq!(
+        serde_json::to_string(&primitive).unwrap(),
+        r#"{"field_id":7,"name":"REGION","arrow_type":"utf8","nullable":true}"#
+    );
+}
+
+/// Every container kind is representable at depth, and each nested field carries the
+/// SAME single binding key its top-level counterpart would — a field-id for Iceberg, a
+/// physical name for Delta `name` mapping, neither for identity binding.
+#[test]
+fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
+    // list<struct<street(3), city(4)>> under Iceberg field-id binding.
+    let list_of_struct = NestedMembers::List {
+        element: Some(Box::new(NestedMembers::Struct {
+            fields: vec![
+                NestedField {
+                    field_id: Some(3),
+                    name: "street".to_string(),
+                    physical_name: None,
+                    nested: None,
+                },
+                NestedField {
+                    field_id: Some(4),
+                    name: "city".to_string(),
+                    physical_name: None,
+                    nested: None,
+                },
+            ],
+        })),
+    };
+    assert_eq!(
+        serde_json::to_string(&list_of_struct).unwrap(),
+        r#"{"list":{"element":{"struct":{"fields":[{"field_id":3,"name":"street"},{"field_id":4,"name":"city"}]}}}}"#
+    );
+
+    // struct<inner_int> under Delta `name` mapping: the physical name is the binding key.
+    let name_mapped_struct = NestedMembers::Struct {
+        fields: vec![NestedField {
+            field_id: None,
+            name: "inner_int".to_string(),
+            physical_name: Some("col-7f2f94cf".to_string()),
+            nested: None,
+        }],
+    };
+    assert_eq!(
+        serde_json::to_string(&name_mapped_struct).unwrap(),
+        r#"{"struct":{"fields":[{"name":"inner_int","physical_name":"col-7f2f94cf"}]}}"#
+    );
+
+    // map<int, struct<a>>: a positional member carries only its own members, so a map of
+    // primitives encodes as an empty object rather than inventing names for key/value.
+    let map_of_struct = NestedMembers::Map {
+        key: None,
+        value: Some(Box::new(NestedMembers::Struct {
+            fields: vec![NestedField {
+                field_id: None,
+                name: "a".to_string(),
+                physical_name: None,
+                nested: None,
+            }],
+        })),
+    };
+    assert_eq!(
+        serde_json::to_string(&map_of_struct).unwrap(),
+        r#"{"map":{"value":{"struct":{"fields":[{"name":"a"}]}}}}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&NestedMembers::Map {
+            key: None,
+            value: None
+        })
+        .unwrap(),
+        r#"{"map":{}}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&NestedMembers::List { element: None }).unwrap(),
+        r#"{"list":{}}"#
+    );
+
+    for members in [
+        list_of_struct,
+        name_mapped_struct,
+        map_of_struct,
+        NestedMembers::List { element: None },
+        NestedMembers::Map {
+            key: None,
+            value: None,
+        },
+    ] {
+        let field = LogicalField {
+            field_id: Some(2),
+            name: "ADDR".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            nested: Some(members),
+            physical_name: None,
+        };
+        let json = serde_json::to_string(&field).unwrap();
+        assert!(
+            json.contains(r#""arrow_type":"utf8""#),
+            "a nested column's logical type stays the utf8 tag: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<LogicalField>(&json).unwrap(),
+            field,
+            "{field:?} must survive its own encoding"
+        );
+    }
 }

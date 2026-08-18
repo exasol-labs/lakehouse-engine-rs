@@ -32,7 +32,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array, Decimal128Array, Int64Array, StringArray, StringViewArray};
+use arrow::array::{
+    Array, Decimal128Array, Int64Array, ListBuilder, StringArray, StringBuilder, StringViewArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
@@ -41,7 +43,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_scan_runtime, read_scan_spec, run_raw_scan_with_session, run_scan_one,
@@ -184,6 +186,79 @@ fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) 
     url::Url::from_file_path(&path)
         .expect("absolute path")
         .to_string()
+}
+
+/// Write a local Parquet at `dir/name` with `id` (Int64) and a populated
+/// `list<string>` `tags` column (one row: `["hello","world"]`), and return its
+/// `file://` URL.
+fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
+    let mut tags_builder = ListBuilder::new(StringBuilder::new());
+    tags_builder.values().append_value("hello");
+    tags_builder.values().append_value("world");
+    tags_builder.append(true);
+    let tags = tags_builder.finish();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tags", tags.data_type().clone(), true),
+    ]));
+    let path = dir.join(name);
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int64Array::from(vec![0i64])), Arc::new(tags)],
+    )
+    .expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string()
+}
+
+/// A raw-scan `ScanSpec` over one file declaring `tags` as a nested `list`
+/// column via the logical schema (field-id path), projecting ID/TAGS with the
+/// given `emit_exa_types`.
+fn nested_spec_for_file(file_url: String, emit_exa_types: Vec<String>) -> ScanSpec {
+    let size = file_size(&file_url);
+    ScanSpec {
+        common: CommonScanSpec {
+            projection: vec!["ID".into(), "TAGS".into()],
+            logical_schema: vec![
+                LogicalField {
+                    field_id: None,
+                    name: "id".to_string(),
+                    arrow_type: "int64".to_string(),
+                    nullable: false,
+                    initial_default: None,
+                    nested: None,
+                    physical_name: None,
+                },
+                LogicalField {
+                    field_id: None,
+                    name: "tags".to_string(),
+                    arrow_type: "utf8".to_string(),
+                    nullable: true,
+                    initial_default: None,
+                    nested: Some(NestedMembers::List { element: None }),
+                    physical_name: None,
+                },
+            ],
+            emit_exa_types,
+            storage: StorageBackend::S3(StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            }),
+            df_batch_size: 64,
+            ..Default::default()
+        },
+        files: vec![FileEntry::new(file_url, size)],
+    }
 }
 
 /// A DISTINCT row-scan `ScanSpec` over one file: single-column `CATEGORY`
@@ -470,6 +545,67 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
         categories_of(&emitted),
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
         "emitted rows must be exactly the distinct value set, no duplicates"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (nested-json-rendering): a nested column already rendered to JSON
+/// upstream crosses `coerce_batch_to_exa_types` (the emit-coercion boundary)
+/// UNCHANGED. Compares a declared-VARCHAR run (the cast-to-Utf8 branch) against
+/// an undeclared-type run (the view-type-normalization fallback branch): both
+/// already receive a Utf8 column post-render, so both must emit byte-identical
+/// JSON text — proof neither coercion branch needs a nested-aware special case,
+/// because the rendering already happened upstream of this boundary.
+#[test]
+fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
+    let dir = std::env::temp_dir().join(format!("lh_emit_nested_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_url = write_parquet_tags(&dir, "tags.parquet");
+
+    let declared = nested_spec_for_file(
+        file_url.clone(),
+        vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
+    );
+    let undeclared = nested_spec_for_file(file_url.clone(), vec![]);
+
+    let built = AtomicUsize::new(0);
+    let declared_emitted = run_one_row(&declared, &built);
+    let undeclared_emitted = run_one_row(&undeclared, &built);
+
+    let rendered_tags = |batches: &[RecordBatch]| -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let index = batch.schema().index_of("TAGS").expect("TAGS present");
+            let col = batch.column(index);
+            if let Some(v) = col.as_any().downcast_ref::<StringViewArray>() {
+                for i in 0..batch.num_rows() {
+                    out.push((!v.is_null(i)).then(|| v.value(i).to_string()));
+                }
+            } else if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
+                for i in 0..batch.num_rows() {
+                    out.push((!s.is_null(i)).then(|| s.value(i).to_string()));
+                }
+            } else {
+                panic!("unexpected TAGS column type: {:?}", col.data_type());
+            }
+        }
+        out
+    };
+
+    let declared_tags = rendered_tags(&declared_emitted);
+    let undeclared_tags = rendered_tags(&undeclared_emitted);
+
+    assert_eq!(
+        declared_tags,
+        vec![Some(r#"["hello","world"]"#.to_string())],
+        "the rendered nested column must cross the emit boundary as valid JSON, not display text"
+    );
+    assert_eq!(
+        declared_tags, undeclared_tags,
+        "a declared-VARCHAR emit coercion (cast-to-Utf8 branch) and an undeclared-type \
+         coercion (view-type-normalization branch) must emit the identical rendered JSON — \
+         proof neither branch needs nested-aware special-casing"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

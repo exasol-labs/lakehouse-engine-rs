@@ -254,6 +254,7 @@ fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
         arrow_type: arrow_type.to_string(),
         nullable: false,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }
 }

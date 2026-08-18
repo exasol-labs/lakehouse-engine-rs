@@ -1505,6 +1505,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }];
 
@@ -1574,6 +1575,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }];
 
@@ -1654,6 +1656,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
         arrow_type: "utf8".to_string(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }];
 
@@ -2373,7 +2376,7 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
         other => panic!("every refusal must be a user error, got {other:?}"),
     };
     assert!(
-        message.contains("binary_col") && message.contains("#350"),
+        message.contains("binary_col") && message.contains("#351"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );
@@ -2451,7 +2454,7 @@ fn assert_refuses_binary_col(error: UdfError) {
         other => panic!("every refusal must be a user error, got {other:?}"),
     };
     assert!(
-        message.contains("binary_col") && message.contains("#350"),
+        message.contains("binary_col") && message.contains("#351"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );
@@ -2605,6 +2608,7 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             arrow_type: "int32".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         }],
         storage: back.storage.clone(),

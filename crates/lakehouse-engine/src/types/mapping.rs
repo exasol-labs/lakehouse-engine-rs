@@ -207,6 +207,25 @@ pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
 }
 
+/// Whether an Arrow DataType is one of the five variants
+/// `datafusion-scan/nested-json-rendering` renders as a JSON document (`List`,
+/// `LargeList`, `FixedSizeList`, `Struct`, `Map`).
+///
+/// Narrower than `needs_json_fallback`, which also answers true for `Binary` and an
+/// out-of-range `Decimal128` — both of which keep the `CAST(col AS VARCHAR)`
+/// Arrow-display path this predicate diverts columns away from. The two predicates
+/// answer different questions and neither is derived from the other.
+pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    )
+}
+
 /// Whether Exasol can express a CATALOG-declared `DECIMAL(precision, scale)`.
 ///
 /// Sole owner of Exasol's DECIMAL domain for catalog wire input:

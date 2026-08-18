@@ -7,26 +7,31 @@
 //! and the single-source-of-truth INT96-coercing `ParquetFormat` used at every
 //! scan data-file read (shared with `positional_deletes`).
 
+use arrow::datatypes::DataType;
 use datafusion::common::config::TableParquetOptions;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
 use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::scan::emit::{classify_scan_error, emit_stream};
+use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{
     FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
     render_order_by_clause,
 };
 use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::needs_json_fallback;
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
 use super::field_id_projection::{
     FieldIdResolution, build_logical_arrow_schema, index_declared_physical_names,
-    reconstruct_initial_defaults,
+    index_nested_members, reconstruct_initial_defaults,
 };
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanSchema;
@@ -233,15 +238,17 @@ pub(super) async fn register_file_list(
     };
 
     // Build the binding tables ONCE per registration from the logical schema —
-    // the declared-physical-name index and the logical-name → ScalarValue
-    // initial-default map — and thread them into the column-binding adapter
-    // factory, which uses them per file for the declared-physical-name binding and
-    // the absent-with-default fill (Iceberg rule 3). A malformed encoded default
-    // surfaces as a clean user error, never a panic.
+    // the declared-physical-name index, the logical-name → ScalarValue
+    // initial-default map, and the nested member trees — and thread them into the
+    // column-binding adapter factory, which uses them per file for the
+    // declared-physical-name binding, the absent-with-default fill (Iceberg rule 3),
+    // and the nested resolution. A malformed encoded default surfaces as a clean
+    // user error, never a panic.
     let field_id_resolution = FieldIdResolution {
         name_mapping: name_mapping.to_vec(),
         declared_physical_names: index_declared_physical_names(logical_schema),
         defaults: reconstruct_initial_defaults(logical_schema).map_err(UdfError::User)?,
+        nested_members: index_nested_members(logical_schema),
     };
 
     // The partition columns leave the file schema here: they have no physical
@@ -273,23 +280,107 @@ const INT96_COERCE_TIME_UNIT: &str = "us";
 /// Timezone applied to coerced INT96 timestamps: an INT96 instant is UTC.
 const INT96_COERCE_TZ: &str = "UTC";
 
-/// The [`ParquetFormat`] every scan data-file read uses, coercing Parquet INT96
-/// timestamps to microsecond resolution as UTC instants (`coerce_int96 = "us"`,
-/// `coerce_int96_tz = "UTC"`).
+/// The base [`ParquetFormat`] every scan data-file read is built from, coercing
+/// Parquet INT96 timestamps to microsecond resolution as UTC instants
+/// (`coerce_int96 = "us"`, `coerce_int96_tz = "UTC"`).
 ///
 /// arrow-rs otherwise decodes INT96 as `Timestamp(Nanosecond)`, whose i64 range
 /// (1677..=2262) overflows on the far-future values legacy writers such as
 /// Fivetran emit — the plain-`SELECT *` overflow of issue #143. This is the
 /// single source of truth for that coercion so the schema-inference site
 /// ([`register_file_list`]) and the decode site
-/// ([`crate::scan::positional_deletes::PositionalDeleteScanTable`]) cannot drift:
+/// ([`scan_table_parquet_format`], reached through
+/// [`crate::scan::positional_deletes::PositionalDeleteScanTable`]) cannot drift:
 /// a divergence between inferred `Timestamp(Nanosecond)` and decoded
-/// `Timestamp(Microsecond)` would be a schema mismatch.
+/// `Timestamp(Microsecond)` would be a schema mismatch. Every decode format
+/// differs from this base ONLY in its predicate-driven read optimizations.
 pub fn int96_coerced_parquet_format() -> ParquetFormat {
     let mut options = TableParquetOptions::default();
     options.global.coerce_int96 = Some(INT96_COERCE_TIME_UNIT.to_string());
     options.global.coerce_int96_tz = Some(INT96_COERCE_TZ.to_string());
     ParquetFormat::default().with_options(options)
+}
+
+/// Whether one registered side's logical schema declares a column the scan
+/// renders to JSON — the question both the session-level and the per-table
+/// Parquet filter-pushdown decisions are taken from.
+///
+/// Read from the nested member descriptor each list, struct, and map column
+/// carries, because the logical schema erases the type itself: every nested
+/// column is tagged `utf8`, which is exactly why DataFusion approves a filter
+/// pushdown it then cannot honour. A spec carrying NO logical schema (the legacy
+/// first-file inference path) answers `false` and needs no answer: there the
+/// registered schema declares the column at its real nested type, so DataFusion
+/// rejects the pushdown itself.
+pub(super) fn renders_nested_json(logical_schema: &[crate::scan::spec::LogicalField]) -> bool {
+    logical_schema.iter().any(|field| field.nested.is_some())
+}
+
+/// Whether any side of this scan — the fact table or a broadcast join's
+/// dimension table — renders a column to JSON.
+pub(super) fn scan_renders_nested_json(spec: &ScanSpec) -> bool {
+    renders_nested_json(&spec.common.logical_schema)
+        || spec
+            .common
+            .join
+            .as_ref()
+            .is_some_and(|join| renders_nested_json(&join.logical_schema))
+}
+
+/// The [`ParquetFormat`] a table with no JSON-rendered nested column reads its
+/// data files through: [`int96_coerced_parquet_format`] plus Parquet row-filter
+/// pushdown, which DataFusion leaves off by default.
+///
+/// The flag is set on the table's own Parquet options rather than only on the
+/// session config because `ParquetSource::try_pushdown_filters` ORs the two, so a
+/// session-level `true` cannot be narrowed per table while a table-level one can
+/// be widened per table.
+pub(super) fn row_filter_pushdown_parquet_format() -> ParquetFormat {
+    let mut options = int96_coerced_parquet_format().options().clone();
+    options.global.pushdown_filters = true;
+    ParquetFormat::default().with_options(options)
+}
+
+/// The [`ParquetFormat`] a scan table reads its data files through, decided from
+/// the nested member trees its logical schema produced.
+///
+/// A table carrying a JSON-rendered nested column reads WITHOUT Parquet
+/// row-filter pushdown, and every other table reads WITH it
+/// ([`row_filter_pushdown_parquet_format`]).
+///
+/// Row-filter pushdown is withheld because DataFusion approves it against the
+/// logical schema — where a nested column is `Utf8`, a primitive, so "supported"
+/// — removes the `FilterExec`, and then drops the conjunct at file open because it
+/// does not match the PHYSICAL nested schema: the predicate is applied NOWHERE and
+/// every row comes back. With the pushdown withheld the optimizer keeps a
+/// `FilterExec` that evaluates the predicate over the RENDERED `Utf8` column,
+/// which is correct for every comparison shape. The accepted cost is that such a
+/// table loses row-level pushdown for ALL its columns, since DataFusion scopes the
+/// flag to the Parquet source and never to one column; late materialization no
+/// longer skips rows within a row group.
+///
+/// Statistics pruning, page-index pruning, and bloom-filter probing stay ON, and
+/// that is a measured decision rather than an omission. Parquet does keep
+/// statistics for a nested column's LEAF values — a `list<string>` holding
+/// `["hello","world"]` writes leaf `min = "hello"`, `max = "world"`, which a
+/// min/max range check against the RENDERED document would falsely exclude,
+/// because `[` sorts below `h`. That comparison never happens: the per-file
+/// pruning predicate is built from the ADAPTED predicate, where
+/// [`crate::scan::render_nested_column_as_json`]'s expression wraps the column, so
+/// the pruning-predicate builder finds no `Column` leaf to derive `tags_min` from;
+/// and row-group pruning resolves statistics against the PHYSICAL file schema,
+/// where parquet-rs declines to map a nested field to a leaf at all. Turning the
+/// stages off would therefore cost every PRIMITIVE column of such a table its
+/// row-group pruning while removing no hazard. `tests/scan_parquet_pruning.rs`
+/// proves it positively against a multi-row-group file carrying exactly those
+/// falsely-excluding leaf statistics, and fails loudly if a future release ever
+/// does resolve them.
+pub(super) fn scan_table_parquet_format(resolution: &FieldIdResolution) -> ParquetFormat {
+    if resolution.nested_members.is_empty() {
+        row_filter_pushdown_parquet_format()
+    } else {
+        int96_coerced_parquet_format()
+    }
 }
 
 /// Build the raw-row-path DataFusion physical plan for a session whose scan
@@ -315,10 +406,71 @@ pub async fn build_raw_scan_physical_plan(
         .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
 
+/// Name of the DataFusion scalar function the legacy (no-logical-schema) SQL
+/// paths call to render a nested column as JSON. `build_scan_sql` and
+/// `join_scan::render_join_select_item` cannot substitute a `PhysicalExpr` the
+/// way `FieldIdExprAdapter` does — they build plain SQL text — so the encoder
+/// is reached as a callable function name instead, registered once per session
+/// by [`register_nested_json_render_udf`].
+pub(super) const NESTED_JSON_RENDER_UDF_NAME: &str = "lakehouse_render_nested_json";
+
+/// [`ScalarUDFImpl`] wrapping [`render_nested_column_as_json`] so generated SQL
+/// text can call it under [`NESTED_JSON_RENDER_UDF_NAME`].
+///
+/// Accepts any single argument type (`Signature::any`) because the five nested
+/// Arrow types it serves vary in their inner element/field/key/value types; the
+/// encoder itself, not this signature, is what rejects an unsupported input.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct NestedJsonRenderUdf {
+    signature: Signature,
+}
+
+impl NestedJsonRenderUdf {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(1, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for NestedJsonRenderUdf {
+    fn name(&self) -> &str {
+        NESTED_JSON_RENDER_UDF_NAME
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> datafusion::error::Result<ColumnarValue> {
+        let array = args.args[0].to_array(args.number_rows)?;
+        let rendered = render_nested_column_as_json(&array)?;
+        Ok(ColumnarValue::Array(Arc::new(rendered)))
+    }
+}
+
+/// Register [`NESTED_JSON_RENDER_UDF_NAME`] on `ctx` so generated SQL text can
+/// call it. Called ONCE per session, from
+/// [`build_session_context`](crate::scan::object_store::build_session_context)
+/// at context construction, rather than from each SQL-build entry point that
+/// merely inspects the session's schema.
+pub(super) fn register_nested_json_render_udf(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::from(NestedJsonRenderUdf::new()));
+}
+
 /// Build the SQL string for the scan query.
 ///
-/// For incompatible columns, CAST(col AS VARCHAR) so they arrive as Utf8 and
-/// the convert module's JSON fallback just passes them through as Value::String.
+/// For a nested column (`needs_nested_json_rendering`), calls
+/// [`NESTED_JSON_RENDER_UDF_NAME`] so it renders as strict JSON. For every
+/// other incompatible column, `CAST(col AS VARCHAR)` so it arrives as Utf8 and
+/// the convert module's JSON fallback just passes it through as Value::String.
 pub(super) async fn build_scan_sql(
     ctx: &SessionContext,
     table_name: &str,
@@ -384,17 +536,20 @@ pub(super) async fn build_scan_sql(
             }
             ProjectionItem::Column(col_name) => {
                 let col_lower = col_name.to_lowercase();
-                let needs_cast = schema
+                let data_type = schema
                     .fields()
                     .iter()
                     .find(|f| f.name().to_lowercase() == col_lower)
-                    .map(|f| needs_json_fallback(f.data_type()))
-                    .unwrap_or(false);
+                    .map(|f| f.data_type().clone());
                 let upper = col_name.to_uppercase();
-                if needs_cast {
-                    format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-                } else {
-                    quote_ident(&upper)
+                match data_type {
+                    Some(dt) if needs_nested_json_rendering(&dt) => {
+                        format!("{NESTED_JSON_RENDER_UDF_NAME}({})", quote_ident(&upper))
+                    }
+                    Some(dt) if needs_json_fallback(&dt) => {
+                        format!("CAST({} AS VARCHAR)", quote_ident(&upper))
+                    }
+                    _ => quote_ident(&upper),
                 }
             }
         })

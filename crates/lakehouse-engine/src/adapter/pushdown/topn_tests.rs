@@ -142,6 +142,7 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
             arrow_type: "decimal128(20,0)".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -150,6 +151,7 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
             arrow_type: "decimal128(18,2)".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ]
@@ -760,6 +762,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
             arrow_type: "decimal128(20,0)".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -768,6 +771,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
             arrow_type: "decimal128(40,6)".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -789,6 +793,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
         arrow_type: "decimal128(20,0)".into(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }];
     assert!(

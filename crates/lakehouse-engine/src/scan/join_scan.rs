@@ -12,9 +12,9 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::needs_json_fallback;
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
-use super::raw_scan::{delete_path_read_limiter, register_file_list};
+use super::raw_scan::{NESTED_JSON_RENDER_UDF_NAME, delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
 
 /// Registered table name for the sharded fact (large) side of a broadcast join.
@@ -140,6 +140,9 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
 /// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit)
 /// and is applied HERE — after the join and its
 /// `WHERE` — never to either side's registered scan; see that field's doc.
+///
+/// The JSON-render scalar function is registered here so `render_join_select_item`
+/// can name it in the generated select list.
 async fn build_join_sql(
     ctx: &SessionContext,
     fact_table: &str,
@@ -230,8 +233,10 @@ fn combined_upper_fields(
 
 /// Render one projection item for the join SELECT list. A rendered scalar
 /// expression is spliced verbatim; a bare column is quoted as an uppercase
-/// identifier, wrapped in `CAST(... AS VARCHAR)` when its Arrow type needs the
-/// JSON fallback — the same rule the single-table scan applies in `build_scan_sql`.
+/// identifier, routed through [`NESTED_JSON_RENDER_UDF_NAME`] when its Arrow
+/// type is one of the five `needs_nested_json_rendering` owns, or wrapped in
+/// `CAST(... AS VARCHAR)` for every other type the JSON fallback covers — the
+/// same rule the single-table scan applies in `build_scan_sql`.
 fn render_join_select_item(
     item: &ProjectionItem,
     combined: &[(String, arrow::datatypes::DataType)],
@@ -240,15 +245,18 @@ fn render_join_select_item(
         ProjectionItem::Expr { expr } => expr.clone(),
         ProjectionItem::Column(col_name) => {
             let upper = col_name.to_uppercase();
-            let needs_cast = combined
+            let data_type = combined
                 .iter()
                 .find(|(name, _)| *name == upper)
-                .map(|(_, dt)| needs_json_fallback(dt))
-                .unwrap_or(false);
-            if needs_cast {
-                format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-            } else {
-                quote_ident(&upper)
+                .map(|(_, dt)| dt.clone());
+            match data_type {
+                Some(dt) if needs_nested_json_rendering(&dt) => {
+                    format!("{NESTED_JSON_RENDER_UDF_NAME}({})", quote_ident(&upper))
+                }
+                Some(dt) if needs_json_fallback(&dt) => {
+                    format!("CAST({} AS VARCHAR)", quote_ident(&upper))
+                }
+                _ => quote_ident(&upper),
             }
         }
     }
@@ -272,3 +280,7 @@ pub async fn build_join_physical_plan(
         .await
         .map_err(|e| UdfError::User(format!("physical plan error: {e}")))
 }
+
+#[cfg(test)]
+#[path = "join_scan_tests.rs"]
+mod tests;

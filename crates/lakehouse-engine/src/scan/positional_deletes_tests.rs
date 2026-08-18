@@ -554,26 +554,30 @@ fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
 
 /// A provider over `files` rooted at `table_root`, holding an N-permit read budget.
 /// Built field-by-field because Phase A needs none of the session-bound state
-/// [`PositionalDeleteScanTable::new`] derives from a storage backend.
+/// [`PositionalDeleteScanTable::new`] derives from a storage backend — except the
+/// Parquet read options, which come from the same production decision so this
+/// helper cannot read files under options production never uses.
 fn scan_table_over(
     files: Vec<FileEntry>,
     table_root: &str,
     permits: usize,
 ) -> PositionalDeleteScanTable {
+    let field_id_resolution = FieldIdResolution {
+        name_mapping: Vec::new(),
+        declared_physical_names: HashMap::new(),
+        defaults: HashMap::new(),
+        nested_members: HashMap::new(),
+    };
     PositionalDeleteScanTable {
         object_store_url: ObjectStoreUrl::parse("memory://").unwrap(),
         schema: PartitionedScanSchema::split(Arc::new(arrow::datatypes::Schema::empty()), &[])
             .expect("an empty schema declares no partition column"),
         use_field_id_adapter: false,
-        field_id_resolution: FieldIdResolution {
-            name_mapping: Vec::new(),
-            declared_physical_names: HashMap::new(),
-            defaults: HashMap::new(),
-        },
+        format: Arc::new(scan_table_parquet_format(&field_id_resolution)),
+        field_id_resolution,
         files,
         table_root: table_root.to_string(),
         secrets: Vec::new(),
-        format: Arc::new(int96_coerced_parquet_format()),
         delete_path_read_limiter: Arc::new(Semaphore::new(permits)),
     }
 }

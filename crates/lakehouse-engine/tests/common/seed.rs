@@ -12,8 +12,9 @@
 //!   event_date   DATE32       → DATE
 //!   event_ts     TIMESTAMP(µs,None) → TIMESTAMP
 //!
-//! Complex columns (list/struct) are covered by unit tests; they are not written
-//! here because iceberg-rust does not expose a struct/list writer.
+//! Complex columns (list/struct/map) ARE writable with iceberg-rust 0.10: `seed_complex_types_probe`
+//! builds its Arrow batch from `iceberg::arrow::schema_to_arrow_schema` after `create_table`, so the
+//! batch's nested field-ids match the ones the REST catalog actually assigned.
 //!
 //! Table: e2e_lakehouse.events (namespace=e2e_lakehouse, table=events)
 //! Rows: 20 deterministic rows so LIMIT 5 and WHERE score > 15.0 are both testable.
@@ -32,14 +33,17 @@ use arrow::array::{
     RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow_json::ReaderBuilder;
 use futures::TryStreamExt;
+use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::{
     ADLS_ACCOUNT_KEY, ADLS_ACCOUNT_NAME, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_PATH_STYLE_ACCESS,
     S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
-    DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveType, Schema as IcebergSchema,
-    Struct, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+    DataFileFormat, FormatVersion, ListType, Literal, MapType, NestedField, PrimitiveType,
+    Schema as IcebergSchema, Struct, StructType, Transform, Type, UnboundPartitionField,
+    UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -62,6 +66,7 @@ use iceberg_storage_opendal::{
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
+use serde_json::json;
 
 /// Namespace and table names for the E2E seed tables.
 pub const E2E_NAMESPACE: &str = "e2e_lakehouse";
@@ -3107,6 +3112,344 @@ fn make_non_ascii_identifier_batch() -> RecordBatch {
         ],
     )
     .expect("straße RecordBatch construction is infallible")
+}
+
+// ---------------------------------------------------------------------------
+// Complex-types probe (list/struct/map) — nested JSON rendering E2E fixture
+// ---------------------------------------------------------------------------
+
+/// Table name for the nested-type JSON rendering E2E probe.
+pub const E2E_COMPLEX_TABLE: &str = "complex_probe";
+
+/// Row id whose every nested column is fully populated.
+pub const COMPLEX_ROW_POPULATED: i64 = 1;
+/// Row id whose every nested column is SQL NULL (the whole cell, not a member).
+pub const COMPLEX_ROW_NULL: i64 = 2;
+/// Row id whose list/map columns are empty collections and whose `addr` struct
+/// carries one NULL member field (`city`).
+pub const COMPLEX_ROW_EMPTY: i64 = 3;
+/// Row id carrying a second, DISTINCT populated value per column, so a predicate,
+/// `GROUP BY`, `ORDER BY`, or `COUNT(DISTINCT)` over a nested column has more than
+/// one non-null value to discriminate.
+pub const COMPLEX_ROW_ALT: i64 = 4;
+/// Total rows in the complex-types probe table.
+pub const COMPLEX_TOTAL_ROWS: usize = 4;
+
+/// Seed the `complex_probe` table into the `e2e_lakehouse` namespace: one primitive
+/// `id` control column plus a `list<string>`, a `list<int>`, a
+/// `struct<street: string, city: string>`, a `map<string, string>`, a
+/// `map<int, string>`, and a `list<struct<a: int>>` — every shape
+/// `datafusion-scan/nested-json-rendering` renders.
+///
+/// `iceberg-rest-fixture` assigns FRESH field-ids on `create_table`, and
+/// `overlay_iceberg_field_ids` repairs only TOP-LEVEL ids by name, so a batch built
+/// from the schema as AUTHORED below fails nested field-id lookup. This seed
+/// therefore builds its Arrow batch from `schema_to_arrow_schema(table.metadata()
+/// .current_schema())` AFTER `create_table` returns, so every nested field-id in
+/// the batch matches what Iceberg actually assigned. Idempotent.
+pub async fn seed_complex_types_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-complex-types").await?;
+
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    let table_ident = TableIdent::new(ns.clone(), E2E_COMPLEX_TABLE.to_string());
+
+    if let Some(paths) = existing_data_file_paths(&catalog, &table_ident).await?
+        && !paths.is_empty()
+    {
+        return Ok(());
+    }
+
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = complex_types_iceberg_schema()?;
+    let partition_spec = UnboundPartitionSpec::builder().with_spec_id(0).build();
+    let creation = TableCreation::builder()
+        .name(E2E_COMPLEX_TABLE.to_string())
+        .schema(iceberg_schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+
+    let table = match catalog.create_table(&ns, creation).await {
+        Ok(t) => t,
+        Err(_) => catalog
+            .load_table(&table_ident)
+            .await
+            .context("load existing complex-types table after create failed")?,
+    };
+
+    // Check again after load (race).
+    let existing = collect_current_snapshot_paths(&table).await?;
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    write_complex_types_and_commit(&catalog, table).await
+}
+
+/// The complex-types probe's Iceberg schema, as AUTHORED. `create_table` assigns
+/// its own field-ids; `write_complex_types_and_commit` re-derives the Arrow schema
+/// from the CREATED table rather than from this one.
+fn complex_types_iceberg_schema() -> Result<IcebergSchema> {
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(
+                2,
+                "tags",
+                Type::List(ListType::new(
+                    NestedField::list_element(3, Type::Primitive(PrimitiveType::String), false)
+                        .into(),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                4,
+                "nums",
+                Type::List(ListType::new(
+                    NestedField::list_element(5, Type::Primitive(PrimitiveType::Int), false).into(),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                6,
+                "addr",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(7, "street", Type::Primitive(PrimitiveType::String))
+                        .into(),
+                    NestedField::optional(8, "city", Type::Primitive(PrimitiveType::String)).into(),
+                ])),
+            )
+            .into(),
+            NestedField::optional(
+                9,
+                "attrs",
+                Type::Map(MapType::optional(
+                    10,
+                    Type::Primitive(PrimitiveType::String),
+                    11,
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                12,
+                "int_map",
+                Type::Map(MapType::optional(
+                    13,
+                    Type::Primitive(PrimitiveType::Int),
+                    14,
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            )
+            .into(),
+            NestedField::optional(
+                15,
+                "items",
+                Type::List(ListType::new(
+                    NestedField::list_element(
+                        16,
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(17, "a", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                        false,
+                    )
+                    .into(),
+                )),
+            )
+            .into(),
+        ])
+        .build()
+        .context("build complex-types Iceberg schema")
+}
+
+/// Build the complex-types Arrow batch from the CREATED table's own schema, then
+/// write and commit it as one Parquet data file.
+async fn write_complex_types_and_commit<C: Catalog>(catalog: &C, table: Table) -> Result<()> {
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let arrow_schema = Arc::new(
+        schema_to_arrow_schema(&iceberg_schema)
+            .context("derive Arrow schema for complex-types batch")?,
+    );
+    let batch = complex_types_batch(arrow_schema)?;
+
+    let file_io = table.file_io().clone();
+    let table_location = table.metadata().location().to_string();
+    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+
+    let location_gen = FlatLocationGenerator {
+        base: table_location,
+    };
+    let file_name_gen = DefaultFileNameGenerator::new(
+        E2E_COMPLEX_TABLE.to_string(),
+        Some(uuid_suffix()),
+        DataFileFormat::Parquet,
+    );
+    let parquet_builder =
+        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_builder,
+        file_io,
+        location_gen,
+        file_name_gen,
+    );
+    let partition_key =
+        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), Struct::empty());
+
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .build(Some(partition_key))
+        .await
+        .context("build complex-types data file writer")?;
+    writer
+        .write(batch)
+        .await
+        .context("write complex-types Arrow batch")?;
+    let data_files = writer
+        .close()
+        .await
+        .context("close complex-types data file writer")?;
+
+    let tx = Transaction::new(&table);
+    let action = tx.fast_append().add_data_files(data_files);
+    let tx = action
+        .apply(tx)
+        .context("apply complex-types fast-append action")?;
+    tx.commit(catalog)
+        .await
+        .context("commit complex-types Iceberg snapshot")?;
+    Ok(())
+}
+
+/// Decode the complex-types probe rows from JSON straight into `schema` — the
+/// Arrow schema `schema_to_arrow_schema` derived from the CREATED table, so every
+/// nested field the decoder builds already carries the field-id Iceberg assigned.
+///
+/// Row layout: [`COMPLEX_ROW_POPULATED`] is fully populated; [`COMPLEX_ROW_NULL`]
+/// is SQL NULL in every nested column; [`COMPLEX_ROW_EMPTY`] carries an empty list
+/// and an empty map in every list/map column plus a NULL `city` member inside an
+/// otherwise-populated `addr` struct; [`COMPLEX_ROW_ALT`] is a second, DISTINCT
+/// populated row.
+fn complex_types_batch(schema: Arc<ArrowSchema>) -> Result<RecordBatch> {
+    let rows = vec![
+        json!({
+            "id": COMPLEX_ROW_POPULATED,
+            "tags": ["hello", "world"],
+            "nums": [1, 2, 3],
+            "addr": {"street": "Main St", "city": "Berlin"},
+            "attrs": {"a": "1", "b": "2"},
+            "int_map": {"1": "one", "2": "two"},
+            "items": [{"a": 1}, {"a": 2}],
+        }),
+        json!({
+            "id": COMPLEX_ROW_NULL,
+            "tags": null,
+            "nums": null,
+            "addr": null,
+            "attrs": null,
+            "int_map": null,
+            "items": null,
+        }),
+        json!({
+            "id": COMPLEX_ROW_EMPTY,
+            "tags": [],
+            "nums": [],
+            "addr": {"street": "Empty Ave", "city": null},
+            "attrs": {},
+            "int_map": {},
+            "items": [],
+        }),
+        json!({
+            "id": COMPLEX_ROW_ALT,
+            "tags": ["foo", "bar", "baz"],
+            "nums": [9, 8],
+            "addr": {"street": "Second St", "city": "Paris"},
+            "attrs": {"x": "9"},
+            "int_map": {"3": "three"},
+            "items": [{"a": 3}],
+        }),
+    ];
+
+    let mut decoder = ReaderBuilder::new(schema)
+        .build_decoder()
+        .context("build complex-types JSON decoder")?;
+    decoder
+        .serialize(&rows)
+        .context("serialize complex-types rows")?;
+    decoder
+        .flush()
+        .context("flush complex-types JSON decoder")?
+        .context("complex-types JSON decoder produced no batch")
+}
+
+/// Table name for the nested-type probe's JOIN partner.
+pub const E2E_COMPLEX_JOIN_TABLE: &str = "complex_join_probe";
+
+/// The rendered `tags` document [`COMPLEX_ROW_POPULATED`] carries, held in the join
+/// partner as a plain `string`.
+pub const COMPLEX_JOIN_POPULATED_DOC: &str = r#"["hello","world"]"#;
+/// The rendered `tags` document [`COMPLEX_ROW_ALT`] carries.
+pub const COMPLEX_JOIN_ALT_DOC: &str = r#"["foo","bar","baz"]"#;
+/// A document no `complex_probe` row renders, so a join over the nested column has
+/// to DISCRIMINATE rather than pair every row with every row.
+pub const COMPLEX_JOIN_ORPHAN_DOC: &str = r#"["never","matched"]"#;
+
+/// Seed the `complex_join_probe` table (`tag_doc`, `label`) into the
+/// `e2e_lakehouse` namespace: a SECOND, distinct table whose plain `string` column
+/// holds the documents `complex_probe`'s `tags` column renders to, so a join
+/// CONDITION over a nested column can be exercised without aliasing that table to
+/// itself. Idempotent.
+pub async fn seed_complex_types_join_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-complex-join").await?;
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "tag_doc", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::required(2, "label", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build complex_join_probe Iceberg schema")?;
+
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_COMPLEX_JOIN_TABLE,
+        iceberg_schema,
+        vec![vec![make_complex_join_probe_batch()]],
+    )
+    .await
+    .context("seed complex_join_probe table")?;
+    Ok(())
+}
+
+fn make_complex_join_probe_batch() -> RecordBatch {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("tag_doc", DataType::Utf8, false),
+        Field::new("label", DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                COMPLEX_JOIN_POPULATED_DOC,
+                COMPLEX_JOIN_ALT_DOC,
+                COMPLEX_JOIN_ORPHAN_DOC,
+            ])),
+            Arc::new(StringArray::from(vec!["POPULAR", "ALT", "ORPHAN"])),
+        ],
+    )
+    .expect("complex_join_probe RecordBatch construction is infallible")
 }
 
 #[cfg(test)]

@@ -429,6 +429,14 @@ pub struct LogicalField {
     /// every spec authored before this field existed deserializes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_default: Option<String>,
+    /// The members of this column's nested type — see [`NestedMembers`] — carried so the
+    /// JSON renderer keys a struct by its LOGICAL field name rather than by the physical
+    /// name the file stores. `None` for every primitive column, and absent from JSON when
+    /// `None`, so a spec authored before this field existed deserializes unchanged. It is
+    /// NOT a type: `arrow_type` stays the `"utf8"` tag for every nested column, because the
+    /// rendered JSON string IS the column's type everywhere the type is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested: Option<NestedMembers>,
     /// This column's physical-name binding key — its `delta.columnMapping.physicalName`
     /// under Delta `name` mapping, where the protocol requires a reader to match on the
     /// physical name. `None` whenever the column binds by `field_id` or by identity
@@ -436,6 +444,68 @@ pub struct LogicalField {
     /// absent from JSON when `None`, so a field-id-bound column's encoding gains no key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_name: Option<String>,
+}
+
+/// The members one nested logical field exposes, one variant per container kind.
+///
+/// This is the format-neutral nested counterpart of [`LogicalField`]'s own binding-key
+/// choice, recursed: a struct's fields each carry a logical name plus the ONE binding key
+/// the format's column mapping selects, exactly as a top-level column does, and a member
+/// that is itself nested carries its own [`NestedMembers`] in turn. Nothing here names a
+/// table format — an Iceberg nested field-id and a Delta `columnMapping` physical name are
+/// the same two keys the top level already distinguishes.
+///
+/// A list's element and a map's key and value are POSITIONAL: a `ListArray` has exactly one
+/// child and a `MapArray` exactly one key and one value child, so no name or id is needed to
+/// find them, and carrying one would invent a binding key for a member the Delta protocol
+/// never names. Each therefore carries only its own members, present only when that member
+/// is itself a container — so `list<string>` encodes as `{"list":{}}` and
+/// `map<int,struct<a>>` as `{"map":{"value":{"struct":{"fields":[{"name":"a"}]}}}}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NestedMembers {
+    /// A `list`, `large_list`, or `fixed_size_list` and its element's own members.
+    List {
+        /// The element's members, or `None` when the element is not itself a container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        element: Option<Box<NestedMembers>>,
+    },
+    /// A `struct` and its fields, in the schema's declared order.
+    Struct {
+        /// The struct's fields, each with its logical name and single binding key.
+        fields: Vec<NestedField>,
+    },
+    /// A `map` and the members of its key and of its value.
+    Map {
+        /// The key's members, or `None` when the key is not itself a container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<Box<NestedMembers>>,
+        /// The value's members, or `None` when the value is not itself a container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<Box<NestedMembers>>,
+    },
+}
+
+/// One named field of a nested `struct`, carrying its logical name and AT MOST ONE binding
+/// key — the same `field_id` XOR `physical_name` XOR identity choice [`LogicalField`] makes
+/// for a top-level column, so the scan side resolves a nested field by the one binding order
+/// it already applies and no format-specific nested branch exists. See [`LogicalField`]'s
+/// "Binding key" table for which producer populates which key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NestedField {
+    /// This field's field-id binding key — an Iceberg nested field-id, or a Delta
+    /// `columnMapping.id` under `id` mapping. Absent from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_id: Option<i32>,
+    /// Current logical name, which is the name the rendered JSON object uses.
+    pub name: String,
+    /// This field's physical-name binding key — its `delta.columnMapping.physicalName`
+    /// under Delta `name` mapping. Absent from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_name: Option<String>,
+    /// This field's own members when it is itself a container. Absent from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested: Option<NestedMembers>,
 }
 
 /// One flattened, top-level entry of the Iceberg `schema.name-mapping.default`

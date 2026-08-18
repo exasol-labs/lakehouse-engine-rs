@@ -227,8 +227,13 @@ fn incompatible_columns_emit_json_strings() {
         rows[0][0]
     );
 
-    // Struct → Value::String (empty-fields struct with 1 null row).
-    let struct_arr = StructArray::new_empty_fields(1, None);
+    // Struct → Value::String (a populated field, not a zero-field placeholder).
+    let mut name_builder = StringBuilder::new();
+    name_builder.append_value("Berlin");
+    let struct_arr = StructArray::from(vec![(
+        Arc::new(Field::new("city", DataType::Utf8, false)),
+        Arc::new(name_builder.finish()) as arrow::array::ArrayRef,
+    )]);
     let rows = batch_to_rows(&single_col_batch("st", Arc::new(struct_arr)));
     assert!(
         matches!(&rows[0][0], Value::String(_)),

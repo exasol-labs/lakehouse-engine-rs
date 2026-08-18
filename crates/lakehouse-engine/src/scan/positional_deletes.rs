@@ -33,10 +33,9 @@
 use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector};
 use crate::scan::diagnostics;
 use crate::scan::partition_values::PartitionedScanSchema;
+use crate::scan::raw_scan::scan_table_parquet_format;
 use crate::scan::spec::{DeleteMechanism, FileEntry, StorageBackend};
-use crate::scan::{
-    FieldIdExprAdapterFactory, FieldIdResolution, int96_coerced_parquet_format, reconstruct_abs_uri,
-};
+use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, reconstruct_abs_uri};
 use arrow::array::{Array, Int64Array, LargeStringArray, StringArray};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -552,8 +551,10 @@ fn build_access_plan(
 /// access plan attached, so the change is unified across all scans.
 ///
 /// The physical plan is produced through [`ParquetFormat::create_physical_plan`]
-/// — the same seam `ListingTable` uses — which applies the session's Parquet
-/// options and installs a `CachedParquetFileReaderFactory` backed by the session
+/// — the same seam `ListingTable` uses — which applies THIS provider's Parquet
+/// options (it overwrites the source's with the `format`'s, which is what makes
+/// the row-filter-pushdown decision per table rather than per session) and
+/// installs a `CachedParquetFileReaderFactory` backed by the session
 /// [`FileMetadataCache`]; access-plan construction reads through that SAME cache
 /// with the SAME metadata size hint, so a delete-carrying file's footer parses
 /// ONCE for both access-plan construction and the scan. The hint has exactly one
@@ -604,7 +605,11 @@ impl PositionalDeleteScanTable {
     /// reconstructed Iceberg `initial-default` values keyed by logical column
     /// name, all resolved once in the VS alongside the logical schema and empty
     /// when the table declares none of them. It is carried through unchanged to
-    /// the [`FieldIdExprAdapterFactory`] installed in [`Self::scan`]. `delete_path_read_limiter` is the shared
+    /// the [`FieldIdExprAdapterFactory`] installed in [`Self::scan`], and its
+    /// nested member trees also decide THIS table's Parquet read options through
+    /// [`scan_table_parquet_format`] — the one place a table carrying a
+    /// JSON-rendered nested column is told to read without row-filter pushdown.
+    /// `delete_path_read_limiter` is the shared
     /// instance-level semaphore bounding every object-store read the delete
     /// path issues while preparing a scan — Phase A delete-file bodies and
     /// Phase B data-file footers alike, one permit per read — sized
@@ -626,6 +631,7 @@ impl PositionalDeleteScanTable {
             .iter()
             .map(|s| s.to_string())
             .collect();
+        let format = Arc::new(scan_table_parquet_format(&field_id_resolution));
         Self {
             object_store_url,
             schema,
@@ -634,7 +640,7 @@ impl PositionalDeleteScanTable {
             files,
             table_root,
             secrets,
-            format: Arc::new(int96_coerced_parquet_format()),
+            format,
             delete_path_read_limiter,
         }
     }

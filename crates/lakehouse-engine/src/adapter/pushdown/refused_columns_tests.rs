@@ -3,9 +3,9 @@ use serde_json::json;
 use super::*;
 
 const BINARY_REASON: &str = "Delta column 'binary_col' has type 'binary', which this engine \
-     refuses rather than casting to text; real JSON rendering is tracked as issue #350";
-const MAP_REASON: &str = "Delta column 'map_col' has type 'map', which arrow-cast reports no \
-     cast to text for; real JSON rendering is tracked as issue #350";
+     refuses rather than casting to text; JSON rendering for binary is tracked as issue #351";
+const VARIANT_REASON: &str = "Delta column 'variant_col' has type 'variant', whose on-disk form is \
+     an opaque (metadata, value) binary pair this engine cannot render as a meaningful value";
 
 fn refused_column(column_name: &str, reason: &str) -> RefusedColumn {
     RefusedColumn {
@@ -21,8 +21,10 @@ fn user_message(err: UdfError) -> String {
     }
 }
 
-/// The `stats_all_types` shape: Exasol's catalog declares both the mappable and
-/// the refused columns, so a request can name either.
+/// The `stats_all_types` shape — `map_col` and `nested_struct` are rendered as JSON and only
+/// `binary_col` is refused — plus a `variant_col`, the one other type that stays refused, so a
+/// request can name one refused column or two. Exasol's catalog declares every one of them,
+/// mappable or not, so a request can name any.
 fn involved_tables() -> Json {
     json!([{
         "name": "STATS_ALL_TYPES",
@@ -30,6 +32,8 @@ fn involved_tables() -> Json {
             {"name": "INT_COL", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
             {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
             {"name": "MAP_COL", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "NESTED_STRUCT", "dataType": {"type": "varchar", "size": 2000000}},
+            {"name": "VARIANT_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ],
     }])
 }
@@ -244,7 +248,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
             "selectList": [column_node("INT_COL")],
             "orderBy": [{
                 "type": "order_by_element",
-                "expression": column_node("MAP_COL"),
+                "expression": column_node("VARIANT_COL"),
                 "isAscending": true,
                 "nullsLast": true,
             }],
@@ -260,7 +264,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
         Some(&projection),
         &[
             refused_column("binary_col", BINARY_REASON),
-            refused_column("map_col", MAP_REASON),
+            refused_column("variant_col", VARIANT_REASON),
         ],
     )
     .expect_err("a request reaching two refused columns must be refused");
@@ -269,13 +273,54 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
     let binary_position = message
         .find(BINARY_REASON)
         .expect("refusal must carry the emitted column's reason");
-    let map_position = message
-        .find(MAP_REASON)
+    let variant_position = message
+        .find(VARIANT_REASON)
         .expect("refusal must carry the ordered-by column's reason");
     assert!(
-        binary_position < map_position,
+        binary_position < variant_position,
         "one error must name both columns in schema order, got: {message}"
     );
+}
+
+// Scenario Coverage (delta-type-mapping): A refused column refuses only the requests that read or
+// emit it
+/// In the `stats_all_types` shape only `binary_col` is refused: a request reading or emitting
+/// `map_col` or `nested_struct` — both rendered as JSON since issue #350 — is planned normally,
+/// while one naming `binary_col` is still refused.
+#[test]
+fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
+    let refused = [refused_column("binary_col", BINARY_REASON)];
+    let nested_request = json!({
+        "involvedTables": involved_tables(),
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [column_node("MAP_COL"), column_node("NESTED_STRUCT")],
+        },
+    });
+    let nested_projection = [
+        ProjectionItem::Column("MAP_COL".to_string()),
+        ProjectionItem::Column("NESTED_STRUCT".to_string()),
+    ];
+
+    let gated =
+        ensure_no_refused_column_referenced(&nested_request, Some(&nested_projection), &refused);
+    assert!(
+        gated.is_ok(),
+        "a rendered nested column must not be gated, got: {:?}",
+        gated.err()
+    );
+
+    let binary_request = json!({
+        "involvedTables": involved_tables(),
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [column_node("MAP_COL"), column_node("BINARY_COL")],
+        },
+    });
+
+    let err = ensure_no_refused_column_referenced(&binary_request, None, &refused)
+        .expect_err("a request naming BINARY_COL must still be refused");
+    assert!(user_message(err).contains(BINARY_REASON));
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it

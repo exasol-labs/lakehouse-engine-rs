@@ -1283,21 +1283,27 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     }
 }
 
-/// The 13 Delta types this engine maps for `stats_all_types`, in fixture column
-/// order. The other 3 declared columns (`binary_col`, `map_col`,
-/// `nested_struct`) are refused per column — exercised by
+/// The 15 Delta types this engine maps for `stats_all_types`, in fixture column
+/// order. `array_col`, `map_col`, and `nested_struct` are rendered as JSON
+/// `VARCHAR(2000000)` per `datafusion-scan/nested-json-rendering`. The one
+/// remaining refused column (`binary_col`) is exercised by
 /// `unity_delta_refused_column_refuses_only_the_queries_naming_it`.
 const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LONG_COL, FLOAT_COL, DOUBLE_COL, DATE_COL, \
-     TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL";
+     TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
+     MAP_COL, NESTED_STRUCT";
 
 /// Scenario: A Delta table spanning varied types returns the expected Exasol
 /// types and values.
 ///
-/// `stats_all_types` carries one active Parquet file of 4 rows across its 13
+/// `stats_all_types` carries one active Parquet file of 4 rows across its 15
 /// mappable columns. `BYTE_COL`/`SHORT_COL` are checked by their real logged
 /// values (not merely "present") to prove `byte`/`short` are not silently
-/// NULLed by a missing mapping; `ARRAY_COL`'s bracketed rendering matches the
-/// scan-level expression-adapter cast proven in `raw_scan_tests`.
+/// NULLed by a missing mapping; `ARRAY_COL`'s strict-JSON rendering matches the
+/// scan-level expression-adapter cast proven in `raw_scan_tests`. `NESTED_STRUCT`
+/// is the nested column-mapping fixture: its physical inner names are
+/// `col-7f2f94cf-...`/`col-26fcfd6b-...`/`col-92dcf16d-...`, so a rendering keyed
+/// by those physical names — rather than the logical `inner_int`/`inner_string`/
+/// `inner_double` — would be immediately visible here.
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1325,6 +1331,8 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
         ("DECIMAL_COL", "DECIMAL(10,2)"),
         ("BOOLEAN_COL", "BOOLEAN"),
         ("ARRAY_COL", "VARCHAR(2000000)"),
+        ("MAP_COL", "VARCHAR(2000000)"),
+        ("NESTED_STRUCT", "VARCHAR(2000000)"),
     ] {
         assert_col_type(&cols, column, expected);
     }
@@ -1338,7 +1346,7 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     );
 
     let rows = conn.query_columns(&select_sql);
-    assert_eq!(rows.len(), 13, "expected 13 projected columns: {rows:?}");
+    assert_eq!(rows.len(), 15, "expected 15 projected columns: {rows:?}");
     assert_eq!(rows[0].len(), 4, "expected 4 rows: {rows:?}");
 
     let byte_non_null: Vec<i64> = rows[0]
@@ -1367,34 +1375,89 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
         rows[1]
     );
 
+    let canonical_json = |cell: &serde_json::Value| -> Option<String> {
+        cell.as_str().map(|text| {
+            let parsed: serde_json::Value = serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("must parse as JSON: {e}: {text}"));
+            serde_json::to_string(&parsed).expect("re-serializing a parsed value cannot fail")
+        })
+    };
+
     let array_col = &rows[12];
-    let mut rendered: Vec<Option<String>> = array_col
-        .iter()
-        .map(|v| v.as_str().map(str::to_string))
-        .collect();
+    let mut rendered: Vec<Option<String>> = array_col.iter().map(canonical_json).collect();
     rendered.sort();
+    let mut expected_array = vec![
+        None,
+        canonical_json(&serde_json::json!("[1,2,3]")),
+        canonical_json(&serde_json::json!("[4,5]")),
+        canonical_json(&serde_json::json!("[6]")),
+    ];
+    expected_array.sort();
     assert_eq!(
-        rendered,
-        vec![
-            None,
-            Some("[1, 2, 3]".to_string()),
-            Some("[4, 5]".to_string()),
-            Some("[6]".to_string()),
-        ],
-        "ARRAY_COL must render each populated array bracketed and keep a NULL \
-         array NULL, matching the scan's own field-id expression adapter cast: \
-         {array_col:?}"
+        rendered, expected_array,
+        "ARRAY_COL must render each populated array as a strict-JSON array of \
+         bare numbers, not the old Arrow display rendering, and keep a NULL \
+         array NULL: {array_col:?}"
+    );
+
+    let map_col = &rows[13];
+    let mut rendered_map: Vec<Option<String>> = map_col.iter().map(canonical_json).collect();
+    rendered_map.sort();
+    let mut expected_map = vec![
+        None,
+        canonical_json(&serde_json::json!(r#"{"key1":100}"#)),
+        canonical_json(&serde_json::json!(r#"{"key2":200,"key3":300}"#)),
+        canonical_json(&serde_json::json!(r#"{"key4":400}"#)),
+    ];
+    expected_map.sort();
+    assert_eq!(
+        rendered_map, expected_map,
+        "MAP_COL must render each populated row as a JSON object keyed by its \
+         own string keys, and keep a NULL map NULL: {map_col:?}"
+    );
+
+    let nested_struct = &rows[14];
+    for cell in nested_struct.iter().filter_map(|v| v.as_str()) {
+        assert!(
+            !cell.contains("col-"),
+            "NESTED_STRUCT must never surface a col- prefixed physical name: {cell}"
+        );
+    }
+    let mut rendered_struct: Vec<Option<String>> =
+        nested_struct.iter().map(canonical_json).collect();
+    rendered_struct.sort();
+    let mut expected_struct = vec![
+        None,
+        canonical_json(&serde_json::json!(
+            r#"{"inner_int":10,"inner_string":"nested_a","inner_double":1.1}"#
+        )),
+        canonical_json(&serde_json::json!(
+            r#"{"inner_int":50,"inner_string":"nested_c","inner_double":5.5}"#
+        )),
+        canonical_json(&serde_json::json!(
+            r#"{"inner_int":30,"inner_string":null,"inner_double":3.3}"#
+        )),
+    ];
+    expected_struct.sort();
+    assert_eq!(
+        rendered_struct, expected_struct,
+        "NESTED_STRUCT must render each populated row keyed by the LOGICAL inner \
+         names, a NULL member as SQL NULL's JSON counterpart, and a NULL struct \
+         cell as SQL NULL: {nested_struct:?}"
     );
 }
 
 /// Scenario: A Delta column this engine cannot render refuses only the queries
 /// that name it.
 ///
-/// `stats_all_types` carries `binary_col`, `map_col`, and `nested_struct` —
-/// each refused per column (issue #350), not table-wide. A projection naming
-/// one individually, a `SELECT *` (which widens to the full base row), and a
-/// WHERE clause referencing one all refuse; the 13-column mappable projection
-/// from `unity_delta_varied_types_return_their_expected_exasol_types_and_values`
+/// `stats_all_types` carries exactly one refused column — `binary_col` (issue
+/// #351). `map_col` and `nested_struct` were refused per column (issue #350)
+/// before this delta; they are now rendered as JSON `VARCHAR(2000000)` per
+/// `datafusion-scan/nested-json-rendering`, so this scenario also proves they
+/// query successfully and appear in no refusal. A projection naming
+/// `binary_col`, a `SELECT *` (which widens to the full base row), and a WHERE
+/// clause referencing it all refuse; the 15-column mappable projection from
+/// `unity_delta_varied_types_return_their_expected_exasol_types_and_values`
 /// still succeeds afterward on the SAME connection, proving the refusal is
 /// per-request rather than session-poisoning.
 #[test]
@@ -1403,23 +1466,17 @@ fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
     let mut conn = exa_conn();
     let table = table_ref("STATS_ALL_TYPES");
 
-    for (column, delta_name) in [
-        ("BINARY_COL", "binary_col"),
-        ("MAP_COL", "map_col"),
-        ("NESTED_STRUCT", "nested_struct"),
-    ] {
-        let resp = conn.try_execute(&format!("SELECT {column} FROM {table}"));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{column} must refuse the query, not return a row: {resp}"
-        );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
-        assert!(
-            msg.contains(delta_name) && msg.contains("#350"),
-            "{column}'s refusal must name its Delta column and cite issue #350: {msg}"
-        );
-    }
+    let resp = conn.try_execute(&format!("SELECT BINARY_COL FROM {table}"));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "BINARY_COL must refuse the query, not return a row: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("binary_col") && msg.contains("#351") && !msg.contains("#350"),
+        "BINARY_COL's refusal must name its Delta column and cite issue #351, not #350: {msg}"
+    );
 
     let star_resp = conn.try_execute(&format!("SELECT * FROM {table}"));
     assert_eq!(
@@ -1439,14 +1496,23 @@ fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
          the select list names only a mappable column: {where_resp}"
     );
 
+    let nested_resp = conn.query_columns(&format!("SELECT MAP_COL, NESTED_STRUCT FROM {table}"));
+    assert_eq!(
+        nested_resp.len(),
+        2,
+        "MAP_COL and NESTED_STRUCT must query successfully, not appear in any \
+         refusal: {nested_resp:?}"
+    );
+    assert_eq!(nested_resp[0].len(), 4, "expected 4 rows: {nested_resp:?}");
+
     let mappable = conn.query_columns(&format!(
         "SELECT {STATS_ALL_TYPES_MAPPABLE_COLUMNS} FROM {table}"
     ));
     assert_eq!(
         mappable.len(),
-        13,
-        "the mappable 13-column projection must still succeed on the same \
-         connection, proving the refusals above were per-request: {mappable:?}"
+        15,
+        "the mappable 15-column projection must still succeed on the same \
+         connection, proving the refusal above was per-request: {mappable:?}"
     );
     assert_eq!(
         mappable[0].len(),
