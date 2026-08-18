@@ -10,6 +10,9 @@ UDF scans exactly one row's assigned file list per call and never iterates the i
 `ctx.next()`. The UDF receives its scan spec as TWO VARCHAR arguments — a shard-invariant
 common spec serialized once for the whole fan-out (including the Iceberg table root), and a
 per-shard `(path, size)` file list — which it merges back into one `ScanSpec` per call.
+Arrow-column-to-SDK-`Value` conversion at the emit boundary — type mapping, incompatible-
+column JSON rendering, and EMITS-type coercion — is owned by
+`datafusion-scan/scan-execution-value-conversion`.
 
 ## Background
 
@@ -42,7 +45,7 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
 * INT96 is a legacy pre-Iceberg Parquet/Hive/Spark physical timestamp encoding absent from the Iceberg spec, whose Parquet mapping is INT64-only. Tolerating INT96 on read is a real-world-compatibility affordance for non-compliant writers, not a spec deviation.
 * Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping is owned by `datafusion-scan/type-mapping`; this feature owns only the physical Parquet decode configuration.
 * INT96 physically carries nanosecond precision (Julian day + nanoseconds-within-day). Coercing to `"us"` deliberately truncates any sub-microsecond digits — a named trade-off, consistent with Iceberg's microsecond `timestamp` model, which promises no sub-microsecond precision. The engine never claimed to preserve INT96's extra precision.
-* `coerce_int96_tz = "UTC"` makes the decoded batch's physical Arrow type `Timestamp(Microsecond, "UTC")` regardless of the Iceberg column type. For an Iceberg `timestamp` (WITHOUT time zone) column the field-id (production) path's logical schema is `Timestamp(Microsecond, None)`; the None-vs-UTC difference is reconciled at the EMITS-coercion step (see the scenario below), not only on the legacy inference path.
+* `coerce_int96_tz = "UTC"` makes the decoded batch's physical Arrow type `Timestamp(Microsecond, "UTC")` regardless of the Iceberg column type. For an Iceberg `timestamp` (WITHOUT time zone) column the field-id (production) path's logical schema is `Timestamp(Microsecond, None)`; the None-vs-UTC difference is reconciled at the EMITS-coercion step owned by `datafusion-scan/scan-execution-value-conversion` (see that feature's EMITS-coercion scenario), not only on the legacy inference path.
 * Consequence of the root-cause-only, no-clamp decision: a coerced value above Exasol's own `TIMESTAMP` maximum (year > 9999) still fails at the Exasol emit boundary with a `TIMESTAMP` range error. This fix removes the arrow-decode overflow for values through `9999-12-31`; it does not make year > 9999 values scannable.
 * See `datafusion-scan/scan-execution-memory-and-credentials` for pool sizing and
   decode-bound scenarios.
@@ -67,6 +70,8 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
   read-time backstop for unsupported delete mechanisms).
 * Per-call Tokio runtime construction and the no-process-caching rule for the scan runtime
   are owned by `datafusion-scan/scan-execution-threading`.
+* See `datafusion-scan/scan-execution-value-conversion` for Arrow-to-`Value` type mapping,
+  incompatible-column JSON emission, and EMITS-type coercion at the emit boundary.
 
 ## Scenarios
 
@@ -109,37 +114,12 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
 * *AND* the UDF SHALL fetch one batch, emit it, and drop it before fetching the next, never materializing the entire result set
 * *AND* the UDF MUST NOT build an intermediate `Vec<Value>` row collection on the raw-row scan path, and no typed Arrow value SHALL cross the `.so` boundary — only the serialized IPC byte buffer
 
-### Scenario: Arrow types map to the correct SDK Value variants
-
-* *GIVEN* a table with integer, floating-point, string, boolean, date, and timestamp columns
-* *WHEN* the scan UDF converts a batch of those columns
-* *THEN* each Arrow column value SHALL map to the corresponding SDK `Value` variant per the `datafusion-scan/type-mapping` table
-* *AND* an Arrow null SHALL map to `Value::Null`
-
-### Scenario: Incompatible Arrow columns are emitted as JSON strings
-
-* *GIVEN* a scan result containing columns of types Exasol cannot represent (list, struct, map, binary, or out-of-range decimal)
-* *WHEN* the scan UDF converts a batch of those columns
-* *THEN* the UDF SHALL serialize each such value to a JSON string and emit it as `Value::String` per the `datafusion-scan/type-mapping` rules
-* *AND* the UDF MUST NOT emit any array, list, struct, or map `Value`
-
 ### Scenario: Scan reports a clear error when an assigned file is unreadable
 
 * *GIVEN* a scan spec referencing a file that cannot be read from object storage
 * *WHEN* the scan UDF runs
 * *THEN* the UDF SHALL return an error identifying that the assigned data could not be read
 * *AND* the error message MUST NOT contain storage access keys or secret keys
-
-### Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
-
-* *GIVEN* a scan spec carrying `emit_exa_types` (the declared Exasol EMITS type string per output column, positionally aligned)
-* *AND* a result Arrow batch whose column types diverge from those declarations (e.g. an `Int32` column declared `DECIMAL(10,0)`, a `Utf8View` column declared `VARCHAR`, or a `Decimal128(10,0)` column declared `DECIMAL(10,0)`)
-* *WHEN* the scan UDF processes the batch
-* *THEN* the UDF SHALL coerce each output column to the Arrow type that `emit_batch`'s strict IPC feed requires for its declared ExaType, before passing the batch to `emit_batch`
-* *AND* the coercion SHALL reproduce Exasol's DECIMAL precision binning: scale-0 precision ≤ 9 → `Int32`; scale-0 precision ≤ 18 → `Int64`; scale > 0 or precision 19..=36 → `Decimal128(p,s)`
-* *AND* string-family declarations (`VARCHAR`, `CHAR`) SHALL coerce the column to `Utf8`, subsuming `Utf8View`/`BinaryView` view-type normalization
-* *AND* a column already of the correct Arrow type SHALL be passed through unchanged (zero-copy fast path)
-* *AND* when `emit_exa_types` is absent or shorter than the column count (specs that predate this field), unmatched columns SHALL fall back to view-type normalization only (`Utf8View` → `Utf8`, `BinaryView` → `Binary`)
 
 ### Scenario: Scan surfaces a clean memory-exhaustion error instead of crashing the VM
 
@@ -155,6 +135,5 @@ per-shard `(path, size)` file list — which it merges back into one `ScanSpec` 
 * *WHEN* the scan UDF constructs its `ParquetFormat`s, registers the file, and scans it
 * *THEN* the UDF SHALL configure every `ParquetFormat` it constructs — both the decode-path provider and any legacy first-file schema inference — to coerce INT96 columns to microsecond resolution (`coerce_int96 = "us"`) with a UTC time zone (`coerce_int96_tz = "UTC"`)
 * *AND* the scan SHALL decode the out-of-range timestamp WITHOUT an i64 nanosecond-overflow error, and on the legacy inference path the inferred schema and the decoded batch SHALL agree on the timestamp column's Arrow type
-* *AND* on the field-id (production) path, where the logical schema maps the Iceberg `timestamp` column to `Timestamp(Microsecond, None)`, the decoded `Timestamp(Microsecond, "UTC")` batch SHALL be coerced to the Arrow type the declared EMITS ExaType requires before `emit_batch` — per `datafusion-scan/scan-execution / Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch` — so the None-vs-UTC difference between logical schema and decoded batch is reconciled at emit
+* *AND* on the field-id (production) path, where the logical schema maps the Iceberg `timestamp` column to `Timestamp(Microsecond, None)`, the decoded `Timestamp(Microsecond, "UTC")` batch SHALL be coerced to the Arrow type the declared EMITS ExaType requires before `emit_batch` — per `datafusion-scan/scan-execution-value-conversion / Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch` — so the None-vs-UTC difference between logical schema and decoded batch is reconciled at emit
 * *AND* the emitted timestamp SHALL equal the source instant at microsecond resolution — INT96's sub-microsecond digits are deliberately truncated, consistent with Iceberg's microsecond `timestamp` model — per the existing Arrow-`Timestamp`-to-Exasol-`TIMESTAMP` mapping
-
