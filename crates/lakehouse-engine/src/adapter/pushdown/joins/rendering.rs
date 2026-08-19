@@ -1,12 +1,12 @@
 use crate::scan::spec::ProjectionItem;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use std::collections::HashMap;
 use vs_expression::{render_df_filter_exasol_safe, render_expression_exasol_safe};
 
 use super::super::support::{
     datafusion_renderable, project_columns, quote_ident, type_accepted_rewrite, walk_column_nodes,
 };
+use super::attribution::{ColumnLeg, JoinLegs, UnattributableColumn};
 use super::planning::{DetectedJoin, involved_table_columns};
 
 /// The SOLE producer of a join's column-type union: `join.tables[0]`'s
@@ -43,47 +43,12 @@ pub(super) fn projection_item_select_sql(item: &ProjectionItem) -> String {
     }
 }
 
-/// Deep-clone an expression node, tagging every `column` node with the subquery
-/// alias its `tableName` maps to (`tableAlias`), so `vs-expression` renders it as a
-/// table-qualified reference (`"ALIAS"."NAME"`).
-///
-/// This is the seam that makes the two-scan wrapper correct regardless of whether
-/// the two joined tables share a column name: bare-name rendering (the broadcast
-/// path) is ambiguous on a collision, but a table-qualified reference resolved
-/// against each side's OWN fan-out subquery never is. A `column` whose `tableName`
-/// is not in `alias_of` is left unqualified (it belongs to neither joined table —
-/// which cannot happen for a well-formed two-table request).
-fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) -> Json {
-    match expr {
-        Json::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len() + 1);
-            for (key, value) in map {
-                out.insert(key.clone(), annotate_columns_with_alias(value, alias_of));
-            }
-            if map.get("type").and_then(|t| t.as_str()) == Some("column")
-                && let Some(alias) = map
-                    .get("tableName")
-                    .and_then(|t| t.as_str())
-                    .and_then(|t| alias_of.get(&t.to_ascii_uppercase()))
-            {
-                out.insert("tableAlias".to_string(), Json::String(alias.clone()));
-            }
-            Json::Object(out)
-        }
-        Json::Array(items) => Json::Array(
-            items
-                .iter()
-                .map(|item| annotate_columns_with_alias(item, alias_of))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// Render an expression node to table-qualified **Exasol** SQL for the two-scan
-/// wrapper: annotate each `column` with its side alias, then reuse the
-/// `vs-expression` translator via its Exasol-dialect entry point. `None` when the
-/// node cannot be rendered.
+/// Render an expression node to table-qualified **Exasol** SQL for the N-scan
+/// wrapper: stamp each `column` with its own LEG's subquery alias
+/// ([`JoinLegs::qualify`]), then reuse the `vs-expression` translator via its
+/// Exasol-dialect entry point. `Ok(None)` when the node cannot be rendered;
+/// `Err` when a reference names two or more legs and matches none of their
+/// aliases, which the caller turns into a hard client-facing decline.
 ///
 /// One recursive translator covers every node shape the qualified N-scan wrapper's
 /// select list needs — columns, literals, scalar expressions, a top-level
@@ -105,64 +70,25 @@ fn annotate_columns_with_alias(expr: &Json, alias_of: &HashMap<String, String>) 
 /// which stay on the bare-`VARCHAR` DataFusion dialect.
 pub(super) fn render_expression_qualified(
     expr: &Json,
-    alias_of: &HashMap<String, String>,
-) -> Option<String> {
-    render_expression_exasol_safe(&annotate_columns_with_alias(expr, alias_of))
+    legs: &JoinLegs,
+) -> Result<Option<String>, UnattributableColumn> {
+    Ok(render_expression_exasol_safe(&legs.qualify(expr)?))
 }
 
 /// Render a WHERE filter to a table-qualified **Exasol** boolean expression for
-/// the two-scan wrapper. `None` when the filter is absent-shaped, trivially true,
+/// the N-scan wrapper. `Ok(None)` when the filter is absent-shaped, trivially true,
 /// or unrenderable — mirroring the single-table `render_df_filter_safe` contract.
 /// A `None` here is never Exasol's problem to catch: the caller must itself
 /// self-apply a declined filter (e.g. as an outer WHERE) rather than omit it
-/// (`pushdown`'s module header). Uses
+/// (`pushdown`'s module header). `Err` carries an unattributable reference, exactly
+/// as [`render_expression_qualified`] does. Uses
 /// the Exasol-dialect entry point because the wrapper WHERE is parsed by Exasol's
 /// core engine (length-qualified CAST targets).
 pub(super) fn render_df_filter_qualified(
     filter: &Json,
-    alias_of: &HashMap<String, String>,
-) -> Option<String> {
-    render_df_filter_exasol_safe(&annotate_columns_with_alias(filter, alias_of))
-}
-
-/// Walk an expression tree, returning every `column` node's owning side: the set of
-/// UPPERCASE `tableName`s seen, whether any `column` carried no `tableName`
-/// (`has_untagged`), and whether any `column` node was seen at all (`any_column`).
-///
-/// `tableName` is the SAME attribution signal [`annotate_columns_with_alias`] uses,
-/// so conjunct-to-side attribution is by table identity — never by column name,
-/// which keeps the shared-column-name case (both tables carry an `ID`) correct.
-pub(super) fn column_tables(expr: &Json) -> (std::collections::HashSet<String>, bool, bool) {
-    let mut tables = std::collections::HashSet::new();
-    let mut has_untagged = false;
-    let mut any_column = false;
-    walk_column_nodes(expr, &mut |map| {
-        any_column = true;
-        match map.get("tableName").and_then(|t| t.as_str()) {
-            Some(tn) => {
-                tables.insert(tn.to_ascii_uppercase());
-            }
-            None => has_untagged = true,
-        }
-    });
-    (tables, has_untagged, any_column)
-}
-
-/// The single side a conjunct is local to — `Some(UPPERCASE table name)` iff every
-/// `column` node it references is tagged with that ONE `tableName`. `None` when the
-/// conjunct spans two tables, carries an untagged column, or references no column at
-/// all (a bare literal). Such a conjunct is withheld from BOTH sides' pruning; only
-/// the outer wrapper's WHERE (which renders the full predicate) applies it.
-///
-/// Sound for an inner equi-join: a conjunct over one side alone is a necessary
-/// condition for that side's rows to survive the join, so using it to prune that
-/// side can never drop a row the join would have kept.
-fn conjunct_single_side(conjunct: &Json) -> Option<String> {
-    let (tables, has_untagged, any_column) = column_tables(conjunct);
-    if has_untagged || !any_column || tables.len() != 1 {
-        return None;
-    }
-    tables.into_iter().next()
+    legs: &JoinLegs,
+) -> Result<Option<String>, UnattributableColumn> {
+    Ok(render_df_filter_exasol_safe(&legs.qualify(filter)?))
 }
 
 /// Flatten a top-level `predicate_and` chain into its individual conjuncts,
@@ -186,8 +112,8 @@ fn flatten_conjuncts<'a>(filter: &'a Json, out: &mut Vec<&'a Json>) {
 /// one is, else a `predicate_and` over all kept conjuncts.
 ///
 /// The shared shape of the two complementary screen pairs over one filter — only
-/// the `keep` predicate differs: [`side_local_filter`] (conjuncts local to one
-/// side) against [`cross_side_residual_filter`] (the cross-side complement), and
+/// the `keep` predicate differs: [`leg_local_filter`] (conjuncts local to one
+/// leg) against [`cross_leg_residual_filter`] (the cross-leg complement), and
 /// [`renderable_only`] against [`declined_only`].
 fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Json> {
     let mut conjuncts = Vec::new();
@@ -207,49 +133,58 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
     }
 }
 
-/// The side-local sub-predicate of `filter` for `table_name`: the AND of exactly
-/// those top-level conjuncts every column of which is attributed to `table_name`.
-/// `None` when no conjunct is side-local to it. Attribution by `tableName` alone —
-/// this makes NO renderability decision, and each consumer screens (or does not
-/// screen) its own input before calling.
+/// The leg-local sub-predicate of `filter` for the leg at index `leg`: the AND of
+/// exactly those top-level conjuncts every column of which [`JoinLegs`] attributes
+/// to that ONE leg. `None` when no conjunct is leg-local to it. Attribution is by
+/// LEG, never by table name, so the two occurrences of a self-joined table each
+/// receive only their own conjuncts — this makes NO renderability decision, and each
+/// consumer screens (or does not screen) its own input before calling.
+///
+/// Sound for an inner join: a conjunct over one leg alone is a necessary condition
+/// for that leg's rows to survive the join, so pruning that leg by it can never drop
+/// a row the join would have kept.
 ///
 /// THREE consumers receive DIFFERENT trees built from this function's output,
 /// deliberately:
-/// (a) that side's resolver call for format-level manifest pruning is given the
-/// RAW filter, unscreened, so every side-local conjunct prunes manifests even when
+/// (a) that leg's resolver call for format-level manifest pruning is given the
+/// RAW filter, unscreened, so every leg-local conjunct prunes manifests even when
 /// the DataFusion dialect cannot render it — screening here would silently open
 /// more files while still returning correct rows;
-/// (b) that side's fan-out `ScanSpec.filter` is given a tree first screened by
-/// [`renderable_only`], then screened AND REWRITTEN per side by
+/// (b) that leg's fan-out `ScanSpec.filter` is given a tree first screened by
+/// [`renderable_only`], then screened AND REWRITTEN per leg by
 /// [`type_screened_leg_filter`], so the leg receives only conjuncts that are both
-/// syntactically renderable and type-correct for that side's own columns; and
+/// syntactically renderable and type-correct for that leg's own columns; and
 /// (c) the outer wrapper's residual `WHERE` receives the RAW conjuncts
 /// [`type_screened_leg_filter`] hands back declined, because the wrapper renders in
 /// the Exasol dialect and a DataFusion-rewritten tree is the wrong input there.
-/// Cross-table conjuncts and OR-spanning conjuncts are withheld from (a) and (b)
+/// Cross-leg conjuncts and OR-spanning conjuncts are withheld from (a) and (b)
 /// and applied only by the outer wrapper's WHERE, alongside the type-declined half.
-pub(super) fn side_local_filter(filter: &Json, table_name: &str) -> Option<Json> {
-    let target = table_name.to_ascii_uppercase();
-    partition_conjuncts(filter, |c| {
-        conjunct_single_side(c).as_deref() == Some(target.as_str())
-    })
+pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
+    partition_conjuncts(filter, |c| legs.conjunct_leg(c) == Some(leg))
 }
 
-/// The cross-side residual sub-predicate of `filter`: the AND of exactly those
-/// top-level conjuncts that are NOT side-local to a single table — i.e. cross-table,
-/// OR-spanning, untagged, or column-free conjuncts (`conjunct_single_side` is
-/// `None`). `None` when every conjunct is side-local.
+/// The cross-leg residual sub-predicate of `filter`: the AND of exactly those
+/// top-level conjuncts that are NOT local to a single leg — i.e. cross-leg,
+/// OR-spanning, or column-free conjuncts, and conjuncts whose columns name no leg or
+/// cannot be attributed to one ([`JoinLegs::conjunct_leg`] is `None`). `None` when
+/// every conjunct is leg-local.
+///
+/// An unattributable conjunct is withheld from every leg here rather than guessed
+/// onto one: it instead surfaces as `build_n_scan_join_sql`'s hard
+/// `unattributable_decline` when the outer wrapper tries to render it (via
+/// [`render_self_applied_where`] → [`JoinLegs::qualify`] returning
+/// `Err(UnattributableColumn)`) — never applied to a guessed leg.
 ///
 /// The complement it forms is over WHATEVER TREE IT IS GIVEN, not over the request's
-/// raw filter: it is the exact set-complement of the per-side [`side_local_filter`]
+/// raw filter: it is the exact set-complement of the per-leg [`leg_local_filter`]
 /// slices of that same tree, and nothing more. On the render path it is given the
 /// [`renderable_only`] half, so the outer wrapper's WHERE additionally carries
 /// [`declined_only`] — the total partition of the request's filter is therefore
 /// `renderable_only`/`declined_only` composed with these two, and it is that
 /// composition, not this function alone, that leaves no conjunct dropped or
 /// double-applied.
-pub(super) fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
-    partition_conjuncts(filter, |c| conjunct_single_side(c).is_none())
+pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Option<Json> {
+    partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
 /// The DataFusion-RENDERABLE half of `filter`'s top-level conjuncts, and
@@ -257,7 +192,7 @@ pub(super) fn cross_side_residual_filter(filter: &Json) -> Option<Json> {
 /// N-scan render path, applied at [`super::sql_builders::build_n_scan_join_sql`]'s
 /// two render sites and NOWHERE else.
 ///
-/// It sits at the render sites rather than inside [`side_local_filter`] because
+/// It sits at the render sites rather than inside [`leg_local_filter`] because
 /// that function has a second consumer that must NOT be screened: `plan_join`
 /// passes its result to Iceberg manifest pruning, where dropping a declined
 /// conjunct would silently open more files while still returning correct rows —
@@ -292,8 +227,8 @@ pub(super) fn declined_only(filter: &Json) -> Option<Json> {
 /// precondition (the broadcast path's `disjoint_schema_guard` is what earns the
 /// broadcast surface its single union universe), so a bare column name here can
 /// resolve to a DIFFERENT Exasol type on each side. The only universe that answers
-/// "will DataFusion accept this conjunct in THIS leg" is the owning side's own
-/// `col_types` — knowable only after [`side_local_filter`] has attributed the
+/// "will DataFusion accept this conjunct in THIS leg" is the owning leg's own
+/// `col_types` — knowable only after [`leg_local_filter`] has attributed the
 /// conjunct, hence a screen that runs after attribution rather than over the request's
 /// whole filter.
 ///
@@ -348,18 +283,20 @@ pub(super) fn conjoin_filters(left: Option<Json>, right: Option<Json>) -> Option
     }
 }
 
-/// Record the UPPERCASE name of every `column` node in `expr` attributed (by
-/// `tableName`, case-insensitive) to `table_name`, recursively.
-fn collect_side_column_names(
+/// Record the ASCII-UPPERCASE name of every `column` node in `expr` that
+/// [`JoinLegs`] resolves to the leg at index `leg`, recursively.
+///
+/// Leg-keyed, not name-keyed: a self-join's two occurrences share one `tableName`,
+/// so charging by name would keep both legs' referenced columns on both legs.
+fn collect_leg_column_names(
     expr: &Json,
-    table_name: &str,
+    legs: &JoinLegs,
+    leg: usize,
     out: &mut std::collections::HashSet<String>,
 ) {
     walk_column_nodes(expr, &mut |map| {
-        let tn = map.get("tableName").and_then(|t| t.as_str());
-        let name = map.get("name").and_then(|n| n.as_str());
-        if let (Some(tn), Some(name)) = (tn, name)
-            && tn.eq_ignore_ascii_case(table_name)
+        if legs.resolve_column(map) == ColumnLeg::Leg(leg)
+            && let Some(name) = map.get("name").and_then(|n| n.as_str())
         {
             out.insert(name.to_ascii_uppercase());
         }
@@ -369,20 +306,26 @@ fn collect_side_column_names(
 /// Every UPPERCASE column name in `expr` that MAY belong to `table_name`: the ones
 /// `tableName` attributes to it, plus every `column` node carrying no `tableName`.
 ///
-/// An untagged reference is charged to EVERY side because nothing in the request
-/// says which side it names — the fail-safe direction for a caller deciding whether
-/// a side must answer for a column its reader could not render.
+/// Keyed on the TABLE name, not on a leg, and deliberately so: its one caller decides
+/// whether a table's format reader REFUSED a column the request reads, and a refusal
+/// belongs to the table that raised it. Over-charging every occurrence of that table
+/// is the fail-safe direction for a refusal, exactly as charging an untagged reference
+/// to every side is — nothing in the request says which side an untagged reference
+/// names.
 pub(super) fn possible_side_column_names(
     expr: &Json,
     table_name: &str,
 ) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    collect_side_column_names(expr, table_name, &mut names);
     walk_column_nodes(expr, &mut |map| {
-        if map.get("tableName").and_then(|t| t.as_str()).is_none()
-            && let Some(name) = map.get("name").and_then(|n| n.as_str())
-        {
-            names.insert(name.to_ascii_uppercase());
+        let Some(name) = map.get("name").and_then(|n| n.as_str()) else {
+            return;
+        };
+        match map.get("tableName").and_then(|t| t.as_str()) {
+            Some(tn) if !tn.eq_ignore_ascii_case(table_name) => {}
+            _ => {
+                names.insert(name.to_ascii_uppercase());
+            }
         }
     });
     names
@@ -404,15 +347,15 @@ pub(super) fn has_no_explicit_select_list(pushdown_req: &Json) -> bool {
 /// one-function edit rather than a two-function edit kept in sync by hand. It owns the
 /// clause set and nothing else: the per-node collector is a parameter because the two
 /// callers must stay divergent in ways this walk has no business reconciling. They
-/// fold case differently — [`referenced_side_columns`] collects through
-/// `collect_side_column_names`' ASCII-only `to_ascii_uppercase`,
+/// fold case differently — [`referenced_leg_columns`] collects through
+/// `collect_leg_column_names`' ASCII-only `to_ascii_uppercase`,
 /// `referenced_column_projection` through `collect_all_column_names`' Unicode
 /// `to_uppercase`, a disagreement `walk_column_nodes`' doc comment and
 /// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
 /// column-collecting walk" scenario both forbid unifying — and they fall back
 /// differently when the narrowing selects nothing.
 ///
-/// [`referenced_side_columns`] deliberately keeps its own absent/empty-`selectList`
+/// [`referenced_leg_columns`] deliberately keeps its own absent/empty-`selectList`
 /// short-circuit BEFORE calling this, so `selectList` is named twice by design. That
 /// guard MUST NOT be folded in here: it is a fallback policy, not part of the clause
 /// set, and folding it in would hand `referenced_column_projection` a short-circuit
@@ -436,13 +379,13 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
     }
 }
 
-/// The subset of `full_cols` this side actually contributes to the outer two-scan
-/// wrapper — dropping columns the wrapper never references, so each fan-out leg
+/// The subset of `full_cols` the leg at index `leg` actually contributes to the outer
+/// N-scan wrapper — dropping columns the wrapper never references, so each fan-out leg
 /// ships narrow rows instead of the table's full column set.
 ///
-/// The kept set is every column of this side referenced by any clause the wrapper
+/// The kept set is every column of this LEG referenced by any clause the wrapper
 /// renders: the SELECT list, the join condition, the WHERE (the FULL predicate —
-/// the outer wrapper renders all of it, so a side-local *or* cross-table filter
+/// the outer wrapper renders all of it, so a leg-local *or* cross-leg filter
 /// column must survive), GROUP BY, HAVING, and ORDER BY. The request's share of that
 /// set comes from [`referenced_clause_values`]; the join condition is collected
 /// separately because it is not a clause of the request. Order and Exasol types are
@@ -454,7 +397,7 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 ///
 /// The `names.contains(name)` narrowing below is a CROSS-FOLD string match: `full_cols`
 /// arrives from [`involved_table_columns`] folded by `support::column_types`' Unicode
-/// `to_uppercase`, while `names` is folded by `collect_side_column_names`' ASCII-only
+/// `to_uppercase`, while `names` is folded by `collect_leg_column_names`' ASCII-only
 /// `to_ascii_uppercase`. The two agree only by premise — `build_listing_virtual_tables` (`adapter/mod.rs`)
 /// Unicode-uppercases every name it declares, so no LOWERCASE name reaches either side
 /// (guarded by the E2E test `non_ascii_table_and_column_stay_queryable`). Non-ASCII
@@ -469,10 +412,11 @@ pub(super) fn referenced_clause_values(pushdown_req: &Json, mut visit: impl FnMu
 /// instead. That is a dropped column, not necessarily a silent one: if the outer
 /// wrapper's rendered SQL still references it elsewhere, Exasol surfaces a
 /// column-not-found error rather than a silently wrong result.
-pub(super) fn referenced_side_columns(
+pub(super) fn referenced_leg_columns(
     pushdown_req: &Json,
     condition: &Json,
-    table_name: &str,
+    legs: &JoinLegs,
+    leg: usize,
     full_cols: &[(String, String)],
 ) -> Vec<(String, String)> {
     // Absent/empty select list ⇒ the wrapper projects every column (SELECT *).
@@ -480,9 +424,9 @@ pub(super) fn referenced_side_columns(
         return full_cols.to_vec();
     }
     let mut names = std::collections::HashSet::new();
-    collect_side_column_names(condition, table_name, &mut names);
+    collect_leg_column_names(condition, legs, leg, &mut names);
     referenced_clause_values(pushdown_req, |v| {
-        collect_side_column_names(v, table_name, &mut names)
+        collect_leg_column_names(v, legs, leg, &mut names)
     });
     let narrowed: Vec<(String, String)> = full_cols
         .iter()

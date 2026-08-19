@@ -478,14 +478,19 @@ pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> 
 /// pushdown chokepoint in `handle_pushdown` (issue #193) and the per-side join
 /// fan-out leg (`build_side_fan_out_sql`).
 ///
-/// This is a CALLER-side concern, not a translator default: the join outer wrapper
-/// deliberately re-qualifies each column to its own subquery alias
-/// (`annotate_columns_with_alias`), which overwrites any `tableAlias` a caller left
-/// in place — so stripping upstream of it is harmless there too.
+/// This is a CALLER-side concern, not a translator default: the join path never
+/// strips before attribution, so `plan_join` still sees each column's original
+/// `tableAlias` when it identifies legs. The per-leg strip in
+/// `build_side_fan_out_sql` runs AFTER that, on that leg's own already-attributed
+/// filter tree — it never touches the tree the outer wrapper qualifies
+/// (`JoinLegs::qualify`), so it cannot erase the aliases attribution or
+/// qualification depend on.
 ///
-/// `tableName` is left intact (the translator ignores it; join conjunct attribution
-/// and the wrapper's re-qualification both read it, and both run on `tableName`
-/// alone).
+/// `tableName` is left intact, and stripping must stay DOWNSTREAM of join attribution:
+/// a leg is identified by the (`tableName`, `tableAlias`) PAIR, so a request stripped
+/// before `plan_join` would leave a self-join's two occurrences indistinguishable. The
+/// single-table chokepoint in `handle_pushdown` therefore strips only after the join
+/// gate has returned.
 pub(super) fn strip_table_alias(expr: &Json) -> Json {
     match expr {
         Json::Object(map) => Json::Object(
@@ -1366,12 +1371,12 @@ pub(super) fn project_columns(
 ///
 /// Case folding is deliberately NOT owned here — each callback applies its own, and the
 /// current callers deliberately disagree: `collect_all_column_names` below folds with
-/// Unicode `to_uppercase`, while `column_tables` and `collect_side_column_names`
+/// Unicode `to_uppercase`, while `collect_leg_column_names` and `possible_side_column_names`
 /// in `joins/rendering.rs` fold with `to_ascii_uppercase`. Those two MUST NOT be unified.
 /// They differ for non-ASCII identifiers — `ß` folds to `SS` under Unicode but stays `ß`
 /// under ASCII — and that divergence is pinned by `column_collectors_keep_divergent_case_folding`
 /// in `joins/rendering.rs`, which feeds `straße` through `collect_all_column_names` and
-/// `collect_side_column_names` and asserts they diverge (`STRASSE` vs `STRAßE`).
+/// `possible_side_column_names` and asserts they diverge (`STRASSE` vs `STRAßE`).
 pub(super) fn walk_column_nodes(expr: &Json, f: &mut impl FnMut(&serde_json::Map<String, Json>)) {
     match expr {
         Json::Object(map) => {

@@ -3,7 +3,6 @@ use crate::scan::spec::{
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
-use std::collections::HashMap;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
 use super::super::shard_paths::relativize_shards_to_root;
@@ -12,15 +11,16 @@ use super::super::support::{
     extract_offset, quote_ident, render_limit_offset, shard_count, strip_table_alias,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
+use super::attribution::{JoinLegs, UnattributableColumn};
 use super::planning::{
     DetectedJoin, JoinSides, JoinWindowPlan, ResolvedJoinSide, disjoint_schema_guard,
     involved_table_columns,
 };
 use super::rendering::{
-    column_tables, conjoin_filters, cross_side_residual_filter, declined_only,
-    extract_join_projection, join_col_types, projection_item_select_sql, referenced_clause_values,
-    referenced_side_columns, render_df_filter_qualified, render_expression_qualified,
-    renderable_only, side_local_filter, type_screened_leg_filter,
+    conjoin_filters, cross_leg_residual_filter, declined_only, extract_join_projection,
+    join_col_types, leg_local_filter, projection_item_select_sql, referenced_clause_values,
+    referenced_leg_columns, render_df_filter_qualified, render_expression_qualified,
+    renderable_only, type_screened_leg_filter,
 };
 
 /// The translator-reuse artifacts for a broadcast inner equi-join, rendered once
@@ -120,72 +120,46 @@ pub(crate) fn render_broadcast_join(
     }))
 }
 
-/// Side `i`'s Exasol virtual table name (UPPERCASE) maps to `aliases[i]`
-/// (`LHS_T{i}`), so every column reference the N-scan wrapper renders is
-/// table-qualified from its `tableName`.
-fn build_n_scan_alias_map(
-    sides: &[ResolvedJoinSide],
-    aliases: &[String],
-) -> HashMap<String, String> {
-    sides
-        .iter()
-        .zip(aliases)
-        .map(|(side, alias)| (side.table_name.to_ascii_uppercase(), alias.clone()))
-        .collect()
-}
-
-/// Render the N-scan fallback's FROM as a left-to-right `INNER JOIN … ON` chain and
-/// return it together with any join conditions that could not be attached to a join
-/// point (untagged, or referencing no known leg). Those unattachable conditions
-/// become outer-WHERE residual conjuncts — for an inner join a condition in the
-/// WHERE is result-equivalent to the same condition in an `ON` clause, so this is a
-/// safe last-resort backstop.
+/// Render the N-scan fallback's FROM as a left-to-right `INNER JOIN … ON` chain over
+/// `fan_outs` — one aliased leg per fan-out, so the chain never names a leg it does not
+/// emit — and return it together with any join conditions that could not be attached to
+/// a join point (referencing no leg, or a reference no leg can be chosen for). Those
+/// unattachable conditions become outer-WHERE residual conjuncts — for an inner join a
+/// condition in the WHERE is result-equivalent to the same condition in an `ON` clause,
+/// so this is a safe last-resort backstop.
 ///
 /// `conditions[i]` is the pre-rendered, table-qualified SQL for `raw_conditions[i]`.
-/// Each condition GREEDILY attaches to the earliest join point where every table it
-/// touches is in scope — the join point that brings its highest-indexed leg in.
-/// Scope is resolved by the SET of `tableName`s the raw condition references
-/// (via [`column_tables`]), NEVER by column name, so two legs sharing a
-/// column name can never fool the attachment. A join point with no attached
-/// condition renders `ON 1=1`.
+/// Each condition GREEDILY attaches to the earliest join point where every leg it
+/// touches is in scope, which is the one [`JoinLegs::attachment_leg`] names — never
+/// decided here, and never by table name or column name, so neither two legs sharing a
+/// column name nor two legs of ONE table can fool the attachment. A join point with no
+/// attached condition renders `ON 1=1`.
 fn build_n_scan_join_from(
     fan_outs: &[String],
-    aliases: &[String],
+    legs: &JoinLegs,
     raw_conditions: &[Json],
     conditions: &[String],
-    sides: &[ResolvedJoinSide],
 ) -> (String, Vec<String>) {
-    let leg_index: HashMap<String, usize> = sides
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.table_name.to_ascii_uppercase(), i))
-        .collect();
-    let last_join_point = aliases.len().saturating_sub(1);
+    // Every bound comes from `fan_outs`, the slice the chain indexes, so no second
+    // count can drift out of step with it.
+    let last_join_point = fan_outs.len().saturating_sub(1);
 
-    let mut on_at: Vec<Vec<String>> = vec![Vec::new(); aliases.len()];
+    let mut on_at: Vec<Vec<String>> = vec![Vec::new(); fan_outs.len()];
     let mut residual: Vec<String> = Vec::new();
     for (raw, rendered) in raw_conditions.iter().zip(conditions) {
-        let (tables, has_untagged, any_column) = column_tables(raw);
-        let resolvable =
-            any_column && !has_untagged && tables.iter().all(|t| leg_index.contains_key(t));
-        // The earliest join point in scope is the one bringing the
-        // highest-indexed leg in; clamp to a real join point (≥ 1, ≤ last).
-        // Guard `last_join_point >= 1` (i.e. at least one join exists) first:
-        // with a single leg there is no join point to attach to (and
-        // `clamp(1, 0)` would panic since min > max), so fall through to
-        // residual; behavior for N≥2 is unchanged.
-        if resolvable
-            && last_join_point >= 1
-            && let Some(m) = tables.iter().map(|t| leg_index[t]).max()
-        {
-            on_at[m.clamp(1, last_join_point)].push(rendered.clone());
-        } else {
-            residual.push(rendered.clone());
+        // Clamp to a real join point (≥ 1, ≤ last). The `last_join_point >= 1` guard
+        // comes first: with a single leg there is no join point to attach to (and
+        // `clamp(1, 0)` would panic), so such a condition falls through to residual.
+        match legs.attachment_leg(raw) {
+            Some(m) if last_join_point >= 1 => {
+                on_at[m.clamp(1, last_join_point)].push(rendered.clone())
+            }
+            _ => residual.push(rendered.clone()),
         }
     }
 
-    let mut from = format!("({}) AS {}", fan_outs[0], quote_ident(&aliases[0]));
-    for k in 1..aliases.len() {
+    let mut from = format!("({}) AS {}", fan_outs[0], quote_ident(&legs.leg_alias(0)));
+    for (k, fan_out) in fan_outs.iter().enumerate().skip(1) {
         let on = if on_at[k].is_empty() {
             "1=1".to_string()
         } else {
@@ -196,26 +170,26 @@ fn build_n_scan_join_from(
                 .join(" AND ")
         };
         from.push_str(&format!(
-            " INNER JOIN ({}) AS {} ON {on}",
-            fan_outs[k],
-            quote_ident(&aliases[k])
+            " INNER JOIN ({fan_out}) AS {} ON {on}",
+            quote_ident(&legs.leg_alias(k))
         ));
     }
     (from, residual)
 }
 
-/// Every column of all involved tables as a table-qualified projection item, in
-/// side order. `cols_per_side[i]` belongs to the side aliased `aliases[i]`.
+/// Every column of all legs as a leg-qualified projection item, in leg order.
+/// `cols_per_leg[i]` belongs to the leg aliased [`JoinLegs::leg_alias`]`(i)`.
 fn n_full_row_qualified_items(
-    aliases: &[String],
-    cols_per_side: &[Vec<(String, String)>],
+    legs: &JoinLegs,
+    cols_per_leg: &[Vec<(String, String)>],
 ) -> Vec<ProjectionItem> {
-    aliases
+    cols_per_leg
         .iter()
-        .zip(cols_per_side)
-        .flat_map(|(alias, cols)| {
+        .enumerate()
+        .flat_map(|(leg, cols)| {
+            let alias = quote_ident(&legs.leg_alias(leg));
             cols.iter().map(move |(name, _)| ProjectionItem::Expr {
-                expr: format!("{}.{}", quote_ident(alias), quote_ident(name)),
+                expr: format!("{alias}.{}", quote_ident(name)),
             })
         })
         .collect()
@@ -239,9 +213,10 @@ fn shard_side(side: &ResolvedJoinSide, tuning: &JoinScanTuning) -> Vec<Vec<FileE
     relativize_shards_to_root(shards, &side.table_root)
 }
 
-/// The shared `User` decline template for the six qualified N-scan render sites —
-/// a select-list item, an involved table's missing column metadata, a join
-/// condition, a GROUP BY key, HAVING, or an ORDER BY key that cannot be rendered.
+/// The shared `User` decline template for the seven qualified N-scan decline sites —
+/// a select-list item, an involved table's missing column metadata, a leg count that
+/// disagrees with the resolved sides, a join condition, a GROUP BY key, HAVING, or an
+/// ORDER BY key that cannot be rendered.
 /// Each caller passes only its own clause fragment; the surrounding sentence (hard
 /// error, no native re-plan) is the one decision this constructor owns.
 ///
@@ -249,55 +224,72 @@ fn shard_side(side: &ResolvedJoinSide, tuning: &JoinScanTuning) -> Vec<Vec<FileE
 /// separate case — a join `from` shape the adapter cannot render into ANY SQL at
 /// all (wrong join type or malformed tree) — and its message inserts an extra
 /// clause (`the adapter cannot render this join shape, `) before the shared tail,
-/// so it is a different sentence, not a seventh instance of this one.
+/// so it is a different sentence, not an eighth instance of this one.
 fn join_render_decline(clause: &str) -> UdfError {
     UdfError::User(format!(
         "join pushdown declined: {clause}; this is a hard error, not a native re-plan"
     ))
 }
 
-/// `Ok(Some(sql))` rendered, `Ok(None)` trivially true, `Err` when neither dialect
-/// renders it (see `_decision/045`).
-fn render_self_applied_where(
-    tree: &Json,
-    alias_of: &HashMap<String, String>,
-    subject: &str,
-) -> Result<Option<String>, UdfError> {
-    match render_df_filter_qualified(tree, alias_of) {
-        Some(sql) => Ok(Some(sql)),
-        None if render_expression_qualified(tree, alias_of).is_some() => Ok(None),
-        None => {
-            let tree_json = serde_json::to_string(tree).unwrap_or_default();
-            Err(join_render_decline(&format!(
-                "{subject} could be rendered by neither dialect, so it could be applied nowhere: {tree_json}"
-            )))
-        }
-    }
+/// The same `User` decline for a `column` reference [`JoinLegs`] cannot place on a
+/// leg — its `tableName` names two or more legs and its `tableAlias` matches none of
+/// them. Reached from every qualified render site, because any of them may be the
+/// first to walk the offending reference; picking a leg arbitrarily instead would
+/// return silently wrong rows.
+fn unattributable_decline(column: UnattributableColumn) -> UdfError {
+    join_render_decline(&format!(
+        "{column} could not be attributed to a join leg, so no correct qualified \
+         reference exists"
+    ))
 }
 
-/// The N-scan wrapper's outer SELECT list, table-qualified. An absent/empty select
-/// list projects every column of all involved tables in side order. An item that
-/// cannot be rendered is a last-resort hard error (no native re-plan).
+/// `Ok(Some(sql))` rendered, `Ok(None)` trivially true, `Err` when neither dialect
+/// renders it (see `_decision/045`) or a reference cannot be placed on a leg.
+fn render_self_applied_where(
+    tree: &Json,
+    legs: &JoinLegs,
+    subject: &str,
+) -> Result<Option<String>, UdfError> {
+    if let Some(sql) = render_df_filter_qualified(tree, legs).map_err(unattributable_decline)? {
+        return Ok(Some(sql));
+    }
+    if render_expression_qualified(tree, legs)
+        .map_err(unattributable_decline)?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let tree_json = serde_json::to_string(tree).unwrap_or_default();
+    Err(join_render_decline(&format!(
+        "{subject} could be rendered by neither dialect, so it could be applied nowhere: {tree_json}"
+    )))
+}
+
+/// The N-scan wrapper's outer SELECT list, leg-qualified. An absent/empty select
+/// list projects every column of every leg in leg order. An item that cannot be
+/// rendered — or a reference no leg can claim — is a last-resort hard error (no
+/// native re-plan).
 fn n_scan_join_select_items(
     pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
-    aliases: &[String],
-    cols_per_side: &[Vec<(String, String)>],
+    legs: &JoinLegs,
+    cols_per_leg: &[Vec<(String, String)>],
 ) -> Result<Vec<ProjectionItem>, UdfError> {
     match pushdown_req.get("selectList") {
         Some(Json::Array(list)) if !list.is_empty() => {
             let mut items = Vec::with_capacity(list.len());
             for item in list {
-                let sql = render_expression_qualified(item, alias_of).ok_or_else(|| {
-                    join_render_decline(
-                        "a select-list item could not be rendered for the qualified N-scan join",
-                    )
-                })?;
+                let sql = render_expression_qualified(item, legs)
+                    .map_err(unattributable_decline)?
+                    .ok_or_else(|| {
+                        join_render_decline(
+                            "a select-list item could not be rendered for the qualified N-scan join",
+                        )
+                    })?;
                 items.push(ProjectionItem::Expr { expr: sql });
             }
             Ok(items)
         }
-        _ => Ok(n_full_row_qualified_items(aliases, cols_per_side)),
+        _ => Ok(n_full_row_qualified_items(legs, cols_per_leg)),
     }
 }
 
@@ -320,14 +312,13 @@ struct OuterWrapperClauses {
 
 fn outer_wrapper_clauses(
     pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
-    aliases: &[String],
-    cols_per_side: &[Vec<(String, String)>],
+    legs: &JoinLegs,
+    cols_per_leg: &[Vec<(String, String)>],
 ) -> Result<OuterWrapperClauses, UdfError> {
-    let select_items = n_scan_join_select_items(pushdown_req, alias_of, aliases, cols_per_side)?;
-    let group_by = qualified_join_group_by(pushdown_req, alias_of)?;
-    let having = qualified_join_having(pushdown_req, alias_of)?;
-    let order_by = qualified_join_order_by(pushdown_req, alias_of)?;
+    let select_items = n_scan_join_select_items(pushdown_req, legs, cols_per_leg)?;
+    let group_by = qualified_join_group_by(pushdown_req, legs)?;
+    let having = qualified_join_having(pushdown_req, legs)?;
+    let order_by = qualified_join_order_by(pushdown_req, legs)?;
     let limit = extract_limit(pushdown_req);
     let offset = extract_offset(pushdown_req);
     // Exasol withholds `limit` ENTIRELY when it cannot delegate an ordering, so an
@@ -371,19 +362,24 @@ fn outer_wrapper_clauses(
 /// original inner join by Exasol's core engine via a left-to-right `INNER JOIN … ON`
 /// chain.
 ///
-/// Each side emits its full column set (narrowed to the columns the wrapper actually
+/// Every attribution decision — which leg a select item, condition, conjunct, or
+/// narrowed column belongs to — is delegated to [`JoinLegs`], the one owner of leg
+/// identity, built here from the FROM-tree leaves. A LEG is one OCCURRENCE of a
+/// table, so a self-join's two occurrences stay two legs instead of collapsing onto
+/// the first (issue #361).
+///
+/// Each leg emits its full column set (narrowed to the columns the wrapper actually
 /// references across all clauses), so the outer wrapper's SELECT, every join
 /// condition, WHERE, aggregate, GROUP BY, HAVING, and ORDER BY can reference any
-/// column the join needs — all rendered TABLE-QUALIFIED (`"LHS_T{i}"."COL"`) from
-/// each `column` node's `tableName`, so the wrapper is correct whether or not any
-/// two involved tables share a column name.
+/// column the join needs — all rendered LEG-QUALIFIED (`"LHS_T{i}"."COL"`), so the
+/// wrapper is correct whether or not any two legs share a column name or a table.
 ///
 /// The FROM is a left-to-right `INNER JOIN … ON` chain: each join
-/// condition greedily attaches to the earliest join point where every table it
-/// touches is in scope, resolved by the SET of `tableName`s the condition references
-/// (never by column name, so shared column names cannot misroute scope); a join
-/// point with no newly-resolvable condition renders `ON 1=1`. Each side's side-local
-/// WHERE conjuncts are pushed into that side's fan-out leg, but only those that pass
+/// condition greedily attaches to the earliest join point where every leg it
+/// touches is in scope, resolved by the SET of LEGS the condition references
+/// (never by table or column name, so neither can misroute scope); a join
+/// point with no newly-resolvable condition renders `ON 1=1`. Each leg's leg-local
+/// WHERE conjuncts are pushed into that leg's fan-out leg, but only those that pass
 /// BOTH screens: the syntactic [`renderable_only`] one, and then
 /// [`type_screened_leg_filter`] against THAT SIDE's own column types — which also
 /// REWRITES what it accepts (a `DATE` `LIKE` subject becomes `CAST(… AS VARCHAR)`), so
@@ -429,19 +425,34 @@ pub(in super::super) fn build_n_scan_join_sql(
         ));
     }
 
-    let aliases: Vec<String> = (0..sides.len()).map(|i| format!("LHS_T{i}")).collect();
-    let alias_of = build_n_scan_alias_map(sides, &aliases);
+    // ONE leg per FROM-tree leaf, in the same order `sides` was resolved in — the sole
+    // owner of which leg a reference belongs to, so two occurrences of one table stay
+    // two legs instead of collapsing onto the first.
+    let legs = join.legs();
+    // A real guard, not a debug assertion: a leg index indexes `sides` and `fan_outs`
+    // too, so a drift between the two counts would be an out-of-bounds panic inside a
+    // release UDF rather than a client-visible decline.
+    if legs.leg_count() != sides.len() {
+        return Err(join_render_decline(&format!(
+            "leg count ({}) and resolved-side count ({}) disagree, so a leg index cannot \
+             index the resolved sides",
+            legs.leg_count(),
+            sides.len()
+        )));
+    }
 
-    // Every join-tree condition, table-qualified. A condition is the one clause with
+    // Every join-tree condition, leg-qualified. A condition is the one clause with
     // no lower fallback: if it cannot be rendered even qualified, no correct join SQL
     // exists → last-resort hard error (no native re-plan).
     let mut conditions = Vec::with_capacity(join.conditions.len());
     for cond in &join.conditions {
-        let rendered = render_expression_qualified(cond, &alias_of).ok_or_else(|| {
-            join_render_decline(
-                "a join condition could not be rendered against the qualified N-scan schema",
-            )
-        })?;
+        let rendered = render_expression_qualified(cond, &legs)
+            .map_err(unattributable_decline)?
+            .ok_or_else(|| {
+                join_render_decline(
+                    "a join condition could not be rendered against the qualified N-scan schema",
+                )
+            })?;
         conditions.push(rendered);
     }
 
@@ -457,26 +468,22 @@ pub(in super::super) fn build_n_scan_join_sql(
     // applied to `leg_eligible`, then `type_screened_leg_filter` against THAT SIDE's
     // own column types — so neither a conjunct DataFusion cannot render nor one it
     // would refuse to coerce reaches a leg, and the leg's own render cannot decline.
-    // All N-1 conditions are passed as one JSON array so `referenced_side_columns`
+    // All N-1 conditions are passed as one JSON array so `referenced_leg_columns`
     // (which walks arbitrary nodes) keeps a side's column referenced by ANY condition.
     let all_conditions = Json::Array(join.conditions.clone());
     let mut fan_outs = Vec::with_capacity(sides.len());
     let mut type_declined: Option<Json> = None;
     for (i, side) in sides.iter().enumerate() {
-        let narrowed = referenced_side_columns(
-            pushdown_req,
-            &all_conditions,
-            &side.table_name,
-            &cols_per_side[i],
-        );
+        let narrowed =
+            referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, &cols_per_side[i]);
         let (side_filter, side_declined) = match leg_eligible
             .as_ref()
-            .and_then(|f| side_local_filter(f, &side.table_name))
+            .and_then(|f| leg_local_filter(f, &legs, i))
         {
             Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
             None => (None, None),
         };
-        // Disjoint by attribution: each side's side-local slice is its own, so the
+        // Disjoint by attribution: each leg's leg-local slice is its own, so the
         // accumulated set can never double-apply a conjunct.
         type_declined = conjoin_filters(type_declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(
@@ -495,24 +502,26 @@ pub(in super::super) fn build_n_scan_join_sql(
     // per-side type screen just handed back.
     let residual = conjoin_filters(
         conjoin_filters(
-            leg_eligible.as_ref().and_then(cross_side_residual_filter),
+            leg_eligible
+                .as_ref()
+                .and_then(|f| cross_leg_residual_filter(f, &legs)),
             where_filter.and_then(declined_only),
         ),
         type_declined,
     );
     let filter = match &residual {
         None => None,
-        Some(tree) => render_self_applied_where(tree, &alias_of, "a residual WHERE conjunct")?,
+        Some(tree) => render_self_applied_where(tree, &legs, "a residual WHERE conjunct")?,
     };
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown_req, &alias_of, &aliases, &cols_per_side)?;
+        outer_wrapper_clauses(pushdown_req, &legs, &cols_per_side)?;
 
     // Assemble the INNER JOIN … ON chain. FROM is the chain of
-    // aliased fan-out legs with each condition greedily attached by table-name set;
-    // the outer WHERE carries the residual filter plus any untaggable join condition.
+    // aliased fan-out legs with each condition greedily attached by leg set;
+    // the outer WHERE carries the residual filter plus any unattachable join condition.
     let (from, residual_conditions) =
-        build_n_scan_join_from(&fan_outs, &aliases, &join.conditions, &conditions, sides);
+        build_n_scan_join_from(&fan_outs, &legs, &join.conditions, &conditions);
 
     let mut where_parts: Vec<String> = residual_conditions
         .iter()
@@ -613,8 +622,8 @@ fn join_fan_out_scan_spec(
 /// exactly the RESIDUAL `WHERE` set — the conjuncts no leg applies (cross-table,
 /// OR-spanning, untagged, column-free, or DataFusion-declined) — so `columns` (the
 /// side's narrowed `(UPPERCASE name, Exasol type)` list, see
-/// [`referenced_side_columns`]) must expose every column any outer clause
-/// references. `side_filter` (see [`side_local_filter`]) arrives both PRE-SCREENED and
+/// [`referenced_leg_columns`]) must expose every column any outer clause
+/// references. `side_filter` (see [`leg_local_filter`]) arrives both PRE-SCREENED and
 /// PRE-REWRITTEN: syntactically renderable per [`renderable_only`], and then accepted
 /// AND type-rewritten for this side's own column types by
 /// [`type_screened_leg_filter`] — so this leg's own `render_df_filter_safe` cannot
@@ -804,7 +813,7 @@ pub(in super::super) fn build_broadcast_join_sql(
 /// be rendered is a last-resort hard error (no native re-plan).
 fn qualified_join_group_by(
     pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
+    legs: &JoinLegs,
 ) -> Result<Option<String>, UdfError> {
     let keys = match pushdown_req
         .get("groupBy")
@@ -816,11 +825,15 @@ fn qualified_join_group_by(
     };
     let mut parts = Vec::with_capacity(keys.len());
     for key in keys {
-        parts.push(render_expression_qualified(key, alias_of).ok_or_else(|| {
-            join_render_decline(
-                "a GROUP BY key could not be rendered for the qualified N-scan join",
-            )
-        })?);
+        parts.push(
+            render_expression_qualified(key, legs)
+                .map_err(unattributable_decline)?
+                .ok_or_else(|| {
+                    join_render_decline(
+                        "a GROUP BY key could not be rendered for the qualified N-scan join",
+                    )
+                })?,
+        );
     }
     Ok(Some(parts.join(", ")))
 }
@@ -828,15 +841,16 @@ fn qualified_join_group_by(
 /// The N-scan wrapper's `HAVING` clause (without the keyword), table-qualified.
 /// `None` when the request carries no `having`. An unrenderable HAVING is a
 /// last-resort hard error (dropping it would return wrong rows; no native re-plan).
-fn qualified_join_having(
-    pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
-) -> Result<Option<String>, UdfError> {
+fn qualified_join_having(pushdown_req: &Json, legs: &JoinLegs) -> Result<Option<String>, UdfError> {
     match pushdown_req.get("having").filter(|h| !h.is_null()) {
         Some(having) => Ok(Some(
-            render_expression_qualified(having, alias_of).ok_or_else(|| {
-                join_render_decline("HAVING could not be rendered for the qualified N-scan join")
-            })?,
+            render_expression_qualified(having, legs)
+                .map_err(unattributable_decline)?
+                .ok_or_else(|| {
+                    join_render_decline(
+                        "HAVING could not be rendered for the qualified N-scan join",
+                    )
+                })?,
         )),
         None => Ok(None),
     }
@@ -851,7 +865,7 @@ fn qualified_join_having(
 /// result Exasol delegated and no longer re-sorts; no native re-plan).
 fn qualified_join_order_by(
     pushdown_req: &Json,
-    alias_of: &HashMap<String, String>,
+    legs: &JoinLegs,
 ) -> Result<Option<String>, UdfError> {
     let elements = match pushdown_req
         .get("orderBy")
@@ -868,7 +882,9 @@ fn qualified_join_order_by(
     for element in elements {
         let (ascending, nulls_last) = parse_sort_flags(element).ok_or_else(decline)?;
         let expr = element.get("expression").ok_or_else(decline)?;
-        let rendered = render_expression_qualified(expr, alias_of).ok_or_else(decline)?;
+        let rendered = render_expression_qualified(expr, legs)
+            .map_err(unattributable_decline)?
+            .ok_or_else(decline)?;
         parts.push(render_ordered(&rendered, ascending, nulls_last));
     }
     Ok(Some(parts.join(", ")))
@@ -898,7 +914,7 @@ fn qualified_join_order_by(
 /// missing at runtime. Column order and Exasol types are preserved from `all_cols`.
 /// Always returns at least one column (an empty EMITS clause is invalid in Exasol):
 /// when the request references no source column it falls back to the first column of
-/// `all_cols`, unlike [`referenced_side_columns`], whose empty-narrowing fallback is
+/// `all_cols`, unlike [`referenced_leg_columns`], whose empty-narrowing fallback is
 /// its whole column set.
 pub(in super::super) fn referenced_column_projection(
     pushdown_req: &Json,
@@ -983,22 +999,11 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<String, UdfError> {
-    const ALIAS: &str = "LHS_T0";
-
-    // Alias EVERY involved table name to the single subquery alias, so a column
-    // node's `tableName` (or a stale request `tableAlias`) resolves to `"LHS_T0"`.
-    let alias_of: HashMap<String, String> = request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .map(|tables| {
-            tables
-                .iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-                .map(|name| (name.to_ascii_uppercase(), ALIAS.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let aliases = vec![ALIAS.to_string()];
+    // ONE leg, onto which every involved table name collapses, so a column node's
+    // `tableName` (or a stale request `tableAlias`) resolves to `"LHS_T0"` and a name
+    // no involved table declares stays unqualified.
+    let legs = JoinLegs::for_single_scan(request);
+    let alias = legs.leg_alias(0);
 
     // The scan exposes the full base row; reconstruct the `(name, type)` universe
     // from the fan-out spec so the no-select-list fallback (unusual for a grouped
@@ -1013,10 +1018,10 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
             ProjectionItem::Expr { .. } => None,
         })
         .collect();
-    let cols_per_side = vec![all_cols];
+    let cols_per_leg = vec![all_cols];
 
     let OuterWrapperClauses { select, trailing } =
-        outer_wrapper_clauses(pushdown_req, &alias_of, &aliases, &cols_per_side)?;
+        outer_wrapper_clauses(pushdown_req, &legs, &cols_per_leg)?;
 
     // One aliased raw sharded fan-out. LIMIT-free / sort-free / no aggregates — the
     // fan-out spec already guarantees this.
@@ -1037,10 +1042,13 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 
     let where_clause = match declined_filter {
         None => None,
-        Some(tree) => render_self_applied_where(tree, &alias_of, "a declined WHERE predicate")?,
+        Some(tree) => render_self_applied_where(tree, &legs, "a declined WHERE predicate")?,
     };
 
-    let mut sql = format!("SELECT {select} FROM ({fan_out}) AS {}", quote_ident(ALIAS));
+    let mut sql = format!(
+        "SELECT {select} FROM ({fan_out}) AS {}",
+        quote_ident(&alias)
+    );
     if let Some(clause) = &where_clause {
         sql.push_str(&format!(" WHERE {clause}"));
     }

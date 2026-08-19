@@ -1,3 +1,4 @@
+use super::attribution::JoinLegs;
 use super::*;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
@@ -157,6 +158,60 @@ pub(super) fn nq3_join_request() -> Json {
     })
 }
 
+/// Build a left-deep N-leg SELF-join pushdown request over `FACT_ORDERS`, one leg
+/// per entry of `leg_aliases` — `Some(alias)` stamps the leaf's `alias` and the
+/// matching column nodes' `tableAlias`; `None` omits BOTH keys entirely, which is
+/// what Exasol emits for an occurrence the user left unaliased. Shapes and key
+/// names mirror the live `EXPLAIN VIRTUAL` capture for issue #361.
+pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
+    fn leaf(alias: Option<&str>) -> Json {
+        let mut leaf = serde_json::json!({"name": "FACT_ORDERS", "type": "table"});
+        if let Some(alias) = alias {
+            leaf["alias"] = Json::String(alias.to_string());
+        }
+        leaf
+    }
+    fn order_key(alias: Option<&str>) -> Json {
+        let mut column = serde_json::json!({
+            "type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS"
+        });
+        if let Some(alias) = alias {
+            column["tableAlias"] = Json::String(alias.to_string());
+        }
+        column
+    }
+
+    let mut from = leaf(leg_aliases[0]);
+    for (left_leg, right_leg) in leg_aliases.iter().zip(leg_aliases.iter().skip(1)) {
+        from = serde_json::json!({
+            "type": "join",
+            "join_type": "inner",
+            "left": from,
+            "right": leaf(*right_leg),
+            "condition": {
+                "type": "predicate_equal",
+                "left": order_key(*left_leg),
+                "right": order_key(*right_leg),
+            },
+        });
+    }
+
+    serde_json::json!({
+        "involvedTables": [
+            {"name": "FACT_ORDERS", "columns": [
+                {"name": "O_ORDERKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}]},
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": from,
+            "selectList": [order_key(leg_aliases[0])],
+        },
+        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+            serde_json::json!({"TABLE_MAP": {"FACT_ORDERS": "lh.fact_orders"}}).to_string()},
+    })
+}
+
 /// Recover the [`DetectedJoin`] a request classifies to (the tests below all
 /// operate on the standard two-table CUSTOMER⋈ORDERS shape from `join_request`).
 pub(super) fn detected_join(request: &Json) -> DetectedJoin {
@@ -164,6 +219,17 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
         JoinShape::Join(join) => join,
         other => panic!("expected Join, got {other:?}"),
     }
+}
+
+/// The leg binding over `leaves`, derived the one way production derives it — through
+/// [`DetectedJoin::legs`], the only constructor of a multi-leg binding. Join conditions
+/// play no part in leg identity, so the stand-in join carries none.
+pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
+    DetectedJoin {
+        tables: leaves,
+        conditions: Vec::new(),
+    }
+    .legs()
 }
 
 /// Build a resolved join side with a given `(path, byte_size)` file list.
