@@ -1,9 +1,29 @@
-# Feature: DataFusion-to-Exasol Type Mapping
+# Feature: Timestamp Precision in DataFusion-to-Exasol Type Mapping
 
-Defines the single authoritative mapping from DataFusion/Arrow column types to Exasol SQL types, and the companion Iceberg-to-Arrow mapping used to build the logical schema the scan registers, so that every column an Iceberg table exposes is queryable through Exasol.
+Defines the version-gated fractional-second precision Exasol declares for a catalog timestamp
+column (Iceberg `timestamp`/`timestamptz`/`timestamp_ns`/`timestamptz_ns`, Delta/Unity Catalog
+`TIMESTAMP`/`TIMESTAMP_NTZ`), and the `timestamptz` zone-flattening trade-off that precision
+change does not alter. Split out of `datafusion-scan/type-mapping` once that feature's scenario
+count crossed this library's per-spec organization threshold; this feature owns every scenario
+issue #359 added, and the parent feature keeps the general Arrow/Exasol type-compatibility surface.
 
 ## Background
 
+* Both timezone-naive (`Timestamp(_, None)`) and timezone-aware (`Timestamp(_, Some(_))`)
+  Arrow timestamps map to plain Exasol `TIMESTAMP`. An Iceberg `timestamptz` /
+  `timestamptz_ns` column is registered internally as the timezone-aware Arrow
+  `Timestamp(_, Some("UTC"))` — so DataFusion's timestamp comparisons, date-function
+  evaluation, and predicate binding stay timezone-correct — but is declared to Exasol and
+  emitted as plain `TIMESTAMP` carrying the UTC-instant value. The Iceberg table spec
+  defines a `timestamptz` value as an instant whose values "are stored as UTC and do not
+  retain a source time zone" (`2017-11-16 17:10:34 PST` is stored/retrieved as
+  `2017-11-17 01:10:34 UTC` and these values are considered identical), so no per-value
+  timezone information exists to lose. Mapping to plain `TIMESTAMP` is a deliberate, named
+  Exasol target-type trade-off: because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as
+  a UDF `EMITS` output type, the declared Exasol column type cannot distinguish
+  `timestamptz` from `timestamp` at the Exasol SQL surface. This is analogous to the
+  struct/list/map JSON-`VARCHAR` trade-off — a target-type limitation, not a change to any
+  emitted value.
 * **This delta is issue #359.** It adds THREE scenarios and AMENDS ONE. The added scenarios record the
   version-gated Exasol TIMESTAMP precision, the default taken when the version string cannot be read,
   and the deliberate exclusion of the ARROW-INPUT resolver from that gate. The amended scenario is
@@ -78,7 +98,6 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 
 ## Scenarios
 
-<!-- DELTA:NEW -->
 ### Scenario: A catalog timestamp column is declared TIMESTAMP(6) on Exasol 2025.x and later
 
 * *GIVEN* a column whose catalog-declared type is a timestamp — an Iceberg `timestamp`, `timestamptz`, `timestamp_ns`, or `timestamptz_ns`, or a Delta/Unity Catalog `TIMESTAMP` or `TIMESTAMP_NTZ`
@@ -92,9 +111,7 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 * *AND* `TIMESTAMP(6)` MUST NOT be declared for any Iceberg or Delta type OTHER than the four Iceberg timestamp variants and the two Unity timestamp names — `date` stays `DATE` and Iceberg `time` stays `VARCHAR(2000000)`, both byte-identical
 * *AND* every other declared type SHALL stay byte-identical on BOTH version arms, so this delta changes exactly one row of the declaration surface
 * *AND* the emitted VALUE MUST NOT be altered on either arm: on `TIMESTAMP(6)` Exasol retains the microsecond digits the Iceberg spec stores, and on bare `TIMESTAMP` Exasol truncates them to milliseconds — a named 8.x version limitation, not a defect and not a tracked exception
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
 ### Scenario: An empty or unparseable database version declares the microsecond precision
 
 * *GIVEN* a database version string that is EMPTY (the `UdfContext::database_version` default for a context carrying no handshake metadata) or whose leading dot-separated component does not parse as an integer (`v2025.2.1`, `unknown`, `.2.1`)
@@ -103,9 +120,7 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 * *AND* the EMPTY string and every UNPARSEABLE string SHALL take that one default arm and MUST NOT be distinguished from each other, because neither carries information the other lacks and a second arm would invite the two to drift
 * *AND* the resolver MUST NOT error, panic, log a warning, or fall back to the bare `TIMESTAMP` declaration on either input, so an unrecognised engine gets the fidelity-preserving declaration and, if it rejects it, fails loudly at `createVirtualSchema` rather than silently truncating every timestamp value
 * *AND* this default SHALL be recorded as a deliberate reversal of the conservative alternative, so a later reader does not "fix" it back to the bare declaration
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
 ### Scenario: The Arrow-input type resolver stays outside the version gate
 
 * *GIVEN* `arrow_to_exasol_type` and its private `compatible_exasol_type` — the ARROW-INPUT direction, whose `DataType::Timestamp(_, _)` arm returns the bare string `TIMESTAMP`
@@ -113,11 +128,9 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 * *THEN* neither function SHALL gain a precision parameter, and both SHALL keep their recorded signature and their recorded answer for every input byte-identical, including `TIMESTAMP` for every `Timestamp(_, _)`
 * *AND* the exclusion SHALL hold because no production path declares an Exasol type from an Arrow type: `datafusion-scan/type-mapping-module-structure` records that `arrow_to_exasol_type` has no call site anywhere in the crate, and the only production consumer of `compatible_exasol_type` is `needs_json_fallback`, whose answer for a `Timestamp(_, _)` is `false` at every precision
 * *AND* `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its answer for every input unchanged, so none of its call sites move
-* *AND* the compatible-Arrow-types table's `Timestamp(_, _) | TIMESTAMP` row SHALL stay unamended, and a reader MUST NOT read it as governing the catalog-declared declaration this delta version-gates
+* *AND* the compatible-Arrow-types table's `Timestamp(_, _) | TIMESTAMP` row SHALL stay unamended (`datafusion-scan/type-mapping`), and a reader MUST NOT read it as governing the catalog-declared declaration this delta version-gates
 * *AND* the exclusion SHALL be recorded rather than left silent, because issue #359's scope text names `arrow_to_exasol_type` as a gate target and an unexplained omission is indistinguishable from an oversight
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:CHANGED -->
 ### Scenario: Iceberg timestamptz maps to plain Exasol TIMESTAMP
 
 * *GIVEN* an Iceberg `timestamptz` or `timestamptz_ns` column, whose values the Iceberg spec stores as UTC with no retained source time zone
@@ -127,4 +140,12 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 * *AND* the emit-boundary coercion SHALL cast that column to `Timestamp(_, None)` preserving the underlying UTC-instant value, so the emitted `TIMESTAMP` is the UTC wall-clock instant and no value is shifted
 * *AND* the declared Exasol column type MUST NOT distinguish `timestamptz` from `timestamp` at the Exasol SQL surface — a deliberate, named target-type trade-off, not a change to any emitted value
 * *AND* the zone-awareness trade-off above and the fractional-second PRECISION are two independent decisions: the version gate changes only the precision, and MUST NOT be read as narrowing or widening this zone-awareness trade-off
-<!-- /DELTA:CHANGED -->
+
+### Scenario: A TIMESTAMP(p) EMITS string maps back to the microsecond Arrow timestamp
+
+* *GIVEN* an EMITS type string of the form `TIMESTAMP(p)` for an integer precision `p` in 0-9 — the shape the adapter now declares for a projected TIMESTAMP CAST expression once `exasol_type_from_json` (`vs-adapter/pushdown-planning`) reads `fractionalSecondsPrecision`
+* *WHEN* the scan resolves that column's Arrow coercion target via `exasol_type_to_arrow` at the emit boundary (`target_arrow_type`)
+* *THEN* `exasol_type_to_arrow` SHALL return `Some(DataType::Timestamp(TimeUnit::Microsecond, None))` for every `TIMESTAMP(p)`, `p` in 0-9, identical to the target it already returns for bare `TIMESTAMP` — because Arrow's Microsecond unit is this project's fixed internal representation for every Exasol TIMESTAMP precision, and the declared `p` only governs Exasol's own type check, never the Arrow unit
+* *AND* the function MUST NOT return `None` for a `TIMESTAMP(p)` string, so the column stays a timestamp and is NOT routed through the `Utf8`/string path — which would stringify the value and violate the `TIMESTAMP(p)` EMITS declaration
+* *AND* a bare `TIMESTAMP` string SHALL continue to map to `Some(DataType::Timestamp(TimeUnit::Microsecond, None))`, unchanged by this scenario
+* *AND* `exasol_type_to_arrow` SHALL leave its `TIMESTAMP WITH LOCAL TIME ZONE` exact-match arm unchanged, because `exasol_type_from_json`'s WLTZ branch short-circuits before any precision logic (`vs-adapter/pushdown-planning`, decision [3]) and emits the bare literal `TIMESTAMP WITH LOCAL TIME ZONE` with no `(p)` suffix, so no precision-aware WLTZ arm is ever needed
