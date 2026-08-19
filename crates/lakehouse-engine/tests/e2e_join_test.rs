@@ -28,8 +28,9 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS,
-    O_TOTALPRICE_PS, order_custkey, order_date_days, order_totalprice_unscaled, seed_events,
+    DIM_CUSTOMER_ROWS, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
+    FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days,
+    order_totalprice_unscaled, seed_events,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -1643,4 +1644,243 @@ fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
              {actual:?}\nexpected: {expected:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Self-join attribution: issue #361 regression coverage (plan
+// fix-join-fallback-self-join-attribution)
+// ---------------------------------------------------------------------------
+
+/// Fetch `fact_orders`' `(O_ORDERKEY, O_CUSTKEY)` rows un-joined, in row order —
+/// the single-node ground truth every self-join test below joins in-process,
+/// independently of the pushdown under test.
+fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
+    let cols = conn.query_columns(&format!(
+        "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
+        vs_fact_table(VS_NAME)
+    ));
+    assert_eq!(
+        cols.len(),
+        2,
+        "expected 2 result columns, got {}",
+        cols.len()
+    );
+    cols[0]
+        .iter()
+        .zip(cols[1].iter())
+        .map(|(key, custkey)| (value_to_string(key), value_to_string(custkey)))
+        .collect()
+}
+
+/// A two-leg self-join on the primitive, unique `O_ORDERKEY` column permanently
+/// reproduces issue #361's headline repro: before the fix, both occurrences
+/// collapsed to one alias-map entry, the rendered `ON` became a tautology
+/// (`LHS_T1.O_ORDERKEY = LHS_T1.O_ORDERKEY`), and the query returned every
+/// row-pair combination (100 rows) instead of each row matching only itself.
+#[test]
+fn e2e_self_join_on_primitive_column_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let fact = vs_fact_table(VS_NAME);
+
+    let query = format!(
+        "SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM {fact} a JOIN {fact} b \
+         ON a.O_ORDERKEY = b.O_ORDERKEY"
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a two-leg self-join must emit the N-scan wrapper with two distinct \
+         LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
+         never broadcast-eligible):\n{pushed}"
+    );
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+    let mut expected = fetch_order_rows(&mut conn);
+    expected.sort();
+
+    assert_eq!(
+        actual.len(),
+        FACT_ORDERS_ROWS,
+        "expected {FACT_ORDERS_ROWS} self-matched rows (O_ORDERKEY is unique \
+         per row), not the pre-fix cross product of {}: {actual:?}",
+        FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
+    );
+    assert_eq!(
+        actual, expected,
+        "self-join on the unique O_ORDERKEY must equal each row matched only \
+         with itself, computed independently by reading fact_orders \
+         un-joined.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A self-join with one occurrence left unaliased — Exasol omits both that
+/// leaf's `alias` key and its columns' `tableAlias`, so its leg key is the
+/// ABSENT alias, distinct from `b`'s `Some("B")` — resolves to exactly two
+/// legs instead of collapsing, per issue #361's `FROM T JOIN T b` repro shape.
+/// Joining on `O_CUSTKEY` (which repeats across two orders per customer)
+/// asserts a non-trivial multiset a tautological `ON` could not coincidentally
+/// reproduce.
+#[test]
+fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let fact = vs_fact_table(VS_NAME);
+    let bare = E2E_FACT_TABLE.to_uppercase();
+
+    let query = format!(
+        "SELECT {bare}.O_ORDERKEY, b.O_ORDERKEY FROM {fact} JOIN {fact} b \
+         ON {bare}.O_CUSTKEY = b.O_CUSTKEY"
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a self-join with one unaliased occurrence must emit the N-scan \
+         wrapper with two distinct LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
+         never broadcast-eligible):\n{pushed}"
+    );
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+    let orders = fetch_order_rows(&mut conn);
+    let mut expected: Vec<(String, String)> = orders
+        .iter()
+        .flat_map(|(a_key, a_cust)| {
+            orders
+                .iter()
+                .filter(move |(_, b_cust)| b_cust == a_cust)
+                .map(move |(b_key, _)| (a_key.clone(), b_key.clone()))
+        })
+        .collect();
+    expected.sort();
+
+    assert_eq!(
+        expected.len(),
+        FACT_ORDERS_ROWS * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS),
+        "seed invariant: {FACT_ORDERS_ROWS} orders over {DIM_CUSTOMER_ROWS} \
+         customers must form {DIM_CUSTOMER_ROWS} groups of 2, each \
+         contributing 4 self-matched pairs (20 total), not the pre-fix cross \
+         product of {}: {expected:?}",
+        FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
+    );
+    assert_eq!(
+        actual, expected,
+        "a self-join with one unaliased occurrence must equal the pairs \
+         sharing O_CUSTKEY, computed independently by reading fact_orders \
+         un-joined.\nactual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A three-leg self-join permanently reproduces issue #361's second repro
+/// shape: before the fix, the N-way FROM-chain's condition attachment
+/// misplaced or duplicated conditions once a table occurred three times,
+/// rendering `ON 1=1` at one join point and returning every 3-row combination
+/// (1000 rows) instead of each row matching only itself at both join points.
+#[test]
+fn e2e_three_leg_self_join_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let fact = vs_fact_table(VS_NAME);
+
+    let query = format!(
+        "SELECT a.O_ORDERKEY, a.O_CUSTKEY FROM {fact} a \
+         JOIN {fact} b ON a.O_ORDERKEY = b.O_ORDERKEY \
+         JOIN {fact} c ON b.O_ORDERKEY = c.O_ORDERKEY"
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 3),
+        "a three-leg self-join must emit the N-scan wrapper with three \
+         distinct LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a three-leg self-join must NOT emit the two-table LHS_T0/LHS_T1 \
+         wrapper:\n{pushed}"
+    );
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+    let mut expected = fetch_order_rows(&mut conn);
+    expected.sort();
+
+    assert_eq!(
+        actual.len(),
+        FACT_ORDERS_ROWS,
+        "expected {FACT_ORDERS_ROWS} self-matched rows, not the pre-fix \
+         three-way cross product of {}: {actual:?}",
+        FACT_ORDERS_ROWS * FACT_ORDERS_ROWS * FACT_ORDERS_ROWS
+    );
+    assert_eq!(
+        actual, expected,
+        "a three-leg self-join on the unique O_ORDERKEY must equal each row \
+         matched only with itself at both join points, computed \
+         independently by reading fact_orders un-joined.\n\
+         actual:   {actual:?}\nexpected: {expected:?}"
+    );
+}
+
+/// A self-join carrying a WHERE conjunct against only one alias must push
+/// that filter into only that occurrence's leg. Before the fix, the
+/// tableName-keyed side-local filter derivation collapsed both occurrences
+/// into one map entry and silently applied `a`'s filter to `b` too — a wrong
+/// answer with no error, harder to notice than a visible cross product.
+/// Joining on `O_CUSTKEY` (many-to-many across the two same-customer orders)
+/// makes leaking the filter onto `b` change the result, unlike joining on the
+/// unique `O_ORDERKEY` where `a` and `b` are always the same row.
+#[test]
+fn e2e_self_join_with_one_sided_filter_matches_single_node() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let fact = vs_fact_table(VS_NAME);
+    let threshold = DIM_CUSTOMER_ROWS as i64;
+
+    let query = format!(
+        "SELECT a.O_ORDERKEY, b.O_ORDERKEY FROM {fact} a JOIN {fact} b \
+         ON a.O_CUSTKEY = b.O_CUSTKEY WHERE a.O_ORDERKEY <= {threshold}"
+    );
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_n_scan_wrapper(&pushed, 2),
+        "a self-join with a one-sided WHERE conjunct must emit the N-scan \
+         wrapper with two distinct LHS_T* fan-out aliases:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "a self-join must NOT ride the broadcast in-UDF join (self-joins are \
+         never broadcast-eligible):\n{pushed}"
+    );
+    let actual = columns_to_sorted_pairs(&conn.query_columns(&query));
+
+    let orders = fetch_order_rows(&mut conn);
+    let mut expected: Vec<(String, String)> = orders
+        .iter()
+        .filter(|(a_key, _)| a_key.parse::<i64>().expect("O_ORDERKEY is numeric") <= threshold)
+        .flat_map(|(a_key, a_cust)| {
+            orders
+                .iter()
+                .filter(move |(_, b_cust)| b_cust == a_cust)
+                .map(move |(b_key, _)| (a_key.clone(), b_key.clone()))
+        })
+        .collect();
+    expected.sort();
+
+    assert!(
+        !expected.is_empty(),
+        "the WHERE conjunct must leave a non-empty result, else this test \
+         proves nothing about leg-local filtering: {expected:?}"
+    );
+    assert_eq!(
+        actual, expected,
+        "a WHERE conjunct local to alias `a` must restrict only `a`'s rows, \
+         leaving `b` free to match any row sharing O_CUSTKEY — including \
+         rows the filter excludes for `a`.\nactual:   {actual:?}\n\
+         expected: {expected:?}"
+    );
 }

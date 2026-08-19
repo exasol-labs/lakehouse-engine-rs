@@ -1,5 +1,7 @@
+use super::super::render_broadcast_join;
 use super::super::tests::{
-    equi_condition, join_request, nq3_join_request, resolved_side, three_table_join_request,
+    detected_join, equi_condition, join_request, nq3_join_request, resolved_side,
+    self_join_request, three_table_join_request,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
@@ -205,6 +207,90 @@ fn join_with_unmapped_table_is_an_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Leaf-alias retention: `collect_join_tree` keeps each occurrence's `alias`.
+// ---------------------------------------------------------------------------
+
+/// The `(table_name, table_alias)` key of every collected leaf, in tree order.
+fn leaf_keys(join: &DetectedJoin) -> Vec<(&str, Option<&str>)> {
+    join.tables
+        .iter()
+        .map(|leaf| (leaf.table_name.as_str(), leaf.table_alias.as_deref()))
+        .collect()
+}
+
+/// A two-leg self-join collects TWO leaves sharing one `table_name`, each carrying
+/// its own FROM-tree `alias` — the per-occurrence signal issue #361 lost, which is
+/// what makes the pair `(table_name, table_alias)` injective where the name alone
+/// is not.
+#[test]
+fn two_leg_self_join_leaves_carry_their_own_aliases() {
+    let request = self_join_request(&[Some("A"), Some("B")]);
+    let join = detected_join(&request);
+
+    assert_eq!(
+        leaf_keys(&join),
+        [("FACT_ORDERS", Some("A")), ("FACT_ORDERS", Some("B"))]
+    );
+    assert_eq!(
+        join.tables[0].table_identifier, join.tables[1].table_identifier,
+        "both occurrences resolve to the same catalog table"
+    );
+}
+
+/// A self-join leg the user left unaliased collects `None` — Exasol omits the
+/// `alias` key entirely rather than emitting an empty string, and an alias-less
+/// occurrence is a distinct leg identity, not a missing value.
+#[test]
+fn unaliased_self_join_leg_collects_none_and_stays_distinct() {
+    let request = self_join_request(&[None, Some("B")]);
+    let join = detected_join(&request);
+
+    let keys = leaf_keys(&join);
+    assert_eq!(keys, [("FACT_ORDERS", None), ("FACT_ORDERS", Some("B"))]);
+    assert_ne!(keys[0], keys[1], "the two legs must remain distinguishable");
+}
+
+/// A quoted mixed-case alias is retained verbatim — no upper- or lower-casing —
+/// so a verbatim comparison against a column node's `tableAlias` matches.
+#[test]
+fn mixed_case_leaf_alias_is_retained_verbatim() {
+    let request = self_join_request(&[Some("myAlias"), Some("B")]);
+    let join = detected_join(&request);
+
+    assert_eq!(join.tables[0].table_alias.as_deref(), Some("myAlias"));
+}
+
+/// A three-leg left-deep self-join collects one leaf per occurrence, each with its
+/// own alias, at every tree depth — alias retention is not limited to the two-leg
+/// shape.
+#[test]
+fn three_leg_left_deep_self_join_collects_one_aliased_leaf_per_occurrence() {
+    let request = self_join_request(&[Some("A"), Some("B"), Some("C")]);
+    let join = detected_join(&request);
+
+    assert_eq!(
+        leaf_keys(&join),
+        [
+            ("FACT_ORDERS", Some("A")),
+            ("FACT_ORDERS", Some("B")),
+            ("FACT_ORDERS", Some("C")),
+        ]
+    );
+    assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 legs");
+}
+
+/// A join over two DIFFERENT tables written without aliases collects `None` for
+/// both leaves — the common, currently-correct case gains no alias out of thin
+/// air.
+#[test]
+fn unaliased_two_table_join_leaves_carry_no_alias() {
+    let request = join_request(Json::Null, equi_condition());
+    let join = detected_join(&request);
+
+    assert_eq!(leaf_keys(&join), [("CUSTOMER", None), ("ORDERS", None)]);
+}
+
+// ---------------------------------------------------------------------------
 // Join side selection + broadcast threshold: `select_broadcast_sides`.
 // The pure core of the two-table broadcast role/threshold decision — exercised
 // without a live Iceberg catalog. `plan_join` resolves each side via
@@ -343,4 +429,35 @@ fn equal_size_tie_breaks_to_first_argument() {
     assert_eq!(sides.dimension.table_name, "SELF_A");
     assert_eq!(sides.fact.table_name, "SELF_B");
     assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// A self-join never reaches the broadcast path.
+// ---------------------------------------------------------------------------
+
+/// A self-join declares an IDENTICAL column set on both occurrences (both leaves
+/// share one `table_name`, so [`involved_table_columns`] returns the same list
+/// twice), which the disjoint-schema guard already declines on its own — no
+/// same-table guard is added; this pins the decline that already covers it.
+/// [`render_broadcast_join`] therefore returns `Ok(None)`, the same clean
+/// fall-through an overlapping-column two-table join takes, so `plan_join` falls
+/// to the unified N-scan fallback rather than ever building a broadcast plan.
+#[test]
+fn self_join_is_never_broadcast_eligible() {
+    let request = self_join_request(&[Some("A"), Some("B")]);
+    let join = detected_join(&request);
+
+    let left = involved_table_columns(&request, &join.tables[0].table_name);
+    let right = involved_table_columns(&request, &join.tables[1].table_name);
+    assert!(
+        !disjoint_schema_guard(&left, &right),
+        "a self-join's two occurrences declare the same columns, so the guard must decline it"
+    );
+
+    let rendered = render_broadcast_join(&request, &pd(&request), &join)
+        .expect("no column-metadata error for a well-formed self-join request");
+    assert!(
+        rendered.is_none(),
+        "a self-join must never reach the broadcast path, only the clean N-scan fall-through"
+    );
 }

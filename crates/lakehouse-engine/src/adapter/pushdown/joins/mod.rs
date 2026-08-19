@@ -10,6 +10,7 @@ use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
+mod attribution;
 mod planning;
 mod rendering;
 mod sql_builders;
@@ -32,7 +33,7 @@ pub(super) use planning::JoinWindowPlan;
 use planning::{
     classify_join_window, involved_table_columns, resolve_one_join_side, select_broadcast_sides,
 };
-use rendering::{has_no_explicit_select_list, possible_side_column_names, side_local_filter};
+use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // Re-exported `pub(super)` (not merely `use`) so the dispatch-golden test module
 // (a sibling of `joins` under `pushdown`, gated `#[cfg(test)]`) can drive both
 // join SQL builders directly to pin cross-site golden-SQL fixtures — the same
@@ -171,8 +172,8 @@ pub(super) async fn plan_join(
 ) -> Result<Json, UdfError> {
     // Resolve each side ONCE (one catalog resolution per involved table, never per
     // shard), through the SAME per-request resolver, each pruned by its own
-    // side-local WHERE conjuncts for format-level manifest pruning — attributed by
-    // `tableName`, so a shared-column-name case stays correct.
+    // leg-local WHERE conjuncts for format-level manifest pruning — attributed by
+    // LEG, so both a shared-column-name case and a repeated table stay correct.
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     let connection = ConnectionStorage {
         storage,
@@ -190,9 +191,14 @@ pub(super) async fn plan_join(
         .collect();
     let resolver =
         TableScanResolver::for_request(catalog_kind, catalog_uri, connection, &identifiers).await?;
+    // ONE leg per FROM-tree leaf, so the resolve loop is driven by LEG INDEX: a
+    // self-join's two occurrences share a `tableName`, and keying pruning on the name
+    // would hand each occurrence the other's predicate too — over-filtered rows with
+    // no error.
+    let legs = join.legs();
     let mut sides = Vec::with_capacity(join.tables.len());
-    for leaf in &join.tables {
-        let side_filter = filter.and_then(|f| side_local_filter(f, &leaf.table_name));
+    for (leg, leaf) in join.tables.iter().enumerate() {
+        let side_filter = filter.and_then(|f| leg_local_filter(f, &legs, leg));
         let side = resolve_one_join_side(
             &leaf.table_name,
             &leaf.table_identifier,

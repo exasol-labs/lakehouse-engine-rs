@@ -1,16 +1,54 @@
 use super::super::super::support::collect_all_column_names;
-use super::super::planning::{JoinSides, JoinWindowPlan, disjoint_schema_guard};
+use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan, disjoint_schema_guard};
 use super::super::sql_builders::{
     JoinScanTuning, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
     build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
-    detected_join, equi_condition, join_request, resolved_side, two_scan_tuning,
+    detected_join, equi_condition, join_request, legs_from_leaves, resolved_side, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::support::apply_type_rewrites;
 use crate::adapter::pushdown::test_support::*;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
+
+/// A `JoinLegs` binding over `names`, one leg per name in FROM-tree order, every
+/// occurrence unaliased — the no-table-occurs-twice shape whose behaviour must stay
+/// byte-identical. Leg `i` is `names[i]`.
+fn legs_of(names: &[&str]) -> JoinLegs {
+    let leaves: Vec<JoinLeaf> = names
+        .iter()
+        .map(|name| JoinLeaf {
+            table_name: (*name).to_string(),
+            table_alias: None,
+            table_identifier: format!("lh.{}", name.to_lowercase()),
+        })
+        .collect();
+    legs_from_leaves(leaves)
+}
+
+/// The standard `CUSTOMER` (leg 0) ⋈ `ORDERS` (leg 1) binding.
+fn customer_orders_legs() -> JoinLegs {
+    legs_of(&["CUSTOMER", "ORDERS"])
+}
+
+/// A two-leg self-join binding: both leaves share `FACT_ORDERS` but carry their
+/// own occurrence alias (`A` at leg 0, `B` at leg 1) — the shape issue #361's
+/// fix makes distinguishable.
+fn self_join_legs() -> JoinLegs {
+    legs_from_leaves(vec![
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("A".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+        JoinLeaf {
+            table_name: "FACT_ORDERS".to_string(),
+            table_alias: Some("B".to_string()),
+            table_identifier: "lh.fact_orders".to_string(),
+        },
+    ])
+}
 
 // ---------------------------------------------------------------------------
 // Join rendering: disjoint-column guard + condition/filter/projection
@@ -339,11 +377,11 @@ fn join_projection_like_guard_reaches_join_select_list() {
 // and per-side filter pushdown in the fallback path.
 // -----------------------------------------------------------------------
 
-/// A conjunct referencing only one side's columns is attributed to that side
-/// alone: the CUSTOMER-only conjunct threads to CUSTOMER, the ORDERS-only
-/// conjunct to ORDERS, and neither leaks to the other.
+/// A conjunct referencing only one leg's columns is attributed to that leg
+/// alone: the CUSTOMER-only conjunct threads to leg 0, the ORDERS-only
+/// conjunct to leg 1, and neither leaks to the other.
 #[test]
-fn side_local_filter_attributes_conjuncts_to_owning_side() {
+fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -356,8 +394,9 @@ fn side_local_filter_attributes_conjuncts_to_owning_side() {
         ],
     });
 
+    let legs = customer_orders_legs();
     let cust = render_df_filter_safe(
-        &side_local_filter(&filter, "CUSTOMER").expect("a CUSTOMER-local conjunct exists"),
+        &leg_local_filter(&filter, &legs, 0).expect("a CUSTOMER-local conjunct exists"),
     )
     .expect("renders");
     assert!(
@@ -366,7 +405,7 @@ fn side_local_filter_attributes_conjuncts_to_owning_side() {
     );
 
     let ord = render_df_filter_safe(
-        &side_local_filter(&filter, "ORDERS").expect("an ORDERS-local conjunct exists"),
+        &leg_local_filter(&filter, &legs, 1).expect("an ORDERS-local conjunct exists"),
     )
     .expect("renders");
     assert!(
@@ -375,12 +414,12 @@ fn side_local_filter_attributes_conjuncts_to_owning_side() {
     );
 }
 
-/// A cross-table conjunct (references both sides) and an OR spanning both sides
-/// are withheld from BOTH sides' pruning — only the outer wrapper's WHERE
-/// applies them. A single-side-local conjunct alongside a cross-table one is
-/// still extracted for its side.
+/// A cross-leg conjunct (references both legs) and an OR spanning both legs
+/// are withheld from BOTH legs' pruning — only the outer wrapper's WHERE
+/// applies them. A single-leg-local conjunct alongside a cross-leg one is
+/// still extracted for its leg.
 #[test]
-fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
+fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -394,8 +433,9 @@ fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
              "right": {"type": "literal_string", "value": "ACME"}},
         ],
     });
+    let legs = customer_orders_legs();
     let cust = render_df_filter_safe(
-        &side_local_filter(&filter, "CUSTOMER").expect("CUSTOMER-local conjunct present"),
+        &leg_local_filter(&filter, &legs, 0).expect("CUSTOMER-local conjunct present"),
     )
     .expect("renders");
     assert!(
@@ -403,11 +443,11 @@ fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
         "the cross-table conjunct must NOT be pushed to CUSTOMER: {cust}"
     );
     assert!(
-        side_local_filter(&filter, "ORDERS").is_none(),
-        "ORDERS is only referenced by the cross-table conjunct, so nothing is side-local to it"
+        leg_local_filter(&filter, &legs, 1).is_none(),
+        "ORDERS is only referenced by the cross-leg conjunct, so nothing is leg-local to it"
     );
 
-    // An OR spanning both sides is one opaque conjunct referencing both → withheld.
+    // An OR spanning both legs is one opaque conjunct referencing both → withheld.
     let or_filter = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
@@ -419,10 +459,10 @@ fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
              "right": {"type": "literal_string", "value": "1995-01-01"}},
         ],
     });
-    assert!(side_local_filter(&or_filter, "CUSTOMER").is_none());
-    assert!(side_local_filter(&or_filter, "ORDERS").is_none());
+    assert!(leg_local_filter(&or_filter, &legs, 0).is_none());
+    assert!(leg_local_filter(&or_filter, &legs, 1).is_none());
 
-    // An OR referencing only ONE side is side-local to it (still prunable).
+    // An OR referencing only ONE leg is leg-local to it (still prunable).
     let one_side_or = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
@@ -435,31 +475,32 @@ fn side_local_filter_withholds_cross_table_and_or_conjuncts() {
         ],
     });
     assert!(
-        side_local_filter(&one_side_or, "CUSTOMER").is_some(),
-        "an OR over one side alone is side-local and prunable"
+        leg_local_filter(&one_side_or, &legs, 0).is_some(),
+        "an OR over one leg alone is leg-local and prunable"
     );
-    assert!(side_local_filter(&one_side_or, "ORDERS").is_none());
+    assert!(leg_local_filter(&one_side_or, &legs, 1).is_none());
 }
 
-/// A filter that is a single (non-AND) conjunct is attributed to its owning side
+/// A filter that is a single (non-AND) conjunct is attributed to its owning leg
 /// without a top-level AND wrapper.
 #[test]
-fn side_local_filter_handles_a_single_conjunct() {
+fn leg_local_filter_handles_a_single_conjunct() {
     let single = serde_json::json!({
         "type": "predicate_equal",
         "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
         "right": {"type": "literal_string", "value": "ACME"}
     });
-    assert!(side_local_filter(&single, "CUSTOMER").is_some());
-    assert!(side_local_filter(&single, "ORDERS").is_none());
+    let legs = customer_orders_legs();
+    assert!(leg_local_filter(&single, &legs, 0).is_some());
+    assert!(leg_local_filter(&single, &legs, 1).is_none());
 }
 
-/// Attribution is by `tableName`, NOT by column name: with a column name shared
-/// across both tables (`ID`), a conjunct on `EVENTS.ID` is side-local to EVENTS
-/// only and is never applied to LABELS (which also has an `ID`). This is the
-/// shared-column-name safety the whole per-side pruning rests on.
+/// Attribution is by LEG, NOT by column name: with a column name shared
+/// across both tables (`ID`), a conjunct on `EVENTS.ID` is leg-local to EVENTS'
+/// leg only and is never applied to LABELS' (which also has an `ID`). This is the
+/// shared-column-name safety the whole per-leg pruning rests on.
 #[test]
-fn side_local_filter_attributes_shared_column_by_table_not_name() {
+fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -472,8 +513,9 @@ fn side_local_filter_attributes_shared_column_by_table_not_name() {
         ],
     });
 
+    let legs = legs_of(&["EVENTS", "LABELS"]);
     let events = render_df_filter_safe(
-        &side_local_filter(&filter, "EVENTS").expect("EVENTS.ID conjunct is side-local"),
+        &leg_local_filter(&filter, &legs, 0).expect("EVENTS.ID conjunct is leg-local"),
     )
     .expect("renders");
     assert!(
@@ -482,12 +524,58 @@ fn side_local_filter_attributes_shared_column_by_table_not_name() {
     );
 
     let labels = render_df_filter_safe(
-        &side_local_filter(&filter, "LABELS").expect("LABELS.LABEL conjunct is side-local"),
+        &leg_local_filter(&filter, &legs, 1).expect("LABELS.LABEL conjunct is leg-local"),
     )
     .expect("renders");
     assert!(
         labels.contains("LABEL") && !labels.contains('5'),
         "the EVENTS.ID predicate must NOT be applied to LABELS despite the shared name: {labels}"
+    );
+}
+
+/// The self-join analog of the shared-column-name test above: TWO OCCURRENCES of
+/// the SAME table, each carrying its own conjunct. A conjunct against occurrence
+/// A must reach only occurrence A's leg-local filter — the value
+/// [`leg_local_filter`] hands BOTH to a leg's `ScanSpec.filter` (via
+/// [`super::super::sql_builders`]'s type-screening) and, unscreened, to that
+/// leg's Iceberg manifest-pruning predicate in `plan_join` — never occurrence B's,
+/// despite the two occurrences sharing one `tableName`. This is exactly the defect
+/// issue #361 also caused: name-keyed attribution would have handed one
+/// occurrence's predicate to the other, over-filtering it with no error.
+#[test]
+fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
+    let filter = serde_json::json!({
+        "type": "predicate_and",
+        "expressions": [
+            {"type": "predicate_greater",
+             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
+                      "tableAlias": "A"},
+             "right": {"type": "literal_exactnumeric", "value": 5}},
+            {"type": "predicate_equal",
+             "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS",
+                      "tableAlias": "B"},
+             "right": {"type": "literal_exactnumeric", "value": 7}},
+        ],
+    });
+    let legs = self_join_legs();
+
+    let occurrence_a = render_df_filter_safe(
+        &leg_local_filter(&filter, &legs, 0).expect("occurrence A's conjunct is leg-local"),
+    )
+    .expect("renders");
+    assert!(
+        occurrence_a.contains('5') && !occurrence_a.contains('7'),
+        "occurrence A's leg-local filter must carry only its own conjunct: {occurrence_a}"
+    );
+
+    let occurrence_b = render_df_filter_safe(
+        &leg_local_filter(&filter, &legs, 1).expect("occurrence B's conjunct is leg-local"),
+    )
+    .expect("renders");
+    assert!(
+        occurrence_b.contains('7') && !occurrence_b.contains('5'),
+        "occurrence B's leg-local filter must NOT receive occurrence A's conjunct despite the \
+         shared table name: {occurrence_b}"
     );
 }
 
@@ -560,8 +648,8 @@ fn declined_side_local_conjunct_partitions_to_residual() {
          WHERE could not apply it either"
     );
     assert_eq!(
-        conjunct_single_side(&declined).as_deref(),
-        Some("ORDERS"),
+        customer_orders_legs().conjunct_leg(&declined),
+        Some(1),
         "attribution is unchanged — only the RENDER declines, so the screen is \
          the sole reason this conjunct becomes residual"
     );
@@ -576,7 +664,8 @@ fn rendering_side_local_conjunct_still_reaches_its_leg() {
     let leg_eligible = renderable_only(&filter).expect("the rendering conjunct survives");
 
     let leg = render_df_filter_safe(
-        &side_local_filter(&leg_eligible, "ORDERS").expect("still ORDERS-side-local"),
+        &leg_local_filter(&leg_eligible, &customer_orders_legs(), 1)
+            .expect("still ORDERS-leg-local"),
     )
     .expect("a DataFusion-renderable leg filter renders");
 
@@ -587,33 +676,34 @@ fn rendering_side_local_conjunct_still_reaches_its_leg() {
 }
 
 /// The Iceberg manifest-pruning input is NOT screened: `plan_join` passes the
-/// RAW filter to `side_local_filter`, so a conjunct whose DataFusion render
-/// declines still prunes that side's manifests. Only the leg's `ScanSpec.filter`
-/// sees the screened tree — screening inside `side_local_filter` would silently
+/// RAW filter to `leg_local_filter`, so a conjunct whose DataFusion render
+/// declines still prunes that leg's manifests. Only the leg's `ScanSpec.filter`
+/// sees the screened tree — screening inside `leg_local_filter` would silently
 /// open more files with no failing test.
 #[test]
 fn join_side_pruning_input_unchanged_when_df_render_declines() {
     let filter = orders_local_rendering_and_declined_filter();
 
-    let pruning =
-        side_local_filter(&filter, "ORDERS").expect("both conjuncts are ORDERS-side-local");
+    let legs = customer_orders_legs();
+    let pruning = leg_local_filter(&filter, &legs, 1).expect("both conjuncts are ORDERS-leg-local");
     let mut pruning_conjuncts = Vec::new();
     flatten_conjuncts(&pruning, &mut pruning_conjuncts);
     assert_eq!(
         pruning_conjuncts.len(),
         2,
-        "pruning must still receive BOTH side-local conjuncts: {pruning}"
+        "pruning must still receive BOTH leg-local conjuncts: {pruning}"
     );
     assert!(
         pruning_conjuncts.iter().any(|c| !datafusion_renderable(c)),
         "the declined conjunct must still be in the pruning input: {pruning}"
     );
 
-    let leg = side_local_filter(
+    let leg = leg_local_filter(
         &renderable_only(&filter).expect("the rendering conjunct survives"),
-        "ORDERS",
+        &legs,
+        1,
     )
-    .expect("the rendering conjunct is still ORDERS-side-local");
+    .expect("the rendering conjunct is still ORDERS-leg-local");
     let mut leg_conjuncts = Vec::new();
     flatten_conjuncts(&leg, &mut leg_conjuncts);
     assert_eq!(
@@ -873,10 +963,10 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
 }
 
 /// The fallback projection is narrowed to the columns the outer wrapper
-/// references for a side — SELECT list + join condition + WHERE — preserving
+/// references for a leg — SELECT list + join condition + WHERE — preserving
 /// the full-column order/type, and dropping columns referenced nowhere.
 #[test]
-fn referenced_side_columns_narrows_to_used_columns() {
+fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = serde_json::json!({
         "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
         "filter": {"type": "predicate_equal",
@@ -894,7 +984,8 @@ fn referenced_side_columns_narrows_to_used_columns() {
         ("C_ADDRESS".to_string(), "VARCHAR(100)".to_string()),
         ("C_PHONE".to_string(), "VARCHAR(20)".to_string()),
     ];
-    let narrowed = referenced_side_columns(&pushdown_req, &condition, "CUSTOMER", &full);
+    let narrowed =
+        referenced_leg_columns(&pushdown_req, &condition, &customer_orders_legs(), 0, &full);
     let names: Vec<&str> = narrowed.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
         names,
@@ -911,7 +1002,7 @@ fn referenced_side_columns_narrows_to_used_columns() {
 /// An absent (or empty) SELECT list means the wrapper projects every column via
 /// `SELECT *`, so no narrowing is applied — all columns are kept.
 #[test]
-fn referenced_side_columns_keeps_all_when_select_list_absent() {
+fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     let condition = serde_json::json!({
         "type": "predicate_equal",
         "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
@@ -921,19 +1012,25 @@ fn referenced_side_columns_keeps_all_when_select_list_absent() {
         ("C_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
         ("C_NAME".to_string(), "VARCHAR(100)".to_string()),
     ];
-    let narrowed = referenced_side_columns(&serde_json::json!({}), &condition, "CUSTOMER", &full);
+    let narrowed = referenced_leg_columns(
+        &serde_json::json!({}),
+        &condition,
+        &customer_orders_legs(),
+        0,
+        &full,
+    );
     assert_eq!(
         narrowed, full,
         "an absent select list ⇒ SELECT *, keep every column"
     );
 }
 
-/// A narrowing that selects no column of this side keeps the FULL column set —
-/// `referenced_side_columns` never emits a zero-column fan-out leg. That full-set
+/// A narrowing that selects no column of this leg keeps the FULL column set —
+/// `referenced_leg_columns` never emits a zero-column fan-out leg. That full-set
 /// fallback is its own policy; `referenced_column_projection` falls back to only
 /// the first column instead, and the two MUST stay divergent.
 #[test]
-fn referenced_side_columns_keeps_all_when_narrowing_empty() {
+fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     let pushdown_req = serde_json::json!({
         "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
     });
@@ -942,7 +1039,13 @@ fn referenced_side_columns_keeps_all_when_narrowing_empty() {
         ("L_ORDERKEY".to_string(), "DECIMAL(20,0)".to_string()),
         ("L_QUANTITY".to_string(), "DECIMAL(18,2)".to_string()),
     ];
-    let narrowed = referenced_side_columns(&pushdown_req, &condition, "LINEITEM", &full);
+    let narrowed = referenced_leg_columns(
+        &pushdown_req,
+        &condition,
+        &legs_of(&["CUSTOMER", "ORDERS", "LINEITEM"]),
+        2,
+        &full,
+    );
     assert_eq!(
         narrowed, full,
         "no clause references a LINEITEM column ⇒ keep every column rather than \
@@ -951,8 +1054,8 @@ fn referenced_side_columns_keeps_all_when_narrowing_empty() {
 }
 
 /// The two column collectors MUST keep their divergent case folding:
-/// `collect_all_column_names` folds with Unicode `to_uppercase`,
-/// `collect_side_column_names` with ASCII-only `to_ascii_uppercase`. `ß` is the
+/// `collect_all_column_names` folds with Unicode `to_uppercase`, the joins module's
+/// own walks with ASCII-only `to_ascii_uppercase`. `ß` is the
 /// witness — Unicode folds it to `SS`, ASCII leaves it untouched. No other test in
 /// this crate uses a non-ASCII identifier, so without this test reconciling the two
 /// folds (which sharing one clause walk invites) would change behavior while the
@@ -971,12 +1074,11 @@ fn column_collectors_keep_divergent_case_folding() {
         "collect_all_column_names folds ß to SS via Unicode to_uppercase"
     );
 
-    let mut ascii_folded = std::collections::HashSet::new();
-    collect_side_column_names(&expr, "CUSTOMER", &mut ascii_folded);
+    let ascii_folded = possible_side_column_names(&expr, "CUSTOMER");
     assert_eq!(
         ascii_folded,
         std::collections::HashSet::from(["STRAßE".to_string()]),
-        "collect_side_column_names leaves ß untouched via to_ascii_uppercase"
+        "the joins module's walks leave ß untouched via to_ascii_uppercase"
     );
 
     assert_ne!(

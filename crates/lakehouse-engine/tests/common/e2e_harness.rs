@@ -468,7 +468,7 @@ pub fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
 /// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
 /// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
 /// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
-/// aliases (`build_n_scan_alias_map`) are unique to the N-scan wrapper's
+/// aliases (`JoinLegs::leg_alias`) are unique to the N-scan wrapper's
 /// generated SQL — never present in a native retry or a broadcast join.
 pub fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
     (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))

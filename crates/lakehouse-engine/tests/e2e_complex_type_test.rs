@@ -368,3 +368,35 @@ fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
     );
     assert_pushed_to_scan_udf(&mut conn, &upper_sql, "the select-list UPPER(TAGS)");
 }
+
+/// Scenario: A self-join on a nested JSON-rendered column (issue #361's second
+/// repro, `FROM complex_probe a JOIN complex_probe b ON a.TAGS = b.TAGS`) pairs
+/// each row only with itself. `COMPLEX_ROW_NULL` must match nothing — including
+/// itself — since SQL `NULL = NULL` is never true.
+#[test]
+fn e2e_self_join_on_nested_json_column_matches_single_node() {
+    setup();
+    let mut conn = exa_conn();
+    let table = served_table();
+    let qualified = format!("{VS_NAME}.{table}");
+
+    let join_sql = format!(
+        "SELECT a.ID, b.ID FROM {qualified} a JOIN {qualified} b ON a.TAGS = b.TAGS \
+         ORDER BY a.ID, b.ID"
+    );
+    let joined = conn.query_columns(&join_sql);
+    let left_ids: Vec<i64> = joined[0].iter().map(parse_int).collect();
+    let right_ids: Vec<i64> = joined[1].iter().map(parse_int).collect();
+    let actual: Vec<(i64, i64)> = left_ids.into_iter().zip(right_ids).collect();
+    assert_eq!(
+        actual,
+        vec![
+            (COMPLEX_ROW_POPULATED, COMPLEX_ROW_POPULATED),
+            (COMPLEX_ROW_EMPTY, COMPLEX_ROW_EMPTY),
+            (COMPLEX_ROW_ALT, COMPLEX_ROW_ALT),
+        ],
+        "a self-join on TAGS must pair each row only with itself, and \
+         COMPLEX_ROW_NULL must match nothing, not even itself: {actual:?}"
+    );
+    assert_pushed_to_scan_udf(&mut conn, &join_sql, "the self-join ON TAGS");
+}

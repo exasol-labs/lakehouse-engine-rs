@@ -1,9 +1,11 @@
 use super::super::super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME};
 use super::super::ineligible_join_decline;
-use super::super::planning::{IneligibleJoinReason, JoinShape, classify_join_window, detect_join};
+use super::super::planning::{
+    IneligibleJoinReason, JoinLeaf, JoinShape, classify_join_window, detect_join,
+};
 use super::super::tests::{
-    detected_join, equi_condition, join_request, nq3_join_request, resolved_side,
-    three_table_join_request, two_scan_tuning,
+    detected_join, equi_condition, join_request, legs_from_leaves, nq3_join_request, resolved_side,
+    self_join_request, three_table_join_request, two_scan_tuning,
 };
 use super::*;
 use crate::adapter::pushdown::test_support::*;
@@ -443,7 +445,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
 /// correctly emits no clause. The non-suppressing `render_expression_qualified`
 /// over the same tree separates the two causes.
 ///
-/// A column-free conjunct is residual by construction (`conjunct_single_side` is
+/// A column-free conjunct is residual by construction (`JoinLegs::conjunct_leg` is
 /// `None`), so this is the shape that reaches the gate.
 #[test]
 fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
@@ -768,6 +770,303 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
     assert!(
         sql.starts_with(r#"SELECT "LHS_T0"."ID", "LHS_T1"."LABEL", "LHS_T2"."TAG_NAME" FROM "#),
         "the outer SELECT list must qualify the shared ID column, never bare: {sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Self-join leg attribution (issue #361): each occurrence of a repeated table
+// renders as its own leg, never collapsing onto one.
+// ---------------------------------------------------------------------------
+
+/// Issue #361's own repro shape: `FROM FACT_ORDERS a JOIN FACT_ORDERS b ON
+/// a.O_ORDERKEY = b.O_ORDERKEY`. Before the fix the rendered `ON` compared
+/// `"LHS_T1"."O_ORDERKEY"` to itself (a tautology) and the select list was
+/// wrongly all-`LHS_T1`. Run for both a fully-aliased self-join and a mixed
+/// aliased/unaliased one (`FROM FACT_ORDERS JOIN FACT_ORDERS b`, also captured
+/// live returning 100 rows instead of 10) — both must resolve to exactly two
+/// distinct legs.
+#[test]
+fn self_join_renders_each_occurrence_as_its_own_leg() {
+    for leg_aliases in [[Some("A"), Some("B")], [None, Some("B")]] {
+        let request = self_join_request(&leg_aliases);
+        let sides = vec![
+            resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
+            resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
+        ];
+        let sql = build_n_scan_join_sql(
+            &request,
+            &pd(&request),
+            &detected_join(&request),
+            &sides,
+            &two_scan_tuning(),
+            "SCAN",
+            "DISTRIBUTE",
+        )
+        .expect("a two-leg self-join must build through the unified fallback, never Err");
+
+        assert!(
+            sql.contains(r#"ON (("LHS_T0"."O_ORDERKEY" = "LHS_T1"."O_ORDERKEY"))"#),
+            "leg_aliases {leg_aliases:?}: the ON must compare two DISTINCT occurrences, never \
+             the pre-fix tautology over one collapsed leg: {sql}"
+        );
+        assert!(
+            sql.starts_with(r#"SELECT "LHS_T0"."O_ORDERKEY" FROM"#),
+            "leg_aliases {leg_aliases:?}: the select list must qualify by the referencing \
+             occurrence's own leg, not the last-write-wins collapse that made every item \
+             `LHS_T1`: {sql}"
+        );
+    }
+}
+
+/// A three-leg self-join (`FACT_ORDERS a JOIN FACT_ORDERS b JOIN FACT_ORDERS c`)
+/// attaches its two conditions at two DIFFERENT join points, each exactly once —
+/// the pre-fix collapse rendered `ON 1=1` at one join point and duplicated the
+/// same tautology at the other, returning 1000 rows instead of 10 over a 10-row
+/// table (live capture).
+#[test]
+fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
+    let request = self_join_request(&[Some("A"), Some("B"), Some("C")]);
+    let sides = vec![
+        resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
+        resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
+        resolved_side("FACT_ORDERS", vec![("s3://w/f2.parquet", 10)]),
+    ];
+    let sql = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("a three-leg self-join must build through the unified fallback, never Err");
+
+    assert!(
+        !sql.contains("1=1"),
+        "no join point may fall back to a tautology when a real condition attaches: {sql}"
+    );
+    assert_eq!(
+        sql.matches(r#""LHS_T0"."O_ORDERKEY" = "LHS_T1"."O_ORDERKEY""#)
+            .count(),
+        1,
+        "the A=B condition must attach exactly once, at the first join point: {sql}"
+    );
+    assert_eq!(
+        sql.matches(r#""LHS_T1"."O_ORDERKEY" = "LHS_T2"."O_ORDERKEY""#)
+            .count(),
+        1,
+        "the B=C condition must attach exactly once, at the second join point, never \
+         duplicated onto the first: {sql}"
+    );
+}
+
+/// A `column` reference whose `tableAlias` matches neither self-join occurrence
+/// is a hard client-facing error naming the column and its table — never an
+/// arbitrary leg guess, which would silently return wrong rows.
+#[test]
+fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
+    let mut request = self_join_request(&[Some("A"), Some("B")]);
+    request["pushdownRequest"]["selectList"] = serde_json::json!([
+        {"type": "column", "name": "O_ORDERKEY", "tableName": "FACT_ORDERS", "tableAlias": "Z"}
+    ]);
+    let sides = vec![
+        resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
+        resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
+    ];
+
+    let err = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect_err("a reference no leg key matches must be a hard error, never an arbitrary guess");
+
+    match err {
+        UdfError::User(msg) => {
+            assert!(msg.contains("O_ORDERKEY"), "{msg}");
+            assert!(msg.contains("FACT_ORDERS"), "{msg}");
+            assert!(
+                msg.contains("could not be attributed to a join leg"),
+                "{msg}"
+            );
+            assert!(msg.contains("hard error, not a native re-plan"), "{msg}");
+        }
+        other => panic!("expected a User decline, got {other:?}"),
+    }
+}
+
+/// A `sides` list that does not carry one resolved side per FROM-tree leaf is a
+/// client-visible decline naming BOTH counts — never the debug-only assertion this
+/// replaced, which a release UDF drops: the FROM chain emits one leg per resolved side,
+/// so a reference qualified to a leg the chain never emitted (captured: `"LHS_T1"` over
+/// a one-leg FROM) would reach Exasol as invalid SQL.
+#[test]
+fn a_leg_count_disagreeing_with_the_resolved_sides_declines_naming_both_counts() {
+    let request = self_join_request(&[Some("A"), Some("B")]);
+    let sides = vec![resolved_side(
+        "FACT_ORDERS",
+        vec![("s3://w/f0.parquet", 10)],
+    )];
+
+    let err = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect_err("a leg index that cannot index the resolved sides must decline, not panic");
+
+    match err {
+        UdfError::User(msg) => assert_eq!(
+            msg,
+            "join pushdown declined: leg count (2) and resolved-side count (1) disagree, \
+             so a leg index cannot index the resolved sides; this is a hard error, not a \
+             native re-plan"
+        ),
+        other => panic!("expected a User decline, got {other:?}"),
+    }
+}
+
+/// Every outer-wrapper clause the unified fallback renders — SELECT, GROUP BY,
+/// HAVING, and ORDER BY — qualifies by the referencing occurrence's own leg on a
+/// self-join, including a column buried inside an aggregate argument.
+#[test]
+fn n_scan_wrapper_qualifies_every_clause_by_leg() {
+    fn col(alias: &str) -> Json {
+        serde_json::json!({
+            "type": "column", "name": "O_CUSTKEY", "tableName": "FACT_ORDERS", "tableAlias": alias
+        })
+    }
+    fn sum_of(alias: &str) -> Json {
+        serde_json::json!({
+            "type": "function_aggregate", "name": "SUM", "distinct": false,
+            "arguments": [col(alias)]
+        })
+    }
+    let mut request = self_join_request(&[Some("A"), Some("B")]);
+    request["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
+    request["pushdownRequest"]["selectList"] = serde_json::json!([col("A"), sum_of("B")]);
+    request["pushdownRequest"]["groupBy"] = serde_json::json!([col("A")]);
+    request["pushdownRequest"]["having"] = serde_json::json!({
+        "type": "predicate_greater", "left": sum_of("B"),
+        "right": {"type": "literal_exactnumeric", "value": 10},
+    });
+    request["pushdownRequest"]["orderBy"] = serde_json::json!([
+        {"expression": col("A"), "isAscending": true, "nullsLast": false},
+    ]);
+
+    let sides = vec![
+        resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
+        resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
+    ];
+    let sql = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("every clause must render against its own occurrence's leg");
+
+    assert!(
+        sql.contains(r#"SELECT "LHS_T0"."O_CUSTKEY", SUM("LHS_T1"."O_CUSTKEY")"#),
+        "the select list must qualify each item to its own occurrence: {sql}"
+    );
+    assert!(
+        sql.contains(r#"GROUP BY "LHS_T0"."O_CUSTKEY""#),
+        "GROUP BY must qualify to occurrence A: {sql}"
+    );
+    assert!(
+        sql.contains(r#"HAVING (SUM("LHS_T1"."O_CUSTKEY") > 10)"#),
+        "HAVING must qualify to occurrence B, nested inside the aggregate argument: {sql}"
+    );
+    assert!(
+        sql.contains(r#"ORDER BY "LHS_T0"."O_CUSTKEY" ASC NULLS FIRST"#),
+        "ORDER BY must qualify to occurrence A: {sql}"
+    );
+}
+
+/// A self-join WHERE filter with one conjunct local to EACH occurrence
+/// partitions exactly: both conjuncts push into their own occurrence's
+/// `ScanSpec.filter` (never the other's, despite the shared table name), the
+/// join condition attaches to the `ON` clause, and no cross-leg residual
+/// remains in the outer `WHERE`.
+#[test]
+fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
+    fn col(alias: &str) -> Json {
+        serde_json::json!({
+            "type": "column", "name": "O_CUSTKEY", "tableName": "FACT_ORDERS", "tableAlias": alias
+        })
+    }
+    let mut request = self_join_request(&[Some("A"), Some("B")]);
+    request["pushdownRequest"]["filter"] = serde_json::json!({
+        "type": "predicate_and",
+        "expressions": [
+            {"type": "predicate_greater", "left": col("A"),
+             "right": {"type": "literal_exactnumeric", "value": 100}},
+            {"type": "predicate_equal", "left": col("B"),
+             "right": {"type": "literal_exactnumeric", "value": 7}},
+        ],
+    });
+    let sides = vec![
+        resolved_side("FACT_ORDERS", vec![("s3://w/f0.parquet", 10)]),
+        resolved_side("FACT_ORDERS", vec![("s3://w/f1.parquet", 10)]),
+    ];
+    let sql = build_n_scan_join_sql(
+        &request,
+        &pd(&request),
+        &detected_join(&request),
+        &sides,
+        &two_scan_tuning(),
+        "SCAN",
+        "DISTRIBUTE",
+    )
+    .expect("a fully leg-partitioned self-join filter must build");
+
+    assert!(
+        sql.contains(r#"ON (("LHS_T0"."O_ORDERKEY" = "LHS_T1"."O_ORDERKEY"))"#),
+        "the join condition must attach across the two occurrences: {sql}"
+    );
+    assert!(
+        !sql.contains(" WHERE "),
+        "both conjuncts are leg-local, so no cross-leg residual remains in the outer WHERE: {sql}"
+    );
+
+    // The UDF argument literals alternate common blob, files; every other one is
+    // a leg's common blob (see `fallback_leg_fan_out_spec_never_carries_a_limit_or_sort`).
+    let legs: Vec<Json> = sql
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .step_by(2)
+        .map(|blob| serde_json::from_str(blob).expect("each leg's common blob is valid JSON"))
+        .collect();
+    assert_eq!(legs.len(), 2, "one common blob per leg: {sql}");
+    let occurrence_a_filter = legs[0]
+        .get("filter")
+        .and_then(|f| f.as_str())
+        .expect("occurrence A's leg carries its own ScanSpec.filter");
+    let occurrence_b_filter = legs[1]
+        .get("filter")
+        .and_then(|f| f.as_str())
+        .expect("occurrence B's leg carries its own ScanSpec.filter");
+    assert!(
+        occurrence_a_filter.contains("100") && !occurrence_a_filter.contains('7'),
+        "occurrence A's leg-local filter must carry only its own conjunct: {occurrence_a_filter}"
+    );
+    assert!(
+        occurrence_b_filter.contains('7') && !occurrence_b_filter.contains("100"),
+        "occurrence B's leg-local filter must carry only its own conjunct: {occurrence_b_filter}"
     );
 }
 
@@ -1325,15 +1624,27 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     );
 }
 
-/// A three-side `alias_of` map ({CUSTOMER→LHS_T0, ORDERS→LHS_T1,
-/// LINEITEM→LHS_T2}) for the seam-unification tests, matching the `LHS_T*` scheme
-/// [`build_n_scan_alias_map`] produces from resolved sides.
-fn seam_alias_of() -> HashMap<String, String> {
-    HashMap::from([
-        ("CUSTOMER".to_string(), "LHS_T0".to_string()),
-        ("ORDERS".to_string(), "LHS_T1".to_string()),
-        ("LINEITEM".to_string(), "LHS_T2".to_string()),
-    ])
+/// A three-leg binding (CUSTOMER→`LHS_T0`, ORDERS→`LHS_T1`, LINEITEM→`LHS_T2`) for
+/// the seam-unification tests, built the way the N-scan wrapper builds it — one leg
+/// per FROM-tree leaf.
+fn seam_legs() -> JoinLegs {
+    let leaves: Vec<JoinLeaf> = ["CUSTOMER", "ORDERS", "LINEITEM"]
+        .iter()
+        .map(|name| JoinLeaf {
+            table_name: (*name).to_string(),
+            table_alias: None,
+            table_identifier: format!("lh.{}", name.to_lowercase()),
+        })
+        .collect();
+    legs_from_leaves(leaves)
+}
+
+/// The one-leg binding over a single involved table, exactly as the N = 1 qualified
+/// wrapper builds it.
+fn single_scan_legs(table_name: &str) -> JoinLegs {
+    JoinLegs::for_single_scan(&serde_json::json!({
+        "involvedTables": [{ "name": table_name }]
+    }))
 }
 
 /// A select item that is a SCALAR FUNCTION WRAPPING AGGREGATES — e.g.
@@ -1345,7 +1656,7 @@ fn seam_alias_of() -> HashMap<String, String> {
 /// `None`, declining the whole grouped-join pushdown at every arity.
 #[test]
 fn render_expression_qualified_renders_scalar_over_aggregate() {
-    let alias_of = seam_alias_of();
+    let legs = seam_legs();
     let sum_case = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
         "arguments": [{
@@ -1369,7 +1680,8 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
             {"type": "literal_exactnumeric", "value": 2}]
     });
 
-    let sql = render_expression_qualified(&item, &alias_of)
+    let sql = render_expression_qualified(&item, &legs)
+        .expect("every reference names exactly one leg")
         .expect("a scalar-over-aggregate item must render, never decline to None");
     assert!(
         sql.contains(r#"SUM(CASE WHEN ("LHS_T2"."L_RETURNFLAG" = 'R') THEN 1 ELSE 0 END)"#),
@@ -1388,14 +1700,16 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
 /// exact expected strings are captured here so any future drift at the seam fails.
 #[test]
 fn render_expression_qualified_top_level_aggregate_byte_compatible() {
-    let alias_of = seam_alias_of();
+    let legs = seam_legs();
 
     let sum = serde_json::json!({
         "type": "function_aggregate", "name": "SUM", "distinct": false,
         "arguments": [{"type": "column", "name": "O_TOTALPRICE", "tableName": "ORDERS"}]
     });
     assert_eq!(
-        render_expression_qualified(&sum, &alias_of).as_deref(),
+        render_expression_qualified(&sum, &legs)
+            .expect("every reference names exactly one leg")
+            .as_deref(),
         Some(r#"SUM("LHS_T1"."O_TOTALPRICE")"#)
     );
 
@@ -1403,7 +1717,9 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
         "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
     });
     assert_eq!(
-        render_expression_qualified(&count_star, &alias_of).as_deref(),
+        render_expression_qualified(&count_star, &legs)
+            .expect("every reference names exactly one leg")
+            .as_deref(),
         Some("COUNT(*)")
     );
 
@@ -1412,7 +1728,9 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
         "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]
     });
     assert_eq!(
-        render_expression_qualified(&count_distinct, &alias_of).as_deref(),
+        render_expression_qualified(&count_distinct, &legs)
+            .expect("every reference names exactly one leg")
+            .as_deref(),
         Some(r#"COUNT(DISTINCT "LHS_T0"."C_CUSTKEY")"#)
     );
 }
@@ -1430,7 +1748,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
 /// under plain `cargo test`, without Docker/Exasol.
 #[test]
 fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
-    let alias_of = seam_alias_of();
+    let legs = seam_legs();
     let item = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "distinct": true,
         "arguments": [{
@@ -1439,7 +1757,8 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
             "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
         }]
     });
-    let sql = render_expression_qualified(&item, &alias_of)
+    let sql = render_expression_qualified(&item, &legs)
+        .expect("every reference names exactly one leg")
         .expect("COUNT(DISTINCT CAST(col AS CHAR(20))) must render for the qualified wrapper");
     assert!(
         sql.contains("CHAR(20) ASCII"),
@@ -2039,6 +2358,9 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     );
 }
 
+/// Pins the property that a request in which no table occurs twice emits SQL
+/// byte-identical to its pre-self-join-fix output — the self-join attribution
+/// change must not perturb this ordinary two-distinct-table join's rendered SQL.
 #[test]
 fn golden_n_scan_join_sql_unchanged() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -2137,12 +2459,13 @@ fn golden_n_scan_render_decline_messages_unchanged() {
         }
     }
     let unrenderable = || serde_json::json!({"type": "totally_unsupported_node_type"});
-    let alias_of: HashMap<String, String> = HashMap::new();
+    // No leg at all: every fixture below is column-free, so attribution never runs.
+    let legs = legs_from_leaves(Vec::new());
 
     // n_scan_join_select_items: an unrenderable select-list item.
     let select_list_req = serde_json::json!({ "selectList": [unrenderable()] });
     let msg = user_message(
-        n_scan_join_select_items(&select_list_req, &alias_of, &[], &[])
+        n_scan_join_select_items(&select_list_req, &legs, &[])
             .expect_err("an unrenderable select-list item must decline"),
     );
     assert_eq!(
@@ -2204,7 +2527,7 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     // qualified_join_group_by: an unrenderable GROUP BY key.
     let group_by_req = serde_json::json!({ "groupBy": [unrenderable()] });
     let msg = user_message(
-        qualified_join_group_by(&group_by_req, &alias_of)
+        qualified_join_group_by(&group_by_req, &legs)
             .expect_err("an unrenderable GROUP BY key must decline"),
     );
     assert_eq!(
@@ -2216,7 +2539,7 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     // qualified_join_having: an unrenderable HAVING expression.
     let having_req = serde_json::json!({ "having": unrenderable() });
     let msg = user_message(
-        qualified_join_having(&having_req, &alias_of)
+        qualified_join_having(&having_req, &legs)
             .expect_err("an unrenderable HAVING expression must decline"),
     );
     assert_eq!(
@@ -2234,7 +2557,7 @@ fn golden_n_scan_render_decline_messages_unchanged() {
         }],
     });
     let msg = user_message(
-        qualified_join_order_by(&order_by_req, &alias_of)
+        qualified_join_order_by(&order_by_req, &legs)
             .expect_err("an unrenderable ORDER BY expression must decline"),
     );
     assert_eq!(
@@ -2927,11 +3250,8 @@ fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialec
 /// companion to the grouped top-N-groups e2e case's group-set equality.
 #[test]
 fn outer_wrapper_renders_qualified_expression_sort_key() {
-    let alias_of: HashMap<String, String> = [("T".to_string(), "LHS_T0".to_string())]
-        .into_iter()
-        .collect();
-    let aliases = vec!["LHS_T0".to_string()];
-    let cols_per_side = vec![vec![
+    let legs = single_scan_legs("T");
+    let cols_per_leg = vec![vec![
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
         ("NAME".to_string(), "VARCHAR(100)".to_string()),
     ]];
@@ -2950,7 +3270,7 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         "limit": {"numElements": 4}
     });
 
-    let clauses = outer_wrapper_clauses(&pushdown_req, &alias_of, &aliases, &cols_per_side)
+    let clauses = outer_wrapper_clauses(&pushdown_req, &legs, &cols_per_leg)
         .expect("a renderable expression sort key must render, not decline");
 
     assert!(
@@ -2976,36 +3296,58 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     );
 }
 
-/// The trailing clause suffix the qualified wrapper renders for `pushdown_req`,
-/// against the seeded `events` table under the single `LHS_T0` alias. A self-join's
-/// alias map collapses to ONE entry — both legs carry the same `tableName` — so
-/// this is exactly what the seam sees for capture rows 9-11 too.
-fn seam_trailing(pushdown_req: &Json) -> Result<String, UdfError> {
-    let alias_of = HashMap::from([("EVENTS".to_string(), "LHS_T0".to_string())]);
-    let aliases = vec!["LHS_T0".to_string()];
-    let cols_per_side = vec![vec![
+/// The trailing clause suffix the qualified wrapper renders for `pushdown_req`
+/// against `legs` — the SAME kind of binding production builds for that request
+/// shape: the N = 1 single-leg binding for row 8's genuine single scan, or a real
+/// two-leg self-join binding (`DetectedJoin::legs`, one leg per occurrence) for
+/// rows 9-11, exactly as [`build_n_scan_join_sql`] constructs it. No row is
+/// evaluated against a collapsed stand-in binding.
+fn seam_trailing(pushdown_req: &Json, legs: &JoinLegs) -> Result<String, UdfError> {
+    let cols = vec![
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
         ("NAME".to_string(), "VARCHAR(100)".to_string()),
         ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
-    ]];
-    outer_wrapper_clauses(pushdown_req, &alias_of, &aliases, &cols_per_side)
-        .map(|clauses| clauses.trailing)
+    ];
+    let cols_per_leg = vec![cols; legs.leg_count()];
+    outer_wrapper_clauses(pushdown_req, legs, &cols_per_leg).map(|clauses| clauses.trailing)
 }
 
 /// The FOUR live-captured offset-carrying request shapes that reach this seam
 /// (#191 reachability capture rows 8-11), as
-/// `(shape, pushdown_req, expected trailing tail)`:
+/// `(shape, pushdown_req, legs, expected trailing tail)`:
 ///
 /// - row 8: `GROUP BY MOD(id,4)` with `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2
-///   OFFSET 1` — the qualified single-table (N = 1) wrapper entry point
+///   OFFSET 1` — the qualified single-table (N = 1) wrapper entry point, so
+///   `legs` is the N = 1 single-leg binding
 /// - row 9: self-join, `ORDER BY 1 LIMIT 5 OFFSET 2`
 /// - row 10: self-join, `ORDER BY a.id LIMIT 5 OFFSET 2` (sort key outside the
 ///   select list)
 /// - row 11: self-join + `GROUP BY a.id`, `ORDER BY 1 LIMIT 5 OFFSET 2`
 ///
+/// Rows 9-11 reach the N-scan join wrapper, so `legs` for each is a genuine
+/// two-leg self-join binding (`DetectedJoin::legs`, occurrences `A`/`B`) —
+/// the same binding [`build_n_scan_join_sql`] constructs in production — and
+/// every referenced column carries occurrence `A`'s own `tableAlias`, per the
+/// per-occurrence signal production actually sends. No row is evaluated against
+/// a single-leg stand-in it would not reach in production.
+///
 /// Every one carries a non-empty `orderBy` beside its offset — fact 5, which is
 /// what makes the offset-without-`ORDER BY` state unreachable rather than guarded.
-fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
+fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'static str)> {
+    let single_scan = single_scan_legs("EVENTS");
+    let self_join = legs_from_leaves(vec![
+        JoinLeaf {
+            table_name: "EVENTS".to_string(),
+            table_alias: Some("A".to_string()),
+            table_identifier: "lh.events".to_string(),
+        },
+        JoinLeaf {
+            table_name: "EVENTS".to_string(),
+            table_alias: Some("B".to_string()),
+            table_identifier: "lh.events".to_string(),
+        },
+    ]);
+
     let id = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS"});
     let mod_key = serde_json::json!({
         "type": "function_scalar", "name": "MOD",
@@ -3024,7 +3366,13 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
     let count_star = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
     });
-    let score = serde_json::json!({"type": "column", "name": "SCORE", "tableName": "EVENTS"});
+    // Rows 9-11 are a self-join, so every referenced column carries the
+    // `tableAlias` of the occurrence it actually belongs to — occurrence `A`,
+    // resolving to leg 0 — rather than the bare, alias-free form only a genuine
+    // single-table request sends.
+    let id_a = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS", "tableAlias": "A"});
+    let score_a = serde_json::json!({"type": "column", "name": "SCORE", "tableName": "EVENTS", "tableAlias": "A"});
+    let name_a = serde_json::json!({"type": "column", "name": "NAME", "tableName": "EVENTS", "tableAlias": "A"});
 
     vec![
         (
@@ -3036,35 +3384,39 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
                 "orderBy": [ascending(&mod_key)],
                 "limit": {"numElements": 2, "offset": 1},
             }),
+            single_scan.clone(),
             r#" ORDER BY MOD("LHS_T0"."ID", 4) ASC NULLS FIRST LIMIT 2 OFFSET 1"#,
         ),
         (
             "row 9: self-join, ORDER BY ordinal over a projected column",
             serde_json::json!({
-                "selectList": [id.clone(), score],
-                "orderBy": [ascending(&id)],
+                "selectList": [id_a.clone(), score_a],
+                "orderBy": [ascending(&id_a)],
                 "limit": {"numElements": 5, "offset": 2},
             }),
+            self_join.clone(),
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
         (
             "row 10: self-join, sort key outside the select list",
             serde_json::json!({
-                "selectList": [{"type": "column", "name": "NAME", "tableName": "EVENTS"}],
-                "orderBy": [ascending(&id)],
+                "selectList": [name_a],
+                "orderBy": [ascending(&id_a)],
                 "limit": {"numElements": 5, "offset": 2},
             }),
+            self_join.clone(),
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
         (
             "row 11: self-join + GROUP BY",
             serde_json::json!({
                 "aggregationType": "group_by",
-                "selectList": [id.clone(), count_star],
-                "groupBy": [id.clone()],
-                "orderBy": [ascending(&id)],
+                "selectList": [id_a.clone(), count_star],
+                "groupBy": [id_a.clone()],
+                "orderBy": [ascending(&id_a)],
                 "limit": {"numElements": 5, "offset": 2},
             }),
+            self_join,
             r#" ORDER BY "LHS_T0"."ID" ASC NULLS FIRST LIMIT 5 OFFSET 2"#,
         ),
     ]
@@ -3081,8 +3433,8 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, &'static str)> {
 /// grammar rejects a bare OFFSET).
 #[test]
 fn qualified_wrapper_renders_limit_offset() {
-    for (shape, pushdown_req, expected_tail) in offset_carrying_seam_fixtures() {
-        let trailing = seam_trailing(&pushdown_req)
+    for (shape, pushdown_req, legs, expected_tail) in offset_carrying_seam_fixtures() {
+        let trailing = seam_trailing(&pushdown_req, &legs)
             .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
         assert!(
             trailing.ends_with(expected_tail),
@@ -3098,9 +3450,9 @@ fn qualified_wrapper_renders_limit_offset() {
 /// neither an `orderBy` nor an offset must carry no `OFFSET` token at all.
 #[test]
 fn qualified_wrapper_never_renders_offset_without_order_by() {
-    let mut cases: Vec<(&str, Json)> = offset_carrying_seam_fixtures()
+    let mut cases: Vec<(&str, Json, JoinLegs)> = offset_carrying_seam_fixtures()
         .into_iter()
-        .map(|(shape, req, _)| (shape, req))
+        .map(|(shape, req, legs, _)| (shape, req, legs))
         .collect();
     cases.push((
         "control: limit, no orderBy, no offset",
@@ -3108,10 +3460,11 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
             "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
             "limit": {"numElements": 5},
         }),
+        single_scan_legs("EVENTS"),
     ));
 
-    for (shape, pushdown_req) in cases {
-        let trailing = seam_trailing(&pushdown_req)
+    for (shape, pushdown_req, legs) in cases {
+        let trailing = seam_trailing(&pushdown_req, &legs)
             .unwrap_or_else(|e| panic!("{shape} must render, not decline: {e}"));
         if let Some(offset_at) = trailing.find("OFFSET") {
             let order_at = trailing.find("ORDER BY").unwrap_or(usize::MAX);
@@ -3132,16 +3485,17 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
 /// wrappers; this freezes the trailing window itself.
 #[test]
 fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
+    let legs = single_scan_legs("EVENTS");
     let mut pushdown_req = serde_json::json!({
         "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
         "limit": {"numElements": 5},
     });
-    let bare = seam_trailing(&pushdown_req).expect("a plain limited request must render");
+    let bare = seam_trailing(&pushdown_req, &legs).expect("a plain limited request must render");
     assert_eq!(bare, " LIMIT 5");
 
     // Exasol normalises `OFFSET 0` away, but an explicit zero must render the
     // same string if it ever arrives.
     pushdown_req["limit"] = serde_json::json!({"numElements": 5, "offset": 0});
-    let zero = seam_trailing(&pushdown_req).expect("an explicit zero offset must render");
+    let zero = seam_trailing(&pushdown_req, &legs).expect("an explicit zero offset must render");
     assert_eq!(zero, bare);
 }

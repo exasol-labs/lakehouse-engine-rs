@@ -31,6 +31,11 @@ pub(crate) enum IneligibleJoinReason {
 pub(crate) struct JoinLeaf {
     /// The Exasol virtual table name (a `from`-tree leaf's `name`).
     pub table_name: String,
+    /// This occurrence's SQL alias (the leaf's `alias`), verbatim — Exasol applies
+    /// no case folding. `None` when the occurrence carries no alias: Exasol omits
+    /// the key outright rather than emitting an empty string, and an alias-less
+    /// occurrence is a distinct leg identity, not a missing value.
+    pub table_alias: Option<String>,
     /// `table_name`'s original-cased catalog identifier, from `TABLE_MAP`.
     pub table_identifier: String,
 }
@@ -71,9 +76,10 @@ pub(crate) enum JoinShape {
     Join(DetectedJoin),
 }
 
-/// Recursively collect a join tree's base-table leaf names (into `tables`, stable
-/// left-to-right order) and every join node's `condition` (into `conditions`,
-/// post-order).
+/// Recursively collect a join tree's base-table leaves as `(name, alias)` pairs
+/// (into `leaves`, stable left-to-right order) and every join node's `condition`
+/// (into `conditions`, post-order). A leaf without an `alias` key contributes
+/// `None` — that occurrence is alias-less, which is a leg identity of its own.
 ///
 /// Returns the specific [`IneligibleJoinReason`] on the first non-inner join node
 /// ([`IneligibleJoinReason::NotInnerJoinType`]), a join node missing a
@@ -81,7 +87,7 @@ pub(crate) enum JoinShape {
 /// neither a `join` nor a `table` node ([`IneligibleJoinReason::UnsupportedShape`]).
 fn collect_join_tree(
     node: &Json,
-    tables: &mut Vec<String>,
+    leaves: &mut Vec<(String, Option<String>)>,
     conditions: &mut Vec<Json>,
 ) -> Result<(), IneligibleJoinReason> {
     match node.get("type").and_then(|t| t.as_str()) {
@@ -101,14 +107,18 @@ fn collect_join_tree(
                 Some(condition) => condition.clone(),
                 None => return Err(IneligibleJoinReason::UnsupportedShape),
             };
-            collect_join_tree(left, tables, conditions)?;
-            collect_join_tree(right, tables, conditions)?;
+            collect_join_tree(left, leaves, conditions)?;
+            collect_join_tree(right, leaves, conditions)?;
             conditions.push(condition);
             Ok(())
         }
         Some("table") => match node.get("name").and_then(|n| n.as_str()) {
             Some(name) => {
-                tables.push(name.to_string());
+                let alias = node
+                    .get("alias")
+                    .and_then(|a| a.as_str())
+                    .map(str::to_string);
+                leaves.push((name.to_string(), alias));
                 Ok(())
             }
             None => Err(IneligibleJoinReason::UnsupportedShape),
@@ -125,14 +135,15 @@ fn collect_join_tree(
 /// ```json
 /// {"type": "join", "join_type": "inner", "left": {...}, "right": {...}, "condition": {...}}
 /// ```
-/// where `left`/`right` are each a base-table reference (`{"name": ..., "type": "table"}`)
-/// or a nested `join` node. The whole tree is walked ONCE by [`collect_join_tree`]:
-/// it collects the base-table leaves (stable left-to-right order) and every join
-/// node's `condition`, asserting every join node is `join_type = "inner"`. The
-/// two-involved-table case is simply N = 2 — there is no separate two-table shape,
-/// and no equi-condition gate here (broadcast eligibility, computed later in
-/// [`plan_join`], is what requires an equi condition; the N-scan fallback renders
-/// any inner-join condition into its WHERE).
+/// where `left`/`right` are each a base-table reference (`{"name": ..., "type":
+/// "table"}`, carrying an `alias` key only when that occurrence is aliased) or a
+/// nested `join` node. The whole tree is walked ONCE by [`collect_join_tree`]: it
+/// collects the base-table leaves with their aliases (stable left-to-right order)
+/// and every join node's `condition`, asserting every join node is
+/// `join_type = "inner"`. The two-involved-table case is simply N = 2 — there is no
+/// separate two-table shape, and no equi-condition gate here (broadcast
+/// eligibility, computed later in [`plan_join`], is what requires an equi
+/// condition; the N-scan fallback renders any inner-join condition into its WHERE).
 ///
 /// A request whose `from` clause is absent or a plain table reference is
 /// [`JoinShape::NotAJoin`]: today's single-table pushdown path, unaffected.
@@ -152,15 +163,15 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         return Ok(JoinShape::NotAJoin);
     }
 
-    let mut table_names = Vec::new();
+    let mut leaves = Vec::new();
     let mut conditions = Vec::new();
-    if let Err(reason) = collect_join_tree(from, &mut table_names, &mut conditions) {
+    if let Err(reason) = collect_join_tree(from, &mut leaves, &mut conditions) {
         return Ok(JoinShape::Ineligible(reason));
     }
 
     let table_map = crate::adapter::read_table_map(request);
-    let mut tables = Vec::with_capacity(table_names.len());
-    for table_name in table_names {
+    let mut tables = Vec::with_capacity(leaves.len());
+    for (table_name, table_alias) in leaves {
         let table_identifier = table_map.get(&table_name).cloned().ok_or_else(|| {
             UdfError::User(format!(
                 "pushdown: virtual table '{table_name}' is not in TABLE_MAP; \
@@ -169,6 +180,7 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
         })?;
         tables.push(JoinLeaf {
             table_name,
+            table_alias,
             table_identifier,
         });
     }
@@ -330,7 +342,8 @@ pub(super) fn select_broadcast_sides(
 /// `resolver`, which is built once per request, so a two-leg join performs no
 /// more catalog authentication round-trips than a single-table scan.
 ///
-/// `filter_json` is this side's SIDE-LOCAL sub-predicate (see [`side_local_filter`])
+/// `filter_json` is this side's LEG-LOCAL sub-predicate (see
+/// [`super::rendering::leg_local_filter`])
 /// — the conjuncts of the WHERE every column of which is this table's — forwarded
 /// for format-level file pruning exactly as `filter_json_raw` is on the single-table
 /// path. For an inner join a side-local conjunct is a necessary condition for that
@@ -361,9 +374,9 @@ pub(super) async fn resolve_one_join_side(
 /// A partial application of `support::column_types`, supplying the find-by-name
 /// selection.
 ///
-/// CROSS-FOLD SEAM: this output travels into `referenced_side_columns`
+/// CROSS-FOLD SEAM: this output travels into `referenced_leg_columns`
 /// (`joins/rendering.rs`) as `full_cols`, where it is string-matched against the name
-/// set `collect_side_column_names` builds with the ASCII-only `to_ascii_uppercase`.
+/// set `collect_leg_column_names` builds with the ASCII-only `to_ascii_uppercase`.
 /// The two folds are different BY DESIGN and MUST NOT be reconciled by changing
 /// either one: `column_types` owns this side's fold, and unifying the collect walks'
 /// is forbidden by `walk_column_nodes`' doc comment and by
