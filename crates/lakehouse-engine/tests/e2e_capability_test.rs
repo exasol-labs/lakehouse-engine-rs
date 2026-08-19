@@ -32,6 +32,7 @@ use common::seed::{
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
 };
+use common::timestamp_precision::expected_timestamp_precision;
 
 use std::sync::OnceLock;
 
@@ -2723,12 +2724,17 @@ fn e2e_upper_double_declines_to_native_oracle() {
 
 /// `UPPER(c_ts)` over the virtual table declines pushdown the same way
 /// `UPPER(c_double)` does (#210) and matches an in-session native oracle over
-/// a bare `TIMESTAMP` literal.
+/// a `CAST` to the engine's declared timestamp precision.
 ///
 /// Seed: `typed_distinct_probe.c_ts` for id=1 is `BASE_TS_MICROS + 100ms` =
 /// 2024-01-01 00:00:00.100 (see `common/seed.rs`'s `typed_probe()`; its
 /// `ts(100)` closure computes `BASE_TS_MICROS + 100 * 1_000` microseconds).
-/// See the section note above regarding live-stack verification of this case.
+/// The oracle's `CAST` target is read from `expected_timestamp_precision`
+/// (task 5) rather than hardcoded. The `.100` fixture renders identically
+/// under both CAST targets on both engines (decision-log.md `[C4]`), so
+/// reading the target from the oracle changes no assertion today; it exists
+/// so this test stays correct if the fixture ever gains sub-millisecond
+/// digits.
 #[test]
 fn e2e_upper_timestamp_declines_to_native_oracle() {
     setup_e2e();
@@ -2746,8 +2752,11 @@ fn e2e_upper_timestamp_declines_to_native_oracle() {
         .as_str()
         .unwrap_or_else(|| panic!("UPPER(c_ts) not a string: {:?}", vs_cols[0][0]));
 
-    let oracle_cols =
-        conn.query_columns("SELECT UPPER(CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS TIMESTAMP))");
+    let declared_column_type = expected_timestamp_precision(&mut conn).declared_column_type;
+    let oracle_sql = format!(
+        "SELECT UPPER(CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS {declared_column_type}))"
+    );
+    let oracle_cols = conn.query_columns(&oracle_sql);
     let oracle_value = oracle_cols[0][0]
         .as_str()
         .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
