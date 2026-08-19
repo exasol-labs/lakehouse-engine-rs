@@ -8,6 +8,20 @@ this library's per-spec organization threshold.
 
 ## Background
 
+* **This delta is issue #350.** The vendored `stats-all-types` fixture already carries every column
+  this delta needs: `array_col` (`array<integer>`), `map_col` (`map<string, integer>`), and
+  `nested_struct` (`struct<inner_int, inner_string, inner_double>`), populated across 4 rows. No new
+  Delta fixture is provisioned.
+* **`stats-all-types` is the nested column-mapping case, which is why it is the load-bearing
+  fixture here.** Its metadata declares `delta.columnMapping.mode = name`, and its three inner
+  `StructField`s carry `delta.columnMapping.physicalName` values
+  `col-7f2f94cf-7082-430c-bba7-852bc6c5215e`, `col-26fcfd6b-04c7-4772-8bdf-04ac9425f06e`, and
+  `col-92dcf16d-d249-48a9-afb8-93deeaf7ce23`. A rendering that read the PHYSICAL nested names would
+  emit those identifiers as JSON keys, so this fixture is the only end-to-end proof that
+  `datafusion-scan/nested-json-rendering`'s logical-name resolution actually fires on the Delta path.
+* **Two recorded scenarios of this feature change their expected column sets, and the change is a
+  narrowing of the refused set, not a new capability claim.** `map_col` and `nested_struct` move from
+  refused to queryable; `binary_col` stays refused (issue #351).
 * **Split from `e2e-harness/unity-catalog-e2e-harness`, issue #320.** That feature keeps harness
   bring-up, createVirtualSchema enumeration, the virtual schema's storage-credential wiring, the
   stack-unavailable failure contract, and the credential-leak guarantee. This feature owns every
@@ -204,52 +218,25 @@ this library's per-spec organization threshold.
   the suite rather than passing on correct rows
 * *AND* the error text of any failure in this scenario MUST NOT contain any credential value
 
-### Scenario: A Delta table spanning varied types returns the expected Exasol types and values
+### Scenario: A refused column refuses only the queries naming it
 
-* *GIVEN* the seeded broad-type fixture `unity.delta_e2e.stats_all_types`, whose 4 rows span 13
-  mappable Delta types under `name` column mapping — `byte`, `short`, `integer`, `long`, `float`,
-  `double`, `date`, `timestamp`, `timestamp_ntz`, `string`, `decimal(10,2)`, `boolean`, and
-  `array<integer>` — and whose reader features are `timestampNtz` and `columnMapping`, both supported
-* *WHEN* the suite issues `SELECT` naming those 13 columns explicitly, plus `SELECT COUNT(*)`
-* *THEN* `SELECT COUNT(*)` SHALL return 4 and the projection SHALL return those 4 rows with the values
-  the fixture's data file holds, under the virtual table's declared column names
-* *AND* each column SHALL arrive as its declared Exasol type: `byte_col` as `DECIMAL(3,0)`,
-  `short_col` as `DECIMAL(5,0)`, `int_col` as `DECIMAL(10,0)`, `long_col` as `DECIMAL(20,0)`,
-  `float_col` and `double_col` as `DOUBLE PRECISION`, `date_col` as `DATE`, `timestamp_col` and
-  `timestamp_ntz_col` as `TIMESTAMP`, `string_col` as `VARCHAR`, `decimal_col` as `DECIMAL(10,2)`,
-  `boolean_col` as `BOOLEAN`, and `array_col` as `VARCHAR`
-* *AND* `byte_col` and `short_col` SHALL return their real logged values rather than NULL, so the
-  `int32` logical tag over the Parquet reader's physical `Int8`/`Int16` is proven end to end and not
-  only in a unit test
-* *AND* `array_col` SHALL return a non-NULL `VARCHAR` carrying a bracketed rendering of the array's
-  integer elements, which is what the engine's incompatible-type-to-`VARCHAR` path produces for it;
-  the suite MUST NOT assert strict JSON conformance of that text, because exact JSON rendering for
-  nested types is issue #350
-* *AND* the suite SHALL capture the generated pushdown SQL for at least one of these queries and
-  assert it drives the scan UDF, so a silent fallback to an unaccelerated wrapper fails the suite
-  rather than passing on correct rows
-* *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
+* *GIVEN* the `stats_all_types` Delta table, whose 16 declared columns are now 15 mappable and exactly ONE refused — `binary_col`, refused because casting binary to text replaces every non-UTF-8 byte sequence with NULL (issue #351)
+* *WHEN* the harness queries that table through the virtual schema
+* *THEN* a projection naming only mappable columns SHALL return its rows, and a query that reads or emits `binary_col` — including `SELECT *`, which widens to the full base row — SHALL fail with an error naming `binary_col` and its refusal reason
+* *AND* `map_col` and `nested_struct` MUST NOT appear in any refusal, because both are now rendered as JSON `VARCHAR(2000000)` per `datafusion-scan/nested-json-rendering`
+* *AND* a WHERE clause referencing `binary_col` SHALL still refuse the query even when the select list names only mappable columns
+* *AND* the refusal message for `binary_col` SHALL cite issue #351 and MUST NOT cite issue #350, because #350 is this plan and a closed issue cited in a shipped refusal reads as an unfixed gap with no owner
 
-### Scenario: A Delta column this engine cannot render refuses only the queries that name it
+### Scenario: A Delta table's varied types return their expected Exasol types and values
 
-* *GIVEN* the same `unity.delta_e2e.stats_all_types` fixture, whose `binary_col`, `map_col`, and
-  `nested_struct` columns Unity Catalog declares — as `BINARY`, `STRING`, and `STRING` — and whose
-  Delta types this engine refuses
-* *WHEN* the suite issues `SELECT binary_col`, `SELECT map_col`, `SELECT nested_struct`, and
-  `SELECT *` against that virtual table
-* *THEN* each of the four queries SHALL fail with a plan-time error naming the refused column and its
-  Delta type, and MUST NOT return a row — including `SELECT *`, whose full-row projection covers all
-  three
-* *AND* the `binary_col`, `map_col`, and `nested_struct` errors SHALL cite issue #350, so the refusal
-  is traceable to the follow-up that will lift it
-* *AND* a query whose WHERE clause names a refused column while its select list names only mappable
-  ones SHALL ALSO fail, because a `binary` column pushed into the scan's filter would otherwise be
-  compared as text with every non-UTF-8 value silently NULL
-* *AND* the 13-column projection of the scenario above SHALL keep succeeding on the SAME table in the
-  SAME suite run, which is what proves the refusal is scoped to the column rather than to the table
-* *AND* the failure MUST arrive as a SQL error rather than as a crashed UDF VM — checked by a
-  follow-up query surviving on the same connection — and the error text MUST NOT contain any
-  credential value
+* *GIVEN* the `stats_all_types` Delta table's 15 mappable columns, in fixture column order, with `array_col`, `map_col`, and `nested_struct` now among them
+* *WHEN* the harness queries every mappable column and compares the returned Exasol types and values
+* *THEN* the 12 natively-representable columns SHALL keep their recorded Exasol types and values byte-identical, unchanged by this delta
+* *AND* `array_col`, `map_col`, and `nested_struct` SHALL each be declared `VARCHAR(2000000)` and SHALL each return a value that parses as JSON
+* *AND* `array_col` SHALL return a JSON array of bare numbers, so its recorded bracketed display rendering (`[1, 2]`, an Arrow value-formatter artifact) is replaced by a strict-JSON array
+* *AND* `nested_struct` SHALL return an object keyed by the LOGICAL inner names `inner_int`, `inner_string`, and `inner_double`, and MUST NOT return any `col-` prefixed physical name — the assertion that makes the nested column-mapping resolution falsifiable
+* *AND* `map_col` SHALL return an object keyed by its own string keys
+* *AND* a row whose nested value is NULL SHALL return SQL NULL rather than the text `null`
 
 ### Scenario: A query whose files were pruned returns the same rows as before pruning
 

@@ -187,6 +187,7 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
                 arrow_type: "int64".to_string(),
                 nullable: false,
                 initial_default: None,
+                nested: None,
                 physical_name: None,
             }],
             table_root: format!("s3://warehouse/lh/{lower}"),
@@ -439,7 +440,7 @@ fn assert_refuses_binary_col(error: UdfError) {
         other => panic!("every refusal must be a user error, got {other:?}"),
     };
     assert!(
-        message.contains("binary_col") && message.contains("#350"),
+        message.contains("binary_col") && message.contains("#351"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );

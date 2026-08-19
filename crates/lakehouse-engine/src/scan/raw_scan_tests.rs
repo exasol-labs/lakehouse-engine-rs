@@ -23,6 +23,128 @@ fn both_parquet_format_sites_coerce_int96_us_utc() {
     );
 }
 
+/// The per-table Parquet read options are decided by the presence of a nested
+/// member tree, and every table keeps the INT96 coercion either way.
+///
+/// A table carrying a JSON-rendered nested column reads WITHOUT row-filter
+/// pushdown, because DataFusion would approve the pushdown against the `utf8`
+/// logical tag and then drop the conjunct against the physical nested type,
+/// applying it nowhere. Statistics, page-index, and bloom-filter pruning stay ON
+/// for BOTH tables: they cannot prune on the rendered column (proven in
+/// `tests/scan_parquet_pruning.rs`), so disabling them would only cost the
+/// table's primitive columns their pruning.
+#[test]
+fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
+    use crate::scan::spec::NestedMembers;
+
+    let resolution = |nested: &[(&str, NestedMembers)]| FieldIdResolution {
+        name_mapping: Vec::new(),
+        declared_physical_names: std::collections::HashMap::new(),
+        defaults: std::collections::HashMap::new(),
+        nested_members: nested
+            .iter()
+            .map(|(name, members)| (name.to_string(), members.clone()))
+            .collect(),
+    };
+
+    let primitive_only = scan_table_parquet_format(&resolution(&[]));
+    assert!(
+        primitive_only.options().global.pushdown_filters,
+        "a table with no nested column must keep Parquet row-filter pushdown"
+    );
+
+    let nested = scan_table_parquet_format(&resolution(&[(
+        "tags",
+        NestedMembers::List { element: None },
+    )]));
+    assert!(
+        !nested.options().global.pushdown_filters,
+        "a table carrying a nested column must read without row-filter pushdown"
+    );
+
+    for format in [&primitive_only, &nested] {
+        let global = &format.options().global;
+        assert!(global.pruning, "row-group statistics pruning stays enabled");
+        assert!(global.enable_page_index, "page-index pruning stays enabled");
+        assert!(
+            global.bloom_filter_on_read,
+            "bloom-filter probing stays enabled"
+        );
+        assert_eq!(
+            global.coerce_int96,
+            Some("us".to_string()),
+            "every decode format keeps the INT96 coercion of its base"
+        );
+    }
+}
+
+/// The session-level `pushdown_filters` flag is withheld for a scan that renders
+/// a nested column on EITHER side, and only for such a scan.
+///
+/// It has to be: `ParquetSource::try_pushdown_filters` ORs the session flag with
+/// the table's own, so a session-level `true` would re-enable the pushdown for the
+/// very table `scan_table_parquet_format` withheld it from. Leaving it off at
+/// session level and opting each table back in is what keeps the decision per
+/// table — the non-nested side of a broadcast join keeps its pushdown.
+#[test]
+fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
+    use crate::scan::spec::{JoinSpec, JoinType, LogicalField, NestedMembers};
+
+    let field = |name: &str, nested: Option<NestedMembers>| LogicalField {
+        field_id: None,
+        name: name.into(),
+        arrow_type: "utf8".into(),
+        nullable: true,
+        initial_default: None,
+        nested,
+        physical_name: None,
+    };
+    let pushdown_enabled = |spec: &ScanSpec| {
+        session_config_for_spec(spec)
+            .options()
+            .execution
+            .parquet
+            .pushdown_filters
+    };
+
+    let mut spec = minimal_spec();
+    spec.common.logical_schema = vec![field("name", None)];
+    assert!(
+        pushdown_enabled(&spec),
+        "a logical schema of primitive columns keeps the session-level pushdown"
+    );
+
+    spec.common.logical_schema = vec![
+        field("name", None),
+        field("tags", Some(NestedMembers::List { element: None })),
+    ];
+    assert!(
+        !pushdown_enabled(&spec),
+        "a scan rendering a nested column must not enable pushdown at session level"
+    );
+
+    let mut join_spec = minimal_spec();
+    join_spec.common.logical_schema = vec![field("name", None)];
+    join_spec.common.join = Some(JoinSpec {
+        table_root: "s3://test-bucket/dim".into(),
+        files: vec![crate::scan::spec::FileEntry::new(
+            "s3://test-bucket/dim/part-0.parquet",
+            512,
+        )],
+        logical_schema: vec![field("tags", Some(NestedMembers::List { element: None }))],
+        name_mapping: Vec::new(),
+        join_type: JoinType::Inner,
+        condition: r#""F_KEY" = "D_KEY""#.into(),
+        post_join_limit: None,
+        partition_columns: Vec::new(),
+        storage: join_spec.common.storage.clone(),
+    });
+    assert!(
+        !pushdown_enabled(&join_spec),
+        "a nested column on the DIMENSION side must withhold the session-level pushdown too"
+    );
+}
+
 /// A malformed/hand-crafted `ScanSpec` with `s3_max_connections: 0` must not
 /// deadlock every delete-file read via `Semaphore::new(0)`.
 #[test]
@@ -159,6 +281,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
         arrow_type: "int64".to_string(),
         nullable,
         initial_default: None,
+        nested: None,
         physical_name: None,
     };
     let mut spec = minimal_spec();
@@ -374,6 +497,7 @@ async fn build_scan_sql_aliases_over_logical_schema() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -382,6 +506,7 @@ async fn build_scan_sql_aliases_over_logical_schema() {
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -474,20 +599,26 @@ async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
 /// The classifier tags a mappable `array<E>` column `utf8`, so the LOGICAL schema
 /// declares `Utf8` while the physical Parquet column is a real `List(Int32)`.
 /// `build_scan_sql` emits NO `CAST(... AS VARCHAR)` for a logically-`Utf8` column,
-/// so the physical-to-logical cast can only come from the scan's OWN
+/// so the physical-to-logical adaptation can only come from the scan's OWN
 /// [`FieldIdExprAdapter`] — not from DataFusion's default schema adapter, which
-/// this provider never installs. That link is what this asserts.
+/// this provider never installs. That link is what this asserts. The available
+/// `List → Utf8` cast produces Arrow display text, which is not JSON.
+///
+/// The logical field declares its nested member tree, which is the ONE signal the
+/// diversion is keyed on — the same one the Parquet row-filter-pushdown withdrawal
+/// reads, so a rendered column can never keep a pushdown that would drop a predicate
+/// over it.
 ///
 /// The column binds by field-id across a physical-name divergence (Delta `id`
-/// column mapping), so the rename and the cast have to compose: the delegate
-/// inserts the cast against the logical name, and the outer rewrite must restore
-/// the physical name UNDER that cast for the opener's name-based lookups.
+/// column mapping), so the rename and the rendering have to compose: the outer
+/// rewrite must restore the physical name UNDER the rendering expression for the
+/// opener's name-based lookups.
 ///
 /// NULL and empty lists are covered because the three render differently and the
 /// distinction is observable in Exasol: a NULL array must stay NULL rather than
 /// collapse to `[]` or the empty string.
 #[tokio::test]
-async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() {
+async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_adapter() {
     use crate::scan::spec::LogicalField;
     use arrow::array::{Array, Int64Array, ListArray, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
@@ -546,6 +677,7 @@ async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() 
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -554,6 +686,7 @@ async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() 
             arrow_type: "utf8".to_string(),
             nullable: true,
             initial_default: None,
+            nested: Some(crate::scan::spec::NestedMembers::List { element: None }),
             physical_name: None,
         },
     ];
@@ -569,14 +702,14 @@ async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() 
     assert!(
         !sql.contains("CAST("),
         "build_scan_sql must add no SQL cast for a logically-Utf8 column, leaving \
-         the physical-to-logical cast entirely to the expression adapter: {sql}"
+         the physical-to-logical adaptation entirely to the expression adapter: {sql}"
     );
 
     let df = ctx.sql(&sql).await.expect("plan scan SQL");
     let batches = df
         .collect()
         .await
-        .expect("the expression adapter must cast the physical list to the logical Utf8");
+        .expect("the expression adapter must render the physical list as the logical Utf8");
 
     let mut rows: Vec<(i64, Option<String>)> = Vec::new();
     for batch in &batches {
@@ -600,12 +733,444 @@ async fn a_list_column_tagged_utf8_is_cast_by_the_field_id_expression_adapter() 
     assert_eq!(
         rows,
         vec![
-            (1, Some("[1, 2, 3]".to_string())),
+            (1, Some("[1,2,3]".to_string())),
             (2, None),
             (3, Some("[]".to_string())),
         ],
-        "a populated array must render bracketed, an empty array as `[]`, and a \
+        "a populated array must render as strict JSON, an empty array as `[]`, and a \
          NULL array must stay NULL"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (nested-json-rendering): a `struct` and a `map` column are diverted
+/// around the physical-to-logical cast too — the two arrow-cast cannot convert to
+/// text AT ALL, so before the diversion the scan failed outright rather than
+/// returning display text.
+///
+/// Read end to end through the Parquet opener, because that is where the diversion
+/// has to hold: the opener resolves the wrapped column by NAME against the real
+/// physical file schema, so a wrapper that lost the physical name would silently
+/// project the column away instead of reading it. The members bind by their DECLARED
+/// physical names — the Delta `name` column-mapping shape — so the rendered documents
+/// prove the JSON is keyed by the table's logical names and not the file's opaque
+/// ones.
+#[tokio::test]
+async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
+    use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
+    use arrow::array::{
+        Array, ArrayRef, Int64Array, MapBuilder, StringArray, StringBuilder, StructArray,
+    };
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::context::SessionContext;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use std::collections::HashMap;
+
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+
+    let addr = StructArray::try_new(
+        Fields::from(vec![
+            Arc::new(Field::new("col-street", DataType::Utf8, true)),
+            Arc::new(Field::new("col-city", DataType::Utf8, true)),
+        ]),
+        vec![
+            Arc::new(StringArray::from(vec![Some("Main St"), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("Berlin"), None])) as ArrayRef,
+        ],
+        Some(NullBuffer::from(vec![true, false])),
+    )
+    .expect("struct array");
+
+    let mut attrs_builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+    attrs_builder.keys().append_value("a");
+    attrs_builder.values().append_value("1");
+    attrs_builder.append(true).expect("populated map row");
+    attrs_builder.append(false).expect("null map row");
+    let attrs = attrs_builder.finish();
+
+    let dir = std::env::temp_dir().join("lh_struct_map_render");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("nested.parquet");
+    let physical_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("col-addr", addr.data_type().clone(), true).with_metadata(field_id_meta(2)),
+        Field::new("col-attrs", attrs.data_type().clone(), true).with_metadata(field_id_meta(3)),
+    ]));
+    {
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
+        let batch = RecordBatch::try_new(
+            physical_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2])),
+                Arc::new(addr),
+                Arc::new(attrs),
+            ],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    let file_url = url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string();
+
+    let nested_field = |name: &str, physical_name: &str| NestedField {
+        field_id: None,
+        name: name.to_string(),
+        physical_name: Some(physical_name.to_string()),
+        nested: None,
+    };
+    let logical_field = |field_id: i32, name: &str, nested: Option<NestedMembers>| LogicalField {
+        field_id: Some(field_id),
+        name: name.to_string(),
+        arrow_type: "utf8".to_string(),
+        nullable: true,
+        initial_default: None,
+        nested,
+        physical_name: None,
+    };
+
+    let mut spec = minimal_spec();
+    let file_size = local_file_size(&file_url);
+    spec.files = vec![FileEntry::new(file_url, file_size)];
+    spec.common.logical_schema = vec![
+        LogicalField {
+            field_id: Some(1),
+            name: "id".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+            nested: None,
+            physical_name: None,
+        },
+        logical_field(
+            2,
+            "addr",
+            Some(NestedMembers::Struct {
+                fields: vec![
+                    nested_field("street", "col-street"),
+                    nested_field("city", "col-city"),
+                ],
+            }),
+        ),
+        logical_field(
+            3,
+            "attrs",
+            Some(NestedMembers::Map {
+                key: None,
+                value: None,
+            }),
+        ),
+    ];
+    spec.common.projection = vec!["ID".into(), "ADDR".into(), "ATTRS".into()];
+
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    register_files(&ctx, "scan_target", &spec)
+        .await
+        .expect("register_files must succeed for utf8-tagged struct and map columns");
+    let sql = build_scan_sql(&ctx, "scan_target", &spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        !sql.contains("CAST("),
+        "build_scan_sql must add no SQL cast for a logically-Utf8 column: {sql}"
+    );
+
+    let df = ctx.sql(&sql).await.expect("plan scan SQL");
+    let batches = df
+        .collect()
+        .await
+        .expect("the expression adapter must render struct and map columns as JSON");
+
+    let column = |batch: &RecordBatch, index: usize, row: usize| {
+        let rendered = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("a nested column must arrive as Utf8, not as its physical nested type");
+        (!rendered.is_null(row)).then(|| rendered.value(row).to_string())
+    };
+    let mut rows: Vec<(i64, Option<String>, Option<String>)> = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column is Int64");
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row), column(batch, 1, row), column(batch, 2, row)));
+        }
+    }
+    rows.sort_by_key(|(id, _, _)| *id);
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                1,
+                Some(r#"{"street":"Main St","city":"Berlin"}"#.to_string()),
+                Some(r#"{"a":"1"}"#.to_string()),
+            ),
+            (2, None, None),
+        ],
+        "a struct must render keyed by the TABLE's member names, a map as one JSON \
+         object, and a NULL nested value must stay NULL"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario (nested-json-rendering): the legacy no-logical-schema path routes a
+/// nested column through the SAME JSON encoder the field-id path uses, instead of
+/// the `List → Utf8` display-text cast that answers `needs_json_fallback`.
+#[tokio::test]
+async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
+    use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::SessionContext;
+
+    let mut tags_builder = ListBuilder::new(StringBuilder::new());
+    tags_builder.values().append_value("hello");
+    tags_builder.values().append_value("world");
+    tags_builder.append(true);
+    let tags = tags_builder.finish();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tags", tags.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(tags)],
+    )
+    .unwrap();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_table("scan_target", Arc::new(table)).unwrap();
+    register_nested_json_render_udf(&ctx);
+
+    let mut spec = minimal_spec();
+    spec.common.projection = vec!["ID".into(), "TAGS".into()];
+
+    let sql = build_scan_sql(&ctx, "scan_target", &spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        sql.contains(&format!("{NESTED_JSON_RENDER_UDF_NAME}(\"TAGS\")")),
+        "a nested column must be routed through the JSON render function: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(\"TAGS\""),
+        "a nested column must not fall back to the display-text CAST: {sql}"
+    );
+
+    let df = ctx.sql(&sql).await.expect("plan scan SQL");
+    let batches = df.collect().await.expect("collect");
+    let mut rendered: Option<String> = None;
+    for batch in &batches {
+        let col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("TAGS must arrive as Utf8, not its physical list type");
+        for row in 0..batch.num_rows() {
+            if !col.is_null(row) {
+                rendered = Some(col.value(row).to_string());
+            }
+        }
+    }
+    assert_eq!(
+        rendered.as_deref(),
+        Some(r#"["hello","world"]"#),
+        "the legacy path must render strict JSON, not Arrow display text"
+    );
+}
+
+/// A non-nested incompatible column (e.g. `Binary`) must keep emitting
+/// `CAST(col AS VARCHAR)` byte-identical to before — only the five nested types
+/// `needs_nested_json_rendering` owns divert to the JSON render function.
+#[tokio::test]
+async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() {
+    use arrow::array::BinaryArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::context::SessionContext;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "payload",
+        DataType::Binary,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BinaryArray::from(vec![Some(b"hi".as_slice())]))],
+    )
+    .unwrap();
+    let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_table("scan_target", Arc::new(table)).unwrap();
+
+    let mut spec = minimal_spec();
+    spec.common.projection = vec!["PAYLOAD".into()];
+
+    let sql = build_scan_sql(&ctx, "scan_target", &spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        sql.contains("CAST(\"PAYLOAD\" AS VARCHAR)"),
+        "a non-nested incompatible column must keep the byte-identical CAST: {sql}"
+    );
+}
+
+#[tokio::test]
+async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() {
+    use crate::scan::spec::{LogicalField, NestedMembers};
+    use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::context::SessionContext;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use std::collections::HashMap;
+
+    let field_id_meta =
+        |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+
+    let mut tags_builder = ListBuilder::new(StringBuilder::new());
+    tags_builder.values().append_value("hello");
+    tags_builder.values().append_value("world");
+    tags_builder.append(true);
+    let tags = tags_builder.finish();
+
+    let dir = std::env::temp_dir().join("lh_shared_encoder_paths");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("shared.parquet");
+    let physical_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false).with_metadata(field_id_meta(1)),
+        Field::new("tags", tags.data_type().clone(), true).with_metadata(field_id_meta(2)),
+    ]));
+    {
+        let file = std::fs::File::create(&path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, physical_schema.clone(), None).expect("arrow writer");
+        let batch = RecordBatch::try_new(
+            physical_schema,
+            vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(tags)],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+    }
+    let file_url = url::Url::from_file_path(&path)
+        .expect("absolute path")
+        .to_string();
+    let file_size = local_file_size(&file_url);
+
+    async fn rendered_tags(ctx: &SessionContext, sql: &str) -> Option<String> {
+        let df = ctx.sql(sql).await.expect("plan scan SQL");
+        let batches = df.collect().await.expect("collect");
+        let mut value = None;
+        for batch in &batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            let rendered = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("tags must arrive as Utf8, not its physical list type");
+            for row in 0..batch.num_rows() {
+                if ids.value(row) == 1 && !rendered.is_null(row) {
+                    value = Some(rendered.value(row).to_string());
+                }
+            }
+        }
+        value
+    }
+
+    // Logical-schema path: the field-id adapter substitutes `NestedJsonRenderExpr`
+    // for the physical list column at the physical-plan level.
+    let mut logical_spec = minimal_spec();
+    logical_spec.files = vec![FileEntry::new(file_url.clone(), file_size)];
+    logical_spec.common.logical_schema = vec![
+        LogicalField {
+            field_id: Some(1),
+            name: "id".to_string(),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+            nested: None,
+            physical_name: None,
+        },
+        LogicalField {
+            field_id: Some(2),
+            name: "tags".to_string(),
+            arrow_type: "utf8".to_string(),
+            nullable: true,
+            initial_default: None,
+            nested: Some(NestedMembers::List { element: None }),
+            physical_name: None,
+        },
+    ];
+    logical_spec.common.projection = vec!["ID".into(), "TAGS".into()];
+
+    let logical_ctx = SessionContext::new_with_config(session_config_for_spec(&logical_spec));
+    register_files(&logical_ctx, "scan_target", &logical_spec)
+        .await
+        .expect("register_files must succeed for the logical-schema path");
+    let logical_sql = build_scan_sql(&logical_ctx, "scan_target", &logical_spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        !logical_sql.contains("CAST(") && !logical_sql.contains(NESTED_JSON_RENDER_UDF_NAME),
+        "the logical-schema path must route through the expression adapter, not a SQL-level \
+         cast or UDF call: {logical_sql}"
+    );
+    let logical_rendered = rendered_tags(&logical_ctx, &logical_sql).await;
+
+    // Legacy path: no logical schema, so the registered table reports the real
+    // physical List type and `build_scan_sql` routes it through the SQL-level
+    // `NESTED_JSON_RENDER_UDF_NAME` call instead.
+    let mut legacy_spec = minimal_spec();
+    legacy_spec.files = vec![FileEntry::new(file_url, file_size)];
+    legacy_spec.common.logical_schema = Vec::new();
+    legacy_spec.common.projection = vec!["ID".into(), "TAGS".into()];
+
+    let legacy_ctx = SessionContext::new_with_config(session_config_for_spec(&legacy_spec));
+    register_files(&legacy_ctx, "scan_target", &legacy_spec)
+        .await
+        .expect("register_files must succeed for the legacy no-logical-schema path");
+    register_nested_json_render_udf(&legacy_ctx);
+    let legacy_sql = build_scan_sql(&legacy_ctx, "scan_target", &legacy_spec)
+        .await
+        .expect("build_scan_sql");
+    assert!(
+        legacy_sql.contains(&format!("{NESTED_JSON_RENDER_UDF_NAME}(\"TAGS\")")),
+        "the legacy path must route through the SQL-level JSON render function call: {legacy_sql}"
+    );
+    let legacy_rendered = rendered_tags(&legacy_ctx, &legacy_sql).await;
+
+    assert_eq!(
+        logical_rendered.as_deref(),
+        Some(r#"["hello","world"]"#),
+        "the logical-schema path must render strict JSON for the populated list"
+    );
+    assert_eq!(
+        logical_rendered, legacy_rendered,
+        "both paths call the same render_nested_column_as_json encoder, so their \
+         rendered JSON for identical underlying data must be byte-identical"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

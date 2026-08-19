@@ -22,6 +22,9 @@ pub(crate) use field_id_projection::{
     FieldIdExprAdapterFactory, FieldIdResolution, PARQUET_FIELD_ID_META_KEY,
 };
 
+mod json_render;
+pub(crate) use json_render::render_nested_column_as_json;
+
 mod sql_support;
 pub use sql_support::build_alias_items;
 
@@ -138,6 +141,15 @@ pub fn build_scan_runtime(threads: usize) -> Result<tokio::runtime::Runtime, Str
 /// file-level pruning the planning layer already applies: Iceberg drops whole
 /// files, the Parquet reader then drops row groups and pages within survivors.
 /// Pruning narrows what is read; it never changes the result set.
+///
+/// The one exception is a scan that renders a nested column to JSON, where
+/// row-filter pushdown is left OFF at session level. `try_pushdown_filters` ORs
+/// the session flag with the table's own, so a session-level `true` would
+/// re-enable the pushdown for the very table that must not have it —
+/// `raw_scan::nested_json_parquet_format` explains why. Each table then opts back
+/// in through its own Parquet options, which keeps the decision per table: the
+/// non-nested side of a broadcast join over a nested-carrying table keeps its
+/// pushdown.
 pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
     let config = SessionConfig::new()
         .with_information_schema(false)
@@ -145,7 +157,10 @@ pub fn session_config_for_spec(spec: &ScanSpec) -> SessionConfig {
         .with_batch_size(spec.common.df_batch_size.max(1))
         .with_parquet_pruning(true)
         .with_parquet_page_index_pruning(true)
-        .set_bool("datafusion.execution.parquet.pushdown_filters", true);
+        .set_bool(
+            "datafusion.execution.parquet.pushdown_filters",
+            !raw_scan::scan_renders_nested_json(spec),
+        );
 
     if spec.common.join.is_some() {
         // Broadcast-join build-side determinism. The scan places the bounded

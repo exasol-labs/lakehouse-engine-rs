@@ -798,6 +798,7 @@ fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
         arrow_type: arrow_type.into(),
         nullable: false,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }
 }

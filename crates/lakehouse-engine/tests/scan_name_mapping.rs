@@ -181,6 +181,7 @@ fn logical_schema() -> Vec<LogicalField> {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -189,6 +190,7 @@ fn logical_schema() -> Vec<LogicalField> {
             arrow_type: "int64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ]

@@ -272,8 +272,8 @@ fn refused(column_name: &str, reason: &str) -> RefusedColumn {
 #[test]
 fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
     let refused_columns = vec![
-        refused("binary_col", "binary is refused, see #350"),
-        refused("map_col", "map is refused, see #350"),
+        refused("binary_col", "binary is refused, see #351"),
+        refused("variant_col", "variant renders no meaningful value"),
     ];
 
     let error = ensure_table_has_a_mappable_column(&[], &refused_columns)
@@ -285,12 +285,12 @@ fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
     };
     assert!(message.contains("binary_col"), "message was: {message}");
     assert!(
-        message.contains("binary is refused, see #350"),
+        message.contains("binary is refused, see #351"),
         "message was: {message}"
     );
-    assert!(message.contains("map_col"), "message was: {message}");
+    assert!(message.contains("variant_col"), "message was: {message}");
     assert!(
-        message.contains("map is refused, see #350"),
+        message.contains("variant renders no meaningful value"),
         "message was: {message}"
     );
 }
@@ -305,9 +305,10 @@ fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
         arrow_type: "int64".to_string(),
         nullable: false,
         initial_default: None,
+        nested: None,
         physical_name: None,
     }];
-    let refused_columns = vec![refused("binary_col", "binary is refused, see #350")];
+    let refused_columns = vec![refused("binary_col", "binary is refused, see #351")];
 
     ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)
         .expect("a table with a mappable column must not be refused as a whole");

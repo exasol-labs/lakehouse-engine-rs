@@ -242,6 +242,7 @@ fn logical_fields(fields: &[(&str, &str)]) -> Vec<LogicalField> {
             arrow_type: (*arrow_type).to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         })
         .collect()

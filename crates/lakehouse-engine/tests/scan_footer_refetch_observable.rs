@@ -257,6 +257,7 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
                     arrow_type: "int64".to_string(),
                     nullable: false,
                     initial_default: None,
+                    nested: None,
                     physical_name: None,
                 },
                 LogicalField {
@@ -265,6 +266,7 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
                     arrow_type: "utf8".to_string(),
                     nullable: false,
                     initial_default: None,
+                    nested: None,
                     physical_name: None,
                 },
             ],

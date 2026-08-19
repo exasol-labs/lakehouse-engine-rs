@@ -26,6 +26,7 @@ fn bare_resolution() -> FieldIdResolution {
         name_mapping: Vec::new(),
         declared_physical_names: HashMap::new(),
         defaults: HashMap::new(),
+        nested_members: HashMap::new(),
     }
 }
 
@@ -203,6 +204,7 @@ fn builds_logical_arrow_schema_with_field_ids() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -211,6 +213,7 @@ fn builds_logical_arrow_schema_with_field_ids() {
             arrow_type: "float64".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -249,6 +252,7 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -257,6 +261,7 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
             arrow_type: "utf8".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -265,6 +270,7 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
             arrow_type: "utf8".to_string(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: Some("col-abc".to_string()),
         },
     ];
@@ -945,6 +951,7 @@ async fn field_id_adapter_reads_renamed_column_rows() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -953,6 +960,7 @@ async fn field_id_adapter_reads_renamed_column_rows() {
             arrow_type: "float64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -1071,6 +1079,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
             arrow_type: "int64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -1079,6 +1088,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
             arrow_type: "float64".to_string(),
             nullable: false,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ];
@@ -1203,6 +1213,7 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             arrow_type: (*tag).to_string(),
             nullable: true,
             initial_default: Some((*encoded).to_string()),
+            nested: None,
             physical_name: None,
         })
         .collect();
@@ -1272,4 +1283,445 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             "a non-primitive struct initial-default must encode NO default"
         );
     }
+}
+
+/// One nested struct field binding by its nested field-id — the Iceberg nested key,
+/// and Delta's under `id` column mapping.
+fn nested_by_id(field_id: i32, name: &str) -> crate::scan::spec::NestedField {
+    crate::scan::spec::NestedField {
+        field_id: Some(field_id),
+        name: name.to_string(),
+        physical_name: None,
+        nested: None,
+    }
+}
+
+/// One nested struct field binding by the physical name it declares — Delta `name`
+/// column mapping, whose file-side member names are opaque identifiers.
+fn nested_by_physical_name(name: &str, physical_name: &str) -> crate::scan::spec::NestedField {
+    crate::scan::spec::NestedField {
+        field_id: None,
+        name: name.to_string(),
+        physical_name: Some(physical_name.to_string()),
+        nested: None,
+    }
+}
+
+/// The member names of a resolved struct field, in resolved order.
+fn struct_member_names(data_type: &DataType) -> Vec<&str> {
+    match data_type {
+        DataType::Struct(fields) => fields.iter().map(|f| f.name().as_str()).collect(),
+        other => panic!("expected a resolved struct field, got {other}"),
+    }
+}
+
+/// A nested column's members resolve onto the logical tree by the SAME
+/// first-match-wins order a top-level column binds by — a nested field-id, a
+/// declared physical name, or identity — renamed to their logical names, reordered
+/// into logical order, an unclaimed physical member dropped and an absent logical
+/// field null-filled, so the rendered JSON is keyed by the TABLE's names and never
+/// by the file's.
+#[test]
+fn nested_fields_resolve_to_logical_names_across_binding_keys() {
+    use crate::scan::render_nested_column_as_json;
+    use crate::scan::spec::NestedMembers;
+    use arrow::array::{
+        Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
+    };
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Fields;
+
+    // An Iceberg struct: the file names field-id 11 `street_v2` and holds it AFTER
+    // field-id 12, carries a member no logical field claims, and omits field-id 13.
+    let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![
+        (
+            Arc::new(field_with_id("city", DataType::Utf8, true, 12)),
+            Arc::new(StringArray::from(vec!["Berlin"])) as ArrayRef,
+        ),
+        (
+            Arc::new(field_with_id("street_v2", DataType::Utf8, true, 11)),
+            Arc::new(StringArray::from(vec!["Main St"])) as ArrayRef,
+        ),
+        (
+            Arc::new(field_with_id("junk", DataType::Int32, true, 99)),
+            Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+        ),
+    ]));
+    // A Delta `name`-mapped struct: the file's member name is an opaque identifier.
+    let props_physical: ArrayRef = Arc::new(StructArray::from(vec![(
+        Arc::new(field_no_id("col-i", DataType::Int32, true)),
+        Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+    )]));
+    // A list whose element is itself a struct: the element is positional, the struct
+    // inside it binds by field-id.
+    let labels = Arc::new(StructArray::from(vec![(
+        Arc::new(field_with_id("lbl", DataType::Utf8, true, 21)),
+        Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+    )])) as ArrayRef;
+    let tags_physical: ArrayRef = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("item", labels.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            labels,
+            None,
+        )
+        .expect("list builds"),
+    );
+    // A map whose VALUE is a struct: key and value are positional, the struct inside
+    // the value binds by field-id.
+    let map_values = Arc::new(StructArray::from(vec![(
+        Arc::new(field_with_id("v_old", DataType::Int32, true, 31)),
+        Arc::new(Int32Array::from(vec![5])) as ArrayRef,
+    )])) as ArrayRef;
+    let entries = StructArray::try_new(
+        Fields::from(vec![
+            Arc::new(Field::new("key", DataType::Utf8, false)),
+            Arc::new(Field::new("value", map_values.data_type().clone(), true)),
+        ]),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+            map_values,
+        ],
+        None,
+    )
+    .expect("map entries build");
+    let attrs_physical: ArrayRef = Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            entries,
+            None,
+            false,
+        )
+        .expect("map builds"),
+    );
+
+    let logical = Schema::new(vec![
+        field_with_id("addr", DataType::Utf8, true, 10),
+        field_no_id("props", DataType::Utf8, true),
+        field_with_id("tags", DataType::Utf8, true, 20),
+        field_with_id("attrs", DataType::Utf8, true, 30),
+    ]);
+    let physical = Schema::new(vec![
+        field_with_id("addr_old", addr_physical.data_type().clone(), true, 10),
+        field_no_id("col-p", props_physical.data_type().clone(), true),
+        field_with_id("tags", tags_physical.data_type().clone(), true, 20),
+        field_with_id("attrs", attrs_physical.data_type().clone(), true, 30),
+    ]);
+    let resolution = FieldIdResolution {
+        declared_physical_names: HashMap::from([("col-p".to_string(), "props".to_string())]),
+        nested_members: HashMap::from([
+            (
+                "addr".to_string(),
+                NestedMembers::Struct {
+                    fields: vec![
+                        nested_by_id(11, "street"),
+                        nested_by_id(12, "city"),
+                        nested_by_id(13, "zip"),
+                    ],
+                },
+            ),
+            (
+                "props".to_string(),
+                NestedMembers::Struct {
+                    fields: vec![nested_by_physical_name("inner_int", "col-i")],
+                },
+            ),
+            (
+                "tags".to_string(),
+                NestedMembers::List {
+                    element: Some(Box::new(NestedMembers::Struct {
+                        fields: vec![nested_by_id(21, "label")],
+                    })),
+                },
+            ),
+            (
+                "attrs".to_string(),
+                NestedMembers::Map {
+                    key: None,
+                    value: Some(Box::new(NestedMembers::Struct {
+                        fields: vec![nested_by_id(31, "amount")],
+                    })),
+                },
+            ),
+        ]),
+        ..bare_resolution()
+    };
+
+    let binding = bind_columns(&logical, &physical, &resolution);
+
+    assert_eq!(
+        struct_member_names(binding.nested["addr"].resolved_field().data_type()),
+        vec!["street", "city", "zip"],
+        "members must take their logical names in logical order, with the unclaimed \
+         physical member dropped and the absent logical field null-filled"
+    );
+    assert_eq!(
+        struct_member_names(binding.nested["props"].resolved_field().data_type()),
+        vec!["inner_int"],
+        "a declared physical name must claim a member exactly as it claims a column"
+    );
+
+    let rendered = |column: &str, array: &ArrayRef| {
+        let resolved = binding.nested[column]
+            .apply(array)
+            .expect("the resolution applies to its own column");
+        render_nested_column_as_json(&resolved)
+            .expect("a resolved nested column renders")
+            .value(0)
+            .to_string()
+    };
+    assert_eq!(
+        rendered("addr", &addr_physical),
+        r#"{"street":"Main St","city":"Berlin","zip":null}"#
+    );
+    assert_eq!(rendered("props", &props_physical), r#"{"inner_int":1}"#);
+    assert_eq!(
+        rendered("tags", &tags_physical),
+        r#"[{"label":"x"},{"label":"y"}]"#
+    );
+    assert_eq!(rendered("attrs", &attrs_physical), r#"{"a":{"amount":5}}"#);
+}
+
+/// A nested column THIS file does not carry NULL-fills through the delegate's own
+/// absent-column path rather than a nested-specific one: nothing is read, so nothing
+/// is diverted, and the fill takes the logical `Utf8` the schema declares.
+#[test]
+fn nested_column_absent_from_a_file_null_fills_as_the_logical_utf8() {
+    use crate::scan::spec::NestedMembers;
+
+    let logical = Arc::new(Schema::new(vec![
+        field_with_id("id", DataType::Int64, false, 1),
+        field_with_id("addr", DataType::Utf8, true, 10),
+    ]));
+    let physical = Arc::new(Schema::new(vec![field_with_id(
+        "id",
+        DataType::Int64,
+        false,
+        1,
+    )]));
+    let resolution = FieldIdResolution {
+        nested_members: HashMap::from([(
+            "addr".to_string(),
+            NestedMembers::Struct {
+                fields: vec![nested_by_id(11, "street")],
+            },
+        )]),
+        ..bare_resolution()
+    };
+
+    let rewritten = rewrite_with(logical, physical, resolution, Column::new("addr", 1))
+        .expect("an absent nullable nested column must NULL-fill, never error");
+
+    assert_eq!(
+        literal_value(&rewritten),
+        Some(ScalarValue::Utf8(None)),
+        "an absent nested column must fill with a NULL of the logical Utf8 type"
+    );
+}
+
+/// A nested physical column reaches `Utf8` by JSON RENDERING, never by a cast: the
+/// resolution keeps the column NESTED — the schema the delegate resolves against
+/// carries the resolved `Struct`, not a primitive — while arrow-cast has no
+/// struct-to-text kernel at all, which is why the cast must be diverted.
+///
+/// The diversion is what the delegate's two schemas make possible: they carry ONE
+/// identical field for the column, so the delegate emits a bare `Column` for it and
+/// `FieldIdExprAdapter` substitutes the rendering expression for that column.
+#[test]
+fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
+    use crate::scan::spec::NestedMembers;
+    use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, StructArray};
+
+    let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![(
+        Arc::new(field_with_id("street_v2", DataType::Utf8, true, 11)),
+        Arc::new(StringArray::from(vec!["Main St"])) as ArrayRef,
+    )]));
+    let logical = Arc::new(Schema::new(vec![field_with_id(
+        "addr",
+        DataType::Utf8,
+        true,
+        10,
+    )]));
+    // The file names the column `addr_old`, so the rename and the diversion have to
+    // compose: the wrapped child must carry the file's own name.
+    let physical = Arc::new(Schema::new(vec![field_with_id(
+        "addr_old",
+        addr_physical.data_type().clone(),
+        true,
+        10,
+    )]));
+    let resolution = FieldIdResolution {
+        nested_members: HashMap::from([(
+            "addr".to_string(),
+            NestedMembers::Struct {
+                fields: vec![nested_by_id(11, "street")],
+            },
+        )]),
+        ..bare_resolution()
+    };
+
+    let binding = bind_columns(&logical, &physical, &resolution);
+    let nested = binding.nested_columns();
+    let delegate_physical = binding.delegate_physical_schema(&nested);
+
+    assert!(
+        !arrow::compute::can_cast_types(addr_physical.data_type(), &DataType::Utf8),
+        "arrow-cast has no struct-to-text kernel, so the cast path cannot serve this column"
+    );
+    assert!(
+        matches!(delegate_physical.field(0).data_type(), DataType::Struct(_)),
+        "the delegate must resolve against the column's RESOLVED nested type"
+    );
+    assert_eq!(
+        delegate_logical_schema(&logical, &delegate_physical, &nested).field(0),
+        delegate_physical.field(0),
+        "the delegate's two schemas must carry ONE identical field for a nested column — \
+         name, type, nullability, and metadata together — because it answers ANY \
+         difference with the cast this diversion exists to avoid"
+    );
+
+    let rewritten = rewrite_with(
+        Arc::clone(&logical),
+        Arc::clone(&physical),
+        resolution,
+        Column::new("addr", 0),
+    )
+    .expect("a nested column must rewrite rather than fail a castability check");
+
+    assert!(
+        rewritten.downcast_ref::<CastExpr>().is_none(),
+        "a nested column must never be handed to a cast: {rewritten}"
+    );
+    assert_eq!(
+        rewritten
+            .data_type(&physical)
+            .expect("the substituted expression reports its type"),
+        DataType::Utf8,
+        "the substituted expression must agree with the registered table schema"
+    );
+    let children = rewritten.children();
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child
+                .downcast_ref::<Column>()
+                .map(|c| (c.name(), c.index())))
+            .collect::<Vec<_>>(),
+        vec![Some(("addr_old", 0))],
+        "the wrapped child must stay a bare Column at the file's REAL physical name, \
+         which is what the opener's name-based projection and reassignment resolve"
+    );
+
+    let batch = RecordBatch::try_new(Arc::clone(&physical), vec![Arc::clone(&addr_physical)])
+        .expect("a batch of the physical column");
+    let evaluated = rewritten
+        .evaluate(&batch)
+        .expect("the substituted expression evaluates over the physical column")
+        .into_array(batch.num_rows())
+        .expect("an array result");
+    assert_eq!(
+        evaluated.data_type(),
+        &DataType::Utf8,
+        "rendering, not casting, is what yields Utf8"
+    );
+    assert_eq!(
+        evaluated
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("the rendered column is Utf8")
+            .value(0),
+        r#"{"street":"Main St"}"#,
+        "the rendering must key the document by the TABLE's member name"
+    );
+}
+
+/// The declared member tree is the ONLY signal that diverts a column around the
+/// cast. A physically nested column whose logical field declares none is left to
+/// the delegate, which has no struct-to-text kernel and fails loudly — the one
+/// outcome that cannot silently lose a predicate, because the row-filter-pushdown
+/// withdrawal reads that same descriptor and would otherwise stay ON for a column
+/// this site had quietly rendered.
+#[test]
+fn a_nested_physical_column_with_no_descriptor_fails_the_cast_rather_than_rendering() {
+    use arrow::array::{ArrayRef, StringArray, StructArray};
+
+    let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![(
+        Arc::new(field_no_id("street", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec!["Main St"])) as ArrayRef,
+    )]));
+    let logical = Arc::new(Schema::new(vec![field_no_id("addr", DataType::Utf8, true)]));
+    let physical = Arc::new(Schema::new(vec![field_no_id(
+        "addr",
+        addr_physical.data_type().clone(),
+        true,
+    )]));
+
+    let binding = bind_columns(&logical, &physical, &bare_resolution());
+    assert!(
+        binding.nested_columns().is_empty(),
+        "a column with no declared member tree must not be diverted"
+    );
+
+    let error = rewrite_with(logical, physical, bare_resolution(), Column::new("addr", 0))
+        .expect_err("an undeclared nested column must fail rather than render");
+    let message = error.to_string();
+    assert!(
+        message.contains("addr"),
+        "the failure must name the column it could not adapt, got: {message}"
+    );
+}
+
+/// The cast diversion and the row-filter-pushdown withdrawal read ONE signal, so a
+/// file binding that diverts a column can only come from a resolution that also
+/// withholds Parquet row-filter pushdown. Were the two to drift apart, DataFusion
+/// would approve the pushdown against the `Utf8` logical schema, drop the conjunct
+/// against the physical nested schema, and return EVERY row.
+#[test]
+fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
+    use crate::scan::raw_scan::scan_table_parquet_format;
+    use crate::scan::spec::NestedMembers;
+    use arrow::array::{ArrayRef, StringArray, StructArray};
+
+    let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![(
+        Arc::new(field_no_id("street", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec!["Main St"])) as ArrayRef,
+    )]));
+    let logical = Arc::new(Schema::new(vec![field_no_id("addr", DataType::Utf8, true)]));
+    let physical = Arc::new(Schema::new(vec![field_no_id(
+        "addr",
+        addr_physical.data_type().clone(),
+        true,
+    )]));
+
+    let declared = FieldIdResolution {
+        nested_members: HashMap::from([(
+            "addr".to_string(),
+            NestedMembers::Struct {
+                fields: vec![nested_by_physical_name("street", "street")],
+            },
+        )]),
+        ..bare_resolution()
+    };
+    assert!(
+        !bind_columns(&logical, &physical, &declared)
+            .nested_columns()
+            .is_empty(),
+        "a declared member tree must divert its column"
+    );
+    assert!(
+        !scan_table_parquet_format(&declared)
+            .options()
+            .global
+            .pushdown_filters,
+        "a table whose binding diverts a column must read WITHOUT Parquet row-filter pushdown"
+    );
+
+    let undeclared = bare_resolution();
+    assert!(
+        bind_columns(&logical, &physical, &undeclared)
+            .nested_columns()
+            .is_empty(),
+        "no declared member tree means no diversion, so nothing is rendered to lose a predicate"
+    );
 }

@@ -98,7 +98,9 @@ fn incompatible_types_map_to_varchar_json() {
     );
     // struct/map/binary families
     assert_eq!(
-        arrow_to_exasol_type(&DataType::Struct(arrow::datatypes::Fields::empty())),
+        arrow_to_exasol_type(&DataType::Struct(arrow::datatypes::Fields::from(vec![
+            arrow::datatypes::Field::new("a", DataType::Int32, true)
+        ]))),
         "VARCHAR(2000000)"
     );
     assert_eq!(arrow_to_exasol_type(&DataType::Binary), "VARCHAR(2000000)");
@@ -113,6 +115,76 @@ fn incompatible_types_map_to_varchar_json() {
     ))));
     assert!(!needs_json_fallback(&DataType::Boolean));
     assert!(!needs_json_fallback(&DataType::Decimal128(36, 6)));
+}
+
+/// Scenario: Incompatible Arrow types are serialized to JSON VARCHAR
+///
+/// The nested half (`List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`) is owned by
+/// `needs_nested_json_rendering`; the non-nested half (`Binary` and an out-of-range
+/// `Decimal128` among others) keeps the `CAST(col AS VARCHAR)` path `needs_json_fallback`
+/// already governs, unchanged by the new predicate.
+#[test]
+fn nested_and_non_nested_incompatible_halves_are_owned_by_one_predicate_each() {
+    let list_of_int = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        DataType::Int32,
+        true,
+    )));
+    let large_list_of_int = DataType::LargeList(std::sync::Arc::new(arrow::datatypes::Field::new(
+        "item",
+        DataType::Int32,
+        true,
+    )));
+    let fixed_size_list_of_int = DataType::FixedSizeList(
+        std::sync::Arc::new(arrow::datatypes::Field::new("item", DataType::Int32, true)),
+        3,
+    );
+    let struct_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
+        arrow::datatypes::Field::new("a", DataType::Int32, true),
+    ]));
+    let map_type = DataType::Map(
+        std::sync::Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(arrow::datatypes::Fields::from(vec![
+                arrow::datatypes::Field::new("key", DataType::Utf8, false),
+                arrow::datatypes::Field::new("value", DataType::Utf8, true),
+            ])),
+            false,
+        )),
+        false,
+    );
+    let out_of_range_decimal = DataType::Decimal128(38, 6);
+
+    for nested in [
+        &list_of_int,
+        &large_list_of_int,
+        &fixed_size_list_of_int,
+        &struct_type,
+        &map_type,
+    ] {
+        assert!(
+            needs_nested_json_rendering(nested),
+            "{nested:?} is one of the five nested variants the JSON encoder renders"
+        );
+        assert!(
+            needs_json_fallback(nested),
+            "{nested:?} still needs JSON fallback, unchanged by the new predicate"
+        );
+    }
+
+    for non_nested in [&DataType::Binary, &out_of_range_decimal] {
+        assert!(
+            !needs_nested_json_rendering(non_nested),
+            "{non_nested:?} keeps the CAST(col AS VARCHAR) path, not the JSON encoder"
+        );
+        assert!(
+            needs_json_fallback(non_nested),
+            "{non_nested:?} must stay in needs_json_fallback's CAST path"
+        );
+    }
+
+    assert!(!needs_nested_json_rendering(&DataType::Boolean));
+    assert!(!needs_json_fallback(&DataType::Boolean));
 }
 
 /// Scenario (delta-type-mapping): The castability claims behind the Delta type
@@ -178,6 +250,41 @@ fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
     assert!(!can_cast_types(&populated_struct, &DataType::Utf8));
     assert!(!can_cast_types(&map, &DataType::Utf8));
     assert!(!can_cast_types(&list_of_struct, &DataType::Utf8));
+}
+
+/// Scenario (nested-json-rendering): the `List(Utf8) → Utf8` kernel `arrow-cast`
+/// makes available is a raw display-text renderer, not a JSON encoder. Pins that
+/// using it directly (unrelated to `render_nested_column_as_json`) produces
+/// unquoted Arrow display text that does NOT parse as JSON.
+#[test]
+
+fn list_to_utf8_cast_kernel_renders_display_text_not_json() {
+    use arrow::array::{ListBuilder, StringArray, StringBuilder};
+    use arrow::compute::cast;
+
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    builder.values().append_value("hello");
+    builder.values().append_value("world");
+    builder.append(true);
+    let list = builder.finish();
+
+    let casted =
+        cast(&list, &DataType::Utf8).expect("List(Utf8) -> Utf8 is a real arrow-cast kernel");
+    let rendered = casted
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("cast target is Utf8")
+        .value(0);
+
+    assert_eq!(
+        rendered, "[hello, world]",
+        "the raw cast kernel renders unquoted Arrow display text"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(rendered).is_err(),
+        "unquoted bare words are not valid JSON tokens, unlike the JSON encoder's \
+         output: {rendered}"
+    );
 }
 
 /// Scenario: One arm list decides both the Exasol type string and the

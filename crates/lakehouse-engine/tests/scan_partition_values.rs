@@ -129,6 +129,7 @@ fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
             arrow_type: "utf8".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -137,6 +138,7 @@ fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
             arrow_type: "int64".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -145,6 +147,7 @@ fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
             arrow_type: "float64".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ]
@@ -387,6 +390,7 @@ fn logical_schema_with_flag() -> Vec<LogicalField> {
         arrow_type: "int32".into(),
         nullable: true,
         initial_default: None,
+        nested: None,
         physical_name: None,
     });
     fields
@@ -495,6 +499,7 @@ fn one_off_logical_schema() -> Vec<LogicalField> {
             arrow_type: "utf8".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -503,6 +508,7 @@ fn one_off_logical_schema() -> Vec<LogicalField> {
             arrow_type: "int64".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ]
@@ -666,6 +672,7 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
             arrow_type: "int64".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
         LogicalField {
@@ -674,6 +681,7 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
             arrow_type: "float64".into(),
             nullable: true,
             initial_default: None,
+            nested: None,
             physical_name: None,
         },
     ]

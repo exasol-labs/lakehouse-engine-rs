@@ -32,7 +32,7 @@ mod tests;
 
 /// One column a table format's reader declined to map to an Arrow tag, named
 /// with the reason it gave. Iceberg never produces one; a Delta reader does for
-/// a `binary`, `struct`, `map`, or `variant` column (or an array nesting one).
+/// a `binary` or `variant` column, or a container carrying one at any depth.
 ///
 /// Never a `ScanSpec` field: the scan itself never reads this list, only the
 /// pushdown-resolution gate that runs before it.

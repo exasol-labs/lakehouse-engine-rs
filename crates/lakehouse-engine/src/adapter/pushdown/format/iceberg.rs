@@ -11,7 +11,9 @@ use lakehouse_catalog::{
 use serde_json::Value as Json;
 
 use super::{ConnectionStorage, FormatReader, ResolvedScan};
-use crate::scan::spec::{DeleteMechanism, FileEntry, LogicalField, NameMappingEntry};
+use crate::scan::spec::{
+    DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
+};
 
 #[cfg(test)]
 #[path = "iceberg_tests.rs"]
@@ -592,10 +594,41 @@ pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<Logica
                 arrow_type,
                 nullable: !f.required,
                 initial_default: encode_initial_default(f),
+                nested: derive_nested_members(&f.field_type),
                 physical_name: None,
             }
         })
         .collect()
+}
+
+fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
+    use iceberg::spec::Type;
+
+    match ty {
+        Type::Primitive(_) => None,
+        Type::Struct(s) => Some(NestedMembers::Struct {
+            fields: s
+                .fields()
+                .iter()
+                .map(|f| NestedField {
+                    field_id: Some(f.id),
+                    name: f.name.clone(),
+                    physical_name: None,
+                    nested: derive_nested_members(&f.field_type),
+                })
+                .collect(),
+        }),
+        // A list's element and a map's key/value are positional (see `NestedMembers`),
+        // so only their own field-type recurses — the pseudo-field's own Iceberg id is
+        // never carried across.
+        Type::List(l) => Some(NestedMembers::List {
+            element: derive_nested_members(&l.element_field.field_type).map(Box::new),
+        }),
+        Type::Map(m) => Some(NestedMembers::Map {
+            key: derive_nested_members(&m.key_field.field_type).map(Box::new),
+            value: derive_nested_members(&m.value_field.field_type).map(Box::new),
+        }),
+    }
 }
 
 /// Encode a field's Iceberg `initial-default` as the raw primitive scalar in
